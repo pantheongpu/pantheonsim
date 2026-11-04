@@ -950,11 +950,12 @@ struct OpSet {
   Reg c;
   bool negate_c = false;
 };
-struct OpSelp { Type ty; Reg dst; Operand a, b; Reg pred; };
+struct OpSelp { Type ty; Reg dst; Operand a, b; Reg pred; bool pred_negated = false; };
 // and/or/xor.pred. Either source may be an immediate, which nvcc emits for
 // a negation (`xor.pred %p2, %p1, -1`): non-zero is true in every lane.
-struct OpPredBin { PredBinOp op = PredBinOp::And; Reg dst; Reg a, b; int8_t a_imm = -1, b_imm = -1; };
-struct OpNotPred { Reg dst; Reg src; };
+// a_neg / b_neg: the source is written `!%p` (a negated predicate source).
+struct OpPredBin { PredBinOp op = PredBinOp::And; Reg dst; Reg a, b; int8_t a_imm = -1, b_imm = -1; bool a_neg = false, b_neg = false; };
+struct OpNotPred { Reg dst; Reg src; bool src_neg = false; };
 // atom and red are the same instruction; red is the form that discards the
 // old value. nvcc emits it whenever the result of an atomicAdd() is unused,
 // which in a reduction or a histogram is every call, so a kernel full of

@@ -282,6 +282,15 @@ extern WarpRowsFn g_warp_rows __attribute__((visibility("hidden")));
 }
 inline WarpRowsFn warp_rows_kernel() { return detail::g_warp_rows; }
 
+// Whether the 32 lanes of a full warp's global access are on consecutive elements of `bytes` bytes (1, 2, 4 or 8; 0: every lane the same), judged on the
+// base registers' rows alone and storing nothing: lane l's (lo[l] | hi[l] << 32) (`hi` null: lo[l]) is lane 0's plus l * bytes modulo 2^64 for every l (the added offset is the
+// same in every lane and cancels). `lo` is not null. Null below AVX2, like the row kernel.
+using WarpRunFn = bool (*)(const uint32_t* lo, const uint32_t* hi, unsigned bytes);
+namespace detail {
+extern WarpRunFn g_warp_run __attribute__((visibility("hidden")));
+}
+inline WarpRunFn warp_run_kernel() { return detail::g_warp_run; }
+
 // The AVX2 forms of the PTX engine's f64 lane loops (32 lanes; `m` the active ones; null/absent below AVX2, see
 // avx2_f64_available): fma d = a * b + c with the contracted-subtract negations in `sub` (bit 0 the product, bit 1 the
 // addend), and add (op 0), sub (1), mul (2) or div (3) into a row of 32 results, returning whether any is a NaN.

@@ -7579,6 +7579,7 @@ class Interpreter {
     }
     if (const auto* op = std::get_if<OpSelp>(&ins.op)) {
       Mask p = read_pred(w, ins, op->pred);
+      if (op->pred_negated) p = ~p;
       Lanes _s_a;
       const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
       Lanes _s_b;
@@ -9029,8 +9030,10 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpPredBin>(&ins.op)) {
-      const Mask a = op->a_imm >= 0 ? (op->a_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->a);
-      const Mask b = op->b_imm >= 0 ? (op->b_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->b);
+      Mask a = op->a_imm >= 0 ? (op->a_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->a);
+      Mask b = op->b_imm >= 0 ? (op->b_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->b);
+      if (op->a_neg) a = ~a;
+      if (op->b_neg) b = ~b;
       Mask r = op->op == PredBinOp::And ? (a & b) : op->op == PredBinOp::Or ? (a | b) : (a ^ b);
       Mask& p = pred_slot(w, op->dst);
       p = (p & ~m) | (r & m);
@@ -9038,6 +9041,7 @@ class Interpreter {
     }
     if (const auto* op = std::get_if<OpNotPred>(&ins.op)) {
       Mask s = read_pred(w, ins, op->src);
+      if (op->src_neg) s = ~s;
       Mask& p = pred_slot(w, op->dst);
       p = (p & ~m) | (~s & m);
       return;

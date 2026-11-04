@@ -1372,6 +1372,8 @@ vgpu_unit_test(test_runtime)
 vgpu_unit_test(test_exec2)
 vgpu_unit_test(test_exec3)
 vgpu_unit_test(test_ptx_bitwise_not)
+# PTX forms JIT compilers emit: negated predicate sources, .reg .func parameters, var[imm] addresses, ldu.
+vgpu_unit_test(test_ptx_forms)
 # Hopper (sm_90a): the warpgroup MMA, against the ISA's own layout examples.
 vgpu_unit_test(test_hopper)
 # Blackwell (sm_100a): Tensor Memory and tcgen05, against the ISA's figures.
@@ -1460,6 +1462,8 @@ vgpu_unit_test(test_sass_s2r_fill)
 vgpu_unit_test(test_sass_ldgsts)
 # LD and ST of generic addresses: the tier's window rule against the interpreter and the rule written out.
 vgpu_unit_test(test_sass_generic_mem)
+add_test(NAME test_sass_generic_mem_simd_base COMMAND test_sass_generic_mem)
+set_tests_properties(test_sass_generic_mem_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base")
 # CALL.REL, RET, WARPSYNC and FCHK run by the tier's own code, and a whole warp's shared-memory offsets, against the interpreter's: registers and counters.
 vgpu_unit_test(test_sass_dispatch)
 target_include_directories(test_sass_dispatch PRIVATE src)

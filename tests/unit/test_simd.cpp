@@ -1065,13 +1065,17 @@ VTEST(wide_integer_kernels_at_every_level) {
       }
 
       // imad_wide, signed and unsigned
-      for (bool sgn : {false, true}) {
+      // (a carry-in mask or none, the carry-out asked for or not: the sum is the same; with a null carry_out nothing is stored through it)
+      for (int variant = 0; variant < 8; ++variant) {
+        const bool sgn = variant & 1;
+        const uint32_t cin = (variant & 2) ? m1 : 0u;
+        const bool want_c = !(variant & 4);
         uint32_t rlo[32], rhi[32], carry = 0xdeadbeef, want_carry = 0;
-        k.imad_wide(rlo, rhi, a, b, c, c2, sgn, m1, &carry);
+        k.imad_wide(rlo, rhi, a, b, c, c2, sgn, cin, want_c ? &carry : nullptr);
         for (int i = 0; i < 32; ++i) {
           const unsigned __int128 prod = sgn ? static_cast<unsigned __int128>(static_cast<__int128>(static_cast<int64_t>(static_cast<int32_t>(a[i])) * static_cast<int32_t>(b[i])) & ((static_cast<__int128>(1) << 64) - 1))
                                              : static_cast<unsigned __int128>(uint64_t{a[i]} * b[i]);
-          const unsigned __int128 full = prod + (uint64_t{c[i]} | (uint64_t{c2[i]} << 32)) + ((m1 >> i) & 1);
+          const unsigned __int128 full = prod + (uint64_t{c[i]} | (uint64_t{c2[i]} << 32)) + ((cin >> i) & 1);
           want_carry |= static_cast<uint32_t>((full >> 64) != 0) << i;
           const uint64_t lo64 = static_cast<uint64_t>(full);
           if (rlo[i] != static_cast<uint32_t>(lo64) || rhi[i] != static_cast<uint32_t>(lo64 >> 32))
@@ -1079,8 +1083,8 @@ VTEST(wide_integer_kernels_at_every_level) {
                                  hex(a[i]) + " b=0x" + hex(b[i]) + " c=0x" + hex(c[i] | (uint64_t{c2[i]} << 32)) + " got 0x" +
                                  hex(uint64_t{rlo[i]} | (uint64_t{rhi[i]} << 32)) + " want 0x" + hex(lo64));
         }
-        if (carry != want_carry)
-          throw vtest::Failure(lv + " imad_wide carry out: got 0x" + hex(carry) + " want 0x" + hex(want_carry));
+        if (want_c ? carry != want_carry : carry != 0xdeadbeef)
+          throw vtest::Failure(lv + " imad_wide carry out: got 0x" + hex(carry) + " want 0x" + hex(want_c ? want_carry : 0xdeadbeefu));
       }
 
       // shf, every form

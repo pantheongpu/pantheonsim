@@ -386,7 +386,8 @@ void build_micro(EntryFn& fn) {
     } else if (const auto* op = std::get_if<OpPredBin>(&ins.op)) {
       const bool a_ok = op->a_imm >= 0 || (!op->a.wide && op->a.id != kNoReg);
       const bool b_ok = op->b_imm >= 0 || (!op->b.wide && op->b.id != kNoReg);
-      ok = a_ok && b_ok && narrow_dst(op->dst);
+      // A negated source (`!%p`) is left to the interpreter.
+      ok = a_ok && b_ok && !op->a_neg && !op->b_neg && narrow_dst(op->dst);
       if (ok) {
         u.kind = MicroOp::PredBin;
         u.sub = static_cast<uint8_t>(op->op);
@@ -394,7 +395,7 @@ void build_micro(EntryFn& fn) {
         if (op->b_imm >= 0) { u.src_imm |= 2; u.src[1] = op->b_imm ? 1 : 0; } else { u.src[1] = op->b.id; }
       }
     } else if (const auto* op = std::get_if<OpNotPred>(&ins.op)) {
-      ok = !op->src.wide && op->src.id != kNoReg && narrow_dst(op->dst);
+      ok = !op->src.wide && op->src.id != kNoReg && !op->src_neg && narrow_dst(op->dst);
       if (ok) {
         u.kind = MicroOp::NotPred;
         u.src[0] = op->src.id;
@@ -442,7 +443,7 @@ void build_micro(EntryFn& fn) {
         if (op->ty.is_signed()) u.flags |= MicroOp::kSigned;
       }
     } else if (const auto* op = std::get_if<OpSelp>(&ins.op)) {
-      ok = op->ty.bits == 32 && !op->pred.wide && op->pred.id != kNoReg && narrow_dst(op->dst) &&
+      ok = op->ty.bits == 32 && !op->pred_negated && !op->pred.wide && op->pred.id != kNoReg && narrow_dst(op->dst) &&
            source(0, op->a) && source(1, op->b);
       if (ok) {
         u.kind = MicroOp::Selp32;

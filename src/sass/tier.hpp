@@ -194,6 +194,10 @@ struct MOp {
   // a place to look first, and read and written relaxed by whichever thread runs the op).
   // A shared-memory access: the entry of the thread's table of bank passes this instruction's last warp was found in (sass_bank_passes_offsets's `hint`).
   mutable uint8_t way = 0;
+  // A global access of a full warp: the shape the last such warp's lanes had (h_global tries the cheap test for this one first; only ever a place to
+  // start, read and written relaxed by whichever thread runs the op).
+  static constexpr uint8_t kShapeRun = 0, kShapeOne = 1, kShapeOther = 2;
+  mutable uint8_t shape = kShapeRun;
 };
 static_assert(sizeof(MOp) == 96, "an op is 96 bytes: a cache line and a half, which the run loop reads one after the other");
 inline constexpr uint16_t kNoReg = 0xffff;

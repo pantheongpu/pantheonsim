@@ -420,8 +420,10 @@ TIER_HANDLER(h_imad_wide) {
     clo = mlo;
     chi = mhi;
   }
-  uint32_t carry;
-  c.sk->imad_wide(rlo, rhi, a, b, clo, chi, (op.aux & 2) != 0, (op.aux & 1) ? static_cast<uint32_t>(tier_pmask(c, op.p)) : 0u, &carry);
+  uint32_t carry = 0;
+  // (the carry out is found only when a predicate takes it)
+  c.sk->imad_wide(rlo, rhi, a, b, clo, chi, (op.aux & 2) != 0, (op.aux & 1) ? static_cast<uint32_t>(tier_pmask(c, op.p)) : 0u,
+                  op.dst2 != tier::kNoReg ? &carry : nullptr);
   if (op.dst != tier::kNoReg) {   // write64: R254's partner is RZ
     tier_store(c, op.dst, ex, rlo);
     if (op.dst + 1u != kRZ) tier_store(c, static_cast<uint16_t>(op.dst + 1), ex, rhi);
@@ -986,12 +988,38 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
   // all from one pass over the registers' rows (made here, and used by the paths below).
   simd::WarpRowsInfo ri{};
   bool rows = false;
-  if (ex == kAll) {
+  // A full warp whose lanes are on consecutive elements (a run), or all on one address (a load that every lane makes of the same word), is asked of
+  // the registers' rows alone (simd::warp_run_kernel: nothing stored, under half the work of the address pass above), the shape this instruction's
+  // warps had last time first (`op.shape`, only ever a place to start: a warp of another shape is one the kernel answers "no" to). When it says yes
+  // the 32 addresses and the window and stride answers are made only if the access does not go through below (the memory manager declines it, or it
+  // is in the constant window): then the kernel above runs, as if this had not been tried.
+  unsigned fast = 0;   // 1: a run, 2: one address
+  uint64_t fast_a0 = 0;
+  if (ex == kAll && blo) {
+    if (const simd::WarpRunFn run_kernel = simd::warp_run_kernel()) {
+      const unsigned shape = __atomic_load_n(&op.shape, __ATOMIC_RELAXED);
+      if (shape != tier::MOp::kShapeOther) {
+        const bool one = shape == tier::MOp::kShapeOne && !Store;
+        if (run_kernel(blo, bhi, one ? 0u : bytes)) {
+          fast = one ? 2 : 1;
+          fast_a0 = (bhi ? (static_cast<uint64_t>(bhi[0]) << 32) | blo[0] : uint64_t{blo[0]}) + urv + imm;
+        }
+      }
+    }
+  }
+  const auto make_rows = [&] {
     if (const simd::WarpRowsFn kernel = simd::warp_rows_kernel()) {
       kernel(blo, bhi, urv + imm, kConstWindow, addrs, ri);
       rows = true;
+      // (the shape the next warp of this instruction is asked for first)
+      const uint8_t shape = !ri.progression ? tier::MOp::kShapeOther
+                            : ri.stride == bytes ? tier::MOp::kShapeRun
+                            : (ri.stride == 0 && !Store) ? tier::MOp::kShapeOne
+                                                         : tier::MOp::kShapeOther;
+      __atomic_store_n(&op.shape, shape, __ATOMIC_RELAXED);
     }
-  }
+  };
+  if (ex == kAll && !fast) make_rows();
   if (ex && ((ex + (ex & -ex)) & ex) == 0) {
     const unsigned first = static_cast<unsigned>(std::countr_zero(ex));
     const unsigned count = popc(ex);
@@ -999,7 +1027,13 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
     // below, for an access that is not a run or that the memory manager declines).
     uint64_t g0;
     bool run;
-    if (rows) {   // (a run is the lanes on a stride of one element)
+    if (fast == 1) {
+      g0 = fast_a0;
+      run = true;
+    } else if (fast == 2) {   // (one address: not a run)
+      g0 = fast_a0;
+      run = false;
+    } else if (rows) {   // (a run is the lanes on a stride of one element)
       g0 = ri.a0;
       run = ri.progression && ri.stride == bytes;
     } else {
@@ -1045,6 +1079,31 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
       }
     }
   }
+  if (fast == 2 && fast_a0 - kConstWindow >= (uint64_t{1} << 32)) {
+    // Every lane loads one address: one load (MemoryManager::load_broadcast), the same as the batch below would do for it (a load declined falls through).
+    uint64_t fv[32];
+    if (mem.load_broadcast(fast_a0, 32, bytes, fv, &op.way)) {
+      if (dreg) {
+        uint32_t* d = c.R + op.dst * 32u;
+        if (bytes == 4) {
+          for (unsigned l = 0; l < 32; ++l) d[l] = static_cast<uint32_t>(fv[l]);
+        } else if (bytes < 4) {
+          for (unsigned l = 0; l < 32; ++l) d[l] = tier_extend(op.b, static_cast<uint32_t>(fv[l]));
+        } else {
+          for (unsigned l = 0; l < 32; ++l) {
+            d[l] = static_cast<uint32_t>(fv[l]);
+            d[32 + l] = static_cast<uint32_t>(fv[l] >> 32);
+          }
+        }
+      }
+      if (!count_global_progression(blk.st, false, fast_a0, 0, bytes, c.r->fastcount())) {
+        for (unsigned l = 0; l < 32; ++l) addrs[l] = fast_a0;   // (the registers may be written over by now: the addresses are the one)
+        count_access(blk.st, 0, false, addrs, ex, bytes);
+      }
+      return;
+    }
+  }
+  if (fast) make_rows();   // (an access that did not go through: the rest is as for any full warp)
   if (ex == kAll) {
     // A full warp: the addresses are the batch as they stand (no lane to skip, none to find again when the values go back to the
     // registers).
