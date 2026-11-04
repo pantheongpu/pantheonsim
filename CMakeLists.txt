@@ -2637,6 +2637,27 @@ if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
   add_test(NAME test_driver_launch_ex COMMAND test_driver_launch_ex)
   set_tests_properties(test_driver_launch_ex PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100;VGPU_QUIET=1")
 endif()
+# cuLaunchKernel's `extra` argument form (pantheonsim #471).
+if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
+  add_executable(test_driver_launch_extra nvidia/tests/unit/test_driver_launch_extra.cpp)
+  # The driver's graph calls go to the runtime in the process (driver_graph.cpp), so it is linked in for the node case.
+  target_link_libraries(test_driver_launch_extra PRIVATE vgpucuda)
+  if(TARGET vgpucudart)
+    target_link_libraries(test_driver_launch_extra PRIVATE -Wl,--no-as-needed vgpucudart)
+  endif()
+  target_include_directories(test_driver_launch_extra PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_driver_launch_extra COMMAND test_driver_launch_extra)
+  set_tests_properties(test_driver_launch_extra PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/a100;VGPU_QUIET=1")
+endif()
+# The OpenGL, EGL and VDPAU interop names of libcuda, exported and refused (pantheonsim #470).
+if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
+  add_executable(test_driver_gl_stubs nvidia/tests/unit/test_driver_gl_stubs.cpp)
+  target_link_libraries(test_driver_gl_stubs PRIVATE vgpucuda ${CMAKE_DL_LIBS})
+  target_include_directories(test_driver_gl_stubs PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  target_compile_definitions(test_driver_gl_stubs PRIVATE VGPU_CUDA_INCLUDE="${CUDA_ABI_INCLUDE}")
+  add_test(NAME test_driver_gl_stubs COMMAND test_driver_gl_stubs)
+  set_tests_properties(test_driver_gl_stubs PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/a100;VGPU_QUIET=1")
+endif()
 # Runtime entry points the toolkit exports and this one lacked (cudaMemset3D,
 # cudaChooseDevice, cudaDeviceGetByPCIBusId, the 2D array copies, the texture
 # descriptor getters, cudaFuncGetName and cudaFuncGetParamInfo, ...).
