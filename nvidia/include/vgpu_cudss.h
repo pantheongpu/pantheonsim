@@ -2,7 +2,7 @@
  * vgpu_cudss.h -- VirtualGPU's clean-room declarations of the cuDSS API.
  *
  * Written from NVIDIA's publicly documented cuDSS API
- * (docs.nvidia.com/cuda/cudss), version 0.8, so that programs built against
+ * (docs.nvidia.com/cuda/cudss), versions 1.0 and 0.8, so that programs built against
  * cuDSS -- the sparse direct solver -- can run on VirtualGPU's libcudss. It
  * contains no NVIDIA code. Type layouts and numeric values (status codes,
  * enums, phase bits) follow the documented ABI, so a program compiled with
@@ -14,7 +14,13 @@
  * internal interface, so it cannot run on a simulated driver (cudssCreate
  * fails).
  *
- * The whole 0.8 API is declared. The communication and threading layer
+ * The default is the 1.0 API (libcudss.so.1). Define VGPU_CUDSS_API_0_8
+ * before including this header to get the 0.8 one (libcudss.so.0): the
+ * library keeps both majors, as NVIDIA's own packages do side by side. The two
+ * differ in the version macros, the value-type spelling and numbers, three
+ * functions and four config parameters; every other declaration is shared.
+ *
+ * The whole API of either version is declared. The communication and threading layer
  * interfaces (the structs a cuDSS comm or threading library fills in) are
  * not: VirtualGPU's cuDSS loads neither library.
  */
@@ -28,11 +34,18 @@
 #include <driver_types.h>  /* cudaStream_t */
 #include <library_types.h> /* cudaDataType_t, libraryPropertyType */
 
+#ifdef VGPU_CUDSS_API_0_8
 #define CUDSS_VERSION_MAJOR 0
 #define CUDSS_VERSION_MINOR 8
 #define CUDSS_VERSION_PATCH 0
-/* 800 for 0.8.0. Programs test it (>= 800) to pick the 0.8 signatures, in
- * which cudssMatrixCreateCsr takes the offset type and index type apart. */
+#else
+#define CUDSS_VERSION_MAJOR 1
+#define CUDSS_VERSION_MINOR 0
+#define CUDSS_VERSION_PATCH 0
+#endif
+/* 800 for 0.8.0, 10000 for 1.0.0. Programs test it (>= 800) to pick the 0.8
+ * signatures, in which cudssMatrixCreateCsr takes the offset type and index
+ * type apart; 1.0 keeps them. */
 #define CUDSS_VERSION \
   (CUDSS_VERSION_MAJOR * 10000 + CUDSS_VERSION_MINOR * 100 + CUDSS_VERSION_PATCH)
 
@@ -51,6 +64,7 @@ typedef struct cudssMatrix* cudssMatrix_t; /* dense or sparse, single or batch *
 typedef struct cudssData* cudssData_t;     /* factors and per-system results */
 typedef struct cudssConfig* cudssConfig_t; /* solver settings */
 
+#ifdef VGPU_CUDSS_API_0_8
 /* Value and index types. The floating-point ones are cudaDataType_t's values. */
 typedef enum cudssDataType_t {
   CUDSS_DATA_TYPE_UNSET = 1024,
@@ -62,6 +76,44 @@ typedef enum cudssDataType_t {
   CUDSS_R_32I = CUDA_R_32I,
   CUDSS_R_64I = CUDA_R_64I
 } cudssDataType_t;
+#else
+/* 1.0 goes back to cudaDataType_t: cudssDataType_t is only another name for
+ * it, and the CUDSS_* names are the CUDA_* values (so a 0.8 program's calls
+ * keep their meaning). The two cuDSS-only types are numbers outside CUDA's. */
+typedef cudaDataType_t cudssDataType_t;
+#define CUDSS_DATA_TYPE_UNSET ((cudaDataType_t)63)
+#define CUDSS_R_32F CUDA_R_32F
+#define CUDSS_R_64F CUDA_R_64F
+#define CUDSS_C_32F CUDA_C_32F
+#define CUDSS_C_64F CUDA_C_64F
+#define CUDSS_R_64F_MP2 ((cudaDataType_t)62) /* double-double */
+#define CUDSS_R_32I CUDA_R_32I
+#define CUDSS_R_64I CUDA_R_64I
+#define CUDSS_R_64F_64F CUDSS_R_64F_MP2 /* the 0.8 name */
+
+typedef enum cudssSolveMode_t {
+  CUDSS_SOLVE_MODE_NORMAL = 0,
+  CUDSS_SOLVE_MODE_TRANSPOSE = 1,
+  CUDSS_SOLVE_MODE_CONJUGATE_TRANSPOSE = 2
+} cudssSolveMode_t;
+
+typedef enum cudssMemoryEstimateState_t {
+  CUDSS_MEMORY_ESTIMATE_STATE_NONE = 0,
+  CUDSS_MEMORY_ESTIMATE_STATE_FILL_KNOWN = 1,
+  CUDSS_MEMORY_ESTIMATE_STATE_FINAL = 2
+} cudssMemoryEstimateState_t;
+
+typedef enum cudssDowncastFactorsMode_t {
+  CUDSS_DOWNCAST_FACTORS_MODE_DISABLED = 0,
+  CUDSS_DOWNCAST_FACTORS_MODE_KEEP_BLOCK_DIAGONAL = 1,
+  CUDSS_DOWNCAST_FACTORS_MODE_KEEP_STRICT_DIAGONAL = 2
+} cudssDowncastFactorsMode_t;
+
+typedef enum cudssMemoryOptimizationFlags_t {
+  CUDSS_MEMORY_OPTIMIZATION_DEFAULT = 0,
+  CUDSS_MEMORY_OPTIMIZATION_SOLVE_ONLY = 1 << 0
+} cudssMemoryOptimizationFlags_t;
+#endif
 
 typedef enum cudssConfigParam_t {
   CUDSS_CONFIG_REORDERING_ALG = 0,       /* int (cudssReorderingAlg_t) */
@@ -89,7 +141,15 @@ typedef enum cudssConfigParam_t {
   CUDSS_CONFIG_DEVICE_INDICES = 22,      /* int[device count] */
   CUDSS_CONFIG_SCHUR_MODE = 23,          /* int */
   CUDSS_CONFIG_DETERMINISTIC_MODE = 24,  /* int */
+#ifdef VGPU_CUDSS_API_0_8
   CUDSS_CONFIG_ND_UBFACTOR = 25          /* int */
+#else
+  CUDSS_CONFIG_ND_UBFACTOR = 25,         /* int */
+  CUDSS_CONFIG_EMULATION_MANTISSA_BIT_COUNT = 26,  /* int, >= 0 */
+  CUDSS_CONFIG_FORCE_NONSYMMETRIC_MATCHING = 27,   /* int, 0 or 1 */
+  CUDSS_CONFIG_DOWNCAST_FACTORS = 28,              /* int (cudssDowncastFactorsMode_t) */
+  CUDSS_CONFIG_MEMORY_OPTIMIZATION_SETTING = 29    /* int (cudssMemoryOptimizationFlags_t) */
+#endif
 } cudssConfigParam_t;
 
 /* "index" below is the system matrix's index type; "value" its value type. */
@@ -217,7 +277,7 @@ typedef enum cudssPivotType_t {
   CUDSS_PIVOT_GLOBAL_ROW = 3,
   CUDSS_PIVOT_DIAGONAL = 4,
   CUDSS_PIVOT_LOCAL_BLOCK = 5,
-  CUDSS_PIVOT_BUNCH_KAUFMAN = 6 /* reserved by cuDSS 0.8: NOT_SUPPORTED */
+  CUDSS_PIVOT_BUNCH_KAUFMAN = 6 /* reserved by cuDSS 0.8 (NOT_SUPPORTED); 1.0 takes it */
 } cudssPivotType_t;
 
 /* Bit flags; a batch of CSR matrices reports CSR | BATCH. */
@@ -236,7 +296,9 @@ typedef struct {
   char name[CUDSS_ALLOCATOR_NAME_LEN];
 } cudssDeviceMemHandler_t;
 
-/* The CUDSS_R_64F_64F element: an unevaluated sum hi + lo, 16-byte aligned. */
+#ifdef VGPU_CUDSS_API_0_8
+/* The CUDSS_R_64F_64F element: an unevaluated sum hi + lo, 16-byte aligned.
+ * (1.0 drops it from the public header.) */
 #ifdef __cplusplus
 struct alignas(16) cudss_fp64mp2_t {
   double hi;
@@ -247,6 +309,15 @@ typedef struct {
   _Alignas(16) double hi;
   double lo;
 } cudss_fp64mp2_t;
+#endif
+#else
+/* 1.0: a pool of page-locked host memory the library may allocate from. */
+typedef struct {
+  void* ctx;
+  int (*pinned_alloc)(void* ctx, void** ptr, size_t size, cudaStream_t stream);
+  int (*pinned_free)(void* ctx, void* ptr, size_t size, cudaStream_t stream);
+  char name[CUDSS_ALLOCATOR_NAME_LEN];
+} cudssPinnedMemHandler_t;
 #endif
 
 typedef void (*cudssLoggerCallback_t)(int logLevel, const char* functionName, const char* message);
@@ -262,6 +333,11 @@ cudssStatus_t CUDSSAPI cudssSetCommLayer(cudssHandle_t handle, const char* commL
 cudssStatus_t CUDSSAPI cudssSetThreadingLayer(cudssHandle_t handle, const char* thrLibFileName);
 cudssStatus_t CUDSSAPI cudssGetDeviceMemHandler(const cudssHandle_t handle, cudssDeviceMemHandler_t* handler);
 cudssStatus_t CUDSSAPI cudssSetDeviceMemHandler(cudssHandle_t handle, const cudssDeviceMemHandler_t* handler);
+#ifndef VGPU_CUDSS_API_0_8
+cudssStatus_t CUDSSAPI cudssGetPinnedMemHandler(const cudssHandle_t handle, cudssPinnedMemHandler_t* handler);
+cudssStatus_t CUDSSAPI cudssSetPinnedMemHandler(cudssHandle_t handle, const cudssPinnedMemHandler_t* handler);
+cudssStatus_t CUDSSAPI cudssSetJitCacheDir(cudssHandle_t handle, const char* cacheDir);
+#endif
 
 /* Settings and solver data */
 cudssStatus_t CUDSSAPI cudssConfigCreate(cudssConfig_t* config);

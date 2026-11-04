@@ -10,6 +10,11 @@ release says what runs and what it produces, never how fast a real GPU would run
 - PTX accepts unary `~` on an integer constant (`and.b64 %rd3, %rd3, ~0x2;`), alone, nested, with `-` or in
   parentheses, at the width of the instruction; the lexer used to stop with `unexpected character '~'`
   (pantheonsim #483).
+- cuDSS 1.0 runs. The simulator's cuDSS is now presented as `libcudss.so.1` (1.0: its version macros,
+  `cudaDataType_t` signatures, `cudssSetJitCacheDir` and the pinned-memory handler functions, the four new
+  config parameters, Bunch-Kaufman accepted) with `libcudss.so.0` (0.8) kept beside it, unchanged, so programs
+  built against either major run. A program built against NVIDIA's 1.0, such as SCS's `run_tests_cudss`, no
+  longer stops with "needs libcudss.so.1, but this build of the simulator has no libcudss.so" (#426).
 - A kernel run from PTX no longer fails to launch when its register estimate is up to twice the block's register
   file. The estimate is the peak of live virtual registers and ptxas needs fewer, so ggml's `rms_norm_f32`
   (88 estimated, 64 allowed at 1,024 threads) stopped Ollama running Gemma 3 on the RTX PRO 6000 profile, the one

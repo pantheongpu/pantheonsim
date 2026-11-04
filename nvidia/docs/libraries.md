@@ -85,6 +85,26 @@ both libraries. Refused with a message: the Schur complement mode, the nested
 dissection tree, double-double values, and a matrix distributed across
 processes.
 
+**Two majors.** NVIDIA's apt repository carries cuDSS 0.8 (`libcudss.so.0`) and 1.0
+(`libcudss.so.1`) side by side, and a program is built against one. The shim is the same
+source built twice, `build/shim/libcudss.so.0` (0.8, exactly as before) and
+`build/shim/libcudss.so.1` (1.0), so `vgpu run` finds whichever the program needs;
+`nvidia/include/vgpu_cudss.h` declares 1.0 by default and 0.8 under `VGPU_CUDSS_API_0_8`.
+1.0 changes the version macros, goes back to `cudaDataType_t` for the matrix functions
+(`CUDSS_R_64F_MP2` is 62 and `CUDSS_DATA_TYPE_UNSET` 63; the numbers a 0.8 program passes keep their
+meaning), adds `cudssSetJitCacheDir`, `cudssGetPinnedMemHandler` and `cudssSetPinnedMemHandler`
+(recorded and handed back; nothing here compiles kernels or pins memory), accepts
+`CUDSS_PIVOT_BUNCH_KAUFMAN`, and tags its symbols `libcudss.so.1` as NVIDIA's does. The four
+new settings (`EMULATION_MANTISSA_BIT_COUNT`, `FORCE_NONSYMMETRIC_MATCHING`, `DOWNCAST_FACTORS`,
+`MEMORY_OPTIMIZATION_SETTING`) have NVIDIA's defaults and ranges (measured on 1.0.0.35) and are
+stored and returned but change nothing, since the arithmetic is double precision on the host.
+The default matching is `AUTO` as in 1.0; as in 0.8 it is accepted and not performed (identity
+permutation, no scaling), so only the reported permutation and scales differ from a real GPU's.
+Refused with a message in 1.0: the transposed solve modes (`CUDSS_CONFIG_SOLVE_MODE` 1 and 2).
+`nvidia/tests/unit/test_cudss_abi.cpp` pins each major's behaviour,
+`nvidia/tests/e2e/cudss1_kkt.cpp` is SCS's call sequence against 1.0, and
+`nvidia/tests/e2e/run_cudss_sonames.sh` runs a program that needs each soname under `vgpu run`.
+
 ## cuFile: GPUDirect Storage's compatibility mode
 
 GPUDirect Storage moves file data straight between storage and GPU memory by
@@ -629,7 +649,7 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | cusolverMg | `libcusolverMg.so.12` | getrf/getrs, potrf/potrs/potri and syevd on a matrix, or getrf/getrs and potrf/potrs/potri on a submatrix (IA, JA), spread over several devices in NVIDIA's column-block-cyclic layout |
 | NCCL | `libnccl.so.2` | collectives (all-to-all, gather and scatter included, and the `nccl*Config` forms of each) and point-to-point across ranks; ncclCommSplit, ncclCommShrink, ncclCommGetUniqueId + ncclCommGrow, ncclCommRevoke, ncclCommSuspend/Resume/MemStats, ncclCommInitRankScalable, non-blocking communicators, pre-multiplied sums with host or device scalars, the `ncclParam*` registry; the device API's host side answers as the RTX 3060 pair does (unsupported) |
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
-| cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
+| cuDSS | `libcudss.so.0`, `libcudss.so.1` | the sparse direct solver, the whole 0.8 and 1.0 APIs (two libraries, one source): LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuFile (GPUDirect Storage) | `libcufile.so.0` | compatibility mode: file I/O staged through host memory into device memory, the driver and parameter API, handle and buffer registration (user-space file system handles register but, as on the card, do no I/O), batch and stream-ordered I/O, statistics; NVIDIA's statuses (CUDA 13.0) |
 | nvCOMP | `libnvcomp.so.5`, `libnvcomp_cpu.so.5` | the low-level batched API and the C++ manager API for LZ4 (bitshuffle included), Snappy, Deflate, GDeflate, Gzip and Zstd, chunks and containers interoperable with NVIDIA's in both directions, CRC32, streaming gzip compression, and the CPU GDeflate library; Cascaded, Bitcomp and ANS refused (no public bitstream) |
 | NVSHMEM | `libnvshmem_host.so.3` | the host API across a job of PEs, one simulated GPU per process, bootstrapped by unique ID, MPI, OpenSHMEM or PMIx: every type of the RMA lists (half and bfloat16 included) with nonblocking, strided and stream-ordered forms, typed collectives and reductions, atomics, waits in stream order, teams (also from a unique ID); the device API of kernels built with NVIDIA's NVSHMEM headers and device library, all PEs peer to peer |

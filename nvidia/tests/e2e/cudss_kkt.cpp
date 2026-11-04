@@ -20,6 +20,9 @@
 #include <random>
 #include <vector>
 
+#ifndef VGPU_CUDSS_E2E_1_0 /* cudss1_kkt.cpp builds this same program against cuDSS 1.0 */
+#define VGPU_CUDSS_API_0_8 /* these programs pin the 0.8 behaviour (libcudss.so.0) */
+#endif
 #include "../../include/vgpu_cudss.h"
 
 static int failures = 0;
@@ -233,6 +236,9 @@ static void scs_like(const char* label, cudssDataType_t itype, cudssDataType_t v
 int main() {
   // SCS checks for cuDSS 0.8's API by version.
   check(CUDSS_VERSION >= 800, "CUDSS_VERSION selects the 0.8 signatures");
+#ifdef VGPU_CUDSS_E2E_1_0
+  check(CUDSS_VERSION_MAJOR == 1, "built against the 1.0 declarations (libcudss.so.1)");
+#endif
   scs_like<int32_t, double>("32-bit indices, double (SCS's default build)", CUDSS_R_32I, CUDSS_R_64F, 30, 45, 1e-13);
   scs_like<int64_t, double>("64-bit indices, double (DLONG)", CUDSS_R_64I, CUDSS_R_64F, 30, 45, 1e-13);
   scs_like<int32_t, float>("32-bit indices, float (SFLOAT)", CUDSS_R_32I, CUDSS_R_32F, 30, 45, 1e-5);

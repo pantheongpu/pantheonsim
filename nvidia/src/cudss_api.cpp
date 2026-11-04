@@ -93,7 +93,11 @@ Status refuse(const char* api, const std::string& why) {
 // ---- types ----
 
 size_t type_size(cudssDataType_t t) {
+#ifdef VGPU_CUDSS_API_0_8
   switch (t) {
+#else
+  switch ((int)t) {  // 1.0's double-double (62) is not one of cudaDataType_t's enumerators
+#endif
     case CUDSS_R_32F: case CUDSS_R_32I: return 4;
     case CUDSS_R_64F: case CUDSS_C_32F: case CUDSS_R_64I: return 8;
     case CUDSS_C_64F: case CUDSS_R_64F_64F: return 16;
@@ -215,10 +219,22 @@ struct cudssContext {
   int mg_count = 0;                     // devices of a cudssCreateMg handle
   std::vector<int> mg_devices;
   std::vector<cudaStream_t> mg_streams;
+#ifndef VGPU_CUDSS_API_0_8
+  cudssPinnedMemHandler_t pinned{};  // kept and handed back, never allocated through
+  bool has_pinned = false;
+  std::string jit_cache_dir;         // recorded: there is no JIT to cache
+#endif
 };
 
+// cuDSS 1.0 matches by default (CUDSS_MATCHING_ALG_AUTO), 0.8 did not.
+#ifdef VGPU_CUDSS_API_0_8
+constexpr int kDefaultMatching = CUDSS_MATCHING_ALG_NONE;
+#else
+constexpr int kDefaultMatching = CUDSS_MATCHING_ALG_AUTO;
+#endif
+
 struct cudssConfig {
-  int reordering = 0, factorization = 0, solve = 0, matching = 0, solve_mode = 0, ir_steps = 0;
+  int reordering = 0, factorization = 0, solve = 0, matching = kDefaultMatching, solve_mode = 0, ir_steps = 0;
   double ir_tol = 0;
   int pivot_type = 0;
   double pivot_threshold = 1.0, pivot_epsilon = -1.0;  // -1: the value type's default
@@ -229,6 +245,13 @@ struct cudssConfig {
   int ubatch_size = 1, ubatch_index = -1, superpanels = 1, device_count = 1;
   std::vector<int> device_indices;  // empty: 0 .. device_count - 1
   int schur_mode = 0, deterministic = 0, nd_ubfactor = 20;
+#ifndef VGPU_CUDSS_API_0_8
+  // 1.0's settings. All four are kept and handed back, none changes a result
+  // here: the arithmetic is double precision on the host, so there is no
+  // tensor-core emulation to size, no factor storage to shrink, and the
+  // matching (identity, no scaling) is the same either way.
+  int emulation_mantissa_bits = 0, force_nonsymmetric_matching = 0, downcast_factors = 0, memory_optimization = 0;
+#endif
 };
 
 // A thin wrapper over the caller's buffers, read when the matrix is used.
@@ -683,6 +706,14 @@ Status run_phases(const cudssConfig& cfg, cudssData* d, const cudssMatrix& A, co
   }
   if (phase & kSolveBits) {
     if (d->stage != kFactored) return CUDSS_STATUS_INVALID_VALUE;
+#ifndef VGPU_CUDSS_API_0_8
+    // 1.0 accepts the transposed solve modes; this solver applies the factors
+    // as they are, so a program asking for one is refused, not answered with
+    // the plain solution.
+    if (cfg.solve_mode != CUDSS_SOLVE_MODE_NORMAL)
+      return refuse("cudssExecute", "the transposed solve modes (CUDSS_CONFIG_SOLVE_MODE) are not supported "
+                                    "by this simulator's cuDSS");
+#endif
     return solve<T>(cfg, d, A, X, B, phase);
   }
   return CUDSS_STATUS_SUCCESS;
@@ -811,6 +842,31 @@ cudssStatus_t cudssGetDeviceMemHandler(const cudssHandle_t handle, cudssDeviceMe
   return CUDSS_STATUS_SUCCESS;
 }
 
+#ifndef VGPU_CUDSS_API_0_8
+// Like the device handler, the pinned one is kept and handed back: the host
+// memory the factors use is the process's own.
+cudssStatus_t cudssSetPinnedMemHandler(cudssHandle_t handle, const cudssPinnedMemHandler_t* handler) {
+  if (!handle) return CUDSS_STATUS_INVALID_VALUE;
+  handle->has_pinned = handler != nullptr;
+  if (handler) handle->pinned = *handler;
+  return CUDSS_STATUS_SUCCESS;
+}
+
+cudssStatus_t cudssGetPinnedMemHandler(const cudssHandle_t handle, cudssPinnedMemHandler_t* handler) {
+  if (!handle || !handler || !handle->has_pinned) return CUDSS_STATUS_INVALID_VALUE;
+  *handler = handle->pinned;
+  return CUDSS_STATUS_SUCCESS;
+}
+
+// NVIDIA's keeps the kernels it compiles at run time in this directory. This
+// one compiles none, so the name is recorded and nothing is written there.
+cudssStatus_t cudssSetJitCacheDir(cudssHandle_t handle, const char* cacheDir) {
+  if (!handle || !cacheDir) return CUDSS_STATUS_INVALID_VALUE;
+  handle->jit_cache_dir = cacheDir;
+  return CUDSS_STATUS_SUCCESS;
+}
+#endif
+
 // ---- configuration ----
 
 cudssStatus_t cudssConfigCreate(cudssConfig_t* config) {
@@ -863,6 +919,12 @@ Field field(cudssConfig* c, cudssConfigParam_t param) {
     case CUDSS_CONFIG_SCHUR_MODE: return {&c->schur_mode, 4};
     case CUDSS_CONFIG_DETERMINISTIC_MODE: return {&c->deterministic, 4};
     case CUDSS_CONFIG_ND_UBFACTOR: return {&c->nd_ubfactor, 4};
+#ifndef VGPU_CUDSS_API_0_8
+    case CUDSS_CONFIG_EMULATION_MANTISSA_BIT_COUNT: return {&c->emulation_mantissa_bits, 4};
+    case CUDSS_CONFIG_FORCE_NONSYMMETRIC_MATCHING: return {&c->force_nonsymmetric_matching, 4};
+    case CUDSS_CONFIG_DOWNCAST_FACTORS: return {&c->downcast_factors, 4};
+    case CUDSS_CONFIG_MEMORY_OPTIMIZATION_SETTING: return {&c->memory_optimization, 4};
+#endif
     default: return {};
   }
 }
@@ -878,13 +940,27 @@ bool in_range(cudssConfigParam_t param, const void* value, Status* why) {
     case CUDSS_CONFIG_IR_N_STEPS: return i >= 0;
     case CUDSS_CONFIG_IR_TOL: return x >= 0;
     case CUDSS_CONFIG_PIVOT_TYPE:
+#ifdef VGPU_CUDSS_API_0_8
       if (i == CUDSS_PIVOT_BUNCH_KAUFMAN) *why = CUDSS_STATUS_NOT_SUPPORTED;
       return i >= CUDSS_PIVOT_AUTO && i < CUDSS_PIVOT_BUNCH_KAUFMAN;
+#else
+      return i >= CUDSS_PIVOT_AUTO && i <= CUDSS_PIVOT_BUNCH_KAUFMAN;
+#endif
     case CUDSS_CONFIG_ND_NLEVELS: return i >= 1;
     case CUDSS_CONFIG_HYBRID_MEMORY_MODE:
     case CUDSS_CONFIG_HYBRID_EXECUTE_MODE: return i == 0 || i == 1;
     case CUDSS_CONFIG_ND_UBFACTOR: return i >= 0 && i <= 100;
     case CUDSS_CONFIG_DEVICE_COUNT: return i >= 1 && i <= 16;
+#ifndef VGPU_CUDSS_API_0_8
+    // Measured on NVIDIA's 1.0.0.35: these are the ranges it accepts.
+    case CUDSS_CONFIG_EMULATION_MANTISSA_BIT_COUNT: return i >= 0;
+    case CUDSS_CONFIG_FORCE_NONSYMMETRIC_MATCHING:
+    case CUDSS_CONFIG_MEMORY_OPTIMIZATION_SETTING: return i == 0 || i == 1;
+    case CUDSS_CONFIG_DOWNCAST_FACTORS: return i >= 0 && i <= 2;
+    case CUDSS_CONFIG_SOLVE_MODE:
+      *why = CUDSS_STATUS_NOT_SUPPORTED;
+      return i >= CUDSS_SOLVE_MODE_NORMAL && i <= CUDSS_SOLVE_MODE_CONJUGATE_TRANSPOSE;
+#endif
     default: return true;
   }
 }
