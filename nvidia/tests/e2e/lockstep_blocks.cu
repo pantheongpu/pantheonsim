@@ -200,26 +200,21 @@ __global__ void forward_chain(volatile unsigned* flag, unsigned* out, unsigned* 
 // ---- 6. a wait that works only on some turns: the shape of Barnes-Hut's SortKernel -----------------
 
 // Cell k waits for the cell above it (k + 1), which another thread handles, often in a block that has not
-// started: `start[k] < 0` means "not yet", and the turns that find nothing write nothing. The loop
-// also stores and changes the address it polls (k), on the turns that find work, so it is not a poll the
-// kernel_polls test of "the same address, no store" can see; the turns that find nothing are one. Each
-// pass ends in a __syncthreads, as the original's does.
-constexpr unsigned kSortLimit = 1u << 16;
-
-__global__ void sort_wait(volatile int* start, int* out, int ncells, unsigned* timeouts) {
+// started: `start[k] < 0` means "not yet", and the turns that find nothing write nothing. The loop also
+// stores and changes the address it polls (k) on the turns that find work, so it is not a poll the
+// "same address, no store" test sees; the turns that find nothing are one. Each pass ends in a
+// __syncthreads, and the loop's bound is read from memory, as the original's is. A run that does not
+// interleave the blocks ends at the simulator's step limit (the script sets VGPU_MAX_STEPS) with an error.
+__global__ void sort_wait(volatile int* start, int* out, int ncells, const int* bottomp) {
+  const int bottom = *bottomp;
   const int dec = blockDim.x * gridDim.x;
   int k = ncells - dec + threadIdx.x + blockIdx.x * blockDim.x;
-  unsigned polls = 0;
-  while (k >= 0) {
+  while (k >= bottom) {
     const int s = start[k];
     if (s >= 0) {
       out[k] = s;
       if (k >= 1) start[k - 1] = s + 1;   // the cell below it can go on
       k -= dec;
-      polls = 0;
-    } else if (++polls >= kSortLimit) {
-      atomicAdd(timeouts, 1u);
-      break;
     }
     __syncthreads();
   }
@@ -411,28 +406,26 @@ int main(int argc, char** argv) {
     const int ncells = static_cast<int>(blocks * threads * rounds);
     int* start = dev<int>(ncells);
     int* out = dev<int>(ncells);
-    unsigned* timeouts = dev<unsigned>(1);
+    int* bottom = dev<int>(1);   // (0: every cell is one)
     std::vector<int> init(ncells, -1);
     init[ncells - 1] = 0;
     CHECK(cudaMemcpy(start, init.data(), init.size() * sizeof(int), cudaMemcpyHostToDevice));
     CHECK(cudaMemset(out, 0xff, ncells * sizeof(int)));
-    sort_wait<<<blocks, threads>>>(start, out, ncells, timeouts);
+    sort_wait<<<blocks, threads>>>(start, out, ncells, bottom);
     CHECK(cudaGetLastError());
     CHECK(cudaDeviceSynchronize());
     std::vector<int> h(ncells);
-    unsigned t = 0;
     CHECK(cudaMemcpy(h.data(), out, h.size() * sizeof(int), cudaMemcpyDeviceToHost));
-    CHECK(cudaMemcpy(&t, timeouts, sizeof t, cudaMemcpyDeviceToHost));
     bool ok = true;
     for (int c = 0; c < ncells; ++c) ok = ok && h[c] == ncells - 1 - c;
-    std::printf("cells waiting for the cell above (%d cells): %s, %u timed-out waits\n", ncells, ok ? "right" : "wrong", t);
-    expect(ok && t == 0, "a wait that stores and moves its address when it finds work");
+    std::printf("cells waiting for the cell above (%d cells): %s\n", ncells, ok ? "right" : "wrong");
+    expect(ok, "a wait that stores and moves its address when it finds work");
     // the decoy runs beside it, and the script checks that only sort_wait went the lockstep way
     int* in = dev<int>(ncells);
     volatile_scan<<<blocks, threads>>>(in, out, ncells);
     CHECK(cudaGetLastError());
     CHECK(cudaDeviceSynchronize());
-    cudaFree(start), cudaFree(out), cudaFree(timeouts), cudaFree(in);
+    cudaFree(start), cudaFree(out), cudaFree(bottom), cudaFree(in);
   }
 
   std::printf(fails ? "FAIL\n" : "PASS\n");

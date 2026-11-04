@@ -57,12 +57,13 @@ ARGS=locks
 run "old behaviour: the patch locks fail (SASS)" "$out.sass" FAIL VGPU_LOCKSTEP=0 VGPU_THREADS=1
 run "old behaviour: the patch locks fail (PTX)"  "$out.ptx"  FAIL VGPU_LOCKSTEP=0 VGPU_THREADS=1
 ARGS=sortwait
-run "SASS, sort-shaped wait"               "$out.sass" PASS
-run "SASS, sort-shaped wait, one thread"   "$out.sass" PASS VGPU_THREADS=1
-run "SASS, sort-shaped wait, three threads" "$out.sass" PASS VGPU_THREADS=3
-run "old behaviour: the sort-shaped wait times out (SASS)" "$out.sass" FAIL VGPU_LOCKSTEP=0 VGPU_THREADS=1
+# (a run that does not interleave the blocks spins until the step limit: kept short)
+run "SASS, sort-shaped wait"               "$out.sass" PASS VGPU_MAX_STEPS=20000000
+run "SASS, sort-shaped wait, one thread"   "$out.sass" PASS VGPU_MAX_STEPS=20000000 VGPU_THREADS=1
+run "SASS, sort-shaped wait, three threads" "$out.sass" PASS VGPU_MAX_STEPS=20000000 VGPU_THREADS=3
+run "old behaviour: the sort-shaped wait hits the step limit (SASS)" "$out.sass" FAIL VGPU_MAX_STEPS=20000000 VGPU_LOCKSTEP=0 VGPU_THREADS=1
 rm -f "$out.log"
-run "SASS, sort-shaped wait, logging the lockstep launches" "$out.sass" PASS VGPU_LOCKSTEP_LOG="$out.log"
+run "SASS, sort-shaped wait, logging the lockstep launches" "$out.sass" PASS VGPU_MAX_STEPS=20000000 VGPU_LOCKSTEP_LOG="$out.log"
 if grep -q 'kernel _Z9sort_wait' "$out.log" 2>/dev/null; then echo "ok: sort_wait runs in lockstep"; else echo "FAIL: sort_wait did not run in lockstep"; fails=1; fi
 if grep -q 'volatile_scan' "$out.log" 2>/dev/null; then echo "FAIL: volatile_scan was taken for a poller"; fails=1; else echo "ok: volatile_scan is not taken for a poller"; fi
 exit "$fails"
