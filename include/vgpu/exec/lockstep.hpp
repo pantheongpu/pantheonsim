@@ -22,7 +22,8 @@
 //
 // A grid of fewer than 16 blocks runs on one host thread with all its resident blocks taking turns
 // from the start, in a fixed order, as a cooperative launch does: the answer of a program like the
-// patch locks is then the same on every run. A larger grid uses the host threads, two blocks to a thread at least, each
+// patch locks is then the same on every run. (The SASS engine lets such a grid use the host threads when
+// its kernel only polls with loads: see `small_grid_spreads` below.) A larger grid uses the host threads, two blocks to a thread at least, each
 // starting with one block, as before, and holding one more block at a time only after no block of the
 // launch, on any thread, has stored or finished for three milliseconds: a chain of look-back flags,
 // where each block waits on the one before it, then runs as it did (the blocks of a real kernel store
