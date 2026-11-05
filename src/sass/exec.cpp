@@ -404,7 +404,11 @@ uint64_t sass_max_steps(uint64_t configured) {
 // clock returned, or from a variable register, or it is read before the loop sets it and the loop
 // does set it (it comes round from the last turn: a counter, an old value). A register the loop only
 // reads, or sets from constants and other fixed registers before it reads it, is fixed.
-bool kernel_polls_loop(const std::vector<const Instr*>& body) {
+constexpr unsigned kPollLoad = 1, kPollAtomic = 2;
+// `kinds`, when given, gets kPollLoad set when the poll is a strong load and kPollAtomic when it is an atomic that returns its old
+// value (a lock being taken): a launch whose waits are loads only may spread over host threads whatever its grid, one that takes locks
+// keeps a small grid on one thread (exec/lockstep.hpp).
+bool kernel_polls_loop(const std::vector<const Instr*>& body, unsigned* kinds = nullptr) {
   enum : uint8_t { Undef, Fixed, Variable };
   uint8_t state[256] = {};
   std::bitset<256> set_in_loop;
@@ -435,6 +439,7 @@ bool kernel_polls_loop(const std::vector<const Instr*>& body) {
     }
   };
   bool polls = false;
+  unsigned found = 0;
   for (const Instr* ins : body) {
     switch (ins->op) {
       case Op::STG: case Op::ST: case Op::RED: case Op::CALL: case Op::UTMASTG: case Op::UTMAREDG:
@@ -446,9 +451,11 @@ bool kernel_polls_loop(const std::vector<const Instr*>& body) {
     bool var_src = false;
     for (const Operand& s : ins->src) touch(s, [&](unsigned r) { var_src = var_src || is_variable(r); });
     bool poll = false;
+    unsigned kind = 0;
     if (ins->op == Op::ATOM || ins->op == Op::ATOMG) {
       if (ins->dst.empty() || (ins->dst.back().kind == Kind::Reg && ins->dst.back().reg == kRZ)) return false;   // no result: a store
       poll = true;
+      kind = kPollAtomic;
     } else if (ins->op == Op::LDG || ins->op == Op::LD) {
       bool strong = false, cta = false;
       for (const std::string& m : ins->mods) {
@@ -456,11 +463,16 @@ bool kernel_polls_loop(const std::vector<const Instr*>& body) {
         cta = cta || m == "CTA";
       }
       poll = strong && !cta;
+      kind = kPollLoad;
     }
-    polls = polls || (poll && !var_src);
+    if (poll && !var_src) {
+      polls = true;
+      found |= kind;
+    }
     const uint8_t now = (generates(*ins) || var_src) ? Variable : Fixed;
     for (const Operand& d : ins->dst) touch(d, [&](unsigned r) { state[r] = now; });
   }
+  if (polls && kinds) *kinds |= found;
   return polls;
 }
 
@@ -488,7 +500,7 @@ bool call_target_is_inert(const Code& code, size_t first_index_of_target) {
   return false;
 }
 
-bool kernel_polls_conditional(const Code& code, size_t first, size_t last) {
+bool kernel_polls_conditional(const Code& code, size_t first, size_t last, unsigned* kinds = nullptr) {
   const size_t n = last - first + 1;   // the closing branch is the last of them
   if (n > 400) return false;
   // What depends on a strong load's value: registers (R0..R254) and predicates (P0..P6), going through the body once.
@@ -541,7 +553,7 @@ bool kernel_polls_conditional(const Code& code, size_t first, size_t last) {
       if (j > last || j < first || budget == 0) return false;   // out of the loop, or out of budget
       --budget;
       const Instr& ins = code.instr(j);
-      if (j == last) return kernel_polls_loop(path);   // the closing branch: the path has gone round
+      if (j == last) return kernel_polls_loop(path, kinds);   // the closing branch: the path has gone round
       const bool skipped = ins.guard != kPT && !ins.guard_uniform && tpred.test(ins.guard);
       switch (ins.op) {
         case Op::BRA: {
@@ -593,19 +605,20 @@ bool kernel_polls_conditional(const Code& code, size_t first, size_t last) {
   return walk(first);
 }
 
-bool kernel_polls(const Module& m, const CubinKernel& k) {
+unsigned kernel_poll_kinds(const Module& m, const CubinKernel& k) {
   {
     std::lock_guard<std::mutex> g(m.polling_mu);
     if (const auto it = m.polling.find(k.name); it != m.polling.end()) return it->second;
   }
   std::vector<std::string> names = reachable(m, k.name);
   names.push_back(k.name);
-  bool found = false;
+  unsigned kinds = 0;
   for (const std::string& f : names) {
     const auto it = m.code_index.find(f == k.name ? k.text_section : ".text." + f);
     if (it == m.code_index.end()) continue;
     const Code& code = m.code[it->second];
-    for (size_t i = 0; i < code.count && !found; ++i) {
+    // (every loop is looked at: one that takes a lock decides what a small grid does, whatever the loops before it wait on)
+    for (size_t i = 0; i < code.count && !(kinds & kPollAtomic); ++i) {
       const Instr& br = code.instr(i);
       if (br.op != Op::BRA || br.src.empty()) continue;
       const int64_t target = br.src.back().imm;
@@ -614,12 +627,12 @@ bool kernel_polls(const Module& m, const CubinKernel& k) {
       if (i - first > 400) continue;
       std::vector<const Instr*> body;
       for (size_t j = first; j <= i; ++j) body.push_back(&code.instr(j));
-      found = kernel_polls_loop(body) || kernel_polls_conditional(code, first, i);
+      if (!kernel_polls_loop(body, &kinds)) kernel_polls_conditional(code, first, i, &kinds);
     }
-    if (found) break;
+    if (kinds & kPollAtomic) break;
   }
   std::lock_guard<std::mutex> g(m.polling_mu);
-  return m.polling.emplace(k.name, found).first->second;
+  return m.polling.emplace(k.name, kinds).first->second;
 }
 
 // A kernel's Module::KernelStatics: the module's (made by the first launch of the kernel), or, for a module that load() did not make,
@@ -1555,12 +1568,16 @@ exec::LaunchStats Runner::run() {
   }
   // Blocks that may wait on one another (vgpu/exec/lockstep.hpp): a kernel with a loop that polls
   // global memory runs the blocks the device holds at once together, taking turns.
-  bool lockstep = false;
+  bool lockstep = false, loads_only = false;
   uint64_t capacity = 0;
   if (!cfg_.cooperative && !clustered_) {
     const exec::LockstepMode mode = exec::lockstep_mode(env_.lockstep);
-    if (mode == exec::LockstepMode::All || (mode == exec::LockstepMode::Auto && cfg_.resident_blocks && kernel_polls(m_, k_))) {
+    const unsigned kinds = mode == exec::LockstepMode::Auto && cfg_.resident_blocks ? kernel_poll_kinds(m_, k_) : 0;
+    if (mode == exec::LockstepMode::All || kinds != 0) {
       lockstep = true;
+      // Waits on loads only (a chain of look-back flags) give the same answer whichever thread runs a block, so a small grid
+      // may use the host threads too; a kernel that takes locks keeps it on one thread, in a fixed order (exec/lockstep.hpp).
+      loads_only = mode == exec::LockstepMode::Auto && !(kinds & kPollAtomic);
       capacity = cfg_.resident_blocks ? cfg_.resident_blocks : units;
     }
   }
@@ -1596,7 +1613,7 @@ exec::LaunchStats Runner::run() {
     }
     for (Block& blk : all) stats_.add(blk.st);
   } else if (lockstep) {
-    const exec::LockstepShape shape = exec::lockstep_shape(units, capacity, threads);
+    const exec::LockstepShape shape = exec::lockstep_shape(units, capacity, threads, /*ranges=*/false, /*small_grid_spreads=*/loads_only);
     exec::lockstep_note(k_.name.c_str(), units, shape);
     std::atomic<uint64_t> beat{0};
     std::atomic<bool> failed{false};

@@ -96,7 +96,7 @@ struct Module {
   // another and a launch runs them together (vgpu/exec/lockstep.hpp). Found the first time a kernel
   // launches, from its code and the functions it calls.
   mutable std::mutex polling_mu;
-  mutable std::map<std::string, bool> polling;
+  mutable std::map<std::string, unsigned> polling;   // 0, or kPollLoad / kPollAtomic (src/sass/exec.cpp)
 
   // What a launch of a kernel finds out about it from the module, the same every time: which constant banks are backed by device
   // memory, where and how big (a bank is named by 5 bits of an instruction), the kernel's own bank 0 template and where its code
