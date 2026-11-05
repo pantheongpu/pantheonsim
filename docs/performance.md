@@ -7229,3 +7229,18 @@ A survey of the 123 real programs of the Phase 0 set (polybench, rodinia, HeCBen
 ### Tests and mutants
 * `test_amd_gcn_tier_same_bits` runs every corpus line both ways (tier on, tier off) on three seeds and 23 flavours of state and compares registers, LDS, memory, counters and the error: `amd/tools/tier-corpus.py` now writes `ds_read2`, `ds_read2st64`, `ds_write2` and `ds_write2st64` (b32 and b64, ten offset pairs each, the data registers apart from and overlapping the address and a high register; the `ds_load_2addr` / `ds_store_2addr` spelling for gfx11 and gfx12) into the six `isa_corpus_tier_*.txt` files (260 lines to each CDNA file, 320 to each RDNA one, appended; the rest of the files unchanged, assembled with llvm-mc 18). New flavours 26 (scattered in-range addresses, lanes sharing an address, half the lanes off, sometimes one lane at the end of the LDS so that its access ends at or just past the last byte) and 27 (lanes 8 bytes apart, every lane on or one run of them) for LDS accesses; flavour 18 (consecutive words, so adjacent lanes' 8-byte values overlap) already made the write order matter.
 * Mutants (rebuilt and run on server3 with `VGPU_TIER_ONLY=ds_`; each fails the test): the write's two offsets swapped (killed, 3105 runs differ); the write's second value stored first (killed, 874); the read's whole-wave path taking its second value from the first offset (2229); the read's partial path with rows 2 and 3 swapped (3719); the write's bound check 4 bytes instead of 8 (114, only flavour 26's lane at the end of the LDS finds it); the read's whole-wave bound check ignoring the second offset (160, `ds_read2st64_b64` only: the offsets that reach past the LDS); the partial path's ignoring the first (210); the st64 unit 4 instead of 8 bytes (11497); the write's second data register taken from the first's low row (5438). Survived: copying the address row before the reads (the first version did; removed as unneeded: every address of a group of four lanes is read before it is stored).
+
+### Round sp25 (lds-measure): the sp23-ds handlers on real programs
+
+The branch was rebased onto `origin/main` d6a98b42 and the four handlers measured on the HeCBench programs hipified for gfx942 (hipcc 7.2, `-O2 -ffp-contract=off`), `amd/mi300x`, 1 thread pinned to one core, server2 (Zen 5, load kept under 8). A = `origin/main` build, W = this branch, A2 = a second copy of A (A/A control), 15 runs each, alternating order. Instruction counters (`VGPU_DISPATCH_STATS`, every launch line, including `lds=`) are byte-identical A against W in radixsort2, sortKV and aop; program output matches (shmembench differs only in its printed GB/s).
+
+Executions of the four forms (the interpreter's count in A, `VGPU_AMD_TIER_STATS=1`; zero in W): radixsort2 (`-float -keysonly -n=65536`) 409,600 `ds_write2_b64` + 102,400 `ds_read2_b64`; sortKV (`65536`) 32,768 `ds_write2_b64`, 8,192 `ds_read2_b64`, 4,096 `ds_read2st64_b64`; aop 99 `ds_write2_b64`; shmembench 8,192 `ds_write2_b64`. The other 24 hipified HeCBench programs have none of the four in their code objects.
+
+| program | A median s | A2 median s | W median s | W / A | A2 / A (noise) | W / A2 |
+| --- | --- | --- | --- | --- | --- | --- |
+| radixsort2 | 3.799 | 3.688 | 3.470 | 0.914 | 0.971 | 0.941 |
+| sortKV (`65536 20`) | 6.175 | 6.054 | 5.679 | 0.920 | 0.980 | 0.938 |
+| aop | 0.884 | 0.875 | 0.884 | 0.999 | 0.990 | 1.010 |
+| shmembench | 3.209 | 3.229 | 3.244 | 1.011 | 1.006 | 1.005 |
+
+radixsort2 and sortKV gain 6 to 9 % (3 % of it inside the A/A spread; 6 % against the better control); aop and shmembench run too few of the instructions to move.
