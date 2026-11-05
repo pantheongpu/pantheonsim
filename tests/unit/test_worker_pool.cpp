@@ -293,6 +293,9 @@ VTEST(the_cost_from_busy_time_is_per_block_and_never_zero) {
 VTEST(a_slow_wake_up_does_not_keep_a_small_launch_on_the_pool) {
   using vgpu::exec::LaunchWidth;
   static int key;   // any stable address names the kernel
+  // (The cap's figure set by hand, to its own default: the cap alone is what this checks. Left to itself the width trial would widen this
+  // kernel for some launches, depending on how long the busy wait below takes on the host, which hosted CI runners make slow and noisy.)
+  ::setenv("VGPU_POOL_MIN_WORK_US", "100", 1);
   const uint64_t kBlocks = 64, kBlockNs = 234;
   unsigned requested = 4;
   std::vector<unsigned> used;
@@ -312,6 +315,7 @@ VTEST(a_slow_wake_up_does_not_keep_a_small_launch_on_the_pool) {
       }
     }
   }
+  ::unsetenv("VGPU_POOL_MIN_WORK_US");
   VCHECK_EQ(used[0], 4u);   // the first launch of a kernel has no cost to go by
   for (size_t i = 1; i < used.size(); ++i) VCHECK_EQ(used[i], 1u);
 }
