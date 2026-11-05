@@ -170,6 +170,9 @@ vgpu shell -y --gpu amd/mi300x --count 8 --rocm 6.2.0 --driver 6.3.6 \
 | `-c`, `--command <cmd>` | Run one command in the machine instead of an interactive shell. |
 | `-y`, `--no-prompt` | Take the defaults for anything not given, without asking. |
 | `--no-isolate` | Skip the namespaces (session tools only). |
+| `--rootfs` | Give the session its own root filesystem instead of the host's: the system read-only from the host, everything else empty and thrown away on exit. Needs user namespaces; where the host refuses them the shell exits `1` rather than start on the host's files. See [machine-simulator.md](machine-simulator.md#a-private-root---rootfs). |
+| `-v`, `--volume`, `--mount HOST:DEST[:ro]` | With `--rootfs`: mount a host file or directory at `DEST` in the session, as `docker run -v` does. Read-write unless `:ro`. Repeatable. `HOST` must exist and `DEST` must be absolute and not under `/proc` or `/sys`, or the shell exits `2` before starting. Without `--rootfs` it is an error. |
+| `--home DIR` | With `--rootfs`: mount the host directory `DIR` as the session's `/root` (its `$HOME`), so it persists between runs. Without it `/root` is empty each time. |
 
 `./run [config.yaml] [-- command]` at the root of the repository starts this shell
 for you (see [machine-simulator.md](machine-simulator.md#start-it-with-run)).
@@ -261,6 +264,7 @@ variable is unset by default.
 | `VGPU_VRAM_MB` | Virtual VRAM size, overriding the profile. | profile |
 | `VGPU_CUDA_VERSION`, `VGPU_DRIVER_VERSION` | CUDA and driver version strings that `nvidia-smi` and NVML report. | this build's |
 | `VGPU_ROCM_VERSION` | ROCm version string that `amd-smi version` reports. | `6.2.0` in `vgpu shell`, else `N/A` |
+| `VGPU_SHELL_NO_NAMESPACES` | `1` makes `vgpu shell --rootfs` behave as on a host that refuses user namespaces (exit `1`, no session). A test hook; nothing else reads it. | unset |
 
 **Memory**
 

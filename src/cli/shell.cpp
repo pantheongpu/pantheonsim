@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "args.hpp"
+#include "shell_rootfs.hpp"
 #include "vgpu/driver_version.hpp"
 #include "vgpu/amd_kfd.hpp"
 #include "vgpu/amd_metrics.hpp"
@@ -85,6 +86,10 @@ struct Config {
   std::string hostname = "vgpu-sim";
   double load = 0.0;
   bool isolate = true;
+  // --rootfs: the session builds its own root (shell_rootfs.hpp); -v and --home add to it.
+  bool rootfs = false;
+  std::vector<vgpu::cli::Volume> volumes;
+  std::string home;
 };
 
 // What each value must look like, checked the same way for a flag and for an
@@ -854,6 +859,22 @@ int cmd_shell(const std::vector<std::string>& args) {
       }
     }
     else if (a == "--no-isolate") c.isolate = false;
+    else if (a == "--rootfs") c.rootfs = true;
+    else if (a == "-v" || a == "--volume" || a == "--mount") {
+      vgpu::cli::Volume v;
+      std::string why;
+      if (!vgpu::cli::parse_volume(next(), &v, &why)) {
+        std::fprintf(stderr, "vgpu shell: %s\n", why.c_str());
+        return 2;
+      }
+      c.volumes.push_back(v);
+    } else if (a == "--home") {
+      std::string why;
+      if (!vgpu::cli::parse_home(next(), &c.home, &why)) {
+        std::fprintf(stderr, "vgpu shell: %s\n", why.c_str());
+        return 2;
+      }
+    }
     else if (a == "-c" || a == "--command") {
       c.command = next();
       c.has_command = true;
@@ -894,6 +915,25 @@ int cmd_shell(const std::vector<std::string>& args) {
       std::fprintf(stderr, "vgpu shell: unknown argument '%s'\n", a.c_str());
       return 2;
     }
+  }
+
+  if (!c.rootfs && (!c.volumes.empty() || !c.home.empty())) {
+    std::fprintf(stderr, "vgpu shell: %s needs --rootfs (without it the session sees the host's files, and there is nothing to add to)\n",
+                 c.volumes.empty() ? "--home" : "-v");
+    return 2;
+  }
+  if (c.rootfs && !c.isolate) {
+    std::fprintf(stderr, "vgpu shell: --rootfs and --no-isolate contradict each other: the private root needs the namespaces\n");
+    return 2;
+  }
+  // The private root is what the user asked for isolation with: where it cannot
+  // be built the session does not start, rather than run on the host's files.
+  if (c.rootfs && stage2_session.empty() && vgpu::cli::namespaces_unavailable()) {
+    std::fprintf(stderr,
+                 "vgpu shell: --rootfs needs user namespaces, and this host does not allow them "
+                 "(on Ubuntu 24.04: kernel.apparmor_restrict_unprivileged_userns=1). Not starting on the host's filesystem; "
+                 "drop --rootfs to run as before.\n");
+    return 1;
   }
 
   // Prompting only makes sense when there is someone to answer. With -c the
@@ -973,10 +1013,24 @@ int cmd_shell(const std::vector<std::string>& args) {
       argv.push_back("-c");
       argv.push_back(c.command);
     }
+    if (c.rootfs) argv.push_back("--rootfs");
+    for (const auto& v : c.volumes) {
+      argv.push_back("-v");
+      argv.push_back(v.host + ":" + v.dest + (v.ro ? ":ro" : ":rw"));
+    }
+    if (!c.home.empty()) {
+      argv.push_back("--home");
+      argv.push_back(c.home);
+    }
     std::vector<char*> cargv;
     for (auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
     cargv.push_back(nullptr);
     ::execvp("unshare", cargv.data());
+    if (c.rootfs) {
+      std::fprintf(stderr, "vgpu shell: --rootfs needs `unshare`, which is not installed. Not starting on the host's filesystem.\n");
+      remove_session_dir(s.dir);
+      return 1;
+    }
     // unshare unavailable: fall through and run without isolation -- and
     // actually without it. This used to print that message and then carry on
     // with c.isolate still set, so the bind mounts below ran in the *host's*
@@ -1114,6 +1168,40 @@ int cmd_shell(const std::vector<std::string>& args) {
     renamed = ::sethostname(c.hostname.c_str(), c.hostname.size()) == 0;
   }
 
+  // The private root. Everything above ran against the host's tree (the
+  // overlays are inherited into the new root); from here the session has its own.
+  std::vector<std::string> rootfs_summary;
+  if (c.rootfs) {
+    vgpu::cli::RootfsResult built;
+    bool ok = isolated;
+    if (!ok) built.error = "the namespace's mounts could not be made private";
+    if (ok) {
+      vgpu::cli::RootfsInput in;
+      in.session_dir = s.dir;
+      in.session_root = s.root;
+      in.volumes = c.volumes;
+      in.home = c.home;
+      in.install_dirs.push_back(shim_dir().substr(0, shim_dir().size() - 5));   // the directory holding shim/ and bin/
+      {
+        const std::string exe = exe_path();
+        in.install_dirs.push_back(exe.substr(0, exe.find_last_of('/')));
+      }
+      ok = vgpu::cli::enter_rootfs(in, &built);
+    }
+    if (!ok) {
+      std::fprintf(stderr, "vgpu shell: --rootfs: %s\n", built.error.c_str());
+      remove_session_dir(s.dir);
+      return 1;
+    }
+    rootfs_summary = built.summary;
+    // The host's home, user and temporary directory are not here.
+    setenv("HOME", "/root", 1);
+    setenv("USER", "root", 1);
+    setenv("LOGNAME", "root", 1);
+    setenv("PWD", "/root", 1);
+    if (const char* t = std::getenv("TMPDIR"); t && ::access(t, W_OK) != 0) unsetenv("TMPDIR");
+  }
+
   setenv("VGPU_TELEMETRY_PATH", s.telemetry.c_str(), 1);
   setenv("VGPU_GPU", c.gpu.c_str(), 1);
   setenv("VGPU_DEVICE_COUNT", std::to_string(c.count).c_str(), 1);
@@ -1184,6 +1272,10 @@ int cmd_shell(const std::vector<std::string>& args) {
                                   : "on (/proc/driver/nvidia and /etc/os-release overlaid)")
                        : renamed ? "partial (hostname set; /proc and /etc left as the host's)"
                                  : "off (session tools only)");
+  if (c.rootfs) {
+    std::printf("    Root     : private (your own tmpfs root; the host's files are not here unless listed)\n");
+    for (const std::string& line : rootfs_summary) std::printf("               %s\n", line.c_str());
+  }
   std::printf("\n  Try: %s | lspci | dmesg | uname -a\n",
               profile.vendor == "amd" ? "rocm-smi | amd-smi | rocm_agent_enumerator"
                                       : "nvidia-smi | rocm-smi | rocm_agent_enumerator");
@@ -1276,7 +1368,10 @@ int cmd_shell(const std::vector<std::string>& args) {
   // tools and system files behind in /tmp.
   // No shell: the path is ours and the prefix check stays, but removing a
   // directory does not need /bin/sh, quoting, or a return value to ignore.
-  if (s.dir.rfind("/tmp/vgpu-session-", 0) == 0) remove_session_dir(s.dir);
+  if (s.dir.rfind("/tmp/vgpu-session-", 0) == 0) {
+    remove_session_dir(s.dir);
+    if (c.rootfs) vgpu::cli::rootfs_release_session_dir(s.dir);
+  }
   if (!c.has_command)
     std::printf("\n  Session ended. Simulated %d x %s.\n", c.count, profile.model.c_str());
   // A shell killed by a signal reports 128+N, as every shell and `vgpu run`

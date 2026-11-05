@@ -1310,7 +1310,7 @@ else()
 endif()
 
 # CLI
-add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/debug.cpp src/cli/test.cpp src/cli/check.cpp src/cli/ncu.cpp
+add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/shell_rootfs.cpp src/cli/run.cpp src/cli/debug.cpp src/cli/test.cpp src/cli/check.cpp src/cli/ncu.cpp
                src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp src/cli/lspci.cpp
                src/cli/config.cpp src/cli/config_cmd.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
@@ -1520,6 +1520,10 @@ vgpu_unit_test(test_launch_env)
 vgpu_unit_test(test_lockstep_yield)
 # How many host threads a lockstep grid takes: a small one of waits on loads spreads, one that takes locks stays on one thread.
 vgpu_unit_test(test_lockstep_shape)
+# The fingerprint of a block's registers (eight chains for long inputs): any one-byte change changes it, at every length.
+vgpu_unit_test(test_lockstep_fold)
+# When a lockstep launch first looks at its blocks (after what the last look cost, per resident block), and that a block standing still is found out.
+vgpu_unit_test(test_lockstep_look)
 vgpu_unit_test(test_sass_lea)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
 vgpu_unit_test(test_simd)
@@ -2533,6 +2537,11 @@ set_tests_properties(smi_cli PROPERTIES DEPENDS vgpu_cli
 add_test(NAME shell_cli COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_shell_cli.sh)
 set_tests_properties(shell_cli PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
+# vgpu shell --rootfs: the session's own root, -v mounts, --home, and the refusal where
+# namespaces are not allowed. The checks that need namespaces are left out on a host without them.
+add_test(NAME shell_rootfs COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_shell_rootfs.sh)
+set_tests_properties(shell_rootfs PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 600)
 add_test(NAME amd_session COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_amd_session.sh)
 set_tests_properties(amd_session PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)

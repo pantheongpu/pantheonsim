@@ -1307,7 +1307,13 @@ TIER_DUAL(h_cmp)
 int h_never(const Op&, Regs&) { return 0; }
 
 // ---- LDS
-enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAdd, kDsSwizzle, kDsPerm };
+enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAdd, kDsSwizzle, kDsPerm, kDsReadN, kDsWriteN };
+// The byte and halfword forms (ds_read_u8/i8/u16/i16, the _d16 and _d16_hi reads, ds_write_b8/b16, ds_write_b8/b16_d16_hi): Op::words is the
+// access in bytes and Op::off1 these bits.
+constexpr int32_t kDsSign = 1;   // a read extends its sign (otherwise zeroes)
+constexpr int32_t kDsD16 = 2;    // a _d16 read: the halfword is the register's low half, or (kDsHi) its high one, the rest zero (CDNA) or kept (kDsKeep: RDNA)
+constexpr int32_t kDsHi = 4;     // ... and the _d16_hi write stores the register's high half
+constexpr int32_t kDsKeep = 8;
 // (Out of line: their 256-byte rows in h_ds's frame cost the LDS handlers' common paths a larger prologue.)
 [[gnu::noinline]] int ds_swizzle_run(const Op& o, Regs& R, uint64_t ex) {
     // ds_swizzle_b32: a lane reads another lane of its group of 32 as the offset's pattern says (a lane that is off gives zero); the data is read
@@ -1572,6 +1578,98 @@ enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAd
   }
 }
 TIER_DUAL(h_ds)
+
+// A byte or a halfword a lane, from the LDS to a register (B bytes; Sign: extended with its sign, else with zeros). `lowmask` and `shift` make
+// the _d16 forms' halfword (kDsD16, kDsHi) of the extended value, `mrg` the bits of the register that are written (all, but for RDNA's d16
+// loads, which keep the other half): the same arithmetic as the interpreter's half_load and write_half_load. Every address was checked.
+template <unsigned B, bool Sign, bool Merge>
+[[gnu::always_inline]] inline void ds_narrow_read(uint32_t* out, const uint32_t* addr, uint32_t x0, const uint8_t* lds, uint64_t ex, unsigned n,
+                                                  uint32_t lowmask, unsigned shift, uint32_t mrg) {
+  const auto one = [&](unsigned l) __attribute__((always_inline)) {
+    uint32_t raw = 0;
+    std::memcpy(&raw, lds + static_cast<uint32_t>(addr[l] + x0), B);   // (the low B bytes: the machine is little-endian)
+    uint32_t v = raw;
+    if constexpr (Sign) v = B == 1 ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw))) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+    v = (v & lowmask) << shift;
+    out[l] = Merge ? (out[l] & ~mrg) | (v & mrg) : v;
+  };
+  if (full(ex, n)) {
+    for (unsigned l = 0; l < n; ++l) one(l);
+  } else {
+    for (uint64_t m = ex; m; m &= m - 1) one(static_cast<unsigned>(__builtin_ctzll(m)));
+  }
+}
+template <unsigned B>
+[[gnu::always_inline]] inline void ds_narrow_write(const uint32_t* in, const uint32_t* addr, uint32_t x0, uint8_t* lds, uint64_t ex, unsigned n, unsigned shift) {
+  const auto one = [&](unsigned l) __attribute__((always_inline)) {
+    const uint32_t v = in[l] >> shift;
+    std::memcpy(lds + static_cast<uint32_t>(addr[l] + x0), &v, B);
+  };
+  if (full(ex, n)) {
+    for (unsigned l = 0; l < n; ++l) one(l);   // (in lane order: lanes that share a halfword end as they do one at a time)
+  } else {
+    for (uint64_t m = ex; m; m &= m - 1) one(static_cast<unsigned>(__builtin_ctzll(m)));
+  }
+}
+[[gnu::always_inline]] inline int h_dsn_body(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  if (o.store && *R.store_gate && ex && R.nwaves > 1) {
+    *R.store_gate = false;
+    *R.soft_yield = true;
+    return 3;
+  }
+  if (!ex) return 1;
+  const uint32_t* const addr = R.vgpr[o.src[0].index];
+  const uint32_t x0 = static_cast<uint32_t>(o.off0);
+  const unsigned bytes = o.words, n = R.lanes;
+  // Every lane must land inside the LDS (an access past it is the interpreter's: nothing has changed when one does not).
+  {
+    const uint64_t size = R.lds_size;
+    unsigned past = 0;
+    if (full(ex, n)) {
+      for (unsigned l = 0; l < n; ++l) past |= static_cast<uint64_t>(static_cast<uint32_t>(addr[l] + x0)) + bytes > size;
+    } else {
+      for (uint64_t m = ex; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+        past |= static_cast<uint64_t>(static_cast<uint32_t>(addr[l] + x0)) + bytes > size;
+      }
+    }
+    if (past) return 0;
+  }
+  const int32_t flags = o.off1;
+  uint8_t* const lds = R.lds;
+  if (o.sub == kDsWriteN) {
+    const uint32_t* const in = R.vgpr[o.src[1].index];
+    const unsigned shift = flags & kDsHi ? 16 : 0;
+    if (bytes == 2) ds_narrow_write<2>(in, addr, x0, lds, ex, n, shift);
+    else ds_narrow_write<1>(in, addr, x0, lds, ex, n, shift);
+    return 1;
+  }
+  uint32_t* const out = R.vgpr[o.dst.index];
+  const bool d16 = flags & kDsD16, sign = flags & kDsSign;
+  const uint32_t lowmask = d16 ? 0xFFFFu : ~0u;
+  const unsigned shift = flags & kDsHi ? 16 : 0;
+  if (flags & kDsKeep) {
+    const uint32_t mrg = flags & kDsHi ? 0xFFFF0000u : 0x0000FFFFu;
+    if (bytes == 1) {
+      if (sign) ds_narrow_read<1, true, true>(out, addr, x0, lds, ex, n, lowmask, shift, mrg);
+      else ds_narrow_read<1, false, true>(out, addr, x0, lds, ex, n, lowmask, shift, mrg);
+    } else {
+      ds_narrow_read<2, false, true>(out, addr, x0, lds, ex, n, lowmask, shift, mrg);
+    }
+    return 1;
+  }
+  if (bytes == 1) {
+    if (sign) ds_narrow_read<1, true, false>(out, addr, x0, lds, ex, n, lowmask, shift, ~0u);
+    else ds_narrow_read<1, false, false>(out, addr, x0, lds, ex, n, lowmask, shift, ~0u);
+  } else if (sign) {
+    ds_narrow_read<2, true, false>(out, addr, x0, lds, ex, n, lowmask, shift, ~0u);
+  } else {
+    ds_narrow_read<2, false, false>(out, addr, x0, lds, ex, n, lowmask, shift, ~0u);
+  }
+  return 1;
+}
+TIER_DUAL(h_dsn)
 
 // A 64-bit comparison (integers, or binary64 with the source modifiers): `kern` is the test for the first n lanes.
 [[gnu::always_inline]] inline int h_cmp64_body(const Op& o, Regs& R) {
@@ -2156,6 +2254,21 @@ const std::unordered_map<std::string_view, Entry>& table() {
     m["ds_permute_b32"] = {Cat::Ds, kDsPerm, 1, 0, nullptr, 1};
     m["ds_swizzle_b32"] = {Cat::Ds, kDsSwizzle, 1, 0, nullptr, 1};
     m["ds_add_u32"] = {Cat::Ds, kDsAdd, 1, 0, nullptr, 1};
+    // The byte and halfword forms: Entry::sub is the size in bytes, Entry::flags the kDs bits (the CDNA spelling keeps nothing of the other half).
+    m["ds_read_u8"] = {Cat::Ds, kDsReadN, 1, 0, nullptr, 1};
+    m["ds_read_i8"] = {Cat::Ds, kDsReadN, 1, kDsSign, nullptr, 1};
+    m["ds_read_u16"] = {Cat::Ds, kDsReadN, 1, 0, nullptr, 2};
+    m["ds_read_i16"] = {Cat::Ds, kDsReadN, 1, kDsSign, nullptr, 2};
+    m["ds_read_u8_d16"] = {Cat::Ds, kDsReadN, 1, kDsD16, nullptr, 1};
+    m["ds_read_u8_d16_hi"] = {Cat::Ds, kDsReadN, 1, kDsD16 | kDsHi, nullptr, 1};
+    m["ds_read_i8_d16"] = {Cat::Ds, kDsReadN, 1, kDsD16 | kDsSign, nullptr, 1};
+    m["ds_read_i8_d16_hi"] = {Cat::Ds, kDsReadN, 1, kDsD16 | kDsSign | kDsHi, nullptr, 1};
+    m["ds_read_u16_d16"] = {Cat::Ds, kDsReadN, 1, kDsD16, nullptr, 2};
+    m["ds_read_u16_d16_hi"] = {Cat::Ds, kDsReadN, 1, kDsD16 | kDsHi, nullptr, 2};
+    m["ds_write_b8"] = {Cat::Ds, kDsWriteN, 1, 0, nullptr, 1};
+    m["ds_write_b16"] = {Cat::Ds, kDsWriteN, 1, 0, nullptr, 2};
+    m["ds_write_b8_d16_hi"] = {Cat::Ds, kDsWriteN, 1, kDsHi, nullptr, 1};
+    m["ds_write_b16_d16_hi"] = {Cat::Ds, kDsWriteN, 1, kDsHi, nullptr, 2};
     m["ds_read2st64_b32"] = {Cat::Ds, kDsRead2, 1, 1, nullptr, 2};
     m["ds_write2st64_b32"] = {Cat::Ds, kDsWrite2, 1, 1, nullptr, 2};
     m["ds_read2_b32"] = {Cat::Ds, kDsRead2, 1, 0, nullptr, 2};
@@ -2848,6 +2961,26 @@ void tier_classify(Inst& in) {
         f.dst.kind = kVgpr, f.dst.index = in.dst[0].index;
         f.src[1].kind = kVgpr, f.src[1].index = in.src[1].index;
         f.run = TIER_RUN(h_ds);
+        f.unit = kUnitLds;
+        return;
+      }
+      if (e.k == kDsReadN || e.k == kDsWriteN) {
+        // (One data register; the offset is the byte offset. The loads' operand must be a plain register of its own.)
+        if (e.k == kDsReadN) {
+          if (in.dst.size() != 1 || in.dst[0].kind != OperandKind::Vgpr || in.dst[0].index >= kVgprs || in.dst[0].width != 1) return;
+          f.dst.kind = kVgpr, f.dst.index = in.dst[0].index;
+        } else {
+          if (in.src.size() < 2 || in.src[1].kind != OperandKind::Vgpr || in.src[1].index >= kVgprs || in.src[1].width != 1) return;
+          f.src[1].kind = kVgpr, f.src[1].index = in.src[1].index;
+          f.store = true;
+        }
+        int32_t bits = static_cast<int32_t>(e.flags);
+        if ((bits & kDsD16) && e.k == kDsReadN && gcn::is_rdna(in.arch)) bits |= kDsKeep;   // (CDNA writes the whole register; RDNA keeps the other half)
+        f.sub = e.k;
+        f.words = static_cast<uint8_t>(e.sub);
+        f.off0 = in.offset;
+        f.off1 = bits;
+        f.run = TIER_RUN(h_dsn);
         f.unit = kUnitLds;
         return;
       }

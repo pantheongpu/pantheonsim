@@ -13919,6 +13919,37 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
     const uint32_t start = static_cast<uint32_t>(r.next() & 0x7FFC);
     for (uint32_t lane = 0; lane < kLanes; ++lane) w.vgpr[in.src[0].index][lane] = start + stride * lane;
   }
+  if (flavour >= 25 && flavour <= 31 && in.enc == gcn::Enc::Ds && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
+    // Flavours 25 to 31 (LDS accesses only): the lane-address shapes of a tiled kernel's shared-memory accesses, with the lanes that are on drawn too.
+    // 25 a stride of 2, 4, 6, 64, 128, 130 or 258 bytes a lane (the bank-conflict-heavy ones among them), all lanes on; 26 every lane the same
+    // address, odd or even, a few lanes off; 27 neighbouring lanes share an address, odd (so a halfword store straddles its neighbour's), all on;
+    // 28 scattered addresses in the LDS, any alignment, half the lanes off; 29 scattered, with one lane (or two) past the end of the LDS;
+    // 30 and 31 scattered, with one lane on the last bytes of the LDS an access can have (30) or one byte past them (31).
+    static const uint32_t kStrides[] = {2, 4, 6, 64, 128, 130, 258};
+    const uint32_t start = static_cast<uint32_t>(r.next() % 0x4000);
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      uint32_t a;
+      switch (flavour) {
+        case 25: a = start + kStrides[seed % 7] * lane; break;
+        case 26: a = start; break;
+        case 27: a = (start | 1) + 2 * (lane / 2); break;
+        default: a = static_cast<uint32_t>(r.next() % 0xFF00); break;   // (28 to 31)
+      }
+      w.vgpr[in.src[0].index][lane] = a;
+    }
+    if (flavour == 26) w.exec &= r.next() | r.next();
+    if (flavour == 28) w.exec &= r.next();
+    if (flavour == 30 || flavour == 31) {   // (one lane at the last bytes the 64 KiB LDS has, or one byte short of them; the offset is part of the address)
+      // (the tier's own idea of the access: its size, and the offset it adds -- the byte and halfword forms' handlers keep the size in `words`)
+      const uint32_t bytes = in.fast.sub >= 8 ? in.fast.words : in.fast.sub <= 1 ? 4u * std::max<uint32_t>(in.fast.words, 1) : 4u;
+      const uint32_t offs = in.fast.run ? static_cast<uint32_t>(in.fast.off0) : static_cast<uint32_t>(in.offset);
+      w.vgpr[in.src[0].index][r.next() % w.lanes] = 0x10000u - bytes + (flavour == 31 ? 1u : 0u) - offs;
+    }
+    if (flavour == 29) {
+      w.vgpr[in.src[0].index][r.next() % w.lanes] = 0xFFFF0u + static_cast<uint32_t>(r.next() & 0xFFFF);   // (well past the 64 KiB)
+      if (seed & 1) w.vgpr[in.src[0].index][r.next() % w.lanes] = 0xFFFFFFFEu;
+    }
+  }
   if (flavour == 12 || flavour == 13) w.loads_in_flight = 3 + static_cast<uint32_t>(r.next() & 7);   // (loads to wait for)
   w.pc = 0;
   Mix64 h;

@@ -598,19 +598,35 @@ inline uint32_t ptx_bank_passes_reference(const uint64_t* addrs, uint64_t mask, 
   return worst;
 }
 
-inline uint32_t ptx_bank_passes(const uint64_t* addrs, uint64_t mask, unsigned lanes, uint64_t span) {
-  if (!fast() || span > 128 || lanes > 64) return ptx_bank_passes_reference(addrs, mask, lanes, span);
-  if (span) {
-    const uint64_t m = mask & detail::lane_mask(lanes);
-    uint32_t out;
-    if (m && detail::bank_passes_progression<false>(addrs, m, static_cast<uint32_t>(span), out)) return out;
-  }
+// The counting that is left once the closed forms have given up: the words of every active lane, by bank.
+inline uint32_t ptx_bank_passes_table(const uint64_t* addrs, uint64_t mask, unsigned lanes, uint64_t span) {
   detail::BankTable t;
   for (unsigned lane = 0; lane < lanes; ++lane) {
     if (!(mask & (uint64_t{1} << lane))) continue;
     for (uint64_t off = 0; off < span; off += 4) t.add((addrs[lane] + off) / 4);
   }
   return t.worst();
+}
+
+// What is counted without any table: the calls the fast counting does not take (the reference) and the warps on a stride (closed
+// forms). False, with `out` untouched, for a warp that is left to the counting of its words. This is the one place the closed forms
+// are called from, which is what lets the compiler put them in line in the interpreter's call, the path of every shared access.
+inline bool ptx_bank_passes_closed(const uint64_t* addrs, uint64_t mask, unsigned lanes, uint64_t span, uint32_t& out) {
+  if (!fast() || span > 128 || lanes > 64) {
+    out = ptx_bank_passes_reference(addrs, mask, lanes, span);
+    return true;
+  }
+  if (span) {
+    const uint64_t m = mask & detail::lane_mask(lanes);
+    if (m && detail::bank_passes_progression<false>(addrs, m, static_cast<uint32_t>(span), out)) return true;
+  }
+  return false;
+}
+
+inline uint32_t ptx_bank_passes(const uint64_t* addrs, uint64_t mask, unsigned lanes, uint64_t span) {
+  uint32_t out;
+  if (ptx_bank_passes_closed(addrs, mask, lanes, span, out)) return out;
+  return ptx_bank_passes_table(addrs, mask, lanes, span);
 }
 
 // The SASS executor's passes, over the words the bytes cover.
@@ -765,6 +781,88 @@ inline uint32_t sass_bank_passes_memo(BankMemo& memo, const uint64_t* addrs, uin
     memo.lookups = memo.hits = 0;
   }
   return passes;
+}
+
+// ptx_bank_passes, with a table in front of the counting, as sass_bank_passes_memo has for the SASS executor (the same key: each
+// active lane's address less the first active lane's word, a lane that does not run taken at that word, and the access width). The
+// interpreter's words are (address + 4k) / 4, so they move with the address by whole words as the SASS ones do. `memo` is the
+// interpreter's own: its entries hold the interpreter's passes, which are not the SASS executor's for the same shape. A shift of
+// every address by a multiple of four bytes is a bijection on the words, taken modulo 2^64 as the addition in the words is, so warps
+// with equal keys have the same passes even where the addresses wrap (no check for the top of the address space, which the SASS
+// executor's table needs because its loop does not wrap alike). The table is
+// bigger than the SASS one (a wavefront kernel, Needleman-Wunsch, asks for a hundred shapes and more: one mask a step), and the mask
+// is in the hash, because a partial warp has only some of its lanes among the eight sampled and shapes that differ in the mask alone
+// are the same sample.
+struct PtxBankMemo {
+  static constexpr unsigned kEntries = 128;
+  struct Entry {
+    uint32_t bytes = 0;    // (zero: empty)
+    uint32_t passes = 0;
+    uint64_t rel[32] = {};
+  };
+  Entry e[kEntries];
+  uint32_t lookups = 0, hits = 0;   // in this window
+  uint32_t skip = 0;                // calls still to go without the table
+};
+
+// The table's part, for a warp the closed forms have given up on (out of line: the closed forms are on the path of every shared
+// access, and a long function there costs the ones on a stride a call).
+[[gnu::noinline]] inline uint32_t ptx_bank_passes_memoized(PtxBankMemo& memo, const uint64_t* addrs, uint64_t m, uint64_t span) {
+  if (memo.skip) {
+    --memo.skip;
+    return ptx_bank_passes_table(addrs, m, 32, span);
+  }
+  const uint32_t width = static_cast<uint32_t>(span);
+  const uint64_t base = addrs[std::countr_zero(m)] & ~3ull;
+  uint64_t held[32];
+  const uint64_t* src = addrs;
+  if (m != 0xFFFFFFFFull) {
+    for (unsigned l = 0; l < 32; ++l) held[l] = (m >> l & 1) ? addrs[l] : base;
+    src = held;
+  }
+  uint32_t h = width * 0x01000193u ^ static_cast<uint32_t>(m) * 0x2545F491u;
+  h ^= static_cast<uint32_t>(src[1] - base) * 0x9E3779B1u ^ static_cast<uint32_t>(src[3] - base) * 0x85EBCA77u ^
+       static_cast<uint32_t>(src[6] - base) * 0xC2B2AE3Du ^ static_cast<uint32_t>(src[10] - base) * 0x27D4EB2Fu ^
+       static_cast<uint32_t>(src[15] - base) * 0x165667B1u ^ static_cast<uint32_t>(src[21] - base) * 0x9E3779B1u ^
+       static_cast<uint32_t>(src[26] - base) * 0x85EBCA77u ^ static_cast<uint32_t>(src[31] - base) * 0xC2B2AE3Du;
+  h ^= h >> 15;
+  PtxBankMemo::Entry& e = memo.e[h % PtxBankMemo::kEntries];
+  const detail::V2 basev = {base, base};
+  detail::V2 diff = {static_cast<uint64_t>(e.bytes ^ width), 0};
+  for (unsigned i = 0; i < 16; ++i) {
+    const detail::V2 a = detail::load_v2(src + 2 * i);
+    diff |= (a - basev) ^ detail::load_v2(e.rel + 2 * i);
+  }
+  const bool hit = (diff[0] | diff[1]) == 0;
+  uint32_t passes;
+  if (hit) {
+    passes = e.passes;
+  } else {
+    passes = ptx_bank_passes_table(addrs, m, 32, span);
+    e.bytes = width;
+    e.passes = passes;
+    for (unsigned l = 0; l < 32; ++l) e.rel[l] = src[l] - base;
+  }
+  memo.hits += hit;
+  if (++memo.lookups == BankMemo::kWindow) {
+    if (memo.hits * 3 < BankMemo::kWindow) memo.skip = BankMemo::kSkip;
+    memo.lookups = memo.hits = 0;
+  }
+  return passes;
+}
+
+// The rest of ptx_bank_passes_closed's false: the table for a warp of 32 lanes (out of line, with the host thread's table made on first
+// use by the caller), the plain counting of its words for anything else.
+[[gnu::noinline]] inline uint32_t ptx_bank_passes_open(PtxBankMemo& memo, const uint64_t* addrs, uint64_t mask, unsigned lanes, uint64_t span) {
+  const uint64_t m = mask & 0xFFFFFFFFull;
+  if (lanes != 32 || span == 0 || !m) return ptx_bank_passes_table(addrs, mask, lanes, span);
+  return ptx_bank_passes_memoized(memo, addrs, m, span);
+}
+
+inline uint32_t ptx_bank_passes_memo(PtxBankMemo& memo, const uint64_t* addrs, uint64_t mask, unsigned lanes, uint64_t span) {
+  uint32_t out;
+  if (ptx_bank_passes_closed(addrs, mask, lanes, span, out)) return out;
+  return ptx_bank_passes_open(memo, addrs, mask, lanes, span);
 }
 
 // ---- bank passes of a warp given as 32-bit offsets
