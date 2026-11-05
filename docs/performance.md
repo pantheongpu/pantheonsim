@@ -7097,6 +7097,60 @@ Survived, equivalent: the run taken in the constant window with the first window
 * A strided gather (ATAX's `A[i][k]`) still goes through the full address pass, which needs its addresses; a progression of any stride other than 0 and the access size would need its address fill when the access falls back, and the gain there is the 8 stores of a kernel that is about 115 instructions.
 * The PTX engine and the AMD engine are untouched.
 
+## Round sp19 (PTX): a warp's global load or store goes to memory as it stands, and the lockstep fingerprint folds eight words at a time (branch `sp19-ptx`, merged with `origin/main` dad11eee)
+
+The question: the PTX interpreter is about 2.2x slower than the SASS tier on the same program; what in `exec_ld` / `exec_st` and in the lockstep launch costs the most that can go without a change of any result, counter or error text? Measured on server3 (Zen 4), one thread, `VGPU_SASS=0`, `nvidia/rtx3060`, programs from the `tools/bench/real` corpora, Release, GCC 13.3, each side built here (A = `origin/main` dad11eee, B = A + this branch), `perf stat -e instructions:u,cycles:u`, pinned to cpu 13.
+
+### What changed (commit aa14743f, rebased by merge)
+1. `exec_ld` / `exec_st`: for a full warp of one value each (`n == 1`, 32 active lanes, power-of-two width, aligned) the addresses already in `at` go to `MemoryManager` as they are (`load_broadcast` when every lane names one address, `load_batch` otherwise; `store_strided` when the lanes are on a constant stride, `store_batch` otherwise) and the values come back into the register's row without a copy. Anything the memory manager declines has touched nothing and takes the old path, so counters, errors and memory are those of the lane loop. `VGPU_FASTPATH=0` keeps the lane loop as the reference.
+2. `lockstep_fold` (the fingerprint of a block's registers, taken by the SASS, PTX and AMD lockstep launches to tell a waiting block from a computing one): input of 64 bytes or more is folded by eight independent chains of the old step; only equality of two fingerprints is looked at.
+
+### Results (A/B alternating, 15 pairs, three fresh copies of each side's library, A/A control with the same script)
+Outputs: `real.py` with `VGPU_SASS=0`, stdout and stderr of one run per side hashed with the timing lines dropped, **identical** for SYRK, SYR2K, ATAX, GEMVER, 3MM, 2DCONV, lud, needle, hotspot, radixsort2 (PASS), sortKV (PASS); `rc` 0 on both sides. Instruction counts are deterministic, so their rows are exact; cycles were taken at load 1.5 to 2.8 (the first run, at load 13 to 25, gave the same instruction rows and cycles rows that moved with the load, which is why the cycles rows below are from the second run).
+
+| program | instructions B/A | cycles B/A (load < 3) | cycles A/A |
+|---|---:|---:|---:|
+| polybench SYRK | 0.6701 | 0.6597 | 0.9957 |
+| polybench ATAX | 0.6762 | 0.6750 | 0.9957 |
+| hecbench radixsort2 | 0.9257 | 0.6558 | 1.0012 |
+| hecbench sortKV | 0.9057 | 0.6043 | 1.0014 |
+| polybench GEMVER | 0.7874 | (load 13 to 25) | |
+| polybench 3MM | 0.7264 | (load 13 to 25) | |
+| rodinia hotspot | 0.9907 | (load 13 to 25) 1.005 | |
+| polybench 2DCONV | 1.0005 | (load 13 to 25) 0.990 | |
+A/A instructions are exactly 1.0000 in every row. One uncontrolled wall-clock run per side at load 2 (`real_ptx.py`): SYRK 18.69 s to 12.47 s, SYR2K 32.45 to 20.94, ATAX 3.56 to 2.46, 3MM 5.49 to 4.34, GEMVER 1.51 to 1.23, radixsort2 13.72 to 9.29, sortKV 1.56 to 1.05; hotspot, 2DCONV, needle and lud within 3%.
+The sort programs' instruction count falls 7 to 9% but their cycles 34 to 40%: the saving is the fold's dependent multiply chain (seven cycles a word, one word at a time), which is few instructions and many cycles.
+
+### Mutations (built and run on server3; `tests/unit/test_lockstep_fold.cpp`, `tests/unit/test_ptx_paths.cpp`)
+Killed: fold lane 7 left out of the combination, chain 0 left out, tail dropped, last word of a 64-byte block skipped; load broadcast taken for every warp, or the batch reversed/one lane short; store stride one element too large, constant-stride test ignored, values taken from the neighbouring lane, partial mask taken (killed by the new `guarded` rows), last lane left out of the stride test (killed by the new `last lane off the stride` rows).
+Survived, judged equivalent for the property each guards: the running value ignored when the eight chains are seeded (it still enters in the final combination); the `>> 29` of the chain step removed and `n >= 64` changed to `n > 64` (a different fold, still one in which any change of any byte changes the value); the alignment test ahead of the batch (`load_batch` / `store_batch` decline a misaligned warp themselves); `fast_enabled_` dropped from the new condition (the reference run of the test then takes the same path); a partial mask taken by the load (the register write is masked and inactive lanes' valid addresses are only read). Survived and not testable here: the lane number carried into the error when `store_batch` runs out of host memory for a chunk (`failed_at`).
+
+### Round sp19 (PTX), part 2: the interpreter's bank passes are remembered by warp shape (`PtxBankMemo`)
+`ptx_bank_passes` had no table in the PTX path and cost 14.8% of lud's and 6.5% of hotspot's cycles. The SASS tier has had `BankMemo` since sp21; the interpreter now has the same idea in `include/vgpu/exec/mem_counters.hpp` (`ptx_bank_passes_closed` / `ptx_bank_passes_open` / `ptx_bank_passes_memoized`, `PtxBankMemo`), wired in `Interpreter::count_addresses`.
+* Key: as `sass_bank_passes_memo` (each active lane's address less the first active lane's word, an idle lane taken at that word, and the access width `span`), so a hit returns exactly what the counting of the words returns. The interpreter's words are `(address + 4k) / 4`, so a move of every address by whole words moves the banks together and keeps equal words equal. There is no check for the top of the address space (the SASS table has one): the move is a bijection of the words modulo 2^64, which is also how the interpreter's addition wraps, and `tests/unit/test_bank_memo.cpp` has a wrap test (a warp moved to wrap around, against the definition).
+* Different from the SASS table on purpose: 128 entries of 64-bit keys (a wavefront kernel asks for a hundred shapes and more) and the mask in the hash (a partial warp has only some lanes among the eight sampled). The closed forms (a warp on a stride) run first, in `ptx_bank_passes_closed`, which is the only caller of the progression code, so the compiler keeps it in line in `count_addresses`; the table, and the host thread's table made on first use, are out of line. A first version with the table's call inside `ptx_bank_passes_memo` cost needle 2.3% to 3.3% more instructions (the progression was no longer in line, and all of needle's 3.1 M shared accesses are on a stride: the table is never reached); the split brought it to 1.0008. `VGPU_FASTCOUNT=0` still takes the reference.
+* Same bits: the outputs and the per-launch counter file (`VGPU_COUNTERS_FILE`, pid dropped) of branch-without-memo and branch-with-memo hash **identical** for lud, hotspot, needle, backprop, SYRK, ATAX, GEMVER, 3MM, gaussian, pathfinder and radixsort2 (`VGPU_SASS=0`, `nvidia/rtx3060`; srad_v2 launched nothing in this setup and says nothing).
+* Numbers (server3, Zen 4, cpu 13, `VGPU_SASS=0`, one thread, A = `62fb7253` (sp19-ptx before the memo), B = A + the memo, alternating 15 pairs, three fresh library copies a side, Mann-Whitney p):
+
+| program | instructions B/A | cycles B/A (load < 5) | A/A (instructions, cycles) |
+|---|---:|---:|---:|
+| rodinia lud | 0.8255 | 0.8794 | 1.0000, 1.0001 |
+| rodinia hotspot | 0.9617 | 0.9775 | 1.0000, 0.9967 |
+| rodinia needle | 1.0008 | 1.0076 (p 0.036) | 1.0000, 0.9987 |
+| rodinia backprop | 0.9938 | 1.0131 | |
+| polybench SYRK | 1.0003 | 0.9771 (p 0.021) | |
+| polybench ATAX | 1.0003 | 0.9916 (p 0.049) | |
+Only lud and hotspot move by more than 2%; the other rows are inside the noise band (A/A cycles move up to 0.7%; backprop's cycles row is above 2% on a 0.6% instruction change and is not claimed). Backprop's PTX shared accesses are on strides too: the SASS gain of sp21 (0.927) came from the SASS tier's other shapes.
+
+### Round sp19 (PTX), part 3: the shared lockstep fold on SASS and AMD launches
+`lockstep_fold` is shared by the SASS, PTX and AMD lockstep launches. A = `origin/main` dad11eee, B = `sp19-ptx` with the memo (the memo is PTX only, so SASS and AMD differences are the fold's). Same method (alternating 15 pairs, 3 copies a side, cpu 13, load < 4).
+* SASS tier (default engine, `nvidia/rtx3060`), outputs and counter file **identical**: gaussian, needle, lud, hotspot, pathfinder, backprop, atomicCost, SYRK, ATAX. Instructions B/A 1.0000 in every row; cycles B/A gaussian 0.9939, needle 1.0068, atomicCost 1.0076, lud 1.0052, hotspot 1.0132, A/A gaussian 1.0056, needle 0.9979. All inside 2%: **no change claimed** in either direction (hotspot's 1.3% is the largest, p 0.001, below the claim threshold).
+* AMD (`bench_amd` gfx942 built earlier, `amd/mi300x`, no hipcc on server3 so the cached binary of tools/bench-amd, full size): dispatch-stats files and stdout identical for lds, ldsx, mem, divergent, wave, atomics, mfma (quick size); cycles B/A lds 1.0048, ldsx 0.9966, mem 0.9962, divergent 0.9955, A/A lds 0.9981, mem 1.0019: **no change**. Not measured: rocBLAS or any real HIP program (none on server3), RDNA (`amd/rx6800`: outputs and counters identical for lds, mem, divergent, wave, timing not taken).
+* The fold's saving on the PTX sort programs (radixsort2, sortKV, above) comes from kernels that wait on barriers for long; the SASS and AMD programs here do not spend their time there.
+
+### Mutation checks of the memo (`tests/unit/test_bank_memo.cpp`, built and run on server3)
+Killed: the 32-lane condition removed, the table taken for every warp, the back-off branch removed or its length zero, idle lanes taken at their own address or the substitution off, the width left out of the stored entry, the answer not stored, the last lane left out of the stored key, the key stored without the base, the base not word-aligned, always-hit, the back-off threshold inverted, the window not reset after a long run of hits, the width or the mask out of the hash, hits not counted.
+Survived, equivalent: the span == 0 guard and the empty-mask guard of `ptx_bank_passes_open` (both give the table's own answer of 1; the empty mask is unreachable from `count_addresses`), the width in the entry comparison (the width is in the hash by an xor, so two widths of one shape can never share a slot, and shapes in a slot differ in the key anyway), the slot index perturbed (a different slot is the same behaviour: the key is compared whole).
 ## Round sp24: AMD LDS byte and halfword accesses in the tier (branch `sp24-lds`, base origin/main dad11eee)
 
 **Profile first** (server3, Zen 4, one host thread, `perf record -e cycles:u`, simulated MI300X, rocBLAS 5.1 / ROCm 7.1 `rocblas_gemm_ex` on a 1024 x 1024 x 1024 problem, the library's own gfx942 kernels; the driver is a 60-line program that `dlopen`s `libamdhip64` and `librocblas`, checks four columns of C against a host sum, and is not in the repo). f16 in, f32 compute (HHS): `Machine::lds_access` 29.8%, `Machine::lds_fast` 15.5%, `write_half_load` 4.7%, `set_word` 3.5%, `OpName::operator==` 2.3%: 56% of the cycles in the LDS access path of the interpreter, not the 36 to 40% of the earlier profile. `VGPU_AMD_TIER_STATS=1` says which instructions the tier handed to the interpreter (n = 512): `ds_read_u16` 65,536 and `ds_read_u16_d16_hi` 65,536 of the 216,064 (61%; the rest `v_mfma_*` 32,768, `buffer_load_dword` 32,768, ...) for HHS and bf16 (BBS), `ds_write_b16` 32,768 of 134,144 (HHH, f16 compute). The kernels read the two halves of a packed operand with two halfword reads a lane. The 32-bit and wider forms (`ds_read_b32/b64/b128`, `ds_write_*`, `read2`/`write2`) were already tier handlers (sp5, sp12); the byte and halfword forms never were, and each went through `lds_access` (name facts, a `Half` built, the ladder) and `lds_fast` (a `switch` on the op in every lane) or, for the `_d16` forms, the ladder's half path with `write_half_load` and `set_word` in every lane. There is no bank-conflict model in the AMD engine (the LDS instruction counts are the only counters), so nothing of that kind changes.
@@ -7244,3 +7298,43 @@ Executions of the four forms (the interpreter's count in A, `VGPU_AMD_TIER_STATS
 | shmembench | 3.209 | 3.229 | 3.244 | 1.011 | 1.006 | 1.005 |
 
 radixsort2 and sortKV gain 6 to 9 % (3 % of it inside the A/A spread; 6 % against the better control); aop and shmembench run too few of the instructions to move.
+
+## Round sp24 (fingerprint): the first lockstep look of a launch waits for what the last look cost (branch `sp24-fingerprint`, base `sp19-ptx` bccfa63b)
+
+The question: the lockstep fingerprint (the fold of every warp's registers and the shared memory of each resident block, `lockstep_worker` in `include/vgpu/exec/lockstep.hpp`) was still 25.6% of radixsort2's cycles after the eight-chain fold. Is it the fold, building the input, or the call, and what is the cheapest change that moves no result?
+
+### Diagnosis (server3, Zen 4, cpu 13, `VGPU_SASS=0`, `nvidia/rtx3060`, one thread, RelWithDebInfo with `-fno-omit-frame-pointer`)
+* `perf record -F 3000 --call-graph dwarf` puts 33.0% of radixsort2's cycles in the `{lambda(unsigned int)#1}` of `launch_grid` (the host thread's body, with `run_lockstep` and `lockstep_worker` inlined into it); `perf annotate -l` on that symbol puts **88.7% of its samples on two source lines, `lockstep.hpp:131` and `:132`, the fold's chain step** (`s[i] = (s[i] ^ w[i]) * kPrime; s[i] ^= s[i] >> 29`), 1.3% on the loop line (`:130`) and 2.6% on the `memcpy` of the words. So it is the fold itself, not the input and not the call.
+* Why a rule that bounds a look to a thirteenth of the time (`check_every = max(250 us, 12 x the look's cost)`) still gave a third: counters in `lockstep_worker` (temporary, not shipped) on radixsort2 `-float -keysonly -n=65536`: **400 launches, 400 looks, exactly one look per launch, 0 of them finding the blocks standing still, 0 naps**; 3.5 s of the 9.7 s the workers ran was those 400 looks (about 8.7 ms for 9 resident blocks, a PTX register file being every virtual register of the kernel). A launch of the sort lasts about 24 ms, its blocks store nothing for the first 250 us, so the one look every launch makes is the first one, at 250 us, before the 12x rule has measured anything. sortKV: 32 launches, 32 looks, 0.45 s of 0.97 s. SYRK and the other non-lockstep programs: 0 launches in `lockstep_worker`.
+* A look decides one thing, whether the thread sleeps between passes (`same >= 2`). It reaches no register, memory, counter or error text; when it is made is already a function of the wall clock (250 us, then 12x its own cost).
+
+### What changed
+`lockstep_worker` keeps, per call site (so per engine: PTX, SASS, AMD), what the last look cost **for each resident block** (`look_ns_per_block`, a relaxed atomic, 0 until a look has been made). A launch that has not looked yet takes its first look after `max(250 us, 12 x that x the blocks resident now)`, at most 500 ms (`lockstep_first_look`); once it has looked, `check_every` is what it was (`max(250 us, 12 x the look just made)`). Both helpers are `[[gnu::noinline]]`: see the layout paragraph below. Nothing is skipped or approximated: when a look is made it folds exactly what it folded.
+Same bits by construction: the only input changed is the time of a look, which already was a wall-clock quantity, and the look's only effect is the nap. A block that stands still is still found out (a look 250 us in when nothing has been learned, the third equal look sleeping, as before). The cost of the change is that a launch with big register files and a block really waiting for another is found waiting later (by up to 12 looks' worth, at most 0.5 s for the first look), which spins a host thread, with `yield()` between passes, a little longer before it naps.
+Not done, and why: folding only the live registers (the kernel's virtual register count is known, liveness is not; a dead register that differs would make two looks differ, a different fingerprint rule) and dirty-tracking (a spin loop writes registers every turn, so a dirty block would be folded every time; the blocks that are not dirty are not the cost here).
+
+### Results (A = `origin/sp19-ptx` bccfa63b, B = A + this branch, both Release/LTO built on server3, `perf stat -e instructions:u,cycles:u`, alternating 15 pairs, 3 fresh library copies a side, cpu 13, `VGPU_SASS=0`)
+Outputs and `VGPU_COUNTERS_FILE` (pid dropped), timing lines dropped, **identical** for radixsort2, sortKV, SYRK, ATAX, GEMVER, lud, hotspot, 3MM at one thread, for radixsort2 at `VGPU_THREADS=4`, and for radixsort2, sortKV, lud on the SASS engine (`VGPU_SASS=1`). sortKV at `VGPU_THREADS=4` has per-launch counters that differ between two runs of A itself (the look-back kernel's counters depend on how the threads interleave): outputs identical, counters not comparable there.
+
+| program | instructions B/A | cycles B/A (p) | cycles A/A (p) | load |
+|---|---:|---:|---:|---|
+| hecbench radixsort2 | 0.7187 | **0.7655** (0.000) | 0.9998 (0.98) | 1.1 to 1.2 |
+| hecbench sortKV | 0.6444 | **0.6888** (0.000) | 1.0019 (0.12) | 1.1 |
+| polybench SYRK | 1.0000 | 1.0146 (0.76) | 0.9845 (0.37) | 1 to 7 |
+| polybench ATAX | 1.0000 | 0.9862 (0.012) | | 4.5 to 7 |
+| polybench GEMVER | 1.0000 | 1.0078 (0.76) | | 4.5 to 8.7 |
+| rodinia lud | 1.0000 | 1.0007 (0.89) | 0.9993 (0.85) | 2 to 9 |
+| rodinia hotspot | 1.0000 | 0.9904 (0.08) | | 2.4 |
+SASS engine, 10 pairs: radixsort2 0.9878 (p 0.000), sortKV 0.9912 (p 0.008), instructions 0.994 and 0.996: under the 2% claim line, **no change claimed**. The AMD engine shares the template and was not run (no hipcc on server3).
+Only radixsort2 and sortKV move. Wall clock of the RelWithDebInfo runs, one each: radixsort2 10.9 s before, 9.5 s with the counters still in.
+
+### The layout trap (why the helpers are out of line)
+The first build of this change (the logic inline in the worker) gave ATAX 1.0414 and SYRK 1.0401 on cycles with instructions exactly 1.0000, in programs that never enter `lockstep_worker`. A control build `B0` with the new logic switched off (`per_block = 0`, so the worker behaves as in A) gave 1.0385 and 1.0564: **the loss is code layout, not the change** (the hot `exec_ld` / `load_batch` / `run_warp_until_yield` all moved by one to two points, `perf report` of ATAX). Moving the two small computations into `[[gnu::noinline]]` functions gave a layout with ATAX 0.9797 and SYRK 0.9922 (table above, the full run: 0.9862 and 1.0146 inside the noise). A change to any function inlined into `launch_grid` can do this, and the sign is luck: before reading a flat row of this kind as a cost of the change, build a control with the change neutralised.
+
+### Mutations (`tests/unit/test_lockstep_look.cpp`, built and run on server3; `test_lockstep_fold` and `test_lockstep_yield` pass unchanged)
+Killed: the cost not remembered (stored as 0), the blocks resident not multiplied in, the cost stored per launch rather than per block, the ratio 1 or 24 for the first look, the ceiling removed or lowered to 100 ms, the 250 us floor removed, the ratio after a look 1 or 100, the looks switched off, the nap switched off, `blocks + 1`.
+Survived, equivalent: `looked` never set. Every pass then recomputes `check_every` from the last look's cost per block, which is what the look set, except that the ceiling applies and that it follows the number of resident blocks as the window grows; kept as written so that the behaviour after a look is exactly what it was.
+Timing tests (looks 24 ms, 48 ms, 500 ms in with margins of 12 to 60 ms): a machine that stalls a thread for longer than that can fail them; they ran 5 times clean on server3 at load 2 to 8.
+
+### Not verified
+No AMD run. No kernel with a real cross-block wait at more than one thread on PTX (the programs here are single-thread); the one-core test_lockstep_yield stays green. Zen 5 and Intel not measured. The layout effect above is understood only by the control, not by a disassembly comparison.

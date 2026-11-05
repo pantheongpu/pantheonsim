@@ -584,3 +584,223 @@ VTEST(every_nibble_of_a_partial_mask_selects_its_own_lanes_in_the_key) {
         }
       }
 }
+
+// ---- the interpreter's table (ptx_bank_passes_memo)
+
+namespace {
+
+// The interpreter's definition: the words (address + 4k) / 4 for 4k < span of every active lane, the most distinct in any bank.
+uint32_t ptx_def(const uint64_t* a, uint64_t mask, uint64_t span) {
+  std::vector<uint64_t> words[32];
+  for (unsigned l = 0; l < 32; ++l) {
+    if (!(mask >> l & 1)) continue;
+    for (uint64_t off = 0; off < span; off += 4) words[((a[l] + off) / 4) % 32].push_back((a[l] + off) / 4);
+  }
+  size_t worst = 1;
+  for (auto& v : words) {
+    std::sort(v.begin(), v.end());
+    worst = std::max<size_t>(worst, static_cast<size_t>(std::unique(v.begin(), v.end()) - v.begin()));
+  }
+  return static_cast<uint32_t>(worst);
+}
+
+}  // namespace
+
+VTEST(ptx_shapes_are_counted_as_the_definition_counts_them) {
+  Rng r(20261104);
+  mc::PtxBankMemo memo;
+  const uint32_t spans[] = {1, 2, 4, 4, 4, 4, 8, 8, 12, 16, 16, 24, 32, 64, 128};
+  std::vector<Shape> pool;
+  for (int i = 0; i < 400; ++i) pool.push_back(make_shape(r, static_cast<unsigned>(r.below(7))));
+  for (int i = 0; i < 300000; ++i) {
+    const Shape& sh = pool[r.below(r.below(8) == 0 ? pool.size() : 40)];
+    const uint64_t span = spans[r.below(15)];
+    uint64_t mask = 0xFFFFFFFFull;
+    switch (r.below(6)) {
+      case 0: mask = (r.next() | r.next()) & 0xFFFFFFFFull; break;
+      case 1: mask = r.next() & 0xFFFFFFFFull; break;
+      case 2: mask = 0xFFFFull << r.below(16); break;
+      case 3: mask = 1ull << r.below(32); break;
+      default: break;
+    }
+    if (!mask) mask = 1;
+    uint64_t base;
+    switch (r.below(8)) {
+      case 0: base = r.below(1 << 14); break;
+      case 1: base = r.below(1 << 12) * 4 + (r.below(4) == 0 ? r.below(4) : 0); break;
+      case 2: base = (uint64_t{r.below(16)} << 24) + r.below(1 << 20) * 4; break;
+      case 3: base = (uint64_t{1} << 62) - 600 + r.below(1200); break;   // the edge of what the table takes
+      case 4: base = (uint64_t{1} << 32) + r.below(4096) * 4; break;
+      default: base = r.below(1 << 16) * 4; break;
+    }
+    uint64_t a[32];
+    for (unsigned l = 0; l < 32; ++l) a[l] = (mask >> l & 1) ? base + sh.off[l] : 0;
+    if (r.below(5) == 0)
+      for (unsigned l = 0; l < 32; ++l)
+        if (!(mask >> l & 1)) a[l] = r.next();
+    if (r.below(7) == 0) a[r.below(32)] += 4 * (1 + r.below(70)) + (r.below(3) == 0 ? 1 : 0);
+    VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, mask, 32, span), ptx_def(a, mask, span));
+  }
+}
+
+VTEST(ptx_table_hits_misses_and_does_not_confuse_widths_or_lanes) {
+  mc::PtxBankMemo memo;
+  uint64_t a[32];
+  for (unsigned l = 0; l < 32; ++l) a[l] = 4096 + 4 * (l / 2) * 33 + (l & 1) * 128;   // not on a stride
+  const uint32_t want4 = ptx_def(a, 0xFFFFFFFFull, 4);
+  for (int i = 0; i < 3; ++i) VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull, 32, 4), want4);
+  // The same addresses at another width must not take the width-4 entry.
+  VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull, 32, 16), ptx_def(a, 0xFFFFFFFFull, 16));
+  VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull, 32, 4), want4);
+  // Moved by a whole number of words: same shape, answered from the table, same value.
+  uint64_t b[32];
+  for (unsigned l = 0; l < 32; ++l) b[l] = a[l] + 4 * 77;
+  VCHECK_EQ(mc::ptx_bank_passes_memo(memo, b, 0xFFFFFFFFull, 32, 4), ptx_def(b, 0xFFFFFFFFull, 4));
+  // One lane moved onto another word of its bank, then one lane absent: neither may hit.
+  b[9] += 128;
+  VCHECK_EQ(mc::ptx_bank_passes_memo(memo, b, 0xFFFFFFFFull, 32, 4), ptx_def(b, 0xFFFFFFFFull, 4));
+  for (unsigned l = 0; l < 32; ++l) VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull & ~(1ull << l), 32, 4),
+                                              ptx_def(a, 0xFFFFFFFFull & ~(1ull << l), 4));
+  // Another lane count, a zero span and an empty mask take the plain function.
+  VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFull, 16, 4), mc::ptx_bank_passes(a, 0xFFFFull, 16, 4));
+  VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull, 32, 0), mc::ptx_bank_passes(a, 0xFFFFFFFFull, 32, 0));
+  VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0, 32, 4), mc::ptx_bank_passes(a, 0, 32, 4));
+  // A warp near the top of the address space is counted, not remembered: the wrap must give the plain function's answer.
+  for (unsigned l = 0; l < 32; ++l) b[l] = (uint64_t{1} << 63) + 4096 + 4 * (l / 2) * 33 + (l & 1) * 128;
+  for (int i = 0; i < 3; ++i) VCHECK_EQ(mc::ptx_bank_passes_memo(memo, b, 0xFFFFFFFFull, 32, 4), ptx_def(b, 0xFFFFFFFFull, 4));
+}
+
+VTEST(ptx_table_backs_off_after_misses_and_comes_back) {
+  mc::PtxBankMemo memo;
+  Rng r(77);
+  uint64_t a[32];
+  // Shapes that never repeat: the table backs off (skip set), answers stay right throughout.
+  bool saw_skip = false;
+  for (int i = 0; i < 2000; ++i) {
+    for (unsigned l = 0; l < 32; ++l) a[l] = 4 * r.below(100000);
+    VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull, 32, 4), ptx_def(a, 0xFFFFFFFFull, 4));
+    saw_skip |= memo.skip != 0;
+  }
+  VCHECK(saw_skip);
+  // A repeating shape: after the back-off runs out, hits resume.
+  for (unsigned l = 0; l < 32; ++l) a[l] = 4096 + 4 * (l / 2) * 33 + (l & 1) * 128;
+  for (int i = 0; i < 4000; ++i) VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull, 32, 4), ptx_def(a, 0xFFFFFFFFull, 4));
+  VCHECK(memo.skip == 0);   // (a table that hits does not back off)
+}
+
+VTEST(ptx_warp_at_the_top_of_the_address_space_is_not_taken_for_its_shape_in_low_memory) {
+  // The words of an access that runs off the top of the address space wrap to the bottom of it: the same offsets in low
+  // memory are another shape, so a warp that is remembered low must not answer for it (nor the other way round).
+  mc::PtxBankMemo memo;
+  Rng r(4242);
+  for (int round = 0; round < 300; ++round) {
+    const uint64_t span = (round % 4 == 0) ? 16 : (round % 4 == 1) ? 8 : 4;
+    uint64_t lo[32], hi[32];
+    for (unsigned l = 0; l < 32; ++l) {
+      const uint64_t off = 4 * ((l * 37 + r.below(3)) % 29) + (l & 1) * 128;
+      lo[l] = 4096 + off;
+    }
+    // The same offsets moved so that the lanes with the larger ones run past the top and wrap (their differences, mod 2^64, are
+    // those of the low warp): a table that took the move for a plain shift would answer with the low warp's passes.
+    const uint64_t move = ~uint64_t{0} - 4096 - 4 * r.below(120);
+    for (unsigned l = 0; l < 32; ++l) hi[l] = lo[l] + move;
+    for (int rep = 0; rep < 3; ++rep) {
+      VCHECK_EQ(mc::ptx_bank_passes_memo(memo, lo, 0xFFFFFFFFull, 32, span), ptx_def(lo, 0xFFFFFFFFull, span));
+      VCHECK_EQ(mc::ptx_bank_passes_memo(memo, hi, 0xFFFFFFFFull, 32, span), ptx_def(hi, 0xFFFFFFFFull, span));
+    }
+    for (unsigned l = 0; l < 32; ++l) hi[l] = l < 16 ? lo[l] + 4096 : ~uint64_t{0} - 4 * (31 - l);   // half low, half at the top
+    VCHECK_EQ(mc::ptx_bank_passes_memo(memo, hi, 0xFFFFFFFFull, 32, span), ptx_def(hi, 0xFFFFFFFFull, span));
+  }
+}
+
+VTEST(ptx_table_is_left_alone_where_the_closed_forms_count_and_where_the_plain_function_takes_the_call) {
+  mc::PtxBankMemo memo;
+  uint64_t a[32];
+  for (unsigned l = 0; l < 32; ++l) a[l] = 8192 + 4 * l;   // on a stride: counted by the closed form, never looked up
+  for (int i = 0; i < 100; ++i) VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull, 32, 4), 1u);
+  VCHECK(memo.lookups == 0 && memo.hits == 0 && memo.skip == 0);
+  // A span over 128 bytes is the plain function's (its reference counting), a lane count other than 32 too, and the lanes past
+  // `lanes` are not counted whatever the mask says.
+  for (unsigned l = 0; l < 32; ++l) a[l] = 4096 + 4 * (l / 2) * 33 + (l & 1) * 128;
+  for (uint64_t span : {132ull, 192ull, 256ull})
+    VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull, 32, span), mc::ptx_bank_passes(a, 0xFFFFFFFFull, 32, span));
+  for (uint64_t span : {132ull, 192ull, 256ull})
+    VCHECK_EQ(mc::ptx_bank_passes(a, 0xFFFFFFFFull, 32, span), ptx_def(a, 0xFFFFFFFFull, span));
+  VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull, 16, 4), mc::ptx_bank_passes(a, 0xFFFFFFFFull, 16, 4));
+  VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull, 16, 4), ptx_def(a, 0xFFFFull, 4));
+  VCHECK(memo.lookups == 0);
+  // The closed forms alone: false (nothing written) for the warp that needs the table, true with the plain function's answer for
+  // the calls the table does not take and for a warp on a stride.
+  uint32_t out = 77;
+  VCHECK(!mc::ptx_bank_passes_closed(a, 0xFFFFFFFFull, 32, 4, out) && out == 77);
+  VCHECK(mc::ptx_bank_passes_closed(a, 0xFFFFFFFFull, 32, 132, out) && out == mc::ptx_bank_passes(a, 0xFFFFFFFFull, 32, 132));
+  VCHECK(!mc::ptx_bank_passes_closed(a, 0xFFFFFFFFull, 16, 4, out));   // (the table is for 32 lanes; ..._open counts these itself)
+  VCHECK_EQ(mc::ptx_bank_passes_open(memo, a, 0xFFFFFFFFull, 16, 4), ptx_def(a, 0xFFFFull, 4));
+  VCHECK(!mc::ptx_bank_passes_closed(a, 0, 32, 4, out));
+  VCHECK_EQ(mc::ptx_bank_passes_open(memo, a, 0, 32, 4), 1u);
+  VCHECK_EQ(mc::ptx_bank_passes_open(memo, a, 0xFFFFFFFFull, 32, 0), mc::ptx_bank_passes(a, 0xFFFFFFFFull, 32, 0));
+  for (unsigned l = 0; l < 32; ++l) a[l] = 8192 + 4 * l;
+  VCHECK(mc::ptx_bank_passes_closed(a, 0xFFFFFFFFull, 32, 4, out) && out == 1);
+}
+
+VTEST(ptx_table_answers_a_warp_whatever_the_idle_lanes_hold_and_tells_widths_apart) {
+  mc::PtxBankMemo memo;
+  Rng r(99);
+  uint64_t a[32];
+  for (unsigned l = 0; l < 32; ++l) a[l] = 4096 + 4 * (l / 2) * 33 + (l & 1) * 128;
+  const uint64_t mask = 0x0F0FF0F1ull;
+  VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, mask, 32, 4), ptx_def(a, mask, 4));
+  const uint32_t before = memo.hits;
+  for (int i = 0; i < 20; ++i) {
+    for (unsigned l = 0; l < 32; ++l)
+      if (!(mask >> l & 1)) a[l] = r.next();
+    VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, mask, 32, 4), ptx_def(a, mask, 4));
+  }
+  VCHECK(memo.hits - before == 20);   // (all hits: what the idle lanes hold is not in the key)
+  // The same warp at two widths, back and forth: each width keeps its own entry (the width is in the place the key hashes to).
+  mc::PtxBankMemo two;
+  for (unsigned l = 0; l < 32; ++l) a[l] = 4096 + 4 * (l / 2) * 33 + (l & 1) * 128;
+  for (int i = 0; i < 30; ++i) {   // (60 lookups: inside one window, which is what hits counts)
+    VCHECK_EQ(mc::ptx_bank_passes_memo(two, a, 0xFFFFFFFFull, 32, 4), ptx_def(a, 0xFFFFFFFFull, 4));
+    VCHECK_EQ(mc::ptx_bank_passes_memo(two, a, 0xFFFFFFFFull, 32, 8), ptx_def(a, 0xFFFFFFFFull, 8));
+  }
+  VCHECK(two.hits == 58);
+  // Two masks that differ in a lane the key does not sample (lane 2): each keeps its own entry (the mask is in the hash), so a loop
+  // that alternates them hits on all but the first two.
+  mc::PtxBankMemo masks;
+  for (int i = 0; i < 30; ++i) {
+    VCHECK_EQ(mc::ptx_bank_passes_memo(masks, a, 0xFFFFFFFFull, 32, 4), ptx_def(a, 0xFFFFFFFFull, 4));
+    VCHECK_EQ(mc::ptx_bank_passes_memo(masks, a, 0xFFFFFFFBull, 32, 4), ptx_def(a, 0xFFFFFFFBull, 4));
+  }
+  VCHECK(masks.hits == 58);
+}
+
+VTEST(ptx_table_backs_off_again_after_a_long_run_of_hits) {
+  // The window of lookups starts afresh each time it fills: a long run of hits does not bank credit against a later run of misses.
+  mc::PtxBankMemo memo;
+  Rng r(5);
+  uint64_t a[32];
+  for (unsigned l = 0; l < 32; ++l) a[l] = 4096 + 4 * (l / 2) * 33 + (l & 1) * 128;
+  for (int i = 0; i < 3000; ++i) VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull, 32, 4), ptx_def(a, 0xFFFFFFFFull, 4));
+  VCHECK(memo.skip == 0);
+  bool saw_skip = false;
+  for (int i = 0; i < 400; ++i) {
+    for (unsigned l = 0; l < 32; ++l) a[l] = 4 * r.below(100000);
+    VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull, 32, 4), ptx_def(a, 0xFFFFFFFFull, 4));
+    saw_skip |= memo.skip != 0;
+  }
+  VCHECK(saw_skip);
+}
+
+VTEST(ptx_table_keeps_the_widths_of_one_warp_apart_in_a_crowded_table) {
+  // Many shapes, each asked at two widths in a row: some pairs fall in one slot, where only the width in the key keeps them apart.
+  mc::PtxBankMemo memo;
+  Rng r(808);
+  for (int i = 0; i < 3000; ++i) {
+    uint64_t a[32];
+    for (unsigned l = 0; l < 32; ++l) a[l] = 4096 + 4 * r.below(40);
+    VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull, 32, 4), ptx_def(a, 0xFFFFFFFFull, 4));
+    VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull, 32, 16), ptx_def(a, 0xFFFFFFFFull, 16));
+    VCHECK_EQ(mc::ptx_bank_passes_memo(memo, a, 0xFFFFFFFFull, 32, 4), ptx_def(a, 0xFFFFFFFFull, 4));
+  }
+}

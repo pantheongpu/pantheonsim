@@ -80,7 +80,7 @@ Outcome run(const std::string& body, uint32_t blocks, uint32_t threads, uint32_t
   auto it = parsed.find(body);
   if (it == parsed.end()) it = parsed.emplace(body, ptx::parse(kernel(body))).first;
   const uint64_t total = uint64_t{blocks} * threads;
-  const uint64_t pout = mem.alloc(total * 4 + 64), pflag = mem.alloc(64);
+  const uint64_t pout = mem.alloc(total * 4 + 20480), pflag = mem.alloc(64);   // (the tail past the words is a 16 KiB array for global_words_body)
   LaunchConfig cfg;
   cfg.grid = {blocks, 1, 1};
   cfg.block = {threads, 1, 1};
@@ -284,6 +284,61 @@ $LW:
 )";
 }
 
+// A warp's global loads and stores of one value each, over a 16 KiB array (at pout + 1024) that the kernel fills first: the lane's address
+// is START + lane * STRIDE bytes into it (STRIDE 0: every lane reads one address; a stride equal to the size: consecutive; any other: a column
+// of a row-major array; negative: descending; `gather`: no constant stride), eight accesses per lane 64 bytes apart. A load sums what it read
+// into out[tid]; a store writes a value per lane and access and then every lane sums the whole array, so an access that went to the wrong
+// place or not at all shows in out. `fix` edits the address (a lane off its alignment).
+std::string global_words_body(bool store, const char* ty, int stride, int start, const char* fix, bool gather = false, bool guarded = false) {
+  std::string b = R"(    add.u64 %rd5, %rd1, 1024;
+    mov.u32 %r10, 0;
+$FILL:
+    mad.lo.u32 %r11, %r10, 32, %r1;
+    mul.wide.u32 %rd6, %r11, 4;
+    add.u64 %rd7, %rd5, %rd6;
+    mad.lo.u32 %r12, %r11, 2654435761, 12345;
+    st.global.u32 [%rd7], %r12;
+    add.u32 %r10, %r10, 1;
+    setp.lt.u32 %p1, %r10, 128;
+    @%p1 bra $FILL;
+)";
+  if (gather)
+    b += "    mul.lo.u32 %r16, %r1, %r1;\n    shl.b32 %r16, %r16, 2;\n    and.b32 %r16, %r16, 4088;\n    mul.wide.u32 %rd6, %r16, 1;\n";
+  else
+    b += "    mul.wide.s32 %rd6, %r1, " + std::to_string(stride) + ";\n";
+  b += "    add.s64 %rd7, %rd5, %rd6;\n    add.s64 %rd7, %rd7, " + std::to_string(start) + ";\n";
+  b += std::string(fix) + "    mov.u32 %r14, 0;\n    mov.u32 %r10, 0;\n";
+  // `guarded`: only the first 13 lanes of the warp make the access, but every lane's address is a good one (a full warp's addresses with
+  // part of the warp predicated off must not reach memory for the lanes that are off).
+  if (guarded) b += "    setp.lt.u32 %p3, %r1, 13;\n";
+  b += "$ACC:\n";
+  const std::string g = guarded ? "@%p3 " : "";
+  const std::string t = ty;
+  if (store) {
+    b += "    mad.lo.u32 %r12, %r2, 7, %r10;\n    " + g + "st.global." + t + " [%rd7], %r12;\n";
+  } else if (t == "u64") {
+    b += "    " + g + "ld.global.u64 %rd6, [%rd7];\n    cvt.u32.u64 %r13, %rd6;\n    mad.lo.u32 %r14, %r14, 31, %r13;\n";
+  } else {
+    b += "    " + g + "ld.global." + t + " %r13, [%rd7];\n    mad.lo.u32 %r14, %r14, 31, %r13;\n";
+  }
+  b += "    add.s64 %rd7, %rd7, 64;\n    add.u32 %r10, %r10, 1;\n    setp.lt.u32 %p1, %r10, 8;\n    @%p1 bra $ACC;\n";
+  if (store)
+    b += R"(    mov.u32 %r14, 0;
+    mov.u32 %r10, 0;
+$SUM:
+    mad.lo.u32 %r11, %r10, 32, %r1;
+    mul.wide.u32 %rd6, %r11, 4;
+    add.u64 %rd6, %rd5, %rd6;
+    ld.global.u32 %r13, [%rd6];
+    mad.lo.u32 %r14, %r14, 31, %r13;
+    add.u32 %r10, %r10, 1;
+    setp.lt.u32 %p1, %r10, 128;
+    @%p1 bra $SUM;
+)";
+  b += "    st.global.u32 [%rd4], %r14;\n";
+  return b;
+}
+
 }  // namespace
 
 VTEST(collatz_walks_of_different_lengths_match_one_instruction_at_a_time) {
@@ -352,6 +407,36 @@ VTEST(a_warp_of_local_words_matches_the_lane_loop) {
     same("local every lane misaligned", local_words_body(per_lane, all_misaligned), 1, threads, 0);
   }
   same("local per lane, blocks", local_words_body(per_lane, none), 3, 96, 0);
+}
+
+VTEST(a_warp_of_global_words_matches_the_lane_loop) {
+  const char* none = "";
+  const char* misaligned = "    setp.eq.u32 %p2, %r1, 17;\n    @%p2 add.u64 %rd7, %rd7, 2;\n";
+  struct Size { const char* ty; int bytes; };
+  for (const Size sz : {Size{"u8", 1}, Size{"u16", 2}, Size{"u32", 4}, Size{"u64", 8}}) {
+    for (const bool store : {false, true}) {
+      for (uint32_t threads : {32u, 20u}) {
+        const std::string what = std::string(store ? "global store " : "global load ") + sz.ty;
+        for (const int stride : {0, sz.bytes, 8, 128, 136, -128, 256}) {
+          const int start = stride < 0 ? 4096 : 256;
+          same((what + " stride " + std::to_string(stride)).c_str(), global_words_body(store, sz.ty, stride, start, none), 1, threads, 0);
+        }
+        // Not on one stride, a lane off its alignment, a stride of 12 (off the width of a u64), and lanes that run past the array (the same error).
+        same((what + " gather").c_str(), global_words_body(store, sz.ty, 0, 0, none, true), 1, threads, 0);
+        same((what + " misaligned lane").c_str(), global_words_body(store, sz.ty, 128, 256, misaligned), 1, threads, 0);
+        same((what + " stride 12").c_str(), global_words_body(store, sz.ty, 12, 256, none), 1, threads, 0);
+        // On one stride but for the last lane (the stride test must look at every lane), and the same with lane 1 off the stride.
+        const char* last_off = "    setp.eq.u32 %p2, %r1, 31;\n    @%p2 add.u64 %rd7, %rd7, 8;\n";
+        const char* second_off = "    setp.eq.u32 %p2, %r1, 1;\n    @%p2 add.u64 %rd7, %rd7, 8;\n";
+        same((what + " last lane off the stride").c_str(), global_words_body(store, sz.ty, 128, 256, last_off), 1, threads, 0);
+        same((what + " lane 1 off the stride").c_str(), global_words_body(store, sz.ty, 128, 256, second_off), 1, threads, 0);
+        same((what + " guarded, consecutive").c_str(), global_words_body(store, sz.ty, sz.bytes, 256, none, false, true), 1, threads, 0);
+        same((what + " guarded, strided").c_str(), global_words_body(store, sz.ty, 128, 256, none, false, true), 1, threads, 0);
+        same((what + " guarded, one address").c_str(), global_words_body(store, sz.ty, 0, 256, none, false, true), 1, threads, 0);
+        same((what + " past the array").c_str(), global_words_body(store, sz.ty, 1024, 256, none), 1, threads, 0);
+      }
+    }
+  }
 }
 
 VTEST_MAIN
