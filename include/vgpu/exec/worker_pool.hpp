@@ -97,6 +97,24 @@ uint64_t unit_cost_from_busy(uint64_t units, uint64_t busy_ns);
 // time as before. Exposed for tests, which stand in for the pool.
 void note_busy_ns(uint64_t ns);
 
+// A launch the default cap keeps on one thread may still pay on the pool: 100 us of work per thread is sized for a pool that has gone
+// cold (a futex wake each), and a pool that stays hot hands a launch over in about 10 us (PolyBench JACOBI1D: 20,000 launches of 48 us,
+// 2.0x on 4 threads at 12 us of work per thread, 1.0x at 100). So a kernel whose blocks are cheap gets the wider width on trial and
+// keeps it only while the launches are faster than one thread would have been:
+//   * `hold` launches to go on the conservative width (after a trial that did not pay),
+//   * the trial counts `n` launches and keeps the best ratio `best` of the launch's wall time to what one thread would take (permille),
+//     skipping the first of a trial, which wakes cold workers; after kTrialLaunches the verdict is made.
+// A verdict that does not pay holds the kernel off for `backoff` launches and doubles `backoff` (to kTrialBackoffMax); one that pays
+// keeps the wide width, and resets `backoff`. Threads change nothing a launch computes: only time moves.
+struct PoolTrial {
+  uint32_t hold = 0, backoff = 256, n = 0, best = ~0u;
+};
+inline constexpr uint32_t kTrialLaunches = 8, kTrialBackoffMin = 256, kTrialBackoffMax = 65536, kTrialPaysBelowPermille = 700;
+// Whether this launch may use the wide width; spends one launch of a hold.
+bool pool_trial_allows(PoolTrial& t);
+// The launch that was on trial took `wall_ns`; one thread would have taken `solo_ns`.
+void pool_trial_note(PoolTrial& t, uint64_t wall_ns, uint64_t solo_ns);
+
 // Per-kernel use of the two above, for an engine's grid launch. Construct it
 // after the thread count is known and before the blocks run; it lowers
 // `threads` by the cap and, when it ends, records what the launch cost. `key`
@@ -115,6 +133,8 @@ class LaunchWidth {
   uint64_t units_;
   unsigned used_;
   uint64_t begin_ns_;   // 0: not timed
+  uint64_t solo_ns_ = 0;   // what one thread would take, when this launch is on trial
+  bool trial_ = false;
 };
 
 }  // namespace vgpu::exec

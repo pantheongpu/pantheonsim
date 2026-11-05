@@ -12,6 +12,7 @@
 #include <cfenv>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -304,7 +305,10 @@ VTEST(a_slow_wake_up_does_not_keep_a_small_launch_on_the_pool) {
         std::this_thread::sleep_for(std::chrono::microseconds(300));   // the wake-up and the join
         for (unsigned t = 0; t < threads; ++t) vgpu::exec::note_busy_ns(kBlocks * kBlockNs / threads);
       } else {
-        std::this_thread::sleep_for(std::chrono::microseconds(15));
+        // (a busy wait: sleep_for rounds 15 us up to a timer tick, and a 60 us launch of 64 blocks is one the trial may widen)
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(15);
+        while (std::chrono::steady_clock::now() < until) {
+        }
       }
     }
   }
@@ -323,6 +327,86 @@ VTEST(heavy_blocks_keep_their_threads) {
     VCHECK_EQ(threads, 8u);
     for (unsigned t = 0; t < threads; ++t) vgpu::exec::note_busy_ns(kBlocks * kBlockNs / threads);
   }
+}
+
+// ---- the wide-width trial of a small launch (PoolTrial) -------------------------------------------------
+
+VTEST(a_trial_that_pays_keeps_the_wide_width_and_one_that_does_not_holds_the_kernel_off) {
+  using namespace vgpu::exec;
+  PoolTrial t;
+  VCHECK(pool_trial_allows(t));
+  // A kernel of 48 us on one thread, 20 us on the pool once it is hot (the first launch of a trial wakes cold workers: 400 us).
+  for (uint32_t i = 0; i < kTrialLaunches; ++i) pool_trial_note(t, i == 0 ? 400'000 : 20'000, 48'000);
+  VCHECK_EQ(t.hold, 0u);                    // it pays: no hold
+  VCHECK_EQ(t.n, 0u);                       // and a fresh trial window
+  VCHECK_EQ(t.backoff, kTrialBackoffMin);
+  VCHECK(pool_trial_allows(t));
+  // The same kernel where the pool never beats one thread (a slow hand-off: 60 us for 48 us of work).
+  for (uint32_t i = 0; i < kTrialLaunches; ++i) pool_trial_note(t, 60'000, 48'000);
+  VCHECK_EQ(t.hold, kTrialBackoffMin);
+  VCHECK_EQ(t.backoff, 2 * kTrialBackoffMin);
+  for (uint32_t i = 0; i < kTrialBackoffMin; ++i) VCHECK(!pool_trial_allows(t));   // held off for exactly `hold` launches
+  VCHECK(pool_trial_allows(t));
+  // A second loss doubles the hold again, up to the cap.
+  for (uint32_t round = 0; round < 12; ++round) {
+    for (uint32_t i = 0; i < kTrialLaunches; ++i) pool_trial_note(t, 60'000, 48'000);
+    t.hold = 0;
+  }
+  VCHECK_EQ(t.backoff, kTrialBackoffMax);
+  // A win after losses resets the backoff.
+  for (uint32_t i = 0; i < kTrialLaunches; ++i) pool_trial_note(t, i == 0 ? 400'000 : 20'000, 48'000);
+  VCHECK_EQ(t.backoff, kTrialBackoffMin);
+  // An unknown cost judges nothing.
+  PoolTrial u;
+  for (uint32_t i = 0; i < 3 * kTrialLaunches; ++i) pool_trial_note(u, 1, 0);
+  VCHECK_EQ(u.n, 0u);
+  VCHECK_EQ(u.hold, 0u);
+}
+
+// A kernel whose blocks cost 3 us (16 of them: 48 us a launch) is kept to one thread by 100 us of work per thread, and goes wide on
+// trial; whether it stays there depends on the pool beating one thread.
+VTEST(a_cheap_kernel_goes_wide_on_trial_and_stays_only_if_the_pool_pays) {
+  using vgpu::exec::LaunchWidth;
+  ::unsetenv("VGPU_POOL_MIN_WORK_US");
+  const uint64_t kBlocks = 16, kBlockNs = 3000;
+  // (a busy wait: sleep_for rounds a few microseconds up to a timer tick)
+  const auto spin_us = [](int us) {
+    const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+    while (std::chrono::steady_clock::now() < until) {
+    }
+  };
+  const auto launches = [&](int* key, int count, int pool_us) {
+    std::vector<unsigned> used;
+    for (int launch = 0; launch < count; ++launch) {
+      unsigned threads = 4;
+      LaunchWidth width(key, kBlocks, threads);
+      used.push_back(threads);
+      if (threads > 1) {
+        spin_us(pool_us);
+        for (unsigned t = 0; t < threads; ++t) vgpu::exec::note_busy_ns(kBlocks * kBlockNs / threads);
+      } else {
+        spin_us(48);
+      }
+    }
+    return used;
+  };
+  static int pays, loses;
+  // The pool does it in 15 us: wide from the second launch (the first has no cost to go by) to the end.
+  const std::vector<unsigned> a = launches(&pays, 40, 15);
+  VCHECK_EQ(a[0], 4u);
+  for (size_t i = 1; i < a.size(); ++i) VCHECK_EQ(a[i], 4u);
+  // The pool takes 400 us: the trial (kTrialLaunches launches) is wide, and then the kernel is held to one thread.
+  const std::vector<unsigned> b = launches(&loses, 40, 400);
+  unsigned wide = 0;
+  for (size_t i = 1; i < b.size(); ++i) wide += b[i] > 1;
+  VCHECK_EQ(wide, vgpu::exec::kTrialLaunches);   // (the first launch was before the cost was known, and not a trial)
+  for (size_t i = vgpu::exec::kTrialLaunches + 1; i < b.size(); ++i) VCHECK_EQ(b[i], 1u);
+  // A figure set by hand is the old fixed rule: no trial.
+  ::setenv("VGPU_POOL_MIN_WORK_US", "100", 1);
+  static int fixed;
+  const std::vector<unsigned> c = launches(&fixed, 12, 15);
+  for (size_t i = 1; i < c.size(); ++i) VCHECK_EQ(c[i], 1u);
+  ::unsetenv("VGPU_POOL_MIN_WORK_US");
 }
 
 VTEST_MAIN
