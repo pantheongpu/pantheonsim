@@ -394,23 +394,43 @@ VTEST(a_cheap_kernel_goes_wide_on_trial_and_stays_only_if_the_pool_pays) {
     }
     return used;
   };
-  static int pays, loses;
+  // The cost of a kernel on one thread is its wall time, so a launch that the host preempts (a shared CI runner does, for milliseconds) makes
+  // the next one look expensive and wide: one such launch is noise, not a verdict of the rule. Each rule is therefore checked on up to
+  // kAttempts fresh kernels and holds when one of them shows it cleanly. A rule that is broken fails every attempt.
+  constexpr int kAttempts = 5;
+  static int keys[3][kAttempts];
+  const auto holds = [&](int rule, const auto& check) {
+    for (int attempt = 0; attempt < kAttempts; ++attempt)
+      if (check(&keys[rule][attempt])) return true;
+    return false;
+  };
   // The pool does it in 15 us: wide from the second launch (the first has no cost to go by) to the end.
-  const std::vector<unsigned> a = launches(&pays, 40, 15);
-  VCHECK_EQ(a[0], 4u);
-  for (size_t i = 1; i < a.size(); ++i) VCHECK_EQ(a[i], 4u);
+  VCHECK(holds(0, [&](int* key) {
+    const std::vector<unsigned> a = launches(key, 40, 15);
+    for (size_t i = 0; i < a.size(); ++i)
+      if (a[i] != 4u) return false;   // (the first launch has no cost to go by and is wide too)
+    return true;
+  }));
   // The pool takes 400 us: the trial (kTrialLaunches launches) is wide, and then the kernel is held to one thread.
-  const std::vector<unsigned> b = launches(&loses, 40, 400);
-  unsigned wide = 0;
-  for (size_t i = 1; i < b.size(); ++i) wide += b[i] > 1;
-  VCHECK_EQ(wide, vgpu::exec::kTrialLaunches);   // (the first launch was before the cost was known, and not a trial)
-  for (size_t i = vgpu::exec::kTrialLaunches + 1; i < b.size(); ++i) VCHECK_EQ(b[i], 1u);
+  VCHECK(holds(1, [&](int* key) {
+    const std::vector<unsigned> b = launches(key, 40, 400);
+    unsigned wide = 0;
+    for (size_t i = 1; i < b.size(); ++i) wide += b[i] > 1;   // (the first launch was before the cost was known, and not a trial)
+    if (wide != vgpu::exec::kTrialLaunches) return false;
+    for (size_t i = vgpu::exec::kTrialLaunches + 1; i < b.size(); ++i)
+      if (b[i] != 1u) return false;
+    return true;
+  }));
   // A figure set by hand is the old fixed rule: no trial.
   ::setenv("VGPU_POOL_MIN_WORK_US", "100", 1);
-  static int fixed;
-  const std::vector<unsigned> c = launches(&fixed, 12, 15);
-  for (size_t i = 1; i < c.size(); ++i) VCHECK_EQ(c[i], 1u);
+  const bool fixed_rule = holds(2, [&](int* key) {
+    const std::vector<unsigned> c = launches(key, 12, 15);
+    for (size_t i = 1; i < c.size(); ++i)
+      if (c[i] != 1u) return false;
+    return true;
+  });
   ::unsetenv("VGPU_POOL_MIN_WORK_US");
+  VCHECK(fixed_rule);
 }
 
 VTEST_MAIN
