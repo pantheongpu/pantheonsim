@@ -3,6 +3,7 @@
 // random operands over wide and narrow exponent ranges and a set of adversarial ones (zeros of both signs, subnormals, infinities and
 // NaNs, the largest finite values, powers of two, cancelling pairs, one huge term among tiny ones, accumulators at, above and below the
 // products' size, and operands with arbitrary 32-bit patterns). The speed-up must change no result bit.
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -95,6 +96,7 @@ struct Totals {
   long elements = 0, mismatches = 0;
   long k512 = 0, k512_taken = 0;   // calls the 512-bit float-product kernel was held to the 256-bit one on, and how many it took
   long k512_edge = 0;              // ... and calls repeated with the operands at the end of a mapped page, rows padded with infinities
+  long frag = 0, frag_taken = 0;   // m16n8 calls through the HMMA kernel (simd::Kernels::hmma), and those the fragment form of the 512-bit kernel took
 };
 
 #ifdef VGPU_TC86_AVX2
@@ -177,6 +179,95 @@ void edge_512(bool took, unsigned chunk, unsigned M, unsigned N, unsigned K, int
 }
 #endif
 
+// The HMMA kernel (simd::Kernels::hmma with the sm_86 sum, kind bit 4): the operands as the registers of an m16n8k16 / m16n8k8 instruction hold them
+// (PTX ISA 9.7.16: a register is 32 words, lane 4g + t, two halves a word; A register 2c + h is row g + 8h, columns 8c + 2t, 2t + 1 ...), the
+// answer as the frozen form gives it (a NaN as 0x7fffffff). The layout is spelled out here again, by elements, so that a mistake in the kernel's
+// register arithmetic is not shared with the oracle.
+struct Frag {
+  std::vector<uint32_t> a, b, c;   // A: K/4 registers, B: K/8, C: 4
+  std::vector<float> A, B;         // the operands the registers hold, row-major (A 16 x K, B K x 8)
+};
+Frag pack_frag(int fmt, unsigned K, const std::vector<float>& A, const std::vector<float>& B, const std::vector<float>& C) {
+  Frag fr;
+  fr.a.assign(size_t{K / 4} * 32, 0);
+  fr.b.assign(size_t{K / 8} * 32, 0);
+  fr.c.assign(4 * 32, 0);
+  fr.A.assign(16 * size_t{K}, 0.0f);
+  fr.B.assign(size_t{K} * 8, 0.0f);
+  const auto half = [&](float x) -> uint16_t { return fmt == 0 ? vgpu::simd::f32_to_f16_bits(x) : static_cast<uint16_t>(bits(x) >> 16); };
+  const auto back = [&](uint16_t h) -> float { return fmt == 0 ? f16_to_f32(h) : f(static_cast<uint32_t>(h) << 16); };
+  const auto put = [](std::vector<uint32_t>& regs, unsigned reg, unsigned lane, unsigned which, uint16_t h) {
+    uint32_t& w = regs[size_t{reg} * 32 + lane];
+    w = which ? (w & 0x0000ffffu) | (static_cast<uint32_t>(h) << 16) : (w & 0xffff0000u) | h;
+  };
+  for (unsigned row = 0; row < 16; ++row)
+    for (unsigned col = 0; col < K; ++col) {
+      const unsigned g = row % 8, t = (col % 8) / 2, reg = 2 * (col / 8) + row / 8;
+      const uint16_t h = half(A[row * K + col]);
+      put(fr.a, reg, 4 * g + t, col & 1, h);
+      fr.A[row * K + col] = back(h);
+    }
+  for (unsigned k = 0; k < K; ++k)
+    for (unsigned col = 0; col < 8; ++col) {
+      const unsigned g = col, t = (k % 8) / 2, reg = k / 8;
+      const uint16_t h = half(B[k * 8 + col]);
+      put(fr.b, reg, 4 * g + t, k & 1, h);
+      fr.B[k * 8 + col] = back(h);
+    }
+  for (unsigned row = 0; row < 16; ++row)
+    for (unsigned col = 0; col < 8; ++col) fr.c[size_t{2 * (row / 8) + (col & 1)} * 32 + 4 * (row % 8) + col / 2] = bits(C[row * 8 + col]);
+  return fr;
+}
+
+void check_frag(int round, const Shape& sh, int fmt, int mode, const std::vector<float>& A, const std::vector<float>& B, const std::vector<float>& C, Totals& tot) {
+  const int emin = fmt == 0 ? now::kEminF16 : now::kEminWide;
+  const unsigned K = sh.K;
+  for (int with_c = 0; with_c < 2; ++with_c) {
+    if (with_c == 0 && (round & 3) != 0) continue;   // (the zero accumulator, a quarter of the rounds)
+    const std::vector<float> Cz(C.size(), 0.0f);
+    const Frag fr = pack_frag(fmt, K, A, B, with_c ? C : Cz);
+    std::vector<float> D(C.size());
+    old::mma(16, 8, K, 8, emin, false, fr.A.data(), K, fr.B.data(), 8, with_c ? C.data() : Cz.data(), 8, D.data(), 8);
+    std::vector<uint32_t> want(4 * 32, 0);
+    for (unsigned row = 0; row < 16; ++row)
+      for (unsigned col = 0; col < 8; ++col) {
+        const uint32_t v = bits(D[row * 8 + col]);
+        want[size_t{2 * (row / 8) + (col & 1)} * 32 + 4 * (row % 8) + col / 2] = std::isnan(D[row * 8 + col]) ? 0x7fffffffu : v;
+      }
+    ++tot.frag;
+    std::vector<uint32_t> got(4 * 32, 0xdeadbeefu);
+    vgpu::simd::kernels().hmma(static_cast<unsigned>(fmt) | 16u, K, false, fr.a.data(), fr.b.data(), with_c ? fr.c.data() : nullptr, got.data());
+    bool bad = got != want;
+#ifdef VGPU_TC86_AVX2
+    if (vgpu::simd::supported(vgpu::simd::Level::Avx512)) {
+      // The fragment form itself, with the registers at the end of a mapped page (it reads nothing past a register): it takes the calls the row-major
+      // kernel takes, writes nothing for the others, and gives the answer above for those it takes.
+      static PageEdge edge_a, edge_b, edge_c, edge_o;
+      const auto place = [](PageEdge& e, const std::vector<uint32_t>& src) {
+        uint32_t* p = reinterpret_cast<uint32_t*>(e.base + e.len) - src.size();
+        std::memcpy(p, src.data(), src.size() * sizeof(uint32_t));
+        return p;
+      };
+      const uint32_t* pa = place(edge_a, fr.a);
+      const uint32_t* pb = place(edge_b, fr.b);
+      const uint32_t* pc = with_c ? place(edge_c, fr.c) : nullptr;
+      uint32_t* po = reinterpret_cast<uint32_t*>(edge_o.base + edge_o.len) - 4 * 32;
+      std::fill(po, po + 4 * 32, 0xdeadbeefu);
+      std::vector<float> Dr(C.size(), f(0xdeadbeefu));
+      const bool rowmajor = now::mma_avx512_chunked_f<8, false>(16, 8, K, emin, fr.A.data(), K, fr.B.data(), 8, with_c ? C.data() : Cz.data(), 8, Dr.data(), 8);
+      const bool took = fmt == 0 ? now::mma_avx512_frag_m16n8<false>(K, emin, pa, pb, pc, po) : now::mma_avx512_frag_m16n8<true>(K, emin, pa, pb, pc, po);
+      tot.frag_taken += took;
+      if (took != rowmajor) bad = true;
+      for (unsigned i = 0; i < 4 * 32; ++i)
+        if (took ? po[i] != want[i] : po[i] != 0xdeadbeefu) bad = true;
+    }
+#endif
+    if (bad && ++tot.mismatches <= 5)
+      std::fprintf(stderr, "round %d fragment form K %u fmt %d mode %d with_c %d: differs from the frozen form (or taken/declined differently from the row-major kernel)\n", round, K, fmt,
+                   mode, with_c);
+  }
+}
+
 // Draw a problem (a "mode" picks how adversarial), run old and new, compare every element's bits.
 void one_round(Gen& g, int round, const Shape& sh, int fmt, bool f16acc, Totals& tot) {
   const int emin = fmt == 0 ? now::kEminF16 : now::kEminWide;
@@ -223,6 +314,7 @@ void one_round(Gen& g, int round, const Shape& sh, int fmt, bool f16acc, Totals&
   std::vector<float> D0(C.size()), D1(C.size()), D2(C.size());
   old::mma(sh.M, sh.N, sh.K, sh.chunk, emin, f16acc, A.data(), sh.K, B.data(), sh.N, C.data(), sh.N, D0.data(), sh.N);
   now::mma(sh.M, sh.N, sh.K, sh.chunk, emin, f16acc, A.data(), sh.K, B.data(), sh.N, C.data(), sh.N, D1.data(), sh.N);
+  if (!f16acc && fmt < 2 && sh.M == 16 && sh.N == 8 && sh.chunk == 8 && (sh.K == 16 || sh.K == 8)) check_frag(round, sh, fmt, mode, A, B, C, tot);
 #ifdef VGPU_TC86_AVX2
   if (!f16acc && sh.N % 8 == 0 && __builtin_cpu_supports("avx2"))
     now::mma_avx2(sh.M, sh.N, sh.K, sh.chunk, emin, A.data(), sh.K, B.data(), sh.N, C.data(), sh.N, D2.data(), sh.N);
@@ -274,7 +366,10 @@ VTEST(vector_kernels_equal_the_frozen_form) {
   std::printf("  %ld rounds, %ld elements compared bit for bit; the 512-bit float kernel on %ld of them (%ld taken)\n", rounds, tot.elements, tot.k512, tot.k512_taken);
   VCHECK_EQ(tot.mismatches, 0L);
   VCHECK(tot.elements > 1000000);
+  std::printf("  %ld m16n8 calls through the HMMA kernel (%ld taken by the fragment form of the 512-bit kernel)\n", tot.frag, tot.frag_taken);
+  VCHECK(tot.frag > 5000);
   if (vgpu::simd::supported(vgpu::simd::Level::Avx512)) {
+    VCHECK(tot.frag_taken > 1000);
     VCHECK(tot.k512 > 20000);
     VCHECK(tot.k512_edge >= 2 * tot.k512);
     VCHECK(tot.k512_taken > 5000);
@@ -393,6 +488,76 @@ VTEST(float_product_kernel_edges_equal_the_frozen_form) {
   VCHECK(declined > 40);
 }
 #endif
+
+// The fragment form of the 512-bit kernel (simd::Kernels::hmma) at the edges of what it takes, as the row-major float-product kernel has them above:
+// the exponent sums at and past the limits (bf16, whose exponents reach them), an infinity or a NaN in one operand beside small ones in the other (a
+// product of 255 and a small field is under the limit, so only the check for the field 255 sends the call away), and sums that nearly cancel at the
+// bottom of the range (the lanes the vector form hands to the scalar conversion). Taken or declined as the row-major kernel, and the frozen form's bits.
+VTEST(fragment_kernel_edges_equal_the_frozen_form) {
+  Gen g(0xf4a6);
+  Totals tot;
+  struct Edge {
+    int ea_lo, ea_hi, eb_lo, eb_hi;
+  };
+  const Edge edges[] = {{64, 64, 64, 64}, {64, 64, 63, 63}, {64, 64, 63, 64}, {1, 1, 127, 127}, {1, 1, 126, 126}, {190, 190, 189, 189}, {190, 190, 190, 190},
+                        {127, 127, 127, 127}, {100, 140, 110, 150}, {127, 127, 252, 252}, {127, 127, 253, 253}, {250, 250, 129, 129}, {254, 254, 125, 125}};
+  int round = 0;
+  for (const Edge& edge : edges)
+    for (unsigned K : {16u, 8u})
+      for (int accmode = 0; accmode < 5; ++accmode) {
+        const Shape sh{16, 8, K, 8};
+        std::vector<float> A(16 * size_t{K}), B(size_t{K} * 8), C(16 * 8);
+        const auto draw = [&](int lo, int hi) {
+          const uint32_t h = g.u();
+          const uint32_t e = static_cast<uint32_t>(lo + static_cast<int>((h >> 8) % static_cast<uint32_t>(hi - lo + 1)));
+          return f((h & 0x80000000u) | (e << 23) | (((h >> 20) & 0x7fu) << 16));
+        };
+        for (float& x : A) x = (g.u() % 11 == 0) ? 0.0f : draw(edge.ea_lo, edge.ea_hi);
+        for (float& x : B) x = (g.u() % 11 == 0) ? -0.0f : draw(edge.eb_lo, edge.eb_hi);
+        A[0] = draw(edge.ea_lo, edge.ea_lo);
+        A[K + 1] = draw(edge.ea_hi, edge.ea_hi);
+        B[0] = draw(edge.eb_lo, edge.eb_lo);
+        B[8 + 1] = draw(edge.eb_hi, edge.eb_hi);
+        for (float& x : C) {
+          const uint32_t h = g.u();
+          x = accmode == 0 ? 0.0f : accmode == 1 ? f(h & 0x807fffffu) : accmode == 2 ? f((h & 0x80000000u) | ((1u + (h >> 8) % 20) << 23) | (h & 0x7fffffu))
+              : accmode == 3 ? f((h & 0x80000000u) | ((235u + (h >> 8) % 20) << 23) | (h & 0x7fffffu)) : f((h & 0x80000000u) | ((100u + (h >> 8) % 60) << 23) | (h & 0x7fffffu));
+        }
+        check_frag(4 * round++, sh, 1, 0, A, B, C, tot);
+      }
+  // an infinity or a NaN in one operand, small numbers in the other: f16 (the field 255 comes from the conversion) and bf16
+  for (int fmt = 0; fmt < 2; ++fmt)
+    for (unsigned K : {16u, 8u})
+      for (int side = 0; side < 2; ++side)
+        for (int rep = 0; rep < 12; ++rep) {
+          const Shape sh{16, 8, K, 8};
+          std::vector<float> A(16 * size_t{K}), B(size_t{K} * 8), C(16 * 8);
+          const auto normal = [&](int lo, int hi) { return g.operand(fmt, 1, true) * 0.0f + f(((g.u() & 1) << 31) | (static_cast<uint32_t>(lo + g.u() % (hi - lo + 1)) << 23) | (((g.u() >> 8) & 0x3ffu) << 13)); };
+          for (float& x : A) x = normal(side ? 114 : 124, side ? 121 : 130);
+          for (float& x : B) x = normal(side ? 124 : 114, side ? 130 : 121);
+          (side ? B : A)[g.u() % (side ? B.size() : A.size())] = rep % 3 == 0 ? f(0x7f800000u) : rep % 3 == 1 ? f(0xff800000u) : f(0x7fc00000u);
+          for (float& x : C) x = (g.u() % 4 == 0) ? 0.0f : g.acc(9, 100, 140, false);
+          check_frag(4 * round++, sh, fmt, 0, A, B, C, tot);
+        }
+  // sums that nearly cancel at the bottom of the range: pairs a, -a against b, b + 1 ulp of a bf16, products near 2^-126, a zero or tiny accumulator
+  for (unsigned K : {16u, 8u})
+    for (int rep = 0; rep < 400; ++rep) {
+      const Shape sh{16, 8, K, 8};
+      std::vector<float> A(16 * size_t{K}), B(size_t{K} * 8), C(16 * 8);
+      for (float& x : A) x = f(((g.u() & 1) << 31) | ((64u + g.u() % 2) << 23) | ((g.u() & 0x7fu) << 16));
+      for (float& x : B) x = f(((g.u() & 1) << 31) | ((64u + g.u() % 2) << 23) | ((g.u() & 0x7fu) << 16));
+      for (unsigned i = 0; i < 16; ++i)
+        for (unsigned k = 0; k + 1 < K; k += 2) {
+          A[i * K + k + 1] = -A[i * K + k];
+          for (unsigned j = 0; j < 8; ++j) B[(k + 1) * 8 + j] = f(bits(B[k * 8 + j]) + (g.u() % 3 == 0 ? 0x10000u : 0u));
+        }
+      for (float& x : C) x = (g.u() % 3 == 0) ? 0.0f : f((g.u() & 0x80000000u) | ((1u + g.u() % 5) << 23) | (g.u() & 0x7fffffu));
+      check_frag(4 * round++, sh, 1, 0, A, B, C, tot);
+    }
+  std::printf("  %ld calls through the HMMA kernel at the edges, %ld taken by the fragment form\n", tot.frag, tot.frag_taken);
+  VCHECK_EQ(tot.mismatches, 0L);
+  if (vgpu::simd::supported(vgpu::simd::Level::Avx512)) VCHECK(tot.frag_taken > 100);
+}
 
 #ifdef VGPU_TC86_AVX2
 // The vector conversion of a sum to f32 against the scalar one (detail::to_f32_rz), on sums just below and above every power of two (the
