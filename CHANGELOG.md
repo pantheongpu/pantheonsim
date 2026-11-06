@@ -7,6 +7,10 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- License: from the next release PantheonSim is under the Business Source License 1.1, which keeps it free to use, change and run in
+  your own CI and allows one restriction: you may not offer it to other people as a hosted or managed service. Each version becomes
+  Apache-2.0 four years after release. Versions up to 0.2.0 stay Apache-2.0 (`LICENSE-APACHE-2.0`). `docs/licensing.md` has the
+  details, and contributions now need the Contributor Agreement.
 - SASS: `ULDC` with a uniform base register (`ULDC.64 UR6, c[0x3][UR8+-0x72e0]`) takes its offset as a signed 16-bit number and wraps in the
   64 KiB bank, as `LDC` does. ptxas uses it to reach constant data past byte 32768, and the simulator read zero there on the Ampere and Ada
   profiles (an inverse NTT in FIDESlib came out all zeros) (pantheonsim #499).

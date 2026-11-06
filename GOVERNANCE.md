@@ -42,8 +42,10 @@ the lead maintainer makes the final call if that fails.
 
 ## License
 
-PantheonSim is licensed under Apache-2.0. Contributions are accepted under the
-same license, with no separate contributor agreement.
+PantheonSim is licensed under the Business Source License 1.1 from version 0.3.0
+(see `LICENSE` and [docs/licensing.md](docs/licensing.md)); versions up to 0.2.0 are
+Apache-2.0, and each later version becomes Apache-2.0 four years after release.
+Contributions need the [Contributor Agreement](docs/contributor-agreement.md).
 
 ## Changing this document
 

@@ -1,7 +1,8 @@
 # Third-party notices
 
-PantheonSim is Apache-2.0 (see `LICENSE`). It includes or fetches the following
-third-party material.
+PantheonSim's own code is under the Business Source License 1.1 (see `LICENSE`);
+versions up to 0.2.0 are Apache-2.0 (`LICENSE-APACHE-2.0`). It includes or fetches
+the following third-party material, which keeps its own license.
 
 | Component | Where | License |
 |---|---|---|
