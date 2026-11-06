@@ -938,6 +938,31 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
       return;
     }
   }
+  if constexpr (!Store) {
+    // The lanes' 16 bytes as two batches of 8-byte pieces (as the general access reads them, and as LDGSTS does): one lookup a batch, not a lock a lane.
+    // A batch the memory manager declines made nothing happen: the loop below runs as it did.
+    uint64_t fa[32], fb[32], lo[32], hi[32];
+    unsigned n = 0;
+    for (Mask m = ex; m; m &= m - 1) {
+      const uint64_t a = addrs[std::countr_zero(m)];
+      fa[n] = a;
+      fb[n++] = a + 8;
+    }
+    if (n && mem.load_batch(fa, n, 8, lo, &op.way) && mem.load_batch(fb, n, 8, hi, &op.way)) {
+      if (d) {
+        unsigned i = 0;
+        for (Mask m = ex; m; m &= m - 1, ++i) {
+          const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+          d[l] = static_cast<uint32_t>(lo[i]);
+          d[32 + l] = static_cast<uint32_t>(lo[i] >> 32);
+          d[64 + l] = static_cast<uint32_t>(hi[i]);
+          d[96 + l] = static_cast<uint32_t>(hi[i] >> 32);
+        }
+      }
+      count_access(blk.st, 0, Store, addrs, ex, 16);
+      return;
+    }
+  }
   for (Mask m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
     uint32_t v[4];
@@ -1716,31 +1741,18 @@ TIER_HANDLER(h_ldsm) {
   const unsigned ra = op.s[0].off;
   const uint32_t* base = ra != kRZ ? c.R + ra * 32u : nullptr;
   const uint64_t urv = op.s[1].off != ~0u ? c.w->ur[op.s[1].off] : 0;
-  const uint64_t imm = static_cast<uint64_t>(op.imm);
-  exec::SharedWindowCheck window;
-  for (unsigned l = 0; l < 32; ++l) {
-    rows[l] = static_cast<uint32_t>((base ? base[l] : 0u) + urv + imm);
-    window.add(rows[l], blk.rank);
-  }
-  if (ex != kAll || !window.inside(blk.shared.size(), 16, true)) {
+  const uint32_t add = static_cast<uint32_t>(urv + static_cast<uint64_t>(op.imm));   // (the sum is cut to 32 bits, so cutting the terms first is the same)
+  if (base)
+    for (unsigned l = 0; l < 32; ++l) rows[l] = base[l] + add;
+  else
+    for (unsigned l = 0; l < 32; ++l) rows[l] = add;
+  // (every lane's row address, the unused ones too, in this block's window and with its 16 bytes inside the array: shared_window_inside_warp is
+  // SharedWindowCheck over the 32 addresses, see window_check.hpp)
+  if (ex != kAll || !exec::shared_window_inside_warp(rows, kAll, blk.rank, blk.shared.size(), 16)) {
     c.r->tier_exec_mem(blk, *c.w, *op.ins, ex);
     return;
   }
-  const uint8_t* sh = blk.shared.data();
-  uint32_t out[4][32];
-  for (unsigned i = 0; i < nmat; ++i)
-    for (unsigned t = 0; t < 32; ++t) {
-      if (!op.b) {
-        std::memcpy(&out[i][t], sh + (rows[8 * i + t / 4] & 0xffffff) + 4 * (t % 4), 4);
-      } else {
-        uint16_t lo, hi;
-        std::memcpy(&lo, sh + (rows[8 * i + 2 * (t % 4)] & 0xffffff) + 2 * (t / 4), 2);
-        std::memcpy(&hi, sh + (rows[8 * i + 2 * (t % 4) + 1] & 0xffffff) + 2 * (t / 4), 2);
-        out[i][t] = lo | (static_cast<uint32_t>(hi) << 16);
-      }
-    }
-  if (op.dst != tier::kNoReg)
-    for (unsigned i = 0; i < nmat; ++i) std::memcpy(c.R + (op.dst + i) * 32u, out[i], 32 * sizeof(uint32_t));
+  if (op.dst != tier::kNoReg) exec::ldsm_move(blk.shared.data(), rows, nmat, op.b != 0, c.R + op.dst * 32u);
   blk.st.shared_loads += 32;
   blk.st.shared_bytes_read += 32u * 4 * nmat;
 }
@@ -1758,6 +1770,21 @@ TIER_HANDLER(h_imma) {
                        tb = four ? (sb ? exec::FragType::S4 : exec::FragType::U4) : (sb ? exec::FragType::S8 : exec::FragType::U8);
   const unsigned per_reg = four ? 8 : 4, a_regs = M * K / (32 * per_reg), b_regs = K * 8 / (32 * per_reg), c_regs = M * 8 / 32;
   static const uint32_t kZeros[32] = {};
+#ifdef VGPU_IMMA_FRAG
+  // 8-bit operands, a wrapping sum, 16 x 8 x 16 or 16 x 8 x 32, at the AVX-512 level: straight from the registers (imma_frag.hpp). An RZ operand is zeros.
+  if (!sat && !four && M == 16 && (K == 16 || K == 32) && c.sk->level == simd::Level::Avx512) {
+    alignas(64) static const uint32_t kZ4[4 * 32] = {};
+    const unsigned ra = op.s[0].off, rb = op.s[1].off, rc = op.s[2].off;
+    const uint32_t* const pa = ra == kRZ ? kZ4 : c.R + ra * 32u;
+    const uint32_t* const pb = rb == kRZ ? kZ4 : c.R + rb * 32u;
+    const uint32_t* const pc = rc == kRZ ? nullptr : c.R + rc * 32u;
+    alignas(64) uint32_t xo[4 * 32];
+    if (sa) sb ? exec::imma_frag_m16n8<true, true>(K, pa, pb, pc, xo) : exec::imma_frag_m16n8<true, false>(K, pa, pb, pc, xo);
+    else sb ? exec::imma_frag_m16n8<false, true>(K, pa, pb, pc, xo) : exec::imma_frag_m16n8<false, false>(K, pa, pb, pc, xo);
+    for (unsigned s = 0; s < 4; ++s) tier_store(c, static_cast<uint16_t>(op.dst + s), ex, xo + s * 32);
+    return;
+  }
+#endif
   alignas(32) uint32_t xa[8 * 32], xb[4 * 32], xc[4 * 32], xd[4 * 32];
   const auto load = [&](unsigned base, unsigned n, uint32_t* dst) {
     for (unsigned i = 0; i < n; ++i) __builtin_memcpy(dst + 32 * i, base == kRZ ? kZeros : c.R + (base + i) * 32u, 32 * sizeof(uint32_t));
@@ -1773,10 +1800,7 @@ TIER_HANDLER(h_imma) {
   c.sk->tile_i32(M, 8, K, ia, ib, ic, 8, sat ? 128 / (four ? 4 : 8) : K, sat, id, 8);   // (.SAT clamps after every 128 bits of K)
   if (M == 16) exec::wgmma_tile_to_acc_i32(id, 8, xd);
   else exec::mma_tile_to_acc8_i32(id, xd);
-  for (Mask m = ex; m; m &= m - 1) {
-    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-    for (unsigned s = 0; s < c_regs; ++s) c.R[(op.dst + s) * 32u + l] = xd[s * 32 + l];
-  }
+  for (unsigned s = 0; s < c_regs; ++s) tier_store(c, static_cast<uint16_t>(op.dst + s), ex, xd + s * 32);   // (the executing lanes: a row copy, or a blend, not a store a lane)
 }
 
 // HMMA (the dense f16, bf16 and tf32 forms): one SIMD kernel over the warp's fragments, as exec_mma gives them to it, the

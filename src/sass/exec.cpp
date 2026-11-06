@@ -57,6 +57,8 @@ asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.popsection");
 #include "vgpu/exec/sass_lanes.hpp"
 #include "vgpu/exec/sass_mem_rows.hpp"
 #include "vgpu/exec/sass_lea.hpp"
+#include "vgpu/exec/imma_frag.hpp"
+#include "vgpu/exec/ldsm.hpp"
 #include "vgpu/exec/window_check.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
