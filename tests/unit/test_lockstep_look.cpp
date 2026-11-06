@@ -96,15 +96,17 @@ unsigned launch_cap(unsigned run_us, unsigned fold_us) {
 }  // namespace
 
 VTEST(the_first_look_of_a_launch_waits_for_what_the_last_look_cost) {
+  // (All the times below are three times the ones in the comments, so that a runner that stalls a few milliseconds does not move a look
+  // across a block's end: 6 ms a block here is the 2 ms the comments say, and so on.)
   // Nothing is known yet: the look comes after 250 microseconds, and costs 2 ms a block for each of the two.
-  VCHECK_EQ(launch(2, 8, 2000), 2u);
+  VCHECK_EQ(launch(2, 24, 6000), 2u);
   // One block, 20 ms: its look would cost 2 ms, so the first comes after 24 ms, and the launch is over before that.
   // (Not twelve times what both blocks' look cost, and not the 250 microseconds.)
-  VCHECK_EQ(launch(1, 20, 2000), 0u);
+  VCHECK_EQ(launch(1, 60, 6000), 0u);
   // The same for 36 ms: the look comes at about 24 ms, and the next would be 24 ms after it.
-  VCHECK_EQ(launch(1, 36, 2000), 1u);
+  VCHECK_EQ(launch(1, 108, 6000), 1u);
   // Two blocks resident: the cost is 2 ms for each, so the first look is after 48 ms, not 24.
-  VCHECK_EQ(launch(2, 36, 2000), 0u);
+  VCHECK_EQ(launch(2, 108, 6000), 0u);
 }
 
 VTEST(a_block_that_stands_still_is_still_found_out_and_slept_on) {
@@ -127,8 +129,8 @@ VTEST(the_wait_for_the_first_look_has_a_ceiling) {
 
 VTEST(once_it_has_looked_a_launch_looks_again_after_twelve_times_the_look) {
   // Taught 2 ms a block (first launch below), the first look is at 24 ms, the second at 50 and the third at 76: three in 80 ms.
-  launch(1, 30, 2000);
-  const unsigned n = launch(1, 80, 2000);
+  launch(1, 90, 6000);
+  const unsigned n = launch(1, 240, 6000);
   VCHECK(n >= 2 && n <= 3);
 }
 
