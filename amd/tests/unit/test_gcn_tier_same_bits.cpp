@@ -9,6 +9,7 @@
 // (LDS accesses only) which give the lanes consecutive LDS addresses, all on and one run of them on, 20 the integers' edges (carries, borrows),
 // and 25 to 31 (LDS accesses only) strided, broadcast, neighbours sharing a (misaligned) address, scattered with half the lanes off, and scattered with a
 // lane past the end of the LDS (the interpreter's error or zero read), and 30 and 31 one lane on the last bytes the LDS has (30) or one byte short of them (31).
+// and 32 and 33 (LDS accesses only) scattered in-range addresses with some lanes off, and lanes 8 bytes apart (the two-offset 64-bit forms).
 // Three seeds each (VGPU_TIER_SEEDS=n for more).
 // VGPU_TIER_SHARD=k/n runs the shapes whose number among those with a handler is k modulo n (0 <= k < n), so that ctest can run the n shards side by
 // side (CMakeLists.txt: test_amd_gcn_tier_same_bits_shardKofN); every shape's seed and flavours are what they are in the whole run, so the n shards
@@ -120,7 +121,8 @@ VTEST(every_tier_handler_gives_the_interpreters_bits) {
       if (in.name.rfind("s_branch", 0) == 0 || in.name.rfind("s_cbranch", 0) == 0) in.target = 0x1000;
       const auto run_one = [&](const amd::gcn::Inst& inst) {
       for (uint64_t seed = 0; seed < seeds; ++seed)
-        for (uint32_t flavour = 0; flavour < 32; ++flavour) {
+        for (uint32_t flavour = 0; flavour < 34; ++flavour) {
+          if ((flavour == 32 || flavour == 33) && in.enc != amd::gcn::Enc::Ds) continue;   // (scattered and 8-byte-apart LDS addresses)
           if (flavour >= 5 && flavour <= 9) continue;
           if (flavour == 16) continue;   // (every register zero: not a state worth running)
           if (flavour >= 21 && flavour <= 24) continue;   // (the gather test's)

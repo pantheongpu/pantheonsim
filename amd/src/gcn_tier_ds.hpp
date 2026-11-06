@@ -16,5 +16,9 @@ void ds_all_write(uint32_t* const* rows, uint8_t* lds, const uint32_t* addr, uin
 // The lanes of `ex` one by one, w words (2 to 4) a lane.
 void ds_lanes_read(uint32_t* const* rows, const uint8_t* lds, const uint32_t* addr, uint32_t x0, uint64_t ex, unsigned w);
 void ds_lanes_write(uint32_t* const* rows, uint8_t* lds, const uint32_t* addr, uint32_t x0, uint64_t ex, unsigned w);
+// ds_read2_b64 and ds_write2_b64 (and st64): `rows` are the four registers of the two 64-bit values, x0 and x1 the byte offsets; 0 when a lane's
+// access is not inside the LDS (nothing was changed), else 1.
+int ds_two_read(uint32_t* const* rows, const uint32_t* addr_row, uint32_t x0, uint32_t x1, uint64_t ex, uint8_t* lds, uint64_t size, unsigned n);
+int ds_two_write(const uint32_t* const* rows, const uint32_t* addr_row, uint32_t x0, uint32_t x1, uint64_t ex, uint8_t* lds, uint64_t size, unsigned n);
 
 }  // namespace vgpu::amd::gcn::tier_ds
