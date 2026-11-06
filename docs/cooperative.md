@@ -148,7 +148,11 @@ flight together; run one after another every block wins them all).
   instructions per warp, in the order the blocks started. When a block finishes the
   grid's next block takes its place, so blocks beyond the capacity start as earlier
   ones end. A grid of fewer than 16 blocks uses one thread and starts them all, so the
-  order is the same on every run. A larger one uses every host thread it has two blocks for; a thread starts
+  order is the same on every run, when its kernel takes locks (an atomic that returns its old value
+  in a loop: RXMesh's patch locks). A kernel whose waits are only loads (CUB's radix-sort look-back, a
+  flag chain; SASS engine) gives the same answer in any order, so such a small grid uses the host threads
+  too (two blocks to a thread at least), every block resident from the start; its count of failed polls
+  then follows the schedule, as a larger grid's does (at `VGPU_THREADS=1` everything is as before). A larger one uses every host thread it has two blocks for; a thread starts
   with one block, as the old path did (the AMD engine takes ranges of consecutive
   groups, as it did), and holds one more at a time only after no block on any thread has
   stored (to shared or global memory) or finished for three milliseconds, then one more

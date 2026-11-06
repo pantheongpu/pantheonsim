@@ -1522,6 +1522,8 @@ target_include_directories(test_sass_dispatch PRIVATE src)
 vgpu_unit_test(test_launch_env)
 # Blocks that wait on one another, on fewer host cores than threads: a waiting thread gives its turn up (the CI flake of lockstep.gfx942).
 vgpu_unit_test(test_lockstep_yield)
+# How many host threads a lockstep grid takes: a small one of waits on loads spreads, one that takes locks stays on one thread.
+vgpu_unit_test(test_lockstep_shape)
 # The fingerprint of a block's registers (eight chains for long inputs): any one-byte change changes it, at every length.
 vgpu_unit_test(test_lockstep_fold)
 # When a lockstep launch first looks at its blocks (after what the last look cost, per resident block), and that a block standing still is found out.

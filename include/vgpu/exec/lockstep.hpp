@@ -22,7 +22,8 @@
 //
 // A grid of fewer than 16 blocks runs on one host thread with all its resident blocks taking turns
 // from the start, in a fixed order, as a cooperative launch does: the answer of a program like the
-// patch locks is then the same on every run. A larger grid uses the host threads, two blocks to a thread at least, each
+// patch locks is then the same on every run. (The SASS engine lets such a grid use the host threads when
+// its kernel only polls with loads: see `small_grid_spreads` below.) A larger grid uses the host threads, two blocks to a thread at least, each
 // starting with one block, as before, and holding one more block at a time only after no block of the
 // launch, on any thread, has stored or finished for three milliseconds: a chain of look-back flags,
 // where each block waits on the one before it, then runs as it did (the blocks of a real kernel store
@@ -101,13 +102,18 @@ struct LockstepShape {
 // `chunk`: blocks a thread takes at a time (the NVIDIA engines take them one by one, as they always did;
 // the AMD engine took contiguous ranges, and a chain of work-groups each waiting on the one before it
 // then hands over between threads once a range, not at every link).
-inline LockstepShape lockstep_shape(uint64_t units, uint64_t capacity, unsigned threads, bool ranges = false) {
+// `small_grid_spreads`: a grid of fewer than kLockstepOneThread blocks uses the host threads too (two blocks to a thread at least), as a
+// larger one does. For launches whose waits are only loads (a chain of look-back flags: CUB's radix sort, scans), where the answer does
+// not depend on the order the blocks start in; a kernel that takes locks leaves it off and keeps its fixed order.
+inline LockstepShape lockstep_shape(uint64_t units, uint64_t capacity, unsigned threads, bool ranges = false,
+                                    bool small_grid_spreads = false) {
   LockstepShape s;
-  const uint64_t by_size = units < kLockstepOneThread ? 1 : std::max<uint64_t>(1, units / kLockstepBlocksPerThread);
+  const uint64_t by_size = units < kLockstepOneThread && !small_grid_spreads ? 1 : std::max<uint64_t>(1, units / kLockstepBlocksPerThread);
   s.workers = static_cast<unsigned>(std::max<uint64_t>(1, std::min<uint64_t>(threads, by_size)));
   const uint64_t resident = std::max<uint64_t>(1, std::min(units, capacity ? capacity : units));
   s.window = std::max<uint64_t>(1, (resident + s.workers - 1) / s.workers);
-  s.initial = s.workers == 1 ? s.window : 1;
+  // (a small grid that spreads holds all its blocks from the start, as the one-thread rule does: its blocks may wait on one that is last in line)
+  s.initial = s.workers == 1 || (small_grid_spreads && units < kLockstepOneThread) ? s.window : 1;
   if (ranges) s.chunk = std::clamp<uint64_t>(units / (uint64_t{s.workers} * 8), 1, 32);
   return s;
 }
