@@ -781,6 +781,7 @@ class MemoryManager {
                       size_t* failed_at);
   const Allocation& resolve_scalar(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
                                    bool writing, bool page_slack) const;
+  const Allocation& resolve_bulk(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out, bool writing) const;
   // The mapped-memory half of resolve: a hit returns the handle's allocation,
   // a miss returns null so the caller can carry on with its own diagnostics.
   const Allocation* resolve_mapped(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
