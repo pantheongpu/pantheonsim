@@ -7380,3 +7380,24 @@ Timing tests (looks 24 ms, 48 ms, 500 ms in with margins of 12 to 60 ms): a mach
 
 ### Not verified
 No AMD run. No kernel with a real cross-block wait at more than one thread on PTX (the programs here are single-thread); the one-core test_lockstep_yield stays green. Zen 5 and Intel not measured. The layout effect above is understood only by the control, not by a disassembly comparison.
+
+## Round sp30 (atomic-heavy real programs): MATCH.ANY classes by hash
+
+Base: origin/main 2db5dd65. Server2 (Zen 5), nice 19, one builder, `VGPU_GPU=nvidia/rtx3060` (SASS), one thread, Release/LTO.
+
+### Why atomicCost is big and slow
+atomicCost (HeCBench) allocates `length = 922,521,600` elements: two device buffers and two host `malloc` buffers of `length / N` values each, so about 4 x 7.4 GB for the FP64 case. Phase 0 saw 14 GB RSS because the memory manager spills device chunks to its file once the host runs short. This is the program's own memory: with the constant in the binary divided by 16 (the three `mov $0x36fc9000,%edi` immediates, 57,657,600 threads, same kernels), RSS is 1,810 MB = 4 x 461 MB, i.e. exactly the four buffers, and the simulator adds nothing per address (zero-filled chunks of `cudaMemset` are not materialised; `atomicAdd` touches only the pages the kernel writes). The AMD build is stopped by the host-memory guard on a box with 1.8 GB free, which is the guard working. Nothing to cut in memory.
+Speed: the reduced run is 276 M warp instructions in 4.1 s at one thread (about 15 ns per instruction), the profile is flat (`step_warp` 20 %, `exec_mem` 7 %, `init_block` 8 % of which most is the per-warp register-file clear, the atomic lane loops `global_lanes` about 4 %). Full size is simply 16 times that. No lever of 5 % was found there. atomicReduction (16 M elements, repeat 3) is `load_batch` 24 % and `h_global` 11 %: a streaming gather, not an atomic cost.
+
+### The hot spot that was there: atomicAggregate
+atomicAggregate (warp-aggregated increments built on `__match_any_sync`) spent 28 % of its samples in the tier handler `h_match`. MATCH.ANY found each class of equal values by scanning all lanes once per class, so a warp of 32 different values (the 32-address case of the program) took 32 x 32 steps. `sasslanes::match_any` (include/vgpu/exec/sass_lanes.hpp) now sorts the lanes into classes with one pass over a 64-slot open-addressing table keyed on the whole 64-bit value (the hash only chooses the first slot, equality is the full value) and gives each lane its class in a second pass: 2 x popcount(ex) steps whatever the number of classes. `match_any_reference` keeps the old scan for the test. MATCH.ALL is unchanged.
+
+### Results
+`atomicAggregate 1` (6 launches, 65,536 blocks of 256), user+sys, 15 interleaved rounds of A1, A2 (two copies of the same A build, made at the same time) and W, the three on rotating CPUs: A1 3.780 s, A2 3.760 s (A1/A2 = 1.005), W 3.080 s (min 3.04, max 3.15; A's range 3.74 to 3.81, no overlap): **W/A = 0.817 (-18 %)**. The profile after: `h_match` 533 -> 208 samples (28 % -> 13.5 %). atomicCost (reduced) 4.30 / 4.02 / 4.09 s in one round: unchanged within noise, as expected. Peak RSS is unchanged in both programs (atomicAggregate 11 MB, atomicCost reduced 1.8 GB).
+Same bits: `VGPU_COUNTERS_FILE` and `VGPU_KERNEL_DIGEST` (pid removed) byte-identical to A at 1 and at 4 threads for atomicAggregate and atomicCost (reduced), and the programs' stdout (timings removed) equal.
+
+### Test and mutants
+`tests/unit/test_sass_lanes.cpp` `match_any_gives_each_lane_the_lanes_that_hold_its_value`: 60,000 random warps (full and partial masks) against `match_any_reference` and against a lane-by-lane definition, with values that differ only in the high half, only in the low half, values that fall in one table slot (chains of 32 different values), one class, 0 / all-ones; the lanes outside the mask must keep their old contents. Killed: key compared on the low 32 bits only, no probing, class overwritten instead of OR-ed. Survived, equivalent: the hash forced to slot 0 (all values chain from one slot; correct, only slower). The handler's wiring (that `h_match` writes the destination) is covered by the existing `e2e_sass_tier` / `sass_tier_steps` MATCH.ANY checks, which need nvcc and were not run on server2.
+
+### Not verified
+No PTX engine change (its MATCH is separate). No AMD run. The sass_tier e2e tests were not run (no nvcc on server2): CI is the check. One program (atomicAggregate) gains; the others of the list (aidw, aligned-types, babelstream, base64e, binomial) were not profiled for a lever.

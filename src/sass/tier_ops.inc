@@ -1686,17 +1686,7 @@ TIER_HANDLER(h_match) {
   }
   uint32_t* d = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
   if (op.aux & 1) {
-    for (Mask todo = ex; todo;) {
-      const uint64_t x = v[std::countr_zero(todo)];
-      Mask cls = 0;
-      for (Mask m = ex; m; m &= m - 1) {
-        const unsigned k = static_cast<unsigned>(std::countr_zero(m));
-        cls |= static_cast<Mask>(v[k] == x) << k;
-      }
-      if (d)
-        for (Mask m = cls; m; m &= m - 1) d[std::countr_zero(m)] = cls;
-      todo &= ~cls;
-    }
+    if (d) exec::sasslanes::match_any(v, ex, d);   // (v was read first, so a destination that is a source is no problem)
   } else {
     const uint64_t first = v[std::countr_zero(ex)];
     bool same = true;
