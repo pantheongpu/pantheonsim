@@ -36,6 +36,6 @@ ENV PATH=/opt/pantheonsim/bin:$PATH \
     VGPU_GPU=nvidia/t4
 LABEL org.opencontainers.image.title="PantheonSim" \
       org.opencontainers.image.description="Simulated NVIDIA and AMD GPUs on a CPU: CUDA and HIP programs run unmodified" \
-      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.licenses="BUSL-1.1" \
       org.opencontainers.image.source="https://github.com/pantheongpu/pantheonsim"
 CMD ["vgpu", "list-gpus"]
