@@ -2929,7 +2929,9 @@ void sp24_pick(const double v[4], uint32_t sel, uint32_t pick[2]) {
 // memory in it. See there for what "the same on every turn" means; here a register is variable when
 // the loop sets it from what a load, atomic, shuffle, vote or clock returned, from a variable
 // register, or when it is read before the loop sets it and the loop does set it.
-bool ptx_loop_polls(const EntryFn& f, size_t first, size_t last) {
+// `kinds`, when given, gets kPollLoad set when the poll is a load and kPollAtomic when it is an atomic that returns its old value
+// (a lock being taken): a launch whose waits are loads only may spread a small grid over host threads (exec/lockstep.hpp).
+bool ptx_loop_polls(const EntryFn& f, size_t first, size_t last, unsigned* kinds = nullptr) {
   // (instr_registers keys a register as id * 2 + wide; an operand with no register has the largest id)
   const uint32_t kMaxKey = 2 * (f.num_regs32 + f.num_regs64 + 8);
   enum : uint8_t { Undef, Fixed, Variable };
@@ -2977,6 +2979,7 @@ bool ptx_loop_polls(const EntryFn& f, size_t first, size_t last) {
     return true;
   };
   bool polls = false;
+  unsigned found = 0;
   for (size_t i = first; i <= last; ++i) {
     const Instr& ins = f.body[i];
     defs.clear();
@@ -2989,14 +2992,17 @@ bool ptx_loop_polls(const EntryFn& f, size_t first, size_t last) {
       var_src = var_src || (state[u] == Undef ? set_in_loop[u] : state[u] == Variable);
     }
     bool generates = false, poll = false;
+    unsigned kind = 0;
     if (const auto* ld = std::get_if<OpLd>(&ins.op)) {
       generates = true;
       poll = ld->ordered && (ld->space == Space::Global || ld->space == Space::Generic);
+      kind = kPollLoad;
     } else if (const auto* at = std::get_if<OpAtom>(&ins.op)) {
       generates = true;
       if (at->space == Space::Global || at->space == Space::Generic) {
         if (at->discards_result || result_unused(defs)) return false;   // red: a store
         poll = at->vec <= 1;
+        kind = kPollAtomic;
       }
     } else if (const auto* st = std::get_if<OpSt>(&ins.op)) {
       if (st->space == Space::Global || st->space == Space::Generic) return false;
@@ -3012,48 +3018,50 @@ bool ptx_loop_polls(const EntryFn& f, size_t first, size_t last) {
         generates = sr->reg == Sreg::Clock || sr->reg == Sreg::ClockHi || sr->reg == Sreg::Clock64 ||
                     sr->reg == Sreg::GlobalTimer || sr->reg == Sreg::GlobalTimerLo || sr->reg == Sreg::GlobalTimerHi;
     }
-    polls = polls || (poll && !var_src);
+    if (poll && !var_src) {
+      polls = true;
+      found |= kind;
+    }
     const uint8_t now = (generates || var_src) ? Variable : Fixed;
     for (uint32_t d : defs)
       if (d < kMaxKey) state[d] = now;
   }
+  if (polls && kinds) *kinds |= found;
   return polls;
 }
 
-// Whether a function's own body has a polling loop; remembered on the function.
-bool ptx_body_polls(const EntryFn& f) {
+// What a function's own body polls with (0, or kPollLoad / kPollAtomic, or both); remembered on the function. Every loop is looked at:
+// one that takes a lock decides what a small grid does, whatever the loops before it wait on.
+unsigned ptx_body_poll_kinds(const EntryFn& f) {
   const int8_t cached = f.polls.v.load(std::memory_order_relaxed);
-  if (cached >= 0) return cached != 0;
-  bool found = false;
-  for (size_t i = 0; i < f.body.size() && !found; ++i) {
+  if (cached >= 0) return static_cast<unsigned>(cached);
+  unsigned kinds = 0;
+  for (size_t i = 0; i < f.body.size() && !(kinds & kPollAtomic); ++i) {
     const auto* br = std::get_if<OpBra>(&f.body[i].op);
     if (!br || br->target > i || i - br->target > 400) continue;
-    found = ptx_loop_polls(f, br->target, i);
+    ptx_loop_polls(f, br->target, i, &kinds);
   }
-  f.polls.v.store(found ? 1 : 0, std::memory_order_relaxed);
-  return found;
+  f.polls.v.store(static_cast<int8_t>(kinds), std::memory_order_relaxed);
+  return kinds;
 }
 
-// The kernel's body, and the functions it calls directly (an indirect call is not followed).
-bool ptx_kernel_polls(const EntryFn& fn) {
+// The kernel's body, and the functions it calls directly (an indirect call is not followed): what any of them polls with.
+unsigned ptx_kernel_poll_kinds(const EntryFn& fn) {
   const int8_t cached = fn.polls_reach.v.load(std::memory_order_relaxed);
-  if (cached >= 0) return cached != 0;
-  bool found = false;
+  if (cached >= 0) return static_cast<unsigned>(cached);
+  unsigned kinds = 0;
   std::set<const EntryFn*> seen;
   std::vector<const EntryFn*> todo{&fn};
-  while (!todo.empty()) {
+  while (!todo.empty() && !(kinds & kPollAtomic)) {
     const EntryFn* f = todo.back();
     todo.pop_back();
     if (!seen.insert(f).second) continue;
-    if (ptx_body_polls(*f)) {
-      found = true;
-      break;
-    }
+    kinds |= ptx_body_poll_kinds(*f);
     for (const Instr& ins : f->body)
       if (const auto* c = std::get_if<OpCall>(&ins.op); c && c->target) todo.push_back(c->target);
   }
-  fn.polls_reach.v.store(found ? 1 : 0, std::memory_order_relaxed);
-  return found;
+  fn.polls_reach.v.store(static_cast<int8_t>(kinds), std::memory_order_relaxed);
+  return kinds;
 }
 
 class Interpreter {
@@ -17732,10 +17740,14 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
   if (!eff.cooperative && !ordered && no_clusters) {
     const LockstepMode mode = lockstep_mode(env.lockstep);
     std::set<const ptx::EntryFn*> seen;
-    if (mode == LockstepMode::All || (mode == LockstepMode::Auto && eff.resident_blocks && ptx_kernel_polls(fn))) {
+    const unsigned kinds = mode == LockstepMode::Auto && eff.resident_blocks ? ptx_kernel_poll_kinds(fn) : 0;
+    if (mode == LockstepMode::All || kinds != 0) {
       // A kernel that can allocate while it runs keeps to one host thread (see below).
       const unsigned threads = allocates_while_running(fn, seen) ? 1u : worker_count(blocks, env.threads);
-      const LockstepShape shape = lockstep_shape(blocks, eff.resident_blocks ? eff.resident_blocks : blocks, threads);
+      // (waits on loads only give the same answer whichever thread runs a block, so a small grid may use the host threads too; a kernel
+      // that takes locks keeps it on one thread, in a fixed order: exec/lockstep.hpp)
+      const LockstepShape shape = lockstep_shape(blocks, eff.resident_blocks ? eff.resident_blocks : blocks, threads, /*ranges=*/false,
+                                                 /*small_grid_spreads=*/lockstep_loads_only(mode, kinds));
       lockstep_note(fn.name.c_str(), blocks, shape);
       std::vector<LaunchStats> per_thread(shape.workers);
       std::atomic<uint64_t> ticket{0}, beat{0};

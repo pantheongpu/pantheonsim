@@ -413,6 +413,23 @@ for gpu_prog in "amd/mi300x lockstep.gfx942" "amd/mi455x lockstep.gfx1250"; do
   expect "$prog on $gpu: the barrier, chain, queue, lock and forward kernels are all found to poll" "5" \
     "$(grep -o 'lockstep: kernel [^,]*' "$log" | sort -u | wc -l)"
   rm -f "$log"
+  # A grid of fewer than 16 groups: waits on loads only (the 10-group producer/consumer) give the same answer in any order, so it uses
+  # the host threads, two groups to a thread at least; a kernel that takes locks (the 12-group patch locks) keeps one thread and a
+  # fixed order.
+  for scenario_kernel in "queue producer_consumer" "locks lock_kernel"; do
+    read -r scenario kernel <<< "$scenario_kernel"
+    log=$(mktemp)
+    out=$(VGPU_QUIET=1 VGPU_GPU=$gpu LD_LIBRARY_PATH="$shim" VGPU_THREADS=4 VGPU_LOCKSTEP_LOG="$log" timeout 300 \
+          "$(dirname "$exe")/$prog" "$scenario" 2>&1)
+    expect "$prog on $gpu, 4 threads: $scenario passes" "PASS" "$(grep -x 'PASS\|FAIL' <<< "$out")"
+    host=$(sed -n "/kernel [^,]*$kernel[^,]*,/s/.* \([0-9][0-9]*\) host thread.*/\1/p" "$log" | head -n 1)
+    rm -f "$log"
+    if [[ $scenario == queue ]]; then
+      expect "$prog on $gpu: the 10-group grid that waits on loads uses the host threads" "yes" "$([[ -n "$host" && "$host" -ge 2 ]] && echo yes || echo "no (${host:-none})")"
+    else
+      expect "$prog on $gpu: the 12-group lock grid stays on one host thread" "1" "$host"
+    fi
+  done
 done
 
 # The MI455X (gfx1250, CDNA 5; wave32): the same self-checking programs built for it by ROCm 7.2's hipcc and run on a
