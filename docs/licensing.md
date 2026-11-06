@@ -36,5 +36,4 @@ Contact saqibkh@pantheonsim.com.
 ## One thing to say plainly
 
 A license that restricts hosting is source-available. It is not open source by the Open Source Initiative's definition,
-so from 0.3.0 we do not call PantheonSim open source. We say "source-available, free except as a hosted service,
-Apache-2.0 after four years".
+so from 0.3.0 we describe it as source-available: free except as a hosted service, Apache-2.0 after four years.
