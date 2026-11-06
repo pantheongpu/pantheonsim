@@ -110,7 +110,9 @@ VTEST(the_first_look_of_a_launch_waits_for_what_the_last_look_cost) {
 VTEST(a_block_that_stands_still_is_still_found_out_and_slept_on) {
   // Looks 250 microseconds apart (a look costs nothing), the third finding nothing changed: the thread then sleeps between passes. Without
   // that it would take a turn every microsecond or so, tens of thousands in 100 ms.
-  VCHECK(spin(100) < 5000);
+  // (A thread that never slept makes hundreds of thousands of turns in 100 ms, even under TSan; one that sleeps makes a few thousand at
+  // most, more on a loaded runner. The bound is between the two.)
+  VCHECK(spin(100) < 50000);
 }
 
 VTEST(the_wait_for_the_first_look_has_a_ceiling) {
