@@ -384,10 +384,10 @@ VTEST(global_accesses_off_a_stride_over_a_full_warp) {
 VTEST(full_warp_runs_at_the_end_of_the_allocation) {
   Scoped scoped;
   const std::vector<uint8_t> input = random_input();
-  const unsigned sizes[][2] = {{0, 0}, {2, 2}, {2, 3}, {4, 4}, {5, 5}, {6, 6}, {4, 0}, {0, 4}};
+  const unsigned sizes[][2] = {{0, 0}, {2, 2}, {2, 3}, {4, 4}, {5, 5}, {6, 6}, {4, 0}, {0, 4}, {0, 6}};   // ({0, 6}: a byte stored, 128 bits loaded: the load is what runs past the end)
   unsigned ran = 0, faulted = 0;
   for (const auto& z : sizes)
-    for (int d : {-32, -8, -4, -1, 0, 1, 4, 32}) {
+    for (int d : {-32, -8, -4, -1, 0, 1, 4, 8, 32}) {   // (8: a 128-bit access whose first half is inside and whose second half is not)
       const unsigned sb = bytes_of(z[0]), lb = bytes_of(z[1]);
       const unsigned elem = std::max(sb, lb);
       const uint32_t total = kIn + 32 * 32;

@@ -1537,6 +1537,10 @@ vgpu_unit_test(test_simd)
 vgpu_unit_test(test_tc_ampere)
 # The vector kernels of that sum against a frozen copy of the earlier form, bit for bit, over random and adversarial operands.
 vgpu_unit_test(test_tc_ampere_fast)
+# IMMA.16816 / 16832 (8-bit operands) straight from the registers (include/vgpu/exec/imma_frag.hpp) against the definition, every sign combination.
+vgpu_unit_test(test_imma_frag)
+# LDSM's data movement (include/vgpu/exec/ldsm.hpp) against the element-at-a-time form it replaced, rows anywhere in the array and at a page's end.
+vgpu_unit_test(test_ldsm_move)
 # The PTX engine's SIMD route for mma.sync against its general path (VGPU_FASTPATH=0), bit for bit.
 vgpu_unit_test(test_mma_fast)
 # The tile-product kernels and the wgmma/mma operand code against the scalar loops they replace, bit for bit.

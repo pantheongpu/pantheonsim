@@ -35,6 +35,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <type_traits>
 
 #include "vgpu/simd/fp16.hpp"
@@ -1118,6 +1119,212 @@ __attribute__((VGPU_TC86_T512, aligned(64), noinline)) inline bool mma_avx512_ch
   } else {
     for (; u + VGPU_TC86_ROWS_Z <= units; u += VGPU_TC86_ROWS_Z) rows(std::false_type{}, std::integral_constant<unsigned, VGPU_TC86_ROWS_Z>{}, u);
     for (; u < units; ++u) rows(std::false_type{}, std::integral_constant<unsigned, 1>{}, u);
+  }
+  return true;
+}
+
+// ---- the 512-bit float-product kernel on the registers of an HMMA / mma.sync m16n8 (f16 or bf16 operands, f32 accumulator) --------------------
+// simd::Kernels::hmma used to take the fragments apart into row-major float matrices (A 16 x K, B K x 8, C 16 x 8), call mma_avx512_chunked_f, and put
+// the answer together again; the kernel then decoded those matrices once more and paired the rows (2p, 2p+1) for the sixteen-lane units. This does the
+// decode straight from the registers into the arrays the units read, and the accumulators and the answer cross between the registers and the unit order
+// by one permutation each. The arithmetic is that of mma_avx512_chunked_f for M = 16, N = 8, chunk 8 (the units, the checks that decline a call, the lanes
+// finished by mma_f_fix512), so a call it takes gives the same bits, and a call it declines has written nothing (the caller then takes the old way).
+//
+// The fragment layout (PTX ISA 9.7.16, m16n8k16 / m16n8k8; a register is 32 words, lane 4g + t, two halves a word, low half first):
+//   A: register 2c + h holds, in the 8 halves of lane group g, row g + 8h, columns 8c .. 8c + 7;
+//   B: register c holds, in the 8 halves of lane group g, column g, rows 8c .. 8c + 7;
+//   C and D (f32): register 2h + e, word 4g + t, is row g + 8h, column 2t + e.
+// The rows (2p, 2p + 1) of a pair are the groups g, g + 1 (g = 2p mod 8) of register 2c + (p >= 4): 32 contiguous bytes, the 16 halves one conversion turns
+// into the floats [row 2p, columns 8c ..][row 2p+1, ...].
+template <bool BF16>
+__attribute__((VGPU_TC86_T512)) inline __m512i frag_halves_bits(__m256i h) {
+  if constexpr (BF16) return _mm512_slli_epi32(_mm512_cvtepu16_epi32(h), 16);
+  else return _mm512_castps_si512(_mm512_cvtph_ps(h));
+}
+
+// The two operands as the row-major float matrices the cold paths read (mma_f_fix512 re-does a lane from the operands themselves).
+template <bool BF16>
+__attribute__((VGPU_TC86_T512, noinline, cold)) inline void frag_to_matrices(unsigned K, const uint32_t* a, const uint32_t* b, float* A, float* B) {
+  const auto conv = [](uint16_t h) {
+    if constexpr (BF16) return std::bit_cast<float>(static_cast<uint32_t>(h) << 16);
+    else return simd::f16_to_f32(h);   // (the scalar conversion, which F16C is checked against at start-up)
+  };
+  for (unsigned r = 0; r < K / 4; ++r) {   // (register r of A: row g + 8 (r & 1), columns 8 (r >> 1) + j)
+    uint16_t hw[64];   // (the register's 64 halves in memory order)
+    std::memcpy(hw, a + size_t{r} * 32, sizeof hw);
+    for (unsigned g = 0; g < 8; ++g)
+      for (unsigned j = 0; j < 8; ++j) A[(g + 8 * (r & 1)) * K + 8 * (r >> 1) + j] = conv(hw[g * 8 + j]);
+  }
+  for (unsigned r = 0; r < K / 8; ++r) {   // (register r of B: column g, rows 8 r + j)
+    uint16_t hw[64];
+    std::memcpy(hw, b + size_t{r} * 32, sizeof hw);
+    for (unsigned g = 0; g < 8; ++g)
+      for (unsigned j = 0; j < 8; ++j) B[(8 * r + j) * 8 + g] = conv(hw[g * 8 + j]);
+  }
+}
+
+// K is 8 or 16; `c` may be null (a zero accumulator); `out` is four registers.
+template <bool BF16>
+__attribute__((VGPU_TC86_T512, aligned(64), noinline)) inline bool mma_avx512_frag_m16n8(unsigned K, int emin, const uint32_t* a, const uint32_t* b, const uint32_t* c,
+                                                                                     uint32_t* out) {
+  constexpr unsigned NC = 8, kMaxK = 16;
+  alignas(64) float bf2[kMaxK * 16];        // B: for each k, the 8 columns each doubled (lane 2j + s is column j)
+  alignas(64) int32_t bt2[kMaxK * 16];
+  alignas(64) int64_t apf[8 * kMaxK];       // A: for each pair p of rows and k, the floats of rows (2p, 2p+1) as one 64-bit element ...
+  alignas(64) int64_t apt[8 * kMaxK];       //  ... and their terms
+  alignas(64) uint32_t acc_in[8 * 16], acc_out[8 * 16];   // the accumulators and the answer, a unit (pair p) a row of sixteen lanes
+  alignas(64) float afull[16 * kMaxK], bfull[kMaxK * 8];
+  bool have_full = false;
+  const __m512i zero = _mm512_setzero_si512(), cff = _mm512_set1_epi32(0xff), c7fffff = _mm512_set1_epi32(0x7fffff), c254 = _mm512_set1_epi32(254),
+                cnoterm = _mm512_set1_epi32(kNoTerm), cmask = _mm512_set1_epi32(static_cast<int>(0xffffe000u)), one = _mm512_set1_epi32(1);
+  __m512i amx = zero, amn = _mm512_set1_epi32(-1), bmx = zero, bmn = _mm512_set1_epi32(-1);
+  __mmask16 subn = 0;
+  // (decode_v of mma_avx512_chunked_f, for sixteen live lanes. For f16 operands the mask (the low 13 bits of a tf32) changes nothing: a half's float has
+  // them clear, and the float subnormal that `subn` looks for cannot arise (an exponent field of 0 is a zero, and 255 is declined by the maximum), so
+  // neither is computed.)
+  const auto decode_v = [&](const __m512i bits, int bias, float* fout, int32_t* tout, __m512i& mx, __m512i& mn) __attribute__((VGPU_TC86_T512)) {
+    const __m512i masked = BF16 ? _mm512_and_si512(bits, cmask) : bits;
+    const __m512i e = _mm512_and_si512(_mm512_srli_epi32(bits, 23), cff);
+    const __m512i em1 = _mm512_sub_epi32(e, one);
+    const __mmask16 dead = _mm512_cmpge_epu32_mask(em1, c254);   // e == 0 or e == 255
+    if constexpr (BF16) subn = static_cast<__mmask16>(subn | _mm512_mask_test_epi32_mask(dead, masked, c7fffff));
+    const __m512i term = _mm512_max_epi32(_mm512_sub_epi32(e, _mm512_set1_epi32(127 - bias)), _mm512_set1_epi32(emin + bias));
+    _mm512_storeu_si512(tout, _mm512_mask_mov_epi32(term, dead, cnoterm));
+    _mm512_storeu_ps(fout, _mm512_castsi512_ps(masked));
+    mx = _mm512_max_epi32(mx, e);
+    mn = _mm512_min_epu32(mn, em1);
+  };
+  const unsigned nch = K / 8;
+  {
+    const __m512i in8 = _mm512_setr_epi32(0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15);
+    for (unsigned p = 0; p < 8; ++p)
+      for (unsigned ch = 0; ch < nch; ++ch) {
+        const uint32_t* const src = a + size_t{2 * ch + (p >> 2)} * 32 + 4 * ((2 * p) & 7);
+        const __m512i bits = _mm512_permutexvar_epi32(in8, frag_halves_bits<BF16>(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src))));
+        decode_v(bits, 1, reinterpret_cast<float*>(apf + p * K + ch * 8), reinterpret_cast<int32_t*>(apt + p * K + ch * 8), amx, amn);
+      }
+  }
+  for (unsigned ch = 0; ch < nch; ++ch) {   // B: an 8 x 8 block of halves, transposed (k-major) and each column doubled
+    const uint32_t* const src = b + size_t{ch} * 32;
+    const __m128i r0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src)), r1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 4)),
+                  r2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 8)), r3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 12)),
+                  r4 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 16)), r5 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 20)),
+                  r6 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 24)), r7 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 28));
+    const __m128i a0 = _mm_unpacklo_epi16(r0, r1), a1 = _mm_unpackhi_epi16(r0, r1), a2 = _mm_unpacklo_epi16(r2, r3), a3 = _mm_unpackhi_epi16(r2, r3),
+                  a4 = _mm_unpacklo_epi16(r4, r5), a5 = _mm_unpackhi_epi16(r4, r5), a6 = _mm_unpacklo_epi16(r6, r7), a7 = _mm_unpackhi_epi16(r6, r7);
+    const __m128i b0 = _mm_unpacklo_epi32(a0, a2), b1 = _mm_unpackhi_epi32(a0, a2), b2 = _mm_unpacklo_epi32(a1, a3), b3 = _mm_unpackhi_epi32(a1, a3),
+                  b4 = _mm_unpacklo_epi32(a4, a6), b5 = _mm_unpackhi_epi32(a4, a6), b6 = _mm_unpacklo_epi32(a5, a7), b7 = _mm_unpackhi_epi32(a5, a7);
+    const __m128i t[8] = {_mm_unpacklo_epi64(b0, b4), _mm_unpackhi_epi64(b0, b4), _mm_unpacklo_epi64(b1, b5), _mm_unpackhi_epi64(b1, b5),
+                          _mm_unpacklo_epi64(b2, b6), _mm_unpackhi_epi64(b2, b6), _mm_unpacklo_epi64(b3, b7), _mm_unpackhi_epi64(b3, b7)};   // t[j][g] = B[8 ch + j][g]
+    VGPU_TC86_UNROLL
+    for (unsigned j = 0; j < 8; ++j) {
+      const __m256i dbl = _mm256_set_m128i(_mm_unpackhi_epi16(t[j], t[j]), _mm_unpacklo_epi16(t[j], t[j]));
+      const size_t k = size_t{ch} * 8 + j;
+      decode_v(frag_halves_bits<BF16>(dbl), 0, &bf2[k * 16], &bt2[k * 16], bmx, bmn);
+    }
+  }
+  const int a_max = _mm512_reduce_max_epi32(amx), b_max = _mm512_reduce_max_epi32(bmx);
+  if (a_max == 255 || b_max == 255 || subn) return false;
+  const auto field_min = [](uint32_t m) { return m >= 254 ? 255 : static_cast<int>(m) + 1; };
+  const int a_min = field_min(_mm512_reduce_min_epu32(amn)), b_min = field_min(_mm512_reduce_min_epu32(bmn));
+  if (a_min <= 254 && b_min <= 254 && a_min + b_min < 128) return false;
+  if (a_max + b_max > 379) return false;
+
+  // The accumulators in unit order: lane 2j + r is row 2p + r, column j = 2t + e, from word 4g + t of registers 2h + e (g = 2p mod 8, h = p >= 4).
+  if (c) {
+    const __m512i idx_in = _mm512_setr_epi32(0, 4, 16, 20, 1, 5, 17, 21, 2, 6, 18, 22, 3, 7, 19, 23);   // e * 16 + r * 4 + t (the odd register's words are the second operand)
+    for (unsigned p = 0; p < 8; ++p) {
+      const size_t at = size_t{2 * (p >> 2)} * 32 + 4 * ((2 * p) & 7);
+      const __m512i x = _mm512_castsi256_si512(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(c + at))),
+                    y = _mm512_castsi256_si512(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(c + at + 32)));
+      _mm512_store_si512(&acc_in[p * 16], _mm512_permutex2var_epi32(x, idx_in, y));
+    }
+  } else {
+    for (unsigned p = 0; p < 8; ++p) _mm512_store_si512(&acc_in[p * 16], zero);
+  }
+
+  const auto units = [&]<unsigned R>(std::integral_constant<unsigned, R>, unsigned u0) __attribute__((VGPU_TC86_T512)) {
+    const unsigned Kl = K;
+    const int64_t* const aptl = apt;
+    const int64_t* const apfl = apf;
+    const int32_t* const btl = bt2;
+    const float* const bfl = bf2;
+    const int emin_l = emin;
+    const __m512i cff = _mm512_set1_epi32(0xff), c7fffff = _mm512_set1_epi32(0x7fffff), c255 = _mm512_set1_epi32(255), c150 = _mm512_set1_epi32(150),
+                  c127 = _mm512_set1_epi32(127), c25 = _mm512_set1_epi32(25), one = _mm512_set1_epi32(1), zero = _mm512_setzero_si512();
+    __m512i accb[R];
+    VGPU_TC86_UNROLL
+    for (unsigned r = 0; r < R; ++r) accb[r] = _mm512_load_si512(&acc_in[(u0 + r) * 16]);
+    for (unsigned k0 = 0; k0 < Kl; k0 += NC) {
+      __m512i top[R], g[R], S[R];
+      __m512 scale[R];
+      __mmask16 acc_nonfin[R], badg[R];
+      const int32_t* const bt = btl + size_t{k0} * 16;
+      const float* const bp = bfl + size_t{k0} * 16;
+      VGPU_TC86_UNROLL
+      for (unsigned r = 0; r < R; ++r) {
+        top[r] = _mm512_set1_epi32(kNoTerm);
+        VGPU_TC86_UNROLL
+        for (unsigned t = 0; t < NC; ++t)
+          top[r] = _mm512_max_epi32(top[r], _mm512_add_epi32(_mm512_set1_epi64(aptl[size_t{u0 + r} * Kl + k0 + t]), _mm512_load_si512(bt + size_t{t} * 16)));
+      }
+      VGPU_TC86_UNROLL
+      for (unsigned r = 0; r < R; ++r) {
+        const __m512i ae = _mm512_and_si512(_mm512_srli_epi32(accb[r], 23), cff), am = _mm512_and_si512(accb[r], c7fffff);
+        const __mmask16 aenz = _mm512_cmpneq_epi32_mask(ae, zero);
+        acc_nonfin[r] = _mm512_cmpeq_epi32_mask(ae, c255);
+        __m512i asig = _mm512_mask_or_epi32(am, aenz, am, _mm512_set1_epi32(0x800000));
+        const __m512i alsb = _mm512_mask_blend_epi32(aenz, _mm512_set1_epi32(-149), _mm512_sub_epi32(ae, c150));
+        const __m512i lead = _mm512_sub_epi32(_mm512_srli_epi32(_mm512_castps_si512(_mm512_cvtepi32_ps(asig)), 23), c127);
+        top[r] = _mm512_max_epi32(top[r], _mm512_add_epi32(_mm512_add_epi32(lead, alsb), one));
+        asig = _mm512_mask_sub_epi32(asig, _mm512_movepi32_mask(accb[r]), zero, asig);
+        g[r] = _mm512_sub_epi32(top[r], c25);
+        S[r] = shift_term_avx512(asig, _mm512_sub_epi32(alsb, g[r]));
+        const __mmask16 live = _mm512_cmpgt_epi32_mask(top[r], _mm512_set1_epi32(-200));
+        const __m512i sexp = _mm512_maskz_sub_epi32(live, c127, g[r]);
+        badg[r] = static_cast<__mmask16>(_mm512_mask_cmplt_epi32_mask(live, sexp, one) | _mm512_mask_cmpgt_epi32_mask(live, sexp, _mm512_set1_epi32(254)));
+        scale[r] = _mm512_castsi512_ps(_mm512_slli_epi32(sexp, 23));
+      }
+      VGPU_TC86_UNROLL
+      for (unsigned r = 0; r < R; ++r) {
+        VGPU_TC86_UNROLL
+        for (unsigned t = 0; t < NC; ++t) {
+          const __m512 x = _mm512_mul_ps(_mm512_castsi512_ps(_mm512_set1_epi64(apfl[size_t{u0 + r} * Kl + k0 + t])), _mm512_load_ps(bp + size_t{t} * 16));
+          S[r] = _mm512_add_epi32(S[r], _mm512_cvttps_epi32(_mm512_mul_ps(x, scale[r])));
+        }
+      }
+      VGPU_TC86_UNROLL
+      for (unsigned r = 0; r < R; ++r) {
+        __m512i res;
+        __mmask16 snz, inrange;
+        sum_to_f32_avx512(S[r], g[r], res, snz, inrange);
+        const unsigned redo = static_cast<unsigned>(snz & ~inrange & 0xffffu), special = acc_nonfin[r], bad = badg[r];
+        if (__builtin_expect(redo | special | bad, 0)) {
+          if (!have_full) {
+            frag_to_matrices<BF16>(Kl, a, b, afull, bfull);
+            have_full = true;
+          }
+          res = mma_f_fix512<NC, false, true>(S[r], g[r], accb[r], res, redo, special, bad, &afull[2 * size_t{u0 + r} * Kl + k0], Kl, &bfull[size_t{k0} * 8], 8, emin_l);
+        }
+        accb[r] = res;
+      }
+    }
+    VGPU_TC86_UNROLL
+    for (unsigned r = 0; r < R; ++r) _mm512_store_si512(&acc_out[(u0 + r) * 16], accb[r]);
+  };
+  unsigned u = 0;
+  for (; u + VGPU_TC86_ROWS_Z <= 8; u += VGPU_TC86_ROWS_Z) units(std::integral_constant<unsigned, VGPU_TC86_ROWS_Z>{}, u);
+  for (; u < 8; ++u) units(std::integral_constant<unsigned, 1>{}, u);
+
+  // The answer to the registers (a NaN as the register holds it: the canonical 0x7fffffff): registers 2h + e, word 4g + t, from lane 4t + 2e + r of unit p.
+  const __m512i idx_out = _mm512_setr_epi32(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);   // [even columns of the two rows | odd columns]
+  const __m512i cnan = _mm512_set1_epi32(0x7fffffff);
+  for (unsigned p = 0; p < 8; ++p) {
+    __m512i v = _mm512_permutexvar_epi32(idx_out, _mm512_load_si512(&acc_out[p * 16]));
+    v = _mm512_mask_mov_epi32(v, _mm512_cmp_ps_mask(_mm512_castsi512_ps(v), _mm512_castsi512_ps(v), _CMP_UNORD_Q), cnan);
+    const size_t at = size_t{2 * (p >> 2)} * 32 + 4 * ((2 * p) & 7);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + at), _mm512_castsi512_si256(v));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + at + 32), _mm512_extracti64x4_epi64(v, 1));
   }
   return true;
 }
