@@ -483,6 +483,157 @@ static void multicast() {
   cuCtxDestroy(c);
 }
 
+// ---- calls that need no current context ----
+// Measured on an RTX 3060 (driver 13.0): a stream-ordered call that names a stream of its own takes its context from the
+// stream, memory is freed by the context that owns the pointer, and a virtual address range belongs to the device. All of
+// these work with nothing current on the thread, which is how cuda-api-wrappers drives the API (retain the primary context,
+// push it for one call, pop it again). The legacy and per-thread streams and NULL belong to the current context, so the
+// same calls on them fail with CUDA_ERROR_INVALID_CONTEXT, as do the synchronous copies.
+static void drain_stack() {
+  CUcontext c;
+  while (cuCtxPopCurrent(&c) == CUDA_SUCCESS) {}
+}
+static void calls_without_context() {
+  drain_stack();
+  CUdevice dev;
+  cuDeviceGet(&dev, 0);
+  CUcontext ctx = nullptr;
+  IS(cuDevicePrimaryCtxRetain(&ctx, dev), CUDA_SUCCESS);
+  IS(cuCtxPushCurrent(ctx), CUDA_SUCCESS);
+  CUstream s;
+  IS(cuStreamCreate(&s, CU_STREAM_NON_BLOCKING), CUDA_SUCCESS);
+  CUdeviceptr dptr = 0, managed = 0, other = 0;
+  void* pinned = nullptr;
+  IS(cuMemAlloc(&dptr, 4096), CUDA_SUCCESS);
+  IS(cuMemAlloc(&other, 4096), CUDA_SUCCESS);
+  IS(cuMemAllocManaged(&managed, 4096, CU_MEM_ATTACH_GLOBAL), CUDA_SUCCESS);
+  IS(cuMemHostAlloc(&pinned, 4096, CU_MEMHOSTALLOC_DEVICEMAP), CUDA_SUCCESS);
+  CUmemPoolProps props = {};
+  props.allocType = CU_MEM_ALLOCATION_TYPE_PINNED;
+  props.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  props.location.id = 0;
+  CUmemoryPool pool = nullptr;
+  IS(cuMemPoolCreate(&pool, &props), CUDA_SUCCESS);
+  CUDA_ARRAY3D_DESCRIPTOR ad = {};
+  ad.Width = 4;
+  ad.Height = 4;
+  ad.Depth = 4;
+  ad.Format = CU_AD_FORMAT_FLOAT;
+  ad.NumChannels = 1;
+  CUarray arr = nullptr;
+  IS(cuArray3DCreate(&arr, &ad), CUDA_SUCCESS);
+  CUcontext popped = nullptr;
+  IS(cuCtxPopCurrent(&popped), CUDA_SUCCESS);
+  check(current() == nullptr, "nothing is current from here on");
+
+  // Stream-ordered: the stream identifies the context.
+  CUdeviceptr p = 0;
+  static float host[64];
+  IS(cuMemAllocFromPoolAsync(&p, 1024, pool, s), CUDA_SUCCESS);
+  IS(cuMemFreeAsync(p, s), CUDA_SUCCESS);
+  IS(cuMemAllocAsync(&p, 1024, s), CUDA_SUCCESS);
+  IS(cuMemFreeAsync(p, s), CUDA_SUCCESS);
+  IS(cuMemcpyHtoDAsync(dptr, host, 64, s), CUDA_SUCCESS);
+  IS(cuMemcpyDtoHAsync(host, dptr, 64, s), CUDA_SUCCESS);
+  IS(cuMemcpyDtoDAsync(other, dptr, 64, s), CUDA_SUCCESS);
+  IS(cuMemcpyAsync(other, dptr, 64, s), CUDA_SUCCESS);
+  IS(cuMemsetD8Async(dptr, 1, 64, s), CUDA_SUCCESS);
+  IS(cuMemsetD32Async(dptr, 1, 16, s), CUDA_SUCCESS);
+  CUDA_MEMCPY3D c = {};
+  c.srcMemoryType = CU_MEMORYTYPE_HOST;
+  c.srcHost = host;
+  c.srcPitch = 16;
+  c.srcHeight = 4;
+  c.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+  c.dstArray = arr;
+  c.WidthInBytes = 16;
+  c.Height = 4;
+  c.Depth = 4;
+  IS(cuMemcpy3DAsync(&c, s), CUDA_SUCCESS);
+  IS(cuStreamSynchronize(s), CUDA_SUCCESS);
+  // The synchronous copy has no stream and needs the context.
+  IS(cuMemcpy3D(&c), CUDA_ERROR_INVALID_CONTEXT);
+  IS(cuMemcpy(other, dptr, 64), CUDA_ERROR_INVALID_CONTEXT);
+  IS(cuMemsetD8(dptr, 1, 64), CUDA_ERROR_INVALID_CONTEXT);
+  // The streams that are the current context's own.
+  IS(cuMemAllocAsync(&p, 64, nullptr), CUDA_ERROR_INVALID_CONTEXT);
+  IS(cuMemAllocAsync(&p, 64, CU_STREAM_LEGACY), CUDA_ERROR_INVALID_CONTEXT);
+  IS(cuMemAllocFromPoolAsync(&p, 64, pool, nullptr), CUDA_ERROR_INVALID_CONTEXT);
+  IS(cuMemAllocFromPoolAsync(&p, 64, pool, CU_STREAM_PER_THREAD), CUDA_ERROR_INVALID_CONTEXT);
+  IS(cuMemcpyHtoDAsync(dptr, host, 64, nullptr), CUDA_ERROR_INVALID_CONTEXT);
+  IS(cuMemsetD8Async(dptr, 1, 64, nullptr), CUDA_ERROR_INVALID_CONTEXT);
+  IS(cuStreamQuery(nullptr), CUDA_ERROR_INVALID_CONTEXT);
+  IS(cuStreamQuery(CU_STREAM_LEGACY), CUDA_ERROR_INVALID_CONTEXT);
+  IS(cuStreamSynchronize(CU_STREAM_LEGACY), CUDA_ERROR_INVALID_CONTEXT);
+  IS(cuStreamSynchronize(CU_STREAM_PER_THREAD), CUDA_ERROR_INVALID_CONTEXT);
+
+  // Address ranges are the device's.
+  CUdeviceptr base = 0;
+  IS(cuMemAddressReserve(&base, 2 << 20, 0, 0, 0), CUDA_SUCCESS);
+  check(base != 0, "the range has an address");
+  IS(cuMemAddressFree(base, 2 << 20), CUDA_SUCCESS);
+
+  // Frees: the owning context is known from the pointer.
+  IS(cuMemFree(managed), CUDA_SUCCESS);
+  IS(cuMemFree(dptr), CUDA_SUCCESS);
+  IS(cuMemFree(other), CUDA_SUCCESS);
+  IS(cuMemFreeHost(pinned), CUDA_SUCCESS);
+  check(current() == nullptr, "none of it made a context current");
+
+  IS(cuCtxPushCurrent(ctx), CUDA_SUCCESS);
+  IS(cuArrayDestroy(arr), CUDA_SUCCESS);
+  IS(cuMemPoolDestroy(pool), CUDA_SUCCESS);
+  IS(cuStreamDestroy(s), CUDA_SUCCESS);
+  IS(cuCtxPopCurrent(&popped), CUDA_SUCCESS);
+  IS(cuDevicePrimaryCtxRelease(dev), CUDA_SUCCESS);
+}
+
+// ---- the context a pointer belongs to ----
+// cuPointerGetAttribute(CONTEXT) is the context the memory was allocated in, whichever is current when it is asked
+// (measured on an RTX 3060): with two contexts on one device, each pointer names its own, queried from a third.
+static void pointer_owner_context() {
+  drain_stack();
+  CUdevice dev;
+  cuDeviceGet(&dev, 0);
+  CUcontext c1, c2, primary;
+  IS(make_ctx(&c1, 0, dev), CUDA_SUCCESS);
+  CUdeviceptr p1 = 0, m1 = 0;
+  IS(cuMemAlloc(&p1, 123), CUDA_SUCCESS);
+  IS(cuMemAllocManaged(&m1, 123, CU_MEM_ATTACH_GLOBAL), CUDA_SUCCESS);
+  void* h1 = nullptr;
+  IS(cuMemHostAlloc(&h1, 123, 0), CUDA_SUCCESS);
+  IS(make_ctx(&c2, 0, dev), CUDA_SUCCESS);
+  CUdeviceptr p2 = 0;
+  IS(cuMemAlloc(&p2, 123), CUDA_SUCCESS);
+  IS(cuDevicePrimaryCtxRetain(&primary, dev), CUDA_SUCCESS);
+  IS(cuCtxPushCurrent(primary), CUDA_SUCCESS);
+  const auto owner = [](CUdeviceptr p) {
+    CUcontext got = nullptr;
+    return cuPointerGetAttribute(&got, CU_POINTER_ATTRIBUTE_CONTEXT, p) == CUDA_SUCCESS ? got : nullptr;
+  };
+  check(owner(p1) == c1, "a device pointer names the context it was allocated in, not the current one");
+  check(owner(p2) == c2, "and so does one from another context on the same device");
+  check(owner(p1 + 100) == c1, "an address inside the allocation too");
+  check(owner(m1) == c1, "a managed pointer names its context");
+  check(owner(reinterpret_cast<CUdeviceptr>(h1)) == c1, "so does a pinned host pointer");
+  CUcontext attrs = nullptr;
+  CUpointer_attribute which = CU_POINTER_ATTRIBUTE_CONTEXT;
+  void* out = &attrs;
+  IS(cuPointerGetAttributes(1, &which, &out, p2), CUDA_SUCCESS);
+  check(attrs == c2, "cuPointerGetAttributes agrees");
+  IS(cuCtxPopCurrent(&attrs), CUDA_SUCCESS);
+  IS(cuCtxSetCurrent(c1), CUDA_SUCCESS);
+  IS(cuMemFree(m1), CUDA_SUCCESS);
+  IS(cuMemFreeHost(h1), CUDA_SUCCESS);
+  IS(cuMemFree(p1), CUDA_SUCCESS);
+  IS(cuCtxSetCurrent(c2), CUDA_SUCCESS);
+  IS(cuMemFree(p2), CUDA_SUCCESS);
+  IS(cuCtxSetCurrent(nullptr), CUDA_SUCCESS);
+  IS(cuCtxDestroy(c1), CUDA_SUCCESS);
+  IS(cuCtxDestroy(c2), CUDA_SUCCESS);
+  IS(cuDevicePrimaryCtxRelease(dev), CUDA_SUCCESS);
+}
+
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);   // every line out, should a call crash
   if (cuInit(0) != CUDA_SUCCESS) {
@@ -497,6 +648,8 @@ int main() {
   limits();
   exported_memory();
   multicast();
+  calls_without_context();
+  pointer_owner_context();
   std::printf(failures ? "FAIL: %d driver checks\n" : "PASS: every driver check\n", failures);
   return failures ? 1 : 0;
 }
