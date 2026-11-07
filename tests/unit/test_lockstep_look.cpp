@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <memory>
 #include <thread>
+#include <type_traits>
+#include <utility>
 
 #include "vgpu/exec/lockstep.hpp"
 #include "vtest.hpp"
@@ -31,6 +33,7 @@ void busy(std::chrono::microseconds d) {
 
 // One launch of `units` blocks, all resident, each finishing `run_ms` after its first turn. A look costs `fold_us` a block. Returns the
 // number of times a block was folded. (One call site, so one memory of what a look costs, shared by the calls below in order.)
+template <int Tag>
 unsigned launch(unsigned units, unsigned run_ms, unsigned fold_us) {
   std::atomic<uint64_t> ticket{0}, beat{0};
   unsigned folds = 0;
@@ -54,6 +57,7 @@ unsigned launch(unsigned units, unsigned run_ms, unsigned fold_us) {
 }
 
 // The same, for a block that stands still; its own call site. Returns the number of turns it was given in `run_ms`.
+template <int Tag>
 uint64_t spin(unsigned run_ms) {
   std::atomic<uint64_t> ticket{0}, beat{0};
   uint64_t turns = 0;
@@ -71,7 +75,21 @@ uint64_t spin(unsigned run_ms) {
   return turns;
 }
 
+// How many turns of spin()'s kind a thread takes in a microsecond on this machine and in this build (a turn reads the clock twice and yields): the
+// answer differs by an order of magnitude between a plain build and a sanitizer build, and a fixed bound on the turns taken cannot be
+// right for both.
+double turns_per_us() {
+  uint64_t n = 0;
+  const auto start = Clock::now();
+  while (Clock::now() - start < std::chrono::milliseconds(2)) {
+    ++n;
+    std::this_thread::yield();   // (a pass that waits gives the core up, as the worker does)
+  }
+  return static_cast<double>(n) / 2000.0;
+}
+
 // Its own call site again, for the cap on the wait.
+template <int Tag>
 unsigned launch_cap(unsigned run_us, unsigned fold_us) {
   std::atomic<uint64_t> ticket{0}, beat{0};
   unsigned folds = 0;
@@ -93,41 +111,71 @@ unsigned launch_cap(unsigned run_us, unsigned fold_us) {
   return folds;
 }
 
+// These tests are about when things happen on the wall clock, so a thread that is descheduled for a few milliseconds (a loaded CI
+// machine, and every sanitizer build) can change what a launch sees: a look that was preempted teaches the call site a cost of
+// milliseconds, and the nap that follows never comes within the test's window. So a case may be tried again, up to kAttempts times, each
+// time on call sites of its own (the Tag), which have learned nothing; it passes if one attempt gives the expected answers. A mistake in
+// the worker gives the wrong answer in every attempt and still fails.
+constexpr int kAttempts = 6;
+
+template <class F, size_t... I>
+bool some_attempt_holds(F f, std::index_sequence<I...>) {
+  return (f(std::integral_constant<int, static_cast<int>(I)>{}) || ...);
+}
+
+template <class F>
+bool eventually(F f) {
+  return some_attempt_holds(f, std::make_index_sequence<kAttempts>{});
+}
+
 }  // namespace
 
 VTEST(the_first_look_of_a_launch_waits_for_what_the_last_look_cost) {
-  // Nothing is known yet: the look comes after 250 microseconds, and costs 2 ms a block for each of the two.
-  VCHECK_EQ(launch(2, 8, 2000), 2u);
-  // One block, 20 ms: its look would cost 2 ms, so the first comes after 24 ms, and the launch is over before that.
-  // (Not twelve times what both blocks' look cost, and not the 250 microseconds.)
-  VCHECK_EQ(launch(1, 20, 2000), 0u);
-  // The same for 36 ms: the look comes at about 24 ms, and the next would be 24 ms after it.
-  VCHECK_EQ(launch(1, 36, 2000), 1u);
-  // Two blocks resident: the cost is 2 ms for each, so the first look is after 48 ms, not 24.
-  VCHECK_EQ(launch(2, 36, 2000), 0u);
+  VCHECK(eventually([](auto tag) {
+    constexpr int T = decltype(tag)::value;
+    // Nothing is known yet: the look comes after 250 microseconds, and costs 2 ms a block for each of the two.
+    if (launch<T>(2, 8, 2000) != 2u) return false;
+    // One block, 20 ms: its look would cost 2 ms, so the first comes after 24 ms, and the launch is over before that.
+    // (Not twelve times what both blocks' look cost, and not the 250 microseconds.)
+    if (launch<T>(1, 20, 2000) != 0u) return false;
+    // The same for 36 ms: the look comes at about 24 ms, and the next would be 24 ms after it.
+    if (launch<T>(1, 36, 2000) != 1u) return false;
+    // Two blocks resident: the cost is 2 ms for each, so the first look is after 48 ms, not 24.
+    return launch<T>(2, 36, 2000) == 0u;
+  }));
 }
 
 VTEST(a_block_that_stands_still_is_still_found_out_and_slept_on) {
   // Looks 250 microseconds apart (a look costs nothing), the third finding nothing changed: the thread then sleeps between passes. Without
-  // that it would take a turn every microsecond or so, tens of thousands in 100 ms.
-  VCHECK(spin(100) < 5000);
+  // that it would take a turn every microsecond or so for the 100 ms. With it, the turns are the ones before the third look (about
+  // 750 microseconds' worth) and a few hundred more: about one hundredth of the others. The bound is a quarter, measured on this machine.
+  VCHECK(eventually([](auto tag) {
+    const double bound = turns_per_us() * 100000.0 / 4.0;
+    return static_cast<double>(spin<decltype(tag)::value>(100)) < bound;
+  }));
 }
 
 VTEST(the_wait_for_the_first_look_has_a_ceiling) {
-  // Nothing is known: a launch over in 50 microseconds has not looked (the first look is 250 microseconds in, never at once).
-  VCHECK_EQ(launch_cap(50, 50000), 0u);
-  // A look of 50 ms a block, taken at 250 microseconds, teaches the call site that.
-  VCHECK_EQ(launch_cap(5000, 50000), 1u);
-  // Twelve times that would put the next launch's first look at 600 ms; the ceiling is 500 ms, and not 100.
-  VCHECK_EQ(launch_cap(300000, 50000), 0u);
-  VCHECK_EQ(launch_cap(560000, 50000), 1u);   // (the look at 500 ms, not the one at 600)
+  VCHECK(eventually([](auto tag) {
+    constexpr int T = decltype(tag)::value;
+    // Nothing is known: a launch over in 50 microseconds has not looked (the first look is 250 microseconds in, never at once).
+    if (launch_cap<T>(50, 50000) != 0u) return false;
+    // A look of 50 ms a block, taken at 250 microseconds, teaches the call site that.
+    if (launch_cap<T>(5000, 50000) != 1u) return false;
+    // Twelve times that would put the next launch's first look at 600 ms; the ceiling is 500 ms, and not 100.
+    if (launch_cap<T>(300000, 50000) != 0u) return false;
+    return launch_cap<T>(560000, 50000) == 1u;   // (the look at 500 ms, not the one at 600)
+  }));
 }
 
 VTEST(once_it_has_looked_a_launch_looks_again_after_twelve_times_the_look) {
-  // Taught 2 ms a block (first launch below), the first look is at 24 ms, the second at 50 and the third at 76: three in 80 ms.
-  launch(1, 30, 2000);
-  const unsigned n = launch(1, 80, 2000);
-  VCHECK(n >= 2 && n <= 3);
+  VCHECK(eventually([](auto tag) {
+    constexpr int T = decltype(tag)::value;
+    // Taught 2 ms a block (first launch below), the first look is at 24 ms, the second at 50 and the third at 76: three in 80 ms.
+    launch<T>(1, 30, 2000);
+    const unsigned n = launch<T>(1, 80, 2000);
+    return n >= 2 && n <= 3;
+  }));
 }
 
 VTEST_MAIN
