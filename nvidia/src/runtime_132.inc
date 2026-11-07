@@ -36,7 +36,7 @@ static cudaError_t cudaLaunchHostFunc_v2_traced(cudaStream_t stream, cudaHostFn_
   if (syncMode > 1) return cudaErrorInvalidValue;
   if (!fn) return cudaSuccess;
   if (capture_host_fn(stream, fn, user)) return cudaSuccess;
-  fn(user);
+  async_push_host(stream, fn, user);   // queued behind the stream's work, as cudaLaunchHostFunc
   return cudaSuccess;
 }
 

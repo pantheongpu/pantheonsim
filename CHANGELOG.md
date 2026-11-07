@@ -7,6 +7,14 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- CUDA runtime: `cudaLaunchHostFunc` (and `cudaLaunchHostFunc_v2`) enqueues the function and returns; it runs on a worker thread for
+  the stream, after the stream's earlier host work and before its later work. An event recorded behind it, and `cudaStreamQuery`, report
+  `cudaErrorNotReady` until it has finished, as does `cudaEventElapsedTime`; `cudaStreamSynchronize`, `cudaEventSynchronize` and
+  `cudaDeviceSynchronize` wait for it; `cudaStreamWaitEvent` on a pending event holds the other stream back; the legacy default stream
+  orders against blocking streams. A host function that waits for something the caller does after enqueueing it no longer hangs the
+  call (pantheonsim #487). Kernels, copies and fills still run to completion inside their calls, so an event recorded behind a long
+  kernel is still complete at once (#523 stays open); `cuLaunchHostFunc` in the driver API still runs inline. Programs that never queue
+  a host function see no change. `cudaErrorNotReady` from a query is no longer left as the last error (`cudaGetLastError`), as on a card.
 - License: from the next release PantheonSim is under the Business Source License 1.1, which keeps it free to use, change and run in
   your own CI and allows one restriction: you may not offer it to other people as a hosted or managed service. Each version becomes
   Apache-2.0 four years after release. Versions up to 0.2.0 stay Apache-2.0 (`LICENSE-APACHE-2.0`). `docs/licensing.md` has the
