@@ -29,6 +29,7 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
   };
   auto use_addr = [&](const Addr& a) {
     if (a.base_kind == Addr::Base::Reg && a.base_id != kNoReg) uses.push_back(keyed ? a.base_id * 2 + (a.base_wide ? 1u : 0u) : a.base_id);
+    if (a.index_id != kNoReg) uses.push_back(keyed ? a.index_id * 2 + (a.index_wide ? 1u : 0u) : a.index_id);   // var[%reg]
   };
   if (ins.has_pred && ins.pred.id != kNoReg) uses.push_back(K(ins.pred));
 

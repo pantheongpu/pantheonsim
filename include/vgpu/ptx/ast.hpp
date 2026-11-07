@@ -164,6 +164,12 @@ struct Addr {
   // parameter list, so a load need not look its name up in a hash table.
   uint32_t param_index = kNoReg;
   int64_t offset = 0;
+  // For base_kind == Symbol addressed as `var[%reg]`: the element index register (in index_wide's file) and the
+  // element size in bytes. The address is the variable's plus the register's value (signed) times index_scale.
+  uint32_t index_id = kNoReg;
+  bool index_wide = false;
+  uint32_t index_scale = 0;
+  std::string index;
 };
 
 enum class Space { Param, Global, Shared, Local, Generic };

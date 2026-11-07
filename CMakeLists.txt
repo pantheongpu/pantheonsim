@@ -1420,6 +1420,7 @@ vgpu_unit_test(test_runtime)
 vgpu_unit_test(test_exec2)
 vgpu_unit_test(test_exec3)
 vgpu_unit_test(test_ptx_bitwise_not)
+vgpu_unit_test(test_ptx_issue_batch_2026_11_06)
 # PTX forms JIT compilers emit: negated predicate sources, .reg .func parameters, var[imm] addresses, ldu.
 vgpu_unit_test(test_ptx_forms)
 # 16-bit signed integer forms on registers with zero upper bits (abs.s16 and its siblings).
@@ -4596,6 +4597,12 @@ set_tests_properties(e2e_vgpu_run PROPERTIES
 # program built with nvcc --default-stream per-thread calls; COLMAP does.
 add_test(NAME e2e_per_thread_stream COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_per_thread_stream.sh)
 set_tests_properties(e2e_per_thread_stream PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 300)
+# cudaLaunchHostFunc enqueues and returns; events and streams behind it are not ready until it finishes (#487).
+add_test(NAME e2e_async_host_events COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_async_host_events.sh)
+set_tests_properties(e2e_async_host_events PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 300)

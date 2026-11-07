@@ -6571,16 +6571,39 @@ class Interpreter {
   // So a path that gets here while lanes it names are on another path parks,
   // as at bar.red, until they reach this pc and merge with it. Returns true
   // when it parked; if no other path can run, it goes on as before.
-  bool wait_for_members(Warp& w, const BlockCtx& ctx, const Instr& ins, size_t idx, const Operand& members, Mask m) {
+  bool wait_for_members(Warp& w, const BlockCtx& ctx, const Instr& ins, size_t idx, const Operand& members, Mask& m) {
     if (w.paths.size() < 2 || m == 0) return false;
     Lanes _s_members;
-    const Mask named = static_cast<Mask>(read_operand(w, ctx, ins, members, _s_members)[first_set(m)]) & 0xffffffffu;
-    for (size_t i = 0; i < w.paths.size(); ++i) {
-      if (i == idx || !(w.paths[i].mask & named)) continue;
-      if (select_other_runnable(w, idx) == idx) return false;
+    // Each lane that runs this names its own mask, and the masks may differ
+    // (two half-warp tiles, 0xffff and 0xffff0000, each shuffle among their
+    // own lanes). Reading only the first lane's let the other tile go on while
+    // one of its members was still in a long loop, and the shuffle read 0 for
+    // it. A lane waits for the lanes its own mask names that sit on another
+    // path; lanes whose members are all here go on without them.
+    const Lanes& mm = read_operand(w, ctx, ins, members, _s_members);
+    Mask elsewhere = 0;
+    for (size_t i = 0; i < w.paths.size(); ++i)
+      if (i != idx) elsewhere |= w.paths[i].mask;
+    Mask waiting = 0;
+    for (Mask rest = m; rest != 0; rest &= rest - 1) {
+      const uint32_t lane = first_set(rest);
+      if (static_cast<Mask>(mm[lane]) & 0xffffffffu & elsewhere) waiting |= Mask{1} << lane;
+    }
+    if (waiting == 0) return false;
+    if (select_other_runnable(w, idx) == idx) return false;
+    if (waiting == m && waiting == w.paths[idx].mask) {
       w.paths[idx].parked = Path::kAtBarrier;
       return true;
     }
+    // Only some lanes wait: they park as a path of their own at this pc (they
+    // merge with the lanes they wait for when those arrive, as a parked path
+    // does), and the rest run the instruction now.
+    Path parked{w.paths[idx].pc, waiting};
+    parked.parked = Path::kAtBarrier;
+    parked.issued_at = w.steps;
+    w.paths[idx].mask &= ~waiting;
+    m &= ~waiting;
+    w.paths.push_back(parked);
     return false;
   }
 
@@ -12917,6 +12940,10 @@ class Interpreter {
         default: return false;  // unordered forms are float-only; handled above
       }
     };
+    // .bf16 is its own type kind (is_float() is false for it): without this it
+    // fell through to the integer path and compared raw bits (sign ignored,
+    // NaN never detected).
+    if (ty.is_bfloat()) return compare_float(cmp, bf16_to_double(a & 0xFFFF), bf16_to_double(b & 0xFFFF));
     if (ty.is_float()) {
       if (ty.bits == 16) return compare_float(cmp, f16_to_double(a), f16_to_double(b));
       return ty.bits == 32 ? compare_float(cmp, f32(a), f32(b)) : compare_float(cmp, f64(a), f64(b));
@@ -12935,7 +12962,25 @@ class Interpreter {
   const Lanes& addr_base(Warp& w, const BlockCtx& ctx, const Instr& ins, const Addr& a,
                          Lanes& scratch) {
     if (a.base_kind == Addr::Base::Symbol) {
-      scratch.fill(resolve_symbol(ctx, ins, a.base));
+      const uint64_t sym = resolve_symbol(ctx, ins, a.base);
+      if (a.index_id == kNoReg) {
+        scratch.fill(sym);
+        return scratch;
+      }
+      // `var[%reg]`: the variable's address plus the element index times the element size, per lane.
+      const uint64_t scale = a.index_scale;
+      if (a.index_wide) {
+        if (a.index_id >= w.regs64.size() || !w.written64[a.index_id])
+          ctx_fail(ins, -1, Err::UninitializedRegister, "array index register " + a.index + " read before any write");
+        const auto& r = w.regs64[a.index_id];
+        for (uint32_t lane = 0; lane < W_; ++lane) scratch[lane] = sym + r[lane] * scale;
+      } else {
+        if (a.index_id >= w.regs32.size() || !w.written32[a.index_id])
+          ctx_fail(ins, -1, Err::UninitializedRegister, "array index register " + a.index + " read before any write");
+        const auto& r = w.regs32[a.index_id];
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          scratch[lane] = sym + static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(r[lane])) * static_cast<int64_t>(scale));
+      }
       return scratch;
     }
     // Address registers are .b64 in 64-bit PTX, but shared/local addressing

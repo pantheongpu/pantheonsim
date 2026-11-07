@@ -2,6 +2,7 @@
 //   * a negated predicate source operand (`and.pred %p2, !%p0, %p1;`)    issue 474
 //   * `ldu` (uniform load), which reads what `ld` reads    issue 472
 //   * the array-element address `var[imm]` (without or with the outer brackets)    issue 476
+//   * the array-element address with a register index, `var[%r0]`    issue 530
 //   * `.reg` parameters and return values of a .func, and the call through them    issue 475
 // Each result is compared with what the PTX ISA says the instruction computes, worked out here on the host.
 #include <cstdint>
@@ -278,6 +279,173 @@ VTEST(array_element_index_outside_the_array_is_refused) {
 )";
   auto e = VCAPTURE(Error, ptx::parse(ptx));
   VCHECK_CONTAINS(std::string(e.what()), "outside 'arr'");
+}
+
+// ---- 530: a register as the element index ----
+
+// The issue's kernel (Dr.Jit's opaque-index array access): one thread stores through arr[%r0] and loads back through it.
+VTEST(array_element_address_with_a_register_index_the_issue_kernel) {
+  const std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out, .param .u32 idx)
+{
+  .reg .b32 %r<4>;
+  .reg .f32 %f<4>;
+  .reg .b64 %rd<2>;
+  .local .align 4 .b32 arr[10];
+  ld.param.u64 %rd0, [out];
+  ld.param.u32 %r0, [idx];
+  mov.f32 %f0, 0f40000000;       // 2.0
+  st.local.b32 arr[%r0], %f0;    // register-indexed array element
+  ld.local.b32 %f1, arr[%r0];
+  st.global.f32 [%rd0], %f1;
+  ret;
+}
+)";
+  runtime::Runtime rt(load_gpu("nvidia/a10"));
+  auto& dev = rt.device(0);
+  const uint64_t mod = dev.load_module(ptx);
+  const ptx::EntryFn* fn = dev.get_function(mod, "k");
+  const uint64_t out = dev.memory().alloc(4);
+  dev.memory().store_scalar(out, 4, 0);
+  LaunchConfig cfg;
+  std::vector<uint8_t> idx(4);
+  const uint32_t three = 3;
+  std::memcpy(idx.data(), &three, 4);
+  dev.launch(*fn, cfg, {arg_u64(out), idx}, dev.symbols(mod));
+  VCHECK_EQ(uint64_t{dev.memory().load_scalar(out, 4)}, uint64_t{0x40000000u});
+}
+
+// The index differs per lane, the elements are 4 and 8 bytes wide, the index register is 32- or 64-bit (ptxas refuses the
+// bracketed `[arr[%r]]`, measured, so only the bare form is used). Every thread fills the whole array first through
+// fixed indexes, then reads element (tid & 3) / (tid % 3) back through a lane-dependent register.
+VTEST(array_element_address_with_a_register_index_differs_per_lane) {
+  const std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 po)
+{
+  .reg .b32 %r<16>;
+  .reg .b64 %rd<12>;
+  .local .align 4 .b32 arr[4];
+  .local .align 8 .b64 big[3];
+  ld.param.u64 %rd0, [po];
+  cvta.to.global.u64 %rd0, %rd0;
+  mov.u32 %r0, %tid.x;
+  mov.u32 %r1, 0;
+  add.u32 %r2, %r0, 100;
+  st.local.b32 arr[%r1], %r2;
+  mov.u32 %r1, 1;
+  add.u32 %r2, %r0, 200;
+  st.local.b32 arr[%r1], %r2;
+  mov.u32 %r1, 2;
+  add.u32 %r2, %r0, 300;
+  st.local.b32 arr[%r1], %r2;
+  mov.u32 %r1, 3;
+  add.u32 %r2, %r0, 400;
+  st.local.b32 arr[%r1], %r2;
+  cvt.u64.u32 %rd1, %r0;
+  mov.u64 %rd2, 0;
+  add.u64 %rd3, %rd1, 1000;
+  st.local.b64 big[%rd2], %rd3;
+  mov.u64 %rd2, 1;
+  add.u64 %rd3, %rd1, 2000;
+  st.local.b64 big[%rd2], %rd3;
+  mov.u64 %rd2, 2;
+  add.u64 %rd3, %rd1, 3000;
+  st.local.b64 big[%rd2], %rd3;
+  and.b32 %r3, %r0, 3;                       // element 0..3, different in neighbouring lanes
+  ld.local.b32 %r4, arr[%r3];
+  ld.local.b32 %r5, arr[%r3];
+  rem.u32 %r6, %r0, 3;
+  cvt.u64.u32 %rd4, %r6;                     // a 64-bit index register
+  ld.local.b64 %rd5, big[%rd4];
+  ld.local.b64 %rd6, big[%r6];               // the same element through the 32-bit register
+  mul.wide.u32 %rd7, %r0, 24;
+  add.u64 %rd8, %rd0, %rd7;
+  st.global.u32 [%rd8+0], %r4;
+  st.global.u32 [%rd8+4], %r5;
+  st.global.u64 [%rd8+8], %rd5;
+  st.global.u64 [%rd8+16], %rd6;   // 24-byte rows keep the 8-byte stores aligned
+  ret;
+}
+)";
+  const std::vector<uint32_t> r = run(ptx, 32, 32 * 6);
+  for (uint32_t t = 0; t < 32; ++t) {
+    const uint32_t* row = &r[t * 6];
+    VCHECK_EQ(uint64_t{row[0]}, uint64_t{t + 100 * ((t & 3) + 1)});
+    VCHECK_EQ(uint64_t{row[1]}, uint64_t{t + 100 * ((t & 3) + 1)});
+    const uint64_t want = t + 1000 * (t % 3 + 1);
+    uint64_t a, b;
+    std::memcpy(&a, &row[2], 8);
+    std::memcpy(&b, &row[4], 8);
+    VCHECK_EQ(a, want);
+    VCHECK_EQ(b, want);
+  }
+}
+
+VTEST(array_element_address_with_a_register_index_on_shared_and_global) {
+  const std::string ptx = std::string(kHeader) + R"(
+.global .align 4 .u32 gl[8];
+.visible .entry k(.param .u64 po)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<4>;
+  .shared .align 4 .u32 sh[8];
+  ld.param.u64 %rd0, [po];
+  cvta.to.global.u64 %rd0, %rd0;
+  mov.u32 %r0, %tid.x;
+  add.u32 %r1, %r0, 7;
+  st.shared.u32 sh[%r0], %r1;
+  add.u32 %r2, %r0, 9;
+  st.global.u32 gl[%r0], %r2;
+  bar.sync 0;
+  sub.u32 %r3, 7, %r0;                       // the reverse element: another thread's store
+  ld.shared.u32 %r4, sh[%r3];
+  ld.global.u32 %r5, gl[%r3];
+  mul.wide.u32 %rd1, %r0, 8;
+  add.u64 %rd2, %rd0, %rd1;
+  st.global.u32 [%rd2+0], %r4;
+  st.global.u32 [%rd2+4], %r5;
+  ret;
+}
+)";
+  const std::vector<uint32_t> r = run(ptx, 8, 16);
+  for (uint32_t t = 0; t < 8; ++t) {
+    VCHECK_EQ(uint64_t{r[t * 2]}, uint64_t{(7 - t) + 7});
+    VCHECK_EQ(uint64_t{r[t * 2 + 1]}, uint64_t{(7 - t) + 9});
+  }
+}
+
+// A register that holds no value yet is reported, as for any address register; and a register index on something that
+// is not a declared array is a parse error, not a wrong address.
+VTEST(array_element_address_with_a_register_index_is_checked) {
+  const std::string unwritten = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 po)
+{
+  .reg .b32 %r<2>;
+  .local .align 4 .b32 arr[4];
+  st.local.b32 arr[%r1], %r0;
+  ret;
+}
+)";
+  runtime::Runtime rt(load_gpu("nvidia/a10"));
+  auto& dev = rt.device(0);
+  const uint64_t mod = dev.load_module(unwritten);
+  const ptx::EntryFn* fn = dev.get_function(mod, "k");
+  LaunchConfig cfg;
+  const uint64_t out = dev.memory().alloc(4);
+  auto e = VCAPTURE(Error, dev.launch(*fn, cfg, {arg_u64(out)}, dev.symbols(mod)));
+  VCHECK_CONTAINS(std::string(e.what()), "array index register %r1");
+
+  const std::string not_an_array = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 po)
+{
+  .reg .b32 %r<2>;
+  .reg .b64 %rd<2>;
+  st.global.b32 %rd0[%r1], %r0;
+  ret;
+}
+)";
+  auto p = VCAPTURE(Error, ptx::parse(not_an_array));
+  VCHECK_CONTAINS(std::string(p.what()), "declared as an array");
 }
 
 // ---- 475: .reg parameters and return values ----

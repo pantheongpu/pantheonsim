@@ -983,6 +983,52 @@ static void misc(CUcontext ctx, CUdevice dev) {
   IS(cuModuleUnload(m), CUDA_SUCCESS);
 }
 
+// ---- memory size queries, empty allocations, function handles ----
+// Measured on an RTX 3060 (driver 13.0): cuMemGetInfo takes a NULL for either pointer (and for both) and fills the other;
+// cuMemAlloc of 0 bytes is CUDA_ERROR_INVALID_VALUE with the result cleared, where the pinned host allocations of 0 bytes
+// succeed with a NULL pointer; cuModuleGetFunction names a function by one handle, however often it is asked, and
+// it is the handle cuModuleEnumerateFunctions lists.
+static void memory_and_handles(CUmodule mod, CUfunction kfill, CUfunction kmixed) {
+  size_t free_b = 1, total_b = 1;
+  IS(cuMemGetInfo(&free_b, &total_b), CUDA_SUCCESS);
+  check(total_b > 0 && free_b <= total_b, "cuMemGetInfo gives a total and a free size no larger than it");
+  size_t t2 = 0, f2 = 0;
+  IS(cuMemGetInfo(nullptr, &t2), CUDA_SUCCESS);
+  check(t2 == total_b, "cuMemGetInfo(NULL, &total) gives the total");
+  IS(cuMemGetInfo(&f2, nullptr), CUDA_SUCCESS);
+  check(f2 > 0 && f2 <= total_b, "cuMemGetInfo(&free, NULL) gives the free size");
+  IS(cuMemGetInfo(nullptr, nullptr), CUDA_SUCCESS);
+
+  CUdeviceptr z = 0x1234;
+  IS(cuMemAlloc(&z, 0), CUDA_ERROR_INVALID_VALUE);
+  check(z == 0, "the refused cuMemAlloc clears the pointer");
+  void* hp = reinterpret_cast<void*>(0x1);
+  IS(cuMemHostAlloc(&hp, 0, 0), CUDA_SUCCESS);
+  check(hp == nullptr, "a pinned allocation of 0 bytes has no pointer");
+  hp = reinterpret_cast<void*>(0x1);
+  IS(cuMemAllocHost(&hp, 0), CUDA_SUCCESS);
+  check(hp == nullptr, "and cuMemAllocHost's has none either");
+  IS(cuMemFreeHost(hp), CUDA_SUCCESS);
+
+  CUfunction again = nullptr, mixed_again = nullptr;
+  IS(cuModuleGetFunction(&again, mod, "fill"), CUDA_SUCCESS);
+  IS(cuModuleGetFunction(&mixed_again, mod, "mixed"), CUDA_SUCCESS);
+  check(again == kfill, "a function looked up twice is the same handle");
+  check(mixed_again == kmixed && kmixed != kfill, "and each function has its own");
+#if CUDA_VERSION >= 12040
+  unsigned n = 0;
+  IS(cuModuleGetFunctionCount(&n, mod), CUDA_SUCCESS);
+  std::vector<CUfunction> all(n ? n : 1, nullptr);
+  IS(cuModuleEnumerateFunctions(all.data(), n, mod), CUDA_SUCCESS);
+  bool has_fill = false, has_mixed = false;
+  for (unsigned i = 0; i < n; ++i) {
+    has_fill |= all[i] == kfill;
+    has_mixed |= all[i] == kmixed;
+  }
+  check(has_fill && has_mixed, "cuModuleEnumerateFunctions lists the handles the lookups gave");
+#endif
+}
+
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);   // every line out, should a call crash
   CUdevice dev;
@@ -1041,6 +1087,7 @@ int main() {
   texture_objects(ktex, ksurf);
   misc(ctx, dev);
   stream_context(ctx);
+  memory_and_handles(mod, kfill, kmixed);
   IS(cuModuleUnload(mod), CUDA_SUCCESS);
   IS(cuCtxDestroy(ctx), CUDA_SUCCESS);
   std::printf(failures ? "FAIL: %d driver checks\n" : "PASS: every driver check\n", failures);

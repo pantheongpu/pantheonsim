@@ -1069,3 +1069,81 @@ VGPU_EXPORT cudaError_t cudaMemDiscardAndPrefetchBatchAsync(void** dptrs, size_t
   return traced_call("cudaMemDiscardAndPrefetchBatchAsync", cudaMemDiscardAndPrefetchBatchAsync_traced, dptrs, sizes, count, prefetchLocs, prefetchLocIdxs, numPrefetchLocs, flags, stream);
 }
 #endif
+
+// ---- OpenGL interop (cuda_gl_interop.h; pantheonsim #528) ------------------------------------------------------------
+// A simulated GPU has no OpenGL. NVIDIA's libcudart exports the eleven cudaGL* / cudaGraphicsGL* functions all the
+// same, and a program linked with -z now (Ubuntu's default for PIE executables) that merely references one (COLMAP's
+// SiftGPU does) fails to start without the name. So each is exported and answers as an RTX 3060 under NVIDIA's CUDA
+// 13.0 runtime does with no GL context current (measured with short probes on the card):
+//   cudaGraphicsGLRegisterBuffer / Image, cudaGLGetDevices, cudaGLRegisterBufferObject, cudaGLUnregisterBufferObject
+//       cudaErrorInvalidGraphicsContext (219); a null `resource` of Register* is cudaErrorInvalidValue; GetDevices
+//       leaves its count untouched;
+//   cudaGLMapBufferObject, cudaGLUnmapBufferObject, cudaGLSetBufferObjectMapFlags, cudaGLMapBufferObjectAsync,
+//       cudaGLUnmapBufferObjectAsync (no buffer was ever registered)  cudaErrorInvalidValue;
+//   cudaGLSetGLDevice  an unknown device is cudaErrorInvalidDevice, a valid one cudaErrorSetOnActiveProcess (the card
+//       answers cudaErrorDevicesUnavailable, 46, when it is the program's first runtime call, and then refuses the
+//       device for everything after; that state is not modelled).
+// The GL types are plain unsigned ints here (GLuint) so this file needs no GL header.
+static cudaError_t cudaGraphicsGLRegisterBuffer_traced(cudaGraphicsResource** resource, unsigned int, unsigned int) {
+  return resource ? cudaErrorInvalidGraphicsContext : cudaErrorInvalidValue;
+}
+VGPU_EXPORT cudaError_t cudaGraphicsGLRegisterBuffer(cudaGraphicsResource** resource, unsigned int buffer, unsigned int flags) {
+  return traced_call("cudaGraphicsGLRegisterBuffer", cudaGraphicsGLRegisterBuffer_traced, resource, buffer, flags);
+}
+
+static cudaError_t cudaGraphicsGLRegisterImage_traced(cudaGraphicsResource** resource, unsigned int, unsigned int, unsigned int) {
+  return resource ? cudaErrorInvalidGraphicsContext : cudaErrorInvalidValue;
+}
+VGPU_EXPORT cudaError_t cudaGraphicsGLRegisterImage(cudaGraphicsResource** resource, unsigned int image, unsigned int target, unsigned int flags) {
+  return traced_call("cudaGraphicsGLRegisterImage", cudaGraphicsGLRegisterImage_traced, resource, image, target, flags);
+}
+
+static cudaError_t cudaGLGetDevices_traced(unsigned int*, int*, unsigned int, int) { return cudaErrorInvalidGraphicsContext; }
+VGPU_EXPORT cudaError_t cudaGLGetDevices(unsigned int* count, int* devices, unsigned int n, int list) {
+  return traced_call("cudaGLGetDevices", cudaGLGetDevices_traced, count, devices, n, list);
+}
+
+static cudaError_t cudaGLSetGLDevice_traced(int device) {
+  return guard("cudaGLSetGLDevice", [&](State& s) -> cudaError_t {
+    if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
+    return cudaErrorSetOnActiveProcess;
+  });
+}
+VGPU_EXPORT cudaError_t cudaGLSetGLDevice(int device) {
+  return traced_call("cudaGLSetGLDevice", cudaGLSetGLDevice_traced, device);
+}
+
+static cudaError_t cudaGLRegisterBufferObject_traced(unsigned int) { return cudaErrorInvalidGraphicsContext; }
+VGPU_EXPORT cudaError_t cudaGLRegisterBufferObject(unsigned int bufObj) {
+  return traced_call("cudaGLRegisterBufferObject", cudaGLRegisterBufferObject_traced, bufObj);
+}
+
+static cudaError_t cudaGLUnregisterBufferObject_traced(unsigned int) { return cudaErrorInvalidGraphicsContext; }
+VGPU_EXPORT cudaError_t cudaGLUnregisterBufferObject(unsigned int bufObj) {
+  return traced_call("cudaGLUnregisterBufferObject", cudaGLUnregisterBufferObject_traced, bufObj);
+}
+
+static cudaError_t cudaGLMapBufferObject_traced(void**, unsigned int) { return cudaErrorInvalidValue; }
+VGPU_EXPORT cudaError_t cudaGLMapBufferObject(void** devPtr, unsigned int bufObj) {
+  return traced_call("cudaGLMapBufferObject", cudaGLMapBufferObject_traced, devPtr, bufObj);
+}
+
+static cudaError_t cudaGLUnmapBufferObject_traced(unsigned int) { return cudaErrorInvalidValue; }
+VGPU_EXPORT cudaError_t cudaGLUnmapBufferObject(unsigned int bufObj) {
+  return traced_call("cudaGLUnmapBufferObject", cudaGLUnmapBufferObject_traced, bufObj);
+}
+
+static cudaError_t cudaGLSetBufferObjectMapFlags_traced(unsigned int, unsigned int) { return cudaErrorInvalidValue; }
+VGPU_EXPORT cudaError_t cudaGLSetBufferObjectMapFlags(unsigned int bufObj, unsigned int flags) {
+  return traced_call("cudaGLSetBufferObjectMapFlags", cudaGLSetBufferObjectMapFlags_traced, bufObj, flags);
+}
+
+static cudaError_t cudaGLMapBufferObjectAsync_traced(void**, unsigned int, cudaStream_t) { return cudaErrorInvalidValue; }
+VGPU_EXPORT cudaError_t cudaGLMapBufferObjectAsync(void** devPtr, unsigned int bufObj, cudaStream_t stream) {
+  return traced_call("cudaGLMapBufferObjectAsync", cudaGLMapBufferObjectAsync_traced, devPtr, bufObj, stream);
+}
+
+static cudaError_t cudaGLUnmapBufferObjectAsync_traced(unsigned int, cudaStream_t) { return cudaErrorInvalidValue; }
+VGPU_EXPORT cudaError_t cudaGLUnmapBufferObjectAsync(unsigned int bufObj, cudaStream_t stream) {
+  return traced_call("cudaGLUnmapBufferObjectAsync", cudaGLUnmapBufferObjectAsync_traced, bufObj, stream);
+}

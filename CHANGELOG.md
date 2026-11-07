@@ -7,6 +7,47 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- CUDA runtime and driver: a zero-byte `cudaMalloc`, `cudaMallocManaged`, `cudaMallocHost`, `cudaHostAlloc` or `cudaMallocAsync` succeeds
+  and gives a NULL pointer, as on a GPU, where it gave a distinct non-NULL one (Gpufit tests its unused buffers against NULL); the
+  driver's `cuMemHostAlloc`/`cuMemAllocHost` of 0 bytes do the same, and `cuMemAlloc(0)` is `CUDA_ERROR_INVALID_VALUE` with the
+  result cleared (pantheonsim #515).
+- CUDA runtime and driver: `cudaMemGetInfo` and `cuMemGetInfo` accept a NULL for the free or the total pointer, or both, and fill
+  the other, as on a GPU. They used to answer invalid value, which stopped cuda-api-wrappers' device_management example
+  (pantheonsim #519).
+- CUDA driver: calls that work with no current context on a GPU now do. A stream-ordered call that names a stream of its own
+  (`cuMemAllocAsync`, `cuMemAllocFromPoolAsync`, `cuMemFreeAsync`, the `Async` copies and fills including `cuMemcpy3DAsync`,
+  `cuStreamSynchronize`, `cuStreamQuery`) takes its context from the stream; `cuMemFree` and `cuMemFreeHost` use the context that
+  owns the pointer; `cuMemAddressReserve` and `cuMemAddressFree` need none. The legacy, per-thread and NULL streams and the
+  synchronous copies still answer `CUDA_ERROR_INVALID_CONTEXT`. This is how cuda-api-wrappers drives the API (retain the primary
+  context, push it for one call, pop it), and five of its examples stopped on it (pantheonsim #518).
+- CUDA driver: `cuPointerGetAttribute(CU_POINTER_ATTRIBUTE_CONTEXT)` (and `cuPointerGetAttributes`) returns the context a
+  `cuMemAlloc`, `cuMemAllocPitch`, `cuMemAllocManaged` or `cuMemHostAlloc` allocation was made in, not the one current on the
+  calling thread (pantheonsim #521).
+- CUDA driver: `cuModuleGetFunction` returns the same `CUfunction` for the same module and name every time, and it is the handle
+  `cuModuleEnumerateFunctions` lists, so programs that compare handles (cuda-api-wrappers' module_management example) find them
+  equal (pantheonsim #520).
+- CUDA runtime: `cudaLaunchHostFunc` (and `cudaLaunchHostFunc_v2`) enqueues the function and returns; it runs on a worker thread for
+  the stream, after the stream's earlier host work and before its later work. An event recorded behind it, and `cudaStreamQuery`, report
+  `cudaErrorNotReady` until it has finished, as does `cudaEventElapsedTime`; `cudaStreamSynchronize`, `cudaEventSynchronize` and
+  `cudaDeviceSynchronize` wait for it; `cudaStreamWaitEvent` on a pending event holds the other stream back; the legacy default stream
+  orders against blocking streams. A host function that waits for something the caller does after enqueueing it no longer hangs the
+  call (pantheonsim #487). Kernels, copies and fills still run to completion inside their calls, so an event recorded behind a long
+  kernel is still complete at once (#523 stays open); `cuLaunchHostFunc` in the driver API still runs inline. Programs that never queue
+  a host function see no change. `cudaErrorNotReady` from a query is no longer left as the last error (`cudaGetLastError`), as on a card.
+- PTX: `mov.u32%r1, %laneid;` (no space between the type and the operand, which nvcc emits for inline asm written `"mov.u32%0, ..."`) is
+  accepted, as ptxas does; a `%` only ever opens a register name, so it now ends the opcode word (pantheonsim #522).
+- PTX: `elect.sync _|%p, mask;` and `elect.sync %r|_, mask;` accept the sink `_` for either result, as ptxas does (cubecl's
+  `plane_elect`) (pantheonsim #503).
+- PTX: `setp` and `set` on `.bf16` (and `.bf16x2`) compare the values, not the raw bits: the sign counts, `-0 == +0`, and NaN is
+  unordered, so `setp.nan.bf16`, `setp.neu.bf16` and the ordered forms give the answers they give on `.f16` (pantheonsim #502).
+- PTX: `shfl.sync`, `vote.sync`, `match.sync`, `redux.sync` and `bar.warp.sync` wait for every lane that any running lane's member mask
+  names, not just the first lane's. With two half-warp tiles, the tile that did not contain the first lane went on while a member of
+  its own tile was still in a long loop and read 0 for it (HierarchicalKV's `tlp_v2_upsert*`). Only the lanes whose members are away
+  wait; the rest of the path runs on (pantheonsim #488).
+- License: from the next release PantheonSim is under the Business Source License 1.1, which keeps it free to use, change and run in
+  your own CI and allows one restriction: you may not offer it to other people as a hosted or managed service. Each version becomes
+  Apache-2.0 four years after release. Versions up to 0.2.0 stay Apache-2.0 (`LICENSE-APACHE-2.0`). `docs/licensing.md` has the
+  details, and contributions now need the Contributor Agreement.
 - The container image builds again. `scripts/package-build.sh` left `shim/libcudss.so.1` pointing into `cudss1/`, a directory the image does not
   have, so the build stopped at "links that lead nowhere" from the cuDSS 1.0 change onward. A lint test (`lint_package_build`) now builds a small
   tree with the same layout.
@@ -30,6 +71,15 @@ release says what runs and what it produces, never how fast a real GPU would run
 - PTX: `ldu.global` (the uniform load, scalar and `.v2`/`.v4`) runs as the `ld.global` it stands for.
 - PTX: the array-element address `var[imm]` (`st.local.b32 arr[0], %f0;`, also `[arr[1]]`) is accepted for `.local`, `.shared`,
   `.global` and `.const` arrays. The index counts elements of the declared type; one outside the array is refused.
+- PTX: the array-element address with a register index, `st.local.b32 arr[%r15], %f16;` and `ld.local.b32 %f100, arr[%r99];` (a 32- or
+  64-bit register; `.local`, `.shared`, `.global` and `.const` arrays), is accepted: the address is the variable's plus the register times
+  the element size, per lane, unchecked as on the card. Dr.Jit emits it for every opaque-index array access, and the module used to fail to
+  load with `bad integer literal '%r0'` (pantheonsim #530).
+- The runtime exports the OpenGL interop functions of `cuda_gl_interop.h` (`cudaGraphicsGLRegisterBuffer`, `cudaGraphicsGLRegisterImage`,
+  `cudaGLGetDevices`, `cudaGLSetGLDevice` and the legacy `cudaGL*BufferObject` family), so a program linked with `-z now` that merely
+  references one (COLMAP's SiftGPU) starts instead of dying with `undefined symbol: cudaGLRegisterBufferObject`. They answer as an RTX 3060
+  with no GL context does: `cudaErrorInvalidGraphicsContext`, `cudaErrorInvalidValue` for a buffer that was never registered
+  (pantheonsim #528). `tests/lint/check_header_exports.py` now checks `cuda_gl_interop.h` too.
 - PTX: a `.func` can take its parameters and return its value in `.reg`s (`.func (.reg .b32 r) f(.reg .u64 data)`), and a call
   (direct, or through a `.callprototype` with `.reg`s) passes registers or numbers for them.
 - libcuda exports the OpenGL, EGL and VDPAU interop functions (`cuGraphicsGLRegisterBuffer`,
