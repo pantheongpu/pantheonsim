@@ -2,6 +2,7 @@
 // protocol, and the size rule (include/vgpu/host_gpu.hpp). The part that drives the real GPU is run by
 // nvidia/tests/e2e/run_host_gpu.sh, on a machine with a card.
 #include <cstdint>
+#include <cstdio>
 #include <random>
 #include <string>
 #include <vector>
@@ -606,6 +607,31 @@ VTEST(idiom_classification_by_mnemonic) {
   VCHECK(!exact_opcode_allowed("MUFU", {"RCP"}));
   VCHECK(!exact_opcode_allowed("CALL", {"REL", "NOINC"}));
   VCHECK(!exact_opcode_allowed("RET", {"REL", "NODEC"}));
+}
+
+// The start-up refusals (08 section 3): a mode value that is not a mode is said, and every diagnostic that only the simulator gives switches the mode off.
+VTEST(mode_text_known_and_diagnostic_switches) {
+  VCHECK(mode_text_is_known(nullptr) && mode_text_is_known("") && mode_text_is_known("off") && mode_text_is_known("exact") && mode_text_is_known("0"));
+  VCHECK(!mode_text_is_known("approx") && !mode_text_is_known("EXACT") && !mode_text_is_known("on") && !mode_text_is_known("1"));
+  for (const char* v : kIncompatibleVars) {
+    const std::string name(v);
+    VCHECK(!diagnostic_switched_on(name, nullptr));
+    VCHECK(!diagnostic_switched_on(name, ""));
+    VCHECK(!diagnostic_switched_on(name, "0"));
+    if (name != "VGPU_SCHEDULER") VCHECK(diagnostic_switched_on(name, "1"));
+  }
+  // the scheduler's default name is what a config file writes for `scheduler: deterministic`: not a diagnostic; the others are
+  VCHECK(!diagnostic_switched_on("VGPU_SCHEDULER", "deterministic"));
+  VCHECK(diagnostic_switched_on("VGPU_SCHEDULER", "random") && diagnostic_switched_on("VGPU_SCHEDULER", "adversarial"));
+  // every way the simulator can be told to fail or look inside a launch is on the list
+  const char* must[] = {"VGPU_COUNTERS", "VGPU_SASS_TRACE", "VGPU_KERNEL_DIGEST", "VGPU_TRACE", "VGPU_MAX_STEPS", "VGPU_FAIL_ALLOC", "VGPU_FAIL_LAUNCH",
+                        "VGPU_FAIL_MEMCPY", "VGPU_RACE", "VGPU_STRICT", "VGPU_SCHEDULER"};
+  for (const char* m : must) {
+    bool found = false;
+    for (const char* v : kIncompatibleVars) found = found || std::string(v) == m;
+    if (!found) std::fprintf(stderr, "%s is not in kIncompatibleVars\n", m);
+    VCHECK(found);
+  }
 }
 
 VTEST_MAIN

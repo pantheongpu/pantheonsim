@@ -42,12 +42,16 @@ __global__ void divexp(float* d, int n) {   // the division idiom and an EX2 in 
   if (i < n) d[i] = expf(d[i] * 0.001f) / (float(i % 977) + 1.25f);
 }
 
+void leak_heap();   // host_gpu_lazy_heap.cu: a kernel of a module of its own (a kernel that calls malloc keeps every kernel of its module in the simulator)
+
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "big";
   const bool small = !std::strcmp(mode, "small"), mufu = !std::strcmp(mode, "mufu");
   const bool div = !std::strcmp(mode, "div"), rcp = !std::strcmp(mode, "rcp"), divexp_mode = !std::strcmp(mode, "divexp");
+  const bool heap = !std::strcmp(mode, "heap");   // `big`, after a kernel left a block of the device heap in use: no launch may go to the card
   const int n = small ? 64 : 1 << 18;
   void* d = nullptr;
+  if (heap) leak_heap();
   cudaMalloc(&d, n * 4);
   cudaMemset(d, 1, n * 4);
   uint64_t h = 0xcbf29ce484222325ull;

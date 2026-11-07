@@ -3,6 +3,8 @@
 // counts the questions. Each assertion is one way a stale card copy would go unseen -- a remembered allocation, a run access that skips the lookup,
 // a free that the gate is not told of -- and each fails when its guard is removed.
 #include <atomic>
+#include <cstdio>
+#include <functional>
 #include <cstdint>
 #include <unistd.h>
 
@@ -163,6 +165,162 @@ VTEST(a_zero_count_makes_the_allocation_ordinary_again) {
   for (int i = 0; i < 3; ++i) VCHECK_EQ(mm.load_scalar(a, 4), uint64_t{0});
   VCHECK_EQ(gate.accesses.size(), asked);   // remembered again, and the gate is not asked
   VCHECK(mm.card_slot(a + 1) == nullptr);   // only a base is a slot
+}
+
+
+// ---- every way into an allocation's bytes (the hook inventory of docs/perf-design/10-host-gpu-hooks.md) ----------------------------------------------
+// One case per public MemoryManager entry that reads or writes device bytes. For an allocation whose card copy is valid, each must either decline
+// (return false having done nothing: the caller then takes a path that asks) or ask the gate for the range it touches, with the right direction. A new
+// entry point that forgets the gate is a silent stale read, so the table is the checklist; each row fails when its guard is removed.
+namespace {
+struct PathCase {
+  const char* name;
+  bool writes;                                   // the direction the gate must be told when the call goes ahead
+  std::function<bool(MemoryManager&, uint64_t)> call;   // true: the call went ahead; false: it declined
+};
+}  // namespace
+
+VTEST(every_memory_manager_entry_asks_the_gate_or_declines_for_a_card_valid_allocation) {
+  alignas(16) uint64_t out[64] = {};
+  uint64_t vals[32];
+  for (auto& v : vals) v = 3;
+  const uint8_t pat = 0x11;
+  const std::vector<PathCase> cases = {
+      {"write", true, [&](MemoryManager& m, uint64_t a) { m.write(a, vals, 64); return true; }},
+      {"read", false, [&](MemoryManager& m, uint64_t a) { m.read(a, out, 64); return true; }},
+      {"fill", true, [&](MemoryManager& m, uint64_t a) { m.fill(a, &pat, 1, 4096); return true; }},
+      {"load_scalar", false, [&](MemoryManager& m, uint64_t a) { (void)m.load_scalar(a, 4); return true; }},
+      {"store_scalar", true, [&](MemoryManager& m, uint64_t a) { m.store_scalar(a, 4, 1); return true; }},
+      {"load_run", false, [&](MemoryManager& m, uint64_t a) { return m.load_run(a, out, 256, 4); }},
+      {"store_run", true, [&](MemoryManager& m, uint64_t a) { return m.store_run(a, vals, 128, 4); }},
+      {"load_batch", false, [&](MemoryManager& m, uint64_t a) {
+         uint64_t ad[4] = {a, a + 4, a + 8, a + 12};
+         return m.load_batch(ad, 4, 4, out);
+       }},
+      {"load_broadcast", false, [&](MemoryManager& m, uint64_t a) { return m.load_broadcast(a, 4, 4, out); }},
+      {"store_batch", true, [&](MemoryManager& m, uint64_t a) {
+         uint64_t ad[4] = {a, a + 4, a + 8, a + 12};
+         return m.store_batch(ad, 4, 4, vals);
+       }},
+      {"store_strided", true, [&](MemoryManager& m, uint64_t a) { return m.store_strided(a, 4, 4, 4, vals); }},
+      {"batch_window", true, [&](MemoryManager& m, uint64_t a) {
+         uint64_t ad[4] = {a, a + 4, a + 8, a + 12};
+         MemoryManager::BatchWindow w;
+         return m.batch_window(ad, 4, 4, &w);
+       }},
+      {"atomic_word_ptrs", true, [&](MemoryManager& m, uint64_t a) {
+         uint64_t ad[2] = {a, a + 4};
+         uint8_t* p[2];
+         return m.atomic_word_ptrs(ad, 2, 4, p);
+       }},
+      {"rmw_batch", true, [&](MemoryManager& m, uint64_t a) {
+         uint64_t ad[2] = {a, a + 4}, olds[2];
+         size_t done = 0;
+         return m.rmw_batch(ad, 2, 4, [](size_t, uint64_t o) { return o + 1; }, olds, &done, /*lock_free=*/true);
+       }},
+      {"rmw_scalar", true, [&](MemoryManager& m, uint64_t a) {
+         uint64_t old;
+         return m.rmw_scalar(a, 4, [](uint64_t o) { return o + 1; }, &old);
+       }},
+      {"atomic_rmw", true, [&](MemoryManager& m, uint64_t a) {
+         uint64_t old;
+         return m.atomic_rmw(a, 4, [](uint64_t o) { return o + 1; }, &old);
+       }},
+      {"rmw_if_changed", true, [&](MemoryManager& m, uint64_t a) {
+         uint64_t old;
+         return m.rmw_if_changed(a, 4, [](uint64_t o) { return o + 1; }, &old);
+       }},
+      {"load_fields", false, [&](MemoryManager& m, uint64_t a) {
+         const uint8_t sz[2] = {4, 4};
+         return m.load_fields(a, sz, 2, out);
+       }},
+      {"load_texels", false, [&](MemoryManager& m, uint64_t a) {
+         uint64_t ad[2] = {a, a + 16};
+         return m.load_texels(ad, 2, 4, 1, out);
+       }},
+      {"load_quad", false, [&](MemoryManager& m, uint64_t a) { m.load_quad(a, out); return true; }},
+      {"store_quad", true, [&](MemoryManager& m, uint64_t a) { m.store_quad(a, vals); return true; }},
+      {"load_quad_run", false, [&](MemoryManager& m, uint64_t a) { return m.load_quad_run(a, 2, out); }},
+      {"store_quad_run", true, [&](MemoryManager& m, uint64_t a) { return m.store_quad_run(a, 2, vals); }},
+      {"copy_to (source)", false, [&](MemoryManager& m, uint64_t a) {
+         MemoryManager other(64 << 20, 1);
+         const uint64_t d = other.alloc(1 << 20);
+         return m.copy_to(other, d, a, 4096);
+       }},
+      {"copy_to (destination)", true, [&](MemoryManager& m, uint64_t a) {
+         MemoryManager other(64 << 20, 1);
+         const uint64_t s = other.alloc(1 << 20);
+         return other.copy_to(m, a, s, 4096);
+       }},
+  };
+  int ran = 0, declined = 0;
+  for (const auto& c : cases) {
+    MemoryManager mm(64 << 20);
+    FakeGate gate;
+    mm.set_card_gate(&gate);
+    const uint64_t a = mm.alloc(1 << 20);
+    make_card_valid(mm, a, 16);
+    gate.accesses.clear();
+    const bool went = c.call(mm, a);
+    if (!went) {
+      ++declined;
+      // (a fast path that declines hands the caller to the general path, which asks: the declines are why the lookup memory excludes a card-resident allocation)
+      if (std::string(c.name) == "write" || std::string(c.name) == "read" || std::string(c.name) == "fill" || std::string(c.name) == "load_scalar" ||
+          std::string(c.name) == "store_scalar") {
+        std::fprintf(stderr, "entry %s declined: it has no other path\n", c.name);
+        VCHECK(false);
+      }
+      continue;
+    }
+    ++ran;
+    bool asked = false;
+    for (const auto& x : gate.accesses)
+      if (x.addr >= a && x.addr < a + (1 << 20) && (x.write == c.writes || x.write)) asked = true;
+    if (!asked) std::fprintf(stderr, "entry %s went ahead on a card-valid allocation without asking the gate\n", c.name);
+    VCHECK(asked);
+    // The direction: a call that writes must say so (a read-direction ask for a write leaves the card copy stale).
+    if (c.writes) {
+      bool wrote = false;
+      for (const auto& x : gate.accesses) wrote = wrote || x.write;
+      if (!wrote) std::fprintf(stderr, "entry %s writes but told the gate it reads\n", c.name);
+      VCHECK(wrote);
+    }
+  }
+  std::fprintf(stderr, "card gate paths: %d asked the gate, %d declined\n", ran, declined);
+  VCHECK(ran >= 5);   // the five general entries (the others decline) at least
+}
+
+// ---- device memory outside the allocation table is a reason to keep launches off the card ----------------------------------------------------------
+// The card copy is the table of live allocations. A VMM mapping, an IPC region or a block of the kernel heap holds device bytes that are not in it, so a
+// pointer to one, from an argument or from memory, would read what the card never got. card_blocker() is how the launch path knows.
+VTEST(card_blocker_names_device_memory_outside_the_allocation_table) {
+  MemoryManager mm(256 << 20);
+  VCHECK(mm.card_blocker() == nullptr);
+  const uint64_t a = mm.alloc(1 << 20);
+  VCHECK(mm.card_blocker() == nullptr);   // ordinary allocations are the table
+  // VMM: a mapping holds bytes of its own
+  const uint64_t gran = MemoryManager::kVmmGranularity;
+  const uint64_t va = mm.reserve(gran, gran);
+  const uint64_t h = mm.create_handle(gran);
+  mm.map(va, gran, 0, h);
+  VCHECK(mm.card_blocker() != nullptr);
+  mm.unmap(va, gran);
+  mm.release_handle(h);
+  mm.address_free(va, gran);
+  VCHECK(mm.card_blocker() == nullptr);   // and the card may be used again once it is gone
+  // IPC: exported memory leaves the table for a file
+  const std::string path = "/tmp/vgpu-card-blocker-share-" + std::to_string(getpid());
+  mm.share(a, path);
+  VCHECK(mm.card_blocker() != nullptr);
+  mm.free(a);
+  ::unlink(path.c_str());
+  VCHECK(mm.card_blocker() == nullptr);
+  // the kernel heap
+  const uint64_t p = mm.heap_alloc(256, 1 << 20);
+  VCHECK(p != 0);
+  VCHECK(mm.card_blocker() != nullptr);
+  VCHECK(mm.heap_free(p));
+  VCHECK(mm.card_blocker() == nullptr);
 }
 
 VTEST_MAIN
