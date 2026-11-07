@@ -22,7 +22,7 @@
 //
 // A grid of fewer than 16 blocks runs on one host thread with all its resident blocks taking turns
 // from the start, in a fixed order, as a cooperative launch does: the answer of a program like the
-// patch locks is then the same on every run. (The SASS engine lets such a grid use the host threads when
+// patch locks is then the same on every run. (Every engine lets such a grid use the host threads when
 // its kernel only polls with loads: see `small_grid_spreads` below.) A larger grid uses the host threads, two blocks to a thread at least, each
 // starting with one block, as before, and holding one more block at a time only after no block of the
 // launch, on any thread, has stored or finished for three milliseconds: a chain of look-back flags,
@@ -89,6 +89,15 @@ inline constexpr std::chrono::milliseconds kLockstepFirstCheckMax{500};
 [[gnu::noinline]] inline void lockstep_note_look(std::atomic<uint64_t>& look_ns_per_block, std::chrono::steady_clock::duration cost, size_t blocks) {
   look_ns_per_block.store(std::chrono::duration_cast<std::chrono::nanoseconds>(cost).count() / blocks, std::memory_order_relaxed);
 }
+
+// What a kernel's polling loops wait with (found in the machine code by each engine): a strong load (a chain of look-back flags), or an
+// atomic that returns its old value (a lock being taken). A kernel may have both.
+inline constexpr unsigned kPollLoad = 1, kPollAtomic = 2;
+
+// Whether a lockstep launch's waits are loads only, so that a small grid may use the host threads (`small_grid_spreads` below): the
+// default mode (VGPU_LOCKSTEP=all runs every launch this way to check that nothing depends on the order blocks start in, and keeps the
+// fixed order for a small grid) and no atomic among the kernel's polls.
+inline bool lockstep_loads_only(LockstepMode mode, unsigned kinds) { return mode == LockstepMode::Auto && !(kinds & kPollAtomic); }
 
 struct LockstepShape {
   unsigned workers = 1;     // host threads

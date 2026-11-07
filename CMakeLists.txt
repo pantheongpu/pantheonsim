@@ -1527,6 +1527,8 @@ vgpu_unit_test(test_launch_env)
 vgpu_unit_test(test_lockstep_yield)
 # How many host threads a lockstep grid takes: a small one of waits on loads spreads, one that takes locks stays on one thread.
 vgpu_unit_test(test_lockstep_shape)
+# The same on the PTX engine: a small grid of load polls uses the host threads, one that takes a lock (or has a lock loop among its loops) keeps one.
+vgpu_unit_test(test_ptx_lockstep_threads)
 # The fingerprint of a block's registers (eight chains for long inputs): any one-byte change changes it, at every length.
 vgpu_unit_test(test_lockstep_fold)
 # When a lockstep launch first looks at its blocks (after what the last look cost, per resident block), and that a block standing still is found out.
@@ -1801,6 +1803,12 @@ target_compile_definitions(test_amd_gcn_int64 PRIVATE VGPU_SOURCE_DIR="${CMAKE_S
 
 vgpu_unit_test(test_amd_gcn_atomics amd/tests/unit/test_gcn_atomics.cpp)
 target_compile_definitions(test_amd_gcn_atomics PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
+# How many host threads a small lockstep grid takes on the AMD engine: work-groups that wait on loads only use them, ones that take a lock keep one (gfx942, and gfx1100 for wave32).
+vgpu_unit_test(test_amd_lockstep_threads amd/tests/unit/test_amd_lockstep_threads.cpp)
+target_compile_definitions(test_amd_lockstep_threads PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME test_amd_lockstep_threads_gfx1100 COMMAND test_amd_lockstep_threads)
+set_tests_properties(test_amd_lockstep_threads_gfx1100 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1100")
 
 vgpu_unit_test(test_amd_gcn_mixed amd/tests/unit/test_gcn_mixed.cpp)
 target_compile_definitions(test_amd_gcn_mixed PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

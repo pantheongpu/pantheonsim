@@ -34,6 +34,12 @@ for src in vector_add ops math memory globals grid bytes int64 atomics mixed hal
   echo "wrote $(pwd)/$src.gfx1250.o"
 done
 
+# Work-groups that wait on one another (test_amd_lockstep_threads): gfx942 and gfx1100 (wave32).
+for t in gfx942 gfx1100; do
+  "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=$t -nogpulib -O2 -c lockstep_threads.c -o "lockstep_threads.$t.o"
+  echo "wrote $(pwd)/lockstep_threads.$t.o"
+done
+
 # The narrow-run kernels (test_amd_gcn_narrowruns), for the five targets memruns runs on.
 for t in gfx942 gfx1100 gfx1201 gfx1030 gfx1250; do
   "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=$t -nogpulib -O2 -c narrowruns.c -o "narrowruns.$t.o"

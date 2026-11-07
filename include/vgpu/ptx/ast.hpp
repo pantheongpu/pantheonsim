@@ -1503,8 +1503,8 @@ struct EntryFn {
   // A kernel loaded from a cubin rather than PTX: its SASS, which the launch
   // runs instead of `body` (empty then). See nvidia/docs/sass.md.
   std::shared_ptr<const sass::Module> sass;
-  // Whether the kernel has a loop that polls global memory (vgpu/exec/lockstep.hpp): -1 not yet
-  // looked at, else 0 or 1. Memoized here, as the register analysis is, and copyable so that the
+  // What the kernel's loops poll global memory with (vgpu/exec/lockstep.hpp): -1 not yet
+  // looked at, else 0 (nothing), 1 (loads), 2 (atomics) or 3 (both). Memoized here, as the register analysis is, and copyable so that the
   // function still is.
   struct PollsFlag {
     mutable std::atomic<int8_t> v{-1};

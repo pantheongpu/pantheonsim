@@ -84,7 +84,7 @@ struct Kernel {
   bool wave32 = false;
   // Whether the kernel has a loop that polls global memory, so that its work-groups may wait on one
   // another and a launch runs the resident ones together (vgpu/exec/lockstep.hpp): -1 not looked at yet,
-  // else 0 or 1. Found the first time it launches; copyable so that a Kernel still is.
+  // else 0 (no), 1 (it polls with loads), 2 (with atomics) or 3 (both). Found the first time it launches; copyable so that a Kernel still is.
   struct PollsFlag {
     mutable std::atomic<int8_t> v{-1};
     PollsFlag() = default;

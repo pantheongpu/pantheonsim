@@ -406,7 +406,8 @@ uint64_t sass_max_steps(uint64_t configured) {
 // clock returned, or from a variable register, or it is read before the loop sets it and the loop
 // does set it (it comes round from the last turn: a counter, an old value). A register the loop only
 // reads, or sets from constants and other fixed registers before it reads it, is fixed.
-constexpr unsigned kPollLoad = 1, kPollAtomic = 2;
+using exec::kPollLoad;
+using exec::kPollAtomic;
 // `kinds`, when given, gets kPollLoad set when the poll is a strong load and kPollAtomic when it is an atomic that returns its old
 // value (a lock being taken): a launch whose waits are loads only may spread over host threads whatever its grid, one that takes locks
 // keeps a small grid on one thread (exec/lockstep.hpp).
@@ -1579,7 +1580,7 @@ exec::LaunchStats Runner::run() {
       lockstep = true;
       // Waits on loads only (a chain of look-back flags) give the same answer whichever thread runs a block, so a small grid
       // may use the host threads too; a kernel that takes locks keeps it on one thread, in a fixed order (exec/lockstep.hpp).
-      loads_only = mode == exec::LockstepMode::Auto && !(kinds & kPollAtomic);
+      loads_only = exec::lockstep_loads_only(mode, kinds);
       capacity = cfg_.resident_blocks ? cfg_.resident_blocks : units;
     }
   }
