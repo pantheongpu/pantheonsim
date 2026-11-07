@@ -443,15 +443,19 @@ VTEST(sass_mma_tile_route_matches_the_general_form) {
     ::pclose(p);
     return res;
   };
-  const auto on = run_child("avx2"), off = run_child("off");
+  const auto off = run_child("off");
   size_t compared = 0, ran = 0;
-  for (const auto& [key, v] : on) {
-    if (key[0] == '!') throw vtest::Failure("the run with the kernels on reports: " + v);
-    const auto it = off.find(key);
-    if (it == off.end()) throw vtest::Failure(key + " is missing from the run with the kernels off");
-    ++compared;
-    if (v.rfind("skipped", 0) != 0) ++ran;
-    if (v != it->second) throw vtest::Failure(key + ": kernels on " + v.substr(0, v.size() - 1) + ", off " + it->second.substr(0, it->second.size() - 1));
+  // The AVX2 table, and the AVX-512 one (a host without it runs the same table twice): the integer MMA and the f16/bf16 HMMA take routes of their own at each.
+  for (const char* level : {"avx2", "avx512"}) {
+    const auto on = run_child(level);
+    for (const auto& [key, v] : on) {
+      if (key[0] == '!') throw vtest::Failure(std::string("the run with the kernels on (") + level + ") reports: " + v);
+      const auto it = off.find(key);
+      if (it == off.end()) throw vtest::Failure(key + " is missing from the run with the kernels off");
+      ++compared;
+      if (v.rfind("skipped", 0) != 0) ++ran;
+      if (v != it->second) throw vtest::Failure(key + ": kernels on (" + level + ") " + v.substr(0, v.size() - 1) + ", off " + it->second.substr(0, it->second.size() - 1));
+    }
   }
   for (const auto& [key, v] : off)
     if (key[0] == '!') throw vtest::Failure("the run with the kernels off reports: " + v);

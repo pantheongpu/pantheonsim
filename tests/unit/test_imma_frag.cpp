@@ -38,8 +38,10 @@ struct Edge {   // `words` 32-bit words ending at the last byte of a mapped page
   }
 };
 
+using Kernel = void (*)(unsigned, const uint32_t*, const uint32_t*, const uint32_t*, uint32_t*);
+
 template <bool SA, bool SB>
-long run(std::mt19937_64& rng, unsigned K, int rounds) {
+long run(Kernel kernel, std::mt19937_64& rng, unsigned K, int rounds) {
   static Edge ea, eb, ec, eo;
   long calls = 0;
   for (int round = 0; round < rounds; ++round) {
@@ -83,7 +85,7 @@ long run(std::mt19937_64& rng, unsigned K, int rounds) {
     const uint32_t* pc = with_c ? ec.place(rc) : nullptr;
     uint32_t* po = reinterpret_cast<uint32_t*>(eo.base + eo.map_len) - 4 * 32;
     for (unsigned i = 0; i < 4 * 32; ++i) po[i] = 0xdeadbeefu;
-    vgpu::exec::imma_frag_m16n8<SA, SB>(K, pa, pb, pc, po);
+    kernel(K, pa, pb, pc, po);
     ++calls;
     for (unsigned i = 0; i < 4 * 32; ++i)
       if (po[i] != want[i])
@@ -97,22 +99,45 @@ long run(std::mt19937_64& rng, unsigned K, int rounds) {
 }  // namespace
 #endif
 
-VTEST(imma_from_registers_equals_the_definition) {
-#ifdef VGPU_IMMA_FRAG
-  __builtin_cpu_init();
-  if (!(__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("avx512vl"))) {
-    std::printf("  [ SKIP ] this CPU has no AVX-512\n");
-    return;
-  }
+// Both forms (the 512-bit one and the AVX2 one), each on a CPU that has what it needs.
+static long compare_all(Kernel k_ss, Kernel k_su, Kernel k_us, Kernel k_uu) {
   std::mt19937_64 rng(0x1337a);
   long calls = 0;
   for (unsigned K : {16u, 32u}) {
-    calls += run<true, true>(rng, K, 700);
-    calls += run<true, false>(rng, K, 700);
-    calls += run<false, true>(rng, K, 700);
-    calls += run<false, false>(rng, K, 700);
+    calls += run<true, true>(k_ss, rng, K, 700);
+    calls += run<true, false>(k_su, rng, K, 700);
+    calls += run<false, true>(k_us, rng, K, 700);
+    calls += run<false, false>(k_uu, rng, K, 700);
   }
+  return calls;
+}
+
+VTEST(imma_from_registers_equals_the_definition) {
+#ifdef VGPU_IMMA_FRAG
+  __builtin_cpu_init();
+  if (!(__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512vnni"))) {
+    std::printf("  [ SKIP ] this CPU has no AVX-512 with VNNI\n");
+    return;
+  }
+  const long calls = compare_all(vgpu::exec::imma_frag_m16n8<true, true>, vgpu::exec::imma_frag_m16n8<true, false>, vgpu::exec::imma_frag_m16n8<false, true>,
+                                 vgpu::exec::imma_frag_m16n8<false, false>);
   std::printf("  %ld IMMA calls compared with the definition\n", calls);
+  VCHECK(calls == 5600);
+#else
+  std::printf("  [ SKIP ] not an x86-64 build\n");
+#endif
+}
+
+VTEST(imma_from_registers_avx2_equals_the_definition) {
+#ifdef VGPU_IMMA_FRAG
+  __builtin_cpu_init();
+  if (!__builtin_cpu_supports("avx2")) {
+    std::printf("  [ SKIP ] this CPU has no AVX2\n");
+    return;
+  }
+  const long calls = compare_all(vgpu::exec::imma_frag_m16n8_avx2<true, true>, vgpu::exec::imma_frag_m16n8_avx2<true, false>,
+                                 vgpu::exec::imma_frag_m16n8_avx2<false, true>, vgpu::exec::imma_frag_m16n8_avx2<false, false>);
+  std::printf("  %ld AVX2 IMMA calls compared with the definition\n", calls);
   VCHECK(calls == 5600);
 #else
   std::printf("  [ SKIP ] not an x86-64 build\n");

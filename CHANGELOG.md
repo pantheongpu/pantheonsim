@@ -48,6 +48,9 @@ release says what runs and what it produces, never how fast a real GPU would run
   your own CI and allows one restriction: you may not offer it to other people as a hosted or managed service. Each version becomes
   Apache-2.0 four years after release. Versions up to 0.2.0 stay Apache-2.0 (`LICENSE-APACHE-2.0`). `docs/licensing.md` has the
   details, and contributions now need the Contributor Agreement.
+- The container image builds again. `scripts/package-build.sh` left `shim/libcudss.so.1` pointing into `cudss1/`, a directory the image does not
+  have, so the build stopped at "links that lead nowhere" from the cuDSS 1.0 change onward. A lint test (`lint_package_build`) now builds a small
+  tree with the same layout.
 - SASS: `ULDC` with a uniform base register (`ULDC.64 UR6, c[0x3][UR8+-0x72e0]`) takes its offset as a signed 16-bit number and wraps in the
   64 KiB bank, as `LDC` does. ptxas uses it to reach constant data past byte 32768, and the simulator read zero there on the Ampere and Ada
   profiles (an inverse NTT in FIDESlib came out all zeros) (pantheonsim #499).

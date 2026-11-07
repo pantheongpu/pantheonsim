@@ -1475,6 +1475,8 @@ vgpu_unit_test(test_memrmw)
 vgpu_unit_test(test_memhot_sp8)
 # A warp's gather load (load_batch's fused tests and two-pass loads) against load_scalar, over every kind of chunk and every way to decline.
 vgpu_unit_test(test_gather_sp10)
+# A warp's 16-byte loads (load_batch16, the LDG.E.128 path of the SASS tier) against the two 8-byte loads per lane they replace, over every kind of chunk and every decline.
+vgpu_unit_test(test_load_batch16)
 # A warp's load of one address (load_broadcast) and store on a stride (store_strided) against load_scalar / store_scalar, over every kind of chunk, the edges of chunks and of the allocation, and every decline.
 vgpu_unit_test(test_warp_stride_access)
 # A device-to-device copy made chunk to chunk (MemoryManager::copy_to) against the read-into-a-buffer-then-write pair it replaces: bytes, chunk state, declines.
@@ -2536,6 +2538,7 @@ set_tests_properties(lint_readme_commands PROPERTIES TIMEOUT 120)
 # ./run against a fake simulator, unshare and package tools.
 add_test(NAME lint_run_launcher COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_run.sh)
 add_test(NAME lint_fetch_frontend COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_fetch_frontend.sh)
+add_test(NAME lint_package_build COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_package_build.sh)
 set_tests_properties(lint_fetch_frontend PROPERTIES TIMEOUT 300)
 add_test(NAME lint_example_yaml COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_example_yaml.sh)
 set_tests_properties(lint_run_launcher PROPERTIES TIMEOUT 120)

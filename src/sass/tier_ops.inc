@@ -943,12 +943,15 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
     // A batch the memory manager declines made nothing happen: the loop below runs as it did.
     uint64_t fa[32], fb[32], lo[32], hi[32];
     unsigned n = 0;
-    for (Mask m = ex; m; m &= m - 1) {
-      const uint64_t a = addrs[std::countr_zero(m)];
-      fa[n] = a;
-      fb[n++] = a + 8;
+    for (Mask m = ex; m; m &= m - 1) fa[n++] = addrs[std::countr_zero(m)];
+    // One call of 16-byte pieces where the memory manager takes them as such (one lookup, one pass); it declines what the two calls below might treat
+    // differently (a piece across a chunk end, one not wholly in the first's allocation), and then they run, as before.
+    bool got = n && mem.load_batch16(fa, n, lo, hi, &op.way);
+    if (!got && n) {
+      for (unsigned i = 0; i < n; ++i) fb[i] = fa[i] + 8;
+      got = mem.load_batch(fa, n, 8, lo, &op.way) && mem.load_batch(fb, n, 8, hi, &op.way);
     }
-    if (n && mem.load_batch(fa, n, 8, lo, &op.way) && mem.load_batch(fb, n, 8, hi, &op.way)) {
+    if (got) {
       if (d) {
         unsigned i = 0;
         for (Mask m = ex; m; m &= m - 1, ++i) {
@@ -1771,30 +1774,15 @@ TIER_HANDLER(h_ldsm) {
 // as exec_mma lays them out (vgpu/exec/tile_mma.hpp), each product summed with the accumulator in 32 bits (a wrapping sum is the 64-bit sum cut to
 // 32) or, under .SAT, clamped to the s32 range after every 128 bits of K, by the tile kernel (vgpu/simd/simd.hpp: tile_i32). The destination is
 // written for the executing lanes.
-TIER_HANDLER(h_imma) {
-  TIER_PRELUDE
-  if (op.dst == tier::kNoReg) return;   // (an RZ destination: the interpreter computes and throws it away)
+// The general IMMA (any M, K, element width and .SAT), on int32 tiles. Its arrays are 17 KB of stack: kept out of h_imma, whose frame the fast form
+// below would otherwise pay for (a stack probe a page and the setup of the arrays) on every call.
+[[gnu::noinline]] static void imma_tiles(const TCtx& c, const tier::MOp& op, Mask ex) {
   const unsigned M = op.a, K = op.b;
   const bool sa = op.aux & 1, sb = op.aux & 2, sat = op.aux & 4, four = op.aux & 8;
   const exec::FragType ta = four ? (sa ? exec::FragType::S4 : exec::FragType::U4) : (sa ? exec::FragType::S8 : exec::FragType::U8),
                        tb = four ? (sb ? exec::FragType::S4 : exec::FragType::U4) : (sb ? exec::FragType::S8 : exec::FragType::U8);
   const unsigned per_reg = four ? 8 : 4, a_regs = M * K / (32 * per_reg), b_regs = K * 8 / (32 * per_reg), c_regs = M * 8 / 32;
   static const uint32_t kZeros[32] = {};
-#ifdef VGPU_IMMA_FRAG
-  // 8-bit operands, a wrapping sum, 16 x 8 x 16 or 16 x 8 x 32, at the AVX-512 level: straight from the registers (imma_frag.hpp). An RZ operand is zeros.
-  if (!sat && !four && M == 16 && (K == 16 || K == 32) && c.sk->level == simd::Level::Avx512) {
-    alignas(64) static const uint32_t kZ4[4 * 32] = {};
-    const unsigned ra = op.s[0].off, rb = op.s[1].off, rc = op.s[2].off;
-    const uint32_t* const pa = ra == kRZ ? kZ4 : c.R + ra * 32u;
-    const uint32_t* const pb = rb == kRZ ? kZ4 : c.R + rb * 32u;
-    const uint32_t* const pc = rc == kRZ ? nullptr : c.R + rc * 32u;
-    alignas(64) uint32_t xo[4 * 32];
-    if (sa) sb ? exec::imma_frag_m16n8<true, true>(K, pa, pb, pc, xo) : exec::imma_frag_m16n8<true, false>(K, pa, pb, pc, xo);
-    else sb ? exec::imma_frag_m16n8<false, true>(K, pa, pb, pc, xo) : exec::imma_frag_m16n8<false, false>(K, pa, pb, pc, xo);
-    for (unsigned s = 0; s < 4; ++s) tier_store(c, static_cast<uint16_t>(op.dst + s), ex, xo + s * 32);
-    return;
-  }
-#endif
   alignas(32) uint32_t xa[8 * 32], xb[4 * 32], xc[4 * 32], xd[4 * 32];
   const auto load = [&](unsigned base, unsigned n, uint32_t* dst) {
     for (unsigned i = 0; i < n; ++i) __builtin_memcpy(dst + 32 * i, base == kRZ ? kZeros : c.R + (base + i) * 32u, 32 * sizeof(uint32_t));
@@ -1811,6 +1799,34 @@ TIER_HANDLER(h_imma) {
   if (M == 16) exec::wgmma_tile_to_acc_i32(id, 8, xd);
   else exec::mma_tile_to_acc8_i32(id, xd);
   for (unsigned s = 0; s < c_regs; ++s) tier_store(c, static_cast<uint16_t>(op.dst + s), ex, xd + s * 32);   // (the executing lanes: a row copy, or a blend, not a store a lane)
+}
+
+TIER_HANDLER(h_imma) {
+  TIER_PRELUDE
+  if (op.dst == tier::kNoReg) return;   // (an RZ destination: the interpreter computes and throws it away)
+#ifdef VGPU_IMMA_FRAG
+  // 8-bit operands, a wrapping sum, 16 x 8 x 16 or 16 x 8 x 32, at the AVX-512 or AVX2 level: straight from the registers (imma_frag.hpp). An RZ operand is zeros.
+  if (!(op.aux & (4 | 8)) && op.a == 16 && (op.b == 16 || op.b == 32) && c.sk->level >= simd::Level::Avx2) {
+    const unsigned K = op.b;
+    const bool sa = op.aux & 1, sb = op.aux & 2;
+    alignas(64) static const uint32_t kZ4[4 * 32] = {};
+    const unsigned ra = op.s[0].off, rb = op.s[1].off, rc = op.s[2].off;
+    const uint32_t* const pa = ra == kRZ ? kZ4 : c.R + ra * 32u;
+    const uint32_t* const pb = rb == kRZ ? kZ4 : c.R + rb * 32u;
+    const uint32_t* const pc = rc == kRZ ? nullptr : c.R + rc * 32u;
+    alignas(64) uint32_t xo[4 * 32];
+    if (c.sk->level == simd::Level::Avx512) {
+      if (sa) sb ? exec::imma_frag_m16n8<true, true>(K, pa, pb, pc, xo) : exec::imma_frag_m16n8<true, false>(K, pa, pb, pc, xo);
+      else sb ? exec::imma_frag_m16n8<false, true>(K, pa, pb, pc, xo) : exec::imma_frag_m16n8<false, false>(K, pa, pb, pc, xo);
+    } else {   // the AVX2 level (a host without AVX-512, or VGPU_SIMD=avx2)
+      if (sa) sb ? exec::imma_frag_m16n8_avx2<true, true>(K, pa, pb, pc, xo) : exec::imma_frag_m16n8_avx2<true, false>(K, pa, pb, pc, xo);
+      else sb ? exec::imma_frag_m16n8_avx2<false, true>(K, pa, pb, pc, xo) : exec::imma_frag_m16n8_avx2<false, false>(K, pa, pb, pc, xo);
+    }
+    for (unsigned s = 0; s < 4; ++s) tier_store(c, static_cast<uint16_t>(op.dst + s), ex, xo + s * 32);
+    return;
+  }
+#endif
+  imma_tiles(c, op, ex);
 }
 
 // HMMA (the dense f16, bf16 and tf32 forms): one SIMD kernel over the warp's fragments, as exec_mma gives them to it, the

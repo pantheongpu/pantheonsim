@@ -593,6 +593,18 @@ const MemoryManager::Allocation& MemoryManager::resolve_scalar(uint64_t addr, ui
   return resolve(addr, len, op, base_out, writing, page_slack);
 }
 
+// The allocation a read() or write() of `len` bytes at `addr` lies in. A kernel's 16-byte access (LDG.128, STG.128, and an unaligned
+// one) comes here once per lane, so it asks the thread's memory of recent lookups first, as a scalar access does (resolve_scalar), and
+// takes the shared table lock only on a miss: the answer is the allocation resolve() finds (a hit is an allocation of live_ that holds
+// the whole access, with nothing a table lookup adds: page slack is not asked here), and an access that is not one is resolve()'s, errors
+// and all. Not while a card gate is in play (card_resident_): resolve() asks the gate before it looks.
+const MemoryManager::Allocation& MemoryManager::resolve_bulk(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
+                                                             bool writing) const {
+  if (card_resident_.load(std::memory_order_relaxed) <= 0)
+    if (const Allocation* a = find_ordinary(addr, len, base_out)) return *a;
+  return resolve(addr, len, op, base_out, writing);
+}
+
 bool MemoryManager::batch_faults_clear(bool store) const {
   if (store) {
     if (access_fault_ && access_fault_->store_pending &&
@@ -722,6 +734,41 @@ bool MemoryManager::load_batch(const uint64_t* addrs, size_t count, uint32_t siz
   if (!batch_addresses_ok(addrs, count, size, &a, &base, hint)) return false;
   load_batch_in(*a, base, addrs, count, size, out);
   return true;
+}
+
+// A warp's 16-byte loads (LDG.E.128), each as the two relaxed 8-byte loads that two load_batch calls of 8-byte pieces make (lo[i] the first, hi[i] the
+// second), in one lookup and one pass over the lanes where those two calls made two. Everything load_batch(addrs, n, 8) and load_batch(addrs + 8, n, 8)
+// would accept and a lane could still differ in is declined (false, `lo` and `hi` of no use, nothing else changed) and the caller runs those calls: an
+// address that is not 8-byte aligned, a piece outside the allocation the first lies in (the whole 16 bytes must be inside it), a 16-byte access that
+// crosses the end of a chunk (its halves are in two chunks, either of which may be untouched, uniform or real), a host mapping in reach, a fault armed.
+bool MemoryManager::load_batch16(const uint64_t* addrs, size_t count, uint64_t* lo, uint64_t* hi, uint8_t* hint) const {
+  if (count == 0 || count > 64) return false;
+  if (!batch_faults_clear(/*store=*/false)) return false;
+  uint64_t base = 0;
+  const Allocation* a = find_ordinary(addrs[0], 16, &base, hint);
+  if (!a || !host_map_free_span(base, a->size)) return false;
+  const uint64_t limit = a->size - 16 + 1;   // (the first access is inside, so 16 <= a->size)
+  const std::atomic<uint8_t*>* chunks = a->chunks.get();
+  uint64_t bits = 0, bad = 0;
+  for (size_t i = 0; i < count; ++i) {
+    uint64_t off = addrs[i] - base;
+    bits |= addrs[i];
+    const bool past = off >= limit;
+    off = past ? 0 : off;
+    uint64_t in_chunk = off % kChunkSize;
+    const bool crosses = in_chunk > kChunkSize - 16;
+    bad |= static_cast<uint64_t>(past) | static_cast<uint64_t>(crosses);
+    in_chunk = crosses ? 0 : in_chunk;   // (a lane that crosses the chunk's end has no result either, and its second word must not be read past the chunk: ASan)
+    const uint8_t* chunk = chunks[off / kChunkSize].load(std::memory_order_acquire);
+    if (__builtin_expect(chunk != nullptr && !(reinterpret_cast<uintptr_t>(chunk) & 1), 1)) {
+      const uint8_t* p = chunk + (in_chunk & ~uint64_t{7});   // (a misaligned lane's result is not used)
+      lo[i] = relaxed_load<uint64_t>(p);
+      hi[i] = relaxed_load<uint64_t>(p + 8);
+    } else {
+      lo[i] = hi[i] = chunk ? repeated(uniform_byte(chunk), 8) : 0;   // (untouched, or uniform)
+    }
+  }
+  return !((bits & 7) || bad);
 }
 
 // The same address for `count` lanes (a warp's load of one word, as a kernel's uniform index or loop-invariant makes): one lookup, one load, the word
@@ -1000,7 +1047,7 @@ void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
                       "device memory write from a NULL host pointer (", len, " bytes to ",
                       Hex{dst}, ")");
   uint64_t base = 0;
-  Allocation& a = resolve_mut(dst, len, "device memory write", &base);
+  Allocation& a = const_cast<Allocation&>(resolve_bulk(dst, len, "device memory write", &base, /*writing=*/true));
   const uint8_t* s = static_cast<const uint8_t*>(src);
   uint64_t off = dst - base;
   while (len > 0) {
@@ -1618,7 +1665,7 @@ void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
                       "device memory read into a NULL host pointer (", len, " bytes from ",
                       Hex{src}, ")");
   uint64_t base = 0;
-  const Allocation& a = resolve(src, len, "device memory read", &base);
+  const Allocation& a = resolve_bulk(src, len, "device memory read", &base, /*writing=*/false);
   uint8_t* d = static_cast<uint8_t*>(dst);
   read_chunks(a, src - base, d, len);
   if (any_stuck()) access_fault_->on_read(src - va_base_, d, len);
