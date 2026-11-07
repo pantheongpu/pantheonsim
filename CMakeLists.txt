@@ -1474,6 +1474,8 @@ vgpu_unit_test(test_memrmw)
 vgpu_unit_test(test_memhot_sp8)
 # A warp's gather load (load_batch's fused tests and two-pass loads) against load_scalar, over every kind of chunk and every way to decline.
 vgpu_unit_test(test_gather_sp10)
+# A warp's 16-byte loads (load_batch16, the LDG.E.128 path of the SASS tier) against the two 8-byte loads per lane they replace, over every kind of chunk and every decline.
+vgpu_unit_test(test_load_batch16)
 # A warp's load of one address (load_broadcast) and store on a stride (store_strided) against load_scalar / store_scalar, over every kind of chunk, the edges of chunks and of the allocation, and every decline.
 vgpu_unit_test(test_warp_stride_access)
 # A device-to-device copy made chunk to chunk (MemoryManager::copy_to) against the read-into-a-buffer-then-write pair it replaces: bytes, chunk state, declines.
@@ -1524,6 +1526,8 @@ vgpu_unit_test(test_launch_env)
 vgpu_unit_test(test_lockstep_yield)
 # How many host threads a lockstep grid takes: a small one of waits on loads spreads, one that takes locks stays on one thread.
 vgpu_unit_test(test_lockstep_shape)
+# The same on the PTX engine: a small grid of load polls uses the host threads, one that takes a lock (or has a lock loop among its loops) keeps one.
+vgpu_unit_test(test_ptx_lockstep_threads)
 # The fingerprint of a block's registers (eight chains for long inputs): any one-byte change changes it, at every length.
 vgpu_unit_test(test_lockstep_fold)
 # When a lockstep launch first looks at its blocks (after what the last look cost, per resident block), and that a block standing still is found out.
@@ -1798,6 +1802,12 @@ target_compile_definitions(test_amd_gcn_int64 PRIVATE VGPU_SOURCE_DIR="${CMAKE_S
 
 vgpu_unit_test(test_amd_gcn_atomics amd/tests/unit/test_gcn_atomics.cpp)
 target_compile_definitions(test_amd_gcn_atomics PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
+# How many host threads a small lockstep grid takes on the AMD engine: work-groups that wait on loads only use them, ones that take a lock keep one (gfx942, and gfx1100 for wave32).
+vgpu_unit_test(test_amd_lockstep_threads amd/tests/unit/test_amd_lockstep_threads.cpp)
+target_compile_definitions(test_amd_lockstep_threads PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME test_amd_lockstep_threads_gfx1100 COMMAND test_amd_lockstep_threads)
+set_tests_properties(test_amd_lockstep_threads_gfx1100 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1100")
 
 vgpu_unit_test(test_amd_gcn_mixed amd/tests/unit/test_gcn_mixed.cpp)
 target_compile_definitions(test_amd_gcn_mixed PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -2535,6 +2545,7 @@ set_tests_properties(lint_readme_commands PROPERTIES TIMEOUT 120)
 # ./run against a fake simulator, unshare and package tools.
 add_test(NAME lint_run_launcher COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_run.sh)
 add_test(NAME lint_fetch_frontend COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_fetch_frontend.sh)
+add_test(NAME lint_package_build COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_package_build.sh)
 set_tests_properties(lint_fetch_frontend PROPERTIES TIMEOUT 300)
 add_test(NAME lint_example_yaml COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_example_yaml.sh)
 set_tests_properties(lint_run_launcher PROPERTIES TIMEOUT 120)

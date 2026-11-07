@@ -13419,7 +13419,9 @@ bool is_mem_name(std::string_view n) {
   return false;
 }
 
-bool amd_loop_polls(const std::vector<const Inst*>& body) {
+// `kinds`, when given, gets exec::kPollLoad set when the poll is a load and exec::kPollAtomic when it is an atomic that returns its
+// old value (a lock being taken): a launch whose waits are loads only may spread a small grid over host threads (exec/lockstep.hpp).
+bool amd_loop_polls(const std::vector<const Inst*>& body, unsigned* kinds = nullptr) {
   enum : uint8_t { Undef, Fixed, Variable };
   constexpr unsigned kRegs = 1024;
   uint8_t state[2][kRegs] = {};
@@ -13435,6 +13437,7 @@ bool amd_loop_polls(const std::vector<const Inst*>& body) {
   for (const Inst* in : body)
     for (const gcn::Operand& d : in->dst) touch(d, [&](int f, uint32_t r) { set_in_loop[f][r] = true; });
   bool polls = false;
+  unsigned found = 0;
   for (const Inst* in : body) {
     const std::string_view n = in->name;
     const bool atomic = n.find("atomic") != std::string_view::npos && is_mem_name(n);
@@ -13447,18 +13450,23 @@ bool amd_loop_polls(const std::vector<const Inst*>& body) {
     const bool load = n.find("load") != std::string_view::npos && is_mem_name(n) && n.rfind("scratch_", 0) != 0 &&
                       n.rfind("ds_", 0) != 0 && n.rfind("s_", 0) != 0;
     const bool poll = (load && in->cache != 0) || (atomic && n.rfind("ds_", 0) != 0);
-    polls = polls || (poll && !var_src);
+    if (poll && !var_src) {
+      polls = true;
+      found |= atomic ? exec::kPollAtomic : exec::kPollLoad;
+    }
     const uint8_t now = (is_mem_name(n) || var_src) ? Variable : Fixed;
     for (const gcn::Operand& d : in->dst) touch(d, [&](int f, uint32_t r) { state[f][r] = now; });
   }
+  if (polls && kinds) *kinds |= found;
   return polls;
 }
 
-bool amd_kernel_polls(Machine& m) {
+// What the kernel's loops poll with (0, or exec::kPollLoad / exec::kPollAtomic, or both); remembered on the kernel.
+unsigned amd_kernel_poll_kinds(Machine& m) {
   const Kernel& k = *m.d.kernel;
   const int8_t cached = k.polls.v.load(std::memory_order_relaxed);
-  if (cached >= 0) return cached != 0;
-  bool found = false;
+  if (cached >= 0) return static_cast<unsigned>(cached);
+  unsigned kinds = 0;
   try {
     std::vector<const Inst*> code;   // the kernel's instructions in address order
     const uint64_t lo = m.d.code_base + k.entry, hi = lo + (k.size ? k.size : 4096);
@@ -13467,20 +13475,21 @@ bool amd_kernel_polls(Machine& m) {
       code.push_back(&in);
       pc += std::max<uint32_t>(in.size, 4);
     }
-    for (size_t i = 0; i < code.size() && !found; ++i) {
+    // (every loop is looked at: one that takes a lock decides what a small grid does, whatever the loops before it wait on)
+    for (size_t i = 0; i < code.size() && !(kinds & exec::kPollAtomic); ++i) {
       const Inst& br = *code[i];
       if (br.name.rfind("s_branch", 0) != 0 && br.name.rfind("s_cbranch", 0) != 0) continue;
       if (br.target > br.pc || br.pc - br.target > 4000) continue;
       std::vector<const Inst*> body;
       for (size_t j = 0; j <= i; ++j)
         if (code[j]->pc >= br.target) body.push_back(code[j]);
-      found = amd_loop_polls(body);
+      amd_loop_polls(body, &kinds);
     }
   } catch (const Error&) {
-    found = false;   // code this cannot read as a straight run (data among it, an instruction not known): as before
+    kinds = 0;   // code this cannot read as a straight run (data among it, an instruction not known): as before
   }
-  k.polls.v.store(found ? 1 : 0, std::memory_order_relaxed);
-  return found;
+  k.polls.v.store(static_cast<int8_t>(kinds), std::memory_order_relaxed);
+  return kinds;
 }
 
 }  // namespace
@@ -13619,26 +13628,31 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
   }
   // Work-groups that may wait on one another (vgpu/exec/lockstep.hpp): a kernel with a loop that polls
   // global memory runs the groups the device holds at once together, taking turns.
-  bool lockstep = false;
+  bool lockstep = false, loads_only = false;
   uint64_t capacity = 0;
   if (!d.cooperative && !debug::active() && !Machine::tracing()) {
     const exec::LockstepMode mode = exec::lockstep_mode();
+    unsigned kinds = 0;
     if (mode == exec::LockstepMode::All) {
       lockstep = true;
     } else if (mode == exec::LockstepMode::Auto && d.resident_groups) {
       const int8_t known = k.polls.v.load(std::memory_order_relaxed);   // (found the first time the kernel launches)
       if (known >= 0) {
-        lockstep = known != 0;
+        kinds = static_cast<unsigned>(known);
       } else {
         Machine probe(d, mem, *cache);
-        lockstep = amd_kernel_polls(probe);
+        kinds = amd_kernel_poll_kinds(probe);
       }
+      lockstep = kinds != 0;
     }
+    // Waits on loads only give the same answer whichever thread runs a group, so a small grid may use the host threads too; a
+    // kernel that takes locks keeps it on one thread, in a fixed order (exec/lockstep.hpp).
+    loads_only = lockstep && exec::lockstep_loads_only(mode, kinds);
     capacity = d.resident_groups ? d.resident_groups : groups;
   }
   const unsigned nthreads = d.cooperative ? 1 : worker_count(groups);
   if (lockstep) {
-    const exec::LockstepShape shape = exec::lockstep_shape(groups, capacity, nthreads, /*ranges=*/true);
+    const exec::LockstepShape shape = exec::lockstep_shape(groups, capacity, nthreads, /*ranges=*/true, /*small_grid_spreads=*/loads_only);
     exec::lockstep_note(k.name.c_str(), groups, shape);
     std::vector<DispatchStats> per_thread(shape.workers);
     std::atomic<uint64_t> ticket{0}, beat{0};

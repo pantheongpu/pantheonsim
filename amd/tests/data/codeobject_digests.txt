@@ -126,6 +126,8 @@ data/lds.gfx1201.o	1d0dd82861fd23f4
 data/lds.gfx1250.o	ac78d574a0c9342c
 data/lds.gfx942.o	40ef29f5c1de0206
 data/linked.gfx942.hsaco	caeef8f4c7aab7f1
+data/lockstep_threads.gfx1100.o	a9e500297f3ecb6b
+data/lockstep_threads.gfx942.o	fafbc0d6232b6570
 data/math.gfx1030.o	6a8aa5f6e57a0e9c
 data/math.gfx1100.o	1b9e4578c646ff48
 data/math.gfx1201.o	d01c9f0f437e2a61

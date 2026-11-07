@@ -11,6 +11,10 @@
 #include "vtest.hpp"
 
 using vgpu::exec::kLockstepOneThread;
+using vgpu::exec::kPollAtomic;
+using vgpu::exec::kPollLoad;
+using vgpu::exec::LockstepMode;
+using vgpu::exec::lockstep_loads_only;
 using vgpu::exec::lockstep_shape;
 
 VTEST(a_small_grid_stays_on_one_thread_by_default) {
@@ -58,6 +62,15 @@ VTEST(fewer_resident_places_than_blocks_limit_the_window) {
   VCHECK_EQ(s.workers, 4u);
   VCHECK_EQ(s.window, 2u);
   VCHECK_EQ(s.initial, 2u);
+}
+
+VTEST(only_load_polls_in_the_default_mode_let_a_small_grid_spread) {
+  // The rule every engine (SASS, PTX, AMD) applies to what its poll search found in a kernel.
+  VCHECK(lockstep_loads_only(LockstepMode::Auto, kPollLoad));
+  VCHECK(!lockstep_loads_only(LockstepMode::Auto, kPollAtomic));
+  VCHECK(!lockstep_loads_only(LockstepMode::Auto, kPollLoad | kPollAtomic));   // a lock anywhere keeps the fixed order
+  VCHECK(!lockstep_loads_only(LockstepMode::All, kPollLoad));   // VGPU_LOCKSTEP=all checks order independence: fixed order
+  VCHECK(!lockstep_loads_only(LockstepMode::All, 0));
 }
 
 VTEST_MAIN

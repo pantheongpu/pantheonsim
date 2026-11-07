@@ -228,6 +228,11 @@ class MemoryManager {
   // case the caller makes them one at a time and meets any error where it
   // would have. One lookup serves the lot.
   bool load_batch(const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out, uint8_t* hint = nullptr) const;
+  // `count` (<= 64) 16-byte loads, each as the two 8-byte relaxed loads of the two load_batch calls of 8-byte pieces at addrs[i] and addrs[i] + 8 (lo[i],
+  // hi[i]), in one lookup and one pass. False, having done nothing to memory (lo and hi may be written), wherever the caller's two load_batch calls
+  // could differ or decline: an address not 8-byte aligned, a 16 bytes not wholly inside the allocation the first is in, a load across the end of a
+  // chunk, a host mapping in reach, a fault armed. The caller then makes those two calls, and the lane loop after them, as before.
+  bool load_batch16(const uint64_t* addrs, size_t count, uint64_t* lo, uint64_t* hi, uint8_t* hint = nullptr) const;
   // load_batch for `count` lanes that all load the same address: one lookup and one load, the word in every out[i]. False (out may be written) for
   // anything load_batch would decline (a fault armed, a host mapping, a misaligned or no-allocation address).
   bool load_broadcast(uint64_t addr, size_t count, uint32_t size, uint64_t* out, uint8_t* hint = nullptr) const;

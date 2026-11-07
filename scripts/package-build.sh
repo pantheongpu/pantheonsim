@@ -25,6 +25,9 @@ for entry in "$build"/shim/*; do
   real="$(readlink -f "$entry")"
   [[ -f "$real" ]] || { echo "package-build: $entry leads nowhere" >&2; exit 1; }
   cp -an "$real" "$dest/"
+  # The shim's own link may reach its library through a directory the package does not have (cuDSS 1.0 is built
+  # in cudss1/, so libcudss.so.1 -> ../cudss1/libcudss.so.1.0.0): point it at the copy in the package's root.
+  ln -sfn "../$(basename "$real")" "$dest/shim/$(basename "$entry")"
   hop="$(basename "$(readlink "$entry")")"
   [[ "$hop" == "$(basename "$real")" ]] || ln -sfn "$(basename "$real")" "$dest/$hop"
 done

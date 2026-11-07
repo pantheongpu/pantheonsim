@@ -736,6 +736,41 @@ bool MemoryManager::load_batch(const uint64_t* addrs, size_t count, uint32_t siz
   return true;
 }
 
+// A warp's 16-byte loads (LDG.E.128), each as the two relaxed 8-byte loads that two load_batch calls of 8-byte pieces make (lo[i] the first, hi[i] the
+// second), in one lookup and one pass over the lanes where those two calls made two. Everything load_batch(addrs, n, 8) and load_batch(addrs + 8, n, 8)
+// would accept and a lane could still differ in is declined (false, `lo` and `hi` of no use, nothing else changed) and the caller runs those calls: an
+// address that is not 8-byte aligned, a piece outside the allocation the first lies in (the whole 16 bytes must be inside it), a 16-byte access that
+// crosses the end of a chunk (its halves are in two chunks, either of which may be untouched, uniform or real), a host mapping in reach, a fault armed.
+bool MemoryManager::load_batch16(const uint64_t* addrs, size_t count, uint64_t* lo, uint64_t* hi, uint8_t* hint) const {
+  if (count == 0 || count > 64) return false;
+  if (!batch_faults_clear(/*store=*/false)) return false;
+  uint64_t base = 0;
+  const Allocation* a = find_ordinary(addrs[0], 16, &base, hint);
+  if (!a || !host_map_free_span(base, a->size)) return false;
+  const uint64_t limit = a->size - 16 + 1;   // (the first access is inside, so 16 <= a->size)
+  const std::atomic<uint8_t*>* chunks = a->chunks.get();
+  uint64_t bits = 0, bad = 0;
+  for (size_t i = 0; i < count; ++i) {
+    uint64_t off = addrs[i] - base;
+    bits |= addrs[i];
+    const bool past = off >= limit;
+    off = past ? 0 : off;
+    uint64_t in_chunk = off % kChunkSize;
+    const bool crosses = in_chunk > kChunkSize - 16;
+    bad |= static_cast<uint64_t>(past) | static_cast<uint64_t>(crosses);
+    in_chunk = crosses ? 0 : in_chunk;   // (a lane that crosses the chunk's end has no result either, and its second word must not be read past the chunk: ASan)
+    const uint8_t* chunk = chunks[off / kChunkSize].load(std::memory_order_acquire);
+    if (__builtin_expect(chunk != nullptr && !(reinterpret_cast<uintptr_t>(chunk) & 1), 1)) {
+      const uint8_t* p = chunk + (in_chunk & ~uint64_t{7});   // (a misaligned lane's result is not used)
+      lo[i] = relaxed_load<uint64_t>(p);
+      hi[i] = relaxed_load<uint64_t>(p + 8);
+    } else {
+      lo[i] = hi[i] = chunk ? repeated(uniform_byte(chunk), 8) : 0;   // (untouched, or uniform)
+    }
+  }
+  return !((bits & 7) || bad);
+}
+
 // The same address for `count` lanes (a warp's load of one word, as a kernel's uniform index or loop-invariant makes): one lookup, one load, the word
 // copied to every lane. The word is a legal outcome of the lanes' loads one by one (a store from another thread between them could show different
 // words to different lanes; the lanes of one warp are one instruction).
