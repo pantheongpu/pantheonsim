@@ -871,6 +871,114 @@ VTEST(allocating_and_freeing_while_other_threads_read_is_safe) {
   VCHECK_EQ(wrong.load(), 0);
 }
 
+// A 16-byte or unaligned read() / write() (a kernel's LDG.128 / STG.128, one call a lane) asks the thread's memory of recent lookups
+// before the table (resolve_bulk). Whatever it answers must be what the table says: the bytes land in the right allocation (more
+// allocations than the memory has ways, so hits, misses and replacements all happen), an access that runs off the end or lies in
+// freed memory is the table's own error, and an allocation freed after the thread remembered it is never answered from memory.
+VTEST(bulk_reads_and_writes_through_the_lookup_memory_match_the_table) {
+  MemoryManager mm(64ull << 20);
+  constexpr int kAllocs = 24;   // three times the ways of a thread's lookup memory
+  constexpr uint64_t kSize = 4096;
+  std::vector<uint64_t> base(kAllocs);
+  std::vector<std::vector<uint8_t>> shadow(kAllocs, std::vector<uint8_t>(kSize, 0));
+  for (int i = 0; i < kAllocs; ++i) base[i] = mm.alloc(kSize);
+  uint64_t rng = 12345;
+  const auto next = [&] { rng = rng * 6364136223846793005ull + 1442695040888963407ull; return rng >> 33; };
+  for (int step = 0; step < 20000; ++step) {
+    const int i = static_cast<int>(next() % kAllocs);
+    const uint64_t len = (next() % 4 == 0) ? 1 + next() % 40 : 16;
+    const uint64_t off = (len == 16 ? (next() % (kSize / 16)) * 16 : next() % (kSize - len));
+    uint8_t buf[64], got[64];
+    if (next() % 2) {
+      for (uint64_t k = 0; k < len; ++k) buf[k] = static_cast<uint8_t>(next());
+      mm.write(base[i] + off, buf, len);
+      std::memcpy(&shadow[i][off], buf, len);
+    } else {
+      mm.read(base[i] + off, got, len);
+      VCHECK(std::memcmp(got, &shadow[i][off], len) == 0);
+    }
+  }
+  // Off the end: the table's error, the same on a repeat (the second goes past a remembered entry).
+  for (int rep = 0; rep < 2; ++rep) {
+    uint8_t buf[16] = {};
+    auto e1 = VCAPTURE(Error, mm.read(base[3] + kSize - 8, buf, 16));
+    VCHECK(e1.code() == Err::OutOfBounds);
+    VCHECK_CONTAINS(e1.what(), "runs past the end of the 4096-byte allocation");
+    auto e2 = VCAPTURE(Error, mm.write(base[3] + kSize - 8, buf, 16));
+    VCHECK(e2.code() == Err::OutOfBounds);
+    VCHECK_CONTAINS(e2.what(), "runs past the end of the 4096-byte allocation");
+  }
+  // Freed memory the thread remembered is freed memory: read it (so it is remembered), free it, read it again.
+  uint8_t buf[16] = {};
+  for (int round = 0; round < 3; ++round) {
+    const uint64_t p = mm.alloc(kSize);
+    mm.write(p + 32, buf, 16);
+    mm.read(p + 32, buf, 16);
+    mm.read(p + 48, buf, 16);
+    mm.free(p);
+    auto er = VCAPTURE(Error, mm.read(p + 32, buf, 16));
+    VCHECK(er.code() == Err::UseAfterFree);
+    auto ew = VCAPTURE(Error, mm.write(p + 32, buf, 16));
+    VCHECK(ew.code() == Err::UseAfterFree);
+  }
+  // A freed allocation of another (the epoch moves, the entry stays good): still answered, with its bytes.
+  for (int i = 0; i < 8; ++i) {
+    uint8_t got[16];
+    mm.read(base[5] + 16, got, 16);
+    const uint64_t q = mm.alloc(kSize);
+    mm.free(q);
+    mm.read(base[5] + 16, got, 16);
+    VCHECK(std::memcmp(got, &shadow[5][16], 16) == 0);
+  }
+  for (uint64_t b : base) mm.free(b);
+}
+
+// The same calls from several threads while another allocates and frees other memory: each thread's lookup memory is its own, and
+// the answers must hold as the table changes under them (and the ThreadSanitizer job must find nothing). The threads also write: each
+// to words of its own, which only it reads back.
+VTEST(bulk_access_from_many_threads_while_the_table_changes) {
+  MemoryManager mm(256ull << 20);
+  constexpr int kThreads = 6, kFixed = 12;
+  std::vector<uint64_t> fixed(kFixed);
+  for (int i = 0; i < kFixed; ++i) {
+    fixed[i] = mm.alloc(4096);
+    for (uint64_t w = 0; w < 2048; w += 16) {
+      uint64_t v[2] = {(uint64_t{static_cast<unsigned>(i)} << 32) | w, ~w};
+      mm.write(fixed[i] + w, v, 16);
+    }
+  }
+  std::atomic<bool> stop{false};
+  std::atomic<int> wrong{0};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t)
+    threads.emplace_back([&, t] {
+      uint64_t n = static_cast<uint64_t>(t);
+      while (!stop.load(std::memory_order_relaxed)) {
+        const int i = static_cast<int>(n % kFixed);
+        const uint64_t w = ((n * 16) % 2048);
+        uint64_t v[2];
+        mm.read(fixed[i] + w, v, 16);
+        if (v[0] != ((uint64_t{static_cast<unsigned>(i)} << 32) | w) || v[1] != ~w) wrong.fetch_add(1);
+        // This thread's own 16 bytes in the upper half: written, then read back.
+        const uint64_t mine = fixed[i] + 2048 + 16 * static_cast<uint64_t>(t);
+        const uint64_t out[2] = {n, ~n};
+        mm.write(mine, out, 16);
+        uint64_t back[2];
+        mm.read(mine, back, 16);
+        if (back[0] != n || back[1] != ~n) wrong.fetch_add(1);
+        ++n;
+      }
+    });
+  for (int round = 0; round < 400; ++round) {
+    std::vector<uint64_t> tmp;
+    for (int j = 1; j <= 8; ++j) tmp.push_back(mm.alloc(static_cast<uint64_t>(j) * 1000));
+    for (uint64_t p : tmp) mm.free(p);
+  }
+  stop = true;
+  for (auto& th : threads) th.join();
+  VCHECK_EQ(wrong.load(), 0);
+}
+
 // The lock under the table: many readers at once, a writer that waits for
 // them and holds them off, and a writer that takes it again and reads under
 // it from its own thread (the table's mutators call one another).

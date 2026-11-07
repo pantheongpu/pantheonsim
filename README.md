@@ -76,4 +76,4 @@ Each setting is described in [docs/config.md](docs/config.md). It also runs [in 
 
 [Getting started](docs/getting-started.md), [the machine](docs/machine-simulator.md), [commands](docs/cli.md), [status and limits](docs/status.md), [architecture](ARCHITECTURE.md), [contributing](CONTRIBUTING.md), [governance](GOVERNANCE.md), [security](SECURITY.md), [code of conduct](CODE_OF_CONDUCT.md). Questions go in [Discussions](https://github.com/pantheongpu/pantheonsim/discussions), bugs in [issues](https://github.com/pantheongpu/pantheonsim/issues).
 
-License: [Business Source License 1.1](LICENSE) from version 0.3.0. It is free to use, change and run in your own CI; the one restriction is that you may not offer it to other people as a hosted service. Each version becomes Apache-2.0 four years after release, and versions up to 0.2.0 are Apache-2.0 ([details](docs/licensing.md)). CUDA is a trademark of NVIDIA. This project is not affiliated with NVIDIA or AMD.
+Apache-2.0. CUDA is a trademark of NVIDIA. This project is not affiliated with NVIDIA or AMD.

@@ -593,6 +593,18 @@ const MemoryManager::Allocation& MemoryManager::resolve_scalar(uint64_t addr, ui
   return resolve(addr, len, op, base_out, writing, page_slack);
 }
 
+// The allocation a read() or write() of `len` bytes at `addr` lies in. A kernel's 16-byte access (LDG.128, STG.128, and an unaligned
+// one) comes here once per lane, so it asks the thread's memory of recent lookups first, as a scalar access does (resolve_scalar), and
+// takes the shared table lock only on a miss: the answer is the allocation resolve() finds (a hit is an allocation of live_ that holds
+// the whole access, with nothing a table lookup adds: page slack is not asked here), and an access that is not one is resolve()'s, errors
+// and all. Not while a card gate is in play (card_resident_): resolve() asks the gate before it looks.
+const MemoryManager::Allocation& MemoryManager::resolve_bulk(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
+                                                             bool writing) const {
+  if (card_resident_.load(std::memory_order_relaxed) <= 0)
+    if (const Allocation* a = find_ordinary(addr, len, base_out)) return *a;
+  return resolve(addr, len, op, base_out, writing);
+}
+
 bool MemoryManager::batch_faults_clear(bool store) const {
   if (store) {
     if (access_fault_ && access_fault_->store_pending &&
@@ -1000,7 +1012,7 @@ void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
                       "device memory write from a NULL host pointer (", len, " bytes to ",
                       Hex{dst}, ")");
   uint64_t base = 0;
-  Allocation& a = resolve_mut(dst, len, "device memory write", &base);
+  Allocation& a = const_cast<Allocation&>(resolve_bulk(dst, len, "device memory write", &base, /*writing=*/true));
   const uint8_t* s = static_cast<const uint8_t*>(src);
   uint64_t off = dst - base;
   while (len > 0) {
@@ -1618,7 +1630,7 @@ void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
                       "device memory read into a NULL host pointer (", len, " bytes from ",
                       Hex{src}, ")");
   uint64_t base = 0;
-  const Allocation& a = resolve(src, len, "device memory read", &base);
+  const Allocation& a = resolve_bulk(src, len, "device memory read", &base, /*writing=*/false);
   uint8_t* d = static_cast<uint8_t*>(dst);
   read_chunks(a, src - base, d, len);
   if (any_stuck()) access_fault_->on_read(src - va_base_, d, len);
