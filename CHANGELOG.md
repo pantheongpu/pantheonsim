@@ -7,6 +7,7 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Driver calls that a real GPU answers with no current context no longer fail with `CUDA_ERROR_INVALID_CONTEXT`: `cuMemAllocFromPoolAsync`, `cuMemcpy3DAsync` and `cuStreamSynchronize` take the device from their stream, `cuMemFree` (device and managed memory) and `cuMemFreeHost` from the pointer, and `cuMemAddressReserve` and `cuMemAddressFree` need none. `cuMemcpy3D` (no stream) and the null stream still fail as on the card. cuda-api-wrappers pushes and pops the primary context around every call and hit this (pantheonsim #518).
 - The container image builds again. `scripts/package-build.sh` left `shim/libcudss.so.1` pointing into `cudss1/`, a directory the image does not
   have, so the build stopped at "links that lead nowhere" from the cuDSS 1.0 change onward. A lint test (`lint_package_build`) now builds a small
   tree with the same layout.

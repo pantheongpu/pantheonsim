@@ -307,6 +307,21 @@ std::vector<uintptr_t>& ctx_stack() {
   return *t_ctx_stack;
 }
 
+// The device a call works on when the thread has no current context. On the card some calls need none: a
+// stream-ordered call takes the context from its stream, a free from the pointer it frees, and a virtual
+// address range belongs to no context. The call sets this for its duration (DeviceHint) and current_device()
+// answers it where it would otherwise find no context. Never set while a context is current.
+static thread_local int t_dev_hint = -1;
+struct DeviceHint {
+  int prev;
+  explicit DeviceHint(int device) : prev(t_dev_hint) {
+    if (ctx_stack().empty() && device >= 0) t_dev_hint = device;
+  }
+  ~DeviceHint() { t_dev_hint = prev; }
+  DeviceHint(const DeviceHint&) = delete;
+  DeviceHint& operator=(const DeviceHint&) = delete;
+};
+
 bool quiet() {
   const char* q = std::getenv("VGPU_QUIET");
   return q && q[0] == '1';
@@ -452,7 +467,7 @@ CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
     report(name, "cuInit has not been called");
     return CUDA_ERROR_NOT_INITIALIZED;
   }
-  if (s.initialized && ctx_stack().empty() && needs_current_context(name)) {
+  if (s.initialized && ctx_stack().empty() && t_dev_hint < 0 && needs_current_context(name)) {
     report(name, "no current context (create one with cuCtxCreate or cuDevicePrimaryCtxRetain + cuCtxSetCurrent)");
     return CUDA_ERROR_INVALID_CONTEXT;
   }
@@ -486,6 +501,7 @@ CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
 }
 
 int current_device(ShimState& s) {
+  if (ctx_stack().empty() && t_dev_hint >= 0) return t_dev_hint;
   if (ctx_stack().empty())
     throw NoContext("no current context (create one with cuCtxCreate or "
                     "cuDevicePrimaryCtxRetain + cuCtxSetCurrent)");
@@ -541,6 +557,23 @@ vgpu::MemoryManager& owner_memory(ShimState& s, CUdeviceptr p) {
   for (int d = 0; d < s.rt->device_count(); ++d)
     if (s.rt->device(d).memory().owns(p)) return s.rt->device(d).memory();
   return current(s).memory();
+}
+
+// The device a stream was made on, or -1 for the null and legacy streams and for one this shim did not make
+// (those follow the current context).
+int stream_hint(CUstream st) {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  auto it = s.stream_device.find(reinterpret_cast<uintptr_t>(st));
+  return it == s.stream_device.end() ? -1 : it->second;
+}
+
+// The device that owns a device or managed pointer, or -1.
+int pointer_device(ShimState& s, CUdeviceptr p) {
+  if (auto it = s.managed_device.find(p); it != s.managed_device.end()) return it->second;
+  for (int d = 0; d < s.rt->device_count(); ++d)
+    if (s.rt->device(d).memory().owns(p)) return d;
+  return -1;
 }
 
 // The managed allocation holding [p, p + n), or nullptr.
@@ -1417,6 +1450,7 @@ static CUresult cuMemAlloc_impl(CUdeviceptr* dptr, size_t bytesize) {
 static CUresult cuMemFree_v2_impl(CUdeviceptr dptr) {
   return api("cuMemFree", true, false, [&](ShimState& s) {
     if (dptr == 0) return CUDA_SUCCESS;   // a documented no-op, with or without a context
+    const DeviceHint hint(pointer_device(s, dptr));   // the owning context, as on the card
     if (auto it = s.managed.find(dptr); it != s.managed.end()) {
       profile_memory(2, dptr, it->second, vgpu::profiling::MemKind::Managed, current_device(s));
       for (int d = 0; d < s.rt->device_count(); ++d) s.rt->device(d).memory().unmap_host(dptr);
@@ -1953,6 +1987,7 @@ static CUresult cuMemAddressReserve_impl(CUdeviceptr* ptr, size_t size, size_t a
   VGPU_CAPTURE_UNSAFE("cuMemAddressReserve");
   return api("cuMemAddressReserve", true, false, [&](ShimState& s) {
     if (!ptr || size == 0 || flags != 0) return CUDA_ERROR_INVALID_VALUE;
+    const DeviceHint hint(0);   // an address range needs no current context
     // The size is whole granules (2 MiB) and the alignment a power of two, else CUDA_ERROR_INVALID_VALUE (an
     // RTX 3060: sizes of 1, 4096, 65536 and 2 MiB + 1 and an alignment of 5 or 3 granules are refused, and an
     // alignment below 2 MiB is accepted and raised to it).
@@ -1970,6 +2005,7 @@ VGPU_EXPORT CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) { return tra
 static CUresult cuMemAddressFree_impl(CUdeviceptr ptr, size_t size) {
   VGPU_CAPTURE_UNSAFE("cuMemAddressFree");
   return api("cuMemAddressFree", true, false, [&](ShimState& s) {
+    const DeviceHint hint(0);
     owner_memory(s, ptr).address_free(ptr, size);
     return CUDA_SUCCESS;
   });
@@ -3669,6 +3705,7 @@ static CUresult cuMemAllocHost_impl(void** pp, size_t bytesize) {
 static CUresult cuMemFreeHost_impl(void* p) {
   return api("cuMemFreeHost", true, false, [&](ShimState& s) {
     if (!p) return CUDA_SUCCESS;   // as cuMemFree(0): a no-op, with or without a context
+    const DeviceHint hint(0);      // pinned host memory needs no context to free
     auto it = pinned(s).find(p);
     if (it == pinned(s).end()) return CUDA_ERROR_INVALID_VALUE;
     profile_memory(2, reinterpret_cast<uint64_t>(p), it->second.size, vgpu::profiling::MemKind::Pinned, current_device(s));
@@ -4866,6 +4903,7 @@ static CUresult cuMemcpy3D_impl(const CUDA_MEMCPY3D* p) { return cuMemcpy3D_v2(p
 static CUresult cuMemcpy3DAsync_v2_impl(const CUDA_MEMCPY3D* p, CUstream st);
 VGPU_EXPORT CUresult cuMemcpy3DAsync_v2(const CUDA_MEMCPY3D* p, CUstream st) { return traced("cuMemcpy3DAsync_v2", cuMemcpy3DAsync_v2_impl, p, st); }
 static CUresult cuMemcpy3DAsync_v2_impl(const CUDA_MEMCPY3D* p, CUstream st) {
+  const DeviceHint hint(stream_hint(st));   // unlike cuMemcpy3D, the stream names the context
   if (p && stream_capturing(st)) {   // the descriptor is the caller's to reuse: the node keeps its own copy
     const CUDA_MEMCPY3D copy = *p;
     VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpy3D_v2(&copy));
@@ -5041,6 +5079,7 @@ VGPU_EXPORT CUresult cuMemAllocFromPoolAsync(CUdeviceptr* dptr, size_t bytesize,
 static CUresult cuMemAllocFromPoolAsync_impl(CUdeviceptr* dptr, size_t bytesize, void* pool, CUstream st) {
   if (CUresult rc; capture_alloc(dptr, bytesize, st, &rc)) return rc;
   VGPU_CAPTURE_UNSAFE("cuMemAllocFromPoolAsync");
+  const DeviceHint hint(stream_hint(st));   // the stream names the context
   return api("cuMemAllocFromPoolAsync", true, false, [&](ShimState& s) {
     if (!dptr) return CUDA_ERROR_INVALID_VALUE;
     PoolRec* p = pool_from_handle(s, pool);
@@ -5462,8 +5501,9 @@ static CUresult cuStreamDestroy_impl(CUstream stream) { return cuStreamDestroy_v
 // A wait that returned is recorded for a profiler, and the stream and context
 // waits are told to a subscriber (vgpu/profiling.hpp).
 static CUresult cuStreamSynchronize_impl(CUstream stream) {
+  const DeviceHint hint(stream_hint(stream));   // the stream names the context
   return api("cuStreamSynchronize", true, false, [&](ShimState& s) {
-    if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
+    if (ctx_stack().empty() && t_dev_hint < 0) return CUDA_ERROR_INVALID_CONTEXT;
     (void)current_device(s);  // requires a current context
     vgpu::profiling::SyncScope waited(vgpu::profiling::SyncKind::Stream, reinterpret_cast<uint64_t>(stream), 0,
                                       profiled_device(s));
