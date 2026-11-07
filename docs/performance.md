@@ -7401,6 +7401,33 @@ Same bits: `VGPU_COUNTERS_FILE` and `VGPU_KERNEL_DIGEST` (pid removed) byte-iden
 
 ### Not verified
 No PTX engine change (its MATCH is separate). No AMD run. The sass_tier e2e tests were not run (no nvcc on server2): CI is the check. One program (atomicAggregate) gains; the others of the list (aidw, aligned-types, babelstream, base64e, binomial) were not profiled for a lever.
+
+## Round sp31 (the table's reader lock on per-lane 16-byte accesses; branch `sp31-readerlock`, base `origin/main` 2db5dd65)
+
+Round sp29 found `BigReaderLock::unlock_shared` 18% and `lock_shared` 6.7% of cycles in HeCBench `bh-cuda` (SASS, one thread). Where it comes from: `BigReaderLock::lock_shared` is one `lock xadd` on the thread's own slot plus a read of the writer flag, `unlock_shared` a second `lock xadd` (uncontended, one thread's own cache line: the cost is the two serialising atomics, about 40 cycles a pair, and the sampler books the second one's wait on `unlock_shared`). The lock is taken once per call of `MemoryManager::resolve`, and that is called once per lane by `MemoryManager::read` / `write`, which is what `tier_global16` (LDG.128 / STG.128) and every unaligned access use for each active lane that is not one run of 16-byte pieces. Scalar accesses (`load_scalar`, `resolve_scalar`) and the batches already ask the thread's memory of recent lookups first (`find_ordinary`, validated by the lock's epoch) and take the lock only on a miss. `read` and `write` did not.
+
+### What changed
+`read` and `write` ask `find_ordinary` first through `resolve_bulk`, then `resolve` on a miss (and whenever `card_resident_ > 0`, where `resolve` asks the card gate before it looks). Same answer by construction: a hit is an allocation of `live_` that holds the whole access, which is what `resolve` returns for an access with no page slack; an access that is not a hit (off the end, freed, mapped, unknown) is `resolve`'s, errors and all. The hit is under the same epoch rule the scalar path has relied on since the lookup memory was introduced (a free calls `note_free` before the allocation is taken apart; an allocation changes no remembered answer). Nothing about when the lock is held across the copy changes: `resolve` released it before `read_chunks` did its copy both before and after.
+
+Not changed: batches, `find_ordinary_miss`, `batch_ok`, `run_allocation` and the host-mapped run of PR #507 (branch `sp26-zerocopy`, not needed: no file overlap beyond `memory.cpp`'s unrelated hunks). Not done: a per-warp 16-byte batch. Branch `sp26-tensor` (PR #510, open) already does the loads ("128-bit global loads as two batches of 8-byte pieces"), and with it bh-cuda has no lock share left (0.946 s at one thread against 1.28 s on main, `perf`: `load_batch` 9%, no `resolve`). This change is what is left for stores, unaligned accesses and the lanes a batch declines; it is not redundant with #510 but its bh-cuda gain shrinks to nothing once #510 is in.
+
+### Results (A = origin/main 2db5dd65, C = copy of A, W = A + this change; Release/LTO built on server3, cpu 15, one thread, interleaved 15 rounds in rotated order, copies made at the same time; medians of wall seconds)
+| program | A | A/A (C/A) | W/A | W/C |
+|---|---:|---:|---:|---:|
+| hecbench bh-cuda `5000 2` | 1.284 | 1.009 | **0.859** | 0.851 |
+| hecbench clenergy-cuda (time to the 3rd launch) | 13.14 | 0.978 | **0.904** | 0.925 |
+| hecbench particles-cuda `60` | 8.17 | 1.005 | **0.956** | 0.951 |
+| hecbench fluidSim-cuda `100` | 6.12 | 0.998 | **0.961** | 0.963 |
+| hecbench nbnxm-cuda `10` | 9.30 | 0.993 | 0.955 | 0.961 |
+Lock share (`perf record -e cycles:u`, 1 thread, A): bh-cuda 24% (31% in the survey run), clenergy-cuda 25%, particles-cuda 5.2%, nbnxm-cuda 3.2%, fluidSim-cuda 2.8%, zerocopy-cuda 1.1%. None of the other 34 reduced HeCBench programs at their sim arguments, the 20 PolyBench/GPU programs or 8 Rodinia apps shows any (0.0%). Profile of bh-cuda after the change: `resolve_bulk` 15.8%, `read` 11.3%, `read_chunks` 8.8%, `host_pieces` 5.5%; the lock is gone from the list.
+
+Same bits: output, `VGPU_COUNTERS` and `VGPU_KERNEL_DIGEST` identical A against W at one thread for bh-cuda, nbnxm, particles, fluidSim, SYR2K (timing lines only differ), gaussian; at four threads for particles, fluidSim, gaussian, SYR2K (digest). nbnxm's digest at four threads and bh-cuda's counters at four threads differ from run to run on A itself (atomic and lock-retry order), so those two are checked at one thread only. clenergy (one fixed 1 M-atom launch, 100 s) was not compared bit for bit.
+
+### Tests and mutants
+`tests/unit/test_memory.cpp`: `bulk_reads_and_writes_through_the_lookup_memory_match_the_table` (20,000 random 16-byte, odd-length reads and writes over 24 allocations, three times the lookup memory's ways, against a shadow; off-the-end errors twice; read and write of freed memory after the thread remembered it; frees of other allocations leave an entry good) and `bulk_access_from_many_threads_while_the_table_changes` (six threads reading and writing 16-byte words while another allocates and frees; TSan/ASan run it in CI). Mutants, built and run on server3: `resolve_bulk` asks `find_ordinary` for 0 bytes (bounds ignored): killed by the off-the-end check (segfault in the unfiltered run, clean failure with the test filtered); stale remembered entry accepted after a free of its own allocation (`still_valid` skipped): killed (`expected exception ... nothing was thrown`). Not killed: dropping the `card_resident_` guard (no host-GPU gate in a unit test; `resolve` would not ask the gate for a remembered allocation: the same exposure `resolve_scalar` has), and the lock-avoiding property itself (it has no observable effect; the timings above are its evidence). `lint_hot_unit_layout` passes.
+
+### Caveats
+Wins are real only where scattered 16-byte or unaligned accesses are on the path; every other program is unchanged (no measurement, no lock share). Once #510 lands bh-cuda's gain goes to #510; clenergy-style 128-bit stores and the nbnxm/particles/fluidSim lanes remain. The clenergy and nbnxm timings partly overlapped a niced `ninja` on other CPUs (interleaving keeps it fair; the A/A rows are 2.2% and 0.7%).
 ## Round sp27 (AMD gather): a wave's load reads each repeated address once (branch `sp27-gather`, base `origin/main` dfbf2dc1)
 
 ### Where the cost was
