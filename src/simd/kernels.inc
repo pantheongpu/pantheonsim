@@ -117,6 +117,16 @@ void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const ui
   // Bit 4 of `kind` asks for an RTX 3060's tensor-core sum (vgpu/exec/tc_ampere.hpp) in place of the sequential f32 one.
   const bool ampere = (kind & 16) != 0;
   kind &= 3;
+#if VGPU_SIMD_AVX2 && defined(VGPU_TC86_AVX2)
+  // f16 and bf16 operands, f32 accumulator, at the AVX-512 level: the 512-bit float-product kernel straight from the registers (no row-major copies of
+  // the operands, the accumulators and the answer). A call it declines (an operand it does not take, see tc_ampere.hpp) writes nothing and falls
+  // through to the code below.
+  if (ampere && kind < 2 && !acc_f16 && (K == 16 || K == 8) && vgpu::simd::kernels().level == vgpu::simd::Level::Avx512) {
+    if (kind == 0 ? vgpu::exec::tc86::mma_avx512_frag_m16n8<false>(K, vgpu::exec::tc86::kEminF16, a, b, c, out)
+                  : vgpu::exec::tc86::mma_avx512_frag_m16n8<true>(K, vgpu::exec::tc86::kEminWide, a, b, c, out))
+      return;
+  }
+#endif
   const unsigned per_reg = kind == 2 ? 1 : 2, L = 4 * per_reg;
   const unsigned a_regs = K / (2 * per_reg), b_regs = K / (4 * per_reg);
   alignas(32) float FA[256], FB[128];

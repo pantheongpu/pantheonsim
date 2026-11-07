@@ -396,6 +396,10 @@ target_include_directories(amd_exec_bench PRIVATE amd/include)
 add_executable(amd_matrix_bench amd/tools/matrix-bench.cpp)
 target_link_libraries(amd_matrix_bench PRIVATE vgpu)
 target_include_directories(amd_matrix_bench PRIVATE amd/include)
+# What the tier saves on the LDS instructions with two offsets (amd/tools/lds-bench.cpp).
+add_executable(amd_lds_bench amd/tools/lds-bench.cpp)
+target_link_libraries(amd_lds_bench PRIVATE vgpu)
+target_include_directories(amd_lds_bench PRIVATE amd/include)
 # What one tensor-core instruction costs the simulator, PTX and SASS (nvidia/tools/tensor-bench.cpp).
 add_executable(nvidia_tensor_bench nvidia/tools/tensor-bench.cpp)
 target_link_libraries(nvidia_tensor_bench PRIVATE vgpu)
@@ -1533,6 +1537,10 @@ vgpu_unit_test(test_simd)
 vgpu_unit_test(test_tc_ampere)
 # The vector kernels of that sum against a frozen copy of the earlier form, bit for bit, over random and adversarial operands.
 vgpu_unit_test(test_tc_ampere_fast)
+# IMMA.16816 / 16832 (8-bit operands) straight from the registers (include/vgpu/exec/imma_frag.hpp) against the definition, every sign combination.
+vgpu_unit_test(test_imma_frag)
+# LDSM's data movement (include/vgpu/exec/ldsm.hpp) against the element-at-a-time form it replaced, rows anywhere in the array and at a page's end.
+vgpu_unit_test(test_ldsm_move)
 # The PTX engine's SIMD route for mma.sync against its general path (VGPU_FASTPATH=0), bit for bit.
 vgpu_unit_test(test_mma_fast)
 # The tile-product kernels and the wgmma/mma operand code against the scalar loops they replace, bit for bit.
