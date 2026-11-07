@@ -7,6 +7,9 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- PTX: a register written right after the type, with no space (`mov.u32%r1, %laneid;`, which nvcc generates from inline asm like
+  `"mov.u32%0, %%laneid;"` and ptxas accepts), is read as the register. The lexer used to keep the `%` inside the opcode word, and the module
+  failed with `mov missing type` (pantheonsim #522).
 - The container image builds again. `scripts/package-build.sh` left `shim/libcudss.so.1` pointing into `cudss1/`, a directory the image does not
   have, so the build stopped at "links that lead nowhere" from the cuDSS 1.0 change onward. A lint test (`lint_package_build`) now builds a small
   tree with the same layout.

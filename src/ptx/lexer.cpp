@@ -59,6 +59,9 @@ std::vector<Token> lex(const std::string& src) {
     if (word_char(c)) {
       size_t start = i;
       while (i < n) {
+        // '%' starts a register or special register and is never inside a name, so it ends the word before it: ptxas reads
+        // "mov.u32%r1, %laneid;" as the type u32 followed by the register %r1.
+        if (src[i] == '%' && i > start) break;
         if (word_char(src[i])) {
           ++i;
           continue;
@@ -83,7 +86,7 @@ std::vector<Token> lex(const std::string& src) {
       out.push_back({Token::Kind::Word, src.substr(start, i - start), line});
       continue;
     }
-    // '|' appears in shuffle/vote destinations ("d|p"); '%' only inside words.
+    // '|' appears in shuffle/vote destinations ("d|p"); '%' starts a word.
     static const std::string puncts = ",;:()[]{}@+<>!-=*|~";
     if (puncts.find(c) != std::string::npos) {
       out.push_back({Token::Kind::Punct, std::string(1, c), line});
