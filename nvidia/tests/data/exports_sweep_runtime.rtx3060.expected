@@ -229,4 +229,20 @@ cudaMemPrefetchBatchAsync flags 1 [13]: cudaErrorInvalidValue
 cudaMemDiscardBatchAsync [13]: cudaErrorInvalidValue
 cudaMemDiscardBatchAsync null [13]: cudaErrorInvalidValue
 cudaMemDiscardAndPrefetchBatchAsync [13]: cudaErrorInvalidValue
-PASS: 231 cases
+cudaGraphicsGLRegisterBuffer: cudaErrorInvalidGraphicsContext
+cudaGraphicsGLRegisterBuffer null resource: cudaErrorInvalidValue
+cudaGraphicsGLRegisterImage: cudaErrorInvalidGraphicsContext
+cudaGraphicsGLRegisterImage null resource: cudaErrorInvalidValue
+cudaGLGetDevices: cudaErrorInvalidGraphicsContext -- count 99
+cudaGLGetDevices null count: cudaErrorInvalidGraphicsContext
+cudaGLSetGLDevice 0 after the runtime started: cudaErrorSetOnActiveProcess
+cudaGLSetGLDevice 5: cudaErrorInvalidDevice
+cudaGLRegisterBufferObject: cudaErrorInvalidGraphicsContext
+cudaGLUnregisterBufferObject: cudaErrorInvalidGraphicsContext
+cudaGLMapBufferObject: cudaErrorInvalidValue
+cudaGLMapBufferObject null: cudaErrorInvalidValue
+cudaGLUnmapBufferObject: cudaErrorInvalidValue
+cudaGLSetBufferObjectMapFlags: cudaErrorInvalidValue
+cudaGLMapBufferObjectAsync: cudaErrorInvalidValue
+cudaGLUnmapBufferObjectAsync: cudaErrorInvalidValue
+PASS: 247 cases

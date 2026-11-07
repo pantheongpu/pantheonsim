@@ -21,6 +21,23 @@
 #include <string>
 #include <vector>
 
+
+// The OpenGL interop functions (cuda_gl_interop.h, pantheonsim #528). Declared here, with the header's own signatures and
+// C linkage, so the program needs no GL header (libgl-dev is not on every runner).
+extern "C" {
+cudaError_t cudaGraphicsGLRegisterBuffer(cudaGraphicsResource** resource, unsigned int buffer, unsigned int flags);
+cudaError_t cudaGraphicsGLRegisterImage(cudaGraphicsResource** resource, unsigned int image, unsigned int target, unsigned int flags);
+cudaError_t cudaGLGetDevices(unsigned int* count, int* devices, unsigned int n, int list);
+cudaError_t cudaGLSetGLDevice(int device);
+cudaError_t cudaGLRegisterBufferObject(unsigned int bufObj);
+cudaError_t cudaGLMapBufferObject(void** devPtr, unsigned int bufObj);
+cudaError_t cudaGLUnmapBufferObject(unsigned int bufObj);
+cudaError_t cudaGLUnregisterBufferObject(unsigned int bufObj);
+cudaError_t cudaGLSetBufferObjectMapFlags(unsigned int bufObj, unsigned int flags);
+cudaError_t cudaGLMapBufferObjectAsync(void** devPtr, unsigned int bufObj, cudaStream_t stream);
+cudaError_t cudaGLUnmapBufferObjectAsync(unsigned int bufObj, cudaStream_t stream);
+}
+
 __device__ int sym[16];
 __global__ void kern(int* p) {
   extern __shared__ int sm[];
@@ -415,6 +432,24 @@ int main() {
   C13("cudaMemDiscardBatchAsync null", { size_t sz[1] = {1 << 20}; return cudaMemDiscardBatchAsync(nullptr, sz, 1, 0, stream_made()); });
   C13("cudaMemDiscardAndPrefetchBatchAsync", { void* m; cudaMallocManaged(&m, 1 << 20); void* dp[1] = {m}; size_t sz[1] = {1 << 20}; cudaMemLocation l{cudaMemLocationTypeDevice, 0}; size_t li[1] = {0}; return cudaMemDiscardAndPrefetchBatchAsync(dp, sz, 1, &l, li, 1, 0, stream_made()); });
 #endif
+
+  // OpenGL interop with no GL context: what the card answers (a deprecated function is declared above, so no warning).
+  C("cudaGraphicsGLRegisterBuffer", { cudaGraphicsResource* r = nullptr; return cudaGraphicsGLRegisterBuffer(&r, 1, 0); });
+  C("cudaGraphicsGLRegisterBuffer null resource", { return cudaGraphicsGLRegisterBuffer(nullptr, 1, 0); });
+  C("cudaGraphicsGLRegisterImage", { cudaGraphicsResource* r = nullptr; return cudaGraphicsGLRegisterImage(&r, 1, 0x0DE1, 0); });
+  C("cudaGraphicsGLRegisterImage null resource", { return cudaGraphicsGLRegisterImage(nullptr, 1, 0x0DE1, 0); });
+  C("cudaGLGetDevices", { unsigned n = 99; int d[4]; cudaError_t e = cudaGLGetDevices(&n, d, 4, 1); note("count %u", n); return e; });
+  C("cudaGLGetDevices null count", { int d[4]; return cudaGLGetDevices(nullptr, d, 4, 1); });
+  C("cudaGLSetGLDevice 0 after the runtime started", { cudaFree(0); return cudaGLSetGLDevice(0); });
+  C("cudaGLSetGLDevice 5", { cudaFree(0); return cudaGLSetGLDevice(5); });
+  C("cudaGLRegisterBufferObject", { return cudaGLRegisterBufferObject(1); });
+  C("cudaGLUnregisterBufferObject", { return cudaGLUnregisterBufferObject(1); });
+  C("cudaGLMapBufferObject", { void* p = nullptr; return cudaGLMapBufferObject(&p, 1); });
+  C("cudaGLMapBufferObject null", { return cudaGLMapBufferObject(nullptr, 1); });
+  C("cudaGLUnmapBufferObject", { return cudaGLUnmapBufferObject(1); });
+  C("cudaGLSetBufferObjectMapFlags", { return cudaGLSetBufferObjectMapFlags(1, 0); });
+  C("cudaGLMapBufferObjectAsync", { void* p = nullptr; return cudaGLMapBufferObjectAsync(&p, 1, nullptr); });
+  C("cudaGLUnmapBufferObjectAsync", { return cudaGLUnmapBufferObjectAsync(1, nullptr); });
 
   int bad = 0;
   for (const Case& c : cases) {

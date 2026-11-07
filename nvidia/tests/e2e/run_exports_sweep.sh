@@ -42,8 +42,10 @@ build() {   # <nvcc> <extra flags...>
   if [[ $which == runtime ]]; then
     # The runtime shim hands the library calls to the driver shim, found in the process: link libcuda whether or not
     # the program names one of its functions.
+    # -z now binds every name when the program is loaded, as Ubuntu's PIE executables are linked: a function the shim
+    # does not export (the cudaGL* family, pantheonsim #528) then stops the program before its first case.
     "$nvcc_bin" -std=c++17 -cudart shared -arch=sm_86 -Wno-deprecated-gpu-targets -w "$@" "$src" -o "$work/prog" \
-      -Xlinker --no-as-needed -lcuda
+      -Xlinker --no-as-needed -Xlinker -z,now -lcuda
   else
     "$nvcc_bin" -std=c++17 -x c++ -cudart none -Wno-deprecated-gpu-targets -w "$@" "$src" -o "$work/prog" -lcuda
   fi

@@ -23,8 +23,10 @@ SKIPs where there is no toolkit header or no shim at hand.
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -46,9 +48,15 @@ def find_include(arg):
 
 
 def preprocess(include, header, defines, cplusplus):
+    # cuda_gl_interop.h includes <GL/gl.h>, which only its declarations' parameter types need and a preprocessor
+    # run does not: an empty one, searched after the system's, stands in where libgl-dev is not installed.
+    fake_gl = pathlib.Path(tempfile.mkdtemp(prefix="vgpu-fake-gl."))
+    (fake_gl / "GL").mkdir()
+    (fake_gl / "GL" / "gl.h").write_text("")
     cmd = ["g++" if cplusplus else "gcc", "-E", "-P", "-x", "c++" if cplusplus else "c", f"-I{include}",
-           *defines, str(include / header)]
+           f"-idirafter{fake_gl}", *defines, str(include / header)]
     out = subprocess.run(cmd, capture_output=True, text=True)
+    shutil.rmtree(fake_gl, ignore_errors=True)
     if out.returncode != 0:
         raise RuntimeError(f"cannot preprocess {header}: {out.stderr.strip().splitlines()[-1:]}")
     return out.stdout
@@ -99,8 +107,15 @@ def main():
         return 0
 
     missing = {}
-    for header, prefix, syms, cplusplus in (("cuda_runtime_api.h", "cuda", runtime_syms, True),
-                                            ("cuda.h", "cu", driver_syms, False)):
+    headers = [("cuda_runtime_api.h", "cuda", runtime_syms, True), ("cuda.h", "cu", driver_syms, False)]
+    # cuda_gl_interop.h: the cudaGL* family (pantheonsim #528).
+    if (include / "cuda_gl_interop.h").exists():
+        try:
+            preprocess(include, "cuda_gl_interop.h", [], True)
+            headers.append(("cuda_gl_interop.h", "cuda", runtime_syms, True))
+        except RuntimeError as e:
+            print(f"note: cuda_gl_interop.h not checked ({e})")
+    for header, prefix, syms, cplusplus in headers:
         names = set()
         for defines in ([], ["-DCUDA_API_PER_THREAD_DEFAULT_STREAM"]):
             names |= declared(preprocess(include, header, defines, cplusplus), prefix)
@@ -121,7 +136,7 @@ def main():
         print("FAIL: a function the toolkit declares is not exported (export it, refusing with the library's own\n"
               "      'not supported' status if the shim cannot do what it asks)")
         return 1
-    print("PASS: every function cuda_runtime_api.h and cuda.h declare is exported")
+    print("PASS: every function cuda_runtime_api.h, cuda.h and cuda_gl_interop.h declare is exported")
     return 0
 
 
