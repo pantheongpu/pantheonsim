@@ -1464,23 +1464,45 @@ class Parser {
     return ops;
   }
 
-  // `[imm]` after an array's name: the element index, as the byte offset it
-  // names. The element is the declared type's size (PTX ISA 5.1.5, "a[1]" is
-  // the address of the second element), and a constant index outside the
-  // declared array is refused rather than addressed.
-  int64_t parse_array_index(const std::string& base, size_t line) {
+  // `[imm]` or `[%reg]` after an array's name: the element index. The element is the declared type's size (PTX ISA
+  // 5.1.5, "a[1]" is the address of the second element). A constant index comes back as the byte offset it names, and
+  // one outside the declared array is refused rather than addressed. A register index (`st.local.b32 arr[%r0], %f0;`,
+  // which ptxas and the driver accept although the ISA's address-operand list does not name it, and which Dr.Jit
+  // emits for every opaque-index array access; pantheonsim #530) comes back as the register and the element size:
+  // the interpreter adds register * size to the variable's address, unchecked as on the card.
+  struct ArrayIndex {
+    int64_t byte_offset = 0;
+    bool by_reg = false;
+    Reg reg;
+    uint32_t scale = 0;
+  };
+  ArrayIndex parse_array_index(const std::string& base, size_t line) {
     expect_punct("[");
-    const int64_t idx = expect_int("array element index");
+    ArrayIndex out;
+    const bool reg_index = peek().kind == Token::Kind::Word &&
+                           (peek().text[0] == '%' || declared_regs_.count(peek().text));
+    int64_t idx = 0;
+    if (reg_index) {
+      out.reg = intern(expect_word("array element index register"));
+      out.by_reg = true;
+    } else {
+      idx = expect_int("array element index");
+    }
     expect_punct("]");
     auto it = fn_arrays_.find(base);
     if (it == fn_arrays_.end()) it = module_arrays_.find(base);
     if (it == fn_arrays_.end() && it == module_arrays_.end())
       fail(line, "'" + base + "[...]' needs '" + base + "' declared as an array before this instruction");
     const ArrayInfo& info = it->second;
+    if (reg_index) {
+      out.scale = info.elem_bytes;
+      return out;
+    }
     if (idx < 0 || (info.sized && static_cast<uint64_t>(idx) >= info.count))
       fail(line, "element " + std::to_string(idx) + " is outside '" + base + "', which has " +
                      std::to_string(info.count) + " element(s)");
-    return idx * static_cast<int64_t>(info.elem_bytes);
+    out.byte_offset = idx * static_cast<int64_t>(info.elem_bytes);
+    return out;
   }
 
   Addr parse_addr(const EntryFn& fn) {
@@ -1490,8 +1512,9 @@ class Parser {
     if (!bare) next();
     Addr a;
     std::string base = expect_word("address base");
-    int64_t array_off = 0;
-    if (bare || peek_punct("[")) array_off = parse_array_index(base, addr_line);
+    ArrayIndex array_index;
+    if (bare || peek_punct("[")) array_index = parse_array_index(base, addr_line);
+    const int64_t array_off = array_index.byte_offset;
     if (base[0] == '%' || declared_regs_.count(base)) {
       a.base_kind = Addr::Base::Reg;
       Reg r = intern(base);
@@ -1524,6 +1547,12 @@ class Parser {
       }
     }
     a.offset = array_off;
+    if (array_index.by_reg) {
+      a.index_id = array_index.reg.id;
+      a.index_wide = array_index.reg.wide;
+      a.index_scale = array_index.scale;
+      a.index = array_index.reg.name;
+    }
     if (!bare && peek_punct("+")) {
       next();
       a.offset += expect_int("address offset");

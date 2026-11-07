@@ -12954,7 +12954,25 @@ class Interpreter {
   const Lanes& addr_base(Warp& w, const BlockCtx& ctx, const Instr& ins, const Addr& a,
                          Lanes& scratch) {
     if (a.base_kind == Addr::Base::Symbol) {
-      scratch.fill(resolve_symbol(ctx, ins, a.base));
+      const uint64_t sym = resolve_symbol(ctx, ins, a.base);
+      if (a.index_id == kNoReg) {
+        scratch.fill(sym);
+        return scratch;
+      }
+      // `var[%reg]`: the variable's address plus the element index times the element size, per lane.
+      const uint64_t scale = a.index_scale;
+      if (a.index_wide) {
+        if (a.index_id >= w.regs64.size() || !w.written64[a.index_id])
+          ctx_fail(ins, -1, Err::UninitializedRegister, "array index register " + a.index + " read before any write");
+        const auto& r = w.regs64[a.index_id];
+        for (uint32_t lane = 0; lane < W_; ++lane) scratch[lane] = sym + r[lane] * scale;
+      } else {
+        if (a.index_id >= w.regs32.size() || !w.written32[a.index_id])
+          ctx_fail(ins, -1, Err::UninitializedRegister, "array index register " + a.index + " read before any write");
+        const auto& r = w.regs32[a.index_id];
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          scratch[lane] = sym + static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(r[lane])) * static_cast<int64_t>(scale));
+      }
       return scratch;
     }
     // Address registers are .b64 in 64-bit PTX, but shared/local addressing
