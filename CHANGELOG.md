@@ -7,6 +7,10 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- PTX: the array-element address with a register index, `st.local.b32 arr[%r15], %f16;` and `ld.local.b32 %f100, arr_4[%r99];`, is accepted on
+  `.local`, `.shared` and `.global` variables (drjit-core indexes its per-thread arrays this way; the module used to fail with `bad integer
+  literal '%r0'`). The register is an element index scaled by the declared element size, like `arr[imm]`: on an RTX 3060, index 4 of a `.b32` array
+  is byte 16 (pantheonsim #530).
 - The container image builds again. `scripts/package-build.sh` left `shim/libcudss.so.1` pointing into `cudss1/`, a directory the image does not
   have, so the build stopped at "links that lead nowhere" from the cuDSS 1.0 change onward. A lint test (`lint_package_build`) now builds a small
   tree with the same layout.

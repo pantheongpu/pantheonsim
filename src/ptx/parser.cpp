@@ -1464,19 +1464,35 @@ class Parser {
     return ops;
   }
 
-  // `[imm]` after an array's name: the element index, as the byte offset it
-  // names. The element is the declared type's size (PTX ISA 5.1.5, "a[1]" is
-  // the address of the second element), and a constant index outside the
-  // declared array is refused rather than addressed.
-  int64_t parse_array_index(const std::string& base, size_t line) {
+  // `[imm]` or `[%reg]` after an array's name: the element index. The element is the declared type's size (PTX ISA 5.1.5, "a[1]"
+  // is the address of the second element). A constant index outside the declared array is refused rather than addressed. A
+  // register index is not in the ISA's address list, but ptxas and the driver accept it (drjit-core's per-thread arrays use it)
+  // and scale it the same way: an RTX 3060 stored `st.local.b32 arr[%r0]` with %r0 = 4 at byte 16 of a .b32 array, and
+  // `.b16`/`.b8` arrays at 2 and 1 byte per element. It is unchecked, as on the card: a stray index fails as the access does.
+  // Returns the constant's byte offset; a register index is put in `a`.
+  int64_t parse_array_index(const std::string& base, size_t line, Addr& a) {
     expect_punct("[");
+    const ArrayInfo* found = nullptr;
+    if (auto f = fn_arrays_.find(base); f != fn_arrays_.end()) found = &f->second;
+    else if (auto g = module_arrays_.find(base); g != module_arrays_.end()) found = &g->second;
+    const bool known = found != nullptr;
+    const Token& t = peek();
+    if (t.kind == Token::Kind::Word && !t.text.empty() && (t.text[0] == '%' || declared_regs_.count(t.text))) {
+      if (!known)
+        fail(line, "'" + base + "[...]' needs '" + base + "' declared as an array before this instruction");
+      const Reg r = intern(expect_word("array element index"));
+      expect_punct("]");
+      a.idx_id = r.id;
+      a.idx_wide = r.wide;
+      a.idx_name = r.name;
+      a.idx_scale = found->elem_bytes;
+      return 0;
+    }
     const int64_t idx = expect_int("array element index");
     expect_punct("]");
-    auto it = fn_arrays_.find(base);
-    if (it == fn_arrays_.end()) it = module_arrays_.find(base);
-    if (it == fn_arrays_.end() && it == module_arrays_.end())
+    if (!known)
       fail(line, "'" + base + "[...]' needs '" + base + "' declared as an array before this instruction");
-    const ArrayInfo& info = it->second;
+    const ArrayInfo& info = *found;
     if (idx < 0 || (info.sized && static_cast<uint64_t>(idx) >= info.count))
       fail(line, "element " + std::to_string(idx) + " is outside '" + base + "', which has " +
                      std::to_string(info.count) + " element(s)");
@@ -1491,7 +1507,7 @@ class Parser {
     Addr a;
     std::string base = expect_word("address base");
     int64_t array_off = 0;
-    if (bare || peek_punct("[")) array_off = parse_array_index(base, addr_line);
+    if (bare || peek_punct("[")) array_off = parse_array_index(base, addr_line, a);
     if (base[0] == '%' || declared_regs_.count(base)) {
       a.base_kind = Addr::Base::Reg;
       Reg r = intern(base);

@@ -164,6 +164,13 @@ struct Addr {
   // parameter list, so a load need not look its name up in a hash table.
   uint32_t param_index = kNoReg;
   int64_t offset = 0;
+  // For a variable addressed as an array element by a register, `var[%r]`: the index register (a 32- or 64-bit one, read as
+  // unsigned) and the declared element size it is scaled by. The byte address is the variable's, plus index * idx_scale, plus
+  // `offset`. idx_id is kNoReg when the element is a constant (folded into `offset`) or there is none.
+  uint32_t idx_id = kNoReg;
+  bool idx_wide = false;
+  uint32_t idx_scale = 0;
+  std::string idx_name;
 };
 
 enum class Space { Param, Global, Shared, Local, Generic };

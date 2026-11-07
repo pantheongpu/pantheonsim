@@ -12935,7 +12935,19 @@ class Interpreter {
   const Lanes& addr_base(Warp& w, const BlockCtx& ctx, const Instr& ins, const Addr& a,
                          Lanes& scratch) {
     if (a.base_kind == Addr::Base::Symbol) {
-      scratch.fill(resolve_symbol(ctx, ins, a.base));
+      const uint64_t sym = resolve_symbol(ctx, ins, a.base);
+      if (a.idx_id == kNoReg) {
+        scratch.fill(sym);
+        return scratch;
+      }
+      // var[%r]: the element index in a register, scaled by the declared element size.
+      if (a.idx_wide ? (a.idx_id >= w.regs64.size() || !w.written64[a.idx_id])
+                     : (a.idx_id >= w.regs32.size() || !w.written32[a.idx_id]))
+        ctx_fail(ins, -1, Err::UninitializedRegister, "array index register " + a.idx_name + " read before any write");
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        const uint64_t idx = a.idx_wide ? w.regs64[a.idx_id][lane] : uint64_t{w.regs32[a.idx_id][lane]};
+        scratch[lane] = sym + idx * a.idx_scale;
+      }
       return scratch;
     }
     // Address registers are .b64 in 64-bit PTX, but shared/local addressing
