@@ -251,6 +251,10 @@ struct ShimState {
   // The device each managed allocation (by base) was made against, which
   // CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL reports.
   std::map<uintptr_t, int> managed_device;
+  // The context each device, pitched, pooled and managed allocation (by base) was made in, which
+  // CU_POINTER_ATTRIBUTE_CONTEXT reports. An allocation made by another API (the runtime's) has none and is
+  // taken for the device's primary context's.
+  std::map<uint64_t, uintptr_t> alloc_ctx;
   // Allocations (by base) CU_POINTER_ATTRIBUTE_SYNC_MEMOPS has been set on.
   std::set<uint64_t> sync_memops;
   // cuCtxSetLimit, per device, with the defaults the runtime shim keeps
@@ -541,6 +545,18 @@ vgpu::MemoryManager& owner_memory(ShimState& s, CUdeviceptr p) {
   for (int d = 0; d < s.rt->device_count(); ++d)
     if (s.rt->device(d).memory().owns(p)) return s.rt->device(d).memory();
   return current(s).memory();
+}
+
+// Remembers the context the thread allocated `base` in, when it has one on `device`.
+void record_alloc_context(ShimState& s, uint64_t base, int device) {
+  if (!ctx_stack().empty()) {
+    const auto it = s.contexts.find(ctx_stack().back());
+    if (it != s.contexts.end() && it->second == device) {
+      s.alloc_ctx[base] = ctx_stack().back();
+      return;
+    }
+  }
+  s.alloc_ctx.erase(base);
 }
 
 // The managed allocation holding [p, p + n), or nullptr.
@@ -1399,6 +1415,7 @@ static CUresult cuMemAlloc_v2_impl(CUdeviceptr* dptr, size_t bytesize) {
   return api("cuMemAlloc", true, false, [&](ShimState& s) {
     if (!dptr) return CUDA_ERROR_INVALID_VALUE;
     *dptr = current(s).memory().alloc(bytesize);
+    record_alloc_context(s, *dptr, current_device(s));
     profile_memory(1, *dptr, bytesize, vgpu::profiling::MemKind::Device, current_device(s));
     return CUDA_SUCCESS;
   });
@@ -1422,6 +1439,7 @@ static CUresult cuMemFree_v2_impl(CUdeviceptr dptr) {
       for (int d = 0; d < s.rt->device_count(); ++d) s.rt->device(d).memory().unmap_host(dptr);
       std::free(reinterpret_cast<void*>(dptr));
       s.managed_device.erase(dptr);
+      s.alloc_ctx.erase(dptr);
       s.sync_memops.erase(dptr);
       s.managed.erase(it);
       return CUDA_SUCCESS;
@@ -1431,6 +1449,7 @@ static CUresult cuMemFree_v2_impl(CUdeviceptr dptr) {
     uint64_t base = 0, size = 0;
     const bool known = owner_memory(s, dptr).find_allocation(dptr, &base, &size);
     owner_memory(s, dptr).free(dptr);
+    s.alloc_ctx.erase(dptr);
     profile_memory(2, dptr, known ? size : 0, vgpu::profiling::MemKind::Device, current_device(s));
     return CUDA_SUCCESS;
   });
@@ -3837,6 +3856,7 @@ static CUresult cuMemAllocManaged_impl(CUdeviceptr* dptr, size_t bytesize, unsig
       s.rt->device(d).memory().map_host(reinterpret_cast<uint64_t>(p), p, bytesize);
     s.managed[reinterpret_cast<uintptr_t>(p)] = bytesize;
     s.managed_device[reinterpret_cast<uintptr_t>(p)] = current_device(s);
+    record_alloc_context(s, reinterpret_cast<uint64_t>(p), current_device(s));
     *dptr = reinterpret_cast<CUdeviceptr>(p);
     return CUDA_SUCCESS;
   });
@@ -4962,6 +4982,7 @@ CUdeviceptr pool_alloc(ShimState& s, PoolRec& p, size_t size) {
     }
   }
   const uint64_t ptr = s.rt->device(p.device).memory().alloc(size);
+  record_alloc_context(s, ptr, p.device);
   p.live[ptr] = size;
   p.used += size;
   p.reserved += size;
@@ -5319,6 +5340,7 @@ static CUresult cuMemAllocPitch_v2_impl(CUdeviceptr* dptr, size_t* pitch, size_t
       return CUDA_ERROR_INVALID_VALUE;
     *pitch = (width + 511) / 512 * 512;
     *dptr = current(s).memory().alloc(*pitch * height);
+    record_alloc_context(s, *dptr, current_device(s));
     return CUDA_SUCCESS;
   });
 }
@@ -6184,11 +6206,15 @@ PtrInfo describe_pointer(ShimState& s, CUdeviceptr ptr) {
   return pi;
 }
 
-// The context a pointer on `device` was allocated in. The allocation does not
-// record one, so this is the current context when it is on that device and the
-// device's primary context otherwise -- which is the one, in a program that
-// uses a single context per device, it was made in. 0 when there is neither.
-uintptr_t pointer_context(ShimState& s, int device) {
+// The context a pointer on `device` was allocated in: the one recorded when the driver API made it (alloc_ctx).
+// For an allocation made another way (the runtime's, pinned or registered host memory) none is recorded, and
+// it is the current context when that is on the device and the device's primary context otherwise -- which is
+// the one, in a program that uses a single context per device, it was made in. 0 when there is neither.
+uintptr_t pointer_context(ShimState& s, int device, uint64_t base) {
+  if (const auto a = s.alloc_ctx.find(base); a != s.alloc_ctx.end()) {
+    const auto c = s.contexts.find(a->second);
+    if (c != s.contexts.end() && c->second == device) return a->second;   // the context it was made in
+  }
   if (!ctx_stack().empty()) {
     const auto it = s.contexts.find(ctx_stack().back());
     if (it != s.contexts.end() && it->second == device) return ctx_stack().back();
@@ -6226,7 +6252,7 @@ CUresult pointer_attribute(ShimState& s, int attribute, CUdeviceptr ptr, const P
   const bool host = pi.kind == PtrKind::Pinned || pi.kind == PtrKind::Registered;
   switch (attribute) {
     case 1:   // CONTEXT: the context the memory was allocated or registered in
-      *static_cast<void**>(data) = reinterpret_cast<void*>(pointer_context(s, pi.device));
+      *static_cast<void**>(data) = reinterpret_cast<void*>(pointer_context(s, pi.device, pi.base));
       return CUDA_SUCCESS;
     case 2:   // MEMORY_TYPE: CU_MEMORYTYPE_HOST (1) for host memory, DEVICE (2) otherwise
       *static_cast<unsigned int*>(data) = host ? 1 : 2;

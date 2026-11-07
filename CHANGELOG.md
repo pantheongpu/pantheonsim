@@ -7,6 +7,7 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- `cuPointerGetAttribute(CU_POINTER_ATTRIBUTE_CONTEXT)` returns the context the allocation was made in (`cuMemAlloc`, `cuMemAllocPitch`, `cuMemAllocManaged`, pool allocations), not the context that is current when it is asked (pantheonsim #521).
 - The container image builds again. `scripts/package-build.sh` left `shim/libcudss.so.1` pointing into `cudss1/`, a directory the image does not
   have, so the build stopped at "links that lead nowhere" from the cuDSS 1.0 change onward. A lint test (`lint_package_build`) now builds a small
   tree with the same layout.
