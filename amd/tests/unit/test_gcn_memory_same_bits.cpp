@@ -223,4 +223,33 @@ VTEST(the_wave_wide_memory_paths_give_the_bits_lane_by_lane_gives) {
   VCHECK(compared > 1000);
 }
 
+VTEST(the_tier_gives_the_interpreters_bits_for_every_memory_instruction_in_every_way) {
+  // The same instructions in the same twelve ways with the pre-decoded tier off and on (the byte and halfword LDS accesses have handlers
+  // of their own: an access past the LDS, a half-off wave, the same address in every lane, a misaligned one), digest against digest.
+  size_t compared = 0, nonzero = 0;
+  std::string report;
+  const bool was_on = amd::gcn::tier::enabled();
+  for (const Corpus& c : kCorpora) {
+    std::vector<uint32_t> slow, fast;
+    std::vector<std::string> texts;
+    amd::gcn::tier::set_enabled(false);
+    digest_corpus(c, &slow, &texts);
+    amd::gcn::tier::set_enabled(true);
+    texts.clear();
+    digest_corpus(c, &fast, &texts);
+    VCHECK_EQ(slow.size(), fast.size());
+    for (size_t i = 0; i < slow.size(); ++i) {
+      ++compared;
+      nonzero += slow[i] != 0;
+      char buf[48];
+      std::snprintf(buf, sizeof buf, ": %08x with, %08x without", fast[i], slow[i]);
+      if (slow[i] != fast[i]) report += std::string("\n  ") + c.file + ": " + texts[i] + buf;
+    }
+  }
+  amd::gcn::tier::set_enabled(was_on);
+  VCHECK(nonzero > 1000);
+  if (!report.empty()) throw vtest::Failure("the tier differs from the interpreter:" + report);
+  VCHECK(compared > 1000);
+}
+
 VTEST_MAIN

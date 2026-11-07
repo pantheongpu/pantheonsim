@@ -167,9 +167,59 @@ and checked on a real host:
   `pip install --user` are refused; use a virtual environment.
 - **Compilers:** the host's `nvcc` and `hipcc`, if installed. Build CUDA programs
   with `-cudart shared`. See [toolchains.md](toolchains.md).
+- **With `--rootfs`** none of the "files" above hold: see [A private root](#a-private-root---rootfs).
 - **With `--no-isolate`** (what `./run` uses on a system that restricts user
   namespaces) everything above holds, except that `/proc` and `/etc` show your
   real system and you keep your own user, so `sudo` works as it does outside.
+
+## A private root: `--rootfs`
+
+By default the session is a view of your own computer (above). `--rootfs` gives
+it a machine of its own instead: a new root on a tmpfs, built inside the mount
+namespace `vgpu shell` already creates and entered with `pivot_root`, so the
+host's files are not there unless you add them.
+
+```bash
+vgpu shell -y --rootfs                                  # nothing of yours is visible
+vgpu shell -y --rootfs -v ~/project:/work -v ~/data:/data:ro --home ~/.vgpu-home
+vgpu shell -y --rootfs -v "$PWD":/work -c 'cd /work && make test'
+```
+
+What the session has:
+
+| Path | What it is |
+| --- | --- |
+| `/usr`, `/bin`, `/sbin`, `/lib*` | The host's, **read-only**, so compilers, Python and the dynamic loader work. On a host where `/bin`, `/lib` and `/sbin` are links into `/usr` they are links here. |
+| `/etc` (a few entries) | The host's, read-only: `ld.so.cache`, `ld.so.conf*`, `resolv.conf`, `hosts`, `host.conf`, `nsswitch.conf`, `gai.conf`, `passwd`, `group`, `ssl`, `ca-certificates*`, `pki`, `crypto-policies`, `alternatives`, `bash.bashrc`, `profile*`, `shells`, `localtime`, `terminfo`, `inputrc`, `mime.types`, `protocols`, `services`, `environment`. `/etc/os-release` is the simulated machine's. Nothing else of the host's `/etc` is there (no `shadow`, `sudoers`, `ssh`, other programs' settings); the rest of `/etc` is the session's own, empty and writable. |
+| `/root` (`$HOME`), `/home`, `/opt`, `/tmp`, `/var/tmp`, `/work`, `/run`, `/mnt`, `/srv` | Empty and the session's own, in memory, discarded on exit. The one thing in them that is not yours is the simulator's own install and its session directory, which sit at their host paths (see below), so `/tmp` holds a `vgpu-session-N` directory and `/home` or `/opt` hold the path down to the build if it lives there. |
+| `/proc`, `/sys` | As in a default session: the host's, with the synthesized `/proc/driver`, `/sys/class/drm`, hwmon and PCI trees (and on an AMD machine the KFD topology and `amdgpu` module) over them. `/proc` shows the host's processes; there is no PID namespace. |
+| `/dev` | `null`, `zero`, `full`, `random`, `urandom`, `tty`, a fresh `devpts` (`pts`, `ptmx`) and `shm`. On an AMD machine also the simulated `/dev/kfd` and `/dev/dri/*`, which open as `/dev/null` as they do in a default session. |
+| the simulator | The directory holding `vgpu`, `shim/` and `bin/` is mounted **read-only at its host path**, so `PATH`, `LD_LIBRARY_PATH` and the session's scripts are unchanged. The session directory (tools, telemetry, generated files) is at its usual `/tmp/vgpu-session-N`. |
+| `/usr/local/cuda`, `/opt/rocm` | Where a real machine has them. If the host has a CUDA toolkit at `/usr/local/cuda` it is there (through `/usr`, or, when the link leads outside `/usr`, mounted read-only where it points); if the host has `/opt/rocm` it is mounted read-only there. If it has none, nothing is created and the banner says so. No file is invented. |
+
+The network is the host's, as in a default session. You are `root` in a user
+namespace (files you own show as root), `HOME=/root`, and the working directory
+is `/root`; the host's home directory, `TMPDIR` and cwd are not there.
+
+**Adding host directories: `-v HOST:DEST[:ro]`**, repeatable, as in `docker run -v`:
+
+- Read-write unless `:ro`; `:ro` makes the mount and everything mounted below it read-only (writes fail with `EROFS`).
+- `HOST` is a file or a directory and must exist (symlinks are followed); `DEST` must be absolute, not `/`, and not under `/proc` or `/sys`. A bad `-v` exits `2` before a session starts. Paths cannot contain `:`.
+- `DEST` and its parents are created inside the session. Under the read-only system trees they cannot be created, so a new directory there is an error (exit `1`); put your mounts under `/work`, `/data`, `/mnt` and the like.
+- Mounts are applied in the order given, after the system, so a later `-v` goes over an earlier one, and a `-v` over an existing system path (`-v ./hosts:/etc/hosts:ro`, `-v ./mylibs:/usr/local/lib/x`) replaces what is there; that is allowed and means what it says. `-v` onto `/` is refused.
+- `-v` and `--home` need `--rootfs`: without it the session already sees the host's files, so they are an error (exit `2`) that says to add it.
+- `--home DIR` is `-v DIR:/root` read-write, so shell history, `~/.cache` and a virtual environment survive between runs. Without it `/root` is a tmpfs.
+
+**When user namespaces are not available** (Ubuntu 24.04 restricts them with AppArmor:
+`kernel.apparmor_restrict_unprivileged_userns=1`; some containers refuse them),
+a default session falls back to the host's files with a message, but `--rootfs`
+**does not**: you asked for isolation, so it exits `1` with the reason, before
+anything runs. Use `./run` (which falls back) or drop `--rootfs`. `VGPU_SHELL_NO_NAMESPACES=1`
+reproduces this on a host that has namespaces, for tests.
+
+Limits: the session's tmpfs counts against the host's memory (there is no size cap);
+`apt`, `sudo` and anything that writes to `/usr` do not work (a read-only system by design;
+install into `/root` with `--home`, or into a mounted directory); the host's PIDs are visible in `/proc`.
 
 ## Processes share the machine
 

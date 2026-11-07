@@ -2718,12 +2718,14 @@ void dec_ldgdepbar(Instr& ins, const Word&) {
 }
 
 // ULDC URd, c[bank][URa + offset]: the constant bank indexed by a uniform
-// register.
+// register. The offset is a signed 16-bit number, as LDC's is: ptxas writes
+// 0x8d20 as -0x72e0 and adds 0x10000 to the register.
 void dec_uldc_idx(Instr& ins, const Word& w) {
   dec_uldc(ins, w);
   const unsigned ur = static_cast<unsigned>(w.field(24, ureg_bits(ins.sm)));
-  const unsigned bank = static_cast<unsigned>(w.field(54, 5)), off = static_cast<unsigned>(w.field(38, 16));
-  Operand c = Txt("c[" + hex(bank) + "][UR" + std::to_string(ur) + (off ? "+" + hex(off) : "") + "]");
+  const unsigned bank = static_cast<unsigned>(w.field(54, 5));
+  const int64_t off = w.sfield(38, 16);
+  Operand c = Txt("c[" + hex(bank) + "][UR" + std::to_string(ur) + (off ? "+" + signed_hex(off) : "") + "]");
   c.reg = ur;
   c.imm = off;
   ins.src[0] = c;

@@ -11,8 +11,7 @@ licences.
 | HIP programs for AMD GPUs | ROCm, for `hipcc` | 5 to 20 GB | [rocm.docs.amd.com](https://rocm.docs.amd.com), the AMD repository for your distribution |
 | Python, PyTorch, prebuilt binaries | nothing | | `pip install torch`, then `make run APP=python ARGS="train.py" PRELOAD=1` |
 
-You do not need a GPU or a GPU driver for either toolkit. Install only the
-toolkit, not the driver packages (on NVIDIA's repository that is the `cuda-toolkit-*`
+You need no GPU driver. Install only the toolkit, not the driver packages (on NVIDIA's repository that is the `cuda-toolkit-*`
 package, not `cuda` or `cuda-drivers`; on AMD's, the user-space ROCm packages without
 the `amdgpu-dkms` kernel driver).
 

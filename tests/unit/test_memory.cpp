@@ -1593,6 +1593,57 @@ VTEST(host_guard_looks_once_per_window_of_chunks) {
   vgpu::backing::configure({});
 }
 
+// Chunks given back are kept for the next acquire(), and they are the host's if the host is short: a look that finds the host below
+// its reserve gives the pool back and looks again before it refuses or spills anything. (With the host in plenty nothing is given back.)
+VTEST(host_guard_takes_the_pool_back_to_the_heap_when_the_host_is_short) {
+  using vgpu::kChunkSize;
+  FakeHost h;
+  h.meminfo(16 * kGiB, 8 * kGiB);
+  const vgpu::backing::Config c = h.config();
+  {   // an empty pool: whatever earlier tests left in it is taken out and goes to the heap
+    vgpu::backing::Config none = c;
+    none.pool_max_bytes = 0;
+    vgpu::backing::configure(none);
+    std::vector<uint8_t*> held;
+    for (uint64_t n = vgpu::backing::pooled_chunks(); n; --n) held.push_back(vgpu::backing::acquire());
+    for (uint8_t* p : held) vgpu::backing::release(p);
+    VCHECK_EQ(vgpu::backing::pooled_chunks(), uint64_t{0});
+  }
+  vgpu::backing::configure(c);
+  std::vector<uint8_t*> chunks;
+  for (int i = 0; i < 10; ++i) chunks.push_back(vgpu::backing::acquire());
+  for (uint8_t* p : chunks) std::memset(p, 0x33, kChunkSize);
+  for (uint8_t* p : chunks) vgpu::backing::release(p);
+  VCHECK_EQ(vgpu::backing::pooled_chunks(), uint64_t{10});
+  // The host in plenty: a chunk comes from the pool, and the rest stay.
+  uint8_t* one = vgpu::backing::acquire();
+  VCHECK_EQ(vgpu::backing::pooled_chunks(), uint64_t{9});
+  vgpu::backing::release(one);
+  VCHECK_EQ(vgpu::backing::pooled_chunks(), uint64_t{10});
+  // The host short, and no spill directory: the pool is given back, the host is looked at again (still short: the files say so),
+  // and the chunk is refused as before.
+  h.meminfo(16 * kGiB, 100 * kMiB);
+  vgpu::backing::configure(c);   // the next chunk looks afresh
+  const uint64_t before = vgpu::backing::host_guard_samples();
+  VCHECK(VCAPTURE(Error, vgpu::backing::acquire()).code() == Err::OutOfMemory);
+  VCHECK_EQ(vgpu::backing::pooled_chunks(), uint64_t{0});
+  VCHECK_EQ(vgpu::backing::host_guard_samples() - before, uint64_t{2});   // the look, and the look after the pool went back
+  // With the pool empty a shortage is looked at once, as it always was.
+  const uint64_t again = vgpu::backing::host_guard_samples();
+  VCHECK(VCAPTURE(Error, vgpu::backing::acquire()).code() == Err::OutOfMemory);
+  VCHECK_EQ(vgpu::backing::host_guard_samples() - again, uint64_t{1});
+  // The host recovers: the chunks that went back to the system come out zero, though they were written through before.
+  h.meminfo(16 * kGiB, 8 * kGiB);
+  vgpu::backing::configure(c);
+  chunks.clear();
+  for (int i = 0; i < 10; ++i) chunks.push_back(vgpu::backing::acquire());
+  for (uint8_t* p : chunks)
+    for (uint64_t i = 0; i < kChunkSize; ++i)
+      if (p[i]) throw vtest::Failure("a chunk handed out after the pool went back was not zero");
+  for (uint8_t* p : chunks) vgpu::backing::release(p);
+  vgpu::backing::configure({});
+}
+
 // Memory that costs nothing stays free: a card filled with one byte is a table of tags, and the
 // guard speaks only where a real chunk is taken.
 VTEST(host_guard_does_not_touch_chunks_that_cost_nothing) {

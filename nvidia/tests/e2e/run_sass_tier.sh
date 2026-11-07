@@ -49,6 +49,8 @@ others=(${VGPU_TIER_PROGRAMS:-sass_tier_steps:75 sass_fastpath:80 sass_archs:75 
         block_semaphore:75 cooperative_grid:75 alloca_stack:75 shared_max:75 named_barriers:75 smid:75 smem_size_regs:75
         bsync_recursive_abi:75 waterfall:90 sync_masks:86:86 large_params:75 shared_atomics64:75 mma_forms:80 mma_fragment_layout:80
         modern_dtypes:80 wmma_gemm:80 wmma_types:80 vector_atomics:90 dsmem_cluster:90 cooperative_cluster:90})
+# VGPU_TIER_PROGRAMS=- builds none of the others, VGPU_TIER_NO_SASS_TIER=1 not sass_tier (run_sass_jit.sh's shards build only what they run).
+[[ ${VGPU_TIER_PROGRAMS:-} == - ]] && others=()
 min_percent="${VGPU_TIER_MIN_PERCENT:-30}"
 
 supported="$("$nvcc_bin" --list-gpu-code 2>/dev/null)"
@@ -57,7 +59,7 @@ read -r rmaj rmin <<< "$("$nvcc_bin" --version | sed -n 's/.*release \([0-9]*\)\
 jobs=()
 for arch in "${archs[@]}"; do
   if ! grep -qx "$arch" <<< "$supported"; then echo "SKIP $arch: this nvcc cannot target it"; continue; fi
-  jobs+=("sass_tier $arch")
+  [[ -n ${VGPU_TIER_NO_SASS_TIER:-} ]] || jobs+=("sass_tier $arch")
 done
 for p in "${others[@]}"; do
   IFS=: read -r name first last <<< "$p"

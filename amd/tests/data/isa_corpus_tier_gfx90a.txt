@@ -1484,6 +1484,37 @@ D2A00001 00020602	v_pack_b32_f16 v1, s2, v3
 7E0256F9 00031102	v_not_b32_sdwa v1, v2 dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_3
 7E0256F9 00040D02	v_not_b32_sdwa v1, v2 dst_sel:WORD_1 dst_unused:UNUSED_SEXT src0_sel:WORD_0
 7E0256F9 00090902	v_not_b32_sdwa v1, sext(v2) dst_sel:BYTE_1 dst_unused:UNUSED_SEXT src0_sel:BYTE_1
+7E0258F9 00060002	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_0 dst_unused:UNUSED_PAD src0_sel:DWORD
+7E0258F9 00020002	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_0 dst_unused:UNUSED_PAD src0_sel:BYTE_2
+7E0258F9 00050802	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_0 dst_unused:UNUSED_SEXT src0_sel:WORD_1
+7E0258F9 00011002	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_0 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1
+7E0258F9 00060102	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_1 dst_unused:UNUSED_PAD src0_sel:DWORD
+7E0258F9 00020102	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_1 dst_unused:UNUSED_PAD src0_sel:BYTE_2
+7E0258F9 00050902	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_1 dst_unused:UNUSED_SEXT src0_sel:WORD_1
+7E0258F9 00011102	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1
+7E0258F9 00060202	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_2 dst_unused:UNUSED_PAD src0_sel:DWORD
+7E0258F9 00020202	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_2 dst_unused:UNUSED_PAD src0_sel:BYTE_2
+7E0258F9 00050A02	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_2 dst_unused:UNUSED_SEXT src0_sel:WORD_1
+7E0258F9 00011202	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_2 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1
+7E0258F9 00060302	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_3 dst_unused:UNUSED_PAD src0_sel:DWORD
+7E0258F9 00020302	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_3 dst_unused:UNUSED_PAD src0_sel:BYTE_2
+7E0258F9 00050B02	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_3 dst_unused:UNUSED_SEXT src0_sel:WORD_1
+7E0258F9 00011302	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_3 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1
+7E0258F9 00060402	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:DWORD
+7E0258F9 00020402	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:BYTE_2
+7E0258F9 00050C02	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:WORD_1
+7E0258F9 00011402	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1
+7E0258F9 00060502	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD
+7E0258F9 00020502	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_2
+7E0258F9 00050D02	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_1 dst_unused:UNUSED_SEXT src0_sel:WORD_1
+7E0258F9 00011502	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1
+7E0258F9 00060602	v_bfrev_b32_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD
+7E0258F9 00020602	v_bfrev_b32_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_2
+7E0258F9 00050E02	v_bfrev_b32_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_SEXT src0_sel:WORD_1
+7E0258F9 00011602	v_bfrev_b32_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1
+7E0258F9 00031102	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_3
+7E0258F9 00040D02	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_1 dst_unused:UNUSED_SEXT src0_sel:WORD_0
+7E0258F9 00090902	v_bfrev_b32_sdwa v1, sext(v2) dst_sel:BYTE_1 dst_unused:UNUSED_SEXT src0_sel:BYTE_1
 7E0222F9 00060002	v_cvt_f32_ubyte0_sdwa v1, v2 dst_sel:BYTE_0 dst_unused:UNUSED_PAD src0_sel:DWORD
 7E0222F9 00020002	v_cvt_f32_ubyte0_sdwa v1, v2 dst_sel:BYTE_0 dst_unused:UNUSED_PAD src0_sel:BYTE_2
 7E0222F9 00050802	v_cvt_f32_ubyte0_sdwa v1, v2 dst_sel:BYTE_0 dst_unused:UNUSED_SEXT src0_sel:WORD_1
@@ -2736,6 +2767,19 @@ D3D94001 1800007E	v_accvgpr_write_b32 a1, exec_lo
 7E0256FA FF014202	v_not_b32_dpp v1, v2 row_bcast:15 row_mask:0xf bank_mask:0xf
 7E0256FA A5094202	v_not_b32_dpp v1, v2 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
 7F9056FA FF001BFF	v_not_b32_dpp v200, v255 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+7E0258FA FF00B102	v_bfrev_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+7E0258FA A508B102	v_bfrev_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7E0258FA FF011302	v_bfrev_b32_dpp v1, v2 row_shr:3 row_mask:0xf bank_mask:0xf
+7E0258FA A5091302	v_bfrev_b32_dpp v1, v2 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7E0258FA FF012702	v_bfrev_b32_dpp v1, v2 row_ror:7 row_mask:0xf bank_mask:0xf
+7E0258FA A5092702	v_bfrev_b32_dpp v1, v2 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7E0258FA FF014002	v_bfrev_b32_dpp v1, v2 row_mirror row_mask:0xf bank_mask:0xf
+7E0258FA A5094002	v_bfrev_b32_dpp v1, v2 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7E0258FA FF013002	v_bfrev_b32_dpp v1, v2 wave_shl:1 row_mask:0xf bank_mask:0xf
+7E0258FA A5093002	v_bfrev_b32_dpp v1, v2 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7E0258FA FF014202	v_bfrev_b32_dpp v1, v2 row_bcast:15 row_mask:0xf bank_mask:0xf
+7E0258FA A5094202	v_bfrev_b32_dpp v1, v2 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7F9058FA FF001BFF	v_bfrev_b32_dpp v200, v255 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
 680206FA FF00B102	v_add_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
 680206FA A500B102	v_add_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5
 680206FA 3F08B102	v_add_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0x3 bank_mask:0xf bound_ctrl:1
@@ -3709,6 +3753,16 @@ D16E0001 00000085	v_ffbl_b32_e64 v1, 5
 D16F0001 00000102	v_ffbh_i32_e64 v1, v2
 D16F0001 00000002	v_ffbh_i32_e64 v1, s2
 D16F0001 00000085	v_ffbh_i32_e64 v1, 5
+7E025902	v_bfrev_b32_e32 v1, v2
+7F9059FF	v_bfrev_b32_e32 v200, v255
+7E025803	v_bfrev_b32_e32 v1, s3
+7E025880	v_bfrev_b32_e32 v1, 0
+7E0258C1	v_bfrev_b32_e32 v1, -1
+7E0258FF 80000000	v_bfrev_b32_e32 v1, 0x80000000
+7E025887	v_bfrev_b32_e32 v1, 7
+D16C0001 00000102	v_bfrev_b32_e64 v1, v2
+D16C0001 00000002	v_bfrev_b32_e64 v1, s2
+D16C0001 00000085	v_bfrev_b32_e64 v1, 5
 7E006302	v_frexp_mant_f64_e32 v[0:1], v[2:3]
 7E006202	v_frexp_mant_f64_e32 v[0:1], s[2:3]
 7E0062FF 3FF80000	v_frexp_mant_f64_e32 v[0:1], 0x3ff80000
@@ -3803,3 +3857,263 @@ D1320001 00000702	v_min_i16_e64 v1, v2, s3
 D1320001 00000702	v_min_i16_e64 v1, v2, s3
 D13200C8 0003FFFE	v_min_i16_e64 v200, v254, v255
 6591FFFE	v_min_i16_e32 v200, v254, v255
+D86E0000 04000001	ds_read2_b32 v[4:5], v1
+D86E0000 00000001	ds_read2_b32 v[0:1], v1
+D86E0000 C80000FF	ds_read2_b32 v[200:201], v255
+D86E0100 04000001	ds_read2_b32 v[4:5], v1 offset1:1
+D86E0100 00000001	ds_read2_b32 v[0:1], v1 offset1:1
+D86E0100 C80000FF	ds_read2_b32 v[200:201], v255 offset1:1
+D86E0201 04000001	ds_read2_b32 v[4:5], v1 offset0:1 offset1:2
+D86E0201 00000001	ds_read2_b32 v[0:1], v1 offset0:1 offset1:2
+D86E0201 C80000FF	ds_read2_b32 v[200:201], v255 offset0:1 offset1:2
+D86E0302 04000001	ds_read2_b32 v[4:5], v1 offset0:2 offset1:3
+D86E0302 00000001	ds_read2_b32 v[0:1], v1 offset0:2 offset1:3
+D86E0302 C80000FF	ds_read2_b32 v[200:201], v255 offset0:2 offset1:3
+D86E0908 04000001	ds_read2_b32 v[4:5], v1 offset0:8 offset1:9
+D86E0908 00000001	ds_read2_b32 v[0:1], v1 offset0:8 offset1:9
+D86E0908 C80000FF	ds_read2_b32 v[200:201], v255 offset0:8 offset1:9
+D86E403F 04000001	ds_read2_b32 v[4:5], v1 offset0:63 offset1:64
+D86E403F 00000001	ds_read2_b32 v[0:1], v1 offset0:63 offset1:64
+D86E403F C80000FF	ds_read2_b32 v[200:201], v255 offset0:63 offset1:64
+D86E00FF 04000001	ds_read2_b32 v[4:5], v1 offset0:255
+D86E00FF 00000001	ds_read2_b32 v[0:1], v1 offset0:255
+D86E00FF C80000FF	ds_read2_b32 v[200:201], v255 offset0:255
+D86E0707 04000001	ds_read2_b32 v[4:5], v1 offset0:7 offset1:7
+D86E0707 00000001	ds_read2_b32 v[0:1], v1 offset0:7 offset1:7
+D86E0707 C80000FF	ds_read2_b32 v[200:201], v255 offset0:7 offset1:7
+D86EFFC8 04000001	ds_read2_b32 v[4:5], v1 offset0:200 offset1:255
+D86EFFC8 00000001	ds_read2_b32 v[0:1], v1 offset0:200 offset1:255
+D86EFFC8 C80000FF	ds_read2_b32 v[200:201], v255 offset0:200 offset1:255
+D86E8000 04000001	ds_read2_b32 v[4:5], v1 offset1:128
+D86E8000 00000001	ds_read2_b32 v[0:1], v1 offset1:128
+D86E8000 C80000FF	ds_read2_b32 v[200:201], v255 offset1:128
+D8700000 04000001	ds_read2st64_b32 v[4:5], v1
+D8700000 00000001	ds_read2st64_b32 v[0:1], v1
+D8700000 C80000FF	ds_read2st64_b32 v[200:201], v255
+D8700100 04000001	ds_read2st64_b32 v[4:5], v1 offset1:1
+D8700100 00000001	ds_read2st64_b32 v[0:1], v1 offset1:1
+D8700100 C80000FF	ds_read2st64_b32 v[200:201], v255 offset1:1
+D8700201 04000001	ds_read2st64_b32 v[4:5], v1 offset0:1 offset1:2
+D8700201 00000001	ds_read2st64_b32 v[0:1], v1 offset0:1 offset1:2
+D8700201 C80000FF	ds_read2st64_b32 v[200:201], v255 offset0:1 offset1:2
+D8700302 04000001	ds_read2st64_b32 v[4:5], v1 offset0:2 offset1:3
+D8700302 00000001	ds_read2st64_b32 v[0:1], v1 offset0:2 offset1:3
+D8700302 C80000FF	ds_read2st64_b32 v[200:201], v255 offset0:2 offset1:3
+D8700908 04000001	ds_read2st64_b32 v[4:5], v1 offset0:8 offset1:9
+D8700908 00000001	ds_read2st64_b32 v[0:1], v1 offset0:8 offset1:9
+D8700908 C80000FF	ds_read2st64_b32 v[200:201], v255 offset0:8 offset1:9
+D870403F 04000001	ds_read2st64_b32 v[4:5], v1 offset0:63 offset1:64
+D870403F 00000001	ds_read2st64_b32 v[0:1], v1 offset0:63 offset1:64
+D870403F C80000FF	ds_read2st64_b32 v[200:201], v255 offset0:63 offset1:64
+D87000FF 04000001	ds_read2st64_b32 v[4:5], v1 offset0:255
+D87000FF 00000001	ds_read2st64_b32 v[0:1], v1 offset0:255
+D87000FF C80000FF	ds_read2st64_b32 v[200:201], v255 offset0:255
+D8700707 04000001	ds_read2st64_b32 v[4:5], v1 offset0:7 offset1:7
+D8700707 00000001	ds_read2st64_b32 v[0:1], v1 offset0:7 offset1:7
+D8700707 C80000FF	ds_read2st64_b32 v[200:201], v255 offset0:7 offset1:7
+D870FFC8 04000001	ds_read2st64_b32 v[4:5], v1 offset0:200 offset1:255
+D870FFC8 00000001	ds_read2st64_b32 v[0:1], v1 offset0:200 offset1:255
+D870FFC8 C80000FF	ds_read2st64_b32 v[200:201], v255 offset0:200 offset1:255
+D8708000 04000001	ds_read2st64_b32 v[4:5], v1 offset1:128
+D8708000 00000001	ds_read2st64_b32 v[0:1], v1 offset1:128
+D8708000 C80000FF	ds_read2st64_b32 v[200:201], v255 offset1:128
+D8EE0000 04000001	ds_read2_b64 v[4:7], v1
+D8EE0000 00000003	ds_read2_b64 v[0:3], v3
+D8EE0000 C80000FF	ds_read2_b64 v[200:203], v255
+D8EE0100 04000001	ds_read2_b64 v[4:7], v1 offset1:1
+D8EE0100 00000003	ds_read2_b64 v[0:3], v3 offset1:1
+D8EE0100 C80000FF	ds_read2_b64 v[200:203], v255 offset1:1
+D8EE0201 04000001	ds_read2_b64 v[4:7], v1 offset0:1 offset1:2
+D8EE0201 00000003	ds_read2_b64 v[0:3], v3 offset0:1 offset1:2
+D8EE0201 C80000FF	ds_read2_b64 v[200:203], v255 offset0:1 offset1:2
+D8EE0302 04000001	ds_read2_b64 v[4:7], v1 offset0:2 offset1:3
+D8EE0302 00000003	ds_read2_b64 v[0:3], v3 offset0:2 offset1:3
+D8EE0302 C80000FF	ds_read2_b64 v[200:203], v255 offset0:2 offset1:3
+D8EE0908 04000001	ds_read2_b64 v[4:7], v1 offset0:8 offset1:9
+D8EE0908 00000003	ds_read2_b64 v[0:3], v3 offset0:8 offset1:9
+D8EE0908 C80000FF	ds_read2_b64 v[200:203], v255 offset0:8 offset1:9
+D8EE403F 04000001	ds_read2_b64 v[4:7], v1 offset0:63 offset1:64
+D8EE403F 00000003	ds_read2_b64 v[0:3], v3 offset0:63 offset1:64
+D8EE403F C80000FF	ds_read2_b64 v[200:203], v255 offset0:63 offset1:64
+D8EE00FF 04000001	ds_read2_b64 v[4:7], v1 offset0:255
+D8EE00FF 00000003	ds_read2_b64 v[0:3], v3 offset0:255
+D8EE00FF C80000FF	ds_read2_b64 v[200:203], v255 offset0:255
+D8EE0707 04000001	ds_read2_b64 v[4:7], v1 offset0:7 offset1:7
+D8EE0707 00000003	ds_read2_b64 v[0:3], v3 offset0:7 offset1:7
+D8EE0707 C80000FF	ds_read2_b64 v[200:203], v255 offset0:7 offset1:7
+D8EEFFC8 04000001	ds_read2_b64 v[4:7], v1 offset0:200 offset1:255
+D8EEFFC8 00000003	ds_read2_b64 v[0:3], v3 offset0:200 offset1:255
+D8EEFFC8 C80000FF	ds_read2_b64 v[200:203], v255 offset0:200 offset1:255
+D8EE8000 04000001	ds_read2_b64 v[4:7], v1 offset1:128
+D8EE8000 00000003	ds_read2_b64 v[0:3], v3 offset1:128
+D8EE8000 C80000FF	ds_read2_b64 v[200:203], v255 offset1:128
+D8F00000 04000001	ds_read2st64_b64 v[4:7], v1
+D8F00000 00000003	ds_read2st64_b64 v[0:3], v3
+D8F00000 C80000FF	ds_read2st64_b64 v[200:203], v255
+D8F00100 04000001	ds_read2st64_b64 v[4:7], v1 offset1:1
+D8F00100 00000003	ds_read2st64_b64 v[0:3], v3 offset1:1
+D8F00100 C80000FF	ds_read2st64_b64 v[200:203], v255 offset1:1
+D8F00201 04000001	ds_read2st64_b64 v[4:7], v1 offset0:1 offset1:2
+D8F00201 00000003	ds_read2st64_b64 v[0:3], v3 offset0:1 offset1:2
+D8F00201 C80000FF	ds_read2st64_b64 v[200:203], v255 offset0:1 offset1:2
+D8F00302 04000001	ds_read2st64_b64 v[4:7], v1 offset0:2 offset1:3
+D8F00302 00000003	ds_read2st64_b64 v[0:3], v3 offset0:2 offset1:3
+D8F00302 C80000FF	ds_read2st64_b64 v[200:203], v255 offset0:2 offset1:3
+D8F00908 04000001	ds_read2st64_b64 v[4:7], v1 offset0:8 offset1:9
+D8F00908 00000003	ds_read2st64_b64 v[0:3], v3 offset0:8 offset1:9
+D8F00908 C80000FF	ds_read2st64_b64 v[200:203], v255 offset0:8 offset1:9
+D8F0403F 04000001	ds_read2st64_b64 v[4:7], v1 offset0:63 offset1:64
+D8F0403F 00000003	ds_read2st64_b64 v[0:3], v3 offset0:63 offset1:64
+D8F0403F C80000FF	ds_read2st64_b64 v[200:203], v255 offset0:63 offset1:64
+D8F000FF 04000001	ds_read2st64_b64 v[4:7], v1 offset0:255
+D8F000FF 00000003	ds_read2st64_b64 v[0:3], v3 offset0:255
+D8F000FF C80000FF	ds_read2st64_b64 v[200:203], v255 offset0:255
+D8F00707 04000001	ds_read2st64_b64 v[4:7], v1 offset0:7 offset1:7
+D8F00707 00000003	ds_read2st64_b64 v[0:3], v3 offset0:7 offset1:7
+D8F00707 C80000FF	ds_read2st64_b64 v[200:203], v255 offset0:7 offset1:7
+D8F0FFC8 04000001	ds_read2st64_b64 v[4:7], v1 offset0:200 offset1:255
+D8F0FFC8 00000003	ds_read2st64_b64 v[0:3], v3 offset0:200 offset1:255
+D8F0FFC8 C80000FF	ds_read2st64_b64 v[200:203], v255 offset0:200 offset1:255
+D8F08000 04000001	ds_read2st64_b64 v[4:7], v1 offset1:128
+D8F08000 00000003	ds_read2st64_b64 v[0:3], v3 offset1:128
+D8F08000 C80000FF	ds_read2st64_b64 v[200:203], v255 offset1:128
+D81C0000 00050401	ds_write2_b32 v1, v4, v5
+D81C0000 00020101	ds_write2_b32 v1, v1, v2
+D81C0000 00040401	ds_write2_b32 v1, v4, v4
+D81C0000 00FEC8FF	ds_write2_b32 v255, v200, v254
+D81C0100 00050401	ds_write2_b32 v1, v4, v5 offset1:1
+D81C0100 00020101	ds_write2_b32 v1, v1, v2 offset1:1
+D81C0100 00040401	ds_write2_b32 v1, v4, v4 offset1:1
+D81C0100 00FEC8FF	ds_write2_b32 v255, v200, v254 offset1:1
+D81C0201 00050401	ds_write2_b32 v1, v4, v5 offset0:1 offset1:2
+D81C0201 00020101	ds_write2_b32 v1, v1, v2 offset0:1 offset1:2
+D81C0201 00040401	ds_write2_b32 v1, v4, v4 offset0:1 offset1:2
+D81C0201 00FEC8FF	ds_write2_b32 v255, v200, v254 offset0:1 offset1:2
+D81C0302 00050401	ds_write2_b32 v1, v4, v5 offset0:2 offset1:3
+D81C0302 00020101	ds_write2_b32 v1, v1, v2 offset0:2 offset1:3
+D81C0302 00040401	ds_write2_b32 v1, v4, v4 offset0:2 offset1:3
+D81C0302 00FEC8FF	ds_write2_b32 v255, v200, v254 offset0:2 offset1:3
+D81C0908 00050401	ds_write2_b32 v1, v4, v5 offset0:8 offset1:9
+D81C0908 00020101	ds_write2_b32 v1, v1, v2 offset0:8 offset1:9
+D81C0908 00040401	ds_write2_b32 v1, v4, v4 offset0:8 offset1:9
+D81C0908 00FEC8FF	ds_write2_b32 v255, v200, v254 offset0:8 offset1:9
+D81C403F 00050401	ds_write2_b32 v1, v4, v5 offset0:63 offset1:64
+D81C403F 00020101	ds_write2_b32 v1, v1, v2 offset0:63 offset1:64
+D81C403F 00040401	ds_write2_b32 v1, v4, v4 offset0:63 offset1:64
+D81C403F 00FEC8FF	ds_write2_b32 v255, v200, v254 offset0:63 offset1:64
+D81C00FF 00050401	ds_write2_b32 v1, v4, v5 offset0:255
+D81C00FF 00020101	ds_write2_b32 v1, v1, v2 offset0:255
+D81C00FF 00040401	ds_write2_b32 v1, v4, v4 offset0:255
+D81C00FF 00FEC8FF	ds_write2_b32 v255, v200, v254 offset0:255
+D81C0707 00050401	ds_write2_b32 v1, v4, v5 offset0:7 offset1:7
+D81C0707 00020101	ds_write2_b32 v1, v1, v2 offset0:7 offset1:7
+D81C0707 00040401	ds_write2_b32 v1, v4, v4 offset0:7 offset1:7
+D81C0707 00FEC8FF	ds_write2_b32 v255, v200, v254 offset0:7 offset1:7
+D81CFFC8 00050401	ds_write2_b32 v1, v4, v5 offset0:200 offset1:255
+D81CFFC8 00020101	ds_write2_b32 v1, v1, v2 offset0:200 offset1:255
+D81CFFC8 00040401	ds_write2_b32 v1, v4, v4 offset0:200 offset1:255
+D81CFFC8 00FEC8FF	ds_write2_b32 v255, v200, v254 offset0:200 offset1:255
+D81C8000 00050401	ds_write2_b32 v1, v4, v5 offset1:128
+D81C8000 00020101	ds_write2_b32 v1, v1, v2 offset1:128
+D81C8000 00040401	ds_write2_b32 v1, v4, v4 offset1:128
+D81C8000 00FEC8FF	ds_write2_b32 v255, v200, v254 offset1:128
+D81E0000 00050401	ds_write2st64_b32 v1, v4, v5
+D81E0000 00020101	ds_write2st64_b32 v1, v1, v2
+D81E0000 00040401	ds_write2st64_b32 v1, v4, v4
+D81E0000 00FEC8FF	ds_write2st64_b32 v255, v200, v254
+D81E0100 00050401	ds_write2st64_b32 v1, v4, v5 offset1:1
+D81E0100 00020101	ds_write2st64_b32 v1, v1, v2 offset1:1
+D81E0100 00040401	ds_write2st64_b32 v1, v4, v4 offset1:1
+D81E0100 00FEC8FF	ds_write2st64_b32 v255, v200, v254 offset1:1
+D81E0201 00050401	ds_write2st64_b32 v1, v4, v5 offset0:1 offset1:2
+D81E0201 00020101	ds_write2st64_b32 v1, v1, v2 offset0:1 offset1:2
+D81E0201 00040401	ds_write2st64_b32 v1, v4, v4 offset0:1 offset1:2
+D81E0201 00FEC8FF	ds_write2st64_b32 v255, v200, v254 offset0:1 offset1:2
+D81E0302 00050401	ds_write2st64_b32 v1, v4, v5 offset0:2 offset1:3
+D81E0302 00020101	ds_write2st64_b32 v1, v1, v2 offset0:2 offset1:3
+D81E0302 00040401	ds_write2st64_b32 v1, v4, v4 offset0:2 offset1:3
+D81E0302 00FEC8FF	ds_write2st64_b32 v255, v200, v254 offset0:2 offset1:3
+D81E0908 00050401	ds_write2st64_b32 v1, v4, v5 offset0:8 offset1:9
+D81E0908 00020101	ds_write2st64_b32 v1, v1, v2 offset0:8 offset1:9
+D81E0908 00040401	ds_write2st64_b32 v1, v4, v4 offset0:8 offset1:9
+D81E0908 00FEC8FF	ds_write2st64_b32 v255, v200, v254 offset0:8 offset1:9
+D81E403F 00050401	ds_write2st64_b32 v1, v4, v5 offset0:63 offset1:64
+D81E403F 00020101	ds_write2st64_b32 v1, v1, v2 offset0:63 offset1:64
+D81E403F 00040401	ds_write2st64_b32 v1, v4, v4 offset0:63 offset1:64
+D81E403F 00FEC8FF	ds_write2st64_b32 v255, v200, v254 offset0:63 offset1:64
+D81E00FF 00050401	ds_write2st64_b32 v1, v4, v5 offset0:255
+D81E00FF 00020101	ds_write2st64_b32 v1, v1, v2 offset0:255
+D81E00FF 00040401	ds_write2st64_b32 v1, v4, v4 offset0:255
+D81E00FF 00FEC8FF	ds_write2st64_b32 v255, v200, v254 offset0:255
+D81E0707 00050401	ds_write2st64_b32 v1, v4, v5 offset0:7 offset1:7
+D81E0707 00020101	ds_write2st64_b32 v1, v1, v2 offset0:7 offset1:7
+D81E0707 00040401	ds_write2st64_b32 v1, v4, v4 offset0:7 offset1:7
+D81E0707 00FEC8FF	ds_write2st64_b32 v255, v200, v254 offset0:7 offset1:7
+D81EFFC8 00050401	ds_write2st64_b32 v1, v4, v5 offset0:200 offset1:255
+D81EFFC8 00020101	ds_write2st64_b32 v1, v1, v2 offset0:200 offset1:255
+D81EFFC8 00040401	ds_write2st64_b32 v1, v4, v4 offset0:200 offset1:255
+D81EFFC8 00FEC8FF	ds_write2st64_b32 v255, v200, v254 offset0:200 offset1:255
+D81E8000 00050401	ds_write2st64_b32 v1, v4, v5 offset1:128
+D81E8000 00020101	ds_write2st64_b32 v1, v1, v2 offset1:128
+D81E8000 00040401	ds_write2st64_b32 v1, v4, v4 offset1:128
+D81E8000 00FEC8FF	ds_write2st64_b32 v255, v200, v254 offset1:128
+D89C0000 00060401	ds_write2_b64 v1, v[4:5], v[6:7]
+D89C0000 00040401	ds_write2_b64 v1, v[4:5], v[4:5]
+D89C0000 00FEC8FF	ds_write2_b64 v255, v[200:201], v[254:255]
+D89C0100 00060401	ds_write2_b64 v1, v[4:5], v[6:7] offset1:1
+D89C0100 00040401	ds_write2_b64 v1, v[4:5], v[4:5] offset1:1
+D89C0100 00FEC8FF	ds_write2_b64 v255, v[200:201], v[254:255] offset1:1
+D89C0201 00060401	ds_write2_b64 v1, v[4:5], v[6:7] offset0:1 offset1:2
+D89C0201 00040401	ds_write2_b64 v1, v[4:5], v[4:5] offset0:1 offset1:2
+D89C0201 00FEC8FF	ds_write2_b64 v255, v[200:201], v[254:255] offset0:1 offset1:2
+D89C0302 00060401	ds_write2_b64 v1, v[4:5], v[6:7] offset0:2 offset1:3
+D89C0302 00040401	ds_write2_b64 v1, v[4:5], v[4:5] offset0:2 offset1:3
+D89C0302 00FEC8FF	ds_write2_b64 v255, v[200:201], v[254:255] offset0:2 offset1:3
+D89C0908 00060401	ds_write2_b64 v1, v[4:5], v[6:7] offset0:8 offset1:9
+D89C0908 00040401	ds_write2_b64 v1, v[4:5], v[4:5] offset0:8 offset1:9
+D89C0908 00FEC8FF	ds_write2_b64 v255, v[200:201], v[254:255] offset0:8 offset1:9
+D89C403F 00060401	ds_write2_b64 v1, v[4:5], v[6:7] offset0:63 offset1:64
+D89C403F 00040401	ds_write2_b64 v1, v[4:5], v[4:5] offset0:63 offset1:64
+D89C403F 00FEC8FF	ds_write2_b64 v255, v[200:201], v[254:255] offset0:63 offset1:64
+D89C00FF 00060401	ds_write2_b64 v1, v[4:5], v[6:7] offset0:255
+D89C00FF 00040401	ds_write2_b64 v1, v[4:5], v[4:5] offset0:255
+D89C00FF 00FEC8FF	ds_write2_b64 v255, v[200:201], v[254:255] offset0:255
+D89C0707 00060401	ds_write2_b64 v1, v[4:5], v[6:7] offset0:7 offset1:7
+D89C0707 00040401	ds_write2_b64 v1, v[4:5], v[4:5] offset0:7 offset1:7
+D89C0707 00FEC8FF	ds_write2_b64 v255, v[200:201], v[254:255] offset0:7 offset1:7
+D89CFFC8 00060401	ds_write2_b64 v1, v[4:5], v[6:7] offset0:200 offset1:255
+D89CFFC8 00040401	ds_write2_b64 v1, v[4:5], v[4:5] offset0:200 offset1:255
+D89CFFC8 00FEC8FF	ds_write2_b64 v255, v[200:201], v[254:255] offset0:200 offset1:255
+D89C8000 00060401	ds_write2_b64 v1, v[4:5], v[6:7] offset1:128
+D89C8000 00040401	ds_write2_b64 v1, v[4:5], v[4:5] offset1:128
+D89C8000 00FEC8FF	ds_write2_b64 v255, v[200:201], v[254:255] offset1:128
+D89E0000 00060401	ds_write2st64_b64 v1, v[4:5], v[6:7]
+D89E0000 00040401	ds_write2st64_b64 v1, v[4:5], v[4:5]
+D89E0000 00FEC8FF	ds_write2st64_b64 v255, v[200:201], v[254:255]
+D89E0100 00060401	ds_write2st64_b64 v1, v[4:5], v[6:7] offset1:1
+D89E0100 00040401	ds_write2st64_b64 v1, v[4:5], v[4:5] offset1:1
+D89E0100 00FEC8FF	ds_write2st64_b64 v255, v[200:201], v[254:255] offset1:1
+D89E0201 00060401	ds_write2st64_b64 v1, v[4:5], v[6:7] offset0:1 offset1:2
+D89E0201 00040401	ds_write2st64_b64 v1, v[4:5], v[4:5] offset0:1 offset1:2
+D89E0201 00FEC8FF	ds_write2st64_b64 v255, v[200:201], v[254:255] offset0:1 offset1:2
+D89E0302 00060401	ds_write2st64_b64 v1, v[4:5], v[6:7] offset0:2 offset1:3
+D89E0302 00040401	ds_write2st64_b64 v1, v[4:5], v[4:5] offset0:2 offset1:3
+D89E0302 00FEC8FF	ds_write2st64_b64 v255, v[200:201], v[254:255] offset0:2 offset1:3
+D89E0908 00060401	ds_write2st64_b64 v1, v[4:5], v[6:7] offset0:8 offset1:9
+D89E0908 00040401	ds_write2st64_b64 v1, v[4:5], v[4:5] offset0:8 offset1:9
+D89E0908 00FEC8FF	ds_write2st64_b64 v255, v[200:201], v[254:255] offset0:8 offset1:9
+D89E403F 00060401	ds_write2st64_b64 v1, v[4:5], v[6:7] offset0:63 offset1:64
+D89E403F 00040401	ds_write2st64_b64 v1, v[4:5], v[4:5] offset0:63 offset1:64
+D89E403F 00FEC8FF	ds_write2st64_b64 v255, v[200:201], v[254:255] offset0:63 offset1:64
+D89E00FF 00060401	ds_write2st64_b64 v1, v[4:5], v[6:7] offset0:255
+D89E00FF 00040401	ds_write2st64_b64 v1, v[4:5], v[4:5] offset0:255
+D89E00FF 00FEC8FF	ds_write2st64_b64 v255, v[200:201], v[254:255] offset0:255
+D89E0707 00060401	ds_write2st64_b64 v1, v[4:5], v[6:7] offset0:7 offset1:7
+D89E0707 00040401	ds_write2st64_b64 v1, v[4:5], v[4:5] offset0:7 offset1:7
+D89E0707 00FEC8FF	ds_write2st64_b64 v255, v[200:201], v[254:255] offset0:7 offset1:7
+D89EFFC8 00060401	ds_write2st64_b64 v1, v[4:5], v[6:7] offset0:200 offset1:255
+D89EFFC8 00040401	ds_write2st64_b64 v1, v[4:5], v[4:5] offset0:200 offset1:255
+D89EFFC8 00FEC8FF	ds_write2st64_b64 v255, v[200:201], v[254:255] offset0:200 offset1:255
+D89E8000 00060401	ds_write2st64_b64 v1, v[4:5], v[6:7] offset1:128
+D89E8000 00040401	ds_write2st64_b64 v1, v[4:5], v[4:5] offset1:128
+D89E8000 00FEC8FF	ds_write2st64_b64 v255, v[200:201], v[254:255] offset1:128

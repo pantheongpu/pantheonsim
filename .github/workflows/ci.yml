@@ -74,8 +74,18 @@ jobs:
           nvcc --version | tail -2
           cmake --version | head -1
 
+      # Compile cache (.github/actions/ccache): the library's objects from an earlier build, when the source and the compiler are the same.
+      - name: Compile cache
+        id: ccache
+        uses: ./.github/actions/ccache
+        with:
+          key: unit-release
+
       - name: Configure
         # -Werror: the build has no warnings (issue #284), and this keeps it that way.
+        env:
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVGPU_WERROR=ON
 
       - name: Build
@@ -112,8 +122,10 @@ jobs:
           VGPU_CUTLASS_BIN_CACHE: ${{ github.workspace }}/cutlass-bin-cache
         # The ML tests are the ml job's: on the runner whose image has PyTorch
         # and rocBLAS they would run here too, and take an hour.
-        # -j2 (fewer on a machine with under 12 GiB free, ci/jobs.sh): the two
-        # CUTLASS tests were 2200 s of this step's 3200 s (run 38424481981,
+        # Up to four at a time (fewer where under 24 GiB are free, ci/jobs.sh; it was two): the long
+        # tests are split into shards (vgpu_shard_tests in CMakeLists.txt; docs/performance.md,
+        # "CI time"), which only help when there are slots to run them side by side.
+        # The two CUTLASS tests were 2200 s of this step's 3200 s (run 38424481981,
         # before the binary cache above) and
         # use one core for their nvcc compiles, so the other tests run beside
         # them. The CUTLASS, CuTe and heavy nvcc tests take the nvcc_memory lock
@@ -121,7 +133,7 @@ jobs:
         # memory at a time, and the two CUTLASS tests start first (their COST),
         # so the lock chain overlaps the rest. The ml job below runs the other
         # tests at -j2 already.
-        run: ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 6 -m 2)" -E '^(pantheon_workloads|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'
+        run: ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 6 -m 4)" -E '^(pantheon_workloads|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'
 
       - name: Keep the CUTLASS test binaries
         # Only after every test passed, so the directory holds both tests'
@@ -131,6 +143,12 @@ jobs:
         with:
           path: cutlass-bin-cache
           key: ${{ steps.cutlass_bin.outputs.cache-primary-key }}
+
+      - name: Save the compile cache
+        if: always()
+        uses: ./.github/actions/ccache-save
+        with:
+          key: unit-release
 
       - name: Clean the runner
         if: always()
@@ -180,8 +198,18 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends \
             build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit
 
+      # Compile cache (.github/actions/ccache): the library's objects from an earlier build, when the source and the compiler are the same.
+      - name: Compile cache
+        id: ccache
+        uses: ./pantheonsim/.github/actions/ccache
+        with:
+          key: cuda12-release
+
       - name: Build VirtualGPU
         working-directory: pantheonsim
+        env:
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(ci/jobs.sh -p release)"
@@ -193,6 +221,12 @@ jobs:
         run: |
           export VGPU_PANTHEON_DIR="$GITHUB_WORKSPACE/pantheon" VGPU_BUILD_DIR="$GITHUB_WORKSPACE/pantheonsim/build"
           ./tests/workloads/run_pantheon_workloads.sh
+
+      - name: Save the compile cache
+        if: always()
+        uses: ./pantheonsim/.github/actions/ccache-save
+        with:
+          key: cuda12-release
 
       # This job checks out into pantheonsim/, so the action and the build trees are there.
       - name: Clean the runner
@@ -263,7 +297,17 @@ jobs:
           echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
           echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
 
+      # Compile cache (.github/actions/ccache): the library's objects from an earlier build, when the source and the compiler are the same.
+      - name: Compile cache
+        id: ccache
+        uses: ./.github/actions/ccache
+        with:
+          key: cuda13-release
+
       - name: Build VirtualGPU
+        env:
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(ci/jobs.sh -p sass)"
@@ -287,6 +331,12 @@ jobs:
           if grep -E '\*\*\*Skipped' cutlass.log; then
             echo "::error::a CUTLASS test skipped; this job installs what they need"; exit 1
           fi
+
+      - name: Save the compile cache
+        if: always()
+        uses: ./.github/actions/ccache-save
+        with:
+          key: cuda13-release
 
       # The jobs run as root in the container, in a workspace that belongs to the runner's
       # user. On a runner that lasts (the burst pool) what they leave there is root's, and the
@@ -366,7 +416,17 @@ jobs:
             zstd -d | tar -x -C "$ollama_dir"
           echo "$ollama_dir/bin" >> "$GITHUB_PATH"
 
+      # Compile cache (.github/actions/ccache): the library's objects from an earlier build, when the source and the compiler are the same.
+      - name: Compile cache
+        id: ccache
+        uses: ./.github/actions/ccache
+        with:
+          key: cuda13-release
+
       - name: Build VirtualGPU
+        env:
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(ci/jobs.sh -p ollama)"
@@ -483,7 +543,17 @@ jobs:
           rm -rf "$ollama_dir"/lib/ollama/cuda_* "$ollama_dir"/lib/ollama/mlx_*
           echo "$ollama_dir/bin" >> "$GITHUB_PATH"
 
+      # Compile cache (.github/actions/ccache): the library's objects from an earlier build, when the source and the compiler are the same.
+      - name: Compile cache
+        id: ccache
+        uses: ./.github/actions/ccache
+        with:
+          key: cuda13-release
+
       - name: Build VirtualGPU's HIP runtime
+        env:
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(ci/jobs.sh -p ollama-amd)" --target vgpuhip vgpu_cli
@@ -572,7 +642,17 @@ jobs:
           clang --print-targets | grep amdgcn
           llvm-objdump --version | head -2
 
+      # Compile cache (.github/actions/ccache): the library's objects from an earlier build, when the source and the compiler are the same.
+      - name: Compile cache
+        id: ccache
+        uses: ./.github/actions/ccache
+        with:
+          key: cuda12-release
+
       - name: Build
+        env:
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           # Every AMD test binary the next step runs, found by name rather than
@@ -585,7 +665,7 @@ jobs:
           # Without pipefail the tee's status is the step's, and a test that
           # failed or was never built would pass the job.
           set -o pipefail
-          ctest --test-dir build --output-on-failure -R "test_amd_codeobject|test_amd_gcn|test_amd_gcn_exec|test_amd_hip_abi|test_amd_hipcc|test_amd_rocprofiler|test_amd_bundle|amd_gcn_disasm|amd_hip|amd_hipcc|amd_rocm_versions" | tee out
+          ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 3 -m 4)" -R "test_amd_codeobject|test_amd_gcn|test_amd_gcn_exec|test_amd_hip_abi|test_amd_hipcc|test_amd_rocprofiler|test_amd_bundle|amd_gcn_disasm|amd_hip|amd_hipcc|amd_rocm_versions" | tee out
           # A skip here would hide a decoder that no longer matches the
           # assembler, or a HIP program that no longer runs, which is the
           # whole point of this job.
@@ -619,7 +699,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/pr-guard
 
+      # Compile cache (.github/actions/ccache): the library's objects from an earlier build, when the source and the compiler are the same.
+      - name: Compile cache
+        id: ccache
+        uses: ./.github/actions/ccache
+        with:
+          key: ml-release
+          persistent: true
+
       - name: Build
+        env:
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(ci/jobs.sh -p release)"
@@ -692,7 +783,7 @@ jobs:
           RUNNER_SKIPS_OK: '^(e2e_sass_jit_full|bench_amd_counters|e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_packed_int_forms|e2e_runtime_132|e2e_rdc_clones|e2e_host_gpu|amd_rocprofiler_pcsampling|amd_rvs)$'
         run: |
           set -o pipefail
-          ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 4 -m 2)" \
+          ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 4 -m 4)" \
             -E '^(pantheon_workloads|.*ollama.*|e2e_cutlass.*|e2e_.*cute.*|e2e_tma.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm.*|e2e_pytorch_sweep_full|e2e_pytorch_dist_full)$' \
             2>&1 | tee rest.log
           skipped=$(grep -oE 'Test +#[0-9]+: [A-Za-z0-9_]+ \.+\*\*\*(Skipped|Not Run)' rest.log \
@@ -778,14 +869,15 @@ jobs:
           # and the plain builds run the full matrix.
           VGPU_TIER_ARCHS: "sm_80 sm_90"
           VGPU_TIER_PROGRAMS: "sass_tier_steps:75"
-        # -j2 (fewer when under 12 GiB are free, ci/jobs.sh): 534 tests, 1840 s
+        # Up to four at a time (fewer when under 24 GiB are free, ci/jobs.sh; it was two, and
+        # the tier and JIT tests are now shards, CMakeLists.txt vgpu_shard_tests): 534 tests, 1840 s
         # one at a time in run 38424481981 (2031 s in 38612576048), the
         # longest 173 s, on a 24-core machine that otherwise idles through them;
         # the pool has one runner (server2-1), so each minute here is also a
         # minute the jobs queued behind this one wait. The ml job runs these
         # tests at -j2 on every run, and the tests that take the nvcc_memory lock
         # (CMakeLists.txt) still run one at a time.
-        run: ctest --test-dir build-san --output-on-failure -j"$(ci/jobs.sh -g 6 -m 2)" -E pantheon_workloads
+        run: ctest --test-dir build-san --output-on-failure -j"$(ci/jobs.sh -g 6 -m 4)" -E pantheon_workloads
 
       # The jobs run as root in the container, in a workspace that belongs to the runner's
       # user. On a runner that lasts (the burst pool) what they leave there is root's, and the
@@ -858,7 +950,7 @@ jobs:
         # the run needs randomization off. Without this every test aborts with
         # "unexpected memory mapping" before it starts.
         #
-        # -j2 (fewer when under 12 GiB are free, ci/jobs.sh): 534 tests, 1436 s
+        # Up to four at a time (fewer when under 24 GiB are free, ci/jobs.sh; it was two): 534 tests, 1436 s
         # one at a time in run 38424481981 (1586 s in 38612576048), the longest
         # 150 s, on a 24-core machine that otherwise idles through them. See the
         # ASan job above for why it is safe.
@@ -870,8 +962,8 @@ jobs:
           VGPU_TIER_ARCHS: "sm_80 sm_90"
           VGPU_TIER_PROGRAMS: "sass_tier_steps:75"
         run: |
-          single_thread='test_amd_gcn_same_bits|test_amd_gcn_gather_same_bits|test_amd_gcn_tier_same_bits|test_amd_gcn_memory_same_bits|test_amd_gcn_packed_same_bits|test_amd_matrix_fast|test_decode_same_bits|test_hevc_decode|test_h264_decode|test_mpeg2_decode|test_nvenc_.*'
-          setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -j"$(ci/jobs.sh -g 6 -m 2)" -E "^(pantheon_workloads|$single_thread)$"
+          single_thread='test_amd_gcn_same_bits|test_amd_gcn_gather_same_bits|test_amd_gcn_tier_same_bits(_shard_[0-9]+of[0-9]+)?|test_amd_gcn_memory_same_bits|test_amd_gcn_packed_same_bits|test_amd_matrix_fast|test_decode_same_bits|test_hevc_decode|test_h264_decode|test_mpeg2_decode|test_nvenc_.*'
+          setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -j"$(ci/jobs.sh -g 6 -m 4)" -E "^(pantheon_workloads|$single_thread)$"
 
       # The jobs run as root in the container, in a workspace that belongs to the runner's
       # user. On a runner that lasts (the burst pool) what they leave there is root's, and the

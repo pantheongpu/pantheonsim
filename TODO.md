@@ -2,6 +2,8 @@
 
 Updated: 2026-10-22 (rev 5; profile counts refreshed). See ARCHITECTURE.md for the design behind these.
 
+Not yet in the gap register below: `cudaLaunchHostFunc` runs the host function inline (#487) and `shfl.sync` does not wait for a member lane still in a long loop (#488). Some gap-register entries are older than the code (the driver graph API and stream memory operations are in `nvidia/src`); check an entry against the tree before relying on it.
+
 Rev 5 is an audit, not an addition: every claim below was checked against the tree at
 `origin/main` 2ce1f45 (code, the CMake test list, the docs, the git log). The checks were
 static -- a test named here was found in the tree and registered, not re-run for this
@@ -1924,6 +1926,7 @@ table says. `pantheonworkloads #10` lives in another repository and was not chec
 | pantheonsim #310 | Driver stream-ordered memory pools (`cuMemPool*`, `cuMemAllocAsync` through the current pool) |
 | pantheonsim #311 | Driver `cuPointerGetAttributes`, `cuPointerSetAttribute` and the missing `cuPointerGetAttribute` answers |
 | pantheonsim #290 | The memory-pattern e2e test and the `cuda_memtest` and `gpu-burn` external suites |
+| pantheonsim #483 | PTX unary `~` on an integer constant (`~0x2`, `~~5`, `~(0x2)`); other constant expressions (binary operators, `!`) are still not evaluated |
 | pantheonworkloads #10 | `arch-*` and `lib-*` workload runs on `sim:nvidia`, and `unsupported_ok` for ops real GPUs lack |
 
 ## Profile inventory (rev 6)
@@ -2288,7 +2291,7 @@ with what `nvidia/src` defines):
   and vGPU management, GPM and units are absent, and `nvidia-smi` has no `-pm`, `-pl` or `-c`. Deliberately
   not done: an in-process-only setter would make `nvidia-smi -pm 1` look successful while the next process
   shows no change, so persistence across processes needs a design decision first.
-- **PTX**: `multimem` (needs the multicast fabric, which the driver refuses), `sured`, `ldu`, and the `txq` queries other than width, height and depth (a kernel using one for a texture object does not launch on an RTX 3060).
+- **PTX**: `multimem` (needs the multicast fabric, which the driver refuses), `sured`, and the `txq` queries other than width, height and depth (a kernel using one for a texture object does not launch on an RTX 3060).
 
 AMD:
 

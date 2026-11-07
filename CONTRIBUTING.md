@@ -114,5 +114,8 @@ license can be added with their notice kept, and they go in
   approve its CI run.
 - A pull request that conflicts with `main` is not tested; rebase and push again
   ([docs/ci-merge-conflicts.md](docs/ci-merge-conflicts.md)).
-- Contributions are accepted under the project's Apache-2.0 license, with no
-  separate contributor agreement.
+- Contributions need the [Contributor Agreement](docs/contributor-agreement.md):
+  you keep your copyright and give K Digital Systems LLC the right to license your
+  work, including under commercial terms. Write "I agree to the PantheonSim
+  Contributor Agreement" in the description of your first pull request. The
+  project's license is described in [docs/licensing.md](docs/licensing.md).

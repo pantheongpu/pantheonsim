@@ -818,8 +818,8 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     case Op::RPCMOV:   // RPCMOV.32 to or from the return-address register
       each_lane(ex, [&](unsigned l) {
         const unsigned sh = ins.f[1] ? 32 : 0;
-        if (ins.f[0]) write32(w, ins.dst[0], l, static_cast<uint32_t>(w.rpc[l] >> sh));
-        else w.rpc[l] = (w.rpc[l] & ~(uint64_t{0xffffffff} << sh)) | (static_cast<uint64_t>(read32(w, ins.src[0], l)) << sh);
+        if (ins.f[0]) write32(w, ins.dst[0], l, static_cast<uint32_t>(w.rare().rpc[l] >> sh));
+        else w.rare().rpc[l] = (w.rare().rpc[l] & ~(uint64_t{0xffffffff} << sh)) | (static_cast<uint64_t>(read32(w, ins.src[0], l)) << sh);
       });
       return;
     case Op::SGXT:
@@ -918,8 +918,10 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       const unsigned size = ins.f[0];
       const Operand& c = ins.src[0];
       if (ins.f[1]) {   // c[bank][URa + offset] (ULDC's indexed form; LDCU)
-        const uint64_t o = (c.reg == static_cast<unsigned>(m_.sm >= 100 ? 255 : 63) ? 0 : w.ur[c.reg]) +
-                           static_cast<uint64_t>(c.imm);
+        // The indexed ULDC's offset is signed and the address wraps in the 64 KiB bank (as LDC's does); LDCU's is not.
+        uint64_t o = (c.reg == static_cast<unsigned>(m_.sm >= 100 ? 255 : 63) ? 0 : w.ur[c.reg]) +
+                     static_cast<uint64_t>(c.imm);
+        if (ins.f[1] == 1) o &= 0xffff;
         const unsigned words = size == 6 ? 4 : size == 5 ? 2 : 1;
         if (words > 1) {
           Operand d = ins.dst[0];
@@ -5380,7 +5382,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
     }
   };
   const auto release_bar = [&](unsigned id) {
-    Block::Barrier& b = blk.bars[id];
+    Block::Barrier& b = blk.bar(id);
     uint32_t live = 0;
     for (const Warp& ww : blk.warps) live += static_cast<uint32_t>(std::popcount(ww.alive & ~ww.exited));
     const uint32_t expected = b.expected ? b.expected : live;
@@ -5591,20 +5593,20 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       for (unsigned x = 0; x < 16; ++x) release_bsync(x);
       release_warpsync(w);
       for (unsigned id = 0; id < 16; ++id)
-        if (blk.bars[id].arrived) release_bar(id);
+        if (blk.bars()[id].arrived) release_bar(id);
       cluster_barrier_check(blk);
       return true;
     }
     case Op::UCGABAR: {   // barrier.cluster: UCGABAR_ARV arrives, UCGABAR_WAIT waits for the phase
       Cluster& cl = *blk.cluster;
       if (ins.f[0] == 0) {
-        each_lane(ex, [&](unsigned l) { w.cga_target[l] = cl.phase + 1; });
+        each_lane(ex, [&](unsigned l) { w.rare().cga_target[l] = cl.phase + 1; });
         w.cga_arrived |= ex;
         cluster_barrier_check(blk);
         return false;
       }
       each_lane(group, [&](unsigned l) {
-        if ((ex >> l & 1) && cl.phase < w.cga_target[l]) {
+        if ((ex >> l & 1) && cl.phase < w.rare().cga_target[l]) {
           w.waiting |= Mask{1} << l;
           w.wait_kind[l] = Wait::Cluster;
         } else {
@@ -5677,7 +5679,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       }
       const unsigned mode = ins.f[0];
       const unsigned id = ins.src[0].kind == Kind::Imm ? static_cast<unsigned>(ins.src[0].imm) : read32(w, ins.src[0], 0) & 15;
-      Block::Barrier& b = blk.bars[id];
+      Block::Barrier& b = blk.bar(id);
       b.mode = mode;
       b.red = ins.f[1];
       // A thread count (bar.sync 7, 256): only the warps that arrive take part,
@@ -5767,12 +5769,12 @@ void Runner::builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const 
   // engine's exec_device_get_last_error: GetLastError reads it without
   // clearing it, SetLastError writes it.
   if (name == "__cuda_syscall_cnpv2GetLastError") {
-    each_lane(ex, [&](unsigned l) { w.reg(4, l) = w.device_error[l]; });
+    each_lane(ex, [&](unsigned l) { w.reg(4, l) = w.rare().device_error[l]; });
     return;
   }
   if (name == "__cuda_syscall_cnpv2SetLastError") {
     each_lane(ex, [&](unsigned l) {
-      w.device_error[l] = w.reg(4, l);
+      w.rare().device_error[l] = w.reg(4, l);
       w.reg(4, l) = 0;
     });
     return;
@@ -5948,7 +5950,7 @@ bool Runner::device_runtime_call(Block& blk, Warp& w, const Instr& ins, Mask ex,
 
   const auto ret = [&](unsigned l, uint32_t err) {   // a cudaError_t, kept when it is an error
     w.reg(4, l) = err;
-    if (err) w.device_error[l] = err;
+    if (err) w.rare().device_error[l] = err;
   };
   const auto ret_ptr = [&](unsigned l, uint64_t p) {
     w.reg(4, l) = static_cast<uint32_t>(p);
@@ -6119,8 +6121,8 @@ bool Runner::device_runtime_call(Block& blk, Warp& w, const Instr& ins, Mask ex,
     case Fn::GetLastError:
     case Fn::PeekAtLastError:
       each_lane(ex, [&](unsigned l) {
-        w.reg(4, l) = w.device_error[l];
-        if (f == Fn::GetLastError) w.device_error[l] = 0;
+        w.reg(4, l) = w.rare().device_error[l];
+        if (f == Fn::GetLastError) w.rare().device_error[l] = 0;
       });
       return true;
     case Fn::GetDevice:
@@ -6494,7 +6496,7 @@ void Runner::cluster_barrier_check(Block& blk) {
     for (Warp& w : b->warps) {
       w.cga_arrived = 0;
       for (unsigned l = 0; l < 32; ++l)
-        if ((w.waiting >> l & 1) && w.wait_kind[l] == Wait::Cluster && w.cga_target[l] <= cl.phase) {
+        if ((w.waiting >> l & 1) && w.wait_kind[l] == Wait::Cluster && w.rare().cga_target[l] <= cl.phase) {
           w.waiting &= ~(Mask{1} << l);
           w.wait_kind[l] = Wait::None;
           w.pc[l] += 16;

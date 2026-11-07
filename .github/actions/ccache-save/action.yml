@@ -1,0 +1,27 @@
+name: Save the compile cache
+description: >
+  Prints ccache's statistics (the hit rate of this job's build) and, on a push to main in a job whose cache is the Actions cache
+  (./.github/actions/ccache, mode shared), saves the cache under a key of this commit. Pull requests and manual runs on other
+  branches never save, so nothing a pull request builds can end up in the cache that main's builds and later pull requests read.
+  Put it after the build, with `if: always()`; a failed build's objects are still good ones.
+inputs:
+  key:
+    description: the same key the setup step was given
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: ccache statistics
+      if: env.PANTHEON_CCACHE != ''
+      shell: bash
+      continue-on-error: true
+      run: |
+        ccache --show-stats
+        # Objects nobody used for a while are not worth carrying in the cache.
+        [ "$PANTHEON_CCACHE" = shared ] && ccache --evict-older-than 3d || true
+    - name: Save the compile cache
+      if: env.PANTHEON_CCACHE == 'shared' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+      uses: actions/cache/save@v4
+      with:
+        path: .ccache
+        key: ccache-${{ inputs.key }}-${{ runner.arch }}-${{ github.sha }}

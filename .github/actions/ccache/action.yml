@@ -1,0 +1,83 @@
+name: Compile cache
+description: >
+  Turns on ccache for the library's C++ compiles, so that the jobs of one workflow, and the same job in the next run, do not
+  compile what an earlier build already did. ccache keys an object on the preprocessed source, the compiler and its flags, so a hit
+  is the object the compiler would have made, whoever built it; there is no step where a wrong object can be taken for a right one.
+  Put it after the checkout and pr-guard, before the configure step, give that step
+  `env: CMAKE_CXX_COMPILER_LAUNCHER` set to this action's `launcher` output (the steps context of this step's id) (and the same for CMAKE_C_COMPILER_LAUNCHER), and, in the one job
+  per key that builds everything, `./.github/actions/ccache-save` last. Everything is best effort: no ccache and no way to install it
+  means the build runs as it did.
+
+  The cache is restored from, and saved to, the Actions cache; only a push to main saves (./.github/actions/ccache-save), so a pull
+  request reads main's cache and cannot put anything into it. A job on a runner that really lasts (the pantheonsim.com ML runner:
+  `persistent: true`, outside a container) keeps the cache in a directory under ~/.cache that every run of that key shares instead,
+  and does not touch the Actions cache.
+inputs:
+  key:
+    description: >
+      Name of the cache. Jobs that compile the same sources with the same flags and toolchain share one (cuda12-release); a job whose
+      flags differ (the unit job's -Werror) has its own.
+    required: true
+  persistent:
+    description: "'true' on a self-hosted runner that is not thrown away between jobs: keep the cache on its disk"
+    default: 'false'
+  max-size:
+    description: ccache's size limit (CCACHE_MAXSIZE)
+    default: 1G
+outputs:
+  launcher:
+    description: "'ccache' when it is usable, else empty: the value for CMAKE_CXX_COMPILER_LAUNCHER and CMAKE_C_COMPILER_LAUNCHER"
+    value: ${{ steps.setup.outputs.launcher }}
+runs:
+  using: composite
+  steps:
+    - id: setup
+      shell: bash
+      continue-on-error: true
+      env:
+        CC_KEY: ${{ inputs.key }}
+        CC_MAX: ${{ inputs.max-size }}
+        CC_PERSISTENT: ${{ inputs.persistent }}
+      run: |
+        if ! command -v ccache >/dev/null 2>&1; then
+          # Best effort: root in a container, or a runner whose user may sudo without a password. The images do not carry it (yet).
+          if [ "$(id -u)" = 0 ]; then s=""; elif sudo -n true 2>/dev/null; then s="sudo -n"; else s="none"; fi
+          if [ "$s" != none ]; then
+            $s flock /tmp/pool-apt.lock apt-get update -qq >/dev/null 2>&1 || true
+            $s flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends ccache >/dev/null 2>&1 || true
+          fi
+        fi
+        if ! command -v ccache >/dev/null 2>&1; then
+          echo "ccache is not installed and could not be: this build is not cached."
+          echo "::notice::ccache unavailable; building without the compile cache"
+          exit 0
+        fi
+        if [ "$CC_PERSISTENT" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = self-hosted ] && [ ! -f /.dockerenv ]; then
+          mode=local; dir="${XDG_CACHE_HOME:-$HOME/.cache}/pantheonsim-ccache/$CC_KEY"
+        else
+          mode=shared; dir="$GITHUB_WORKSPACE/.ccache"
+        fi
+        mkdir -p "$dir"
+        {
+          echo "CCACHE_DIR=$dir"
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"     # paths under the checkout are hashed relative to it: one cache for any workspace path
+          echo "CCACHE_COMPILERCHECK=content"         # the compiler binary's contents, not its timestamp
+          echo "CCACHE_MAXSIZE=$CC_MAX"
+          echo "PANTHEON_CCACHE=$mode"
+        } >> "$GITHUB_ENV"
+        echo "launcher=ccache" >> "$GITHUB_OUTPUT"
+        echo "mode=$mode" >> "$GITHUB_OUTPUT"
+        ccache --version | head -1
+    - name: Restore the compile cache
+      if: steps.setup.outputs.mode == 'shared'
+      uses: actions/cache/restore@v4
+      with:
+        path: .ccache
+        key: ccache-${{ inputs.key }}-${{ runner.arch }}-${{ github.sha }}
+        restore-keys: |
+          ccache-${{ inputs.key }}-${{ runner.arch }}-
+    - name: Count this build's hits from zero
+      if: steps.setup.outputs.launcher == 'ccache'
+      shell: bash
+      continue-on-error: true
+      run: ccache --zero-stats

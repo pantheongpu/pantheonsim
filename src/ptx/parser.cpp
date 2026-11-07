@@ -539,6 +539,7 @@ class Parser {
     g.size = checked_size(elems, storage_bytes(ty, line, "global '" + g.name + "'"), uint64_t{1} << 40, line,
                           "global '" + g.name + "'");
     if (g.size == 0) fail(line, "zero-sized global '" + g.name + "'");
+    note_array(g.name, ty.bytes(), elems, true);
     if (peek_punct("=")) {
       next();
       if (peek_punct("{")) {
@@ -615,17 +616,31 @@ class Parser {
     EntryFn& fn = *out;
     cur_fn_ = &fn;
     fn.is_device_func = true;
+    reg_retval_.clear();
     call_slots_.clear();
     declared_regs_.clear();
+    fn_arrays_.clear();
     if (peek_punct("(")) {
       next();
-      const std::string kw = expect_word("'.param'");
-      if (kw != ".param") fail(peek().line, "expected .param in a .func return value");
+      const std::string kw = expect_word("'.param' or '.reg'");
+      if (kw != ".param" && kw != ".reg") fail(peek().line, "expected .param or .reg in a .func return value");
       if (peek().kind == Token::Kind::Word && peek().text == ".align") {
         next();
         expect_int("alignment");
       }
       const Type rty = expect_type("return value declaration");
+      if (kw == ".reg") {
+        // A value returned in a register: the name is a register of the function, and each `ret`
+        // passes its value out through a slot (see the "ret" case).
+        const std::string rname = expect_word("return value name");
+        declare_reg(fn, rname, rty, peek().line);
+        fn.retval_slot_name = rname + "$reg";
+        fn.retval_bytes = std::max<uint32_t>(rty.bytes(), 4);
+        reg_retval_ = rname;
+        reg_retval_ty_ = rty;
+        call_slots_.insert(fn.retval_slot_name);
+        expect_punct(")");
+      } else {
       fn.retval_slot_name = expect_word("return value name");
       // An aggregate return: ".param .align 4 .b8 func_retval0[16]". The
       // element type is .b8 and the bracket carries the byte count.
@@ -638,14 +653,40 @@ class Parser {
       }
       call_slots_.insert(fn.retval_slot_name);
       expect_punct(")");
+      }
     }
     fn.name = expect_word("device function name");
     current_kernel_ = fn.name;
+    std::vector<Instr> reg_param_loads;  // the body's first instructions, one per .reg parameter
     if (peek_punct("(")) {
       next();
       while (!peek_punct(")")) {
-        const std::string kw = expect_word("'.param'");
-        if (kw != ".param") fail(peek().line, "expected .param in a .func signature");
+        const std::string kw = expect_word("'.param' or '.reg'");
+        if (kw == ".reg") {
+          // A parameter passed in a register: ".func f(.reg .u64 data)". It travels as a call slot like a
+          // .param does, and the body starts by loading it into the register of that name.
+          const Type rty = expect_type("parameter declaration");
+          while (peek().kind == Token::Kind::Word && peek().text[0] == '.') next();  // ptr annotations
+          const std::string rname = expect_word("parameter name");
+          declare_reg(fn, rname, rty, peek().line);
+          const std::string slot = rname + "$reg";
+          fn.param_slot_bytes.push_back(std::max<uint32_t>(rty.bytes(), 4));
+          fn.param_slot_names.push_back(slot);
+          call_slots_.insert(slot);
+          Instr ld;
+          ld.line = peek().line;
+          ld.opcode_id = intern_opcode("ld");
+          ld.text = "ld.param " + rname;
+          OpLdSlot lop;
+          lop.slot = slot;
+          lop.ty = rty;
+          lop.dsts.push_back(intern(rname));
+          ld.op = std::move(lop);
+          reg_param_loads.push_back(std::move(ld));
+          if (peek_punct(",")) next();
+          continue;
+        }
+        if (kw != ".param") fail(peek().line, "expected .param or .reg in a .func signature");
         if (peek().kind == Token::Kind::Word && peek().text == ".align") {
           next();
           expect_int("alignment");
@@ -692,6 +733,7 @@ class Parser {
       break;
     }
     expect_punct("{");
+    for (Instr& ld : reg_param_loads) fn.body.push_back(std::move(ld));
     parse_body(fn);
     current_kernel_.clear();
     cur_fn_ = nullptr;
@@ -705,6 +747,7 @@ class Parser {
     current_kernel_ = fn.name;
     call_slots_.clear();
     declared_regs_.clear();
+    fn_arrays_.clear();
     if (peek_punct("(")) {
       next();
       while (!peek_punct(")")) {
@@ -960,7 +1003,12 @@ class Parser {
         pending_pos = pos_;
         continue;
       }
-      fn.body.push_back(parse_instruction(fn, bra_fixups));
+      Instr parsed = parse_instruction(fn, bra_fixups);
+      for (Instr& pre : pending_pre_) fn.body.push_back(std::move(pre));
+      pending_pre_.clear();
+      fn.body.push_back(std::move(parsed));
+      for (Instr& post : pending_post_) fn.body.push_back(std::move(post));
+      pending_post_.clear();
       while (fixup_scopes.size() < bra_fixups.size()) fixup_scopes.push_back(scopes);
     }
 
@@ -1158,6 +1206,7 @@ class Parser {
       d.size = 0;
     }
     if (d.align == 0) d.align = 8;
+    note_array(d.name, ty.bytes(), elems, sized);
     expect_punct(";");
     return d;
   }
@@ -1199,6 +1248,7 @@ class Parser {
     d.offset = static_cast<uint32_t>(off);
     fn.local_frame_size = static_cast<uint32_t>(off + d.size);
     if (!fn.locals.emplace(d.name, d).second) fail(line, "duplicate .local '" + d.name + "'");
+    note_array(d.name, ty.bytes(), elems, true);
     expect_punct(";");
   }
 
@@ -1234,8 +1284,31 @@ class Parser {
     return ImmFloatBits{b, 32};
   }
 
+  // The operand of a unary '~' in an integer constant: a literal, another unary
+  // '-' or '~', or any of those in parentheses ("~0x2", "~~5", "~-1", "~(0x2)").
+  // Evaluated on the 64-bit value, as ptxas does; the instruction's type then
+  // keeps the low bits it needs, so ~0x2 is 0xfffffffd for .b32 and
+  // 0xfffffffffffffffd for .b64.
+  int64_t parse_unary_int_constant(size_t line) {
+    const Token& t = next();
+    if (t.kind == Token::Kind::Punct && t.text == "~") return ~parse_unary_int_constant(t.line);
+    if (t.kind == Token::Kind::Punct && t.text == "-") return negate(parse_unary_int_constant(t.line));
+    if (t.kind == Token::Kind::Punct && t.text == "(") {
+      const int64_t v = parse_unary_int_constant(t.line);
+      if (!peek_punct(")")) fail(t.line, "expected ')' to close the constant after '('");
+      next();
+      return v;
+    }
+    if (t.kind != Token::Kind::Word || !isdigit(static_cast<unsigned char>(t.text[0])) || decimal_float(t.text) ||
+        (t.text.size() == 10 && t.text[0] == '0' && (t.text[1] == 'f' || t.text[1] == 'F')) ||
+        (t.text.size() == 18 && t.text[0] == '0' && (t.text[1] == 'd' || t.text[1] == 'D')))
+      fail(t.kind == Token::Kind::End ? line : t.line, "'~' needs an integer constant, got '" + t.text + "'");
+    return parse_int_literal(t.text, t.line);
+  }
+
   Operand parse_operand() {
     const Token& t = next();
+    if (t.kind == Token::Kind::Punct && t.text == "~") return ImmInt{~parse_unary_int_constant(t.line)};
     if (t.kind == Token::Kind::Punct && t.text == "-") {
       std::string w = expect_word("number after '-'");
       if (decimal_float(w)) return decimal_float_operand(w, true, t.line);
@@ -1391,10 +1464,34 @@ class Parser {
     return ops;
   }
 
-  Addr parse_addr(const EntryFn& fn) {
+  // `[imm]` after an array's name: the element index, as the byte offset it
+  // names. The element is the declared type's size (PTX ISA 5.1.5, "a[1]" is
+  // the address of the second element), and a constant index outside the
+  // declared array is refused rather than addressed.
+  int64_t parse_array_index(const std::string& base, size_t line) {
     expect_punct("[");
+    const int64_t idx = expect_int("array element index");
+    expect_punct("]");
+    auto it = fn_arrays_.find(base);
+    if (it == fn_arrays_.end()) it = module_arrays_.find(base);
+    if (it == fn_arrays_.end() && it == module_arrays_.end())
+      fail(line, "'" + base + "[...]' needs '" + base + "' declared as an array before this instruction");
+    const ArrayInfo& info = it->second;
+    if (idx < 0 || (info.sized && static_cast<uint64_t>(idx) >= info.count))
+      fail(line, "element " + std::to_string(idx) + " is outside '" + base + "', which has " +
+                     std::to_string(info.count) + " element(s)");
+    return idx * static_cast<int64_t>(info.elem_bytes);
+  }
+
+  Addr parse_addr(const EntryFn& fn) {
+    // The element form without the outer brackets: "st.local.b32 arr[0], %f0;".
+    const bool bare = !peek_punct("[");
+    const size_t addr_line = peek().line;
+    if (!bare) next();
     Addr a;
     std::string base = expect_word("address base");
+    int64_t array_off = 0;
+    if (bare || peek_punct("[")) array_off = parse_array_index(base, addr_line);
     if (base[0] == '%' || declared_regs_.count(base)) {
       a.base_kind = Addr::Base::Reg;
       Reg r = intern(base);
@@ -1426,11 +1523,12 @@ class Parser {
         a.base_kind = Addr::Base::Symbol;
       }
     }
-    if (peek_punct("+")) {
+    a.offset = array_off;
+    if (!bare && peek_punct("+")) {
       next();
-      a.offset = expect_int("address offset");
+      a.offset += expect_int("address offset");
     }
-    expect_punct("]");
+    if (!bare) expect_punct("]");
     return a;
   }
 
@@ -1461,6 +1559,11 @@ class Parser {
     cur_opcode_ = opcode;
     std::vector<std::string> parts = split_dots(opcode);
     if (parts.empty()) fail(ins.line, "bad opcode '" + opcode + "'");
+    // ldu (a load whose address is the same in every lane of the warp, PTX ISA "ldu") is an ld: the
+    // uniformity is a promise about the address, and a plain load of it reads the same bytes.
+    // Only .global (and the .v2/.v4 forms) exist.
+    const bool is_ldu = parts[0] == "ldu";
+    if (is_ldu) parts[0] = "ld";
 
     auto unsupported = [&](const std::string& hint) -> Instr {
       fail_unsupported(ins.line, reconstruct_from(start_tok), fn.name, hint);
@@ -1679,6 +1782,7 @@ class Parser {
         vec = 2;
       }
       if (!have_ty) fail(ins.line, "ld/st missing type: " + opcode);
+      if (is_ldu && space != Space::Global) return unsupported("ldu outside .global (the ISA defines only ldu.global)");
       storage_bytes(ty, ins.line, opcode);
       if (vec == 8 && (ty.bytes() != 4 || space != Space::Global))
         return unsupported(".v8 " + op0 + " of other than 32-bit elements in global memory");
@@ -2078,6 +2182,7 @@ class Parser {
         OpNotPred op;
         op.dst = expect_reg_operand("not.pred destination");
         expect_punct(",");
+        if (peek_punct("!")) { next(); op.src_neg = true; }
         op.src = expect_reg_operand("not.pred source");
         ins.op = op;
       } else {
@@ -4415,16 +4520,17 @@ class Parser {
         OpPredBin op;
         op.op = *pop;
         op.dst = expect_reg_operand("predicate destination");
-        auto pred_source = [&](Reg& r, int8_t& imm) {
+        auto pred_source = [&](Reg& r, int8_t& imm, bool& neg) {
+          if (peek_punct("!")) { next(); neg = true; }
           const Operand o = parse_operand();
           if (const auto* reg = std::get_if<RegOperand>(&o)) r = reg->reg;
           else if (const auto* i = std::get_if<ImmInt>(&o)) imm = i->value != 0 ? 1 : 0;
           else fail(ins.line, base_op + ".pred takes predicate registers or immediates");
         };
         expect_punct(",");
-        pred_source(op.a, op.a_imm);
+        pred_source(op.a, op.a_imm, op.a_neg);
         expect_punct(",");
-        pred_source(op.b, op.b_imm);
+        pred_source(op.b, op.b_imm, op.b_neg);
         ins.op = op;
       } else if (ty.is_float()) {
         if (ty.bits != 16 && ty.bits != 32 && ty.bits != 64)
@@ -4654,6 +4760,7 @@ class Parser {
       expect_punct(",");
       op.b = parse_operand();
       expect_punct(",");
+      if (peek_punct("!")) { next(); op.pred_negated = true; }
       op.pred = expect_reg_operand("selp predicate");
       ins.op = op;
     } else if (op0 == "bra") {
@@ -4675,9 +4782,35 @@ class Parser {
     } else if (op0 == "call") {
       // call.uni (retval0), vprintf, (param0, param1);
       OpCall op;
+      // An operand written as a register (or, for an argument, a number) is a .reg parameter: it
+      // goes through a slot of its own that this call makes up, so that the callee sees the same
+      // call as with a .param.
+      const int site = reg_call_count_++;
+      auto is_reg_token = [&] {
+        const Token& t = peek();
+        return t.kind == Token::Kind::Word && !t.text.empty() && (t.text[0] == '%' || declared_regs_.count(t.text));
+      };
+      auto side_instr = [&](const char* mnemonic, const char* text) {
+        Instr side = ins;  // keeps the guard, the line
+        side.opcode_id = intern_opcode(mnemonic);
+        side.text = text;
+        return side;
+      };
       if (peek_punct("(")) {
         next();
-        op.retval_slot = expect_word("return value slot");
+        if (is_reg_token()) {
+          const Reg rr = expect_reg_operand("return value register");
+          op.retval_slot = "__regret" + std::to_string(site);
+          Instr ld = side_instr("ld", "ld.param (call return)");
+          OpLdSlot lop;
+          lop.slot = op.retval_slot;
+          lop.ty = Type{Type::Kind::B, rr.wide ? 64u : 32u};
+          lop.dsts.push_back(rr);
+          ld.op = std::move(lop);
+          pending_post_.push_back(std::move(ld));
+        } else {
+          op.retval_slot = expect_word("return value slot");
+        }
         expect_punct(")");
         expect_punct(",");
       }
@@ -4691,7 +4824,32 @@ class Parser {
       expect_punct(",");
       expect_punct("(");
       while (!peek_punct(")")) {
-        op.param_slots.push_back(expect_word("call argument slot"));
+        const bool imm_arg = peek().kind == Token::Kind::Word && !peek().text.empty() &&
+                             isdigit(static_cast<unsigned char>(peek().text[0]));
+        if (is_reg_token() || imm_arg || peek_punct("-")) {
+          // A number travels as 64 bits: a callee that reads fewer takes the low bytes.
+          Operand src;
+          Type sty{Type::Kind::B, 64};
+          if (!imm_arg && !peek_punct("-")) {
+            const Reg ar = expect_reg_operand("call argument register");
+            src = RegOperand{ar};
+            sty = Type{Type::Kind::B, ar.wide ? 64u : 32u};
+          } else {
+            src = parse_operand();
+            if (const auto* f = std::get_if<ImmFloatBits>(&src)) sty = Type{Type::Kind::B, f->width == 64 ? 64u : 32u};
+          }
+          const std::string slot = "__regarg" + std::to_string(site) + "_" + std::to_string(op.param_slots.size());
+          Instr st = side_instr("st", "st.param (call argument)");
+          OpStSlot sop;
+          sop.slot = slot;
+          sop.ty = sty;
+          sop.srcs.push_back(std::move(src));
+          st.op = std::move(sop);
+          pending_pre_.push_back(std::move(st));
+          op.param_slots.push_back(slot);
+        } else {
+          op.param_slots.push_back(expect_word("call argument slot"));
+        }
         if (peek_punct(",")) next();
       }
       next();
@@ -5449,6 +5607,19 @@ class Parser {
       if (op.arrive && !op.have_count) return unsupported("bar.arrive needs a thread count");
       ins.op = op;
     } else if (op0 == "ret" || op0 == "exit") {
+      if (op0 == "ret" && !reg_retval_.empty()) {
+        // The function returns its value in a register: it leaves through the return slot, written
+        // under the same guard as the `ret`.
+        Instr st = ins;
+        st.opcode_id = intern_opcode("st");
+        st.text = "st.param " + reg_retval_;
+        OpStSlot sop;
+        sop.slot = cur_fn_->retval_slot_name;
+        sop.ty = reg_retval_ty_;
+        sop.srcs.push_back(RegOperand{intern(reg_retval_)});
+        st.op = std::move(sop);
+        pending_pre_.push_back(std::move(st));
+      }
       ins.op = OpRet{};
     } else {
       return unsupported("instruction not in the implemented PTX subset");
@@ -5477,11 +5648,26 @@ class Parser {
   std::string current_kernel_;
   std::set<std::string> call_slots_;
   std::set<std::string> declared_regs_;  // every .reg name in the current kernel
+  // The element size and count of every declared array, for the element form
+  // `var[imm]` (PTX ISA 5.1.5: the address of element imm). Variables of the
+  // module (.global, .const, module-scope .shared) and of the current function
+  // (.local, .shared) are kept apart because a function's names go away with it.
+  struct ArrayInfo { uint32_t elem_bytes = 0; uint64_t count = 0; bool sized = true; };
+  std::unordered_map<std::string, ArrayInfo> module_arrays_, fn_arrays_;
+  void note_array(const std::string& name, uint32_t elem_bytes, uint64_t count, bool sized) {
+    (cur_fn_ ? fn_arrays_ : module_arrays_)[name] = ArrayInfo{elem_bytes, count, sized};
+  }
   // Registers declared inside a nested { } block that shadow an outer
   // declaration, innermost block last: source name -> the name it is interned
   // under while the block is open.
   std::vector<std::unordered_map<std::string, std::string>> reg_scopes_;
   int shadow_count_ = 0;
+  // Instructions a .reg-parameter call needs around the instruction being parsed (the stores of its
+  // arguments, the load of its result), and the register a .func returns its value in.
+  std::vector<Instr> pending_pre_, pending_post_;
+  std::string reg_retval_;
+  Type reg_retval_ty_{};
+  int reg_call_count_ = 0;
   EntryFn* cur_fn_ = nullptr;           // receives interned register ids
 };
 

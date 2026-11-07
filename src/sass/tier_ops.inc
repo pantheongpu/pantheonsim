@@ -420,8 +420,10 @@ TIER_HANDLER(h_imad_wide) {
     clo = mlo;
     chi = mhi;
   }
-  uint32_t carry;
-  c.sk->imad_wide(rlo, rhi, a, b, clo, chi, (op.aux & 2) != 0, (op.aux & 1) ? static_cast<uint32_t>(tier_pmask(c, op.p)) : 0u, &carry);
+  uint32_t carry = 0;
+  // (the carry out is found only when a predicate takes it)
+  c.sk->imad_wide(rlo, rhi, a, b, clo, chi, (op.aux & 2) != 0, (op.aux & 1) ? static_cast<uint32_t>(tier_pmask(c, op.p)) : 0u,
+                  op.dst2 != tier::kNoReg ? &carry : nullptr);
   if (op.dst != tier::kNoReg) {   // write64: R254's partner is RZ
     tier_store(c, op.dst, ex, rlo);
     if (op.dst + 1u != kRZ) tier_store(c, static_cast<uint16_t>(op.dst + 1), ex, rhi);
@@ -936,6 +938,31 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
       return;
     }
   }
+  if constexpr (!Store) {
+    // The lanes' 16 bytes as two batches of 8-byte pieces (as the general access reads them, and as LDGSTS does): one lookup a batch, not a lock a lane.
+    // A batch the memory manager declines made nothing happen: the loop below runs as it did.
+    uint64_t fa[32], fb[32], lo[32], hi[32];
+    unsigned n = 0;
+    for (Mask m = ex; m; m &= m - 1) {
+      const uint64_t a = addrs[std::countr_zero(m)];
+      fa[n] = a;
+      fb[n++] = a + 8;
+    }
+    if (n && mem.load_batch(fa, n, 8, lo, &op.way) && mem.load_batch(fb, n, 8, hi, &op.way)) {
+      if (d) {
+        unsigned i = 0;
+        for (Mask m = ex; m; m &= m - 1, ++i) {
+          const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+          d[l] = static_cast<uint32_t>(lo[i]);
+          d[32 + l] = static_cast<uint32_t>(lo[i] >> 32);
+          d[64 + l] = static_cast<uint32_t>(hi[i]);
+          d[96 + l] = static_cast<uint32_t>(hi[i] >> 32);
+        }
+      }
+      count_access(blk.st, 0, Store, addrs, ex, 16);
+      return;
+    }
+  }
   for (Mask m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
     uint32_t v[4];
@@ -986,12 +1013,38 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
   // all from one pass over the registers' rows (made here, and used by the paths below).
   simd::WarpRowsInfo ri{};
   bool rows = false;
-  if (ex == kAll) {
+  // A full warp whose lanes are on consecutive elements (a run), or all on one address (a load that every lane makes of the same word), is asked of
+  // the registers' rows alone (simd::warp_run_kernel: nothing stored, under half the work of the address pass above), the shape this instruction's
+  // warps had last time first (`op.shape`, only ever a place to start: a warp of another shape is one the kernel answers "no" to). When it says yes
+  // the 32 addresses and the window and stride answers are made only if the access does not go through below (the memory manager declines it, or it
+  // is in the constant window): then the kernel above runs, as if this had not been tried.
+  unsigned fast = 0;   // 1: a run, 2: one address
+  uint64_t fast_a0 = 0;
+  if (ex == kAll && blo) {
+    if (const simd::WarpRunFn run_kernel = simd::warp_run_kernel()) {
+      const unsigned shape = __atomic_load_n(&op.shape, __ATOMIC_RELAXED);
+      if (shape != tier::MOp::kShapeOther) {
+        const bool one = shape == tier::MOp::kShapeOne && !Store;
+        if (run_kernel(blo, bhi, one ? 0u : bytes)) {
+          fast = one ? 2 : 1;
+          fast_a0 = (bhi ? (static_cast<uint64_t>(bhi[0]) << 32) | blo[0] : uint64_t{blo[0]}) + urv + imm;
+        }
+      }
+    }
+  }
+  const auto make_rows = [&] {
     if (const simd::WarpRowsFn kernel = simd::warp_rows_kernel()) {
       kernel(blo, bhi, urv + imm, kConstWindow, addrs, ri);
       rows = true;
+      // (the shape the next warp of this instruction is asked for first)
+      const uint8_t shape = !ri.progression ? tier::MOp::kShapeOther
+                            : ri.stride == bytes ? tier::MOp::kShapeRun
+                            : (ri.stride == 0 && !Store) ? tier::MOp::kShapeOne
+                                                         : tier::MOp::kShapeOther;
+      __atomic_store_n(&op.shape, shape, __ATOMIC_RELAXED);
     }
-  }
+  };
+  if (ex == kAll && !fast) make_rows();
   if (ex && ((ex + (ex & -ex)) & ex) == 0) {
     const unsigned first = static_cast<unsigned>(std::countr_zero(ex));
     const unsigned count = popc(ex);
@@ -999,7 +1052,13 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
     // below, for an access that is not a run or that the memory manager declines).
     uint64_t g0;
     bool run;
-    if (rows) {   // (a run is the lanes on a stride of one element)
+    if (fast == 1) {
+      g0 = fast_a0;
+      run = true;
+    } else if (fast == 2) {   // (one address: not a run)
+      g0 = fast_a0;
+      run = false;
+    } else if (rows) {   // (a run is the lanes on a stride of one element)
       g0 = ri.a0;
       run = ri.progression && ri.stride == bytes;
     } else {
@@ -1045,6 +1104,31 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
       }
     }
   }
+  if (fast == 2 && fast_a0 - kConstWindow >= (uint64_t{1} << 32)) {
+    // Every lane loads one address: one load (MemoryManager::load_broadcast), the same as the batch below would do for it (a load declined falls through).
+    uint64_t fv[32];
+    if (mem.load_broadcast(fast_a0, 32, bytes, fv, &op.way)) {
+      if (dreg) {
+        uint32_t* d = c.R + op.dst * 32u;
+        if (bytes == 4) {
+          for (unsigned l = 0; l < 32; ++l) d[l] = static_cast<uint32_t>(fv[l]);
+        } else if (bytes < 4) {
+          for (unsigned l = 0; l < 32; ++l) d[l] = tier_extend(op.b, static_cast<uint32_t>(fv[l]));
+        } else {
+          for (unsigned l = 0; l < 32; ++l) {
+            d[l] = static_cast<uint32_t>(fv[l]);
+            d[32 + l] = static_cast<uint32_t>(fv[l] >> 32);
+          }
+        }
+      }
+      if (!count_global_progression(blk.st, false, fast_a0, 0, bytes, c.r->fastcount())) {
+        for (unsigned l = 0; l < 32; ++l) addrs[l] = fast_a0;   // (the registers may be written over by now: the addresses are the one)
+        count_access(blk.st, 0, false, addrs, ex, bytes);
+      }
+      return;
+    }
+  }
+  if (fast) make_rows();   // (an access that did not go through: the rest is as for any full warp)
   if (ex == kAll) {
     // A full warp: the addresses are the batch as they stand (no lane to skip, none to find again when the values go back to the
     // registers).
@@ -1172,6 +1256,68 @@ template <bool Store>
   }
 }
 
+// A whole warp's 8 or 16 byte elements, lane l at o0 + bytes * l (a float4 array indexed by the thread): the bytes are one run, moved four
+// lanes at a time between the run and the register file's rows (a transpose), and the passes are the bytes / 4 the general count finds for 32
+// lanes end to end on whole words (memcount::bank_passes_progression: the 32 * bytes / 4 consecutive words, bytes / 4 to each bank). Offsets are
+// compared whole (a cluster rank in the high bits must be the same in every lane), and a run that would wrap 32 bits, or the 24 bits an offset
+// addresses, is left to the general code (false, nothing moved or counted). (A function of its own, so that h_shared's common paths keep their
+// registers.)
+template <bool Store>
+[[gnu::noinline]] static bool tier_shared_wide(Block& blk, uint8_t* sh, uint32_t* d, const uint32_t* offs, unsigned bytes) {
+#if defined(__SSE2__)
+  const uint32_t o0 = offs[0];
+  uint32_t seq = 0;
+  for (unsigned l = 0; l < 32; ++l) seq |= offs[l] ^ (o0 + bytes * l);
+  if (seq != 0 || (o0 & 3) != 0 || o0 > 0xffffffffu - 32 * 16 || (o0 & 0xffffff) + 32 * bytes > 0x1000000u) return false;
+  uint8_t* const at = sh + (o0 & 0xffffff);
+  if (bytes == 16) {
+    for (unsigned g = 0; g < 8; ++g) {
+      uint8_t* const p = at + 64 * g;
+      if (Store) {
+        __m128i r[4];
+        for (unsigned i = 0; i < 4; ++i)
+          r[i] = d ? _mm_loadu_si128(reinterpret_cast<const __m128i*>(d + 32 * i + 4 * g)) : _mm_setzero_si128();
+        const __m128i t0 = _mm_unpacklo_epi32(r[0], r[1]), t1 = _mm_unpacklo_epi32(r[2], r[3]);
+        const __m128i t2 = _mm_unpackhi_epi32(r[0], r[1]), t3 = _mm_unpackhi_epi32(r[2], r[3]);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(p), _mm_unpacklo_epi64(t0, t1));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(p) + 1, _mm_unpackhi_epi64(t0, t1));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(p) + 2, _mm_unpacklo_epi64(t2, t3));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(p) + 3, _mm_unpackhi_epi64(t2, t3));
+      } else if (d) {
+        __m128i v[4];
+        for (unsigned j = 0; j < 4; ++j) v[j] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p) + j);
+        const __m128i t0 = _mm_unpacklo_epi32(v[0], v[1]), t1 = _mm_unpacklo_epi32(v[2], v[3]);
+        const __m128i t2 = _mm_unpackhi_epi32(v[0], v[1]), t3 = _mm_unpackhi_epi32(v[2], v[3]);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(d + 4 * g), _mm_unpacklo_epi64(t0, t1));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(d + 32 + 4 * g), _mm_unpackhi_epi64(t0, t1));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(d + 64 + 4 * g), _mm_unpacklo_epi64(t2, t3));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(d + 96 + 4 * g), _mm_unpackhi_epi64(t2, t3));
+      }
+    }
+  } else {
+    for (unsigned g = 0; g < 8; ++g) {
+      uint8_t* const p = at + 32 * g;
+      if (Store) {
+        const __m128 lo = d ? _mm_castsi128_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(d + 4 * g))) : _mm_setzero_ps();
+        const __m128 hi = d ? _mm_castsi128_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(d + 32 + 4 * g))) : _mm_setzero_ps();
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(p), _mm_castps_si128(_mm_unpacklo_ps(lo, hi)));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(p) + 1, _mm_castps_si128(_mm_unpackhi_ps(lo, hi)));
+      } else if (d) {
+        const __m128 a = _mm_castsi128_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+        const __m128 b = _mm_castsi128_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p) + 1));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(d + 4 * g), _mm_castps_si128(_mm_shuffle_ps(a, b, 0x88)));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(d + 32 + 4 * g), _mm_castps_si128(_mm_shuffle_ps(a, b, 0xDD)));
+      }
+    }
+  }
+  count_shared(blk.st, Store, 32, bytes, bytes / 4);
+  return true;
+#else
+  (void)blk, (void)sh, (void)d, (void)offs, (void)bytes;
+  return false;
+#endif
+}
+
 // Shared memory: the interpreter's fast case -- every active lane inside the block's own shared memory -- moved
 // straight between the register file and the block's array; anything else is exec_mem's.
 template <bool Store>
@@ -1249,6 +1395,7 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
       return;
     }
   }
+  if ((bytes == 8 || bytes == 16) && ex == kAll && tier_shared_wide<Store>(blk, sh, d, offs, bytes)) return;
   const unsigned words = std::max(1u, bytes / 4);
   const bool by_groups = bytes == 4 && ex == kAll;
   if (by_groups) tier_shared_words<Store>(sh, d, offs);
@@ -1604,31 +1751,18 @@ TIER_HANDLER(h_ldsm) {
   const unsigned ra = op.s[0].off;
   const uint32_t* base = ra != kRZ ? c.R + ra * 32u : nullptr;
   const uint64_t urv = op.s[1].off != ~0u ? c.w->ur[op.s[1].off] : 0;
-  const uint64_t imm = static_cast<uint64_t>(op.imm);
-  exec::SharedWindowCheck window;
-  for (unsigned l = 0; l < 32; ++l) {
-    rows[l] = static_cast<uint32_t>((base ? base[l] : 0u) + urv + imm);
-    window.add(rows[l], blk.rank);
-  }
-  if (ex != kAll || !window.inside(blk.shared.size(), 16, true)) {
+  const uint32_t add = static_cast<uint32_t>(urv + static_cast<uint64_t>(op.imm));   // (the sum is cut to 32 bits, so cutting the terms first is the same)
+  if (base)
+    for (unsigned l = 0; l < 32; ++l) rows[l] = base[l] + add;
+  else
+    for (unsigned l = 0; l < 32; ++l) rows[l] = add;
+  // (every lane's row address, the unused ones too, in this block's window and with its 16 bytes inside the array: shared_window_inside_warp is
+  // SharedWindowCheck over the 32 addresses, see window_check.hpp)
+  if (ex != kAll || !exec::shared_window_inside_warp(rows, kAll, blk.rank, blk.shared.size(), 16)) {
     c.r->tier_exec_mem(blk, *c.w, *op.ins, ex);
     return;
   }
-  const uint8_t* sh = blk.shared.data();
-  uint32_t out[4][32];
-  for (unsigned i = 0; i < nmat; ++i)
-    for (unsigned t = 0; t < 32; ++t) {
-      if (!op.b) {
-        std::memcpy(&out[i][t], sh + (rows[8 * i + t / 4] & 0xffffff) + 4 * (t % 4), 4);
-      } else {
-        uint16_t lo, hi;
-        std::memcpy(&lo, sh + (rows[8 * i + 2 * (t % 4)] & 0xffffff) + 2 * (t / 4), 2);
-        std::memcpy(&hi, sh + (rows[8 * i + 2 * (t % 4) + 1] & 0xffffff) + 2 * (t / 4), 2);
-        out[i][t] = lo | (static_cast<uint32_t>(hi) << 16);
-      }
-    }
-  if (op.dst != tier::kNoReg)
-    for (unsigned i = 0; i < nmat; ++i) std::memcpy(c.R + (op.dst + i) * 32u, out[i], 32 * sizeof(uint32_t));
+  if (op.dst != tier::kNoReg) exec::ldsm_move(blk.shared.data(), rows, nmat, op.b != 0, c.R + op.dst * 32u);
   blk.st.shared_loads += 32;
   blk.st.shared_bytes_read += 32u * 4 * nmat;
 }
@@ -1646,6 +1780,21 @@ TIER_HANDLER(h_imma) {
                        tb = four ? (sb ? exec::FragType::S4 : exec::FragType::U4) : (sb ? exec::FragType::S8 : exec::FragType::U8);
   const unsigned per_reg = four ? 8 : 4, a_regs = M * K / (32 * per_reg), b_regs = K * 8 / (32 * per_reg), c_regs = M * 8 / 32;
   static const uint32_t kZeros[32] = {};
+#ifdef VGPU_IMMA_FRAG
+  // 8-bit operands, a wrapping sum, 16 x 8 x 16 or 16 x 8 x 32, at the AVX-512 level: straight from the registers (imma_frag.hpp). An RZ operand is zeros.
+  if (!sat && !four && M == 16 && (K == 16 || K == 32) && c.sk->level == simd::Level::Avx512) {
+    alignas(64) static const uint32_t kZ4[4 * 32] = {};
+    const unsigned ra = op.s[0].off, rb = op.s[1].off, rc = op.s[2].off;
+    const uint32_t* const pa = ra == kRZ ? kZ4 : c.R + ra * 32u;
+    const uint32_t* const pb = rb == kRZ ? kZ4 : c.R + rb * 32u;
+    const uint32_t* const pc = rc == kRZ ? nullptr : c.R + rc * 32u;
+    alignas(64) uint32_t xo[4 * 32];
+    if (sa) sb ? exec::imma_frag_m16n8<true, true>(K, pa, pb, pc, xo) : exec::imma_frag_m16n8<true, false>(K, pa, pb, pc, xo);
+    else sb ? exec::imma_frag_m16n8<false, true>(K, pa, pb, pc, xo) : exec::imma_frag_m16n8<false, false>(K, pa, pb, pc, xo);
+    for (unsigned s = 0; s < 4; ++s) tier_store(c, static_cast<uint16_t>(op.dst + s), ex, xo + s * 32);
+    return;
+  }
+#endif
   alignas(32) uint32_t xa[8 * 32], xb[4 * 32], xc[4 * 32], xd[4 * 32];
   const auto load = [&](unsigned base, unsigned n, uint32_t* dst) {
     for (unsigned i = 0; i < n; ++i) __builtin_memcpy(dst + 32 * i, base == kRZ ? kZeros : c.R + (base + i) * 32u, 32 * sizeof(uint32_t));
@@ -1661,10 +1810,7 @@ TIER_HANDLER(h_imma) {
   c.sk->tile_i32(M, 8, K, ia, ib, ic, 8, sat ? 128 / (four ? 4 : 8) : K, sat, id, 8);   // (.SAT clamps after every 128 bits of K)
   if (M == 16) exec::wgmma_tile_to_acc_i32(id, 8, xd);
   else exec::mma_tile_to_acc8_i32(id, xd);
-  for (Mask m = ex; m; m &= m - 1) {
-    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-    for (unsigned s = 0; s < c_regs; ++s) c.R[(op.dst + s) * 32u + l] = xd[s * 32 + l];
-  }
+  for (unsigned s = 0; s < c_regs; ++s) tier_store(c, static_cast<uint16_t>(op.dst + s), ex, xd + s * 32);   // (the executing lanes: a row copy, or a blend, not a store a lane)
 }
 
 // HMMA (the dense f16, bf16 and tf32 forms): one SIMD kernel over the warp's fragments, as exec_mma gives them to it, the
@@ -2056,7 +2202,7 @@ inline void tier_bsync(Warp& w, Mask ex, unsigned x) {
 // the block, or the count it was named with -- the warps' lanes waiting at it go on, every warp learns the reduction's result, and
 // the barrier is reset.
 inline void tier_release_bar(Block& blk, unsigned id) {
-  Block::Barrier& b = blk.bars[id];
+  Block::Barrier& b = blk.bar(id);
   const uint32_t expected = b.expected ? b.expected : blk.live;
   if (b.arrived < expected) return;
   for (Warp& ww : blk.warps) tier_wake(ww, tier_waiting_on(ww, Wait::Bar, id));
@@ -2495,7 +2641,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       tier_set_pcs(w, group, here + 16);
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::YIELD)].fetch_add(1, std::memory_order_relaxed);
     } else if (last.form == tier::Form::Exit && w.waiting == 0 && [&] {
-                 for (const Block::Barrier& b : blk.bars)
+                 for (const Block::Barrier& b : blk.bars())
                    if (b.arrived) return false;
                  return true;
                }()) {
@@ -2528,7 +2674,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       if (ex) ++st.barriers;
       if (idx != first) tier_set_pcs(w, group, here);
       const unsigned id = (last.aux & 1) ? last.c : (tier_sc(c, last.s[0], 0) & 15);
-      Block::Barrier& b = blk.bars[id];
+      Block::Barrier& b = blk.bar(id);
       b.mode = last.a;
       b.red = last.b;
       const uint32_t count = static_cast<uint32_t>(last.imm);

@@ -520,6 +520,65 @@ std::vector<Insn> shared_kernel(unsigned shape) {
   return code;
 }
 
+// 64 and 128 bit LDS/STS of a whole warp (the tier's run of consecutive elements, moved four lanes at a time): R4.. (R4:R5, or R4:R7) stored to the shared
+// array at the lanes' addresses, overwritten, loaded back from the same addresses, and the shared words read in order (which a store and a load that
+// agree on a wrong place would hide). `shape`: 0 a 16 byte element to a lane, 1 an 8 byte one, 2 the same as 0 but only word aligned, 3 two bytes
+// into a word (not whole words), 4 a stride of 20 bytes, 5 a stride of 12 with 8 bytes, 6 neighbours swapped (the same words, not in order), 7 the
+// 128 bit run starting at the last word the array holds for the block, 8 every lane on one element, 9 the run with the last lane (lane 31, then
+// lanes 31 to 62 of the next warp) moved off it, 10 the 128 bit run stored from RZ.
+std::vector<Insn> wide_kernel(unsigned shape) {
+  std::vector<Insn> code;
+  code.push_back(s2r_tid(0));
+  code.push_back(make(0x000fc60000000f00ull, 0x0000580000007a02ull | uint64_t{12} << 16, "MOV R12, c[0x0][0x160]"));
+  code.push_back(make(0x000fc60000000f00ull, 0x0000590000007a02ull | uint64_t{13} << 16, "MOV R13, c[0x0][0x164]"));
+  code.push_back(imad_wide_i(14, 0, kStride, 12));
+  for (unsigned r = 1; r < 8; ++r) {
+    code.push_back(imadi(r, 0, (0x9e3779b1u * r + 17) & 0x7fffffffu, kRZ));
+    code.push_back(iadd3i(r, r, 0x1234567u * r, 0));
+  }
+  const bool w128 = shape != 1 && shape != 5 && shape != 8;
+  switch (shape) {
+    case 2: code.push_back(imadi(9, 0, 16, kRZ)); break;
+    case 3: code.push_back(imadi(9, 0, 16, kRZ)); code.push_back(iadd3i(9, 9, 2, kRZ)); break;
+    case 4: code.push_back(imadi(9, 0, 20, kRZ)); break;
+    case 5: code.push_back(imadi(9, 0, 12, kRZ)); break;
+    case 6: code.push_back(movi(8, 1)), code.push_back(lop3(9, 0, 8, kRZ, 0x66)), code.push_back(imadi(9, 9, 16, kRZ)); break;   // (tid ^ 1)
+    case 8: code.push_back(movi(9, 64)); break;
+    case 9:   // (tid + 1) & 32 is 32 for the threads 31 to 62: the last lane of a warp is 32 bytes past where the run puts it
+      code.push_back(iadd3i(8, 0, 1, kRZ)), code.push_back(movi(10, 32)), code.push_back(lop3(8, 8, 10, kRZ, 0xc0)), code.push_back(imadi(9, 0, 16, kRZ));
+      code.push_back(iadd3(9, 9, 8, kRZ));
+      break;
+    case 1: code.push_back(imadi(9, 0, 8, kRZ)); break;
+    default: code.push_back(imadi(9, 0, 16, kRZ)); break;
+  }
+  const unsigned size = w128 ? 6 : 5;
+  const uint32_t off = shape == 2 ? 4 : shape == 7 ? 0x200 : 0x20;
+  code.push_back(sts(9, shape == 10 ? kRZ : 4, off, size, 0));
+  for (unsigned r = 4; r < 8; ++r) code.push_back(movi(r, 0x77770000u + r));
+  code.push_back(lds(4, 9, off, size, 0));
+  code.push_back(imadi(8, 0, 4, kRZ));
+  code.push_back(lds(8, 8, off & ~3u, 4, 0));
+  for (unsigned r = 1; r < 9; ++r) code.push_back(stg(14, r, 4 * r));
+  code.push_back(stg(14, 0, 0));
+  code.push_back(exit_());
+  return code;
+}
+
+// The kernel run by the tier and by the interpreter (compare, without the recorded answers: the interpreter is the oracle).
+void compare_interpreter(const std::vector<Insn>& code, std::initializer_list<uint32_t> sizes, const std::string& name, uint64_t* conflicts_at_32 = nullptr) {
+  Scoped scoped;
+  Env e;
+  const auto m = e.load(code);
+  for (uint32_t threads : sizes) {
+    const Result tier = e.run(*m, 3, threads);
+    ::setenv("VGPU_FASTPATH", "0", 1);
+    const Result ref = e.run(*m, 3, threads);
+    ::unsetenv("VGPU_FASTPATH");
+    expect_same(tier, ref, name + ", " + std::to_string(threads) + " threads");
+    if (threads == 32 && conflicts_at_32) *conflicts_at_32 = tier.stats.shared_bank_conflicts;
+  }
+}
+
 }  // namespace
 
 VTEST(a_call_by_every_lane_and_its_return_give_the_interpreters_registers_and_counters) {
@@ -549,6 +608,23 @@ VTEST(warpsync_does_not_wait_for_lanes_that_have_exited) {
 
 VTEST(shared_memory_of_a_whole_warp_gives_the_interpreters_registers_and_counters) {
   for (unsigned shape = 0; shape < 12; ++shape) compare(shared_kernel(shape), {32, 64, 33, 5, 19}, "shared memory, shape " + std::to_string(shape));
+}
+
+VTEST(wide_shared_memory_of_a_whole_warp_gives_the_interpreters_registers_and_counters) {
+  for (unsigned shape = 0; shape < 11; ++shape)
+    compare_interpreter(wide_kernel(shape), {32, 64, 33, 5, 19, 96}, "wide shared memory, shape " + std::to_string(shape));
+}
+
+VTEST(a_warp_of_consecutive_wide_elements_takes_bytes_over_four_passes) {
+  // The passes worked out here, not by the interpreter: 32 lanes end to end on whole words are 32 * bytes / 4 consecutive words, bytes / 4 to each
+  // bank, so one STS and one LDS take (bytes / 4 - 1) conflicts each; the word read in order takes none. Three blocks of one warp.
+  uint64_t c128 = 0, c64 = 0, c128u = 0;
+  compare_interpreter(wide_kernel(0), {32}, "128 bit run", &c128);
+  compare_interpreter(wide_kernel(1), {32}, "64 bit run", &c64);
+  compare_interpreter(wide_kernel(2), {32}, "128 bit run, word aligned", &c128u);
+  VCHECK_EQ(c128, uint64_t{3 * 2 * 3});
+  VCHECK_EQ(c64, uint64_t{3 * 2 * 1});
+  VCHECK_EQ(c128u, uint64_t{3 * 2 * 3});
 }
 
 #ifndef SASS_CALL_RET_NO_TIER_FORMS   // (not in the tree the answers were taken from)

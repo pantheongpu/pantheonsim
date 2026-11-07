@@ -43,6 +43,13 @@ struct TensorMemory {
     uint32_t b_fields = 0;
   };
   std::array<Collector, 4> collector_b{};
+  // Whether it is already what reset() leaves, so that a block which never touched Tensor Memory (almost every one) can skip it.
+  bool pristine() const {
+    if (!cells.empty() || !live.empty() || exclusive || relinquished || !peer_alloc.empty() || !peer_dealloc.empty()) return false;
+    for (const Collector& c : collector_b)
+      if (c.valid || c.desc != 0 || c.b_fields != 0) return false;
+    return true;
+  }
   // Back to a fresh Tensor Memory's state, without building one (two deques take four allocations to make).
   void reset() {
     if (!cells.empty()) std::vector<uint32_t>().swap(cells);

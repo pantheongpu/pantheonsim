@@ -5,7 +5,7 @@
 //
 // Every flat / global instruction of the ISA corpora (wave64 for CDNA, wave32 for RDNA) is run on a wave whose addresses are inside an
 // allocation: consecutive lanes (flavour 14), scattered and half the lanes off (15), a run of consecutive lanes and then a gather from
-// a few places so that some lanes read one address twice, every lane on (21) and one of the gathering lanes off (22), lanes a word apart that move two or three words each so that neighbours overlap, as a stencil's do (23, and 24 with a few lanes on the same address and one off). Where the
+// a few places so that some lanes read one address twice, every lane on (21) and one of the gathering lanes off (22), lanes a word apart that move two or three words each so that neighbours overlap, as a stencil's do (23, and 24 with a few lanes on the same address and one off), and every lane at one address (25: Machine::wave_scalars reads such a load once), the second half of a wave at the first half's addresses (34) and groups of neighbouring lanes at one address each (35: Machine::load_wave_repeats reads each address once; one lane off half the time). Where the
 // gathering starts is every lane of the wave, over the seeds, so that a gather from lane 0 (the whole wave), from lane k (the rest of
 // the wave) and from the last lane are all met. No digest is recorded: each run is held to its own lane-by-lane twin.
 #include <cstdint>
@@ -69,7 +69,7 @@ VTEST(a_gather_or_a_run_then_a_gather_gives_the_bits_lane_by_lane_gives) {
       if (in.enc != amd::gcn::Enc::Flat) continue;
       ++shapes;
       for (uint64_t seed = 0; seed < 12; ++seed) {
-        for (const uint32_t flavour : {14u, 15u, 21u, 22u, 23u, 24u}) {
+        for (const uint32_t flavour : {14u, 15u, 21u, 22u, 23u, 24u, 25u, 34u, 35u}) {
           amd::gcn::tier::set_enabled(false);
           amd::set_fast_paths(true, false);
           const uint64_t def = amd::digest_instruction(in, c.target, seed * 7919 + shapes, flavour);

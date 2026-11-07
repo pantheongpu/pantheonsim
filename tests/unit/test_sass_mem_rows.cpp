@@ -246,4 +246,60 @@ VTEST(warp_rows_kernel_shapes) {
   VCHECK(counted > 1000 && declined > 100);
 }
 
+// simd::warp_run_kernel: whether the 32 lanes' base rows are on consecutive elements of 1, 2, 4 or 8 bytes (or, with a width of 0, all on one address), without making the addresses. Held to the
+// definition on the rows (lane l's pair is lane 0's plus l * bytes, modulo 2^64) over: runs that start anywhere in the low word (so that the carry into
+// the high word happens at every lane, and at none), runs whose high word is all ones (the wrap of the 64-bit sum), rows with no high row (a carry then
+// makes the pair differ from the run, which would have a high word of one), and one lane off by a single bit of either word, by a whole element, or
+// by the carry alone (the high word left where it was before the wrap). The run test of h_global is this answer plus lane 0's address.
+VTEST(warp_run_kernel_is_the_definition) {
+  const simd::WarpRunFn kernel = simd::warp_run_kernel();
+  if (simd::level() == simd::Level::Avx2) VCHECK(kernel != nullptr);
+  if (!kernel) return;
+  std::mt19937_64 rng(77);
+  unsigned runs = 0, nonruns = 0, carried = 0;
+  const auto definition = [](const uint32_t* lo, const uint32_t* hi, unsigned bytes) {
+    const auto pair = [&](unsigned l) { return hi ? (static_cast<uint64_t>(hi[l]) << 32) | lo[l] : uint64_t{lo[l]}; };
+    for (unsigned l = 0; l < 32; ++l)
+      if (pair(l) != pair(0) + uint64_t{l} * bytes) return false;
+    return true;
+  };
+  for (int round = 0; round < 400000; ++round) {
+    uint32_t lo[32], hi[32];
+    const unsigned bytes = rng() % 6 == 0 ? 0u : 1u << (rng() % 4);   // (0: every lane the same address)
+    const bool pair = rng() % 4 != 0;
+    // The first lane: a low word within a warp's reach of 2^32 (every lane at which the carry starts), at zero, at all ones, or anywhere.
+    uint64_t start = rng();
+    switch (rng() % 5) {
+      case 0: start = (start & ~uint64_t{0xffff'ffff}) | (0x1'0000'0000ull - (rng() % 260)); break;
+      case 1: start = (start & ~uint64_t{0xffff'ffff}) | (rng() % 260); break;
+      case 2: start = ~uint64_t{0} - (rng() % 260); break;   // wraps the 64-bit sum
+      case 3: start = rng() % 3 == 0 ? 0 : start & 0xffff'ffffull; break;
+      default: break;
+    }
+    if (!pair) start &= 0xffff'ffffull;
+    for (unsigned l = 0; l < 32; ++l) {
+      const uint64_t a = start + uint64_t{l} * bytes;
+      lo[l] = static_cast<uint32_t>(a);
+      hi[l] = pair ? static_cast<uint32_t>(a >> 32) : 0u;
+    }
+    carried += pair && hi[31] != hi[0];
+    switch (rng() % 6) {   // most rows stay runs; the rest are a lane off
+      case 0: lo[rng() % 32] ^= 1u << (rng() % 32); break;
+      case 1: if (pair) hi[rng() % 32] ^= 1u << (rng() % 32); break;
+      case 2: lo[rng() % 32] += bytes; break;
+      case 3: { const unsigned l = rng() % 32; hi[l] = pair ? hi[l] - 1 : hi[l]; break; }   // the carry's high word one short (or one over)
+      case 4: { const unsigned l = rng() % 32; if (pair) hi[l] += 1; break; }
+      default: break;
+    }
+    const bool want = definition(lo, pair ? hi : nullptr, bytes);
+    VCHECK_EQ(kernel(lo, pair ? hi : nullptr, bytes), want);
+    (want ? runs : nonruns) += 1;
+  }
+  VCHECK(runs > 50000 && nonruns > 50000 && carried > 20000);
+  // A row of zeros is no run of any width, and it is one address.
+  uint32_t zero[32] = {};
+  for (unsigned bytes : {1u, 2u, 4u, 8u}) VCHECK(!kernel(zero, zero, bytes));
+  VCHECK(kernel(zero, zero, 0) && kernel(zero, nullptr, 0));
+}
+
 VTEST_MAIN

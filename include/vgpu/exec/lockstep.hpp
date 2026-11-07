@@ -22,7 +22,8 @@
 //
 // A grid of fewer than 16 blocks runs on one host thread with all its resident blocks taking turns
 // from the start, in a fixed order, as a cooperative launch does: the answer of a program like the
-// patch locks is then the same on every run. A larger grid uses the host threads, two blocks to a thread at least, each
+// patch locks is then the same on every run. (The SASS engine lets such a grid use the host threads when
+// its kernel only polls with loads: see `small_grid_spreads` below.) A larger grid uses the host threads, two blocks to a thread at least, each
 // starting with one block, as before, and holding one more block at a time only after no block of the
 // launch, on any thread, has stored or finished for three milliseconds: a chain of look-back flags,
 // where each block waits on the one before it, then runs as it did (the blocks of a real kernel store
@@ -69,6 +70,25 @@ inline constexpr uint64_t kLockstepOneThread = 16, kLockstepBlocksPerThread = 2;
 inline constexpr std::chrono::microseconds kLockstepGrowAfter{3000}, kLockstepGrowAgain{1000};
 // How often a thread whose blocks stored nothing looks whether they are standing still.
 inline constexpr std::chrono::microseconds kLockstepCheckEvery{250};
+// A look costs about a twelfth of the time between looks (below), and a launch's first look is judged by what the
+// last one cost per resident block (the kernels of one program have register files of one size): at most this long.
+inline constexpr unsigned kLockstepCheckCostRatio = 12;
+inline constexpr std::chrono::milliseconds kLockstepFirstCheckMax{500};
+
+// What a launch that has not looked yet waits before its first look: the last look's cost for each resident block, for all of
+// the blocks it holds now, twelve times over, but no less than kLockstepCheckEvery and no more than kLockstepFirstCheckMax.
+// (Out of line: the worker below is a hot loop's neighbour, and these run once per pass that stored nothing.)
+[[gnu::noinline]] inline std::chrono::steady_clock::duration lockstep_first_look(const std::atomic<uint64_t>& look_ns_per_block, size_t blocks) {
+  const uint64_t per_block = look_ns_per_block.load(std::memory_order_relaxed);
+  return std::min<std::chrono::steady_clock::duration>(
+      std::max<std::chrono::steady_clock::duration>(kLockstepCheckEvery, std::chrono::nanoseconds(per_block * blocks * kLockstepCheckCostRatio)),
+      kLockstepFirstCheckMax);
+}
+
+// Remembers what a look at `blocks` blocks cost, for the next launch's first.
+[[gnu::noinline]] inline void lockstep_note_look(std::atomic<uint64_t>& look_ns_per_block, std::chrono::steady_clock::duration cost, size_t blocks) {
+  look_ns_per_block.store(std::chrono::duration_cast<std::chrono::nanoseconds>(cost).count() / blocks, std::memory_order_relaxed);
+}
 
 struct LockstepShape {
   unsigned workers = 1;     // host threads
@@ -82,13 +102,18 @@ struct LockstepShape {
 // `chunk`: blocks a thread takes at a time (the NVIDIA engines take them one by one, as they always did;
 // the AMD engine took contiguous ranges, and a chain of work-groups each waiting on the one before it
 // then hands over between threads once a range, not at every link).
-inline LockstepShape lockstep_shape(uint64_t units, uint64_t capacity, unsigned threads, bool ranges = false) {
+// `small_grid_spreads`: a grid of fewer than kLockstepOneThread blocks uses the host threads too (two blocks to a thread at least), as a
+// larger one does. For launches whose waits are only loads (a chain of look-back flags: CUB's radix sort, scans), where the answer does
+// not depend on the order the blocks start in; a kernel that takes locks leaves it off and keeps its fixed order.
+inline LockstepShape lockstep_shape(uint64_t units, uint64_t capacity, unsigned threads, bool ranges = false,
+                                    bool small_grid_spreads = false) {
   LockstepShape s;
-  const uint64_t by_size = units < kLockstepOneThread ? 1 : std::max<uint64_t>(1, units / kLockstepBlocksPerThread);
+  const uint64_t by_size = units < kLockstepOneThread && !small_grid_spreads ? 1 : std::max<uint64_t>(1, units / kLockstepBlocksPerThread);
   s.workers = static_cast<unsigned>(std::max<uint64_t>(1, std::min<uint64_t>(threads, by_size)));
   const uint64_t resident = std::max<uint64_t>(1, std::min(units, capacity ? capacity : units));
   s.window = std::max<uint64_t>(1, (resident + s.workers - 1) / s.workers);
-  s.initial = s.workers == 1 ? s.window : 1;
+  // (a small grid that spreads holds all its blocks from the start, as the one-thread rule does: its blocks may wait on one that is last in line)
+  s.initial = s.workers == 1 || (small_grid_spreads && units < kLockstepOneThread) ? s.window : 1;
   if (ranges) s.chunk = std::clamp<uint64_t>(units / (uint64_t{s.workers} * 8), 1, 32);
   return s;
 }
@@ -111,18 +136,41 @@ inline void lockstep_note(const char* kernel, uint64_t units, const LockstepShap
 }
 
 // Folds `n` bytes into a running fingerprint (the engines fingerprint a block's registers and
-// program counters to tell a block that is waiting from one that is computing).
+// program counters to tell a block that is waiting from one that is computing). Only equality of two
+// fingerprints of the same block is ever looked at, never a value, so the function is free to be fast:
+// the old one-word-at-a-time chain (xor, multiply, xor-shift: seven cycles a word) was half of the cycles of
+// a decoupled look-back sort. Long inputs are folded by eight independent chains of the same step, a word
+// each in turn, which the core runs side by side; the chains are then folded into `h` in order, so a
+// change of any word still changes the result (each chain's step is a bijection of its state for a given
+// word, and the lanes are combined by the same step).
 inline uint64_t lockstep_fold(uint64_t h, const void* data, size_t n) {
+  constexpr uint64_t kPrime = 0x100000001b3ull;
   const unsigned char* p = static_cast<const unsigned char*>(data);
+  if (n >= 64) {
+    uint64_t s[8];
+    for (unsigned i = 0; i < 8; ++i) s[i] = (h ^ (0x9E3779B97F4A7C15ull * (i + 1))) * kPrime;
+    for (; n >= 64; n -= 64, p += 64) {
+      uint64_t w[8];
+      std::memcpy(w, p, 64);
+      for (unsigned i = 0; i < 8; ++i) {
+        s[i] = (s[i] ^ w[i]) * kPrime;
+        s[i] ^= s[i] >> 29;
+      }
+    }
+    for (unsigned i = 0; i < 8; ++i) {
+      h = (h ^ s[i]) * kPrime;
+      h ^= h >> 29;
+    }
+  }
   for (; n >= 8; n -= 8, p += 8) {
     uint64_t w;
     std::memcpy(&w, p, 8);
-    h = (h ^ w) * 0x100000001b3ull;
+    h = (h ^ w) * kPrime;
     h ^= h >> 29;
   }
   uint64_t w = 0;
   if (n) std::memcpy(&w, p, n);
-  return (h ^ w) * 0x100000001b3ull;
+  return (h ^ w) * kPrime;
 }
 
 // One host thread's part of a lockstep launch, and the one place that decides how resident blocks
@@ -161,6 +209,9 @@ void lockstep_worker(std::atomic<uint64_t>& ticket, std::atomic<uint64_t>& beat,
   // This thread's blocks, or some other thread's, got somewhere.
   auto last_bump = moved_at;
   std::chrono::steady_clock::duration check_every = kLockstepCheckEvery;
+  // What the last look of any launch on this call site cost for each resident block, in nanoseconds (0: none yet).
+  static std::atomic<uint64_t> look_ns_per_block{0};
+  bool looked = false;   // this launch has taken a look
   const auto moved = [&](std::chrono::steady_clock::time_point t) {
     // (told at most every 20 microseconds: the others look at it every few hundred)
     if (t - last_bump >= std::chrono::microseconds(20)) {
@@ -225,12 +276,17 @@ void lockstep_worker(std::atomic<uint64_t>& ticket, std::atomic<uint64_t>& beat,
     }
     // Nothing stored or finished. Every so often, look whether the blocks are standing still (their
     // registers and program counters the same as at the last look).
+    // (a launch that has not looked yet waits as long as the last launch's look says it must, so a launch with
+    // big register files that finishes in a few milliseconds does not spend a third of its time on one look)
+    if (!looked) check_every = lockstep_first_look(look_ns_per_block, live.size());
     if (t - last_check >= check_every) {
       uint64_t h = 0x9e3779b97f4a7c15ull;
       for (const auto& b : live) h = (h ^ fingerprint(*b)) * 0x100000001b3ull;
       last_check = std::chrono::steady_clock::now();
       // (looking costs about a twelfth of the time between looks, however big the blocks are)
-      check_every = std::max<std::chrono::steady_clock::duration>(kLockstepCheckEvery, 12 * (last_check - t));
+      check_every = std::max<std::chrono::steady_clock::duration>(kLockstepCheckEvery, kLockstepCheckCostRatio * (last_check - t));
+      looked = true;
+      lockstep_note_look(look_ns_per_block, last_check - t, live.size());
       same = h == last_print ? same + 1 : 0;
       last_print = h;
       if (!same) nap_us = 0;

@@ -57,6 +57,8 @@ asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.popsection");
 #include "vgpu/exec/sass_lanes.hpp"
 #include "vgpu/exec/sass_mem_rows.hpp"
 #include "vgpu/exec/sass_lea.hpp"
+#include "vgpu/exec/imma_frag.hpp"
+#include "vgpu/exec/ldsm.hpp"
 #include "vgpu/exec/window_check.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
@@ -98,9 +100,11 @@ struct Warp {
   std::vector<uint32_t> r;            // r[reg * 32 + lane]
   Mask p[8] = {0, 0, 0, 0, 0, 0, 0, kAll};
   uint32_t ur[256] = {};
+  // How many of `ur`'s words may be non-zero: the first block a warp runs sets it to the number of uniform registers its
+  // code can write (init_block), so the next block clears that many and no more. Never a word past it has been written.
+  uint32_t ur_extent = 256;
   bool up[8] = {false, false, false, false, false, false, false, true};
   uint64_t pc[32] = {};               // per-lane code address
-  uint32_t device_error[32] = {};     // the device runtime's per-thread last error: a failed call sets it, a successful one leaves it
   Mask alive = 0;                     // lanes that are threads of the block
   Mask exited = 0;
   Mask waiting = 0;
@@ -114,7 +118,6 @@ struct Warp {
   // BMOV.PQUAD MACTIVE: the threads every instruction runs on until MACTIVE is put back (0: the issuing group).
   Mask mactive_force = 0;
   uint64_t bssy_stamp[16] = {};       // when (Block::bssy_clock) each barrier was last set up: higher is more deeply nested
-  uint64_t rpc[32] = {};              // the return-address register (RPCMOV)
   uint64_t gmma_issued = 0;           // warpgroup MMAs this warp has issued
   const Code* code_hint = nullptr;    // the code section this warp last ran in (step_warp, and the tier)
   // The tier's chain (tier_ops.inc): how many more calls of step_warp the caller's turn has after this one, and how many the
@@ -147,9 +150,60 @@ struct Warp {
   // The cluster barrier (UCGABAR): lanes that have arrived in its current
   // phase, and the phase each lane's wait waits for.
   Mask cga_arrived = 0;
-  uint64_t cga_target[32] = {};
+  // State only a few kernels use: the device runtime's per-thread last error (a failed call sets it, a successful one leaves
+  // it), the return-address register (RPCMOV) and the cluster barrier's phase per lane. Every access to it goes through rare(),
+  // which notes that it may differ from a new warp's, so that a warp that never touched it does not have it cleared again for
+  // the next block (init_block). Out of the line from the rest to keep that state's 640 bytes off the hot members' cache lines.
+  struct Rare {
+    uint32_t device_error[32] = {};
+    uint64_t rpc[32] = {};
+    uint64_t cga_target[32] = {};
+  };
+  Rare rare_;
+  bool rare_dirty = false;
+  Rare& rare() { rare_dirty = true; return rare_; }
+  const Rare& rare() const { return rare_; }
+  void reset_rare() {
+    if (!rare_dirty) return;
+    rare_ = Rare{};
+    rare_dirty = false;
+  }
 
   Mask runnable() const { return alive & ~exited & ~waiting; }
+
+  // Back to a new Warp's state for the next block, without building one: `init_block` then sets index, nregs, alive, pc, local_size
+  // and the register file. The members are listed here in the order they are declared; any other must be added here too, which
+  // the size check below (and, in a debug build, init_block's comparison with a new warp) catches.
+  void reset() {
+    std::memset(p, 0, sizeof p);
+    p[7] = kAll;
+    std::memset(ur, 0, std::min<size_t>(ur_extent, 256) * sizeof(uint32_t));
+    std::memset(up, 0, sizeof up);
+    up[7] = true;
+    exited = waiting = ws_held = 0;
+    std::memset(wait_kind, 0, sizeof wait_kind);
+    std::memset(wait_arg, 0, sizeof wait_arg);
+    std::memset(b, 0, sizeof b);
+    mactive_force = 0;
+    std::memset(bssy_stamp, 0, sizeof bssy_stamp);
+    gmma_issued = 0;
+    code_hint = nullptr;
+    budget = extra = 0;
+    local.clear();
+    steps = 0;
+    spins = 0;
+    give_way = false;
+    spin_yields = 0;
+    idle_yields = 0;
+    yield_pc = 0;
+    slice = 0;
+    b2r = 0;
+    b2r_pred = false;
+    yield = false;
+    store_gate = true;
+    cga_arrived = 0;
+    reset_rare();
+  }
   uint32_t& reg(unsigned n, unsigned lane) {
     if (n >= nregs) [[unlikely]] past_file(n);
     return r[n * 32 + lane];
@@ -158,6 +212,9 @@ struct Warp {
     throw std::out_of_range("register R" + std::to_string(n) + " past the warp's " + std::to_string(nregs));
   }
 };
+// Warp::reset names every member. A member added changes this size (or not, if it fits in padding, which the debug build's
+// expect_new_warp would then catch): add it to reset() and to expect_new_warp, then change the number.
+static_assert(sizeof(Warp) == 2488, "Warp has a new member: see Warp::reset");
 
 // A warpgroup MMA's shared-memory operands, read by the first of its four
 // warps (exec_gmma).
@@ -201,7 +258,11 @@ struct Block {
     uint32_t popc = 0;
     bool and_ = true, or_ = false;
   };
-  Barrier bars[16];
+  Barrier bars_[16];
+  // Whether a barrier may differ from a new one (init_block sets them again only then). Every write to one goes through bar().
+  bool bars_dirty = false;
+  Barrier& bar(unsigned id) { bars_dirty = true; return bars_[id]; }
+  const Barrier (&bars() const)[16] { return bars_; }
   // What an mbarrier's word in shared memory has no room for, by its offset:
   // the transaction bytes its phase still waits for (raised by expect-tx,
   // lowered as copies complete; it may dip below zero when a copy lands
@@ -345,7 +406,11 @@ uint64_t sass_max_steps(uint64_t configured) {
 // clock returned, or from a variable register, or it is read before the loop sets it and the loop
 // does set it (it comes round from the last turn: a counter, an old value). A register the loop only
 // reads, or sets from constants and other fixed registers before it reads it, is fixed.
-bool kernel_polls_loop(const std::vector<const Instr*>& body) {
+constexpr unsigned kPollLoad = 1, kPollAtomic = 2;
+// `kinds`, when given, gets kPollLoad set when the poll is a strong load and kPollAtomic when it is an atomic that returns its old
+// value (a lock being taken): a launch whose waits are loads only may spread over host threads whatever its grid, one that takes locks
+// keeps a small grid on one thread (exec/lockstep.hpp).
+bool kernel_polls_loop(const std::vector<const Instr*>& body, unsigned* kinds = nullptr) {
   enum : uint8_t { Undef, Fixed, Variable };
   uint8_t state[256] = {};
   std::bitset<256> set_in_loop;
@@ -376,6 +441,7 @@ bool kernel_polls_loop(const std::vector<const Instr*>& body) {
     }
   };
   bool polls = false;
+  unsigned found = 0;
   for (const Instr* ins : body) {
     switch (ins->op) {
       case Op::STG: case Op::ST: case Op::RED: case Op::CALL: case Op::UTMASTG: case Op::UTMAREDG:
@@ -387,9 +453,11 @@ bool kernel_polls_loop(const std::vector<const Instr*>& body) {
     bool var_src = false;
     for (const Operand& s : ins->src) touch(s, [&](unsigned r) { var_src = var_src || is_variable(r); });
     bool poll = false;
+    unsigned kind = 0;
     if (ins->op == Op::ATOM || ins->op == Op::ATOMG) {
       if (ins->dst.empty() || (ins->dst.back().kind == Kind::Reg && ins->dst.back().reg == kRZ)) return false;   // no result: a store
       poll = true;
+      kind = kPollAtomic;
     } else if (ins->op == Op::LDG || ins->op == Op::LD) {
       bool strong = false, cta = false;
       for (const std::string& m : ins->mods) {
@@ -397,27 +465,162 @@ bool kernel_polls_loop(const std::vector<const Instr*>& body) {
         cta = cta || m == "CTA";
       }
       poll = strong && !cta;
+      kind = kPollLoad;
     }
-    polls = polls || (poll && !var_src);
+    if (poll && !var_src) {
+      polls = true;
+      found |= kind;
+    }
     const uint8_t now = (generates(*ins) || var_src) ? Variable : Fixed;
     for (const Operand& d : ins->dst) touch(d, [&](unsigned r) { state[r] = now; });
   }
+  if (polls && kinds) *kinds |= found;
   return polls;
 }
 
-bool kernel_polls(const Module& m, const CubinKernel& k) {
+// A loop that polls only on some turns: the load whose value decides whether the thread has work to do. Barnes-Hut's SortKernel
+// (`while (k >= bottom) { start = volatile startd[k]; if (start >= 0) { ...stores...; k -= dec; } __syncthreads(); }`) waits like
+// this for the thread that handles its cell's parent, which may be in a block that has not started. The whole loop writes global
+// memory and changes its load's address, so kernel_polls_loop turns it down; but the turns that find nothing to do (the value
+// is not there yet) write nothing and change nothing the next turn reads. Those turns are the path through the loop's body that
+// the branches on the polled value skip the work on. This follows the paths of the body in address order (forward branches only,
+// the loop's own closing branch ends a path), takes the side of a branch (or guard) on the polled value that skips the work first,
+// leaves out what a guard on the polled value skips, and asks kernel_polls_loop of the first path that reaches the end. A call
+// is allowed when the code it goes to is straight code with no store, ending in EXIT or RET (ptxas's shared exit stub). Budgeted:
+// a body with more branches than the budget is not searched. Like the test above it errs towards "no".
+bool call_target_is_inert(const Code& code, size_t first_index_of_target) {
+  for (size_t j = first_index_of_target; j < code.count && j < first_index_of_target + 32; ++j) {
+    const Instr& t = code.instr(j);
+    switch (t.op) {
+      case Op::EXIT: case Op::RET: return true;
+      case Op::STG: case Op::ST: case Op::RED: case Op::ATOM: case Op::ATOMG: case Op::CALL: case Op::BRA: case Op::BRX: case Op::JMP:
+      case Op::UTMASTG: case Op::UTMAREDG: case Op::UBLKRED: case Op::REDAS: case Op::Unknown:
+        return false;
+      default: break;
+    }
+  }
+  return false;
+}
+
+bool kernel_polls_conditional(const Code& code, size_t first, size_t last, unsigned* kinds = nullptr) {
+  const size_t n = last - first + 1;   // the closing branch is the last of them
+  if (n > 400) return false;
+  // What depends on a strong load's value: registers (R0..R254) and predicates (P0..P6), going through the body once.
+  std::bitset<256> treg;
+  std::bitset<8> tpred;
+  bool any_load = false;
+  const auto is_poll_load = [](const Instr& ins) {
+    if (ins.op != Op::LDG && ins.op != Op::LD) return false;
+    bool strong = false, cta = false;
+    for (const std::string& m : ins.mods) {
+      strong = strong || m == "STRONG";
+      cta = cta || m == "CTA";
+    }
+    return strong && !cta;
+  };
+  const auto reads_taint = [&](const Instr& ins) {
+    if (ins.guard != kPT && !ins.guard_uniform && tpred.test(ins.guard)) return true;
+    for (const Operand& o : ins.src) {
+      if (o.kind == Kind::Reg && o.reg != kRZ) {
+        for (unsigned w = 0; w < std::max<unsigned>(1, o.width) && o.reg + w < 255; ++w)
+          if (treg.test(o.reg + w)) return true;
+      } else if (o.kind == Kind::Pred && o.reg != kPT && o.reg < 8 && tpred.test(o.reg)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  for (size_t j = first; j <= last; ++j) {
+    const Instr& ins = code.instr(j);
+    bool t = reads_taint(ins);
+    if (is_poll_load(ins)) {
+      any_load = true;
+      t = true;
+    }
+    if (!t) continue;
+    for (const Operand& d : ins.dst) {
+      if (d.kind == Kind::Reg && d.reg != kRZ) {
+        for (unsigned w = 0; w < std::max<unsigned>(1, d.width) && d.reg + w < 255; ++w) treg.set(d.reg + w);
+      } else if (d.kind == Kind::Pred && d.reg != kPT && d.reg < 8) {
+        tpred.set(d.reg);
+      }
+    }
+  }
+  if (!any_load) return false;
+  // Depth-first over the paths; a path is the instructions it runs (those a tainted guard skips are left out).
+  std::vector<const Instr*> path;
+  size_t budget = 20000;
+  std::function<bool(size_t)> walk = [&](size_t j) -> bool {
+    while (true) {
+      if (j > last || j < first || budget == 0) return false;   // out of the loop, or out of budget
+      --budget;
+      const Instr& ins = code.instr(j);
+      if (j == last) return kernel_polls_loop(path, kinds);   // the closing branch: the path has gone round
+      const bool skipped = ins.guard != kPT && !ins.guard_uniform && tpred.test(ins.guard);
+      switch (ins.op) {
+        case Op::BRA: {
+          const int64_t target = ins.src.empty() ? -1 : ins.src.back().imm;
+          if (target < 0 || static_cast<uint64_t>(target) <= ins.pc) return false;   // another loop inside this one
+          const size_t to = static_cast<size_t>(target) / 16;
+          bool conditional = ins.guard != kPT, on_value = skipped;   // (a branch guarded by the polled value is not "skipped": it chooses)
+          for (const Operand& o : ins.src)
+            if (o.kind == Kind::Pred && o.reg != kPT) {
+              conditional = true;
+              on_value = on_value || (o.reg < 8 && tpred.test(o.reg));
+            }
+          if (!conditional) {
+            j = to;
+            continue;
+          }
+          const size_t fall = j + 1;
+          const size_t mark = path.size();
+          if (on_value) {   // the side that skips the work first: the branch taken
+            if (walk(to)) return true;
+            path.resize(mark);
+            j = fall;
+          } else {          // not on the polled value: either side may be the path; the fall-through first, then the target
+            if (walk(fall)) return true;
+            path.resize(mark);
+            j = to;
+          }
+          continue;
+        }
+        case Op::EXIT: case Op::RET: case Op::BRX: case Op::JMP:
+          if (ins.guard == kPT) return false;   // the path leaves the kernel or the loop
+          j += 1;
+          continue;
+        case Op::CALL: {
+          const int64_t target = ins.src.empty() ? -1 : ins.src.back().imm;
+          if (target < 0 || ins.mnemonic != "CALL" || ins.mods.empty() || ins.mods[0] != "REL") return false;
+          const size_t to = static_cast<size_t>(target) / 16;
+          if (to >= code.count || !call_target_is_inert(code, to)) return false;
+          j += 1;
+          continue;
+        }
+        default:
+          break;
+      }
+      if (!skipped) path.push_back(&ins);
+      j += 1;
+    }
+  };
+  return walk(first);
+}
+
+unsigned kernel_poll_kinds(const Module& m, const CubinKernel& k) {
   {
     std::lock_guard<std::mutex> g(m.polling_mu);
     if (const auto it = m.polling.find(k.name); it != m.polling.end()) return it->second;
   }
   std::vector<std::string> names = reachable(m, k.name);
   names.push_back(k.name);
-  bool found = false;
+  unsigned kinds = 0;
   for (const std::string& f : names) {
     const auto it = m.code_index.find(f == k.name ? k.text_section : ".text." + f);
     if (it == m.code_index.end()) continue;
     const Code& code = m.code[it->second];
-    for (size_t i = 0; i < code.count && !found; ++i) {
+    // (every loop is looked at: one that takes a lock decides what a small grid does, whatever the loops before it wait on)
+    for (size_t i = 0; i < code.count && !(kinds & kPollAtomic); ++i) {
       const Instr& br = code.instr(i);
       if (br.op != Op::BRA || br.src.empty()) continue;
       const int64_t target = br.src.back().imm;
@@ -426,12 +629,12 @@ bool kernel_polls(const Module& m, const CubinKernel& k) {
       if (i - first > 400) continue;
       std::vector<const Instr*> body;
       for (size_t j = first; j <= i; ++j) body.push_back(&code.instr(j));
-      found = kernel_polls_loop(body);
+      if (!kernel_polls_loop(body, &kinds)) kernel_polls_conditional(code, first, i, &kinds);
     }
-    if (found) break;
+    if (kinds & kPollAtomic) break;
   }
   std::lock_guard<std::mutex> g(m.polling_mu);
-  return m.polling.emplace(k.name, found).first->second;
+  return m.polling.emplace(k.name, kinds).first->second;
 }
 
 // A kernel's Module::KernelStatics: the module's (made by the first launch of the kernel), or, for a module that load() did not make,
@@ -1217,6 +1420,24 @@ void Runner::seed_alloc_handshake(Block& blk) {
   }
 }
 
+#ifndef NDEBUG
+// A debug build checks what init_block leaves against a new Warp, member by member: a member that Warp::reset got wrong, or a uniform
+// register written past ur_extent, fails here. (The size of Warp is pinned beside the struct, so that a member added is noticed.)
+static void expect_new_warp(const Warp& w) {
+  const Warp f;
+  const auto same = [](const auto& a, const auto& b) { return std::memcmp(&a, &b, sizeof a) == 0; };
+  bool ok = same(w.p, f.p) && same(w.ur, f.ur) && same(w.up, f.up) && w.exited == f.exited && w.waiting == f.waiting &&
+            w.ws_held == f.ws_held && same(w.wait_kind, f.wait_kind) && same(w.wait_arg, f.wait_arg) && same(w.b, f.b) &&
+            w.mactive_force == f.mactive_force && same(w.bssy_stamp, f.bssy_stamp) && w.gmma_issued == f.gmma_issued &&
+            w.code_hint == f.code_hint && w.budget == f.budget && w.extra == f.extra && w.local.empty() && w.steps == f.steps &&
+            w.spins == f.spins && w.give_way == f.give_way && w.spin_yields == f.spin_yields && w.idle_yields == f.idle_yields &&
+            w.yield_pc == f.yield_pc && w.slice == f.slice && w.b2r == f.b2r && w.b2r_pred == f.b2r_pred && w.yield == f.yield &&
+            w.store_gate == f.store_gate && w.cga_arrived == f.cga_arrived && same(w.rare(), f.rare()) && !w.rare_dirty;
+  for (uint32_t v : w.r) ok = ok && v == 0;
+  if (!ok) throw std::logic_error("init_block left a warp that is not a new warp's state");
+}
+#endif
+
 void Runner::init_block(Block& blk, uint64_t linear) {
   blk.rank = 0;
   blk.own.blocks.assign(1, &blk);
@@ -1227,22 +1448,22 @@ void Runner::init_block(Block& blk, uint64_t linear) {
   blk.ctaid[2] = static_cast<uint32_t>(linear / (static_cast<uint64_t>(cfg_.grid[0]) * cfg_.grid[1]));
   blk.shared.assign(shared_size_, 0);
   seed_alloc_handshake(blk);
-  blk.st = exec::LaunchStats{};
+  // The block's counts, back to zero in place: the counters are the words before inst_by_opcode (see LaunchStats::add), and what the
+  // vector holds, if anything, goes.
+  std::memset(static_cast<void*>(&blk.st), 0, exec::kCounterWords * sizeof(uint64_t));
+  blk.st.inst_by_opcode.clear();
   const uint32_t nwarps = (block_threads_ + 31) / 32;
   blk.st.warps = nwarps;
   blk.warps.resize(nwarps);
   const uint32_t nregs = std::max<uint32_t>(k_.regs + 8, 16);
+  // The uniform registers an instruction of this module can write: a 6-bit field (UR63 is URZ) before sm_100, and 8 bits (UR255)
+  // after. The words past that are never written, so a warp's next block does not clear them (Warp::ur_extent).
+  const uint32_t ur_words = m_.sm >= 100 ? 256 : 64;
   for (uint32_t i = 0; i < nwarps; ++i) {
     Warp& w = blk.warps[i];
-    // A fresh warp, built in place: assigning a temporary copies its three kilobytes, and its register file and local memory
-    // are given back to be allocated again. The two vectors keep their memory and start empty, as a new warp's do.
-    std::vector<uint32_t> regs = std::move(w.r);
-    std::vector<uint8_t> local = std::move(w.local);
-    local.clear();
-    w.~Warp();
-    new (&w) Warp();
-    w.local = std::move(local);
-    w.r = std::move(regs);
+    // A new warp's state, in place: the register file and local memory keep their memory and start empty, as a new warp's do.
+    w.reset();
+    w.ur_extent = ur_words;
     w.index = i;
     w.nregs = std::min<uint32_t>(nregs, 256);
     w.r.assign(static_cast<size_t>(w.nregs) * 32, 0);
@@ -1252,12 +1473,27 @@ void Runner::init_block(Block& blk, uint64_t linear) {
     for (unsigned l = 0; l < 32; ++l) w.pc[l] = entry_;
     w.local_size = local_size_;
     // (the local memory is made on the warp's first local access)
+#ifndef NDEBUG
+    expect_new_warp(w);
+#endif
   }
   blk.live = block_threads_;
-  for (Block::Barrier& b : blk.bars) b = Block::Barrier{};
-  blk.mbar.clear();
-  blk.gmma.clear();
-  blk.tmem.reset();
+  if (blk.bars_dirty) {
+    for (Block::Barrier& b : blk.bars_) b = Block::Barrier{};
+    blk.bars_dirty = false;
+  }
+  if (!blk.mbar.empty()) blk.mbar.clear();
+  if (!blk.gmma.empty()) blk.gmma.clear();
+  if (!blk.tmem.pristine()) blk.tmem.reset();
+#ifndef NDEBUG
+  // (the block's state beyond its warps, against a new Block's: the barriers, the mbarriers' side records, the warpgroup MMAs, Tensor Memory)
+  {
+    bool ok = blk.mbar.empty() && blk.gmma.empty() && blk.tmem.pristine();
+    for (const Block::Barrier& b : blk.bars_)
+      ok = ok && b.arrived == 0 && b.expected == 0 && b.mode == 0 && b.red == 0 && b.popc == 0 && b.and_ && !b.or_;
+    if (!ok) throw std::logic_error("init_block left a block that is not a new block's state");
+  }
+#endif
 }
 
 exec::LaunchStats Runner::run() {
@@ -1334,12 +1570,16 @@ exec::LaunchStats Runner::run() {
   }
   // Blocks that may wait on one another (vgpu/exec/lockstep.hpp): a kernel with a loop that polls
   // global memory runs the blocks the device holds at once together, taking turns.
-  bool lockstep = false;
+  bool lockstep = false, loads_only = false;
   uint64_t capacity = 0;
   if (!cfg_.cooperative && !clustered_) {
     const exec::LockstepMode mode = exec::lockstep_mode(env_.lockstep);
-    if (mode == exec::LockstepMode::All || (mode == exec::LockstepMode::Auto && cfg_.resident_blocks && kernel_polls(m_, k_))) {
+    const unsigned kinds = mode == exec::LockstepMode::Auto && cfg_.resident_blocks ? kernel_poll_kinds(m_, k_) : 0;
+    if (mode == exec::LockstepMode::All || kinds != 0) {
       lockstep = true;
+      // Waits on loads only (a chain of look-back flags) give the same answer whichever thread runs a block, so a small grid
+      // may use the host threads too; a kernel that takes locks keeps it on one thread, in a fixed order (exec/lockstep.hpp).
+      loads_only = mode == exec::LockstepMode::Auto && !(kinds & kPollAtomic);
       capacity = cfg_.resident_blocks ? cfg_.resident_blocks : units;
     }
   }
@@ -1375,7 +1615,7 @@ exec::LaunchStats Runner::run() {
     }
     for (Block& blk : all) stats_.add(blk.st);
   } else if (lockstep) {
-    const exec::LockstepShape shape = exec::lockstep_shape(units, capacity, threads);
+    const exec::LockstepShape shape = exec::lockstep_shape(units, capacity, threads, /*ranges=*/false, /*small_grid_spreads=*/loads_only);
     exec::lockstep_note(k_.name.c_str(), units, shape);
     std::atomic<uint64_t> beat{0};
     std::atomic<bool> failed{false};
@@ -1520,7 +1760,8 @@ bool Runner::break_warpsync_standoff(Block& blk) {
   // The block barrier the lanes go on to counts live lanes, and the ones parked at the BSYNC cannot
   // arrive until the others have gone past it. The hardware counts the warp as arrived, so when nothing
   // can move, a barrier that every other live lane has reached is complete.
-  for (Block::Barrier& b : blk.bars) {
+  for (unsigned bar_id = 0; bar_id < 16; ++bar_id) {
+    const Block::Barrier& b = blk.bars()[bar_id];
     if (!b.arrived || b.expected) continue;
     uint32_t live = 0;
     for (const Warp& w : blk.warps) {
@@ -1540,7 +1781,7 @@ bool Runner::break_warpsync_standoff(Block& blk) {
       w.b2r = b.red == 0 ? b.popc : b.red == 1 ? b.and_ : b.or_;
       w.b2r_pred = b.red == 0 ? b.popc != 0 : b.red == 1 ? b.and_ : b.or_;
     }
-    b = Block::Barrier{};
+    blk.bar(bar_id) = Block::Barrier{};
     any = true;
   }
   return any;

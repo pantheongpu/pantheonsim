@@ -32,9 +32,7 @@ make build
 make demo
 ```
 
-The demo ends with a line starting `PASS`. That is your first simulation.
-`make help` lists everything else you can do, and `./run` takes you inside a
-simulated machine (see below).
+The demo ends with a line starting `PASS`. `make help` lists the other targets.
 
 ### Step inside the machine
 
@@ -47,10 +45,7 @@ it shares with your computer; [toolchains.md](toolchains.md) is about `nvcc` and
 
 ### What works inside, and what does not
 
-The machine is your own computer with the GPU surfaces replaced, not a separate
-system. What follows was read from `src/cli/shell.cpp` and checked on an Ubuntu 24.04
-host (Python 3.12) with `unshare -r -m -u`, the call `vgpu shell` makes. It was not run
-through `vgpu shell` itself, and no end-to-end test exercises pip.
+The machine is your own computer with the GPU surfaces replaced. This was read from `src/cli/shell.cpp` and checked on Ubuntu 24.04 with `unshare -r -m -u`, the call `vgpu shell` makes. No end-to-end test exercises pip.
 
 - **Files are your real files.** Your home and current directory are the host's, so
   anything you create or download persists after `exit`, owned by you. Only
@@ -134,14 +129,7 @@ Makefile variables are in [docs/config.md](config.md).
 
 ## Other ways to use it
 
-- **In your browser:** [pantheonsim.com/play](https://pantheonsim.com/play/) is
-  a Linux machine with simulated GPUs, an editor, a terminal and `nvcc`. No
-  sign-up.
-- **In GitHub Actions:** one step with `pantheongpu/setup-pantheonsim@v0` on
-  the standard runners. See [pantheonsim.com/ci](https://pantheonsim.com/ci/)
-  and [docs/github-action.md](github-action.md).
-- **In a container:** `docker run --rm ghcr.io/pantheongpu/pantheonsim:latest vgpu list-gpus`
-  needs no build. See [docs/docker.md](docker.md).
+In a browser: [pantheonsim.com/play](https://pantheonsim.com/play/). In GitHub Actions: [docs/github-action.md](github-action.md). In a container: [docs/docker.md](docker.md).
 
 ## When something goes wrong
 
@@ -184,18 +172,13 @@ Makefile variables are in [docs/config.md](config.md).
 The engine and its command line are called VirtualGPU (`vgpu`). `make` prints
 each `vgpu` command before it runs, so you can copy it.
 
-## Help, contributing and security
+## Help
 
-Questions and ideas go in [Discussions](https://github.com/pantheongpu/pantheonsim/discussions),
-bugs in [issues](https://github.com/pantheongpu/pantheonsim/issues). How to send a
-change is in [CONTRIBUTING.md](../CONTRIBUTING.md), the rules for taking part in
-[CODE_OF_CONDUCT.md](../CODE_OF_CONDUCT.md), how changes are decided in
-[GOVERNANCE.md](../GOVERNANCE.md), and security problems should be reported privately
-as [SECURITY.md](../SECURITY.md) describes.
+Questions go in [Discussions](https://github.com/pantheongpu/pantheonsim/discussions), bugs in [issues](https://github.com/pantheongpu/pantheonsim/issues). See also [CONTRIBUTING.md](../CONTRIBUTING.md), [GOVERNANCE.md](../GOVERNANCE.md) and [SECURITY.md](../SECURITY.md).
 
 ## License
 
-Apache-2.0 (see ../LICENSE). The `vgpu_cuda.h` header is a clean-room subset
+Business Source License 1.1 from version 0.3.0 (see ../LICENSE and [licensing.md](licensing.md)); Apache-2.0 for versions up to 0.2.0. The `vgpu_cuda.h` header is a clean-room subset
 written from NVIDIA's public driver API documentation; it contains no NVIDIA
 code. The AMD register offsets, fields and SMU message numbers in
 `amd/registers/mmio.yaml` come from the Linux kernel's amdgpu headers, under

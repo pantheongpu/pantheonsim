@@ -117,6 +117,28 @@
 7E026EE9 1F58D102	v_not_b32_dpp v1, v2 dpp8:[1,2,3,4,5,6,7,0]
 7E026EEA 1F58D102	v_not_b32_dpp v1, v2 dpp8:[1,2,3,4,5,6,7,0] fi:1
 7F906EFA FF001BFF	v_not_b32_dpp v200, v255 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+7E0270FA FF00B102	v_bfrev_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+7E0270FA A500B102	v_bfrev_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5
+7E0270FA FF04B102	v_bfrev_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf fi:1
+7E0270FA FF011302	v_bfrev_b32_dpp v1, v2 row_shr:3 row_mask:0xf bank_mask:0xf
+7E0270FA A5011302	v_bfrev_b32_dpp v1, v2 row_shr:3 row_mask:0xa bank_mask:0x5
+7E0270FA FF051302	v_bfrev_b32_dpp v1, v2 row_shr:3 row_mask:0xf bank_mask:0xf fi:1
+7E0270FA FF012702	v_bfrev_b32_dpp v1, v2 row_ror:7 row_mask:0xf bank_mask:0xf
+7E0270FA A5012702	v_bfrev_b32_dpp v1, v2 row_ror:7 row_mask:0xa bank_mask:0x5
+7E0270FA FF052702	v_bfrev_b32_dpp v1, v2 row_ror:7 row_mask:0xf bank_mask:0xf fi:1
+7E0270FA FF014002	v_bfrev_b32_dpp v1, v2 row_mirror row_mask:0xf bank_mask:0xf
+7E0270FA A5014002	v_bfrev_b32_dpp v1, v2 row_mirror row_mask:0xa bank_mask:0x5
+7E0270FA FF054002	v_bfrev_b32_dpp v1, v2 row_mirror row_mask:0xf bank_mask:0xf fi:1
+7E0270FA FF016902	v_bfrev_b32_dpp v1, v2 row_xmask:9 row_mask:0xf bank_mask:0xf
+7E0270FA A5016902	v_bfrev_b32_dpp v1, v2 row_xmask:9 row_mask:0xa bank_mask:0x5
+7E0270FA FF056902	v_bfrev_b32_dpp v1, v2 row_xmask:9 row_mask:0xf bank_mask:0xf fi:1
+7E0270E9 05397702	v_bfrev_b32_dpp v1, v2 dpp8:[7,6,5,4,3,2,1,0]
+7E0270EA 05397702	v_bfrev_b32_dpp v1, v2 dpp8:[7,6,5,4,3,2,1,0] fi:1
+7E0270E9 00000002	v_bfrev_b32_dpp v1, v2 dpp8:[0,0,0,0,0,0,0,0]
+7E0270EA 00000002	v_bfrev_b32_dpp v1, v2 dpp8:[0,0,0,0,0,0,0,0] fi:1
+7E0270E9 1F58D102	v_bfrev_b32_dpp v1, v2 dpp8:[1,2,3,4,5,6,7,0]
+7E0270EA 1F58D102	v_bfrev_b32_dpp v1, v2 dpp8:[1,2,3,4,5,6,7,0] fi:1
+7F9070FA FF001BFF	v_bfrev_b32_dpp v200, v255 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
 4A0206FA FF00B102	v_add_nc_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
 4A0206FA A500B102	v_add_nc_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5
 4A0206FA 3F00B102	v_add_nc_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0x3 bank_mask:0xf
@@ -1472,6 +1494,16 @@ D5BB0001 00000085	v_cls_i32_e64 v1, 5
 D5BB0001 00000102	v_cls_i32_e64 v1, v2
 D5BB0001 00000002	v_cls_i32_e64 v1, s2
 D5BB0001 00000085	v_cls_i32_e64 v1, 5
+7E027102	v_bfrev_b32_e32 v1, v2
+7F9071FF	v_bfrev_b32_e32 v200, v255
+7E027003	v_bfrev_b32_e32 v1, s3
+7E027080	v_bfrev_b32_e32 v1, 0
+7E0270C1	v_bfrev_b32_e32 v1, -1
+7E0270FF 80000000	v_bfrev_b32_e32 v1, 0x80000000
+7E027087	v_bfrev_b32_e32 v1, 7
+D5B80001 00000102	v_bfrev_b32_e64 v1, v2
+D5B80001 00000002	v_bfrev_b32_e64 v1, s2
+D5B80001 00000085	v_bfrev_b32_e64 v1, 5
 D65B0001 00100702	v_permlane16_b32 v1, v2, s3, s4
 D65B0801 00100702	v_permlane16_b32 v1, v2, s3, s4 op_sel:[1,0]
 D65B1001 00100702	v_permlane16_b32 v1, v2, s3, s4 op_sel:[0,1]
@@ -2154,3 +2186,323 @@ CB200D04 02020F02	v_dual_dot2acc_f32_f16 v2, v4, v6 :: v_dual_add_nc_u32 v3, v2,
 CB200D04 02020F05	v_dual_dot2acc_f32_f16 v2, v4, v6 :: v_dual_add_nc_u32 v3, v5, v7
 CB240D04 02020F02	v_dual_dot2acc_f32_f16 v2, v4, v6 :: v_dual_and_b32 v3, v2, v7
 CB240D04 02020F05	v_dual_dot2acc_f32_f16 v2, v4, v6 :: v_dual_and_b32 v3, v5, v7
+D8DC0000 04000001	ds_load_2addr_b32 v[4:5], v1
+D8DC0000 01000001	ds_load_2addr_b32 v[1:2], v1
+D8DC0000 00000001	ds_load_2addr_b32 v[0:1], v1
+D8DC0000 C80000FF	ds_load_2addr_b32 v[200:201], v255
+D8DC0100 04000001	ds_load_2addr_b32 v[4:5], v1 offset1:1
+D8DC0100 01000001	ds_load_2addr_b32 v[1:2], v1 offset1:1
+D8DC0100 00000001	ds_load_2addr_b32 v[0:1], v1 offset1:1
+D8DC0100 C80000FF	ds_load_2addr_b32 v[200:201], v255 offset1:1
+D8DC0201 04000001	ds_load_2addr_b32 v[4:5], v1 offset0:1 offset1:2
+D8DC0201 01000001	ds_load_2addr_b32 v[1:2], v1 offset0:1 offset1:2
+D8DC0201 00000001	ds_load_2addr_b32 v[0:1], v1 offset0:1 offset1:2
+D8DC0201 C80000FF	ds_load_2addr_b32 v[200:201], v255 offset0:1 offset1:2
+D8DC0302 04000001	ds_load_2addr_b32 v[4:5], v1 offset0:2 offset1:3
+D8DC0302 01000001	ds_load_2addr_b32 v[1:2], v1 offset0:2 offset1:3
+D8DC0302 00000001	ds_load_2addr_b32 v[0:1], v1 offset0:2 offset1:3
+D8DC0302 C80000FF	ds_load_2addr_b32 v[200:201], v255 offset0:2 offset1:3
+D8DC0908 04000001	ds_load_2addr_b32 v[4:5], v1 offset0:8 offset1:9
+D8DC0908 01000001	ds_load_2addr_b32 v[1:2], v1 offset0:8 offset1:9
+D8DC0908 00000001	ds_load_2addr_b32 v[0:1], v1 offset0:8 offset1:9
+D8DC0908 C80000FF	ds_load_2addr_b32 v[200:201], v255 offset0:8 offset1:9
+D8DC403F 04000001	ds_load_2addr_b32 v[4:5], v1 offset0:63 offset1:64
+D8DC403F 01000001	ds_load_2addr_b32 v[1:2], v1 offset0:63 offset1:64
+D8DC403F 00000001	ds_load_2addr_b32 v[0:1], v1 offset0:63 offset1:64
+D8DC403F C80000FF	ds_load_2addr_b32 v[200:201], v255 offset0:63 offset1:64
+D8DC00FF 04000001	ds_load_2addr_b32 v[4:5], v1 offset0:255
+D8DC00FF 01000001	ds_load_2addr_b32 v[1:2], v1 offset0:255
+D8DC00FF 00000001	ds_load_2addr_b32 v[0:1], v1 offset0:255
+D8DC00FF C80000FF	ds_load_2addr_b32 v[200:201], v255 offset0:255
+D8DC0707 04000001	ds_load_2addr_b32 v[4:5], v1 offset0:7 offset1:7
+D8DC0707 01000001	ds_load_2addr_b32 v[1:2], v1 offset0:7 offset1:7
+D8DC0707 00000001	ds_load_2addr_b32 v[0:1], v1 offset0:7 offset1:7
+D8DC0707 C80000FF	ds_load_2addr_b32 v[200:201], v255 offset0:7 offset1:7
+D8DCFFC8 04000001	ds_load_2addr_b32 v[4:5], v1 offset0:200 offset1:255
+D8DCFFC8 01000001	ds_load_2addr_b32 v[1:2], v1 offset0:200 offset1:255
+D8DCFFC8 00000001	ds_load_2addr_b32 v[0:1], v1 offset0:200 offset1:255
+D8DCFFC8 C80000FF	ds_load_2addr_b32 v[200:201], v255 offset0:200 offset1:255
+D8DC8000 04000001	ds_load_2addr_b32 v[4:5], v1 offset1:128
+D8DC8000 01000001	ds_load_2addr_b32 v[1:2], v1 offset1:128
+D8DC8000 00000001	ds_load_2addr_b32 v[0:1], v1 offset1:128
+D8DC8000 C80000FF	ds_load_2addr_b32 v[200:201], v255 offset1:128
+D8E00000 04000001	ds_load_2addr_stride64_b32 v[4:5], v1
+D8E00000 01000001	ds_load_2addr_stride64_b32 v[1:2], v1
+D8E00000 00000001	ds_load_2addr_stride64_b32 v[0:1], v1
+D8E00000 C80000FF	ds_load_2addr_stride64_b32 v[200:201], v255
+D8E00100 04000001	ds_load_2addr_stride64_b32 v[4:5], v1 offset1:1
+D8E00100 01000001	ds_load_2addr_stride64_b32 v[1:2], v1 offset1:1
+D8E00100 00000001	ds_load_2addr_stride64_b32 v[0:1], v1 offset1:1
+D8E00100 C80000FF	ds_load_2addr_stride64_b32 v[200:201], v255 offset1:1
+D8E00201 04000001	ds_load_2addr_stride64_b32 v[4:5], v1 offset0:1 offset1:2
+D8E00201 01000001	ds_load_2addr_stride64_b32 v[1:2], v1 offset0:1 offset1:2
+D8E00201 00000001	ds_load_2addr_stride64_b32 v[0:1], v1 offset0:1 offset1:2
+D8E00201 C80000FF	ds_load_2addr_stride64_b32 v[200:201], v255 offset0:1 offset1:2
+D8E00302 04000001	ds_load_2addr_stride64_b32 v[4:5], v1 offset0:2 offset1:3
+D8E00302 01000001	ds_load_2addr_stride64_b32 v[1:2], v1 offset0:2 offset1:3
+D8E00302 00000001	ds_load_2addr_stride64_b32 v[0:1], v1 offset0:2 offset1:3
+D8E00302 C80000FF	ds_load_2addr_stride64_b32 v[200:201], v255 offset0:2 offset1:3
+D8E00908 04000001	ds_load_2addr_stride64_b32 v[4:5], v1 offset0:8 offset1:9
+D8E00908 01000001	ds_load_2addr_stride64_b32 v[1:2], v1 offset0:8 offset1:9
+D8E00908 00000001	ds_load_2addr_stride64_b32 v[0:1], v1 offset0:8 offset1:9
+D8E00908 C80000FF	ds_load_2addr_stride64_b32 v[200:201], v255 offset0:8 offset1:9
+D8E0403F 04000001	ds_load_2addr_stride64_b32 v[4:5], v1 offset0:63 offset1:64
+D8E0403F 01000001	ds_load_2addr_stride64_b32 v[1:2], v1 offset0:63 offset1:64
+D8E0403F 00000001	ds_load_2addr_stride64_b32 v[0:1], v1 offset0:63 offset1:64
+D8E0403F C80000FF	ds_load_2addr_stride64_b32 v[200:201], v255 offset0:63 offset1:64
+D8E000FF 04000001	ds_load_2addr_stride64_b32 v[4:5], v1 offset0:255
+D8E000FF 01000001	ds_load_2addr_stride64_b32 v[1:2], v1 offset0:255
+D8E000FF 00000001	ds_load_2addr_stride64_b32 v[0:1], v1 offset0:255
+D8E000FF C80000FF	ds_load_2addr_stride64_b32 v[200:201], v255 offset0:255
+D8E00707 04000001	ds_load_2addr_stride64_b32 v[4:5], v1 offset0:7 offset1:7
+D8E00707 01000001	ds_load_2addr_stride64_b32 v[1:2], v1 offset0:7 offset1:7
+D8E00707 00000001	ds_load_2addr_stride64_b32 v[0:1], v1 offset0:7 offset1:7
+D8E00707 C80000FF	ds_load_2addr_stride64_b32 v[200:201], v255 offset0:7 offset1:7
+D8E0FFC8 04000001	ds_load_2addr_stride64_b32 v[4:5], v1 offset0:200 offset1:255
+D8E0FFC8 01000001	ds_load_2addr_stride64_b32 v[1:2], v1 offset0:200 offset1:255
+D8E0FFC8 00000001	ds_load_2addr_stride64_b32 v[0:1], v1 offset0:200 offset1:255
+D8E0FFC8 C80000FF	ds_load_2addr_stride64_b32 v[200:201], v255 offset0:200 offset1:255
+D8E08000 04000001	ds_load_2addr_stride64_b32 v[4:5], v1 offset1:128
+D8E08000 01000001	ds_load_2addr_stride64_b32 v[1:2], v1 offset1:128
+D8E08000 00000001	ds_load_2addr_stride64_b32 v[0:1], v1 offset1:128
+D8E08000 C80000FF	ds_load_2addr_stride64_b32 v[200:201], v255 offset1:128
+D9DC0000 04000001	ds_load_2addr_b64 v[4:7], v1
+D9DC0000 01000001	ds_load_2addr_b64 v[1:4], v1
+D9DC0000 00000003	ds_load_2addr_b64 v[0:3], v3
+D9DC0000 C80000FF	ds_load_2addr_b64 v[200:203], v255
+D9DC0100 04000001	ds_load_2addr_b64 v[4:7], v1 offset1:1
+D9DC0100 01000001	ds_load_2addr_b64 v[1:4], v1 offset1:1
+D9DC0100 00000003	ds_load_2addr_b64 v[0:3], v3 offset1:1
+D9DC0100 C80000FF	ds_load_2addr_b64 v[200:203], v255 offset1:1
+D9DC0201 04000001	ds_load_2addr_b64 v[4:7], v1 offset0:1 offset1:2
+D9DC0201 01000001	ds_load_2addr_b64 v[1:4], v1 offset0:1 offset1:2
+D9DC0201 00000003	ds_load_2addr_b64 v[0:3], v3 offset0:1 offset1:2
+D9DC0201 C80000FF	ds_load_2addr_b64 v[200:203], v255 offset0:1 offset1:2
+D9DC0302 04000001	ds_load_2addr_b64 v[4:7], v1 offset0:2 offset1:3
+D9DC0302 01000001	ds_load_2addr_b64 v[1:4], v1 offset0:2 offset1:3
+D9DC0302 00000003	ds_load_2addr_b64 v[0:3], v3 offset0:2 offset1:3
+D9DC0302 C80000FF	ds_load_2addr_b64 v[200:203], v255 offset0:2 offset1:3
+D9DC0908 04000001	ds_load_2addr_b64 v[4:7], v1 offset0:8 offset1:9
+D9DC0908 01000001	ds_load_2addr_b64 v[1:4], v1 offset0:8 offset1:9
+D9DC0908 00000003	ds_load_2addr_b64 v[0:3], v3 offset0:8 offset1:9
+D9DC0908 C80000FF	ds_load_2addr_b64 v[200:203], v255 offset0:8 offset1:9
+D9DC403F 04000001	ds_load_2addr_b64 v[4:7], v1 offset0:63 offset1:64
+D9DC403F 01000001	ds_load_2addr_b64 v[1:4], v1 offset0:63 offset1:64
+D9DC403F 00000003	ds_load_2addr_b64 v[0:3], v3 offset0:63 offset1:64
+D9DC403F C80000FF	ds_load_2addr_b64 v[200:203], v255 offset0:63 offset1:64
+D9DC00FF 04000001	ds_load_2addr_b64 v[4:7], v1 offset0:255
+D9DC00FF 01000001	ds_load_2addr_b64 v[1:4], v1 offset0:255
+D9DC00FF 00000003	ds_load_2addr_b64 v[0:3], v3 offset0:255
+D9DC00FF C80000FF	ds_load_2addr_b64 v[200:203], v255 offset0:255
+D9DC0707 04000001	ds_load_2addr_b64 v[4:7], v1 offset0:7 offset1:7
+D9DC0707 01000001	ds_load_2addr_b64 v[1:4], v1 offset0:7 offset1:7
+D9DC0707 00000003	ds_load_2addr_b64 v[0:3], v3 offset0:7 offset1:7
+D9DC0707 C80000FF	ds_load_2addr_b64 v[200:203], v255 offset0:7 offset1:7
+D9DCFFC8 04000001	ds_load_2addr_b64 v[4:7], v1 offset0:200 offset1:255
+D9DCFFC8 01000001	ds_load_2addr_b64 v[1:4], v1 offset0:200 offset1:255
+D9DCFFC8 00000003	ds_load_2addr_b64 v[0:3], v3 offset0:200 offset1:255
+D9DCFFC8 C80000FF	ds_load_2addr_b64 v[200:203], v255 offset0:200 offset1:255
+D9DC8000 04000001	ds_load_2addr_b64 v[4:7], v1 offset1:128
+D9DC8000 01000001	ds_load_2addr_b64 v[1:4], v1 offset1:128
+D9DC8000 00000003	ds_load_2addr_b64 v[0:3], v3 offset1:128
+D9DC8000 C80000FF	ds_load_2addr_b64 v[200:203], v255 offset1:128
+D9E00000 04000001	ds_load_2addr_stride64_b64 v[4:7], v1
+D9E00000 01000001	ds_load_2addr_stride64_b64 v[1:4], v1
+D9E00000 00000003	ds_load_2addr_stride64_b64 v[0:3], v3
+D9E00000 C80000FF	ds_load_2addr_stride64_b64 v[200:203], v255
+D9E00100 04000001	ds_load_2addr_stride64_b64 v[4:7], v1 offset1:1
+D9E00100 01000001	ds_load_2addr_stride64_b64 v[1:4], v1 offset1:1
+D9E00100 00000003	ds_load_2addr_stride64_b64 v[0:3], v3 offset1:1
+D9E00100 C80000FF	ds_load_2addr_stride64_b64 v[200:203], v255 offset1:1
+D9E00201 04000001	ds_load_2addr_stride64_b64 v[4:7], v1 offset0:1 offset1:2
+D9E00201 01000001	ds_load_2addr_stride64_b64 v[1:4], v1 offset0:1 offset1:2
+D9E00201 00000003	ds_load_2addr_stride64_b64 v[0:3], v3 offset0:1 offset1:2
+D9E00201 C80000FF	ds_load_2addr_stride64_b64 v[200:203], v255 offset0:1 offset1:2
+D9E00302 04000001	ds_load_2addr_stride64_b64 v[4:7], v1 offset0:2 offset1:3
+D9E00302 01000001	ds_load_2addr_stride64_b64 v[1:4], v1 offset0:2 offset1:3
+D9E00302 00000003	ds_load_2addr_stride64_b64 v[0:3], v3 offset0:2 offset1:3
+D9E00302 C80000FF	ds_load_2addr_stride64_b64 v[200:203], v255 offset0:2 offset1:3
+D9E00908 04000001	ds_load_2addr_stride64_b64 v[4:7], v1 offset0:8 offset1:9
+D9E00908 01000001	ds_load_2addr_stride64_b64 v[1:4], v1 offset0:8 offset1:9
+D9E00908 00000003	ds_load_2addr_stride64_b64 v[0:3], v3 offset0:8 offset1:9
+D9E00908 C80000FF	ds_load_2addr_stride64_b64 v[200:203], v255 offset0:8 offset1:9
+D9E0403F 04000001	ds_load_2addr_stride64_b64 v[4:7], v1 offset0:63 offset1:64
+D9E0403F 01000001	ds_load_2addr_stride64_b64 v[1:4], v1 offset0:63 offset1:64
+D9E0403F 00000003	ds_load_2addr_stride64_b64 v[0:3], v3 offset0:63 offset1:64
+D9E0403F C80000FF	ds_load_2addr_stride64_b64 v[200:203], v255 offset0:63 offset1:64
+D9E000FF 04000001	ds_load_2addr_stride64_b64 v[4:7], v1 offset0:255
+D9E000FF 01000001	ds_load_2addr_stride64_b64 v[1:4], v1 offset0:255
+D9E000FF 00000003	ds_load_2addr_stride64_b64 v[0:3], v3 offset0:255
+D9E000FF C80000FF	ds_load_2addr_stride64_b64 v[200:203], v255 offset0:255
+D9E00707 04000001	ds_load_2addr_stride64_b64 v[4:7], v1 offset0:7 offset1:7
+D9E00707 01000001	ds_load_2addr_stride64_b64 v[1:4], v1 offset0:7 offset1:7
+D9E00707 00000003	ds_load_2addr_stride64_b64 v[0:3], v3 offset0:7 offset1:7
+D9E00707 C80000FF	ds_load_2addr_stride64_b64 v[200:203], v255 offset0:7 offset1:7
+D9E0FFC8 04000001	ds_load_2addr_stride64_b64 v[4:7], v1 offset0:200 offset1:255
+D9E0FFC8 01000001	ds_load_2addr_stride64_b64 v[1:4], v1 offset0:200 offset1:255
+D9E0FFC8 00000003	ds_load_2addr_stride64_b64 v[0:3], v3 offset0:200 offset1:255
+D9E0FFC8 C80000FF	ds_load_2addr_stride64_b64 v[200:203], v255 offset0:200 offset1:255
+D9E08000 04000001	ds_load_2addr_stride64_b64 v[4:7], v1 offset1:128
+D9E08000 01000001	ds_load_2addr_stride64_b64 v[1:4], v1 offset1:128
+D9E08000 00000003	ds_load_2addr_stride64_b64 v[0:3], v3 offset1:128
+D9E08000 C80000FF	ds_load_2addr_stride64_b64 v[200:203], v255 offset1:128
+D8380000 00050401	ds_store_2addr_b32 v1, v4, v5
+D8380000 00020101	ds_store_2addr_b32 v1, v1, v2
+D8380000 00040401	ds_store_2addr_b32 v1, v4, v4
+D8380000 00FEC8FF	ds_store_2addr_b32 v255, v200, v254
+D8380100 00050401	ds_store_2addr_b32 v1, v4, v5 offset1:1
+D8380100 00020101	ds_store_2addr_b32 v1, v1, v2 offset1:1
+D8380100 00040401	ds_store_2addr_b32 v1, v4, v4 offset1:1
+D8380100 00FEC8FF	ds_store_2addr_b32 v255, v200, v254 offset1:1
+D8380201 00050401	ds_store_2addr_b32 v1, v4, v5 offset0:1 offset1:2
+D8380201 00020101	ds_store_2addr_b32 v1, v1, v2 offset0:1 offset1:2
+D8380201 00040401	ds_store_2addr_b32 v1, v4, v4 offset0:1 offset1:2
+D8380201 00FEC8FF	ds_store_2addr_b32 v255, v200, v254 offset0:1 offset1:2
+D8380302 00050401	ds_store_2addr_b32 v1, v4, v5 offset0:2 offset1:3
+D8380302 00020101	ds_store_2addr_b32 v1, v1, v2 offset0:2 offset1:3
+D8380302 00040401	ds_store_2addr_b32 v1, v4, v4 offset0:2 offset1:3
+D8380302 00FEC8FF	ds_store_2addr_b32 v255, v200, v254 offset0:2 offset1:3
+D8380908 00050401	ds_store_2addr_b32 v1, v4, v5 offset0:8 offset1:9
+D8380908 00020101	ds_store_2addr_b32 v1, v1, v2 offset0:8 offset1:9
+D8380908 00040401	ds_store_2addr_b32 v1, v4, v4 offset0:8 offset1:9
+D8380908 00FEC8FF	ds_store_2addr_b32 v255, v200, v254 offset0:8 offset1:9
+D838403F 00050401	ds_store_2addr_b32 v1, v4, v5 offset0:63 offset1:64
+D838403F 00020101	ds_store_2addr_b32 v1, v1, v2 offset0:63 offset1:64
+D838403F 00040401	ds_store_2addr_b32 v1, v4, v4 offset0:63 offset1:64
+D838403F 00FEC8FF	ds_store_2addr_b32 v255, v200, v254 offset0:63 offset1:64
+D83800FF 00050401	ds_store_2addr_b32 v1, v4, v5 offset0:255
+D83800FF 00020101	ds_store_2addr_b32 v1, v1, v2 offset0:255
+D83800FF 00040401	ds_store_2addr_b32 v1, v4, v4 offset0:255
+D83800FF 00FEC8FF	ds_store_2addr_b32 v255, v200, v254 offset0:255
+D8380707 00050401	ds_store_2addr_b32 v1, v4, v5 offset0:7 offset1:7
+D8380707 00020101	ds_store_2addr_b32 v1, v1, v2 offset0:7 offset1:7
+D8380707 00040401	ds_store_2addr_b32 v1, v4, v4 offset0:7 offset1:7
+D8380707 00FEC8FF	ds_store_2addr_b32 v255, v200, v254 offset0:7 offset1:7
+D838FFC8 00050401	ds_store_2addr_b32 v1, v4, v5 offset0:200 offset1:255
+D838FFC8 00020101	ds_store_2addr_b32 v1, v1, v2 offset0:200 offset1:255
+D838FFC8 00040401	ds_store_2addr_b32 v1, v4, v4 offset0:200 offset1:255
+D838FFC8 00FEC8FF	ds_store_2addr_b32 v255, v200, v254 offset0:200 offset1:255
+D8388000 00050401	ds_store_2addr_b32 v1, v4, v5 offset1:128
+D8388000 00020101	ds_store_2addr_b32 v1, v1, v2 offset1:128
+D8388000 00040401	ds_store_2addr_b32 v1, v4, v4 offset1:128
+D8388000 00FEC8FF	ds_store_2addr_b32 v255, v200, v254 offset1:128
+D83C0000 00050401	ds_store_2addr_stride64_b32 v1, v4, v5
+D83C0000 00020101	ds_store_2addr_stride64_b32 v1, v1, v2
+D83C0000 00040401	ds_store_2addr_stride64_b32 v1, v4, v4
+D83C0000 00FEC8FF	ds_store_2addr_stride64_b32 v255, v200, v254
+D83C0100 00050401	ds_store_2addr_stride64_b32 v1, v4, v5 offset1:1
+D83C0100 00020101	ds_store_2addr_stride64_b32 v1, v1, v2 offset1:1
+D83C0100 00040401	ds_store_2addr_stride64_b32 v1, v4, v4 offset1:1
+D83C0100 00FEC8FF	ds_store_2addr_stride64_b32 v255, v200, v254 offset1:1
+D83C0201 00050401	ds_store_2addr_stride64_b32 v1, v4, v5 offset0:1 offset1:2
+D83C0201 00020101	ds_store_2addr_stride64_b32 v1, v1, v2 offset0:1 offset1:2
+D83C0201 00040401	ds_store_2addr_stride64_b32 v1, v4, v4 offset0:1 offset1:2
+D83C0201 00FEC8FF	ds_store_2addr_stride64_b32 v255, v200, v254 offset0:1 offset1:2
+D83C0302 00050401	ds_store_2addr_stride64_b32 v1, v4, v5 offset0:2 offset1:3
+D83C0302 00020101	ds_store_2addr_stride64_b32 v1, v1, v2 offset0:2 offset1:3
+D83C0302 00040401	ds_store_2addr_stride64_b32 v1, v4, v4 offset0:2 offset1:3
+D83C0302 00FEC8FF	ds_store_2addr_stride64_b32 v255, v200, v254 offset0:2 offset1:3
+D83C0908 00050401	ds_store_2addr_stride64_b32 v1, v4, v5 offset0:8 offset1:9
+D83C0908 00020101	ds_store_2addr_stride64_b32 v1, v1, v2 offset0:8 offset1:9
+D83C0908 00040401	ds_store_2addr_stride64_b32 v1, v4, v4 offset0:8 offset1:9
+D83C0908 00FEC8FF	ds_store_2addr_stride64_b32 v255, v200, v254 offset0:8 offset1:9
+D83C403F 00050401	ds_store_2addr_stride64_b32 v1, v4, v5 offset0:63 offset1:64
+D83C403F 00020101	ds_store_2addr_stride64_b32 v1, v1, v2 offset0:63 offset1:64
+D83C403F 00040401	ds_store_2addr_stride64_b32 v1, v4, v4 offset0:63 offset1:64
+D83C403F 00FEC8FF	ds_store_2addr_stride64_b32 v255, v200, v254 offset0:63 offset1:64
+D83C00FF 00050401	ds_store_2addr_stride64_b32 v1, v4, v5 offset0:255
+D83C00FF 00020101	ds_store_2addr_stride64_b32 v1, v1, v2 offset0:255
+D83C00FF 00040401	ds_store_2addr_stride64_b32 v1, v4, v4 offset0:255
+D83C00FF 00FEC8FF	ds_store_2addr_stride64_b32 v255, v200, v254 offset0:255
+D83C0707 00050401	ds_store_2addr_stride64_b32 v1, v4, v5 offset0:7 offset1:7
+D83C0707 00020101	ds_store_2addr_stride64_b32 v1, v1, v2 offset0:7 offset1:7
+D83C0707 00040401	ds_store_2addr_stride64_b32 v1, v4, v4 offset0:7 offset1:7
+D83C0707 00FEC8FF	ds_store_2addr_stride64_b32 v255, v200, v254 offset0:7 offset1:7
+D83CFFC8 00050401	ds_store_2addr_stride64_b32 v1, v4, v5 offset0:200 offset1:255
+D83CFFC8 00020101	ds_store_2addr_stride64_b32 v1, v1, v2 offset0:200 offset1:255
+D83CFFC8 00040401	ds_store_2addr_stride64_b32 v1, v4, v4 offset0:200 offset1:255
+D83CFFC8 00FEC8FF	ds_store_2addr_stride64_b32 v255, v200, v254 offset0:200 offset1:255
+D83C8000 00050401	ds_store_2addr_stride64_b32 v1, v4, v5 offset1:128
+D83C8000 00020101	ds_store_2addr_stride64_b32 v1, v1, v2 offset1:128
+D83C8000 00040401	ds_store_2addr_stride64_b32 v1, v4, v4 offset1:128
+D83C8000 00FEC8FF	ds_store_2addr_stride64_b32 v255, v200, v254 offset1:128
+D9380000 00060401	ds_store_2addr_b64 v1, v[4:5], v[6:7]
+D9380000 00030101	ds_store_2addr_b64 v1, v[1:2], v[3:4]
+D9380000 00040401	ds_store_2addr_b64 v1, v[4:5], v[4:5]
+D9380000 00FEC8FF	ds_store_2addr_b64 v255, v[200:201], v[254:255]
+D9380100 00060401	ds_store_2addr_b64 v1, v[4:5], v[6:7] offset1:1
+D9380100 00030101	ds_store_2addr_b64 v1, v[1:2], v[3:4] offset1:1
+D9380100 00040401	ds_store_2addr_b64 v1, v[4:5], v[4:5] offset1:1
+D9380100 00FEC8FF	ds_store_2addr_b64 v255, v[200:201], v[254:255] offset1:1
+D9380201 00060401	ds_store_2addr_b64 v1, v[4:5], v[6:7] offset0:1 offset1:2
+D9380201 00030101	ds_store_2addr_b64 v1, v[1:2], v[3:4] offset0:1 offset1:2
+D9380201 00040401	ds_store_2addr_b64 v1, v[4:5], v[4:5] offset0:1 offset1:2
+D9380201 00FEC8FF	ds_store_2addr_b64 v255, v[200:201], v[254:255] offset0:1 offset1:2
+D9380302 00060401	ds_store_2addr_b64 v1, v[4:5], v[6:7] offset0:2 offset1:3
+D9380302 00030101	ds_store_2addr_b64 v1, v[1:2], v[3:4] offset0:2 offset1:3
+D9380302 00040401	ds_store_2addr_b64 v1, v[4:5], v[4:5] offset0:2 offset1:3
+D9380302 00FEC8FF	ds_store_2addr_b64 v255, v[200:201], v[254:255] offset0:2 offset1:3
+D9380908 00060401	ds_store_2addr_b64 v1, v[4:5], v[6:7] offset0:8 offset1:9
+D9380908 00030101	ds_store_2addr_b64 v1, v[1:2], v[3:4] offset0:8 offset1:9
+D9380908 00040401	ds_store_2addr_b64 v1, v[4:5], v[4:5] offset0:8 offset1:9
+D9380908 00FEC8FF	ds_store_2addr_b64 v255, v[200:201], v[254:255] offset0:8 offset1:9
+D938403F 00060401	ds_store_2addr_b64 v1, v[4:5], v[6:7] offset0:63 offset1:64
+D938403F 00030101	ds_store_2addr_b64 v1, v[1:2], v[3:4] offset0:63 offset1:64
+D938403F 00040401	ds_store_2addr_b64 v1, v[4:5], v[4:5] offset0:63 offset1:64
+D938403F 00FEC8FF	ds_store_2addr_b64 v255, v[200:201], v[254:255] offset0:63 offset1:64
+D93800FF 00060401	ds_store_2addr_b64 v1, v[4:5], v[6:7] offset0:255
+D93800FF 00030101	ds_store_2addr_b64 v1, v[1:2], v[3:4] offset0:255
+D93800FF 00040401	ds_store_2addr_b64 v1, v[4:5], v[4:5] offset0:255
+D93800FF 00FEC8FF	ds_store_2addr_b64 v255, v[200:201], v[254:255] offset0:255
+D9380707 00060401	ds_store_2addr_b64 v1, v[4:5], v[6:7] offset0:7 offset1:7
+D9380707 00030101	ds_store_2addr_b64 v1, v[1:2], v[3:4] offset0:7 offset1:7
+D9380707 00040401	ds_store_2addr_b64 v1, v[4:5], v[4:5] offset0:7 offset1:7
+D9380707 00FEC8FF	ds_store_2addr_b64 v255, v[200:201], v[254:255] offset0:7 offset1:7
+D938FFC8 00060401	ds_store_2addr_b64 v1, v[4:5], v[6:7] offset0:200 offset1:255
+D938FFC8 00030101	ds_store_2addr_b64 v1, v[1:2], v[3:4] offset0:200 offset1:255
+D938FFC8 00040401	ds_store_2addr_b64 v1, v[4:5], v[4:5] offset0:200 offset1:255
+D938FFC8 00FEC8FF	ds_store_2addr_b64 v255, v[200:201], v[254:255] offset0:200 offset1:255
+D9388000 00060401	ds_store_2addr_b64 v1, v[4:5], v[6:7] offset1:128
+D9388000 00030101	ds_store_2addr_b64 v1, v[1:2], v[3:4] offset1:128
+D9388000 00040401	ds_store_2addr_b64 v1, v[4:5], v[4:5] offset1:128
+D9388000 00FEC8FF	ds_store_2addr_b64 v255, v[200:201], v[254:255] offset1:128
+D93C0000 00060401	ds_store_2addr_stride64_b64 v1, v[4:5], v[6:7]
+D93C0000 00030101	ds_store_2addr_stride64_b64 v1, v[1:2], v[3:4]
+D93C0000 00040401	ds_store_2addr_stride64_b64 v1, v[4:5], v[4:5]
+D93C0000 00FEC8FF	ds_store_2addr_stride64_b64 v255, v[200:201], v[254:255]
+D93C0100 00060401	ds_store_2addr_stride64_b64 v1, v[4:5], v[6:7] offset1:1
+D93C0100 00030101	ds_store_2addr_stride64_b64 v1, v[1:2], v[3:4] offset1:1
+D93C0100 00040401	ds_store_2addr_stride64_b64 v1, v[4:5], v[4:5] offset1:1
+D93C0100 00FEC8FF	ds_store_2addr_stride64_b64 v255, v[200:201], v[254:255] offset1:1
+D93C0201 00060401	ds_store_2addr_stride64_b64 v1, v[4:5], v[6:7] offset0:1 offset1:2
+D93C0201 00030101	ds_store_2addr_stride64_b64 v1, v[1:2], v[3:4] offset0:1 offset1:2
+D93C0201 00040401	ds_store_2addr_stride64_b64 v1, v[4:5], v[4:5] offset0:1 offset1:2
+D93C0201 00FEC8FF	ds_store_2addr_stride64_b64 v255, v[200:201], v[254:255] offset0:1 offset1:2
+D93C0302 00060401	ds_store_2addr_stride64_b64 v1, v[4:5], v[6:7] offset0:2 offset1:3
+D93C0302 00030101	ds_store_2addr_stride64_b64 v1, v[1:2], v[3:4] offset0:2 offset1:3
+D93C0302 00040401	ds_store_2addr_stride64_b64 v1, v[4:5], v[4:5] offset0:2 offset1:3
+D93C0302 00FEC8FF	ds_store_2addr_stride64_b64 v255, v[200:201], v[254:255] offset0:2 offset1:3
+D93C0908 00060401	ds_store_2addr_stride64_b64 v1, v[4:5], v[6:7] offset0:8 offset1:9
+D93C0908 00030101	ds_store_2addr_stride64_b64 v1, v[1:2], v[3:4] offset0:8 offset1:9
+D93C0908 00040401	ds_store_2addr_stride64_b64 v1, v[4:5], v[4:5] offset0:8 offset1:9
+D93C0908 00FEC8FF	ds_store_2addr_stride64_b64 v255, v[200:201], v[254:255] offset0:8 offset1:9
+D93C403F 00060401	ds_store_2addr_stride64_b64 v1, v[4:5], v[6:7] offset0:63 offset1:64
+D93C403F 00030101	ds_store_2addr_stride64_b64 v1, v[1:2], v[3:4] offset0:63 offset1:64
+D93C403F 00040401	ds_store_2addr_stride64_b64 v1, v[4:5], v[4:5] offset0:63 offset1:64
+D93C403F 00FEC8FF	ds_store_2addr_stride64_b64 v255, v[200:201], v[254:255] offset0:63 offset1:64
+D93C00FF 00060401	ds_store_2addr_stride64_b64 v1, v[4:5], v[6:7] offset0:255
+D93C00FF 00030101	ds_store_2addr_stride64_b64 v1, v[1:2], v[3:4] offset0:255
+D93C00FF 00040401	ds_store_2addr_stride64_b64 v1, v[4:5], v[4:5] offset0:255
+D93C00FF 00FEC8FF	ds_store_2addr_stride64_b64 v255, v[200:201], v[254:255] offset0:255
+D93C0707 00060401	ds_store_2addr_stride64_b64 v1, v[4:5], v[6:7] offset0:7 offset1:7
+D93C0707 00030101	ds_store_2addr_stride64_b64 v1, v[1:2], v[3:4] offset0:7 offset1:7
+D93C0707 00040401	ds_store_2addr_stride64_b64 v1, v[4:5], v[4:5] offset0:7 offset1:7
+D93C0707 00FEC8FF	ds_store_2addr_stride64_b64 v255, v[200:201], v[254:255] offset0:7 offset1:7
+D93CFFC8 00060401	ds_store_2addr_stride64_b64 v1, v[4:5], v[6:7] offset0:200 offset1:255
+D93CFFC8 00030101	ds_store_2addr_stride64_b64 v1, v[1:2], v[3:4] offset0:200 offset1:255
+D93CFFC8 00040401	ds_store_2addr_stride64_b64 v1, v[4:5], v[4:5] offset0:200 offset1:255
+D93CFFC8 00FEC8FF	ds_store_2addr_stride64_b64 v255, v[200:201], v[254:255] offset0:200 offset1:255
+D93C8000 00060401	ds_store_2addr_stride64_b64 v1, v[4:5], v[6:7] offset1:128
+D93C8000 00030101	ds_store_2addr_stride64_b64 v1, v[1:2], v[3:4] offset1:128
+D93C8000 00040401	ds_store_2addr_stride64_b64 v1, v[4:5], v[4:5] offset1:128
+D93C8000 00FEC8FF	ds_store_2addr_stride64_b64 v255, v[200:201], v[254:255] offset1:128

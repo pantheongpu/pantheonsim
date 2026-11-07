@@ -83,6 +83,50 @@ hosted runner (the test sizes its compiles from the memory free when it starts,
 so it takes one compile at a time there). If a sanitizer job is killed with exit
 137 in its test step, or the build job in a CUTLASS compile, revert the commit.
 
+## Shards and the compile cache
+
+A survey of run 41545325796 on main found about 26,500 runner-seconds per run. Three tests were 35% of the unit job's CPU, and
+six jobs each compiled the same library. Two changes, neither of which removes a check:
+
+**Sharded tests.** `vgpu_shard_tests` (CMakeLists.txt) registers a long test as parallel parts, so that `ctest -j` can overlap them:
+
+| was | now | one part |
+|---|---|---|
+| `test_amd_gcn_tier_same_bits` (679 s plain, about 3,400 s under ASan) | `test_amd_gcn_tier_same_bits_shard_0of8` ... `_7of8` | every eighth corpus shape with a handler (`VGPU_TIER_SHARD=k/n`); a shape keeps its seed and flavours, so the eight run exactly the runs of the whole |
+| `test_amd_gcn_tier_same_bits_simd_base` (688 s) | `..._simd_base_shard_0of8` ... `_7of8` | the same, with `VGPU_SIMD=base` |
+| `e2e_sass_jit` (1,611 s) | `e2e_sass_jit_shard_tier`, `_steps`, `_steps_gather`, `_steps_shared`, `_random`, `_modes` | `VGPU_JIT_SHARD`: sass_tier's variants, sass_tier_steps' faults and region caps, its two step-limit bisections, the random kernels, the failure modes; each shard builds only the programs it runs |
+
+Each family also has a `_shards_partition` test (`tests/lint/check_shard_partition.sh`). The test or script lists the items a run would
+take (`VGPU_TIER_LIST=1`: corpus and line of each shape; `VGPU_JIT_LIST=1`: stage names) without running anything, and the check
+fails unless the shards' lists together are the whole list, every item once, none empty. The shard specs it checks are the ones the
+shard tests were registered with, so a shard added to one list and not the other cannot slip through.
+
+For local use: the binary still runs the whole test (`build/test_amd_gcn_tier_same_bits`, `nvidia/tests/e2e/run_sass_jit.sh`), `ctest -R
+test_amd_gcn_tier_same_bits` and `ctest -R '^e2e_sass_jit_shard'` run all the parts, and `-DVGPU_TEST_SHARDS=OFF` registers the old single
+tests under the old names. `e2e_sass_jit_full` (the nightly) is unchanged. In `ci.yml`'s ThreadSanitizer job the exclusion list
+names the tier shards, as it named the whole test.
+
+Shards only help when there are ctest slots to run them in, so the unit, ASan, TSan, `ml` and AMD code-object jobs now allow up to four
+(`ci/jobs.sh -g 6 -m 4`; was `-m 2`, and no `-j` at all in the AMD code-object job). The memory rule is unchanged: a machine with less
+than 6 GiB per slot gets fewer.
+
+**Compile cache.** `.github/actions/ccache` turns on ccache for the library's C and C++ compiles in the jobs that build it (the unit
+job under its own key, because it builds with `-Werror`; workloads and AMD code objects under `cuda12-release`; SASS, ollama and each
+ollama-amd job under `cuda13-release`; `ml` under `ml-release`, on its runner's disk). An object is looked up by the preprocessed
+source, the compiler's contents and the flags, so a hit is what the compiler would have made; `CCACHE_BASEDIR` makes the workspace
+path (`/home/runner/work/...` against `/__w/...`) irrelevant. The Actions cache holds it: one entry per main commit, written only by a
+push to main (`.github/actions/ccache-save`; a pull request reads the newest main entry and writes nothing), one writer per key (workloads
+for `cuda12-release`, SASS for `cuda13-release`, the unit job for its own), the others restore only. Links are not cached: the LTO link of
+the shims and the test executables still runs in every job. If ccache is not installed and cannot be (no root, no passwordless sudo), the job
+builds as before.
+
+Why not a build artifact shared between jobs: the jobs run in parallel, so one would have to `needs:` another (and wait for its tests, or
+a new build job would go in front of all of them); the build directory holds absolute paths, which differ between a container and a
+runner; and the toolchains differ (CUDA 12.0 and 13.0). A cache keyed on content needs none of that.
+
+To see what the cache does in a run, read the "ccache statistics" step of each job (hit rate, and misses by cause), and the step times
+of "Build" against the previous run. Not measured: this was written without a CI run.
+
 ## How CI has failed, and what it looked like
 
 **The pool went away or never answered.** A job whose label no online runner

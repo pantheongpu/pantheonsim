@@ -6,12 +6,20 @@
 // the fast path runs rather than hands the instruction back), 12 and 13 a second wave in the work-group and loads in flight, for
 // the store gate and the waits (any bits; small integers with half the lanes off), and, for the flat and global accesses only, 14
 // and 15, which point the address registers into memory that exists, in consecutive lanes and scattered (5 to 9 do not exist), 18 and 19
-// (LDS accesses only) which give the lanes consecutive LDS addresses, all on and one run of them on, and 20 the integers' edges (carries, borrows).
+// (LDS accesses only) which give the lanes consecutive LDS addresses, all on and one run of them on, 20 the integers' edges (carries, borrows),
+// and 25 to 31 (LDS accesses only) strided, broadcast, neighbours sharing a (misaligned) address, scattered with half the lanes off, and scattered with a
+// lane past the end of the LDS (the interpreter's error or zero read), and 30 and 31 one lane on the last bytes the LDS has (30) or one byte short of them (31).
+// and 32 and 33 (LDS accesses only) scattered in-range addresses with some lanes off, and lanes 8 bytes apart (the two-offset 64-bit forms).
 // Three seeds each (VGPU_TIER_SEEDS=n for more).
+// VGPU_TIER_SHARD=k/n runs the shapes whose number among those with a handler is k modulo n (0 <= k < n), so that ctest can run the n shards side by
+// side (CMakeLists.txt: test_amd_gcn_tier_same_bits_shardKofN); every shape's seed and flavours are what they are in the whole run, so the n shards
+// together run exactly the runs of the unsharded test, once each. VGPU_TIER_LIST=1 prints the shapes a run would take, one a line ("corpus:line"),
+// and runs nothing (tests/ci/check_shard_partition.sh checks that the shards' lists partition the whole list).
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <sstream>
 #include <string>
@@ -54,6 +62,11 @@ std::vector<std::string> lines_of(const std::string& path) {
 }  // namespace
 
 VTEST(every_tier_handler_gives_the_interpreters_bits) {
+  // The byte and halfword LDS accesses (one wave is the same instruction under another name, loads and stores alike: the operands are the same).
+  static const char* const kNarrowDs[] = {"ds_read_u8", "ds_read_i8", "ds_read_u16", "ds_read_i16", "ds_read_u8_d16", "ds_read_u8_d16_hi", "ds_read_i8_d16",
+                                          "ds_read_i8_d16_hi", "ds_read_u16_d16", "ds_read_u16_d16_hi", "ds_write_b8", "ds_write_b16",
+                                          "ds_write_b8_d16_hi", "ds_write_b16_d16_hi"};
+  uint32_t narrow_seen[2][std::size(kNarrowDs)] = {};   // (how many of each were run under all the names: CDNA's and RDNA's separately)
   size_t shapes = 0, with_handler = 0, runs = 0, wrong = 0;
   std::string report;
   std::map<std::string, size_t> failing;   // (by mnemonic)
@@ -66,9 +79,20 @@ VTEST(every_tier_handler_gives_the_interpreters_bits) {
 #else
   constexpr uint64_t kDefaultSeeds = 3;
 #endif
+  uint64_t shard_k = 0, shard_n = 1;
+  if (const char* sh = std::getenv("VGPU_TIER_SHARD")) {
+    char* end = nullptr;
+    shard_k = std::strtoull(sh, &end, 10);
+    if (*end != '/') throw vtest::Failure(std::string("VGPU_TIER_SHARD wants k/n, got '") + sh + "'");
+    shard_n = std::strtoull(end + 1, &end, 10);
+    if (*end || shard_n == 0 || shard_k >= shard_n) throw vtest::Failure(std::string("VGPU_TIER_SHARD wants k/n with k < n, got '") + sh + "'");
+  }
+  const bool list_only = std::getenv("VGPU_TIER_LIST") != nullptr;
   const uint64_t seeds = std::getenv("VGPU_TIER_SEEDS") ? std::strtoull(std::getenv("VGPU_TIER_SEEDS"), nullptr, 0) : kDefaultSeeds;
   for (const Corpus& c : kCorpora) {
+    size_t line_no = 0;
     for (const std::string& line : lines_of(std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/" + c.file)) {
+      ++line_no;
       if (line[0] == '#') continue;
       const size_t tab = line.find('\t');
       std::vector<uint8_t> code;
@@ -88,27 +112,51 @@ VTEST(every_tier_handler_gives_the_interpreters_bits) {
       ++shapes;
       if (!in.fast.run) continue;
       ++with_handler;
+      if ((with_handler - 1) % shard_n != shard_k) continue;   // (another shard's shape; with_handler still counts it, as the seeds below need)
+      if (list_only) {
+        std::printf("%s:%zu\n", c.file, line_no);
+        continue;
+      }
       // (A branch the corpus holds goes where it was: send it elsewhere, so that taking it shows.)
       if (in.name.rfind("s_branch", 0) == 0 || in.name.rfind("s_cbranch", 0) == 0) in.target = 0x1000;
+      const auto run_one = [&](const amd::gcn::Inst& inst) {
       for (uint64_t seed = 0; seed < seeds; ++seed)
-        for (uint32_t flavour = 0; flavour < 21; ++flavour) {
+        for (uint32_t flavour = 0; flavour < 34; ++flavour) {
+          if ((flavour == 32 || flavour == 33) && in.enc != amd::gcn::Enc::Ds) continue;   // (scattered and 8-byte-apart LDS addresses)
           if (flavour >= 5 && flavour <= 9) continue;
           if (flavour == 16) continue;   // (every register zero: not a state worth running)
-          if ((flavour == 14 || flavour == 15) && in.enc != amd::gcn::Enc::Flat) continue;   // (the flavours that give a global access real addresses)
-          if ((flavour == 18 || flavour == 19) && in.enc != amd::gcn::Enc::Ds) continue;   // (and an LDS access consecutive ones)
+          if (flavour >= 21 && flavour <= 24) continue;   // (the gather test's)
+          if (flavour >= 25 && inst.enc != amd::gcn::Enc::Ds) continue;   // (the LDS address shapes)
+          if ((flavour == 14 || flavour == 15) && inst.enc != amd::gcn::Enc::Flat) continue;   // (the flavours that give a global access real addresses)
+          if ((flavour == 18 || flavour == 19) && inst.enc != amd::gcn::Enc::Ds) continue;   // (and an LDS access consecutive ones)
           amd::gcn::tier::set_enabled(false);
-          const uint64_t off = amd::digest_instruction(in, c.target, seed * 7919 + with_handler, flavour);
+          const uint64_t off = amd::digest_instruction(inst, c.target, seed * 7919 + with_handler, flavour);
           amd::gcn::tier::set_enabled(true);
-          const uint64_t on = amd::digest_instruction(in, c.target, seed * 7919 + with_handler, flavour);
+          const uint64_t on = amd::digest_instruction(inst, c.target, seed * 7919 + with_handler, flavour);
           ++runs;
-          if (off != on && ++failing[in.name] <= 2)
-            example[in.name] += std::string("\n    ") + c.file + ": " + text + " (flavour " + std::to_string(flavour) + ", seed " + std::to_string(seed) + ")";
+          if (off != on && ++failing[inst.name] <= 2)
+            example[inst.name] += std::string("\n    ") + c.file + ": " + text + " (flavour " + std::to_string(flavour) + ", seed " + std::to_string(seed) + ")";
           if (off != on && ++wrong <= 12)
             report += std::string("\n  ") + c.file + ": " + text + " (flavour " + std::to_string(flavour) + ", seed " + std::to_string(seed) + ")";
         }
+      };
+      run_one(in);
+      // The byte and halfword LDS accesses are run under each other's names too (the corpora hold some of them; the operands are the same).
+      if (in.enc == amd::gcn::Enc::Ds) {
+        for (size_t f = 0; f < std::size(kNarrowDs); ++f)
+          if (in.name == kNarrowDs[f] && narrow_seen[in.arch == amd::gcn::Target::Gfx1030 || in.arch == amd::gcn::Target::Gfx1100 || in.arch == amd::gcn::Target::Gfx1200 ? 1 : 0][f]++ < 1)
+            for (const char* n : kNarrowDs) {
+              if (in.name == n) continue;
+              amd::gcn::Inst copy = in;
+              copy.name = n;
+              amd::gcn::finalize(copy);
+              if (copy.fast.run) run_one(copy);
+            }
+      }
     }
   }
   amd::gcn::tier::set_enabled(was_on);
+  if (list_only) return;
   std::fprintf(stderr, "tier handlers: %zu of %zu shapes, %zu runs each way, %llu handed back to the interpreter\n", with_handler, shapes,
                runs, static_cast<unsigned long long>(amd::gcn::tier::bails()));
   if (wrong) {

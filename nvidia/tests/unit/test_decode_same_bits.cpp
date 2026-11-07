@@ -162,7 +162,7 @@ VTEST(words_with_flipped_bits_decode_to_the_same_bits) {
     words.push_back({w, 16 * (rng.next() % 4096)});
   }
   const std::vector<int> archs = {75, 86, 90, 100, 120};
-  check("flipped", run_pass("flipped", words, archs), "58fa54e059f075320a77d7f8e4216083");
+  check("flipped", run_pass("flipped", words, archs), "8f6753506417a0e110243f4bee6bd934");
 }
 
 VTEST(random_opcodes_decode_to_the_same_bits) {
@@ -175,7 +175,7 @@ VTEST(random_opcodes_decode_to_the_same_bits) {
     words.push_back({w, 16 * (rng.next() % 4096)});
   }
   const std::vector<int> archs = {80, 89, 103, 120};
-  check("random", run_pass("random", words, archs), "4b0bac32212e13c16350103e837735fa");
+  check("random", run_pass("random", words, archs), "74fdb982067245257620e41c62013bfe");
 }
 
 VTEST(bench_decode) {

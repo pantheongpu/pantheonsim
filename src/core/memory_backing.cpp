@@ -11,14 +11,30 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <new>
 #include <string>
 #include <vector>
 
 #include "vgpu/error.hpp"
 #include "vgpu/memory.hpp"
 
+// Under AddressSanitizer a chunk is a heap allocation, as it always was: the sanitizer puts red zones round it, which is how a write
+// past a chunk's end is caught. Otherwise chunks are carved from arenas (see arena_chunk).
+#if defined(__SANITIZE_ADDRESS__)
+#define VGPU_HEAP_CHUNKS 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define VGPU_HEAP_CHUNKS 1
+#endif
+#endif
+
 namespace vgpu::backing {
 namespace {
+
+// Heap chunks come from arenas: mappings of kArenaBytes, aligned to the huge page, that the kernel is asked to back with huge pages
+// (a program that fills gigabytes of device memory takes one page fault for each 2 MiB, not 512). A fresh mapping reads as zero.
+constexpr uint64_t kHugePage = 2ull << 20;
+constexpr uint64_t kArenaBytes = 64ull << 20;
 
 // The spill file grows a slice at a time: one fallocate and one mmap per
 // 256 MiB rather than per chunk.
@@ -42,6 +58,13 @@ struct State {
   // Heap chunks given back nearly untouched, all zero, ready to hand out. They count as released in
   // `ram`; acquire() counts them again.
   std::vector<uint8_t*> pool;
+  // Heap chunks whose pages went back to the kernel (madvise DONTNEED: they read as zero on the next touch and cost no memory until
+  // then), ready to hand out; and where the chunks of the arena being carved go on from.
+  std::vector<uint8_t*> cold;
+  uint8_t* arena_next = nullptr;
+  uint8_t* arena_end = nullptr;
+  // Chunks release() is clearing outside the lock, on their way into the pool: they count against its room.
+  uint64_t pool_pending = 0;
 
   // The host-memory guard. since_check counts heap chunks since the last look
   // at the host; zero means the next heap chunk looks. low is what the last
@@ -212,13 +235,45 @@ void look_at_host(State& s) {
   s.low = (look.have_available || look.have_cgroup) && look.headroom < look.reserve;
 }
 
+// Gives a heap chunk's memory back to the system, and the chunk goes on the cold list: it reads as zero when it is next touched.
+// (Where the pages cannot be dropped, the chunk is cleared by hand.)
+void make_cold(State& s, uint8_t* chunk) {
+#ifdef VGPU_HEAP_CHUNKS
+  (void)s;
+  delete[] chunk;
+#else
+  if (::madvise(chunk, kChunkSize, MADV_DONTNEED) != 0) std::memset(chunk, 0, kChunkSize);
+  s.cold.push_back(chunk);
+#endif
+}
+
+// Gives the pool's chunks back to the system; how many.
+uint64_t drain_pool(State& s) {
+  const uint64_t n = s.pool.size();
+  for (uint8_t* c : s.pool) make_cold(s, c);
+  s.pool.clear();
+  s.pool.shrink_to_fit();
+  return n;
+}
+
+// Looks at the host and, if it is short while the pool holds chunks, gives those back and looks again: the pool is
+// memory kept for reuse, never a reason to refuse or spill an allocation the host could have served had the chunks been
+// returned when they were released.
+void look_at_host_with_pool(State& s) {
+  look_at_host(s);
+  if (s.low && !s.pool.empty()) {
+    drain_pool(s);
+    look_at_host(s);
+  }
+}
+
 // Whether the host is short of memory, looked at once per host_check_every_chunks
 // heap chunks (the first chunk always looks). A shortage is looked at again on
 // the very next chunk when there is nowhere to spill, so that the program that
 // catches the error and frees memory is not refused for 16 MiB more than it
 // has to be.
 bool host_is_short(State& s) {
-  if (s.since_check == 0) look_at_host(s);
+  if (s.since_check == 0) look_at_host_with_pool(s);
   const uint64_t every = std::max<uint64_t>(1, s.config.host_check_every_chunks);
   if (++s.since_check >= every || (s.low && s.config.spill_dir.empty())) s.since_check = 0;
   return s.low;
@@ -358,6 +413,32 @@ void configure(const Config& config) {
   }
 }
 
+#ifndef VGPU_HEAP_CHUNKS
+// A zero chunk of the heap, the lock held: one that went back to the kernel, or the next of the arena, which is a fresh mapping.
+uint8_t* arena_chunk(State& s) {
+  if (!s.cold.empty()) {
+    uint8_t* chunk = s.cold.back();
+    s.cold.pop_back();
+    return chunk;
+  }
+  if (s.arena_next == s.arena_end) {
+    // (the head and tail the alignment leaves stay mapped and untouched: they cost no memory)
+    void* m = ::mmap(nullptr, kArenaBytes + kHugePage, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (m == MAP_FAILED) {
+      s.ram -= kChunkSize;
+      throw std::bad_alloc();
+    }
+    const uintptr_t base = (reinterpret_cast<uintptr_t>(m) + kHugePage - 1) & ~(kHugePage - 1);
+    ::madvise(reinterpret_cast<void*>(base), kArenaBytes, MADV_HUGEPAGE);   // (a kernel without huge pages says no, and nothing is lost)
+    s.arena_next = reinterpret_cast<uint8_t*>(base);
+    s.arena_end = s.arena_next + kArenaBytes;
+  }
+  uint8_t* chunk = s.arena_next;
+  s.arena_next += kChunkSize;
+  return chunk;
+}
+#endif
+
 uint8_t* acquire() {
   State& s = state();
   std::unique_lock<std::mutex> lock(s.mu);
@@ -378,9 +459,13 @@ uint8_t* acquire() {
       s.pool.pop_back();
       return chunk;
     }
+#ifdef VGPU_HEAP_CHUNKS
     lock.unlock();
     // Value-initialized: the chunk arrives zeroed, as untouched memory reads.
     return new uint8_t[kChunkSize]();
+#else
+    return arena_chunk(s);
+#endif
   }
   if (s.free_file.empty()) grow(s);
   uint8_t* chunk = s.free_file.back();
@@ -395,33 +480,68 @@ uint8_t* acquire() {
   return chunk;
 }
 
-// How many chunks are kept. (What may be cleared under the lock to keep one is kPoolMaxDirty, in the header.)
-constexpr size_t kPoolMax = 64;
+// Whether the pool has room for one more chunk: it holds at most Config::pool_max_bytes, and where the RAM limit is set
+// (it is what decides when chunks come from the spill file) no more than the limit leaves beside the chunks in use.
+bool pool_has_room(const State& s) {
+  uint64_t cap = s.config.pool_max_bytes;
+  if (s.config.ram_limit_bytes != std::numeric_limits<uint64_t>::max())
+    cap = std::min(cap, s.config.ram_limit_bytes > s.ram ? s.config.ram_limit_bytes - s.ram : uint64_t{0});
+  return (s.pool.size() + s.pool_pending + 1) * kChunkSize <= cap;
+}
+
+// A heap chunk the pool has no room for: its pages go back to the kernel outside the lock (which that takes its time over), and it
+// is handed out again, zero, from the cold list.
+void give_back(State& s, uint8_t* chunk) {
+#ifdef VGPU_HEAP_CHUNKS
+  (void)s;
+  delete[] chunk;
+#else
+  if (::madvise(chunk, kChunkSize, MADV_DONTNEED) != 0) std::memset(chunk, 0, kChunkSize);
+  std::lock_guard<std::mutex> lock(s.mu);
+  s.cold.push_back(chunk);
+#endif
+}
 
 void release(uint8_t* chunk, uint64_t dirty_bytes) {
   if (!chunk) return;
   State& s = state();
-  std::lock_guard<std::mutex> lock(s.mu);
-  adopt_after_fork(s);
-  uint64_t off = 0;
-  if (in_slices(s.inherited, chunk, &off)) return;  // the parent's; see adopt_after_fork
-  if (s.fd >= 0 && file_offset(s, chunk, &off)) {
-    // The hole returns the disk space and makes the chunk read as zero when it
-    // is handed out again. Where holes are not supported, zero it by hand.
-    if (::fallocate(s.fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(off),
-                    static_cast<off_t>(kChunkSize)) != 0)
-      std::memset(chunk, 0, kChunkSize);
-    s.free_file.push_back(chunk);
-    s.spill -= kChunkSize;
+  bool keep = false;
+  {
+    std::lock_guard<std::mutex> lock(s.mu);
+    adopt_after_fork(s);
+    uint64_t off = 0;
+    if (in_slices(s.inherited, chunk, &off)) return;  // the parent's; see adopt_after_fork
+    if (s.fd >= 0 && file_offset(s, chunk, &off)) {
+      // The hole returns the disk space and makes the chunk read as zero when it
+      // is handed out again. Where holes are not supported, zero it by hand.
+      if (::fallocate(s.fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(off),
+                      static_cast<off_t>(kChunkSize)) != 0)
+        std::memset(chunk, 0, kChunkSize);
+      s.free_file.push_back(chunk);
+      s.spill -= kChunkSize;
+      return;
+    }
+    s.ram -= kChunkSize;
+    keep = pool_has_room(s);
+    if (keep) ++s.pool_pending;   // a place is held while the chunk is cleared, which is done without the lock
+  }
+  // (a chunk past the pool's room goes back to the heap outside the lock, which the allocator may take its time over)
+  if (!keep) {
+    give_back(s, chunk);
     return;
   }
-  s.ram -= kChunkSize;
-  if (dirty_bytes <= kPoolMaxDirty && s.pool.size() < kPoolMax) {
-    std::memset(chunk, 0, static_cast<size_t>(dirty_bytes));
-    s.pool.push_back(chunk);
-    return;
+  // Cleared to the byte promised: everything from there on is zero already.
+  std::memset(chunk, 0, static_cast<size_t>(std::min<uint64_t>(dirty_bytes, kChunkSize)));
+  {
+    std::lock_guard<std::mutex> lock(s.mu);
+    --s.pool_pending;
+    // (the limits may have moved while the chunk was being cleared)
+    if (pool_has_room(s)) {
+      s.pool.push_back(chunk);
+      return;
+    }
   }
-  delete[] chunk;
+  give_back(s, chunk);
 }
 
 uint64_t pooled_chunks() {

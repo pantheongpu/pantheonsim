@@ -1580,6 +1580,13 @@ struct BcCache {
   BlockFormat format = BlockFormat::None;
   DecodedBlock block{};
 };
+// The host thread's table of bank passes by warp shape (made on the thread's first warp that needs it).
+[[gnu::noinline]] memcount::PtxBankMemo& thread_bank_memo() {
+  thread_local std::unique_ptr<memcount::PtxBankMemo> memo;
+  if (!memo) memo = std::make_unique<memcount::PtxBankMemo>();
+  return *memo;
+}
+
 thread_local BcCache t_bc;
 
 uint64_t bc_texel_bits(const MemoryManager& mem, const TextureDesc& d, uint32_t x, uint32_t y, uint32_t z, uint32_t ch) {
@@ -5552,7 +5559,10 @@ class Interpreter {
       // access wider than a word touches consecutive words, which the hardware
       // takes in separate passes -- counting each word is what makes a
       // conflict-free 8-byte access come out as conflict-free.
-      const uint32_t worst = memcount::ptx_bank_passes(addrs.data(), m, W_, span);
+      // (The closed forms first; a warp on no stride goes to the host thread's table of passes by shape.)
+      uint32_t worst;
+      if (!memcount::ptx_bank_passes_closed(addrs.data(), m, W_, span, worst))
+        worst = memcount::ptx_bank_passes_open(thread_bank_memo(), addrs.data(), m, W_, span);
       stats_.shared_bank_conflicts += worst - 1;
       ++stats_.shared_requests;
       if (is_store) {
@@ -7579,6 +7589,7 @@ class Interpreter {
     }
     if (const auto* op = std::get_if<OpSelp>(&ins.op)) {
       Mask p = read_pred(w, ins, op->pred);
+      if (op->pred_negated) p = ~p;
       Lanes _s_a;
       const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
       Lanes _s_b;
@@ -8637,8 +8648,11 @@ class Interpreter {
           if (op->ty.is_float())
             r[lane] = float_sign_op(op->ty.bits, v[lane], op->ftz, /*negate=*/false);
           else {
-            int64_t x = op->ty.bits == 64 ? static_cast<int64_t>(v[lane])
-                                          : int64_t{static_cast<int32_t>(v[lane])};
+            // A 16-bit register may hold zeros above bit 15 (mov.b16, cvt.u16.u32), so the value is
+            // the low `bits` bits sign-extended, not the 32-bit register read as s32.
+            const uint32_t bits = op->ty.bits;
+            int64_t x = bits >= 64 ? static_cast<int64_t>(v[lane])
+                                   : static_cast<int64_t>(v[lane] << (64 - bits)) >> (64 - bits);
             r[lane] = static_cast<uint64_t>(x < 0 ? -x : x);
           }
         }
@@ -9029,8 +9043,10 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpPredBin>(&ins.op)) {
-      const Mask a = op->a_imm >= 0 ? (op->a_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->a);
-      const Mask b = op->b_imm >= 0 ? (op->b_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->b);
+      Mask a = op->a_imm >= 0 ? (op->a_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->a);
+      Mask b = op->b_imm >= 0 ? (op->b_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->b);
+      if (op->a_neg) a = ~a;
+      if (op->b_neg) b = ~b;
       Mask r = op->op == PredBinOp::And ? (a & b) : op->op == PredBinOp::Or ? (a | b) : (a ^ b);
       Mask& p = pred_slot(w, op->dst);
       p = (p & ~m) | (r & m);
@@ -9038,6 +9054,7 @@ class Interpreter {
     }
     if (const auto* op = std::get_if<OpNotPred>(&ins.op)) {
       Mask s = read_pred(w, ins, op->src);
+      if (op->src_neg) s = ~s;
       Mask& p = pred_slot(w, op->dst);
       p = (p & ~m) | (~s & m);
       return;
@@ -13433,6 +13450,23 @@ class Interpreter {
     // (MemoryManager::load_batch). Otherwise the lane loop below, which meets
     // any error at the lane it belongs to.
     if ((op.space == Space::Global || op.space == Space::Generic) && n <= 4 && !(op.ordered && n > 1)) {
+      // A whole warp of one value each: `at` already holds the addresses, in lane order, that the loop below would build, so
+      // they go to memory as they are and the values come back into the register's row without a copy (a warp whose lanes
+      // all name one address, the broadcast of a loop-invariant element, is one load: MemoryManager::load_broadcast).
+      if (n == 1 && W_ == 32 && m == all_lanes(W_) && va_pow2 && fast_enabled_) {
+        uint64_t any = 0, diff = 0;
+        for (uint32_t l = 0; l < W_; ++l) {
+          any |= at[l];
+          diff |= at[l] ^ at[0];
+        }
+        if ((any & (va - 1)) == 0) {
+          Lanes got;
+          if ((diff == 0 && mem_.load_broadcast(at[0], W_, size, got.data())) || mem_.load_batch(at.data(), W_, size, got.data())) {
+            write_loaded(w, op.dsts[0], m, got, op.ty);
+            return;
+          }
+        }
+      }
       uint64_t fa[kMaxWarpSize * 4], fv[kMaxWarpSize * 4];
       size_t cnt = 0;
       bool ok = true;
@@ -13644,6 +13678,29 @@ class Interpreter {
     // in lane order and element order, when they are all ordinary aligned device
     // memory with no fault armed; the lane loop below otherwise.
     if ((op.space == Space::Global || op.space == Space::Generic) && n <= 4 && !(op.ordered && n > 1)) {
+      // A whole warp of one value each, as in exec_ld: `at` goes to memory as it is, and a warp on a constant stride (a
+      // column of a row-major array) is stored a chunk at a time (MemoryManager::store_strided); a store that either
+      // declines has stored nothing.
+      if (n == 1 && W_ == 32 && m == all_lanes(W_) && va_pow2 && fast_enabled_) {
+        uint64_t any = 0, bad = 0;
+        const uint64_t step = at[1] - at[0];
+        for (uint32_t l = 0; l < W_; ++l) {
+          any |= at[l];
+          if (l) bad |= (at[l] - at[l - 1]) ^ step;
+        }
+        if ((any & (va - 1)) == 0) {
+          uint64_t sv[kMaxWarpSize];
+          for (uint32_t l = 0; l < W_; ++l) sv[l] = mask_to_bits(vals[0][l], op.ty.bits);
+          size_t failed_at = 0;
+          try {
+            if ((bad == 0 && mem_.store_strided(at[0], static_cast<int64_t>(step), W_, size, sv, &failed_at)) ||
+                mem_.store_batch(at.data(), W_, size, sv, &failed_at))
+              return;
+          } catch (const Error& e) {
+            rethrow_with_context(e, ins, static_cast<int>(failed_at));
+          }
+        }
+      }
       uint64_t fa[kMaxWarpSize * 4], fv[kMaxWarpSize * 4];
       uint8_t fl[kMaxWarpSize * 4];
       size_t cnt = 0;

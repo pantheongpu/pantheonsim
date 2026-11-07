@@ -68,6 +68,10 @@ struct Config {
   std::string meminfo_path = "/proc/meminfo";
   std::string cgroup_root = "/sys/fs/cgroup";
   std::string cgroup_self = "/proc/self/cgroup";
+  // The most heap memory kept, cleared, for the next acquire() (chunks that release() was given). The
+  // pool never holds more than this, nor more than the RAM limit leaves room for beside the chunks in
+  // use, and it goes back to the host the moment the host-memory guard finds the host short.
+  uint64_t pool_max_bytes = 1024ull * 1024 * 1024;
 };
 
 // The configuration the environment gives: VGPU_MEMORY_RAM_MB, VGPU_MEMORY_DIR,
@@ -89,14 +93,15 @@ uint8_t* acquire();
 // Gives a chunk back. A file chunk has its disk blocks released at once.
 //
 // `dirty_bytes` is a promise from the caller: every byte of the chunk from that offset on is still
-// zero. A heap chunk with only a few bytes written (a kernel's argument block, a flag) then goes to
-// a short list of chunks to hand out again, cleared below the offset, and not back to the heap to be
-// zeroed whole by the next acquire(). The default promises nothing.
+// zero. A heap chunk then goes to a list of chunks to hand out again (Config::pool_max_bytes of them at most), cleared
+// below the offset, and not back to the heap to be zeroed whole by the next acquire(): a chunk with only a few bytes
+// written (a kernel's argument block, a flag) costs the clearing of those. The default promises nothing.
 inline constexpr uint64_t kAllBytesDirty = ~uint64_t{0};
-// The most that is cleared (under the lock) to keep a chunk: a buffer of a few KiB, allocated, written and freed
-// over and over, then costs the clearing of what it wrote and not a heap allocation and the zeroing of all 64 KiB
-// on every allocation. Past it the chunk goes back to the heap.
-inline constexpr uint64_t kPoolMaxDirty = 32 * 1024;
+// The most that is cleared to keep a chunk, which is all of it: a buffer allocated, written and freed over and
+// over then costs the clearing of what it wrote (bytes that are in the cache) and not a heap allocation, the
+// page faults of a fresh mapping and the zeroing of all 64 KiB on every allocation. How many chunks are kept is
+// Config::pool_max_bytes.
+inline constexpr uint64_t kPoolMaxDirty = 64 * 1024;
 void release(uint8_t* chunk, uint64_t dirty_bytes = kAllBytesDirty);
 // Chunks kept for hand-out (cleared, not counted in ram_bytes()).
 uint64_t pooled_chunks();

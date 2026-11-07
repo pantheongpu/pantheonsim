@@ -7,6 +7,32 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- License: from the next release PantheonSim is under the Business Source License 1.1, which keeps it free to use, change and run in
+  your own CI and allows one restriction: you may not offer it to other people as a hosted or managed service. Each version becomes
+  Apache-2.0 four years after release. Versions up to 0.2.0 stay Apache-2.0 (`LICENSE-APACHE-2.0`). `docs/licensing.md` has the
+  details, and contributions now need the Contributor Agreement.
+- SASS: `ULDC` with a uniform base register (`ULDC.64 UR6, c[0x3][UR8+-0x72e0]`) takes its offset as a signed 16-bit number and wraps in the
+  64 KiB bank, as `LDC` does. ptxas uses it to reach constant data past byte 32768, and the simulator read zero there on the Ampere and Ada
+  profiles (an inverse NTT in FIDESlib came out all zeros) (pantheonsim #499).
+- `vgpu shell --rootfs`: opt-in private root. The session gets its own root on a tmpfs (entered with `pivot_root` inside the mount
+  namespace the shell already makes): the host's `/usr`, `/bin`, `/sbin`, `/lib*` and the `/etc` entries a loader, resolver, TLS
+  and shell need come through read-only; `/root`, `/home`, `/opt`, `/tmp`, `/var/tmp` and `/work` start empty and are discarded on
+  exit; `/dev` is minimal; `/proc`, `/sys` and the simulated GPU surfaces are as before; `/usr/local/cuda` and `/opt/rocm` appear
+  only where the host has a toolkit. `-v HOST:DEST[:ro]` (repeatable) adds host paths the way `docker run -v` does and `--home DIR`
+  keeps `/root`. Where user namespaces are refused it exits `1` rather than fall back to the host's files. Default behaviour is
+  unchanged. See [docs/machine-simulator.md](docs/machine-simulator.md#a-private-root---rootfs).
+- PTX: `abs.s16` takes the sign from bit 15 of the register. It used to read the whole 32-bit register as s32, so a negative
+  value written with zero upper bits (`mov.b16 a, 0xff81`, `cvt.u16.u32`) came back unchanged instead of as `0x007f`.
+- PTX accepts unary `~` on an integer constant (`and.b64 %rd3, %rd3, ~0x2;`), alone, nested, with `-` or in
+  parentheses, at the width of the instruction; the lexer used to stop with `unexpected character '~'`
+  (pantheonsim #483).
+- PTX: a negated predicate source (`and.pred %p2, !%p0, %p1;`, also `or`, `xor`, `not.pred` and the predicate of `selp`) is accepted. drjit-core
+  emits it for boolean operations, and the module used to fail to load with `expected operand, got '!'`.
+- PTX: `ldu.global` (the uniform load, scalar and `.v2`/`.v4`) runs as the `ld.global` it stands for.
+- PTX: the array-element address `var[imm]` (`st.local.b32 arr[0], %f0;`, also `[arr[1]]`) is accepted for `.local`, `.shared`,
+  `.global` and `.const` arrays. The index counts elements of the declared type; one outside the array is refused.
+- PTX: a `.func` can take its parameters and return its value in `.reg`s (`.func (.reg .b32 r) f(.reg .u64 data)`), and a call
+  (direct, or through a `.callprototype` with `.reg`s) passes registers or numbers for them.
 - libcuda exports the OpenGL, EGL and VDPAU interop functions (`cuGraphicsGLRegisterBuffer`,
   `cuGraphicsGLRegisterImage`, `cuGLGetDevices`, `cuGLCtxCreate`, the legacy `cuGL*BufferObject` family,
   `cuGraphicsEGLRegisterImage`, `cuEGLStream*`, `cuVDPAU*`, `cuGraphicsVDPAURegister*`) and `cuGetProcAddress`

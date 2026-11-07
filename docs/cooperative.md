@@ -131,6 +131,15 @@ flight together; run one after another every block wins them all).
   (`src/exec/interpreter.cpp`) and `amd_kernel_polls` (`amd/src/gcn_exec.cpp`); for
   AMD it assumes, and the ISA guides do not say, that a compiler marks the loads of a
   polling loop with cache-control bits.
+  A SASS loop that stores and moves its address when it finds work (Barnes-Hut's
+  `SortKernel`: `while (k >= bottom) { s = volatile start[k]; if (s >= 0) { ...stores...;
+  k -= dec; } __syncthreads(); }`) is a poll on the turns that find nothing, and is
+  taken too: `kernel_polls_conditional` follows the paths through the loop body,
+  leaving out what a guard on the polled value skips and trying first the side of a
+  branch on the polled value that skips the work, and asks the test above of the first
+  path that goes round. A call is allowed when it goes to straight code with no store
+  that ends in EXIT or RET (ptxas's shared exit stub). The PTX and AMD searches do not
+  have this form yet.
 - **How many are resident.** The runtime works out how many blocks of the kernel the
   device holds at once, as `cudaOccupancyMaxActiveBlocksPerMultiprocessor` does,
   times the multiprocessors (`LaunchConfig::resident_blocks`, `Dispatch::resident_groups`).
@@ -139,7 +148,11 @@ flight together; run one after another every block wins them all).
   instructions per warp, in the order the blocks started. When a block finishes the
   grid's next block takes its place, so blocks beyond the capacity start as earlier
   ones end. A grid of fewer than 16 blocks uses one thread and starts them all, so the
-  order is the same on every run. A larger one uses every host thread it has two blocks for; a thread starts
+  order is the same on every run, when its kernel takes locks (an atomic that returns its old value
+  in a loop: RXMesh's patch locks). A kernel whose waits are only loads (CUB's radix-sort look-back, a
+  flag chain; SASS engine) gives the same answer in any order, so such a small grid uses the host threads
+  too (two blocks to a thread at least), every block resident from the start; its count of failed polls
+  then follows the schedule, as a larger grid's does (at `VGPU_THREADS=1` everything is as before). A larger one uses every host thread it has two blocks for; a thread starts
   with one block, as the old path did (the AMD engine takes ranges of consecutive
   groups, as it did), and holds one more at a time only after no block on any thread has
   stored (to shared or global memory) or finished for three milliseconds, then one more

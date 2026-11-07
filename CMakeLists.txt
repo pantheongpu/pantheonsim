@@ -396,6 +396,10 @@ target_include_directories(amd_exec_bench PRIVATE amd/include)
 add_executable(amd_matrix_bench amd/tools/matrix-bench.cpp)
 target_link_libraries(amd_matrix_bench PRIVATE vgpu)
 target_include_directories(amd_matrix_bench PRIVATE amd/include)
+# What the tier saves on the LDS instructions with two offsets (amd/tools/lds-bench.cpp).
+add_executable(amd_lds_bench amd/tools/lds-bench.cpp)
+target_link_libraries(amd_lds_bench PRIVATE vgpu)
+target_include_directories(amd_lds_bench PRIVATE amd/include)
 # What one tensor-core instruction costs the simulator, PTX and SASS (nvidia/tools/tensor-bench.cpp).
 add_executable(nvidia_tensor_bench nvidia/tools/tensor-bench.cpp)
 target_link_libraries(nvidia_tensor_bench PRIVATE vgpu)
@@ -1310,7 +1314,7 @@ else()
 endif()
 
 # CLI
-add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/debug.cpp src/cli/test.cpp src/cli/check.cpp src/cli/ncu.cpp
+add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/shell_rootfs.cpp src/cli/run.cpp src/cli/debug.cpp src/cli/test.cpp src/cli/check.cpp src/cli/ncu.cpp
                src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp src/cli/lspci.cpp
                src/cli/config.cpp src/cli/config_cmd.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
@@ -1345,7 +1349,51 @@ function(vgpu_unit_test name)
   add_executable(${name} ${_src})
   target_link_libraries(${name} PRIVATE vgpu)
   target_include_directories(${name} PRIVATE tests/framework)
-  add_test(NAME ${name} COMMAND ${name})
+  if(NOT VGPU_UNIT_TEST_NO_ADD_TEST)   # (a sharded test registers its shards itself: vgpu_shard_tests)
+    add_test(NAME ${name} COMMAND ${name})
+  endif()
+endfunction()
+
+# Long tests are split so that ctest -j can run the parts side by side (docs/performance.md, "CI time"). The test picks its part from the
+# environment variable ENV_VAR, whose value is one of SPECS; the part named by no value is the whole test.
+#   vgpu_shard_tests(<base> ENV_VAR <var> LIST_ENV <var> SPECS <spec>... COMMAND <cmd>... [ENVIRONMENT <v=x>...] [PROPERTIES <p v>...])
+# registers <base>_shard_<spec> for each spec ("/" in a spec reads "of": test_x_shard_3of8; the properties and the environment of the whole test, plus ENV_VAR=<spec>), and
+# <base>_shards_partition, which lists what each shard would run (LIST_ENV=1 makes the command list its items and run nothing) and fails unless
+# the lists together are the whole test's list, every item once (tests/lint/check_shard_partition.sh). With -DVGPU_TEST_SHARDS=OFF the whole test is
+# registered under its old name <base> instead, as before the split.
+option(VGPU_TEST_SHARDS "Register the long tests as parallel shards (OFF: each as one test under its old name)" ON)
+function(vgpu_shard_tests base)
+  cmake_parse_arguments(S "" "ENV_VAR;LIST_ENV" "SPECS;COMMAND;ENVIRONMENT;PROPERTIES" ${ARGN})
+  if(NOT VGPU_TEST_SHARDS)
+    add_test(NAME ${base} COMMAND ${S_COMMAND})
+    if(S_PROPERTIES)
+      set_tests_properties(${base} PROPERTIES ${S_PROPERTIES})
+    endif()
+    if(S_ENVIRONMENT)
+      set_property(TEST ${base} APPEND PROPERTY ENVIRONMENT ${S_ENVIRONMENT})
+    endif()
+    return()
+  endif()
+  foreach(_spec ${S_SPECS})
+    string(REPLACE "/" "of" _suffix "${_spec}")
+    set(_name ${base}_shard_${_suffix})
+    add_test(NAME ${_name} COMMAND ${S_COMMAND})
+    if(S_PROPERTIES)
+      set_tests_properties(${_name} PROPERTIES ${S_PROPERTIES})
+    endif()
+    set_property(TEST ${_name} APPEND PROPERTY ENVIRONMENT ${S_ENVIRONMENT} "${S_ENV_VAR}=${_spec}")
+  endforeach()
+  set(_list_env ${S_ENVIRONMENT} "${S_LIST_ENV}=1")
+  # CMake swaps a target name for its file only when it is the command itself; here it is an argument of the script, so spell the path out.
+  set(_partition_command ${S_COMMAND})
+  list(GET _partition_command 0 _partition_exe)
+  if(TARGET ${_partition_exe})
+    list(REMOVE_AT _partition_command 0)
+    list(PREPEND _partition_command "$<TARGET_FILE:${_partition_exe}>")
+  endif()
+  add_test(NAME ${base}_shards_partition
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shard_partition.sh ${S_ENV_VAR} ${S_SPECS} -- ${_partition_command})
+  set_tests_properties(${base}_shards_partition PROPERTIES ENVIRONMENT "${_list_env}" TIMEOUT 600)
 endfunction()
 
 vgpu_unit_test(test_yamlish)
@@ -1371,6 +1419,11 @@ target_compile_definitions(test_exec PRIVATE VGPU_KERNEL_DIR="${CMAKE_SOURCE_DIR
 vgpu_unit_test(test_runtime)
 vgpu_unit_test(test_exec2)
 vgpu_unit_test(test_exec3)
+vgpu_unit_test(test_ptx_bitwise_not)
+# PTX forms JIT compilers emit: negated predicate sources, .reg .func parameters, var[imm] addresses, ldu.
+vgpu_unit_test(test_ptx_forms)
+# 16-bit signed integer forms on registers with zero upper bits (abs.s16 and its siblings).
+vgpu_unit_test(test_ptx_int16)
 # Hopper (sm_90a): the warpgroup MMA, against the ISA's own layout examples.
 vgpu_unit_test(test_hopper)
 # Blackwell (sm_100a): Tensor Memory and tcgen05, against the ISA's figures.
@@ -1436,6 +1489,8 @@ add_test(NAME test_memcount_forms_simd_base COMMAND test_memcount_forms)
 set_tests_properties(test_memcount_forms_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base" TIMEOUT 1500)
 # The table of bank passes by warp shape (sass_bank_passes_memo), against the definition of the passes.
 vgpu_unit_test(test_bank_memo)
+# The bitmap counting of the passes of 1 to 4 byte accesses (detail::bank_passes_bitmap), against the definition of the passes.
+vgpu_unit_test(test_bank_bitmap)
 # The single-lookup atomic read-modify-write and the one-lookup texel read, against the per-access code they replace.
 vgpu_unit_test(test_atom_rmw)
 # Module::code_at (a binary search over the code sections) against the scan it replaced.
@@ -1459,19 +1514,33 @@ vgpu_unit_test(test_sass_s2r_fill)
 vgpu_unit_test(test_sass_ldgsts)
 # LD and ST of generic addresses: the tier's window rule against the interpreter and the rule written out.
 vgpu_unit_test(test_sass_generic_mem)
+add_test(NAME test_sass_generic_mem_simd_base COMMAND test_sass_generic_mem)
+set_tests_properties(test_sass_generic_mem_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base")
 # CALL.REL, RET, WARPSYNC and FCHK run by the tier's own code, and a whole warp's shared-memory offsets, against the interpreter's: registers and counters.
 vgpu_unit_test(test_sass_dispatch)
 target_include_directories(test_sass_dispatch PRIVATE src)
 vgpu_unit_test(test_launch_env)
 # Blocks that wait on one another, on fewer host cores than threads: a waiting thread gives its turn up (the CI flake of lockstep.gfx942).
 vgpu_unit_test(test_lockstep_yield)
+# How many host threads a lockstep grid takes: a small one of waits on loads spreads, one that takes locks stays on one thread.
+vgpu_unit_test(test_lockstep_shape)
+# The fingerprint of a block's registers (eight chains for long inputs): any one-byte change changes it, at every length.
+vgpu_unit_test(test_lockstep_fold)
+# When a lockstep launch first looks at its blocks (after what the last look cost, per resident block), and that a block standing still is found out.
+vgpu_unit_test(test_lockstep_look)
 vgpu_unit_test(test_sass_lea)
+# ULDC c[bank][URa + offset]: the offset is signed and the address wraps in the 64 KiB bank (pantheonsim #499).
+vgpu_unit_test(test_sass_uldc_indexed)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
 vgpu_unit_test(test_simd)
 # An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.
 vgpu_unit_test(test_tc_ampere)
 # The vector kernels of that sum against a frozen copy of the earlier form, bit for bit, over random and adversarial operands.
 vgpu_unit_test(test_tc_ampere_fast)
+# IMMA.16816 / 16832 (8-bit operands) straight from the registers (include/vgpu/exec/imma_frag.hpp) against the definition, every sign combination.
+vgpu_unit_test(test_imma_frag)
+# LDSM's data movement (include/vgpu/exec/ldsm.hpp) against the element-at-a-time form it replaced, rows anywhere in the array and at a page's end.
+vgpu_unit_test(test_ldsm_move)
 # The PTX engine's SIMD route for mma.sync against its general path (VGPU_FASTPATH=0), bit for bit.
 vgpu_unit_test(test_mma_fast)
 # The tile-product kernels and the wgmma/mma operand code against the scalar loops they replace, bit for bit.
@@ -1705,8 +1774,15 @@ vgpu_unit_test(test_amd_run_scan)
 vgpu_unit_test(test_amd_gcn_gather_same_bits amd/tests/unit/test_gcn_gather_same_bits.cpp)
 target_compile_definitions(test_amd_gcn_gather_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # The pre-decoded tier against the interpreter over the same corpora (amd/tests/unit/test_gcn_tier_same_bits.cpp).
+# One process took 680 s in the plain build and about 3400 s under ASan, a third of the unit job's CPU between this and its twin below, so it
+# is registered as eight shards of the shapes (VGPU_TIER_SHARD=k/n, the test's own comment); shard k of 8 takes every eighth shape.
+set(VGPU_TIER_SHARD_SPECS 0/8 1/8 2/8 3/8 4/8 5/8 6/8 7/8)
+set(VGPU_UNIT_TEST_NO_ADD_TEST ON)
 vgpu_unit_test(test_amd_gcn_tier_same_bits amd/tests/unit/test_gcn_tier_same_bits.cpp)
+set(VGPU_UNIT_TEST_NO_ADD_TEST OFF)
 target_compile_definitions(test_amd_gcn_tier_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+vgpu_shard_tests(test_amd_gcn_tier_same_bits ENV_VAR VGPU_TIER_SHARD LIST_ENV VGPU_TIER_LIST SPECS ${VGPU_TIER_SHARD_SPECS}
+                 COMMAND test_amd_gcn_tier_same_bits)
 # The forms the AMD probe workloads found missing (RDNA2's VOP3 16-bit integer spellings), against the interpreter.
 vgpu_unit_test(test_amd_gcn_probe_forms amd/tests/unit/test_gcn_probe_forms.cpp)
 target_compile_definitions(test_amd_gcn_probe_forms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -1822,8 +1898,13 @@ if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize=thread")
     list(APPEND _simd_base_tests test_amd_gcn_same_bits test_amd_matrix_fast test_amd_gcn_tier_same_bits)
   endif()
   foreach(_t ${_simd_base_tests})
-    add_test(NAME ${_t}_simd_base COMMAND ${_t})
-    set_tests_properties(${_t}_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base" TIMEOUT 1500)
+    if(_t STREQUAL "test_amd_gcn_tier_same_bits")   # (688 s in one process: the same eight shards as the test itself)
+      vgpu_shard_tests(${_t}_simd_base ENV_VAR VGPU_TIER_SHARD LIST_ENV VGPU_TIER_LIST SPECS ${VGPU_TIER_SHARD_SPECS}
+                       COMMAND ${_t} ENVIRONMENT "VGPU_SIMD=base" PROPERTIES TIMEOUT 1500)
+    else()
+      add_test(NAME ${_t}_simd_base COMMAND ${_t})
+      set_tests_properties(${_t}_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base" TIMEOUT 1500)
+    endif()
   endforeach()
 endif()
 target_include_directories(test_amd_codeobject_same_bits PRIVATE amd/include)
@@ -2453,6 +2534,8 @@ add_test(NAME lint_readme_commands COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_
 set_tests_properties(lint_readme_commands PROPERTIES TIMEOUT 120)
 # ./run against a fake simulator, unshare and package tools.
 add_test(NAME lint_run_launcher COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_run.sh)
+add_test(NAME lint_fetch_frontend COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_fetch_frontend.sh)
+set_tests_properties(lint_fetch_frontend PROPERTIES TIMEOUT 300)
 add_test(NAME lint_example_yaml COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_example_yaml.sh)
 set_tests_properties(lint_run_launcher PROPERTIES TIMEOUT 120)
 add_test(NAME run_launcher COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_launcher.sh)
@@ -2464,6 +2547,11 @@ set_tests_properties(smi_cli PROPERTIES DEPENDS vgpu_cli
 add_test(NAME shell_cli COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_shell_cli.sh)
 set_tests_properties(shell_cli PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
+# vgpu shell --rootfs: the session's own root, -v mounts, --home, and the refusal where
+# namespaces are not allowed. The checks that need namespaces are left out on a host without them.
+add_test(NAME shell_rootfs COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_shell_rootfs.sh)
+set_tests_properties(shell_rootfs PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 600)
 add_test(NAME amd_session COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_amd_session.sh)
 set_tests_properties(amd_session PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
@@ -3770,13 +3858,14 @@ set_tests_properties(e2e_host_gpu_stub PROPERTIES
 
 # Tier 2 (src/sass/jit.hpp, VGPU_JIT=1) against the tier, on the same programs: results and every counter, with the JIT forced on at once, one
 # and four host threads, a warm cache, the faults of sass_tier_steps, and every way the JIT can fail (the output must not change).
-add_test(NAME e2e_sass_jit
-         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_jit.sh)
-set_tests_properties(e2e_sass_jit PROPERTIES
-  DEPENDS vgpucudart
+# Six shards (VGPU_JIT_SHARD, run_sass_jit.sh): sass_tier's variants, sass_tier_steps' faults and region caps, its two step-limit bisections
+# (gather, shared), the random kernels, and the failure modes. One process it took 1611 s in the unit job
+# (the steps stage alone 1089 s, most of it synchronous host-compiler runs); the shards are independent (each has its own cache
+# directories) and together are the stages of the whole run, once each (e2e_sass_jit_shards_partition proves it).
+vgpu_shard_tests(e2e_sass_jit ENV_VAR VGPU_JIT_SHARD LIST_ENV VGPU_JIT_LIST SPECS tier steps steps_gather steps_shared random modes
+  COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_jit.sh
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-  SKIP_REGULAR_EXPRESSION "^SKIP:"
-  TIMEOUT 3600)
+  PROPERTIES DEPENDS vgpucudart SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
 # The whole matrix (every program on every architecture, three random seeds): about an hour on an idle 16-CPU machine, so it runs only
 # where VGPU_NIGHTLY=1 (the schedule-only `jit` job of .github/workflows/sass-ptx.yml) and SKIPs elsewhere. e2e_sass_jit above is the PR gate.
 add_test(NAME e2e_sass_jit_full

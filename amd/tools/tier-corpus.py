@@ -75,7 +75,7 @@ SEL = ['BYTE_0', 'BYTE_1', 'BYTE_2', 'BYTE_3', 'WORD_0', 'WORD_1', 'DWORD']
 UNUSED = ['UNUSED_PAD', 'UNUSED_SEXT', 'UNUSED_PRESERVE']
 SD2 = ['v_add_u32', 'v_sub_u32', 'v_subrev_u32', 'v_and_b32', 'v_or_b32', 'v_xor_b32', 'v_lshlrev_b32', 'v_lshrrev_b32', 'v_ashrrev_i32',
        'v_min_u32', 'v_max_u32', 'v_min_i32', 'v_max_i32', 'v_mul_u32_u24', 'v_mul_i32_i24']
-SD1 = ['v_mov_b32', 'v_not_b32', 'v_cvt_f32_ubyte0', 'v_cvt_f32_u32', 'v_cvt_f32_i32']
+SD1 = ['v_mov_b32', 'v_not_b32', 'v_bfrev_b32', 'v_cvt_f32_ubyte0', 'v_cvt_f32_u32', 'v_cvt_f32_i32']
 combos = [(d, u, a, b) for d in SEL for u in UNUSED for a, b in [('DWORD', 'DWORD'), ('BYTE_1', 'WORD_1'), ('WORD_1', 'BYTE_3'), ('BYTE_2', 'BYTE_0')]]
 combos = combos[::3] + [('BYTE_1', 'UNUSED_PRESERVE', 'BYTE_3', 'WORD_0'), ('WORD_1', 'UNUSED_SEXT', 'WORD_0', 'WORD_1')]
 for op in SD2:
@@ -214,7 +214,8 @@ for ops in ['a1, v2', 'a255, v255', 'a1, s2', 'a1, 7', 'a1, 1.0', 'a1, 0x1234567
 RDNA_FROM = len(lines) if mcpu.startswith('gfx1') else 0
 
 # ---- DPP: integer operations whose first source is another lane's (every control, the masks, bound_ctrl, FI, DPP8), under both generations' names
-DPP_OPS = ['v_mov_b32', 'v_not_b32', 'v_add_u32', 'v_add_nc_u32', 'v_sub_u32', 'v_sub_nc_u32', 'v_subrev_u32', 'v_and_b32', 'v_or_b32', 'v_xor_b32',
+ONE_SRC = ('v_mov_b32', 'v_not_b32', 'v_bfrev_b32')
+DPP_OPS = ['v_mov_b32', 'v_not_b32', 'v_bfrev_b32', 'v_add_u32', 'v_add_nc_u32', 'v_sub_u32', 'v_sub_nc_u32', 'v_subrev_u32', 'v_and_b32', 'v_or_b32', 'v_xor_b32',
            'v_lshlrev_b32', 'v_lshrrev_b32', 'v_ashrrev_i32', 'v_min_u32', 'v_max_u32', 'v_min_i32', 'v_max_i32', 'v_mul_u32_u24', 'v_mul_i32_i24']
 DPP_CTRL = ['quad_perm:[1,0,3,2]', 'quad_perm:[0,0,0,0]', 'quad_perm:[3,2,1,0]', 'row_shl:1', 'row_shl:7', 'row_shl:15', 'row_shr:1', 'row_shr:3',
             'row_shr:15', 'row_ror:1', 'row_ror:7', 'row_ror:15', 'row_mirror', 'row_half_mirror', 'wave_shl:1', 'wave_rol:1', 'wave_shr:1', 'wave_ror:1',
@@ -224,14 +225,14 @@ for op in DPP_OPS:
     for ctrl in DPP_CTRL if op in DPP_ALL else ['quad_perm:[1,0,3,2]', 'row_shr:3', 'row_ror:7', 'row_mirror', 'wave_shl:1', 'row_bcast:15', 'row_xmask:9']:
         for masks in (['row_mask:0xf bank_mask:0xf', 'row_mask:0xa bank_mask:0x5', 'row_mask:0x3 bank_mask:0xf bound_ctrl:0', 'row_mask:0xf bank_mask:0x6 bound_ctrl:0']
                       if op in DPP_ALL else ['row_mask:0xf bank_mask:0xf', 'row_mask:0xa bank_mask:0x5 bound_ctrl:0']):
-            ops = 'v1, v2' if op in ('v_mov_b32', 'v_not_b32') else 'v1, v2, v3'
+            ops = 'v1, v2' if op in ONE_SRC else 'v1, v2, v3'
             add('%s_dpp %s %s %s' % (op, ops, ctrl, masks))
-        add('%s_dpp %s %s row_mask:0xf bank_mask:0xf fi:1' % (op, 'v1, v2' if op in ('v_mov_b32', 'v_not_b32') else 'v1, v2, v3', ctrl))
+        add('%s_dpp %s %s row_mask:0xf bank_mask:0xf fi:1' % (op, 'v1, v2' if op in ONE_SRC else 'v1, v2, v3', ctrl))
     for sel in ['[7,6,5,4,3,2,1,0]', '[0,0,0,0,0,0,0,0]', '[1,2,3,4,5,6,7,0]']:
-        ops = 'v1, v2' if op in ('v_mov_b32', 'v_not_b32') else 'v1, v2, v3'
+        ops = 'v1, v2' if op in ONE_SRC else 'v1, v2, v3'
         add('%s_dpp %s dpp8:%s' % (op, ops, sel))
         add('%s_dpp %s dpp8:%s fi:1' % (op, ops, sel))
-    add('%s_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf' % op if op not in ('v_mov_b32', 'v_not_b32') else '%s_dpp v200, v255 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf' % op)
+    add('%s_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf' % op if op not in ONE_SRC else '%s_dpp v200, v255 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf' % op)
 
 # ---- ds_swizzle_b32 (bit-mask, quad-perm and rotate patterns), ds_permute_b32, ds_bpermute_b32
 for off in ['0x0C1F', '0x205C', '0x001F', '0x041F', '0x7FFF & 0x7C1F', '0x8000', '0x801B', '0x80E4', '0x8039', '0xC040', '0xC420', '0xC0A1', '0x0000', '0x3E1F']:
@@ -244,6 +245,27 @@ for off in ['', ' offset:4', ' offset:128', ' offset:65532']:
     add('ds_bpermute_b32 v1, v2, v3%s' % off)
 add('ds_permute_b32 v200, v255, v201')
 add('ds_swizzle_b32 v200, v255 offset:4122')
+
+# ---- ds_read2 / ds_write2 (and the st64 forms), 32- and 64-bit: every offset pair, the data registers apart or overlapping the address, a high register
+# (gfx11 and gfx12 spell them ds_load_2addr / ds_store_2addr)
+def ds2_name(op):
+    if mcpu.startswith('gfx11') or mcpu.startswith('gfx12'):
+        return op.replace('ds_read2st64_', 'ds_load_2addr_stride64_').replace('ds_read2_', 'ds_load_2addr_').replace(
+            'ds_write2st64_', 'ds_store_2addr_stride64_').replace('ds_write2_', 'ds_store_2addr_')
+    return op
+for op in ['ds_read2_b32', 'ds_read2st64_b32', 'ds_read2_b64', 'ds_read2st64_b64']:
+    w = 4 if op.endswith('b64') else 2
+    for offs in ['', ' offset1:1', ' offset0:1 offset1:2', ' offset0:2 offset1:3', ' offset0:8 offset1:9', ' offset0:63 offset1:64', ' offset0:255 offset1:0',
+                 ' offset0:7 offset1:7', ' offset0:200 offset1:255', ' offset1:128']:
+        for dst, addr in [('v[4:%d]' % (3 + w), 'v1'), ('v[1:%d]' % w, 'v1'), ('v[0:%d]' % (w - 1), 'v%d' % (w - 1)), ('v[200:%d]' % (199 + w), 'v255')]:
+            add('%s %s, %s%s' % (ds2_name(op), dst, addr, offs))
+for op in ['ds_write2_b32', 'ds_write2st64_b32', 'ds_write2_b64', 'ds_write2st64_b64']:
+    b64 = op.endswith('b64')
+    for offs in ['', ' offset1:1', ' offset0:1 offset1:2', ' offset0:2 offset1:3', ' offset0:8 offset1:9', ' offset0:63 offset1:64', ' offset0:255 offset1:0',
+                 ' offset0:7 offset1:7', ' offset0:200 offset1:255', ' offset1:128']:
+        for a, d0, d1 in ([('v1', 'v[4:5]', 'v[6:7]'), ('v1', 'v[1:2]', 'v[3:4]'), ('v1', 'v[4:5]', 'v[4:5]'), ('v255', 'v[200:201]', 'v[254:255]')] if b64 else
+                          [('v1', 'v4', 'v5'), ('v1', 'v1', 'v2'), ('v1', 'v4', 'v4'), ('v255', 'v200', 'v254')]):
+            add('%s %s, %s, %s%s' % (ds2_name(op), a, d0, d1, offs))
 
 # ---- packed 16-bit integers, and the leading/trailing zero counts
 PK2 = ['v_pk_mul_lo_u16', 'v_pk_add_u16', 'v_pk_add_i16', 'v_pk_sub_u16', 'v_pk_sub_i16', 'v_pk_lshlrev_b16', 'v_pk_lshrrev_b16', 'v_pk_ashrrev_i16',
@@ -258,7 +280,7 @@ for op in PK2 + ['v_pk_mad_u16', 'v_pk_mad_i16']:
             if three:
                 mods = mods.replace('[1,0]', '[1,0,1]').replace('[0,1]', '[0,1,0]').replace('[1,1]', '[1,1,1]').replace('[0,0]', '[0,0,0]')
             add('%s %s%s' % (op, ops, mods))
-for op, alts in [('v_ffbh_u32', ['v_clz_i32_u32']), ('v_ffbl_b32', ['v_ctz_i32_b32']), ('v_ffbh_i32', ['v_cls_i32'])]:
+for op, alts in [('v_ffbh_u32', ['v_clz_i32_u32']), ('v_ffbl_b32', ['v_ctz_i32_b32']), ('v_ffbh_i32', ['v_cls_i32']), ('v_bfrev_b32', [])]:
     for name in [op] + alts:
         for ops in ['v1, v2', 'v200, v255', 'v1, s3', 'v1, 0', 'v1, -1', 'v1, 0x80000000', 'v1, 7']:
             add('%s_e32 %s' % (name, ops))

@@ -15,3 +15,4 @@ build-san/
 build-tsan/
 # Your own settings file (`make init` or `vgpu config init` writes it).
 pantheonsim.yaml
+.ccache/

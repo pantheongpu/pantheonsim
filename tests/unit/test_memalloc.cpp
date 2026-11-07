@@ -563,17 +563,29 @@ VTEST(chunks_returned_nearly_untouched_come_back_zeroed_and_counted) {
   VCHECK_EQ(backing::ram_bytes(), ram);
 }
 
-// A chunk with up to 32 KiB written is kept for the next acquire() (cleared to the byte it promised), one with more
-// goes back to the heap. The size of a buffer a program allocates, fills and frees in a loop decides which of the two
-// each allocation costs.
-VTEST(chunks_with_up_to_32_KiB_dirty_are_kept_cleared_and_counted) {
-  static_assert(backing::kPoolMaxDirty == 32 * 1024, "the pool's limit is part of what this test pins");
-  {   // an empty pool: whatever earlier tests left in it is taken out and given back to the heap
-    std::vector<uint8_t*> held;
-    for (uint64_t n = backing::pooled_chunks(); n; --n) held.push_back(backing::acquire());
-    for (uint8_t* h : held) backing::release(h);
-    VCHECK_EQ(backing::pooled_chunks(), uint64_t{0});
-  }
+// Takes whatever earlier tests left in the pool out and gives it to the heap (a pool that holds nothing more is not allowed to keep them).
+static void empty_pool() {
+  backing::Config none;
+  none.pool_max_bytes = 0;
+  backing::configure(none);
+  std::vector<uint8_t*> held;
+  for (uint64_t n = backing::pooled_chunks(); n; --n) held.push_back(backing::acquire());
+  for (uint8_t* h : held) backing::release(h);
+  backing::configure({});
+  VCHECK_EQ(backing::pooled_chunks(), uint64_t{0});
+}
+
+static void expect_zero(const uint8_t* c, const char* what) {
+  for (uint64_t i = 0; i < kChunkSize; ++i)
+    if (c[i]) throw vtest::Failure(what);
+}
+
+// A chunk given back is kept for the next acquire(), cleared to the byte it promised (everything from there on is zero already), whatever
+// it held: a buffer a program allocates, fills and frees in a loop costs the clearing of what it wrote, in cache, and not a heap
+// allocation, the page faults of a fresh mapping and the zeroing of all 64 KiB.
+VTEST(chunks_given_back_are_kept_cleared_and_counted) {
+  static_assert(backing::kPoolMaxDirty == kChunkSize, "every chunk may be kept: the pool's size is what limits it");
+  empty_pool();
   const uint64_t ram = backing::ram_bytes();
   uint8_t* c = backing::acquire();
   std::memset(c, 0x5A, 20000);
@@ -583,19 +595,126 @@ VTEST(chunks_with_up_to_32_KiB_dirty_are_kept_cleared_and_counted) {
   uint8_t* again = backing::acquire();
   VCHECK_EQ(backing::pooled_chunks(), uint64_t{0});
   VCHECK_EQ(backing::ram_bytes(), ram + kChunkSize);
-  for (uint64_t i = 0; i < kChunkSize; ++i)
-    if (again[i]) throw vtest::Failure("a chunk kept with 20000 bytes dirty came back with a byte not cleared");
-  // the last byte it may promise, and the first past it
-  std::memset(again, 0x5A, backing::kPoolMaxDirty);
-  backing::release(again, backing::kPoolMaxDirty);
+  expect_zero(again, "a chunk kept with 20000 bytes dirty came back with a byte not cleared");
+  // a chunk written all through, promised nothing (the default), and one that promises the whole chunk
+  std::memset(again, 0x5A, kChunkSize);
+  backing::release(again);
   VCHECK_EQ(backing::pooled_chunks(), uint64_t{1});
+  uint8_t* full = backing::acquire();
+  expect_zero(full, "a chunk kept with every byte dirty came back with a byte not cleared");
+  std::memset(full, 0xA5, kChunkSize);
+  backing::release(full, kChunkSize);
+  VCHECK_EQ(backing::pooled_chunks(), uint64_t{1});
+  uint8_t* last = backing::acquire();
+  expect_zero(last, "a chunk kept with 64 KiB dirty came back with a byte not cleared");
+  // the last byte of a chunk written, and nothing promised past it
+  last[kChunkSize - 1] = 0xFF;
+  backing::release(last, kChunkSize);
   uint8_t* edge = backing::acquire();
-  for (uint64_t i = 0; i < kChunkSize; ++i)
-    if (edge[i]) throw vtest::Failure("a chunk kept with 32 KiB dirty came back with a byte not cleared");
-  std::memset(edge, 0x5A, backing::kPoolMaxDirty + 1);
-  backing::release(edge, backing::kPoolMaxDirty + 1);
-  VCHECK_EQ(backing::pooled_chunks(), uint64_t{0});   // too much to clear under the lock: to the heap
+  expect_zero(edge, "the chunk's last byte was not cleared");
+  backing::release(edge);
   VCHECK_EQ(backing::ram_bytes(), ram);
+  empty_pool();
+}
+
+// The pool holds Config::pool_max_bytes and no more: past it a chunk goes back to the heap, and the count of chunks in use follows either way.
+VTEST(the_pool_keeps_no_more_than_its_limit) {
+  empty_pool();
+  const uint64_t ram = backing::ram_bytes();
+  backing::Config c;
+  c.pool_max_bytes = 3 * kChunkSize;
+  backing::configure(c);
+  std::vector<uint8_t*> got;
+  for (int i = 0; i < 8; ++i) {
+    got.push_back(backing::acquire());
+    std::memset(got.back(), 0x77, kChunkSize);
+  }
+  VCHECK_EQ(backing::ram_bytes(), ram + 8 * kChunkSize);
+  for (uint8_t* g : got) backing::release(g);
+  VCHECK_EQ(backing::pooled_chunks(), uint64_t{3});
+  VCHECK_EQ(backing::ram_bytes(), ram);
+  got.clear();
+  for (int i = 0; i < 5; ++i) got.push_back(backing::acquire());   // three from the pool, two new
+  VCHECK_EQ(backing::pooled_chunks(), uint64_t{0});
+  for (uint8_t* g : got) expect_zero(g, "a chunk from the pool was not zero");
+  for (uint8_t* g : got) backing::release(g);
+  VCHECK_EQ(backing::pooled_chunks(), uint64_t{3});
+  // No room at all: nothing is kept.
+  c.pool_max_bytes = 0;
+  backing::configure(c);
+  uint8_t* one = backing::acquire();   // (the pool still holds three; this takes one)
+  backing::release(one);
+  VCHECK_EQ(backing::pooled_chunks(), uint64_t{2});
+  // The edge: room for two chunks less a byte keeps one, room for exactly two keeps two.
+  empty_pool();
+  c.pool_max_bytes = 2 * kChunkSize - 1;
+  backing::configure(c);
+  uint8_t* x = backing::acquire();
+  uint8_t* y = backing::acquire();
+  backing::release(x);
+  backing::release(y);
+  VCHECK_EQ(backing::pooled_chunks(), uint64_t{1});
+  c.pool_max_bytes = 2 * kChunkSize;
+  backing::configure(c);
+  x = backing::acquire();   // (the pooled one)
+  y = backing::acquire();
+  backing::release(x);
+  backing::release(y);
+  VCHECK_EQ(backing::pooled_chunks(), uint64_t{2});
+  backing::configure({});
+  empty_pool();
+}
+
+// Where a RAM limit is set (it decides when chunks come from the spill file) the pool keeps nothing the limit has no room for beside the
+// chunks in use: the memory the process holds does not go past the limit it was given because of the pool.
+VTEST(the_pool_stays_inside_the_ram_limit) {
+  empty_pool();
+  const uint64_t ram = backing::ram_bytes();
+  backing::Config c;
+  c.ram_limit_bytes = ram + 2 * kChunkSize;
+  backing::configure(c);   // (no spill directory: the limit is only the pool's, here)
+  std::vector<uint8_t*> got;
+  for (int i = 0; i < 6; ++i) got.push_back(backing::acquire());
+  for (uint8_t* g : got) backing::release(g);
+  // The last two given back, with the chunks in use down to the starting count, are what fit in the limit.
+  VCHECK_EQ(backing::pooled_chunks(), uint64_t{2});
+  VCHECK(backing::ram_bytes() + backing::pooled_chunks() * kChunkSize <= c.ram_limit_bytes);
+  backing::configure({});
+  empty_pool();
+}
+
+// Chunks come from arenas (64 MiB mappings the kernel may back with huge pages); a chunk the pool has no room for goes back to the
+// kernel and is handed out again without a word written to it, and must read as zero all the same. Written through with a pattern
+// of its own each, so that two chunks that overlapped (a step through the arena of anything but a chunk) are found, over more
+// chunks than one arena holds.
+VTEST(chunks_across_arenas_are_distinct_independent_and_zero_and_come_back_zero_from_the_kernel) {
+  empty_pool();
+  const uint64_t ram = backing::ram_bytes();
+  backing::Config none;
+  none.pool_max_bytes = 0;   // every chunk given back goes to the kernel
+  backing::configure(none);
+  constexpr int kN = 1100;   // (an arena is 1024 chunks)
+  std::vector<uint8_t*> got;
+  for (int round = 0; round < 2; ++round) {
+    got.clear();
+    for (int i = 0; i < kN; ++i) {
+      got.push_back(backing::acquire());
+      VCHECK((reinterpret_cast<uintptr_t>(got.back()) & 15) == 0);   // (the low bit of a chunk's address is a tag's: it must be clear)
+    }
+    VCHECK_EQ(backing::ram_bytes(), ram + uint64_t{kN} * kChunkSize);
+    for (int i = 0; i < kN; ++i) {
+      expect_zero(got[i], round ? "a chunk handed back by the kernel was not zero" : "a fresh chunk was not zero");
+      std::memset(got[i], 1 + i % 250, kChunkSize);
+    }
+    for (int i = 0; i < kN; ++i)
+      for (uint64_t o = 0; o < kChunkSize; o += 4093)
+        if (got[i][o] != 1 + i % 250) throw vtest::Failure("two chunks share bytes");
+    for (uint8_t* g : got) backing::release(g);
+    VCHECK_EQ(backing::ram_bytes(), ram);
+    VCHECK_EQ(backing::pooled_chunks(), uint64_t{0});
+  }
+  backing::configure({});
+  empty_pool();
 }
 
 VTEST(resident_memory_follows_allocations_through_recycling) {
