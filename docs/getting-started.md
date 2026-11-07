@@ -178,7 +178,7 @@ Questions go in [Discussions](https://github.com/pantheongpu/pantheonsim/discuss
 
 ## License
 
-Business Source License 1.1 from version 0.3.0 (see ../LICENSE and [licensing.md](licensing.md)); Apache-2.0 for versions up to 0.2.0. The `vgpu_cuda.h` header is a clean-room subset
+Apache-2.0 (see ../LICENSE). The `vgpu_cuda.h` header is a clean-room subset
 written from NVIDIA's public driver API documentation; it contains no NVIDIA
 code. The AMD register offsets, fields and SMU message numbers in
 `amd/registers/mmio.yaml` come from the Linux kernel's amdgpu headers, under
