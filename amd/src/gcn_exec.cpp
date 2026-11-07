@@ -10090,17 +10090,17 @@ struct Machine {
       // One word a lane in a vector register: the run is the register's row from this lane on, moved in place.
       uint32_t* row = w.vgpr[data.index].data() + lane;
       if (load) {
-        if (!m.load_run(addr, row, uint64_t{4} * count, 4)) return 0;
+        if (!m.load_run(addr, row, uint64_t{4} * count, 4) && !m.load_host_run(addr, row, uint64_t{4} * count, 4)) return 0;
         words[0] = row[count - 1];
-      } else if (!m.store_run(addr, row, uint64_t{4} * count, 4)) {
+      } else if (!m.store_run(addr, row, uint64_t{4} * count, 4) && !m.store_host_run(addr, row, uint64_t{4} * count, 4)) {
         return 0;
       }
       return count;
     }
     alignas(16) uint32_t buf[kLanes * 4];
     if (load) {
-      const bool done = quads ? m.load_quad_run(addr, count, reinterpret_cast<uint64_t*>(buf))
-                              : m.load_run(addr, buf, uint64_t{stride} * count, unit);
+      const bool done = quads ? m.load_quad_run(addr, count, reinterpret_cast<uint64_t*>(buf)) || m.load_host_run(addr, buf, uint64_t{stride} * count, 8)
+                              : m.load_run(addr, buf, uint64_t{stride} * count, unit) || m.load_host_run(addr, buf, uint64_t{stride} * count, unit);
       if (!done) return 0;
       if (data.kind != OperandKind::Agpr) {   // (register k's row, a word of each lane's data in turn)
         for (uint32_t k = 0; k < run_words; ++k) {
@@ -10122,8 +10122,8 @@ struct Machine {
         for (uint32_t i = 0; i < count; ++i)
           for (uint32_t k = 0; k < run_words; ++k) buf[i * run_words + k] = word(w, in.src[1], k, lane + i);
       }
-      const bool done = quads ? m.store_quad_run(addr, count, reinterpret_cast<const uint64_t*>(buf))
-                              : m.store_run(addr, buf, uint64_t{stride} * count, unit);
+      const bool done = quads ? m.store_quad_run(addr, count, reinterpret_cast<const uint64_t*>(buf)) || m.store_host_run(addr, buf, uint64_t{stride} * count, 8)
+                              : m.store_run(addr, buf, uint64_t{stride} * count, unit) || m.store_host_run(addr, buf, uint64_t{stride} * count, unit);
       if (!done) return 0;
     }
     return count;
@@ -10185,8 +10185,13 @@ struct Machine {
   // global_load_dwordx2 -- are two word accesses where lane by lane (Machine::load_words) makes them, an aligned pair one 8-byte
   // access: so the aligned pairs go as one batch of 8-byte loads and the others as a batch of 4-byte loads, two words each. Nothing is
   // written to `vals` that the caller can see unless it all succeeded: false, as load_batch says it, having changed no register.
+  bool store_wave(const uint64_t* addrs, uint32_t n, uint32_t bytes, const uint64_t* vals) {
+    return mem.host_map_possible(addrs[0]) ? mem.host_store_batch(addrs, n, bytes, vals) || mem.store_batch(addrs, n, bytes, vals)
+                                           : mem.store_batch(addrs, n, bytes, vals);
+  }
   bool load_wave(const uint64_t* addrs, uint32_t n, uint32_t bytes, uint64_t* vals) const {
-    if (mem.load_batch(addrs, n, bytes, vals)) return true;
+    // (An address in a host mapping is the host batch's, asked first: load_batch declines it, after a table lookup under a lock.)
+    if (mem.host_map_possible(addrs[0]) ? mem.host_load_batch(addrs, n, bytes, vals) || mem.load_batch(addrs, n, bytes, vals) : mem.load_batch(addrs, n, bytes, vals)) return true;
     if (bytes != 8) return false;
     uint64_t bits = 0, odd = 0;
     for (uint32_t i = 0; i < n; ++i) bits |= addrs[i], odd |= addrs[i] & 4;
@@ -10335,7 +10340,7 @@ struct Machine {
         } else {
           for (uint32_t i = 0; i < count; ++i) vals[i] = row0[i];
         }
-        return mem.store_batch(addrs, count, bytes, vals);
+        return store_wave(addrs, count, bytes, vals);
       }
       if (count > 1 && exec::amdrun::all_equal(addrs, count)) {
         // One address in every lane: every lane takes the value the first got (the rule below), so it is read once.
@@ -10375,7 +10380,7 @@ struct Machine {
       } else {
         for (uint32_t i = 0; i < n; ++i) vals[i] = row0[lanes[i]];
       }
-      return mem.store_batch(addrs, n, bytes, vals);
+      return store_wave(addrs, n, bytes, vals);
     }
     if (!load_wave(addrs, n, bytes, vals)) return false;
     if (conc() && exec::amdrun::any_adjacent_equal(addrs, n))

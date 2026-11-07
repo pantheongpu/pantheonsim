@@ -1785,6 +1785,31 @@ bool MemoryManager::store_run(uint64_t addr, const void* src, uint64_t len, uint
   return true;
 }
 
+// The mapping that holds the whole run [addr, addr + len) of `unit`-byte elements, when each element is the relaxed atomic access of its width
+// that load_scalar / store_scalar make there. False, having done nothing, for anything the lane-by-lane path must meet: a fault armed (as
+// run_allocation declines it), a run that is misaligned, not wholly inside one mapping, or on host bytes that are not `unit`-aligned, and a store
+// to a read-only mapping (which throws there).
+bool MemoryManager::host_run_hit(uint64_t addr, uint64_t len, uint32_t unit, bool store, HostHit* h) const {
+  if (!host_maps_ || !host_maps_->may_contain(addr) || (unit != 1 && unit != 2 && unit != 4 && unit != 8)) return false;
+  if (((addr | len) & (unit - 1)) || access_faults_armed() || !lookup_host(addr, len, h)) return false;
+  if (store && h->read_only) return false;
+  return !((reinterpret_cast<uintptr_t>(h->host) + (addr - h->base)) & (unit - 1));
+}
+
+bool MemoryManager::load_host_run(uint64_t addr, void* dst, uint64_t len, uint32_t unit) const {
+  HostHit h;
+  if (len == 0 || !host_run_hit(addr, len, unit, /*store=*/false, &h)) return false;
+  run_out(h.host + (addr - h.base), static_cast<uint8_t*>(dst), len, unit);
+  return true;
+}
+
+bool MemoryManager::store_host_run(uint64_t addr, const void* src, uint64_t len, uint32_t unit) {
+  HostHit h;
+  if (len == 0 || !host_run_hit(addr, len, unit, /*store=*/true, &h)) return false;
+  run_in(h.host + (addr - h.base), static_cast<const uint8_t*>(src), len, unit);
+  return true;
+}
+
 // (cold and out of line: a large copy is rare beside the kernels' accesses, and its code stays out of the hot text, whose layout moves the
 // interpreters' rows by a few percent at equal instructions)
 [[gnu::cold, gnu::noinline]] bool MemoryManager::copy_to(MemoryManager& dst_mm, uint64_t dst, uint64_t src, uint64_t len) const {
