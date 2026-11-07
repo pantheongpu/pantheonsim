@@ -142,3 +142,17 @@ What is not covered, each a reason a launch stays synchronous (`async_launch_eli
   where a card would not; setting it with a plain store to pinned memory works. This hung before too (the launch itself did not
   return), so it is not a regression, but it is the next limit to remove: it needs the kernel to run without the API lock, which is the
   audit of item 1 above.
+
+### The driver API's host functions (pantheonsim #487)
+
+`cuLaunchHostFunc` uses the same lanes: libcuda reaches them by name (`vgpu_async_*_v1` in `runtime_api.cpp`, found with `dlsym` as the
+capture hooks are; see "Host functions" in `driver_capture.inc`), so the two libraries share one set of lanes and one set of stream
+handles, and a driver stream made with `CU_STREAM_NON_BLOCKING` is told to the runtime (`vgpu_async_stream_flags_v1`) because the
+runtime does not know its flags. Every hook returns at once until a host function has been queued by either API, so programs that
+never queue one are untouched. The driver has no common stream choke point, so the order is enforced where the work is issued:
+`StreamOrder` (an RAII wait, in `driver_api.cpp` before `StreamContext`) in front of the kernel launches, `StreamContext` for the copies
+and fills, and explicit `StreamOrder`s in the 2D, array, peer and stream-memory-operation paths and `cuStreamAddCallback`. It waits before
+the call takes the API lock, once per call stack (a thread-local flag, so an async copy that ends in the synchronous one waits for its own
+stream and not for the legacy stream's dependencies), and not for the replay of a captured launch, which runs under the lock. A driver event
+is also recorded on its runtime shadow event once a host function exists; `cuEventQuery`, `cuEventSynchronize`, `cuEventElapsedTime`
+and `cuStreamWaitEvent` read the shadow's pending state and time (`vgpu_async_event_*_v1`).

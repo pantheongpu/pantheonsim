@@ -32,7 +32,18 @@ release says what runs and what it produces, never how fast a real GPU would run
   `cudaDeviceSynchronize` wait for it; `cudaStreamWaitEvent` on a pending event holds the other stream back; the legacy default stream
   orders against blocking streams. A host function that waits for something the caller does after enqueueing it no longer hangs the
   call (pantheonsim #487). Copies and fills still run to completion inside their calls; kernel launches are the next entry;
-  `cuLaunchHostFunc` in the driver API still runs inline. Programs that never queue a host function see no change. `cudaErrorNotReady` from a query is no longer left as the last error (`cudaGetLastError`), as on a card.
+  the driver API's `cuLaunchHostFunc` is the entry after that. Programs that never queue a host function see no change. `cudaErrorNotReady` from a query is no longer left as the last error (`cudaGetLastError`), as on a card.
+- CUDA driver: `cuLaunchHostFunc` (and `cuLaunchHostFunc_v2`) enqueues the function and returns, as the runtime's does and as a GPU does
+  (pantheonsim #487, the driver half). It runs on the stream's worker thread, in order with the stream's other host functions, and what
+  the stream is given afterwards waits for it: `cuLaunchKernel` and its variants, every `cuMemcpy*` and `cuMemset*` form (the
+  synchronous ones on the legacy stream wait for blocking streams' host functions only), stream memory operations and
+  `cuStreamAddCallback`. `cuStreamQuery` is `CUDA_ERROR_NOT_READY` while one is pending, `cuStreamSynchronize` and `cuCtxSynchronize` wait
+  for it, and a driver event recorded behind it is `CUDA_ERROR_NOT_READY` from `cuEventQuery` and `cuEventElapsedTime` until it has finished
+  (`cuEventSynchronize` waits, `cuEventElapsedTime` measures to the moment it finished), `cuStreamWaitEvent` holds the other stream back.
+  A host function that waits for something the caller does after queueing it no longer hangs the call. Programs that never queue a host
+  function see no change. Not covered: stream-ordered allocation and free, prefetch and attach, external semaphores and `cuMemMapArrayAsync`
+  do not wait for earlier host functions, and `cuStreamAddCallback` still runs its callback in the call (after the earlier host
+  functions) instead of later.
 - CUDA runtime: a kernel launched with `cudaLaunchKernel` (`<<<>>>`) on a stream made with `cudaStreamNonBlocking` returns before the
   kernel has run, so `cudaEventQuery` and `cudaStreamQuery` on work behind it report `cudaErrorNotReady`, and so does
   `cudaEventElapsedTime`, until it has finished (pantheonsim #523; the issue's repro now prints 600, 600, then 0 after the

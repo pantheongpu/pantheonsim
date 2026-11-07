@@ -109,3 +109,94 @@ void* shadow_event(CUevent ev, bool create) {
   }
   return it->second.rt_event;
 }
+
+// ---- Host functions ----------------------------------------------------------------------------------------------------
+// cuLaunchHostFunc queues the function on the stream and returns, as the card does: the function runs on a worker thread
+// after the stream's earlier work, and what the stream is given afterwards waits for it. The stream lanes that do this are
+// the runtime's (runtime_api.cpp, "Stream lanes": the two libraries share one machine and one set of stream handles), and
+// libcuda reaches them by name (vgpu_async_*_v1), as it does capture. Every hook acts only once a host function has been
+// queued by either API, so a program that never queues one is not changed by any of this: the checks below are one call
+// that reads an atomic. What needs the lanes:
+//   - the work a stream is given (kernels, copies, fills, memory operations, callbacks) first waits for the stream's
+//     earlier host functions (StreamOrder, before the API lock is taken);
+//   - cuStreamQuery is CUDA_ERROR_NOT_READY, and cuStreamSynchronize and cuCtxSynchronize wait, while they run;
+//   - a driver event recorded from then on is also recorded on a runtime event (the one that stands for it in a capture),
+//     which stays pending until the lane reaches it: cuEventQuery is NOT_READY, cuEventSynchronize waits,
+//     cuEventElapsedTime is NOT_READY and then measures to the moment the lane got there, and cuStreamWaitEvent holds
+//     the stream back.
+// cuLaunchHostFunc loads the runtime library if the program has not (as the capture check beside it already does); every other
+// call only uses one that is already there, since a program without it has no host function to wait for.
+struct AsyncHooks {
+  int (*used)();
+  void (*host_fn)(void*, CUhostFn, void*);
+  void (*order)(void*);
+  int (*busy)(void*);
+  void (*wait_stream)(void*);
+  void (*wait_device)();
+  void (*event_record)(void*, void*);
+  int (*event_state)(void*, long long*);
+  void (*event_wait)(void*);
+  void (*stream_wait_event)(void*, void*);
+  void (*stream_flags)(void*, int, int);
+};
+// The hooks, or null. With `load` false only a runtime already in the process is used: a program on the driver API alone
+// (no libcudart) must not have one loaded by a copy or a launch (two copies of the simulator in a process are what a sanitizer
+// build refuses), and one that never loads it has no host function to wait for -- cuLaunchHostFunc itself loads it. A miss is not
+// cached for good (a program may load libcudart later), only for a second.
+const AsyncHooks* async_hooks(bool load = false) {
+  static std::atomic<const AsyncHooks*> found{nullptr};
+  static std::atomic<long long> retry_ns{0};
+  if (const AsyncHooks* h = found.load(std::memory_order_acquire)) return h;
+  struct timespec now {};
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  const long long t = now.tv_sec * 1000000000LL + now.tv_nsec;
+  if (!load && t < retry_ns.load(std::memory_order_relaxed)) return nullptr;
+  static std::mutex probe_mu;
+  std::lock_guard<std::mutex> lock(probe_mu);
+  if (const AsyncHooks* h = found.load(std::memory_order_acquire)) return h;
+  auto get = [&](const char* name) { return load ? runtime_symbol(name) : dlsym(RTLD_DEFAULT, name); };
+  const AsyncHooks h{reinterpret_cast<int (*)()>(get("vgpu_async_host_used_v1")),
+                     reinterpret_cast<void (*)(void*, CUhostFn, void*)>(get("vgpu_async_host_fn_v1")),
+                     reinterpret_cast<void (*)(void*)>(get("vgpu_async_order_v1")),
+                     reinterpret_cast<int (*)(void*)>(get("vgpu_async_stream_busy_v1")),
+                     reinterpret_cast<void (*)(void*)>(get("vgpu_async_wait_stream_v1")),
+                     reinterpret_cast<void (*)()>(get("vgpu_async_wait_device_v1")),
+                     reinterpret_cast<void (*)(void*, void*)>(get("vgpu_async_event_record_v1")),
+                     reinterpret_cast<int (*)(void*, long long*)>(get("vgpu_async_event_state_v1")),
+                     reinterpret_cast<void (*)(void*)>(get("vgpu_async_wait_event_v1")),
+                     reinterpret_cast<void (*)(void*, void*)>(get("vgpu_async_stream_wait_event_v1")),
+                     reinterpret_cast<void (*)(void*, int, int)>(get("vgpu_async_stream_flags_v1"))};
+  const bool all = h.used && h.host_fn && h.order && h.busy && h.wait_stream && h.wait_device && h.event_record &&
+                   h.event_state && h.event_wait && h.stream_wait_event && h.stream_flags;
+  if (!all) {
+    retry_ns.store(t + 1000000000LL, std::memory_order_relaxed);
+    return nullptr;
+  }
+  static AsyncHooks stored;
+  stored = h;
+  found.store(&stored, std::memory_order_release);
+  return &stored;
+}
+// Whether any host function has been queued (the runtime keeps the flag), so the lanes matter.
+bool host_async() {
+  const AsyncHooks* h = async_hooks();
+  return h && h->used();
+}
+void async_order(CUstream st) {
+  if (const AsyncHooks* h = async_hooks()) h->order(st);
+}
+void async_wait_stream(CUstream st) {
+  if (const AsyncHooks* h = async_hooks()) h->wait_stream(st);
+}
+void async_wait_device() {
+  if (const AsyncHooks* h = async_hooks()) h->wait_device();
+}
+bool async_stream_busy(CUstream st) {
+  const AsyncHooks* h = async_hooks();
+  return h && h->busy(st);
+}
+// The runtime event standing for `ev`, if it has one, and whether it is a driver event at all.
+void* async_shadow(void* ev) {
+  void* shadow = shadow_event(static_cast<CUevent>(ev), false);
+  return shadow && shadow != ev ? shadow : nullptr;
+}

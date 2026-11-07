@@ -4606,6 +4606,13 @@ set_tests_properties(e2e_async_host_events PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 300)
+# cuLaunchHostFunc, the driver API's half of the same (#487): queued behind the stream, returns at once, driver events, streams and the
+# work issued after it follow it.
+add_test(NAME e2e_async_host_events_driver COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_async_host_events_driver.sh)
+set_tests_properties(e2e_async_host_events_driver PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 600)
 # A kernel launch returns before the kernel finishes; events and streams behind it are not ready until it has run (#523).
 add_test(NAME e2e_async_launch_events COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_async_launch_events.sh)
 set_tests_properties(e2e_async_launch_events PROPERTIES

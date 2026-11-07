@@ -20,4 +20,7 @@ int run_kernel(void* func, const unsigned grid[3], const unsigned block[3], unsi
 void* runtime_event_for(void* driver_event);
 void* driver_event_of(void* runtime_event);
 
+// Work issued on `stream` waits for the host functions queued on it earlier (see driver_capture.inc, "Host functions").
+void async_order(void* stream);
+
 }  // namespace vgpu_driver

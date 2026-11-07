@@ -50,6 +50,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "platform.hpp"
@@ -6466,6 +6467,8 @@ struct LaneItem {
 std::condition_variable g_async_cv;
 std::unordered_map<void*, std::unique_ptr<Lane>> g_lanes;
 std::atomic<bool> g_async_used{false};   // a lane was ever created; before that every hook below returns at once
+std::atomic<bool> g_host_used{false};    // a host function was ever queued (by either API): the driver API's hooks act only then
+std::unordered_set<void*> g_drv_nonblocking;   // driver streams made with CU_STREAM_NON_BLOCKING (guarded by g_stream_mu)
 
 // A lane is named by its stream, the default streams by the two special handles; the null stream is the legacy one.
 void* lane_key(cudaStream_t s) { return s == cudaStreamLegacy ? nullptr : static_cast<void*>(s); }
@@ -6477,7 +6480,8 @@ bool stream_is_blocking(cudaStream_t s) {
   if (s == cudaStreamPerThread) return false;
   std::lock_guard<std::mutex> lock(g_stream_mu);
   const RtStream* r = stream_record(s);
-  return !r || !(r->flags & cudaStreamNonBlocking);
+  if (!r) return g_drv_nonblocking.count(static_cast<void*>(s)) == 0;   // a stream the driver API made
+  return !(r->flags & cudaStreamNonBlocking);
 }
 
 Lane* find_lane(void* key) {   // caller holds g_event_mu
@@ -6647,6 +6651,7 @@ struct AsyncDrainAtExit {
 
 static void async_push_host(cudaStream_t stream, cudaHostFn_t fn, void* user) {
   const bool blocking = stream_is_blocking(stream);
+  g_host_used.store(true, std::memory_order_relaxed);
   LaneItem it;
   it.kind = LaneItem::Host;
   it.fn = fn;
@@ -6784,6 +6789,75 @@ static bool async_stream_busy(cudaStream_t stream) {
   for (const Lane* l : sync_lanes(lane_key(stream), legacy))
     if (lane_busy(l)) return true;
   return false;
+}
+
+// ---- What libcuda reaches by name, to order the driver API's work with the stream lanes (cuLaunchHostFunc, #487) -----------
+// The driver API has no lanes of its own: a host function it queues is a lane item here, and its stream, event and
+// synchronization calls ask these (dlsym, as for capture, driver_capture.inc). None is traced or profiled: they are not
+// calls the program made. Every one of them acts only once a host function has been queued by either API
+// (vgpu_async_host_used_v1), so a program that never queues one is not changed by them.
+extern "C" __attribute__((visibility("default"))) int vgpu_async_host_used_v1(void) {
+  return g_host_used.load(std::memory_order_relaxed) ? 1 : 0;
+}
+// Queues `fn` behind the stream's work; the call returns at once.
+extern "C" __attribute__((visibility("default"))) void vgpu_async_host_fn_v1(void* stream, cudaHostFn_t fn, void* user) {
+  async_push_host(reinterpret_cast<cudaStream_t>(stream), fn, user);
+}
+// Returns once the stream's earlier host work has finished (work issued on the stream follows it).
+extern "C" __attribute__((visibility("default"))) void vgpu_async_order_v1(void* stream) {
+  if (!g_host_used.load(std::memory_order_relaxed)) return;
+  async_order(reinterpret_cast<cudaStream_t>(stream));
+}
+extern "C" __attribute__((visibility("default"))) int vgpu_async_stream_busy_v1(void* stream) {
+  if (!g_host_used.load(std::memory_order_relaxed)) return 0;
+  return async_stream_busy(reinterpret_cast<cudaStream_t>(stream)) ? 1 : 0;
+}
+extern "C" __attribute__((visibility("default"))) void vgpu_async_wait_stream_v1(void* stream) {
+  if (!g_host_used.load(std::memory_order_relaxed)) return;
+  async_wait_stream(reinterpret_cast<cudaStream_t>(stream));
+}
+extern "C" __attribute__((visibility("default"))) void vgpu_async_wait_device_v1(void) {
+  if (g_host_used.load(std::memory_order_relaxed)) async_wait_device();
+}
+// The event record the driver API's cuEventRecord makes on the runtime event that stands for its event: queued behind
+// the stream's pending work, else stamped now. Nothing else of cudaEventRecord (no capture, no profiler record: the
+// driver call makes its own).
+extern "C" __attribute__((visibility("default"))) void vgpu_async_event_record_v1(void* event, void* stream) {
+  const cudaEvent_t e = reinterpret_cast<cudaEvent_t>(event);
+  const cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+  const bool blocking = stream_is_blocking(s);
+  std::lock_guard<std::mutex> lock(g_event_mu);
+  RtEvent* r = find_event(e);
+  if (!r) return;
+  r->captured = false;
+  r->capture_deps.clear();
+  r->recorded = true;
+  if (!async_record_locked(r, e, s, blocking)) r->when = std::chrono::steady_clock::now();
+}
+// 0: not a runtime event, never recorded, or last recorded in a capture (the driver's own answer stands); 1: complete,
+// with the time it completed in nanoseconds of the steady clock (CLOCK_MONOTONIC); 2: recorded behind work that has
+// not finished.
+extern "C" __attribute__((visibility("default"))) int vgpu_async_event_state_v1(void* event, long long* when_ns) {
+  std::lock_guard<std::mutex> lock(g_event_mu);
+  const RtEvent* r = find_event(reinterpret_cast<cudaEvent_t>(event));
+  if (!r || !r->recorded || r->captured) return 0;
+  if (r->outstanding) return 2;
+  if (when_ns) *when_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(r->when.time_since_epoch()).count();
+  return 1;
+}
+extern "C" __attribute__((visibility("default"))) void vgpu_async_wait_event_v1(void* event) {
+  async_wait_event(reinterpret_cast<cudaEvent_t>(event));
+}
+// cuStreamWaitEvent: the stream's later work follows an event that is still pending.
+extern "C" __attribute__((visibility("default"))) void vgpu_async_stream_wait_event_v1(void* stream, void* event) {
+  async_wait_event_on_stream(reinterpret_cast<cudaStream_t>(stream), reinterpret_cast<cudaEvent_t>(event));
+}
+// A stream the driver API made without CU_STREAM_NON_BLOCKING orders against the legacy default stream; one made with
+// it does not (the runtime knows only its own streams' flags).
+extern "C" __attribute__((visibility("default"))) void vgpu_async_stream_flags_v1(void* stream, int non_blocking, int created) {
+  std::lock_guard<std::mutex> lock(g_stream_mu);
+  if (created && non_blocking) g_drv_nonblocking.insert(stream);
+  else g_drv_nonblocking.erase(stream);
 }
 
 static cudaError_t cudaEventCreateWithFlags_body(cudaEvent_t* e, unsigned int flags) {
