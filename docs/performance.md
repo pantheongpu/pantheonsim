@@ -7418,6 +7418,34 @@ Results and counters: `VGPU_KERNEL_DIGEST` equal to A's for radixsort2 (all 600 
 * The 1.9-2.0x on PTX is for a program whose onesweep kernel is the engine's biggest cost; SASS already had it. The AMD figure is a synthetic kernel through `amd::execute` (no HIP runtime between launches), not a real program.
 * The timed runs were on a shared box (load 1 to 7); the A/A control reads 0.2 % to 1.2 %, medians of 15 (9 at one thread).
 * The AMD pool's 16-thread loss (0.95x of one thread on this program) is real and not fixed here.
+## Round sp27 (AMD gather): a wave's load reads each repeated address once (branch `sp27-gather`, base `origin/main` dfbf2dc1)
+
+### Where the cost was
+Phase 0 put `MemoryManager::load_batch` at 37% of amd-polybench/SYR2K. SYR2K's kernel (`c[i][j] += a[i*NJ+k] * b[j*NJ+k] + b[i*NJ+k] * a[j*NJ+k]`, work-groups of 32 x 8) makes a wave of 64 lanes = two rows `i` of 32 columns `j`. Of its four loads a `k`, two (`a[i*NJ+k]`, `b[i*NJ+k]`) have **one address in each half of the wave** (32 lanes at one address), and two (`b[j*NJ+k]`, `a[j*NJ+k]`) are gathers whose **second half repeats the first half's 32 addresses**. `wave_scalars` handed all 64 lanes of every one of them to `load_batch` (14 instructions a lane). So 256 lane loads a `k` did the work of 68.
+
+### What changed
+`Machine::load_wave_repeats` (`amd/src/gcn_exec.cpp`, out of line, called by the whole-wave branch of `wave_scalars` for loads after the "every lane at one address" test): (1) each half of a wave of 64 at one address: two reads, 32 lanes filled from each; (2) a wave of 64 whose lanes 32..63 have lanes 0..31's addresses, on one host thread only (`!conc()`): the first 32 are read and copied; (3) groups of four or more neighbouring lanes at one address (lanes 0..3 and the last four lanes are tested): the distinct addresses are read and expanded. (1) and (3) are the rule `wave_scalars` already had (a lane that follows a lane with the same address takes that lane's value), applied before the read rather than after it, so they hold with threads too; (2) needs that no other thread writes between the two reads. The memory manager sees a subset of the same addresses with the same first lane, so it accepts and declines exactly as for the whole wave (a decline returns false and the lanes go one at a time, as before). Nothing else changed: counters are counted in `tier_global` before this.
+
+### Results (server2, Zen 5, one thread, cpu 20, `user` CPU; A = origin/main dfbf2dc1, W = branch, A2 = a second copy of A's library made at the same time, W0 = W with `load_wave_repeats` returning 0 at once (neutralised control); runs interleaved in shuffled order; Mann-Whitney p; **server2 load was 5 to 14 from other jobs, above the 8 rule: the A/A rows are the check on that**; stdout and `VGPU_DISPATCH_STATS` identical in A, W, A2 in every row, and for SYR2K the FNV hash of C read back from the device too)
+| program | runs | W/A (p) | A2/A | W0/A |
+|---|---:|---|---:|---:|
+| SYR2K | 15 (9 with W0) | **0.734** (0.000) | 0.994 | 1.006 |
+| SYRK | 7 | **0.820** (0.002) | 1.010 | |
+| GEMM | 7 | **0.905** (0.002) | 1.014 | |
+| 3MM | 7 | **0.921** (0.002) | 1.009 | |
+| CORR | 7 | 1.012 (0.66, spread 16%) | 0.984 | |
+| ATAX (0.5 s) | 25 | 1.018 (0.004) | 1.000 | 1.000 |
+| MVT (0.6 s) | 25 | 1.032 (0.024) | 1.000 | 1.000 |
+| 2DCONV, JACOBI2D, GESUMMV, BICG (0.2 to 0.7 s) | 7 to 25 | 1.00 to 1.04, p 0.0 to 0.9 | 0.99 to 1.00 | |
+SYR2K sampler profile (LD_PRELOAD SIGPROF, 500 Hz): 5,325 samples before, 4,149 after; `load_batch` 2,264 -> 886, `load_wave_repeats` 181. Not run for lack of time (each is minutes a run): LU, 3DCONV, COVAR, 2MM, FDTD-2D, GRAMSCHM.
+
+**Caveat, a real small loss**: ATAX +1.8% and MVT +3.2% against W0 = 1.000 and A2 = 1.000 (0.5 s programs, 10 ms clock steps, spread 30 to 40%). Those kernels have no repeated addresses, so the cost is the extra call and the tests (two compares and an early-out `memcmp` a gather); the gain-carrying rows are all 8 to 27%. Not chased further.
+
+### Tests and mutants
+`test_amd_gcn_gather_same_bits` runs every flat / global instruction of the five ISA corpora (982 shapes, 106,056 runs) on new digest flavours **34** (the second half of the wave at the first half's addresses) and **35** (groups of 2 to 64 lanes at one address; one lane in three that is not an end of a half moved; groups sharing their neighbour's address; one lane off half the time so the wave is not whole), against the lane-by-lane twin (tier and whole-wave calls off). Numbering: 32 and 33 are taken by PR #504. Passes with and without the change (also `test_amd_gcn_same_bits`, `test_amd_gcn_memory_same_bits`, `test_gather_sp10`, `lint_hot_unit_layout`). Mutants (one-line edits on server2, `VGPU_GATHER_ONLY=global_load_dword`, each rebuilt; all restored): the second half's value taken from the first half's address (`got2[1]` -> `got2[0]`): killed (26 runs differ); the half copy reading `vals[i - 1]`: killed (368); the run index off by one: killed (348); the second half's constancy test dropped: killed (24); the halves comparison one entry short: killed (6, after flavour 34 learned to move lane 63); runs compared with the first lane instead of the neighbour: killed (42). Survived, equivalent: the run gate (`addrs[h - 1] == addrs[h - 4]` made true) only decides whether the pass is worth making, the expansion is right for any wave; `!conc()` on the halves (the test runs one thread).
+
+### Not done
+Bilateral (`h_div`, libm `modff`/`ldexpf`): left to the sp26 amd-gather branch, which was already changing `h_div`, `h_pk` and `k_fldexp` on server2 while this round ran. `tier_global` (13%) and `wave_scalars` (9%) are now the memory-path remainder of SYR2K: the 32 distinct lines of a gather at stride 4096 map to few L1 sets and are L2 hits, which no instruction count removes (see Round sp21). LU, 3DCONV, COVAR, 2MM, FDTD-2D, GRAMSCHM not timed.
 
 ## Round sp26 (tensor): HMMA and IMMA from the registers, LDSM, 128-bit global loads (branch `sp26-tensor`, base `origin/main` dfbf2dc1)
 

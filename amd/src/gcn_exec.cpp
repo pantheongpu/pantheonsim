@@ -10208,6 +10208,52 @@ struct Machine {
     return true;
   }
 
+  // A whole wave's load whose addresses repeat (a kernel indexed by the thread's row and column: each row of the work-group reads one
+  // address, or the wave's second half reads the first half's addresses): only the distinct ones are read, and the rest of the lanes take
+  // the value of the lane they repeat. Two shapes, either or both:
+  //  * runs: lanes 0 to 3 and the last four lanes each have one address; neighbouring lanes with one address are read once (the rule of
+  //    wave_scalars for loads: a lane that follows a lane with the same address takes the value that lane got, applied before the read);
+  //  * halves: a wave of 64 whose lanes 32..63 have the addresses of lanes 0..31, on one host thread only (no other thread writes between the
+  //    two reads of an address, so they agree; with threads each lane would read for itself).
+  // Returns 0, having done nothing, where neither shape is there; 1 with `vals` for every lane; -1 where the memory manager declined (the
+  // lanes then go one at a time). The distinct addresses are what the whole wave's addresses are for the manager (the first lane's address is
+  // the first lane's, the set of addresses the same), so it accepts and declines exactly as it would for the whole wave.
+  [[gnu::noinline]] int load_wave_repeats(const uint64_t* addrs, uint32_t count, uint32_t bytes, uint64_t* vals) const {
+    constexpr uint32_t kHalf = kLanes / 2;
+    uint32_t h = count;
+    if (count == kLanes) {
+      // Each half of the wave at one address (a row of 32 reading one element): two reads. (The common shape, so it has a test of its own.)
+      if (addrs[kHalf - 1] == addrs[0] && addrs[kLanes - 1] == addrs[kHalf] && exec::amdrun::all_equal(addrs, kHalf) &&
+          exec::amdrun::all_equal(addrs + kHalf, kHalf)) {
+        const uint64_t two[2] = {addrs[0], addrs[kHalf]};
+        uint64_t got2[2];
+        if (!load_wave(two, 2, bytes, got2)) return -1;
+        for (uint32_t i = 0; i < kHalf; ++i) vals[i] = got2[0], vals[kHalf + i] = got2[1];
+        return 1;
+      }
+      if (!conc() && std::memcmp(addrs, addrs + kHalf, sizeof(uint64_t) * kHalf) == 0) h = kHalf;
+    }
+    // (Runs of four or more at both ends: fewer would not pay for the pass.)
+    const bool runs = h >= 4 && addrs[3] == addrs[0] && addrs[h - 1] == addrs[h - 4];
+    if (h == count && !runs) return 0;
+    if (!runs) {
+      if (!load_wave(addrs, h, bytes, vals)) return -1;
+    } else {
+      uint64_t distinct[kLanes], got[kLanes];
+      uint8_t at[kLanes];
+      uint32_t d = 0;
+      for (uint32_t i = 0; i < h; ++i) {
+        d += i == 0 || addrs[i] != addrs[i - 1];
+        distinct[d - 1] = addrs[i];
+        at[i] = static_cast<uint8_t>(d - 1);
+      }
+      if (!load_wave(distinct, d, bytes, got)) return -1;
+      for (uint32_t i = 0; i < h; ++i) vals[i] = got[at[i]];
+    }
+    for (uint32_t i = h; i < count; ++i) vals[i] = vals[i - h];
+    return 1;
+  }
+
   // A load of three words a lane (global_load_dwordx3: a stencil's three neighbours) for the active lanes from `from` on, made together:
   // lane by lane (Machine::load_words) makes each lane's three words an aligned pair and a word -- the pair first when the lane's address
   // is on an 8-byte boundary, the word first otherwise -- so every lane is one 8-byte access and one 4-byte access, and they go as two
@@ -10296,11 +10342,15 @@ struct Machine {
         if (!load_wave(addrs, 1, bytes, vals)) return false;
         for (uint32_t i = 1; i < count; ++i) vals[i] = vals[0];
       } else {
-        if (!load_wave(addrs, count, bytes, vals)) return false;
-        // (On one host thread nothing writes between two lanes' reads of an address, so they already agree: the copy is for threads.)
-        if (conc() && exec::amdrun::any_adjacent_equal(addrs, count))
-          for (uint32_t i = 1; i < count; ++i)
-            if (addrs[i] == addrs[i - 1]) vals[i] = vals[i - 1];
+        const int again = load_wave_repeats(addrs, count, bytes, vals);
+        if (again < 0) return false;
+        if (!again) {
+          if (!load_wave(addrs, count, bytes, vals)) return false;
+          // (On one host thread nothing writes between two lanes' reads of an address, so they already agree: the copy is for threads.)
+          if (conc() && exec::amdrun::any_adjacent_equal(addrs, count))
+            for (uint32_t i = 1; i < count; ++i)
+              if (addrs[i] == addrs[i - 1]) vals[i] = vals[i - 1];
+        }
       }
       if (narrow_by) {
         const Narrow nb = *narrow_by;
@@ -13921,6 +13971,39 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
         w.vgpr[in.src[0].index + 1][lane] = static_cast<uint32_t>((region + off) >> 32);
       }
     }
+  }
+  if ((flavour == 34 || flavour == 35) && in.enc == gcn::Enc::Flat && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
+    // Flavours 34 and 35: a global access whose lanes repeat addresses the way a kernel indexed by the thread's row and column does (the
+    // wave is two rows of 32 columns). 34: the second half of the wave has the first half's addresses (a column gather); 35: groups of
+    // 2, 3, 4, 8, 16, 32 or 64 neighbouring lanes with one address each (a row's broadcast), where a group may share the address of the
+    // one before it. Both draw the addresses on a word or on 16 bytes, and switch one lane off one time in two (so the wave is not whole).
+    if (in.has_saddr && in.saddr + 1 < kSgprs) w.sgpr[in.saddr] = static_cast<uint32_t>(region), w.sgpr[in.saddr + 1] = static_cast<uint32_t>(region >> 32);
+    static constexpr uint32_t kGroup[] = {2, 3, 4, 8, 16, 32, 64};
+    const uint32_t group = kGroup[r.next() % (sizeof kGroup / sizeof kGroup[0])];
+    const uint64_t mask = r.next() % 2 ? 0x7FFCu : 0x7FF0u;
+    uint64_t pool[kLanes];
+    for (uint64_t& p : pool) p = r.next() & mask;
+    if (r.next() % 4 == 0)
+      for (uint32_t k = 1; k < kLanes; ++k)
+        if (r.next() % 3 == 0) pool[k] = pool[k - 1];
+    uint64_t at[kLanes];
+    for (uint32_t lane = 0; lane < kLanes; ++lane) at[lane] = flavour == 34 ? pool[lane % 32] : pool[lane / group];
+    // (One time in three, one lane other than the first of a half is somewhere else: a wave that has the shape except for one lane, which
+    // the tests that look at a few lanes only must not take for it.)
+    if (r.next() % 3 == 0) {
+      const uint32_t lane = 1 + static_cast<uint32_t>(r.next() % 63);
+      if (lane != 32) at[lane] = r.next() & mask;
+    }
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const uint64_t off = at[lane];
+      if (in.has_saddr) {
+        w.vgpr[in.src[0].index][lane] = static_cast<uint32_t>(off);
+      } else {
+        w.vgpr[in.src[0].index][lane] = static_cast<uint32_t>(region + off);
+        w.vgpr[in.src[0].index + 1][lane] = static_cast<uint32_t>((region + off) >> 32);
+      }
+    }
+    if (r.next() % 2) w.exec &= ~(uint64_t{1} << (r.next() % w.lanes));
   }
   if ((flavour == 18 || flavour == 19) && in.enc == gcn::Enc::Ds && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
     // Flavours 18 and 19: an LDS access whose lanes' addresses are consecutive words (or, for the wide forms, consecutive groups of words)
