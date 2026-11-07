@@ -2334,8 +2334,13 @@ static CUresult cuModuleGetFunction_impl(CUfunction* hfunc, CUmodule hmod, const
     if (it == s.modules.end()) return CUDA_ERROR_NOT_FOUND;
     auto [dev, mid] = it->second;
     const vgpu::ptx::EntryFn* fn = s.rt->device(dev).get_function(mid, name);
-    uintptr_t fh = make_handle(s, kTagFunc);
-    s.functions[fh] = {dev, h, fn, s.rt->device(dev).symbols(mid), mid};
+    // One handle per module and name, as on the card, and the one cuModuleEnumerateFunctions hands out
+    // (driver_sweep.inc): programs compare function handles.
+    uintptr_t& fh = s.runtime_functions[{h, std::string(name)}];
+    if (!fh || !s.functions.count(fh)) {
+      fh = make_handle(s, kTagFunc);
+      s.functions[fh] = {dev, h, fn, s.rt->device(dev).symbols(mid), mid};
+    }
     *hfunc = reinterpret_cast<CUfunction>(fh);
     return CUDA_SUCCESS;
   });

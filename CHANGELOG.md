@@ -7,6 +7,7 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- `cuModuleGetFunction` returns the same `CUfunction` for the same module and name, and it is the handle `cuModuleEnumerateFunctions` returns, as on the card. It made a new handle on every call, so programs that compare function handles (cuda-api-wrappers) saw them differ (pantheonsim #520).
 - The container image builds again. `scripts/package-build.sh` left `shim/libcudss.so.1` pointing into `cudss1/`, a directory the image does not
   have, so the build stopped at "links that lead nowhere" from the cuDSS 1.0 change onward. A lint test (`lint_package_build`) now builds a small
   tree with the same layout.
