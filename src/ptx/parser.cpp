@@ -3838,10 +3838,15 @@ class Parser {
       OpElect op;
       // The syntax is "d|p" or just "|p": the leader's lane id, the predicate,
       // or both. A bare "|" means only the predicate is wanted.
-      if (!peek_punct("|")) op.dst = expect_reg_operand("elect destination");
+      // Either part may be the sink `_` ("elect.sync _|%p1, mask"), which discards it.
+      if (!peek_punct("|")) {
+        if (peek().text == "_") next();
+        else op.dst = expect_reg_operand("elect destination");
+      }
       if (peek_punct("|")) {
         next();
-        op.pred_dst = expect_reg_operand("elect predicate destination");
+        if (peek().text == "_") next();
+        else op.pred_dst = expect_reg_operand("elect predicate destination");
       }
       expect_punct(",");
       op.membermask = parse_operand();

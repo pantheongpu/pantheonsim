@@ -1424,6 +1424,7 @@ vgpu_unit_test(test_ptx_bitwise_not)
 vgpu_unit_test(test_ptx_forms)
 # 16-bit signed integer forms on registers with zero upper bits (abs.s16 and its siblings).
 vgpu_unit_test(test_ptx_int16)
+vgpu_unit_test(test_ptx_elect_sink)
 # Hopper (sm_90a): the warpgroup MMA, against the ISA's own layout examples.
 vgpu_unit_test(test_hopper)
 # Blackwell (sm_100a): Tensor Memory and tcgen05, against the ISA's figures.

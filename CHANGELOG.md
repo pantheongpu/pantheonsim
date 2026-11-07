@@ -7,6 +7,8 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- PTX: `elect.sync` accepts the sink `_` for either destination (`elect.sync _|%p1, mask;`, which cubecl's CUDA backend emits for `plane_elect`).
+  The module used to fail to load with `elect destination must be a register, got '_'` (pantheonsim #503).
 - The container image builds again. `scripts/package-build.sh` left `shim/libcudss.so.1` pointing into `cudss1/`, a directory the image does not
   have, so the build stopped at "links that lead nowhere" from the cuDSS 1.0 change onward. A lint test (`lint_package_build`) now builds a small
   tree with the same layout.
