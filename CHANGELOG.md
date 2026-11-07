@@ -7,6 +7,9 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- PTX: `setp` and `set` on `.bf16` compare the values. The comparator did not take `.bf16` for a floating type and compared the raw
+  16 bits as integers, so the sign was ignored (`setp.lt.bf16` of -1 and 1 was false, `-0 == +0` was false) and a NaN was never unordered
+  (`setp.nan.bf16`, `setp.neu.bf16`, `set.nan.u16.bf16`). `.bf16x2` and `.f16` were already right (pantheonsim #502).
 - The container image builds again. `scripts/package-build.sh` left `shim/libcudss.so.1` pointing into `cudss1/`, a directory the image does not
   have, so the build stopped at "links that lead nowhere" from the cuDSS 1.0 change onward. A lint test (`lint_package_build`) now builds a small
   tree with the same layout.

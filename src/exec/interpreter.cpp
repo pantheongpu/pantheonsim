@@ -12917,7 +12917,9 @@ class Interpreter {
         default: return false;  // unordered forms are float-only; handled above
       }
     };
-    if (ty.is_float()) {
+    if (ty.is_real()) {
+      // (.bf16 is not Type::is_float(): it has to be read as a bfloat16 value here, not fall through to the integer compare.)
+      if (ty.is_bfloat()) return compare_float(cmp, bf16_to_double(a & 0xFFFF), bf16_to_double(b & 0xFFFF));
       if (ty.bits == 16) return compare_float(cmp, f16_to_double(a), f16_to_double(b));
       return ty.bits == 32 ? compare_float(cmp, f32(a), f32(b)) : compare_float(cmp, f64(a), f64(b));
     }
