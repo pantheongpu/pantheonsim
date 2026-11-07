@@ -2768,6 +2768,14 @@ if(TARGET vgpucudart)
   set_tests_properties(test_runtime_exports PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
+# Zero-byte allocations: success with NULL from the runtime's allocators, as on the card (pantheonsim #515).
+if(TARGET vgpucudart AND TARGET vgpucuda AND CUDA_ABI_INCLUDE)
+  add_executable(test_zero_size_alloc nvidia/tests/unit/test_zero_size_alloc.cpp)
+  target_link_libraries(test_zero_size_alloc PRIVATE vgpucudart vgpucuda)
+  target_include_directories(test_zero_size_alloc PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_zero_size_alloc COMMAND test_zero_size_alloc)
+  set_tests_properties(test_zero_size_alloc PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1")
+endif()
 # The structures the driver shim declares for itself are cuda.h's (compile-time checks only).
 if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
   add_executable(test_driver_abi_sweep nvidia/tests/unit/test_driver_abi_sweep.cpp)

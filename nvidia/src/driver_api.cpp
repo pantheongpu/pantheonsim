@@ -1398,6 +1398,11 @@ static void profile_memory(uint8_t op, uint64_t address, uint64_t bytes, vgpu::p
 static CUresult cuMemAlloc_v2_impl(CUdeviceptr* dptr, size_t bytesize) {
   return api("cuMemAlloc", true, false, [&](ShimState& s) {
     if (!dptr) return CUDA_ERROR_INVALID_VALUE;
+    // Unlike cudaMalloc, the driver call refuses zero bytes: CUDA_ERROR_INVALID_VALUE, with *dptr set to 0 (RTX 3060).
+    if (bytesize == 0) {
+      *dptr = 0;
+      return CUDA_ERROR_INVALID_VALUE;
+    }
     *dptr = current(s).memory().alloc(bytesize);
     profile_memory(1, *dptr, bytesize, vgpu::profiling::MemKind::Device, current_device(s));
     return CUDA_SUCCESS;
@@ -3638,7 +3643,11 @@ static CUresult cuMemGetAddressRange_v2_impl(CUdeviceptr* base, size_t* size, CU
 
 static CUresult cuMemHostAlloc_impl(void** pp, size_t bytesize, unsigned int flags) {
   return api("cuMemHostAlloc", true, false, [&](ShimState& s) {
-    if (!pp || bytesize == 0) return CUDA_ERROR_INVALID_VALUE;
+    if (!pp) return CUDA_ERROR_INVALID_VALUE;
+    if (bytesize == 0) {   // success with NULL, as on the card (cuMemAllocHost and cuMemHostAlloc alike)
+      *pp = nullptr;
+      return CUDA_SUCCESS;
+    }
     void* p = std::aligned_alloc(4096, (bytesize + 4095) / 4096 * 4096);
     if (!p) return CUDA_ERROR_OUT_OF_MEMORY;
     for (int d = 0; d < s.rt->device_count(); ++d)
@@ -3829,6 +3838,7 @@ static CUresult cuMemAllocManaged_impl(CUdeviceptr* dptr, size_t bytesize, unsig
   VGPU_CAPTURE_UNSAFE("cuMemAllocManaged");
   return api("cuMemAllocManaged", true, false, [&](ShimState& s) {
     // CU_MEM_ATTACH_GLOBAL (1) or CU_MEM_ATTACH_HOST (2), exactly; a size of 0 is refused.
+    if (dptr && bytesize == 0) *dptr = 0;   // refused, with *dptr zeroed, on the card
     if (!dptr || bytesize == 0 || (flags != 1 && flags != 2)) return CUDA_ERROR_INVALID_VALUE;
     const size_t n = (bytesize + 4095) / 4096 * 4096;
     void* p = std::aligned_alloc(4096, n);
@@ -5315,6 +5325,10 @@ static CUresult cuMemAllocPitch_v2_impl(CUdeviceptr* dptr, size_t* pitch, size_t
                                         unsigned int elem) {
   VGPU_CAPTURE_UNSAFE("cuMemAllocPitch_v2");
   return api("cuMemAllocPitch", true, false, [&](ShimState& s) {
+    if (dptr && pitch && (width == 0 || height == 0)) {   // refused, with both outputs zeroed, on the card
+      *dptr = 0;
+      *pitch = 0;
+    }
     if (!dptr || !pitch || width == 0 || height == 0 || (elem != 4 && elem != 8 && elem != 16))
       return CUDA_ERROR_INVALID_VALUE;
     *pitch = (width + 511) / 512 * 512;

@@ -7,6 +7,10 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- A zero-byte allocation behaves as on the card. `cudaMalloc`, `cudaMallocHost`, `cudaHostAlloc`, `cudaMallocManaged`, `cudaMallocAsync` and
+  `cudaMallocFromPoolAsync` return `cudaSuccess` with a NULL pointer (they returned a distinct non-null one, so code that tells an unused buffer by
+  its NULL, such as Gpufit, took the wrong path). In the driver API `cuMemAlloc` and `cuMemAllocManaged` refuse zero bytes with
+  `CUDA_ERROR_INVALID_VALUE` and `*dptr` set to 0, and `cuMemAllocHost` and `cuMemHostAlloc` succeed with NULL, all as measured on an RTX 3060.
 - The container image builds again. `scripts/package-build.sh` left `shim/libcudss.so.1` pointing into `cudss1/`, a directory the image does not
   have, so the build stopped at "links that lead nowhere" from the cuDSS 1.0 change onward. A lint test (`lint_package_build`) now builds a small
   tree with the same layout.
