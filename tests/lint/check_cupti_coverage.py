@@ -31,6 +31,7 @@ RUNTIME_EXEMPT = {
 }
 DRIVER_EXEMPT = {
     "vgpu_driver_bind_primary_v1": "the runtime shim's private hook, not a CUDA function",
+    "vgpu_driver_has_managed_v1": "the runtime shim's private hook, not a CUDA function",
     # event_record() reports the call itself (traced) on the path where the driver records the event; on a
     # capturing stream the record is the runtime's, which reports cudaEventRecordWithFlags.
     "cuEventRecord": "reported by event_record()",

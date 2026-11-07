@@ -970,6 +970,14 @@ VGPU_EXPORT CUresult cuInit(unsigned int flags) {
 // program made current itself is left alone; a primary one is swapped for the
 // runtime's current device's. Called by the runtime shim, found through the
 // process's global scope (runtime_api.cpp).
+// Whether the driver API has made a managed allocation (cuMemAllocManaged, or a module's __managed__ globals): the runtime
+// keeps its launches synchronous while any exists (runtime_api.cpp, the asynchronous launch). Found through the process's
+// global scope; the caller holds the API lock.
+VGPU_EXPORT int vgpu_driver_has_managed_v1() {
+  ShimState& s = state();
+  return !s.managed.empty();
+}
+
 VGPU_EXPORT int vgpu_driver_bind_primary_v1(int dev) {
   if (cuInit_impl(0) != CUDA_SUCCESS) return CUDA_ERROR_NOT_INITIALIZED;
   return api("vgpu_driver_bind_primary", true, false, [&](ShimState& s) {

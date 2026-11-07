@@ -280,6 +280,7 @@ variable is unset by default.
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `VGPU_THREADS` | Host threads used to run blocks. | one per core (`make run` and `./run` set half the cores unless this or `threads:` is set) |
+| `VGPU_ASYNC_LAUNCH` | A kernel launch on a `cudaStreamNonBlocking` stream returns before the kernel has run (`cudaEventQuery` on work behind it is `cudaErrorNotReady`). `all` does the same on streams made with `cudaStreamCreate`; `0` runs every launch inside its call. Never used with a profiler, `VGPU_TRACE`, a managed allocation or a CUDA library shim loaded (docs/perf-design/streams.md). | non-blocking streams |
 | `VGPU_LOCKSTEP` | `0` runs a grid's blocks one after another on each host thread, as before; `all` runs every launch with the blocks the device holds resident together taking turns; the default runs kernels with a loop that polls global memory that way (see [cooperative.md](cooperative.md)). | polling kernels |
 | `VGPU_LOCKSTEP_LOG` | `1` prints a line on stderr for each launch that runs its blocks together; any other value is a file the lines are appended to (the tests count the kernels that do). | off |
 | `VGPU_MAX_STEPS` | Raises (or lowers) the runaway-kernel step budget; `0` removes it. The PTX engine reads it at each launch; the SASS engine reads it once per process. | built-in |

@@ -6,8 +6,7 @@
 //
 // Every check here is what an RTX 3060 (driver 610, CUDA 13.0 runtime) does too -- the program is also built and run
 // against NVIDIA's runtime on the card, where all of them hold -- so each is a fact about CUDA, not about this
-// simulator. The kernel-launch case of #523 (an event recorded behind a long kernel is not ready) is NOT checked: a
-// kernel still runs to completion inside its launch here.
+// simulator. The kernel-launch case of #523 (an event recorded behind a long kernel is not ready) is async_launch_events.cu.
 #include <cuda_runtime.h>
 
 #include <atomic>
