@@ -10,9 +10,11 @@
 //  * row_uniform (whether all 32 words of a register row are one value);
 //  * shfl_move: the words a shuffle shape moves, for every shape the analysis gives, against exec_warp's per-lane rule.
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <random>
+#include <vector>
 
 #include "sass/tier.hpp"
 #include "vgpu/exec/sass_lanes.hpp"
@@ -289,6 +291,51 @@ VTEST(fill_lanes_and_lane_ids_write_the_lanes_of_the_mask_only) {
       VCHECK_EQ(b[l], ((ex >> l) & 1) ? l : keep[l]);
     }
   }
+}
+
+VTEST(match_any_gives_each_lane_the_lanes_that_hold_its_value) {
+  // MATCH.ANY (the tier's h_match): the lanes of the mask are sorted into classes of equal 64-bit values by a hash table; the answer must be the
+  // class-by-class scan's, and the lanes outside the mask must not be touched. Values that differ only in the high or only in the low half,
+  // values that land in the same table slot (so the probing runs), 32 different values, one value, zero and all-ones.
+  std::mt19937_64 rng(2026);
+  const auto slot_of = [](uint64_t x) { return static_cast<unsigned>((x * 0x9E3779B97F4A7C15ull) >> 58); };
+  std::vector<uint64_t> same_slot;   // 48 values for one slot, then 48 for the next: chains that run into each other
+  for (unsigned want : {5u, 6u, 63u})
+    for (unsigned n = 0; n < 48;) {
+      const uint64_t x = rng();
+      if (slot_of(x) == want) { same_slot.push_back(x); ++n; }
+    }
+  long classes_seen = 0;
+  for (int round = 0; round < 60000; ++round) {
+    const Mask ex = round % 4 == 0 ? sl::kAll : random_mask(rng);
+    uint64_t v[32];
+    switch (round % 8) {
+      case 0: for (auto& x : v) x = rng(); break;                                     // (nearly) all different
+      case 1: for (unsigned l = 0; l < 32; ++l) v[l] = uint64_t{l} << 32; break;      // high half only
+      case 2: for (unsigned l = 0; l < 32; ++l) v[l] = l * 977u; break;               // low half only
+      case 3: { const uint64_t x = rng(); for (auto& y : v) y = x; break; }           // one class
+      case 4: for (auto& x : v) x = same_slot[rng() % same_slot.size()]; break;       // collisions
+      case 5: for (auto& x : v) x = (rng() & 1) ? 0 : ~uint64_t{0}; break;
+      case 6: for (unsigned l = 0; l < 32; ++l) v[l] = same_slot[l + (round / 8) % 3 * 48 % 96]; break;   // 32 different values in one chain
+      default: { const uint64_t pool[3] = {rng(), rng(), rng()}; for (auto& x : v) x = pool[rng() % 3] ^ (rng() % 3 == 0 ? uint64_t{1} << 63 : 0); break; }
+    }
+    uint32_t got[32], want[32], bf[32];
+    for (unsigned l = 0; l < 32; ++l) got[l] = want[l] = bf[l] = 0xdeadbeefu ^ l;
+    sl::match_any(v, ex, got);
+    sl::match_any_reference(v, ex, want);
+    for (unsigned l = 0; l < 32; ++l) {
+      if (!((ex >> l) & 1)) { bf[l] = 0xdeadbeefu ^ l; continue; }
+      Mask c = 0;
+      for (unsigned k = 0; k < 32; ++k) c |= static_cast<Mask>(((ex >> k) & 1) && v[k] == v[l]) << k;   // the definition, lane by lane
+      bf[l] = c;
+    }
+    for (unsigned l = 0; l < 32; ++l) {
+      VCHECK_EQ(got[l], want[l]);
+      VCHECK_EQ(got[l], bf[l]);
+    }
+    classes_seen += std::popcount(ex) > 0 ? 1 : 0;
+  }
+  VCHECK(classes_seen > 40000);
 }
 
 VTEST_MAIN
