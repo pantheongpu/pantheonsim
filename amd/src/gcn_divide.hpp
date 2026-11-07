@@ -340,4 +340,142 @@ inline T div_fixup(T s0, T s1, T s2) {
   return sign_out ? -std::fabs(s0) : std::fabs(s0);
 }
 
+// ldexpf(x, k) for any x and any k (v_ldexp_f32): for a normal x and a result that is normal too the exponent field moves and nothing else
+// does -- exact, with no rounding, which is what libm gives -- and everything else (zero, a denormal, an infinity, a NaN, a result that leaves
+// the normal range) is libm's call. The sum is made in 64 bits: k is any 32-bit integer.
+[[gnu::always_inline]] inline bool ldexp_f32_exact(uint32_t bits, int32_t k) {
+  const uint32_t ef = (bits >> 23) & 255u;
+  const int64_t en = static_cast<int64_t>(ef) + k;
+  return ef - 1u < 254u && en >= 1 && en <= 254;
+}
+// (The bits of the answer where ldexp_f32_exact holds.)
+[[gnu::always_inline]] inline uint32_t ldexp_f32_shift(uint32_t bits, int32_t k) { return bits + (static_cast<uint32_t>(k) << 23); }
+// ldexpf for ANY x and k, in integers (libm's answer, bit for bit): zero and infinity come back as they are, a NaN comes back quieted (libm
+// returns x + x), an overflow is the infinity of x's sign, and a result below the normal range is x * 2^k rounded once, to nearest even, to a
+// denormal or to zero (libm multiplies by a power of two, which rounds once; so does this). A denormal x is first normalized.
+[[gnu::always_inline]] inline uint32_t ldexp_f32_bits(uint32_t bits, int32_t k) {
+  const uint32_t sign = bits & 0x80000000u, ef = (bits >> 23) & 255u, frac = bits & 0x7FFFFFu;
+  if (ef == 255u) return frac ? (bits | 0x400000u) : bits;
+  if (ef == 0 && frac == 0) return bits;
+  uint32_t m;
+  int64_t e;
+  if (ef) {
+    m = frac | 0x800000u, e = ef;
+  } else {
+    const int sh = __builtin_clz(frac) - 8;   // (the leading one of a denormal moves to bit 23)
+    m = frac << sh, e = 1 - sh;
+  }
+  e += k;
+  if (e >= 255) return sign | 0x7F800000u;
+  if (e >= 1) return sign | static_cast<uint32_t>(e) << 23 | (m & 0x7FFFFFu);
+  const int64_t shift = 1 - e;   // the result is m / 2^shift in units of the smallest denormal
+  if (shift >= 26) return sign;
+  const uint32_t rem = m & ((1u << shift) - 1u), half = 1u << (shift - 1);
+  uint32_t q = m >> shift;
+  if (rem > half || (rem == half && (q & 1u))) ++q;   // (a carry into 0x800000 is the smallest normal number: the right bits)
+  return sign | q;
+}
+[[gnu::always_inline]] inline float ldexp_f32(float x, int32_t k) {
+  const uint32_t bits = bits_of(x);
+  if (__builtin_expect(ldexp_f32_exact(bits, k), 1)) return from_bits<float>(ldexp_f32_shift(bits, k));
+  return __builtin_ldexpf(x, k);
+}
+
+// ---- Rows of binary32 lanes (the tier's wave-wide forms)
+//
+// A wave's v_div_scale_f32 / v_div_fixup_f32 on the lanes where every operand is an ordinary number and nothing is scaled or special-cased:
+// the answer is a few bit operations on the exponent fields, the same for every lane, so a row of them is tested and computed without a branch
+// and a row with one lane outside it takes the lane-by-lane functions above (nothing is written by these before the verdict). Each returns
+// true when EVERY one of the `n` lanes (active or not) is in the plain case, which is cheap to be conservative about: a lane that is not
+// makes the caller do the lane-by-lane work, which is the reference. test_gcn_divide holds both against div_scale / div_fixup.
+
+// v_div_scale_f32 (S0, S1 = denominator, S2 = numerator): in the plain case the value is S0 and the condition is clear. Plain means that
+// S1 and S2 are normal numbers, their exponents are less than 96 apart, the reciprocal of S1 and the quotient are normal, and S2's exponent
+// is above 23 (the branches of div_scale that leave S0 unchanged and VCC clear).
+[[gnu::always_inline]] inline bool div_scale_row_plain_f32(const uint32_t* s1, const uint32_t* s2, unsigned n) {
+  uint32_t bad = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    const uint32_t e1 = (s1[i] >> 23) & 255u, e2 = (s2[i] >> 23) & 255u;
+    const uint32_t m1 = s1[i] & 0x7FFFFFu, m2 = s2[i] & 0x7FFFFFu;
+    const int32_t diff = static_cast<int32_t>(e2) - static_cast<int32_t>(e1);
+    uint32_t b = (e1 - 1u >= 254u) | (e2 - 1u >= 254u);
+    b |= diff >= Fp<float>::kFar;
+    b |= (e1 >= 254u) | ((e1 == 253u) & (m1 != 0));                                           // the reciprocal is a denormal
+    b |= (diff < Fp<float>::kMinExp) | ((diff == Fp<float>::kMinExp) & (m2 < m1));            // the quotient is
+    b |= e2 <= static_cast<uint32_t>(Fp<float>::kTiny);
+    bad |= b;
+  }
+  return bad == 0;
+}
+
+// v_div_fixup_f32 (S0 = quotient, S1 = denominator, S2 = numerator): in the plain case (S1 and S2 normal numbers whose exponents are within
+// the range that neither underflows nor overflows) the answer is |S0| with the sign of S1 xor S2. Writes the row to `r`; the result is of
+// no use unless true is returned.
+[[gnu::always_inline]] inline bool div_fixup_row_plain_f32(const uint32_t* s0, const uint32_t* s1, const uint32_t* s2, uint32_t* r, unsigned n) {
+  uint32_t bad = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    const uint32_t e1 = (s1[i] >> 23) & 255u, e2 = (s2[i] >> 23) & 255u;
+    const int32_t diff = static_cast<int32_t>(e2) - static_cast<int32_t>(e1);
+    bad |= (e1 - 1u >= 254u) | (e2 - 1u >= 254u) | (diff < Fp<float>::kUnderflow) | (diff >= Fp<float>::kOverflow);
+    r[i] = (s0[i] & 0x7FFFFFFFu) | ((s1[i] ^ s2[i]) & 0x80000000u);
+  }
+  return bad == 0;
+}
+
+// ---- Rows of binary64 lanes
+//
+// The same two tests for v_div_scale_f64 / v_div_fixup_f64, with the double's fields (11 exponent bits, 52 mantissa bits). Unlike the f32 rows
+// only the ACTIVE lanes (`ex`, bit i for lane i) are asked: a lane the instruction does not write holds whatever its register held (zero
+// in a diverged wave, which would make every row of it special), and nothing of it is read back. `ex` has no bit at or above `n` (the tier's rows
+// are 32 lanes only when the high half of EXEC is clear). true: every active lane is plain.
+
+// v_div_scale_f64 (S0, S1 = denominator, S2 = numerator): the value is S0 and the condition is clear when S1 and S2 are normal numbers whose
+// exponents are less than 768 apart, the reciprocal of S1 and the quotient are normal, and S2's exponent is above 53.
+[[gnu::always_inline]] inline bool div_scale_row_plain_f64(const uint64_t* s1, const uint64_t* s2, uint64_t ex, unsigned n) {
+  using F = Fp<double>;
+  constexpr uint64_t kMant = (uint64_t{1} << F::kMantissa) - 1;
+  // First pass on the high words alone (32-bit lanes, which the vector units do whole): the exponent fields are all it needs, except at
+  // the two places where the mantissas decide (the reciprocal's exponent just below the largest, the quotient's just at the denormal edge):
+  // those lanes are only counted, and looked at in full below.
+  uint32_t bad = 0, edge = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    const uint32_t e1 = (static_cast<uint32_t>(s1[i] >> 32) >> 20) & 2047u, e2 = (static_cast<uint32_t>(s2[i] >> 32) >> 20) & 2047u;
+    const int32_t diff = static_cast<int32_t>(e2) - static_cast<int32_t>(e1);
+    uint32_t b = (e1 - 1u >= F::kMaxExp - 1u) | (e2 - 1u >= F::kMaxExp - 1u);
+    b |= diff >= F::kFar;
+    b |= e1 >= F::kMaxExp - 1u;                    // the reciprocal is a denormal
+    b |= diff < F::kMinExp;                        // the quotient is
+    b |= e2 <= static_cast<uint32_t>(F::kTiny);
+    const uint32_t act = 0u - static_cast<uint32_t>((ex >> i) & 1);
+    bad |= b & act;
+    edge |= ((e1 == F::kMaxExp - 2u) | (diff == F::kMinExp)) & act;
+  }
+  if (bad) return false;
+  if (!edge) return true;
+  for (uint64_t m = ex; m; m &= m - 1) {
+    const unsigned i = static_cast<unsigned>(__builtin_ctzll(m));
+    const uint64_t e1 = (s1[i] >> F::kMantissa) & F::kMaxExp, e2 = (s2[i] >> F::kMantissa) & F::kMaxExp;
+    const uint64_t m1 = s1[i] & kMant, m2 = s2[i] & kMant;
+    const int64_t diff = static_cast<int64_t>(e2) - static_cast<int64_t>(e1);
+    if ((e1 == F::kMaxExp - 2u && m1 != 0) || (diff == F::kMinExp && m2 < m1)) return false;
+  }
+  return true;
+}
+
+// v_div_fixup_f64 (S0 = quotient, S1 = denominator, S2 = numerator): for normal S1 and S2 whose exponents are within the range that neither
+// underflows (-1075) nor overflows (1025) the answer is |S0| with the sign of S1 xor S2. Writes the row to `r`; of no use unless true.
+[[gnu::always_inline]] inline bool div_fixup_row_plain_f64(const uint64_t* s0, const uint64_t* s1, const uint64_t* s2, uint64_t* r,
+                                                           uint64_t ex, unsigned n) {
+  using F = Fp<double>;
+  uint32_t bad = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    const uint32_t e1 = (static_cast<uint32_t>(s1[i] >> 32) >> 20) & 2047u, e2 = (static_cast<uint32_t>(s2[i] >> 32) >> 20) & 2047u;
+    const int32_t diff = static_cast<int32_t>(e2) - static_cast<int32_t>(e1);
+    const uint32_t b = (e1 - 1u >= F::kMaxExp - 1u) | (e2 - 1u >= F::kMaxExp - 1u) | (diff < F::kUnderflow) | (diff >= F::kOverflow);
+    bad |= b & (0u - static_cast<uint32_t>((ex >> i) & 1));
+    r[i] = (s0[i] & 0x7FFFFFFFFFFFFFFFull) | ((s1[i] ^ s2[i]) & 0x8000000000000000ull);
+  }
+  return bad == 0;
+}
+
 }  // namespace vgpu::amd::gcn::divide

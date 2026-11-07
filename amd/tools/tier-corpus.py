@@ -58,7 +58,9 @@ for ops in ['v1, v2, v3, vcc', 'v1, s2, v3, s[4:5]', 'v1, 1.0, v3, s[6:7]', 'v1,
             'v1, 0x3f9e0652, v3, vcc', 'v1, -|v2|, -v3, s[10:11]']:
     add('v_cndmask_b32_e64 ' + ops)
 add('v_cndmask_b32_e32 v1, v2, v3, vcc')
-for ops in ['v1, v2, v3', 'v1, -v2, v3', 'v1, |v2|, s3', 'v1, 2.0, 7', 'v1, v2, -3', 'v1, v2, v3 clamp', 'v1, v2, v3 mul:2']:
+# (the constant forms give a row the exponent-field path takes whole; the modifiers must still apply to it)
+for ops in ['v1, v2, v3', 'v1, -v2, v3', 'v1, |v2|, s3', 'v1, 2.0, 7', 'v1, v2, -3', 'v1, v2, v3 clamp', 'v1, v2, v3 mul:2', 'v1, 2.0, 7 mul:2',
+            'v1, 2.0, 7 mul:4', 'v1, 2.0, 7 div:2', 'v1, 2.0, 7 clamp', 'v1, -1.0, 3 clamp mul:2']:
     add('v_ldexp_f32 ' + ops)
 THREE = ['v_fma_f32', 'v_bfe_i32', 'v_perm_b32', 'v_bfe_u32', 'v_bfi_b32', 'v_alignbit_b32', 'v_add3_u32', 'v_mad_u32_u24', 'v_med3_u32']
 for op in THREE:

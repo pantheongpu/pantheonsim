@@ -931,7 +931,7 @@ TIER_DUAL(h_mov64)
 // Packed binary32 (v_pk_add_f32, _mul_f32, _fma_f32): two floats in a register pair, each half its own arithmetic. `sub`: bit k is
 // the half of source k the low result reads (op_sel), bit 3 + k the half the high result reads (op_sel_hi), bits 6 + k and 9 + k
 // negate it for the low and the high result. Both halves are worked out before either is written.
-int h_pk(const Op& o, Regs& R) {
+[[gnu::always_inline]] inline int h_pk_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
   if (!ex) return true;
   const unsigned n = lanes_of(ex);
@@ -976,6 +976,7 @@ int h_pk(const Op& o, Regs& R) {
   }
   return true;
 }
+int h_pk_base(const Op& o, Regs& R) { return h_pk_body(o, R); }
 
 // The packed 16-bit integer instructions (v_pk_add_u16 ...): each result half is the kernel over the halves the sources supply (Op::sub holds,
 // for source k, the half result 0 reads at bit k and the half result 1 reads at bit 3 + k; a constant's two halves are in Src::value and value64).
@@ -1066,7 +1067,7 @@ int h_permlane(const Op& o, Regs& R) {
 // v_div_scale_*, v_div_fmas_* and v_div_fixup_* (gcn_divide.hpp): per lane, the interpreter's divide_step. `sub`: 0 scale, 1 fmas, 2 fixup,
 // plus 4 for the double forms. The scale writes a mask of the lanes whose condition holds to its scalar destination, whatever EXEC says;
 // fmas reads VCC. The sources carry the float modifiers; the result is written whole (no output modifier or clamp).
-int h_div(const Op& o, Regs& R) {
+[[gnu::noinline]] int h_div(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
   const unsigned what = o.sub & 3;
   const bool dbl = o.sub & 4;
@@ -2607,6 +2608,87 @@ bool vgpr_dst(const Operand& o, Src& s, uint32_t regs) {
 
 namespace {
 
+// Later in the file than the handlers they stand beside, so that adding them moves none of those (the hot handlers' placement is a measured
+// thing: Round sp26, amd-gather).
+// The AVX2 build of h_pk (the baseline one is h_pk_base, where h_pk was).
+[[gnu::target("avx2,fma,popcnt")]] int h_pk_avx2(const Op& o, Regs& R) { return h_pk_body(o, R); }
+
+// v_div_scale_f32, v_div_fmas_f32 and v_div_fixup_f32 of a row where no lane is a special case (gcn_divide.hpp), else h_div's lanes.
+[[gnu::always_inline]] inline int h_div_rows_body(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  const unsigned what = o.sub & 3;
+  if (!ex || (o.sub & 4)) return h_div(o, R);
+  // The rows where no lane is a special case, as whole rows (gcn_divide.hpp): scale leaves S0 and clears every condition bit, fmas without a
+  // condition bit in an active lane is the fused multiply-add (unless it makes a NaN: back to the interpreter, as in h_div), fixup is
+  // |S0| with a sign. A row with one lane outside them takes the lanes one at a time (h_div, one copy for both builds).
+  const unsigned n = lanes_of(ex);
+  alignas(32) uint32_t t0[64], t1[64], t2[64], rr[64];
+  const uint32_t* a = load32(o.src[0], R, t0, n);
+  const uint32_t* b = load32(o.src[1], R, t1, n);
+  const uint32_t* c = load32(o.src[2], R, t2, n);
+  bool row = false;
+  if (what == 0) {
+    row = gcn::divide::div_scale_row_plain_f32(b, c, n);
+    if (row) std::memcpy(rr, a, n * 4);
+  } else if (what == 1) {
+    if (!(*R.vcc & ex)) {
+      for (unsigned i = 0; i < n; ++i) {
+        float x, y, z, v;
+        std::memcpy(&x, &a[i], 4), std::memcpy(&y, &b[i], 4), std::memcpy(&z, &c[i], 4);
+        v = __builtin_fmaf(x, y, z);
+        std::memcpy(&rr[i], &v, 4);
+      }
+      if (nan32(rr, ex, n)) return false;   // (see h_div)
+      row = true;
+    }
+  } else {
+    row = gcn::divide::div_fixup_row_plain_f32(a, b, c, rr, n);
+  }
+  if (!row) return h_div(o, R);
+  uint32_t* d = R.vgpr[o.dst.index];
+  if (full(ex, n)) copy_row(d, rr, n);
+  else merge(d, rr, ex, n);
+  if (what == 0 && o.dst2.kind) wr(R, o.dst2, 0);
+  return true;
+}
+int h_div_rows_base(const Op& o, Regs& R) { return h_div_rows_body(o, R); }
+[[gnu::target("avx2,fma,popcnt")]] int h_div_rows_avx2(const Op& o, Regs& R) { return h_div_rows_body(o, R); }
+
+// (defined at the end of the file, so that nothing in front of the handlers below moves: Round sp27)
+void ldexp_mixed(const uint32_t* a, const uint32_t* b, uint64_t ex, unsigned n, uint32_t* r);
+
+// v_ldexp_f32 of a row where every active lane is a normal number and stays one: the exponent field moves (divide::ldexp_f32's rule, exact);
+// a row with any other active lane is ldexp_f32_bits' (libm's answers in integers), and one with an output modifier, or a NaN result, is h_f32's
+// (libm's ldexpf in the kernel), as it was. No NaN can come of the exact rows.
+[[gnu::always_inline]] inline int h_ldexp_body(const Op& o, Regs& R, int (*generic)(const Op&, Regs&)) {
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  if (o.omod | o.clamp) return generic(o, R);
+  const unsigned n = lanes_of(ex);
+  alignas(32) uint32_t t0[64], t1[64], r[64];
+  const uint32_t* a = load32(o.src[0], R, t0, n);
+  const uint32_t* b = load32(o.src[1], R, t1, n);
+  bool exact = true;
+  for (unsigned i = 0; i < n; ++i) exact &= gcn::divide::ldexp_f32_exact(a[i], static_cast<int32_t>(b[i]));
+  if (!exact) {
+    // A row with some active lane outside the exact case (a denormal or a zero, an infinity or a NaN, an exponent that leaves the normal range):
+    // all of them through the integer form of libm's ldexpf. A NaN among the active results is h_f32's, as before.
+    ldexp_mixed(a, b, ex, n, r);
+    if (nan32(r, ex, n)) return generic(o, R);
+  } else {
+    for (unsigned i = 0; i < n; ++i) r[i] = gcn::divide::ldexp_f32_shift(a[i], static_cast<int32_t>(b[i]));
+  }
+  uint32_t* d = R.vgpr[o.dst.index];
+  if (full(ex, n)) copy_row(d, r, n);
+  else merge(d, r, ex, n);
+  return true;
+}
+int h_ldexp_base(const Op& o, Regs& R) { return h_ldexp_body(o, R, h_f32_base); }
+[[gnu::target("avx2,fma,popcnt")]] int h_ldexp_avx2(const Op& o, Regs& R) { return h_ldexp_body(o, R, h_f32_avx2); }
+
+int h_div64_rows_base(const Op& o, Regs& R);
+[[gnu::target("avx2,fma,popcnt")]] int h_div64_rows_avx2(const Op& o, Regs& R);   // (v_div_*_f64 rows: defined at the end of the file)
+
 bool cdna(const Inst& in) { return in.arch == gcn::Target::Gfx90a || in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950; }
 
 // A comparison: named by its opcode, as compare() reads it. False for a type or test the tier does not model.
@@ -2856,7 +2938,7 @@ void tier_classify(Inst& in) {
         }
         const int kernel = (e.flags & kTrigTurns) && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) ? e.k + 1 : e.k;
         f.kern = reinterpret_cast<AnyFn>(T.f32[kernel]);
-        f.run = TIER_RUN(h_f32);
+        f.run = e.k == FLDEXP ? TIER_RUN(h_ldexp) : TIER_RUN(h_f32);
       } else {
         f.kern = reinterpret_cast<AnyFn>(T.ints[e.k]);
         bool rows_only = true;   // (every source a vector register as it is)
@@ -3067,7 +3149,7 @@ void tier_classify(Inst& in) {
       f.clamp = in.clamp;
       f.nan = e.k == FADD ? kNanAdd : e.k == FMUL ? kNanMul : kNanPkFma;
       f.kern = reinterpret_cast<AnyFn>(T.f32[e.k]);
-      f.run = h_pk;
+      f.run = TIER_RUN(h_pk);
       f.unit = kUnitValu;
       return;
     }
@@ -3225,7 +3307,7 @@ void tier_classify(Inst& in) {
       for (int k = 0; k < 3; ++k)
         if (!(dbl ? lane_src64(in.src[k], f.src[k], true) : lane_src32(in.src[k], f.src[k], true))) return fail();
       f.sub = static_cast<uint32_t>(e.k);
-      f.run = h_div;
+      f.run = dbl ? TIER_RUN(h_div64_rows) : TIER_RUN(h_div_rows);
       f.unit = kUnitValu;
       return;
     }
@@ -3313,6 +3395,53 @@ void tier_classify(Inst& in) {
     default: return;
   }
 }
+
+namespace {
+
+// ---- Defined last (Round sp27, amd-f64): nothing above moves for them; see docs/performance.md.
+
+// v_ldexp_f32 of the lanes of a row where some active lane is not the exact case: every active lane by gcn::divide::ldexp_f32_bits (libm's
+// ldexpf, in integers). Inactive lanes get a copy of the operand: their results are never stored.
+[[gnu::noinline]] void ldexp_mixed(const uint32_t* a, const uint32_t* b, uint64_t ex, unsigned n, uint32_t* r) {
+  for (unsigned i = 0; i < n; ++i) r[i] = ((ex >> i) & 1) ? gcn::divide::ldexp_f32_bits(a[i], static_cast<int32_t>(b[i])) : a[i];
+}
+
+// v_div_scale_f64, v_div_fmas_f64 and v_div_fixup_f64 where no active lane is a special case: the rows of h_div_rows_body, for doubles (the
+// tests of the active lanes only: gcn_divide.hpp). Anything else is h_div's lanes, which did all of it before.
+[[gnu::always_inline]] inline int h_div64_rows_body(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  const unsigned what = o.sub & 3;
+  if (!ex) return h_div(o, R);
+  const unsigned n = lanes_of(ex);
+  alignas(32) uint64_t t0[64], t1[64], t2[64], rr[64];
+  load64(o.src[0], R, t0, n), load64(o.src[1], R, t1, n), load64(o.src[2], R, t2, n);
+  bool row = false;
+  if (what == 0) {
+    row = gcn::divide::div_scale_row_plain_f64(t1, t2, ex, n);
+    if (row) std::memcpy(rr, t0, n * 8);
+  } else if (what == 1) {
+    if (!(*R.vcc & ex)) {
+      for (unsigned i = 0; i < n; ++i) {
+        double x, y, z, v;
+        std::memcpy(&x, &t0[i], 8), std::memcpy(&y, &t1[i], 8), std::memcpy(&z, &t2[i], 8);
+        v = __builtin_fma(x, y, z);
+        std::memcpy(&rr[i], &v, 8);
+      }
+      if (nan64(rr, ex, n)) return false;   // (see h_div)
+      row = true;
+    }
+  } else {
+    row = gcn::divide::div_fixup_row_plain_f64(t0, t1, t2, rr, ex, n);
+  }
+  if (!row) return h_div(o, R);
+  store64(R.vgpr[o.dst.index], R.vgpr[o.dst.index + 1], rr, ex, n);
+  if (what == 0 && o.dst2.kind) wr(R, o.dst2, 0);
+  return true;
+}
+int h_div64_rows_base(const Op& o, Regs& R) { return h_div64_rows_body(o, R); }
+[[gnu::target("avx2,fma,popcnt")]] int h_div64_rows_avx2(const Op& o, Regs& R) { return h_div64_rows_body(o, R); }
+
+}  // namespace
 
 #endif  // VGPU_TIER_X86
 

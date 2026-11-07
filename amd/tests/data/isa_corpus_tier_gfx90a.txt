@@ -857,6 +857,11 @@ D2880001 00010EF4	v_ldexp_f32 v1, 2.0, 7
 D2880001 00018702	v_ldexp_f32 v1, v2, -3
 D2888001 00020702	v_ldexp_f32 v1, v2, v3 clamp
 D2880001 08020702	v_ldexp_f32 v1, v2, v3 mul:2
+D2880001 08010EF4	v_ldexp_f32 v1, 2.0, 7 mul:2
+D2880001 10010EF4	v_ldexp_f32 v1, 2.0, 7 mul:4
+D2880001 18010EF4	v_ldexp_f32 v1, 2.0, 7 div:2
+D2888001 00010EF4	v_ldexp_f32 v1, 2.0, 7 clamp
+D2888001 080106F3	v_ldexp_f32 v1, -1.0, 3 clamp mul:2
 D1CB0001 04120702	v_fma_f32 v1, v2, v3, v4
 D1CB0001 04120602	v_fma_f32 v1, s2, v3, v4
 D1CB0001 041206F2	v_fma_f32 v1, 1.0, v3, v4
