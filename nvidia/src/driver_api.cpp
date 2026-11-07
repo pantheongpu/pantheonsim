@@ -238,6 +238,9 @@ struct ShimState {
   std::map<std::pair<int, uint64_t>, uintptr_t> runtime_modules;
   std::map<std::pair<uintptr_t, std::string>, uintptr_t> runtime_functions;
   std::unordered_map<uintptr_t, int> stream_device;   // the device a stream was made on
+  // The context a driver-API allocation (cuMemAlloc, cuMemAllocPitch, cuMemAllocManaged, cuMemHostAlloc) was
+  // made in, by its base address: cuPointerGetAttribute(CONTEXT) answers it, whichever context is current.
+  std::map<uint64_t, uintptr_t> alloc_ctx;
   // Peer access enabled, as (context, peer context): cuCtxEnablePeerAccess
   // is about contexts, and enabling it one way says nothing of the other.
   std::set<std::pair<uintptr_t, uintptr_t>> peer_access;
@@ -443,6 +446,22 @@ bool needs_current_context(const char* name) {
   return false;
 }
 
+// Set while a stream-ordered call that names a stream of its own is running. Such a call takes its context from
+// the stream, so it works with no context current on the thread: an RTX 3060 runs cuMemAllocAsync,
+// cuMemAllocFromPoolAsync, cuMemFreeAsync, the Async copies and fills, cuStreamSynchronize and cuStreamQuery
+// on a stream made earlier with nothing current. The legacy (1) and per-thread (2) streams, and NULL, belong to
+// the current context, and those calls still fail with CUDA_ERROR_INVALID_CONTEXT.
+thread_local bool t_stream_context = false;
+struct StreamContext {
+  bool prev;
+  explicit StreamContext(CUstream st) : prev(t_stream_context) {
+    if (reinterpret_cast<uintptr_t>(st) > 2) t_stream_context = true;
+  }
+  ~StreamContext() { t_stream_context = prev; }
+  StreamContext(const StreamContext&) = delete;
+  StreamContext& operator=(const StreamContext&) = delete;
+};
+
 // Wraps an API body: locks, checks init, catches and maps errors.
 template <class F>
 CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
@@ -452,7 +471,7 @@ CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
     report(name, "cuInit has not been called");
     return CUDA_ERROR_NOT_INITIALIZED;
   }
-  if (s.initialized && ctx_stack().empty() && needs_current_context(name)) {
+  if (s.initialized && ctx_stack().empty() && !t_stream_context && needs_current_context(name)) {
     report(name, "no current context (create one with cuCtxCreate or cuDevicePrimaryCtxRetain + cuCtxSetCurrent)");
     return CUDA_ERROR_INVALID_CONTEXT;
   }
@@ -802,6 +821,12 @@ uint32_t profiled_device(ShimState& s) {
   if (ctx_stack().empty()) return 0;
   const auto it = s.contexts.find(ctx_stack().back());
   return it == s.contexts.end() ? 0u : static_cast<uint32_t>(it->second);
+}
+// The device a stream-ordered call runs on: the stream's own when it names one made earlier (it works with no
+// context current), else the current context's.
+int stream_device_of(ShimState& s, CUstream st) {
+  const auto it = s.stream_device.find(reinterpret_cast<uintptr_t>(st));
+  return it != s.stream_device.end() ? it->second : current_device(s);
 }
 uint32_t profiled_device() {
   ShimState& s = state();
@@ -1398,7 +1423,14 @@ static void profile_memory(uint8_t op, uint64_t address, uint64_t bytes, vgpu::p
 static CUresult cuMemAlloc_v2_impl(CUdeviceptr* dptr, size_t bytesize) {
   return api("cuMemAlloc", true, false, [&](ShimState& s) {
     if (!dptr) return CUDA_ERROR_INVALID_VALUE;
+    // A size of 0 is refused and the result cleared (an RTX 3060: CUDA_ERROR_INVALID_VALUE, *dptr == 0),
+    // where cudaMalloc(0) succeeds with no pointer.
+    if (bytesize == 0) {
+      *dptr = 0;
+      return CUDA_ERROR_INVALID_VALUE;
+    }
     *dptr = current(s).memory().alloc(bytesize);
+    s.alloc_ctx[*dptr] = ctx_stack().back();
     profile_memory(1, *dptr, bytesize, vgpu::profiling::MemKind::Device, current_device(s));
     return CUDA_SUCCESS;
   });
@@ -1418,11 +1450,12 @@ static CUresult cuMemFree_v2_impl(CUdeviceptr dptr) {
   return api("cuMemFree", true, false, [&](ShimState& s) {
     if (dptr == 0) return CUDA_SUCCESS;   // a documented no-op, with or without a context
     if (auto it = s.managed.find(dptr); it != s.managed.end()) {
-      profile_memory(2, dptr, it->second, vgpu::profiling::MemKind::Managed, current_device(s));
+      profile_memory(2, dptr, it->second, vgpu::profiling::MemKind::Managed, static_cast<int>(profiled_device(s)));
       for (int d = 0; d < s.rt->device_count(); ++d) s.rt->device(d).memory().unmap_host(dptr);
       std::free(reinterpret_cast<void*>(dptr));
       s.managed_device.erase(dptr);
       s.sync_memops.erase(dptr);
+      s.alloc_ctx.erase(dptr);
       s.managed.erase(it);
       return CUDA_SUCCESS;
     }
@@ -1431,7 +1464,8 @@ static CUresult cuMemFree_v2_impl(CUdeviceptr dptr) {
     uint64_t base = 0, size = 0;
     const bool known = owner_memory(s, dptr).find_allocation(dptr, &base, &size);
     owner_memory(s, dptr).free(dptr);
-    profile_memory(2, dptr, known ? size : 0, vgpu::profiling::MemKind::Device, current_device(s));
+    s.alloc_ctx.erase(dptr);
+    profile_memory(2, dptr, known ? size : 0, vgpu::profiling::MemKind::Device, static_cast<int>(profiled_device(s)));
     return CUDA_SUCCESS;
   });
 }
@@ -1450,6 +1484,7 @@ static CUresult cuMemFree_impl(CUdeviceptr dptr) {
 // stream is synchronous here, so the stream orders nothing; it is still the one
 // the program named, which is what a profiler's timeline is drawn by.
 static CUresult memcpy_htod(CUdeviceptr dst, const void* src, size_t n, CUstream stream, bool async) {
+  const StreamContext stream_context(stream);
   return api("cuMemcpyHtoD", true, false, [&](ShimState& s) {
     if (!src && n) return CUDA_ERROR_INVALID_VALUE;
     const uint64_t t0 = vgpu::profiling::enabled() ? vgpu::profiling::now_ns() : 0;
@@ -1459,6 +1494,7 @@ static CUresult memcpy_htod(CUdeviceptr dst, const void* src, size_t n, CUstream
   });
 }
 static CUresult memcpy_dtoh(void* dst, CUdeviceptr src, size_t n, CUstream stream, bool async) {
+  const StreamContext stream_context(stream);
   return api("cuMemcpyDtoH", true, false, [&](ShimState& s) {
     if (!dst && n) return CUDA_ERROR_INVALID_VALUE;
     // Memory registered read-only is not a destination for a copy (an RTX 3060: INVALID_VALUE).
@@ -1479,6 +1515,7 @@ static CUresult memcpy_dtoh(void* dst, CUdeviceptr src, size_t n, CUstream strea
   });
 }
 static CUresult memcpy_dtod(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream stream, bool async) {
+  const StreamContext stream_context(stream);
   return api("cuMemcpyDtoD", true, false, [&](ShimState& s) {
     const uint64_t t0 = vgpu::profiling::enabled() ? vgpu::profiling::now_ns() : 0;
     // A large copy between ordinary device allocations goes chunk to chunk, with no buffer (managed memory takes dev_read / dev_write).
@@ -1545,10 +1582,10 @@ static CUresult cuMemGetInfo_v2_impl(size_t* free_out, size_t* total);
 VGPU_EXPORT CUresult cuMemGetInfo_v2(size_t* free_out, size_t* total) { return traced("cuMemGetInfo_v2", cuMemGetInfo_v2_impl, free_out, total); }
 static CUresult cuMemGetInfo_v2_impl(size_t* free_out, size_t* total) {
   return api("cuMemGetInfo", true, false, [&](ShimState& s) {
-    if (!free_out || !total) return CUDA_ERROR_INVALID_VALUE;
+    // Either pointer, or both, may be NULL, as on an RTX 3060: the call succeeds and fills the one it is given.
     vgpu::MemoryManager& mm = current(s).memory();
-    *total = static_cast<size_t>(mm.capacity());
-    *free_out = static_cast<size_t>(mm.capacity() - mm.used());
+    if (total) *total = static_cast<size_t>(mm.capacity());
+    if (free_out) *free_out = static_cast<size_t>(mm.capacity() - mm.used());
     return CUDA_SUCCESS;
   });
 }
@@ -1960,7 +1997,9 @@ static CUresult cuMemAddressReserve_impl(CUdeviceptr* ptr, size_t size, size_t a
     // A fixed address is a request for one particular range; the engine hands
     // out address space monotonically and cannot honour it.
     if (addr != 0) return CUDA_ERROR_NOT_SUPPORTED;
-    *ptr = current(s).memory().reserve(size, alignment);
+    // Address space is not the context's: an RTX 3060 reserves and frees it with no context current. The
+    // current context's device when there is one, device 0 otherwise.
+    *ptr = s.rt->device(static_cast<int>(profiled_device(s))).memory().reserve(size, alignment);
     return CUDA_SUCCESS;
   });
 }
@@ -2334,8 +2373,13 @@ static CUresult cuModuleGetFunction_impl(CUfunction* hfunc, CUmodule hmod, const
     if (it == s.modules.end()) return CUDA_ERROR_NOT_FOUND;
     auto [dev, mid] = it->second;
     const vgpu::ptx::EntryFn* fn = s.rt->device(dev).get_function(mid, name);
-    uintptr_t fh = make_handle(s, kTagFunc);
-    s.functions[fh] = {dev, h, fn, s.rt->device(dev).symbols(mid), mid};
+    // One handle per (module, name): on an RTX 3060 a second lookup returns the same CUfunction, and it
+    // is the one cuModuleEnumerateFunctions gives for that function. Programs compare the handles.
+    uintptr_t& fh = s.runtime_functions[{h, name}];
+    if (!fh || !s.functions.count(fh)) {
+      fh = make_handle(s, kTagFunc);
+      s.functions[fh] = {dev, h, fn, s.rt->device(dev).symbols(mid), mid};
+    }
     *hfunc = reinterpret_cast<CUfunction>(fh);
     return CUDA_SUCCESS;
   });
@@ -3282,6 +3326,7 @@ static CUresult cuMemcpyAsync_impl(CUdeviceptr dst, CUdeviceptr src, size_t n, C
 VGPU_EXPORT CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream a3) { return traced("cuMemcpyAsync", cuMemcpyAsync_impl, dst, src, n, a3); }
 static CUresult cuMemcpyAsync_impl(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream st) {
   VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpy(dst, src, n));
+  const StreamContext stream_context(st);
   return cuMemcpy(dst, src, n);
 }
 
@@ -3344,6 +3389,7 @@ vgpu::profiling::MemKind profiled_kind(ShimState& s, const void* p, bool device)
 template <typename T>
 CUresult memset_impl(const char* name, CUdeviceptr dptr, size_t pitch, T value, size_t width,
                      size_t rows, CUstream stream = nullptr, bool async = false) {
+  const StreamContext stream_context(stream);
   return api(name, true, false, [&](ShimState& s) {
     if (width == 0 || rows == 0) return CUDA_SUCCESS;
     if (!dptr || dptr % sizeof(T)) return CUDA_ERROR_INVALID_VALUE;
@@ -3638,12 +3684,17 @@ static CUresult cuMemGetAddressRange_v2_impl(CUdeviceptr* base, size_t* size, CU
 
 static CUresult cuMemHostAlloc_impl(void** pp, size_t bytesize, unsigned int flags) {
   return api("cuMemHostAlloc", true, false, [&](ShimState& s) {
-    if (!pp || bytesize == 0) return CUDA_ERROR_INVALID_VALUE;
+    if (!pp) return CUDA_ERROR_INVALID_VALUE;
+    if (bytesize == 0) {   // success and no pointer, as cudaMallocHost(0) (an RTX 3060, cuMemHostAlloc and cuMemAllocHost)
+      *pp = nullptr;
+      return CUDA_SUCCESS;
+    }
     void* p = std::aligned_alloc(4096, (bytesize + 4095) / 4096 * 4096);
     if (!p) return CUDA_ERROR_OUT_OF_MEMORY;
     for (int d = 0; d < s.rt->device_count(); ++d)
       s.rt->device(d).memory().map_host(reinterpret_cast<uint64_t>(p), p, bytesize);
     pinned(s)[p] = vgpu::runtime::HostRange{bytesize, 0, flags};
+    s.alloc_ctx[reinterpret_cast<uint64_t>(p)] = ctx_stack().back();
     *pp = p;
     profile_memory(1, reinterpret_cast<uint64_t>(p), bytesize, vgpu::profiling::MemKind::Pinned, current_device(s));
     return CUDA_SUCCESS;
@@ -3671,9 +3722,10 @@ static CUresult cuMemFreeHost_impl(void* p) {
     if (!p) return CUDA_SUCCESS;   // as cuMemFree(0): a no-op, with or without a context
     auto it = pinned(s).find(p);
     if (it == pinned(s).end()) return CUDA_ERROR_INVALID_VALUE;
-    profile_memory(2, reinterpret_cast<uint64_t>(p), it->second.size, vgpu::profiling::MemKind::Pinned, current_device(s));
+    profile_memory(2, reinterpret_cast<uint64_t>(p), it->second.size, vgpu::profiling::MemKind::Pinned, static_cast<int>(profiled_device(s)));
     for (int d = 0; d < s.rt->device_count(); ++d) s.rt->device(d).memory().unmap_host(reinterpret_cast<uint64_t>(p));
     pinned(s).erase(it);
+    s.alloc_ctx.erase(reinterpret_cast<uint64_t>(p));
     std::free(p);
     return CUDA_SUCCESS;
   });
@@ -3837,6 +3889,7 @@ static CUresult cuMemAllocManaged_impl(CUdeviceptr* dptr, size_t bytesize, unsig
       s.rt->device(d).memory().map_host(reinterpret_cast<uint64_t>(p), p, bytesize);
     s.managed[reinterpret_cast<uintptr_t>(p)] = bytesize;
     s.managed_device[reinterpret_cast<uintptr_t>(p)] = current_device(s);
+    s.alloc_ctx[reinterpret_cast<uintptr_t>(p)] = ctx_stack().back();
     *dptr = reinterpret_cast<CUdeviceptr>(p);
     return CUDA_SUCCESS;
   });
@@ -4870,6 +4923,7 @@ static CUresult cuMemcpy3DAsync_v2_impl(const CUDA_MEMCPY3D* p, CUstream st) {
     const CUDA_MEMCPY3D copy = *p;
     VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpy3D_v2(&copy));
   }
+  const StreamContext stream_context(st);
   return cuMemcpy3D_v2(p);
 }
 static CUresult cuMemcpy3DAsync_impl(const CUDA_MEMCPY3D* p, CUstream st);
@@ -5026,13 +5080,14 @@ VGPU_EXPORT CUresult cuMemAllocAsync(CUdeviceptr* dptr, size_t bytesize, CUstrea
 static CUresult cuMemAllocAsync_impl(CUdeviceptr* dptr, size_t bytesize, CUstream st) {
   if (CUresult rc; capture_alloc(dptr, bytesize, st, &rc)) return rc;
   VGPU_CAPTURE_UNSAFE("cuMemAllocAsync");
+  const StreamContext stream_context(st);
   return api("cuMemAllocAsync", true, false, [&](ShimState& s) {
     if (!dptr) return CUDA_ERROR_INVALID_VALUE;
     if (bytesize == 0) {
       *dptr = 0;
       return CUDA_SUCCESS;
     }
-    *dptr = pool_alloc(s, pool_for(s, current_device(s)), bytesize);
+    *dptr = pool_alloc(s, pool_for(s, stream_device_of(s, st)), bytesize);
     return CUDA_SUCCESS;
   });
 }
@@ -5041,6 +5096,7 @@ VGPU_EXPORT CUresult cuMemAllocFromPoolAsync(CUdeviceptr* dptr, size_t bytesize,
 static CUresult cuMemAllocFromPoolAsync_impl(CUdeviceptr* dptr, size_t bytesize, void* pool, CUstream st) {
   if (CUresult rc; capture_alloc(dptr, bytesize, st, &rc)) return rc;
   VGPU_CAPTURE_UNSAFE("cuMemAllocFromPoolAsync");
+  const StreamContext stream_context(st);
   return api("cuMemAllocFromPoolAsync", true, false, [&](ShimState& s) {
     if (!dptr) return CUDA_ERROR_INVALID_VALUE;
     PoolRec* p = pool_from_handle(s, pool);
@@ -5065,6 +5121,7 @@ static CUresult cuMemFreeAsync_impl(CUdeviceptr dptr, CUstream st) {
   }
   VGPU_CAPTURE_UNSAFE("cuMemFreeAsync");
   if (dptr == 0) return CUDA_SUCCESS;
+  const StreamContext stream_context(st);
   bool pooled = false;
   const CUresult r = api("cuMemFreeAsync", true, false, [&](ShimState& s) {
     if (PoolRec* p = pool_of(s, dptr)) {
@@ -5319,6 +5376,7 @@ static CUresult cuMemAllocPitch_v2_impl(CUdeviceptr* dptr, size_t* pitch, size_t
       return CUDA_ERROR_INVALID_VALUE;
     *pitch = (width + 511) / 512 * 512;
     *dptr = current(s).memory().alloc(*pitch * height);
+    s.alloc_ctx[*dptr] = ctx_stack().back();
     return CUDA_SUCCESS;
   });
 }
@@ -5462,9 +5520,10 @@ static CUresult cuStreamDestroy_impl(CUstream stream) { return cuStreamDestroy_v
 // A wait that returned is recorded for a profiler, and the stream and context
 // waits are told to a subscriber (vgpu/profiling.hpp).
 static CUresult cuStreamSynchronize_impl(CUstream stream) {
+  const StreamContext stream_context(stream);
   return api("cuStreamSynchronize", true, false, [&](ShimState& s) {
-    if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
-    (void)current_device(s);  // requires a current context
+    if (ctx_stack().empty() && !t_stream_context) return CUDA_ERROR_INVALID_CONTEXT;
+    if (!ctx_stack().empty()) (void)current_device(s);  // a stream of its own needs none; the others, the current context
     vgpu::profiling::SyncScope waited(vgpu::profiling::SyncKind::Stream, reinterpret_cast<uint64_t>(stream), 0,
                                       profiled_device(s));
     return CUDA_SUCCESS;      // everything is synchronous today
@@ -5488,10 +5547,10 @@ static CUresult cuLaunchHostFunc_impl(CUstream st, CUhostFn fn, void* user) {
 // Always idle. The card records a query that finds the stream idle as a wait
 // on it, and tells a subscriber the stream was synchronized.
 static CUresult cuStreamQuery_impl(CUstream stream) {
-  {   // with no current context the card answers CUDA_ERROR_INVALID_CONTEXT
+  {   // with no current context the card answers CUDA_ERROR_INVALID_CONTEXT, unless the stream is one of its own
     ShimState& st = state();
     std::lock_guard<std::recursive_mutex> lock(st.mu);
-    if (st.initialized && ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
+    if (st.initialized && ctx_stack().empty() && reinterpret_cast<uintptr_t>(stream) <= 2) return CUDA_ERROR_INVALID_CONTEXT;
   }
   const CUresult r = dead_context();
   if (r == CUDA_SUCCESS)
@@ -6184,11 +6243,15 @@ PtrInfo describe_pointer(ShimState& s, CUdeviceptr ptr) {
   return pi;
 }
 
-// The context a pointer on `device` was allocated in. The allocation does not
-// record one, so this is the current context when it is on that device and the
-// device's primary context otherwise -- which is the one, in a program that
-// uses a single context per device, it was made in. 0 when there is neither.
-uintptr_t pointer_context(ShimState& s, int device) {
+// The context a pointer on `device` was allocated in: the one the driver API
+// recorded for it (measured on an RTX 3060: the owning context, whichever is
+// current, so that two contexts on one device each answer for their own
+// pointers). Memory the recorder did not see (the runtime's, which lives in the
+// primary context) is the current context when it is on that device and the
+// device's primary context otherwise. 0 when there is neither.
+uintptr_t pointer_context(ShimState& s, int device, uint64_t base) {
+  if (const auto a = s.alloc_ctx.find(base); a != s.alloc_ctx.end() && s.contexts.count(a->second))
+    return a->second;
   if (!ctx_stack().empty()) {
     const auto it = s.contexts.find(ctx_stack().back());
     if (it != s.contexts.end() && it->second == device) return ctx_stack().back();
@@ -6226,7 +6289,7 @@ CUresult pointer_attribute(ShimState& s, int attribute, CUdeviceptr ptr, const P
   const bool host = pi.kind == PtrKind::Pinned || pi.kind == PtrKind::Registered;
   switch (attribute) {
     case 1:   // CONTEXT: the context the memory was allocated or registered in
-      *static_cast<void**>(data) = reinterpret_cast<void*>(pointer_context(s, pi.device));
+      *static_cast<void**>(data) = reinterpret_cast<void*>(pointer_context(s, pi.device, pi.base));
       return CUDA_SUCCESS;
     case 2:   // MEMORY_TYPE: CU_MEMORYTYPE_HOST (1) for host memory, DEVICE (2) otherwise
       *static_cast<unsigned int*>(data) = host ? 1 : 2;

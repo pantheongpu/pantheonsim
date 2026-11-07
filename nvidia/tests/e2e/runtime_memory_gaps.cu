@@ -192,12 +192,61 @@ static void ipc_pointer() {
   IS(cudaFree(d), cudaSuccess);
 }
 
+// ---- empty allocations and the size query ----
+// Measured on an RTX 3060 (CUDA 13.0 runtime): an allocation of 0 bytes succeeds and gives no pointer, for every
+// kind, and cudaFree(NULL) is the no-op that releases it (Gpufit allocates the buffers it does not use with
+// size 0 and tests them against NULL). cudaMemGetInfo takes a NULL for either pointer and fills the other.
+static void empty_allocations() {
+  void* p = reinterpret_cast<void*>(0x1);
+  IS(cudaMalloc(&p, 0), cudaSuccess);
+  check(p == nullptr, "cudaMalloc(0) has no pointer");
+  IS(cudaFree(p), cudaSuccess);
+  p = reinterpret_cast<void*>(0x1);
+  IS(cudaMallocManaged(&p, 0), cudaSuccess);
+  check(p == nullptr, "cudaMallocManaged(0) has no pointer");
+  IS(cudaFree(p), cudaSuccess);
+  p = reinterpret_cast<void*>(0x1);
+  IS(cudaMallocHost(&p, 0), cudaSuccess);
+  check(p == nullptr, "cudaMallocHost(0) has no pointer");
+  IS(cudaFreeHost(p), cudaSuccess);
+  p = reinterpret_cast<void*>(0x1);
+  IS(cudaHostAlloc(&p, 0, 0), cudaSuccess);
+  check(p == nullptr, "cudaHostAlloc(0) has no pointer");
+  IS(cudaFreeHost(p), cudaSuccess);
+  cudaStream_t st;
+  IS(cudaStreamCreate(&st), cudaSuccess);
+  p = reinterpret_cast<void*>(0x1);
+  IS(cudaMallocAsync(&p, 0, st), cudaSuccess);
+  check(p == nullptr, "cudaMallocAsync(0) has no pointer");
+  IS(cudaFreeAsync(p, st), cudaSuccess);
+  IS(cudaStreamDestroy(st), cudaSuccess);
+  // A real allocation still has one, and a zero-byte one does not take its place.
+  void* q = nullptr;
+  IS(cudaMalloc(&q, 64), cudaSuccess);
+  check(q != nullptr, "cudaMalloc(64) has a pointer");
+  IS(cudaFree(q), cudaSuccess);
+}
+
+static void mem_get_info_null() {
+  size_t free_b = 1, total_b = 1;
+  IS(cudaMemGetInfo(&free_b, &total_b), cudaSuccess);
+  check(total_b > 0 && free_b <= total_b, "cudaMemGetInfo gives a total and a free size no larger than it");
+  size_t t = 0, f = 0;
+  IS(cudaMemGetInfo(nullptr, &t), cudaSuccess);
+  check(t == total_b, "cudaMemGetInfo(NULL, &total) gives the total");
+  IS(cudaMemGetInfo(&f, nullptr), cudaSuccess);
+  check(f > 0 && f <= total_b, "cudaMemGetInfo(&free, NULL) gives the free size");
+  IS(cudaMemGetInfo(nullptr, nullptr), cudaSuccess);
+}
+
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   if (cudaFree(nullptr) != cudaSuccess) {
     std::printf("FAIL: no device\n");
     return 1;
   }
+  empty_allocations();
+  mem_get_info_null();
   pool_handle_types();
   ipc_pointer();
   host_register();

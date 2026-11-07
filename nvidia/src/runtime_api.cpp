@@ -2757,10 +2757,11 @@ VGPU_EXPORT cudaError_t cudaMemcpyPeer(void* dst, int dstDevice, const void* src
 
 static cudaError_t cudaMemGetInfo_body(size_t* free_b, size_t* total_b) {
   return guard("cudaMemGetInfo", [&](State& s) {
-    if (!free_b || !total_b) return cudaErrorInvalidValue;
+    // Either pointer, or both, may be NULL: an RTX 3060 answers cudaSuccess and fills the one it is given
+    // (cuda-api-wrappers asks for the total alone).
     vgpu::MemoryManager& mm = current(s).memory();
-    *total_b = static_cast<size_t>(mm.capacity());
-    *free_b = static_cast<size_t>(mm.capacity() - mm.used());
+    if (total_b) *total_b = static_cast<size_t>(mm.capacity());
+    if (free_b) *free_b = static_cast<size_t>(mm.capacity() - mm.used());
     return cudaSuccess;
   });
 }
@@ -2809,6 +2810,14 @@ static cudaError_t cudaMalloc_body(void** ptr, size_t size) {
   if (const cudaError_t unsafe_ = capture_unsafe_gate("cudaMalloc")) return unsafe_;
   return guard("cudaMalloc", [&](State& s) {
     if (!ptr) return cudaErrorInvalidValue;
+    // A zero-byte allocation succeeds and yields no pointer: an RTX 3060 (CUDA 13.0 runtime) answers
+    // cudaSuccess with *ptr == NULL, and cudaFree(NULL) is the no-op that frees it. Programs lean on the
+    // NULL (Gpufit allocates the buffers it does not use with size 0 and tests them against NULL).
+    // It does not count as an allocation for VGPU_FAIL_ALLOC either.
+    if (size == 0) {
+      *ptr = nullptr;
+      return cudaSuccess;
+    }
     // Injected failure, if this occurrence was selected. Returns the documented
     // out-of-memory the API is allowed to return at any time, which is the
     // error most callers claim to handle and few ever execute.
@@ -2818,14 +2827,8 @@ static cudaError_t cudaMalloc_body(void** ptr, size_t size) {
                              "asked. This is injected, not a real exhaustion\n");
       return cudaErrorMemoryAllocation;
     }
-    // A zero-byte allocation succeeds on hardware and yields a distinct pointer
-    // that can be freed. ggml asks for one and treats a failure as fatal, so
-    // rejecting it stopped whole operations that were doing nothing wrong.
-    // Back it with a single byte: that gives an address no other allocation
-    // shares, which is what makes the pointer usable as an identity and
-    // free-able.
-    *ptr = reinterpret_cast<void*>(current(s).memory().alloc(size ? size : 1));
-    profile_memory(1, *ptr, size ? size : 1, vgpu::profiling::MemKind::Device, t_current_device);
+    *ptr = reinterpret_cast<void*>(current(s).memory().alloc(size));
+    profile_memory(1, *ptr, size, vgpu::profiling::MemKind::Device, t_current_device);
     return cudaSuccess;
   });
 }
@@ -3257,7 +3260,11 @@ static cudaError_t cudaMallocHost_body(void** ptr, size_t size) {
   if (const cudaError_t unsafe_ = capture_unsafe_gate("cudaMallocHost")) return unsafe_;
   return guard("cudaMallocHost", [&](State& s) -> cudaError_t {
     if (!ptr) return cudaErrorInvalidValue;
-    const size_t n = size ? size : 1;
+    if (size == 0) {   // as cudaMalloc: success and no pointer (an RTX 3060)
+      *ptr = nullptr;
+      return cudaSuccess;
+    }
+    const size_t n = size;
     void* p = std::aligned_alloc(4096, (n + 4095) / 4096 * 4096);
     if (!p) return cudaErrorMemoryAllocation;
     pinned(s)[p] = HostRange{n, t_current_device};
@@ -3278,7 +3285,7 @@ VGPU_EXPORT cudaError_t cudaMallocHost(void** ptr, size_t size) {
 static cudaError_t cudaHostAlloc_body(void** ptr, size_t size, unsigned int flags) {
   if (const cudaError_t unsafe_ = capture_unsafe_gate("cudaHostAlloc")) return unsafe_;
   const cudaError_t e = cudaMallocHost(ptr, size);
-  if (e != cudaSuccess) return e;
+  if (e != cudaSuccess || !*ptr) return e;   // a zero-byte request has no pointer to flag
   return guard("cudaHostAlloc", [&](State& s) {
     pinned(s)[*ptr].flags = flags;
     return cudaSuccess;
@@ -3971,6 +3978,10 @@ static cudaError_t cudaMallocAsync_body(void** ptr, size_t size, cudaStream_t st
     cudaError_t rc = cudaSuccess;
     if (capture_malloc(s, stream, size, t_current_device, ptr, &rc)) return rc;
     if (const cudaError_t unsafe_ = capture_unsafe_gate("cudaMallocAsync")) return unsafe_;
+    if (size == 0) {   // as cudaMalloc: success and no pointer (an RTX 3060)
+      *ptr = nullptr;
+      return cudaSuccess;
+    }
     return pool_alloc(s, pool_for(s, t_current_device), size, ptr, stream);
   });
 }
@@ -5818,8 +5829,12 @@ static cudaError_t cudaMallocManaged_body(void** ptr, size_t size, unsigned int)
   if (const cudaError_t unsafe_ = capture_unsafe_gate("cudaMallocManaged")) return unsafe_;
   return guard("cudaMallocManaged", [&](State& s) -> cudaError_t {
     if (!ptr) return cudaErrorInvalidValue;
+    if (size == 0) {   // as cudaMalloc: success and no pointer (an RTX 3060)
+      *ptr = nullptr;
+      return cudaSuccess;
+    }
     if (vgpu::faults::should_fail(vgpu::faults::Op::Alloc)) return cudaErrorMemoryAllocation;
-    const size_t n = size ? size : 1;
+    const size_t n = size;
     void* p = std::aligned_alloc(4096, (n + 4095) / 4096 * 4096);
     if (!p) return cudaErrorMemoryAllocation;
     // Real host memory, addressable by kernels at its own address. This is the
