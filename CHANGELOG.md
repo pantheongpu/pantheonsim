@@ -7,6 +7,16 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- PTX: `mov.u32%r1, %laneid;` (no space between the type and the operand, which nvcc emits for inline asm written `"mov.u32%0, ..."`) is
+  accepted, as ptxas does; a `%` only ever opens a register name, so it now ends the opcode word (pantheonsim #522).
+- PTX: `elect.sync _|%p, mask;` and `elect.sync %r|_, mask;` accept the sink `_` for either result, as ptxas does (cubecl's
+  `plane_elect`) (pantheonsim #503).
+- PTX: `setp` and `set` on `.bf16` (and `.bf16x2`) compare the values, not the raw bits: the sign counts, `-0 == +0`, and NaN is
+  unordered, so `setp.nan.bf16`, `setp.neu.bf16` and the ordered forms give the answers they give on `.f16` (pantheonsim #502).
+- PTX: `shfl.sync`, `vote.sync`, `match.sync`, `redux.sync` and `bar.warp.sync` wait for every lane that any running lane's member mask
+  names, not just the first lane's. With two half-warp tiles, the tile that did not contain the first lane went on while a member of
+  its own tile was still in a long loop and read 0 for it (HierarchicalKV's `tlp_v2_upsert*`). Only the lanes whose members are away
+  wait; the rest of the path runs on (pantheonsim #488).
 - License: from the next release PantheonSim is under the Business Source License 1.1, which keeps it free to use, change and run in
   your own CI and allows one restriction: you may not offer it to other people as a hosted or managed service. Each version becomes
   Apache-2.0 four years after release. Versions up to 0.2.0 stay Apache-2.0 (`LICENSE-APACHE-2.0`). `docs/licensing.md` has the

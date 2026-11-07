@@ -1420,6 +1420,7 @@ vgpu_unit_test(test_runtime)
 vgpu_unit_test(test_exec2)
 vgpu_unit_test(test_exec3)
 vgpu_unit_test(test_ptx_bitwise_not)
+vgpu_unit_test(test_ptx_issue_batch_2026_11_06)
 # PTX forms JIT compilers emit: negated predicate sources, .reg .func parameters, var[imm] addresses, ldu.
 vgpu_unit_test(test_ptx_forms)
 # 16-bit signed integer forms on registers with zero upper bits (abs.s16 and its siblings).

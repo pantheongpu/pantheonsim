@@ -59,6 +59,10 @@ std::vector<Token> lex(const std::string& src) {
     if (word_char(c)) {
       size_t start = i;
       while (i < n) {
+        // A '%' only opens a register name (identifiers cannot contain one), so
+        // "mov.u32%r1" is the opcode "mov.u32" and the operand "%r1": ptxas
+        // accepts the missing space, and nvcc emits it for "mov.u32%0" asm.
+        if (src[i] == '%' && i > start) break;
         if (word_char(src[i])) {
           ++i;
           continue;
