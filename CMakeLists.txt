@@ -4588,6 +4588,12 @@ set_tests_properties(e2e_per_thread_stream PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 300)
+# cudaLaunchHostFunc enqueues and returns; events and streams behind it are not ready until it finishes (#487).
+add_test(NAME e2e_async_host_events COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_async_host_events.sh)
+set_tests_properties(e2e_async_host_events PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 300)
 add_test(NAME e2e_runtime_conformance COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_runtime_conformance.sh)
 set_tests_properties(e2e_runtime_conformance PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
