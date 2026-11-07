@@ -2768,6 +2768,14 @@ if(TARGET vgpucudart)
   set_tests_properties(test_runtime_exports PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
+# cuMemGetInfo and cudaMemGetInfo with a null free or total pointer.
+if(TARGET vgpucuda AND TARGET vgpucudart AND CUDA_ABI_INCLUDE)
+  add_executable(test_mem_get_info_null nvidia/tests/unit/test_mem_get_info_null.cpp)
+  target_link_libraries(test_mem_get_info_null PRIVATE vgpucuda vgpucudart)
+  target_include_directories(test_mem_get_info_null PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_mem_get_info_null COMMAND test_mem_get_info_null)
+  set_tests_properties(test_mem_get_info_null PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1")
+endif()
 # The structures the driver shim declares for itself are cuda.h's (compile-time checks only).
 if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
   add_executable(test_driver_abi_sweep nvidia/tests/unit/test_driver_abi_sweep.cpp)

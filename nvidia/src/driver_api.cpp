@@ -1545,10 +1545,10 @@ static CUresult cuMemGetInfo_v2_impl(size_t* free_out, size_t* total);
 VGPU_EXPORT CUresult cuMemGetInfo_v2(size_t* free_out, size_t* total) { return traced("cuMemGetInfo_v2", cuMemGetInfo_v2_impl, free_out, total); }
 static CUresult cuMemGetInfo_v2_impl(size_t* free_out, size_t* total) {
   return api("cuMemGetInfo", true, false, [&](ShimState& s) {
-    if (!free_out || !total) return CUDA_ERROR_INVALID_VALUE;
+    // Either pointer may be NULL: the card fills in the one it is given (cuda-api-wrappers asks for the total alone).
     vgpu::MemoryManager& mm = current(s).memory();
-    *total = static_cast<size_t>(mm.capacity());
-    *free_out = static_cast<size_t>(mm.capacity() - mm.used());
+    if (total) *total = static_cast<size_t>(mm.capacity());
+    if (free_out) *free_out = static_cast<size_t>(mm.capacity() - mm.used());
     return CUDA_SUCCESS;
   });
 }

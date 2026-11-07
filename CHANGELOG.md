@@ -7,6 +7,7 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- `cuMemGetInfo` and `cudaMemGetInfo` accept a null free or total pointer and fill in the other, as on the card; they answered `INVALID_VALUE`. cuda-api-wrappers asks for the total alone (pantheonsim #519).
 - The container image builds again. `scripts/package-build.sh` left `shim/libcudss.so.1` pointing into `cudss1/`, a directory the image does not
   have, so the build stopped at "links that lead nowhere" from the cuDSS 1.0 change onward. A lint test (`lint_package_build`) now builds a small
   tree with the same layout.

@@ -2757,10 +2757,10 @@ VGPU_EXPORT cudaError_t cudaMemcpyPeer(void* dst, int dstDevice, const void* src
 
 static cudaError_t cudaMemGetInfo_body(size_t* free_b, size_t* total_b) {
   return guard("cudaMemGetInfo", [&](State& s) {
-    if (!free_b || !total_b) return cudaErrorInvalidValue;
+    // Either pointer may be NULL, as on the card.
     vgpu::MemoryManager& mm = current(s).memory();
-    *total_b = static_cast<size_t>(mm.capacity());
-    *free_b = static_cast<size_t>(mm.capacity() - mm.used());
+    if (total_b) *total_b = static_cast<size_t>(mm.capacity());
+    if (free_b) *free_b = static_cast<size_t>(mm.capacity() - mm.used());
     return cudaSuccess;
   });
 }
