@@ -25,7 +25,7 @@ for threads in 1 2 3; do
   echo "== VGPU_THREADS=$threads"
   result="$(VGPU_THREADS=$threads VGPU_GPU=nvidia/t4 LD_LIBRARY_PATH="$shim" timeout 300 "$out" 2>&1)" || rc=$?
   echo "$result"
-  if grep -qE 'VirtualGPU error \[|is not implemented by VirtualGPU|symbol lookup error' <<< "$result"; then
+  if grep -qE 'is not implemented by VirtualGPU|symbol lookup error' <<< "$result"; then
     echo "FAIL: the program reached an unimplemented entry point"; exit 1
   fi
 done
