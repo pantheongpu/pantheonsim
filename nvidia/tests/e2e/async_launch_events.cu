@@ -158,6 +158,8 @@ int main() {
     check(good == 4, "four host threads, each launching on a stream of its own, all get the right results");
   }
 
+  cudaFreeHost(pinned);  // before the fault below kills the context
+
   // 8. A kernel's fault: the launch succeeds, the next call that touches the context reports it, and it is sticky.
   poke_null<<<1, 1, 0, s>>>(nullptr);
   check(cudaGetLastError() == cudaSuccess, "right after the launch of a faulting kernel the last error is clean");
