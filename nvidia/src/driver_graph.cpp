@@ -295,6 +295,7 @@ bool record_node(CUstream st, int type, const std::function<void()>& op) {
 }
 
 CUresult stream_mem_op(CUstream st, std::vector<CUstreamBatchMemOpParams> ops) {
+  vgpu_driver::async_order(st);   // after the host functions queued on the stream earlier (a capture refuses to wait; harmless)
   if (record_node(st, 0 /* a kernel node, as the runtime's API shows it */, [ops] { run_mem_ops(ops); }))
     return CUDA_SUCCESS;
   return run_mem_ops(ops);

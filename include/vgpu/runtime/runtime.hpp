@@ -137,6 +137,10 @@ class Device {
   void launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
               const std::vector<std::vector<uint8_t>>& args,
               const exec::SymbolTable* syms = nullptr);
+  // The checks launch() makes on the configuration before anything runs (grid, block, cluster, shared memory,
+  // registers), throwing Err::LaunchConfig and the like exactly as launch() would. A caller that runs the
+  // launch later (the runtime's asynchronous launches) calls this first, so those refusals stay the launch's own.
+  void check_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg) const;
 
   // Texture and surface objects live for as long as the device, not the
   // module: the host creates them, kernels receive them as parameters, and

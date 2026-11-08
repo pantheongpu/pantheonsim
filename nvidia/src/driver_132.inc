@@ -42,16 +42,14 @@ static CUresult cuKernelGetParamCount_impl(void* kernel, size_t* paramCount) {
 
 // ---- a host function, with its synchronization mode ----------------------------------------------------------------------------------
 // As cuLaunchHostFunc, with CU_HOST_TASK_BLOCKING (0) or CU_HOST_TASK_SPINWAIT (1) for how the thread that runs it
-// waits for the next task: both run the function once the stream's earlier work is done, which here is at once. Any other
+// waits for the next task: both queue the function behind the stream's work, as cuLaunchHostFunc. Any other
 // mode is CUDA_ERROR_INVALID_VALUE (checked first). A null function is CUDA_SUCCESS on the card and runs nothing.
 static CUresult cuLaunchHostFunc_v2_impl(CUstream stream, CUhostFn fn, void* user, unsigned int syncMode);
 VGPU_EXPORT CUresult cuLaunchHostFunc_v2(CUstream stream, CUhostFn fn, void* user, unsigned int syncMode) { return traced("cuLaunchHostFunc_v2", cuLaunchHostFunc_v2_impl, stream, fn, user, syncMode); }
 static CUresult cuLaunchHostFunc_v2_impl(CUstream st, CUhostFn fn, void* user, unsigned int syncMode) {
   if (syncMode > 1) return CUDA_ERROR_INVALID_VALUE;
   if (!fn) return CUDA_SUCCESS;
-  VGPU_CAPTURE_NODE(st, kNodeHost, fn(user));
-  fn(user);
-  return CUDA_SUCCESS;
+  return launch_host_fn(st, fn, user);
 }
 
 // ---- one copy, with attributes -------------------------------------------------------------------------------------------------------

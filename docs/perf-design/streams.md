@@ -1,5 +1,8 @@
 # Concurrent kernels from different streams: design note (r7-sched), NOT IMPLEMENTED
 
+(The section "Asynchronous launch, one kernel at a time" at the end describes what was built later: a launch that returns
+before its kernel has run, with at most one kernel in flight. Concurrent kernels are still not implemented.)
+
 Written 2026-10-12 against `443e79c0`. The brief asked for an implementation
 only if every observable effect could be shown unchanged. It cannot be, so this
 is the analysis and a sketch of what a real implementation would have to do.
@@ -94,3 +97,62 @@ and the tests that pin it, before touching the executors; the worker pool in
 `include/vgpu/exec/worker_pool.hpp` already supports several callers at once
 (`several_host_threads_can_call_at_once`, `callers_waiting_on_each_other_get_threads_of_their_own`),
 so it is not the obstacle.
+
+## Asynchronous launch, one kernel at a time (pantheonsim #523)
+
+What is built: `cudaLaunchKernel` on a stream made with `cudaStreamNonBlocking` (`VGPU_ASYNC_LAUNCH=all`: any `cudaStreamCreate`
+stream) validates and prepares everything in the call, under the API lock, as before (arguments, module load, shared-memory limit,
+the device's configuration checks through `Device::check_launch`, injected failures, the cooperative and graph-launch rules).
+It then queues the kernel as an item on the stream's lane (`runtime_api.cpp`, "Stream lanes") and the lane's worker thread runs
+`Device::launch` while holding the API lock. The launching thread returns once the worker holds the lock.
+
+Why that is safe, and why it is not more:
+
+* Everything that reads or writes the machine takes the API lock (the runtime and the driver share one,
+  `shared_runtime.cpp`), so it waits for the running kernel exactly as it used to wait inside the launch. The thing that makes this
+  sound is that the worker has the lock before the launch returns: a call made after the launch on the same thread cannot get in
+  front of the kernel. Calls that do not take the lock are the ones that should see the kernel pending: `cudaEventQuery`,
+  `cudaEventElapsedTime`, `cudaStreamQuery`, event records (queued behind the kernel on the lane, stamped when it ends, so an event
+  pair times the kernel).
+* At most one kernel is in flight, and a launch (or copy) on a stream first waits for that stream's lane to drain, as it already did
+  for host functions. A second launch also waits for the first kernel by way of the API lock. There is no overlap of kernels, so
+  the determinism argument of item 6 above is untouched; what is lost relative to a card is only kernel-kernel and
+  kernel-copy overlap, which nothing could observe here before either.
+* Errors: a refused configuration is thrown by `check_launch` in the call. A sticky fault is the context's (`set_error` sets it from
+  the worker, and every call that needs the context already reports it, as the launch of a faulting kernel always returned
+  success). The one thing that moves is a failure that is not sticky (a kernel that hit the step limit): it is kept for the
+  launching thread (`g_deferred_errors`) and reaches its `g_last_error` and `g_async_error` at its next runtime call.
+
+What is not covered, each a reason a launch stays synchronous (`async_launch_eligible`):
+
+* **The CUDA library shims** (cuBLAS, cuDNN, cuFFT, cuSOLVER, cuSPARSE, cuRAND, NPP, nvJPEG, ...): their math runs on the calling
+  thread, reads and writes device memory through the allocation table with no API lock, and there is no common entry to hook (a
+  dozen files, hundreds of exports). A pending kernel would race with the next library call. So the launch is synchronous while a
+  library shim is loaded (looked for with `dl_iterate_phdr` at each eligible launch). What would have to change: a drain at the entry
+  of every library call, or in `MemoryManager`'s host-side accessors (which are hot paths for the engine and would need to tell the
+  kernel's own threads from the caller's).
+* **Managed memory** (the fault and migration model assumes no kernel overlaps a host access), a profiler or `VGPU_TRACE` (record
+  order and kernel start/end are committed in expected files), `VGPU_RACE`, `VGPU_MAX_STEPS`, `VGPU_STRICT` (their failures are
+  not sticky and tests read them from the launch).
+* **Cooperative, cluster, graph and `cudaLaunchKernelEx` launches, graph capture, the default streams** (the legacy stream's
+  ordering against blocking streams is the lane barrier's, which stays as for host functions), and a launch from inside another
+  runtime call (the thread holds the API lock the worker needs).
+* **A kernel that waits for the host** (spins on a flag the host sets after the launch): the worker holds the API lock for the
+  kernel, so a host thread that sets the flag through a runtime call (a `cudaMemcpy`) waits for the kernel, and the program hangs
+  where a card would not; setting it with a plain store to pinned memory works. This hung before too (the launch itself did not
+  return), so it is not a regression, but it is the next limit to remove: it needs the kernel to run without the API lock, which is the
+  audit of item 1 above.
+
+### The driver API's host functions (pantheonsim #487)
+
+`cuLaunchHostFunc` uses the same lanes: libcuda reaches them by name (`vgpu_async_*_v1` in `runtime_api.cpp`, found with `dlsym` as the
+capture hooks are; see "Host functions" in `driver_capture.inc`), so the two libraries share one set of lanes and one set of stream
+handles, and a driver stream made with `CU_STREAM_NON_BLOCKING` is told to the runtime (`vgpu_async_stream_flags_v1`) because the
+runtime does not know its flags. Every hook returns at once until a host function has been queued by either API, so programs that
+never queue one are untouched. The driver has no common stream choke point, so the order is enforced where the work is issued:
+`StreamOrder` (an RAII wait, in `driver_api.cpp` before `StreamContext`) in front of the kernel launches, `StreamContext` for the copies
+and fills, and explicit `StreamOrder`s in the 2D, array, peer and stream-memory-operation paths and `cuStreamAddCallback`. It waits before
+the call takes the API lock, once per call stack (a thread-local flag, so an async copy that ends in the synchronous one waits for its own
+stream and not for the legacy stream's dependencies), and not for the replay of a captured launch, which runs under the lock. A driver event
+is also recorded on its runtime shadow event once a host function exists; `cuEventQuery`, `cuEventSynchronize`, `cuEventElapsedTime`
+and `cuStreamWaitEvent` read the shadow's pending state and time (`vgpu_async_event_*_v1`).

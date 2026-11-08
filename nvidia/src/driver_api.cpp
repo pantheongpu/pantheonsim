@@ -452,9 +452,30 @@ bool needs_current_context(const char* name) {
 // on a stream made earlier with nothing current. The legacy (1) and per-thread (2) streams, and NULL, belong to
 // the current context, and those calls still fail with CUDA_ERROR_INVALID_CONTEXT.
 thread_local bool t_stream_context = false;
+
+// Work issued on a stream runs after the host functions queued on it earlier (cuLaunchHostFunc; driver_capture.inc, "Host
+// functions"): StreamOrder waits for them, before the call takes the API lock. The first one on a thread's call stack does
+// it, so a call that is made of other calls (an async copy that ends in the synchronous one) waits for its own stream only.
+void async_order(CUstream st);
+constexpr CUresult kNotReady = static_cast<CUresult>(600);   // CUDA_ERROR_NOT_READY
+thread_local bool t_stream_ordered = false;
+struct StreamOrder {
+  bool prev;
+  explicit StreamOrder(CUstream st, bool on = true) : prev(t_stream_ordered) {
+    if (on && !prev) {
+      async_order(st);
+      t_stream_ordered = true;
+    }
+  }
+  ~StreamOrder() { t_stream_ordered = prev; }
+  StreamOrder(const StreamOrder&) = delete;
+  StreamOrder& operator=(const StreamOrder&) = delete;
+};
 struct StreamContext {
   bool prev;
-  explicit StreamContext(CUstream st) : prev(t_stream_context) {
+  StreamOrder order;
+  // `ordered` is false for a call that does not touch the stream's work (a stream-ordered allocation or free).
+  explicit StreamContext(CUstream st, bool ordered = true) : prev(t_stream_context), order(st, ordered) {
     if (reinterpret_cast<uintptr_t>(st) > 2) t_stream_context = true;
   }
   ~StreamContext() { t_stream_context = prev; }
@@ -970,6 +991,14 @@ VGPU_EXPORT CUresult cuInit(unsigned int flags) {
 // program made current itself is left alone; a primary one is swapped for the
 // runtime's current device's. Called by the runtime shim, found through the
 // process's global scope (runtime_api.cpp).
+// Whether the driver API has made a managed allocation (cuMemAllocManaged, or a module's __managed__ globals): the runtime
+// keeps its launches synchronous while any exists (runtime_api.cpp, the asynchronous launch). Found through the process's
+// global scope; the caller holds the API lock.
+VGPU_EXPORT int vgpu_driver_has_managed_v1() {
+  ShimState& s = state();
+  return !s.managed.empty();
+}
+
 VGPU_EXPORT int vgpu_driver_bind_primary_v1(int dev) {
   if (cuInit_impl(0) != CUDA_SUCCESS) return CUDA_ERROR_NOT_INITIALIZED;
   return api("vgpu_driver_bind_primary", true, false, [&](ShimState& s) {
@@ -1000,7 +1029,7 @@ static CUresult cuDriverGetVersion_impl(int* driverVersion) {
 // Both look the code up in the table the runtime shim shares
 // (error_names.hpp), which lists every CUresult cuda.h declares. This used to
 // be a table of the thirteen codes this file returns, so a program asking for
-// the name of CUDA_ERROR_NO_DEVICE or CUDA_ERROR_NOT_READY -- codes it can
+// the name of CUDA_ERROR_NO_DEVICE or kNotReady -- codes it can
 // receive from any library -- was told the code itself was invalid. A code no
 // header declares still gets CUDA_ERROR_INVALID_VALUE and NULL, as documented.
 static CUresult cuGetErrorName_impl(CUresult error, const char** pStr);
@@ -1347,6 +1376,7 @@ static CUresult cuCtxGetDevice_impl(CUdevice* device) {
 }
 
 static CUresult cuCtxSynchronize_impl(void) {
+  async_wait_device();   // every stream's host functions finish first (before the API lock is taken)
   return api("cuCtxSynchronize", true, false, [&](ShimState& s) {
     if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
     (void)current_device(s);  // requires a current context
@@ -2713,6 +2743,8 @@ int vgpu_driver::copy_kernel_args(void* func, void** kernel_params, void** extra
   });
 }
 
+void vgpu_driver::async_order(void* stream) { ::async_order(static_cast<CUstream>(stream)); }
+
 void* vgpu_driver::runtime_event_for(void* ev) { return shadow_event(static_cast<CUevent>(ev), true); }
 
 void* vgpu_driver::driver_event_of(void* rt_event) {
@@ -2725,6 +2757,7 @@ void* vgpu_driver::driver_event_of(void* rt_event) {
 
 int vgpu_driver::run_kernel(void* func, const unsigned grid[3], const unsigned block[3], unsigned shared,
                             const std::vector<std::vector<uint8_t>>& args) {
+  const StreamOrder replay(nullptr, false);
   std::vector<void*> ptrs(args.size());
   for (size_t i = 0; i < args.size(); ++i) ptrs[i] = const_cast<uint8_t*>(args[i].data());
   return launch_kernel_common("cuLaunchKernel", reinterpret_cast<CUfunction>(func), grid[0], grid[1], grid[2], block[0],
@@ -2736,6 +2769,7 @@ static CUresult cuLaunchKernel_impl(CUfunction f, unsigned int gridDimX, unsigne
                                     unsigned int blockDimY, unsigned int blockDimZ,
                                     unsigned int sharedMemBytes, CUstream hStream,
                                     void** kernelParams, void** extra) {
+  const StreamOrder stream_order(hStream);   // behind the stream's host functions
   return launch_kernel_common("cuLaunchKernel", f, gridDimX, gridDimY, gridDimZ, blockDimX,
                               blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra,
                               /*cooperative=*/false);
@@ -3072,6 +3106,7 @@ static CUresult cuLaunchKernelEx_impl(const void* config, CUfunction f, void** k
     else if (a.id == kLaunchAttrCooperative)
       cooperative = a.value.cooperative != 0;
   }
+  const StreamOrder stream_order(c->stream);
   return launch_kernel_common("cuLaunchKernelEx", f, c->gx, c->gy, c->gz, c->bx, c->by, c->bz,
                               c->shared_bytes, c->stream, kernelParams, extra, cooperative, cluster);
 }
@@ -3139,6 +3174,7 @@ CUresult launch_grid(const char* name, CUfunction f, int width, int height, CUst
     return CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES;
   }
   for (auto& b : storage) args.push_back(b.data());
+  const StreamOrder stream_order(stream);
   return launch_kernel_common(name, f, static_cast<unsigned>(width), static_cast<unsigned>(height), 1,
                               rec.block[0], rec.block[1], rec.block[2], rec.shared_bytes, stream,
                               args.empty() ? nullptr : args.data(), nullptr, /*cooperative=*/false);
@@ -3426,6 +3462,7 @@ static CUresult cuLaunchCooperativeKernel_impl(CUfunction f, unsigned int gridDi
                                                unsigned int blockDimX, unsigned int blockDimY,
                                                unsigned int blockDimZ, unsigned int sharedMemBytes,
                                                CUstream hStream, void** kernelParams) {
+  const StreamOrder stream_order(hStream);
   return launch_kernel_common("cuLaunchCooperativeKernel", f, gridDimX, gridDimY, gridDimZ,
                               blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream,
                               kernelParams, nullptr, /*cooperative=*/true);
@@ -4327,6 +4364,7 @@ static CUresult cuMemcpyHtoAAsync_v2_impl(CUarray dst, size_t off, const void* s
 VGPU_EXPORT CUresult cuMemcpyHtoAAsync_v2(CUarray dst, size_t off, const void* src, size_t n, CUstream a4) { return traced("cuMemcpyHtoAAsync_v2", cuMemcpyHtoAAsync_v2_impl, dst, off, src, n, a4); }
 static CUresult cuMemcpyHtoAAsync_v2_impl(CUarray dst, size_t off, const void* src, size_t n, CUstream st) {
   VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpyHtoA_v2(dst, off, src, n));
+  const StreamOrder stream_order(st);
   return cuMemcpyHtoA_v2(dst, off, src, n);
 }
 static CUresult cuMemcpyHtoAAsync_impl(CUarray dst, size_t off, const void* src, size_t n, CUstream st);
@@ -4338,6 +4376,7 @@ static CUresult cuMemcpyAtoHAsync_v2_impl(void* dst, CUarray src, size_t off, si
 VGPU_EXPORT CUresult cuMemcpyAtoHAsync_v2(void* dst, CUarray src, size_t off, size_t n, CUstream a4) { return traced("cuMemcpyAtoHAsync_v2", cuMemcpyAtoHAsync_v2_impl, dst, src, off, n, a4); }
 static CUresult cuMemcpyAtoHAsync_v2_impl(void* dst, CUarray src, size_t off, size_t n, CUstream st) {
   VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpyAtoH_v2(dst, src, off, n));
+  const StreamOrder stream_order(st);
   return cuMemcpyAtoH_v2(dst, src, off, n);
 }
 static CUresult cuMemcpyAtoHAsync_impl(void* dst, CUarray src, size_t off, size_t n, CUstream st);
@@ -4953,6 +4992,7 @@ static CUresult cuMemcpy2DAsync_v2_impl(const CUDA_MEMCPY2D* c, CUstream st) {
     const CUDA_MEMCPY2D copy = *c;
     VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpy2D_v2(&copy));
   }
+  const StreamOrder stream_order(st);
   return cuMemcpy2D_v2(c);
 }
 static CUresult cuMemcpy2DAsync_impl(const CUDA_MEMCPY2D* c, CUstream st);
@@ -5080,7 +5120,7 @@ VGPU_EXPORT CUresult cuMemAllocAsync(CUdeviceptr* dptr, size_t bytesize, CUstrea
 static CUresult cuMemAllocAsync_impl(CUdeviceptr* dptr, size_t bytesize, CUstream st) {
   if (CUresult rc; capture_alloc(dptr, bytesize, st, &rc)) return rc;
   VGPU_CAPTURE_UNSAFE("cuMemAllocAsync");
-  const StreamContext stream_context(st);
+  const StreamContext stream_context(st, false);
   return api("cuMemAllocAsync", true, false, [&](ShimState& s) {
     if (!dptr) return CUDA_ERROR_INVALID_VALUE;
     if (bytesize == 0) {
@@ -5096,7 +5136,7 @@ VGPU_EXPORT CUresult cuMemAllocFromPoolAsync(CUdeviceptr* dptr, size_t bytesize,
 static CUresult cuMemAllocFromPoolAsync_impl(CUdeviceptr* dptr, size_t bytesize, void* pool, CUstream st) {
   if (CUresult rc; capture_alloc(dptr, bytesize, st, &rc)) return rc;
   VGPU_CAPTURE_UNSAFE("cuMemAllocFromPoolAsync");
-  const StreamContext stream_context(st);
+  const StreamContext stream_context(st, false);
   return api("cuMemAllocFromPoolAsync", true, false, [&](ShimState& s) {
     if (!dptr) return CUDA_ERROR_INVALID_VALUE;
     PoolRec* p = pool_from_handle(s, pool);
@@ -5121,7 +5161,7 @@ static CUresult cuMemFreeAsync_impl(CUdeviceptr dptr, CUstream st) {
   }
   VGPU_CAPTURE_UNSAFE("cuMemFreeAsync");
   if (dptr == 0) return CUDA_SUCCESS;
-  const StreamContext stream_context(st);
+  const StreamContext stream_context(st, false);
   bool pooled = false;
   const CUresult r = api("cuMemFreeAsync", true, false, [&](ShimState& s) {
     if (PoolRec* p = pool_of(s, dptr)) {
@@ -5467,6 +5507,7 @@ static CUresult cuStreamAddCallback_impl(CUstream stream, CUstreamCallback cb, v
   // Measured: refused on a capturing stream, which the refusal leaves capturing.
   if (stream_capturing(stream)) return kCaptureUnsupported;
   if (!cb || flags != 0) return CUDA_ERROR_INVALID_VALUE;
+  const StreamOrder stream_order(stream);   // after the host functions queued before it
   cb(stream, CUDA_SUCCESS, user);
   return CUDA_SUCCESS;
 }
@@ -5485,6 +5526,8 @@ static CUresult stream_create(CUstream* s_out, unsigned int flags, int priority)
     // cuStreamGetPriority; streams run in order, so it changes nothing else.
     s.stream_priority[h] = std::min(vgpu::cuda::kLeastStreamPriority, std::max(vgpu::cuda::kGreatestStreamPriority, priority));
     announce_stream_created(s, h, flags, priority);
+    if (flags & 0x1)   // CU_STREAM_NON_BLOCKING: it does not order against the legacy default stream
+      if (const AsyncHooks* a = async_hooks()) a->stream_flags(reinterpret_cast<void*>(h), 1, 1);
     return CUDA_SUCCESS;
   });
 }
@@ -5508,6 +5551,7 @@ static CUresult cuStreamDestroy_v2_impl(CUstream stream) {
     s.streams.erase(h);
     s.stream_device.erase(h);
     s.stream_priority.erase(h);
+    if (const AsyncHooks* a = async_hooks()) a->stream_flags(stream, 0, 0);
     return CUDA_SUCCESS;
   });
 }
@@ -5520,7 +5564,8 @@ static CUresult cuStreamDestroy_impl(CUstream stream) { return cuStreamDestroy_v
 // A wait that returned is recorded for a profiler, and the stream and context
 // waits are told to a subscriber (vgpu/profiling.hpp).
 static CUresult cuStreamSynchronize_impl(CUstream stream) {
-  const StreamContext stream_context(stream);
+  async_wait_stream(stream);   // the stream's host functions finish first (before the API lock is taken)
+  const StreamContext stream_context(stream, false);
   return api("cuStreamSynchronize", true, false, [&](ShimState& s) {
     if (ctx_stack().empty() && !t_stream_context) return CUDA_ERROR_INVALID_CONTEXT;
     if (!ctx_stack().empty()) (void)current_device(s);  // a stream of its own needs none; the others, the current context
@@ -5534,17 +5579,24 @@ VGPU_EXPORT CUresult cuStreamSynchronize(CUstream stream) {
   VGPU_CAPTURE_UNSAFE("cuStreamSynchronize");
   return traced("cuStreamSynchronize", cuStreamSynchronize_impl, stream);
 }
-// Streams are synchronous, so everything queued before the function has run
-// by the time it is called, which is all a host function is promised.
+// The function is queued behind the stream's work and the call returns (see "Host functions", driver_capture.inc): kernels and
+// copies run in their calls, so the work queued before it has finished, and what the stream is given afterwards waits for it.
 static CUresult cuLaunchHostFunc_impl(CUstream, CUhostFn fn, void* user);
 VGPU_EXPORT CUresult cuLaunchHostFunc(CUstream a0, CUhostFn fn, void* user) { return traced("cuLaunchHostFunc", cuLaunchHostFunc_impl, a0, fn, user); }
-static CUresult cuLaunchHostFunc_impl(CUstream st, CUhostFn fn, void* user) {
-  if (!fn) return CUDA_ERROR_INVALID_VALUE;
+static CUresult launch_host_fn(CUstream st, CUhostFn fn, void* user) {
   VGPU_CAPTURE_NODE(st, kNodeHost, fn(user));
+  if (const AsyncHooks* h = async_hooks(/*load=*/true)) {
+    h->host_fn(st, fn, user);   // queued on the stream's lane; the call returns
+    return CUDA_SUCCESS;
+  }
   fn(user);
   return CUDA_SUCCESS;
 }
-// Always idle. The card records a query that finds the stream idle as a wait
+static CUresult cuLaunchHostFunc_impl(CUstream st, CUhostFn fn, void* user) {
+  if (!fn) return CUDA_ERROR_INVALID_VALUE;
+  return launch_host_fn(st, fn, user);
+}
+// Idle unless a host function is pending. The card records a query that finds the stream idle as a wait
 // on it, and tells a subscriber the stream was synchronized.
 static CUresult cuStreamQuery_impl(CUstream stream) {
   {   // with no current context the card answers CUDA_ERROR_INVALID_CONTEXT, unless the stream is one of its own
@@ -5553,6 +5605,7 @@ static CUresult cuStreamQuery_impl(CUstream stream) {
     if (st.initialized && ctx_stack().empty() && reinterpret_cast<uintptr_t>(stream) <= 2) return CUDA_ERROR_INVALID_CONTEXT;
   }
   const CUresult r = dead_context();
+  if (r == CUDA_SUCCESS && async_stream_busy(stream)) return kNotReady;   // behind a host function that has not finished
   if (r == CUDA_SUCCESS)
     vgpu::profiling::SyncScope waited(vgpu::profiling::SyncKind::Stream, reinterpret_cast<uint64_t>(stream), 0,
                                       profiled_device());
@@ -5589,6 +5642,12 @@ VGPU_EXPORT CUresult cuStreamWaitEvent(CUstream stream, void* event, unsigned in
     }
     void* shadow = shadow_event(static_cast<CUevent>(event), false);
     const bool capturing = stream_capturing(stream);
+    // The stream's later work follows an event that is still pending (recorded behind a host function). Not an event last
+    // recorded in a capture, which joins streams below, nor a stream that is joining one (it is not capturing yet).
+    if (!capturing && shadow && shadow != event && host_async() && async_hooks()->event_state(shadow, nullptr) == 2) {
+      async_hooks()->stream_wait_event(stream, shadow);
+      return traced("cuStreamWaitEvent", cuStreamWaitEvent_impl, stream, event, flags);
+    }
     if (capturing && mine && !shadow && !recorded) return traced("cuStreamWaitEvent", cuStreamWaitEvent_impl, stream, event, flags);
     if (shadow || (capturing && mine)) {
       if (!shadow) shadow = shadow_event(static_cast<CUevent>(event), true);
@@ -5698,11 +5757,17 @@ static CUresult event_record(void* ev, CUstream stream, unsigned int flags) {
       mine = s.events.count(reinterpret_cast<uintptr_t>(ev)) != 0;
     }
     if (mine) {
-      void* shadow = shadow_event(static_cast<CUevent>(ev), stream_capturing(stream));
-      if (shadow) {
+      const bool capturing = stream_capturing(stream);
+      // Once a host function has been queued the event is also recorded on its runtime event, which the stream's lane
+      // completes when it reaches it (see "Host functions", driver_capture.inc).
+      const bool lanes = !capturing && host_async();
+      void* shadow = shadow_event(static_cast<CUevent>(ev), capturing || lanes);
+      if (shadow && lanes) {
+        async_hooks()->event_record(shadow, stream);
+      } else if (shadow) {
         const int rc = rec(shadow, stream, flags);
         if (rc) return static_cast<CUresult>(rc);
-        if (stream_capturing(stream)) return CUDA_SUCCESS;
+        if (capturing) return CUDA_SUCCESS;
       }
     }
   }
@@ -5721,6 +5786,8 @@ static CUresult event_exists(void* event) { return event ? CUDA_SUCCESS : CUDA_E
 static CUresult cuEventQuery_impl(void* event) {
   CUresult r = dead_context();
   if (r == CUDA_SUCCESS) r = event_exists(event);
+  if (r == CUDA_SUCCESS && host_async())   // recorded behind a host function that has not finished
+    if (void* shadow = async_shadow(event); shadow && async_hooks()->event_state(shadow, nullptr) == 2) return kNotReady;
   if (r == CUDA_SUCCESS)
     vgpu::profiling::SyncScope waited(vgpu::profiling::SyncKind::Event, 0, reinterpret_cast<uint64_t>(event),
                                       profiled_device());
@@ -5752,6 +5819,8 @@ static CUresult cuEventSynchronize_impl(void* event) {
 }
 VGPU_EXPORT CUresult cuEventSynchronize(void* event) {
   if (const CUresult r = event_in_capture_answer(event, "cuEventSynchronize", "cudaEventSynchronize")) return r;
+  if (host_async())   // the lane records it when it gets there; waited for before the API lock is taken
+    if (void* shadow = async_shadow(event)) async_hooks()->event_wait(shadow);
   return traced("cuEventSynchronize", cuEventSynchronize_impl, event);
 }
 static CUresult cuEventDestroy_v2_impl(void* ev) {
@@ -5775,6 +5844,14 @@ static CUresult cuEventDestroy_impl(void* ev);
 VGPU_EXPORT CUresult cuEventDestroy(void* ev) { return traced("cuEventDestroy", cuEventDestroy_impl, ev); }
 static CUresult cuEventDestroy_impl(void* ev) { return cuEventDestroy_v2_impl(ev); }
 static CUresult cuEventElapsedTime_impl(float* ms, void* start, void* end) {
+  // An event recorded behind a host function is complete when the lane reached it: not ready before, and timed to that moment.
+  long long lane_ns[2] = {0, 0};
+  int lane_state[2] = {0, 0};
+  if (host_async()) {
+    void* both[2] = {start, end};
+    for (int i = 0; i < 2; ++i)
+      if (void* shadow = async_shadow(both[i])) lane_state[i] = async_hooks()->event_state(shadow, &lane_ns[i]);
+  }
   return api("cuEventElapsedTime", true, false, [&](ShimState& s) {
     auto a = s.events.find(reinterpret_cast<uintptr_t>(start));
     auto b = s.events.find(reinterpret_cast<uintptr_t>(end));
@@ -5784,8 +5861,11 @@ static CUresult cuEventElapsedTime_impl(float* ms, void* start, void* end) {
     if (a == s.events.end() || b == s.events.end() || !a->second.recorded || !b->second.recorded ||
         !a->second.timing || !b->second.timing)
       return CUDA_ERROR_INVALID_HANDLE;
-    double ns = (b->second.when.tv_sec - a->second.when.tv_sec) * 1e9 +
-                (b->second.when.tv_nsec - a->second.when.tv_nsec);
+    if (lane_state[0] == 2 || lane_state[1] == 2) return kNotReady;
+    auto stamp = [](const EventRec& e, int state, long long when_ns) {
+      return state == 1 ? static_cast<double>(when_ns) : e.when.tv_sec * 1e9 + e.when.tv_nsec;
+    };
+    double ns = stamp(b->second, lane_state[1], lane_ns[1]) - stamp(a->second, lane_state[0], lane_ns[0]);
     *ms = static_cast<float>(ns / 1e6);
     return CUDA_SUCCESS;
   });
@@ -6190,6 +6270,7 @@ static CUresult cuMemcpyPeerAsync_impl(CUdeviceptr dst, CUcontext dctx, CUdevice
                                        size_t n, CUstream st) {
   // Measured on an RTX 3060: refused on a capturing stream, which invalidates the capture.
   if (capture_forbidden(st, "cuMemcpyPeerAsync")) return kCaptureUnsupported;
+  const StreamOrder stream_order(st);
   return cuMemcpyPeer(dst, dctx, src, sctx, n);
 }
 

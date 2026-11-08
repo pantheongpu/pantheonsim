@@ -31,9 +31,32 @@ release says what runs and what it produces, never how fast a real GPU would run
   `cudaErrorNotReady` until it has finished, as does `cudaEventElapsedTime`; `cudaStreamSynchronize`, `cudaEventSynchronize` and
   `cudaDeviceSynchronize` wait for it; `cudaStreamWaitEvent` on a pending event holds the other stream back; the legacy default stream
   orders against blocking streams. A host function that waits for something the caller does after enqueueing it no longer hangs the
-  call (pantheonsim #487). Kernels, copies and fills still run to completion inside their calls, so an event recorded behind a long
-  kernel is still complete at once (#523 stays open); `cuLaunchHostFunc` in the driver API still runs inline. Programs that never queue
-  a host function see no change. `cudaErrorNotReady` from a query is no longer left as the last error (`cudaGetLastError`), as on a card.
+  call (pantheonsim #487). Copies and fills still run to completion inside their calls; kernel launches are the next entry;
+  the driver API's `cuLaunchHostFunc` is the entry after that. Programs that never queue a host function see no change. `cudaErrorNotReady` from a query is no longer left as the last error (`cudaGetLastError`), as on a card.
+- CUDA driver: `cuLaunchHostFunc` (and `cuLaunchHostFunc_v2`) enqueues the function and returns, as the runtime's does and as a GPU does
+  (pantheonsim #487, the driver half). It runs on the stream's worker thread, in order with the stream's other host functions, and what
+  the stream is given afterwards waits for it: `cuLaunchKernel` and its variants, every `cuMemcpy*` and `cuMemset*` form (the
+  synchronous ones on the legacy stream wait for blocking streams' host functions only), stream memory operations and
+  `cuStreamAddCallback`. `cuStreamQuery` is `CUDA_ERROR_NOT_READY` while one is pending, `cuStreamSynchronize` and `cuCtxSynchronize` wait
+  for it, and a driver event recorded behind it is `CUDA_ERROR_NOT_READY` from `cuEventQuery` and `cuEventElapsedTime` until it has finished
+  (`cuEventSynchronize` waits, `cuEventElapsedTime` measures to the moment it finished), `cuStreamWaitEvent` holds the other stream back.
+  A host function that waits for something the caller does after queueing it no longer hangs the call. Programs that never queue a host
+  function see no change. Not covered: stream-ordered allocation and free, prefetch and attach, external semaphores and `cuMemMapArrayAsync`
+  do not wait for earlier host functions, and `cuStreamAddCallback` still runs its callback in the call (after the earlier host
+  functions) instead of later.
+- CUDA runtime: a kernel launched with `cudaLaunchKernel` (`<<<>>>`) on a stream made with `cudaStreamNonBlocking` returns before the
+  kernel has run, so `cudaEventQuery` and `cudaStreamQuery` on work behind it report `cudaErrorNotReady`, and so does
+  `cudaEventElapsedTime`, until it has finished (pantheonsim #523; the issue's repro now prints 600, 600, then 0 after the
+  synchronize, as an RTX 3060 does). The kernel runs on the stream's worker thread under the API lock, so every call that takes the
+  lock (copies, frees, allocations, the driver API) waits for it as it waited inside the launch, and a copy or launch on the same
+  stream, `cudaStreamSynchronize`, `cudaEventSynchronize`, `cudaDeviceSynchronize` and `cudaStreamWaitEvent` order after it. Results,
+  counters, `VGPU_KERNEL_DIGEST`, error text and sticky faults are the same as before; a launch the device refuses for its
+  configuration is still refused in the launch. A kernel that ends in a failure that is not a sticky fault (ran past
+  `VGPU_MAX_STEPS`) reports it at the launching thread's next call instead of at the launch. It is not used on the default streams,
+  with a profiler or `VGPU_TRACE`, `VGPU_RACE`, `VGPU_MAX_STEPS` or `VGPU_STRICT`, for cooperative, cluster and graph launches, while
+  a managed allocation exists, or while a CUDA library shim (cuBLAS, cuDNN, cuFFT, ...) is loaded, whose math runs on the calling
+  thread with no lock; those launches run inside the call as before. `VGPU_ASYNC_LAUNCH=all` adds streams made with `cudaStreamCreate`;
+  `VGPU_ASYNC_LAUNCH=0` turns it off. Design and limits: docs/perf-design/streams.md.
 - PTX: `mov.u32%r1, %laneid;` (no space between the type and the operand, which nvcc emits for inline asm written `"mov.u32%0, ..."`) is
   accepted, as ptxas does; a `%` only ever opens a register name, so it now ends the opcode word (pantheonsim #522).
 - PTX: `elect.sync _|%p, mask;` and `elect.sync %r|_, mask;` accept the sink `_` for either result, as ptxas does (cubecl's

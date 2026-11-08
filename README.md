@@ -6,7 +6,7 @@ PantheonSim runs CUDA and HIP programs on a CPU, with no GPU. It supplies fake d
 
 - There is no timing. Timings mean nothing, and `%clock` and `%globaltimer` count instructions. It is also much slower than a GPU.
 - CUDA programs must be built with `nvcc -cudart shared`. Static cudart (CuPy, for example) does not work.
-- Kernels run to completion inside the launch call, so an event recorded behind a kernel is complete at once ([#523](https://github.com/pantheongpu/pantheonsim/issues/523)); the runtime's `cudaLaunchHostFunc` is asynchronous, the driver's `cuLaunchHostFunc` still runs inline ([#487](https://github.com/pantheongpu/pantheonsim/issues/487)).
+- Kernels run to completion inside the launch call, so an event recorded behind a kernel is complete at once ([#523](https://github.com/pantheongpu/pantheonsim/issues/523)); `cudaLaunchHostFunc` and `cuLaunchHostFunc` are asynchronous ([#487](https://github.com/pantheongpu/pantheonsim/issues/487)).
 - Known bug: `shfl.sync` returns 0 for a lane that is still in a long loop ([#488](https://github.com/pantheongpu/pantheonsim/issues/488)).
 - OptiX and NVIDIA's Nsight tools are not supported.
 - 31 of the 48 GPU profiles come from public documents, not from a card.

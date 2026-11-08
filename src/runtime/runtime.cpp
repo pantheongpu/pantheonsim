@@ -1244,6 +1244,13 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   }
 }
 
+void Device::check_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg) const {
+  // Both engines apply the kernel's __cluster_dims__ when the launch names no cluster, then validate.
+  exec::LaunchConfig c = in_cfg;
+  if (c.cluster == std::array<uint32_t, 3>{0, 0, 0}) c.cluster = fn.req_cluster;
+  exec::validate_launch(fn, c, profile_);
+}
+
 void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
                         const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms) {
   // How many of this kernel's blocks the device holds at once: what a kernel whose blocks wait on one
