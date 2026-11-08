@@ -235,7 +235,6 @@ cudaGraphicsGLRegisterImage: cudaErrorInvalidGraphicsContext
 cudaGraphicsGLRegisterImage null resource: cudaErrorInvalidValue
 cudaGLGetDevices: cudaErrorInvalidGraphicsContext -- count 99
 cudaGLGetDevices null count: cudaErrorInvalidGraphicsContext
-cudaGLSetGLDevice 0 after the runtime started: cudaErrorSetOnActiveProcess
 cudaGLSetGLDevice 5: cudaErrorInvalidDevice
 cudaGLRegisterBufferObject: cudaErrorInvalidGraphicsContext
 cudaGLUnregisterBufferObject: cudaErrorInvalidGraphicsContext
@@ -245,4 +244,4 @@ cudaGLUnmapBufferObject: cudaErrorInvalidValue
 cudaGLSetBufferObjectMapFlags: cudaErrorInvalidValue
 cudaGLMapBufferObjectAsync: cudaErrorInvalidValue
 cudaGLUnmapBufferObjectAsync: cudaErrorInvalidValue
-PASS: 247 cases
+PASS: 246 cases

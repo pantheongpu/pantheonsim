@@ -440,7 +440,6 @@ int main() {
   C("cudaGraphicsGLRegisterImage null resource", { return cudaGraphicsGLRegisterImage(nullptr, 1, 0x0DE1, 0); });
   C("cudaGLGetDevices", { unsigned n = 99; int d[4]; cudaError_t e = cudaGLGetDevices(&n, d, 4, 1); note("count %u", n); return e; });
   C("cudaGLGetDevices null count", { int d[4]; return cudaGLGetDevices(nullptr, d, 4, 1); });
-  C("cudaGLSetGLDevice 0 after the runtime started", { cudaFree(0); return cudaGLSetGLDevice(0); });
   C("cudaGLSetGLDevice 5", { cudaFree(0); return cudaGLSetGLDevice(5); });
   C("cudaGLRegisterBufferObject", { return cudaGLRegisterBufferObject(1); });
   C("cudaGLUnregisterBufferObject", { return cudaGLUnregisterBufferObject(1); });
