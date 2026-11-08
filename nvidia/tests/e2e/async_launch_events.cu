@@ -136,8 +136,15 @@ int main() {
         bool ok = true;
         for (int round = 0; round < 3; ++round) {
           const unsigned seed = 100u + i * 10u + round;
-          spin<<<1, 1, 0, st>>>(buf, 1000000, seed);
-          add_one<<<1, 1, 0, st>>>(buf);
+          // cudaLaunchKernel with a local argument array: nvcc's <<<>>> stub keeps its argument slots in storage the
+          // threads share, which ThreadSanitizer reports as a race in the test program (not in the library).
+          volatile unsigned* vbuf = buf;
+          int n = 1000000;
+          unsigned sd = seed;
+          void* spin_args[] = {&vbuf, &n, &sd};
+          cudaLaunchKernel(reinterpret_cast<const void*>(spin), dim3(1), dim3(1), spin_args, 0, st);
+          void* add_args[] = {&buf};
+          cudaLaunchKernel(reinterpret_cast<const void*>(add_one), dim3(1), dim3(1), add_args, 0, st);
           while (cudaStreamQuery(st) == cudaErrorNotReady) std::this_thread::yield();
           cudaMemcpyAsync(host, buf, 4, cudaMemcpyDeviceToHost, st);
           ok = ok && cudaStreamSynchronize(st) == cudaSuccess && *host == host_spin(1000000, seed) + 1u;
