@@ -7,6 +7,8 @@
 #   3. the card path is reached later (the stub's module load is called), and the program's output is the one it prints with the mode off;
 #   4. the division idiom (include/vgpu/host_gpu.hpp division_idiom_only, on the SASS nvcc really emits for a / b): with VGPU_HOST_GPU_DIV=1 a kernel that is
 #      a division reaches the card path; without it, or with a bare rcp.approx or an EX2 beside the division, it never does (not even the driver's start);
+#   6. device memory outside the allocation table (a block of the kernel heap in use) keeps every launch off the card, not even the driver starts (the
+#      card holds only the table, so a pointer into that memory would read what it never got);
 #   5. a driver that cannot start says "mode off" once, the program's output is unchanged and no later launch calls the driver again.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -31,7 +33,7 @@ cc_bin="$(command -v cc || command -v gcc)"
 nvcc_host_compiler_fix
 work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-host-gpu-stub.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
-"$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_lazy.cu" -o "$work/prog" || { echo "FAIL: does not compile"; exit 1; }
+"$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_lazy.cu" "$root/nvidia/tests/e2e/host_gpu_lazy_heap.cu" -o "$work/prog" || { echo "FAIL: does not compile"; exit 1; }
 "$cc_bin" -shared -fPIC -O1 -o "$work/libstubcuda.so" "$root/nvidia/tests/e2e/host_gpu_stub_driver.c" || { echo "FAIL: the stand-in driver does not compile"; exit 1; }
 if ! require_shim_libs "$shim" "$work/prog"; then exit 0; fi
 init_ms=2000
@@ -83,5 +85,10 @@ diff -q "$work/off_big.out" "$work/on_bad.out" > /dev/null || { echo "FAIL: a dr
 n="$(grep -c 'cuInit failed; mode off' "$work/on_bad.err")"
 (( n == 1 )) || { echo "FAIL: expected exactly one 'cuInit failed; mode off' line, got $n"; fails=1; }
 ! grep -q '^cuModuleLoadData$' "$work/on_bad.log" || { echo "FAIL: a launch reached the card after the driver failed to start"; fails=1; }
+# 6. the kernel heap in use: the same program as `big` after a kernel that leaks a heap block.
+env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" heap > "$work/off_heap.out" 2> "$work/off_heap.err" || { echo "FAIL: the heap run with the mode off failed"; tail -5 "$work/off_heap.err"; exit 1; }
+run on_heap heap VGPU_HOST_GPU=exact VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 || { echo "FAIL: the heap run with the mode on failed"; tail -5 "$work/on_heap.err"; fails=1; }
+diff -q "$work/off_heap.out" "$work/on_heap.out" > /dev/null || { echo "FAIL: the mode changes the output of the heap program"; fails=1; }
+[[ ! -s "$work/on_heap.log" ]] || { echo "FAIL: a launch went to the card while the kernel heap held a block: $(calls on_heap)"; fails=1; }
 (( fails == 0 )) && { echo "PASS: first launch $first ms against a driver start of $init_ms ms; driver calls in the big run: $(calls on_big)"; exit 0; }
 exit 1

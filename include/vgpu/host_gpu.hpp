@@ -27,6 +27,29 @@ inline Mode mode_from_text(const char* text) {
   return text && std::string(text) == "exact" ? Mode::Exact : Mode::Off;
 }
 
+// A mode value that is neither off nor exact (a typo, or `approx`, which is not built) must be said, never read as off in silence.
+inline bool mode_text_is_known(const char* text) {
+  if (!text || !*text) return true;
+  const std::string t(text);
+  return t == "off" || t == "exact" || t == "0";
+}
+
+// The switches of diagnostics that only the simulator can give: with any of them on the mode refuses to start (08 section 3), never quietly drops them.
+inline constexpr const char* kIncompatibleVars[] = {
+    "VGPU_COUNTERS",   "VGPU_COUNTERS_FILE", "VGPU_SASS_TRACE", "VGPU_KERNEL_DIGEST", "VGPU_KERNEL_DIGEST_DUMP", "VGPU_HOSTGPU_CAPTURE", "VGPU_TRACE",
+    "VGPU_MAX_STEPS",  "VGPU_FAIL_ALLOC",    "VGPU_FAIL_LAUNCH", "VGPU_FAIL_MEMCPY", "VGPU_RACE", "VGPU_STRICT", "VGPU_SCHEDULER", "VGPU_LOCKSTEP",
+};
+
+// Whether the value of one of kIncompatibleVars switches its diagnostic on. Unset, empty and 0 are off; the scheduler's default name is not a diagnostic
+// (a config file that says `scheduler: deterministic` writes it).
+inline bool diagnostic_switched_on(const std::string& name, const char* value) {
+  if (!value || !*value) return false;
+  const std::string v(value);
+  if (v == "0") return false;
+  if (name == "VGPU_SCHEDULER") return v != "deterministic";
+  return true;
+}
+
 // ---- eligibility ------------------------------------------------------------------------------------------------------------
 
 // The instructions whose result is defined bit for bit by the architecture and that the simulator computes as the card does:

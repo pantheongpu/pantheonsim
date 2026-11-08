@@ -606,6 +606,10 @@ class MemoryManager {
   void card_void_lookups(const std::vector<uint64_t>& bases);
   // Every live allocation's (base, size), in address order: what a host-GPU launch has to make resident.
   std::vector<std::pair<uint64_t, uint64_t>> live_ranges() const;
+  // Why some of this device's memory is not in the allocation table that live_ranges() lists (so a card holding a copy of that table would lack it):
+  // VMM mappings (cuMemMap), memory exported or imported for another process (IPC), blocks of the device heap (kernel malloc). nullptr when every
+  // device byte is in a live allocation. Host-mapped memory (pinned, managed, registered) is outside the device windows and is the caller's check.
+  const char* card_blocker() const;
 
  private:
   AccessFault* access_fault_ = nullptr;

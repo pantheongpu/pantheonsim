@@ -1897,6 +1897,16 @@ std::vector<std::pair<uint64_t, uint64_t>> MemoryManager::live_ranges() const {
   return out;
 }
 
+const char* MemoryManager::card_blocker() const {
+  {
+    SharedGuard table_guard(table_lock_.get());
+    if (!maps_.empty()) return "virtual memory mappings (cuMemMap) hold device memory the card copy would lack";
+    if (!shared_.empty()) return "memory shared with another process (IPC) is outside the card copy";
+  }
+  if (heap_used() != 0) return "the device heap (kernel malloc) holds device memory the card copy would lack";
+  return nullptr;
+}
+
 bool MemoryManager::find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const {
   SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);

@@ -130,10 +130,6 @@ bool logging() {
   return q && *q && *q != '0';
 }
 
-// Diagnostics that need the simulator: with any of them on, the mode refuses to start rather than quietly dropping them.
-const char* const kIncompatible[] = {"VGPU_COUNTERS", "VGPU_SASS_TRACE", "VGPU_KERNEL_DIGEST", "VGPU_HOSTGPU_CAPTURE", "VGPU_TRACE",
-                                     "VGPU_MAX_STEPS", "VGPU_FAULT", "VGPU_RACE", "VGPU_STRICT", "VGPU_SCHEDULER"};
-
 }  // namespace
 
 struct Runtime::Impl : CardGate {
@@ -439,6 +435,9 @@ struct Runtime::Impl : CardGate {
         std::memcpy(&v, &a[i], 8);
         if (v && mem.is_host_mapped(v)) { *why = "argument points into mapped host memory"; return false; }
       }
+    // Device memory that is not in the allocation table (VMM mappings, IPC, the kernel heap) is not on the card: a pointer to it, from an argument or from
+    // memory, would read what the card never got. Not cached: a mapping can appear between two launches of one kernel.
+    if (const char* blocker = mem.card_blocker()) { *why = blocker; return false; }
     const sass::Module& m = *fn.sass;
     const auto key = std::make_pair(&m, fn.name);
     if (const auto it = eligible.find(key); it != eligible.end()) {
@@ -535,10 +534,13 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
   static std::once_flag once;
   static Runtime* rt = nullptr;
   std::call_once(once, [&] {
-    if (mode_from_text(std::getenv("VGPU_HOST_GPU")) != Mode::Exact) return;
-    for (const char* v : kIncompatible)
-      if (const char* e = std::getenv(v); e && *e && *e != '0') {
-        if (!quiet()) std::fprintf(stderr, "host_gpu: %s is set and needs the simulator's launches; mode off\n", v);
+    const char* mode_text = std::getenv("VGPU_HOST_GPU");
+    if (!mode_text_is_known(mode_text)) std::fprintf(stderr, "host_gpu: VGPU_HOST_GPU=%s is not a mode (off or exact); mode off\n", mode_text);
+    if (mode_from_text(mode_text) != Mode::Exact) return;
+    // Said even under VGPU_QUIET: someone who asked for the mode and got none must be told why.
+    for (const char* v : kIncompatibleVars)
+      if (diagnostic_switched_on(v, std::getenv(v))) {
+        std::fprintf(stderr, "host_gpu: %s is set and needs the simulator's launches; mode off\n", v);
         return;
       }
     if (profile.vendor != "nvidia") {

@@ -144,6 +144,11 @@ std::vector<Key> build_keys() {
                       "Silence every simulator message on stderr, errors included."));
   t.push_back(boolean("trace", "VGPU_TRACE", "1", "", "false", "false",
                       "Log every runtime and driver entry point."));
+  // Host GPU (experimental, opt-in; docs/perf-design/08-host-gpu-opt-in-scope.md)
+  t.push_back(enumerated("host_gpu", "VGPU_HOST_GPU", {{"off", "off"}, {"exact", "exact"}}, "off", "off",
+                         "Run launches of kernels whose results are defined bit for bit on this machine's real NVIDIA GPU, which must be the simulated model (exact); everything else stays simulated. Refused, with a message, when counters, trace, race, strict, faults or another check that needs the simulator is on."));
+  t.push_back(boolean("host_gpu_log", "VGPU_HOST_GPU_LOG", "1", "", "false", "false",
+                      "Print each host_gpu decision (offloaded, kept in the simulator and why) with its numbers."));
   return t;
 }
 
