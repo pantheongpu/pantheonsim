@@ -359,6 +359,100 @@ VGPU_EXPORT cudaError_t cudaMipmappedArrayGetSparseProperties(cudaArraySparsePro
   return traced_call("cudaMipmappedArrayGetSparseProperties", cudaMipmappedArrayGetSparseProperties_traced, sparseProperties, mipmap);
 }
 
+// ---- OpenGL interop (cuda_gl_interop.h) ----------------------------------------------------------------------------------
+// The real libcudart exports nine cudaGL* functions. A program that merely names one (COLMAP's SiftGPU references
+// cudaGLRegisterBufferObject) is refused at load time under -z now when the name is missing (pantheonsim #528), so each
+// resolves. A simulated GPU has no OpenGL context, so none can work; the answers are the ones the runtime of an RTX 3060
+// gives with no GL context current (CUDA 13.0): registering, unregistering and cudaGLGetDevices say
+// cudaErrorInvalidGraphicsContext (the count is left alone); mapping, unmapping and the map flags name a buffer that was
+// never registered, cudaErrorInvalidValue, and a map leaves *devPtr NULL; cudaGLSetGLDevice says cudaErrorInvalidDevice for
+// a device that does not exist and otherwise cudaErrorDevicesUnavailable, as the card did on a fresh process (with the
+// device already in use the card says cudaErrorSetOnActiveProcess, which is not modelled). The prototypes are written
+// out here: cuda_gl_interop.h needs the GL headers.
+namespace {
+cudaError_t gl_interop_refused(const char* api, cudaError_t code) {
+  static std::mutex mu;
+  static std::set<std::string> said;
+  std::lock_guard<std::mutex> lock(mu);
+  if (!quiet() && said.insert(api).second)
+    std::fprintf(stderr, "[vgpu] %s is not implemented by VirtualGPU: there is no OpenGL context on a simulated GPU; returning %d\n",
+                 api, static_cast<int>(code));
+  return code;
+}
+}  // namespace
+
+static cudaError_t cudaGLGetDevices_traced(unsigned int*, int*, unsigned int, int) {
+  return guard("cudaGLGetDevices", [&](State&) -> cudaError_t { return gl_interop_refused("cudaGLGetDevices", cudaErrorInvalidGraphicsContext); });
+}
+VGPU_EXPORT cudaError_t cudaGLGetDevices(unsigned int* count, int* devices, unsigned int n, int list) {
+  return traced_call("cudaGLGetDevices", cudaGLGetDevices_traced, count, devices, n, list);
+}
+
+static cudaError_t cudaGLSetGLDevice_traced(int device) {
+  return guard("cudaGLSetGLDevice", [&](State& s) -> cudaError_t {
+    if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
+    return gl_interop_refused("cudaGLSetGLDevice", cudaErrorDevicesUnavailable);
+  });
+}
+VGPU_EXPORT cudaError_t cudaGLSetGLDevice(int device) {
+  return traced_call("cudaGLSetGLDevice", cudaGLSetGLDevice_traced, device);
+}
+
+static cudaError_t cudaGLRegisterBufferObject_traced(unsigned int) {
+  return guard("cudaGLRegisterBufferObject", [&](State&) -> cudaError_t { return gl_interop_refused("cudaGLRegisterBufferObject", cudaErrorInvalidGraphicsContext); });
+}
+VGPU_EXPORT cudaError_t cudaGLRegisterBufferObject(unsigned int buf) {
+  return traced_call("cudaGLRegisterBufferObject", cudaGLRegisterBufferObject_traced, buf);
+}
+
+static cudaError_t cudaGLUnregisterBufferObject_traced(unsigned int) {
+  return guard("cudaGLUnregisterBufferObject", [&](State&) -> cudaError_t { return gl_interop_refused("cudaGLUnregisterBufferObject", cudaErrorInvalidGraphicsContext); });
+}
+VGPU_EXPORT cudaError_t cudaGLUnregisterBufferObject(unsigned int buf) {
+  return traced_call("cudaGLUnregisterBufferObject", cudaGLUnregisterBufferObject_traced, buf);
+}
+
+static cudaError_t cudaGLMapBufferObject_traced(void** devPtr, unsigned int) {
+  return guard("cudaGLMapBufferObject", [&](State&) -> cudaError_t {
+    if (devPtr) *devPtr = nullptr;
+    return gl_interop_refused("cudaGLMapBufferObject", cudaErrorInvalidValue);
+  });
+}
+VGPU_EXPORT cudaError_t cudaGLMapBufferObject(void** devPtr, unsigned int buf) {
+  return traced_call("cudaGLMapBufferObject", cudaGLMapBufferObject_traced, devPtr, buf);
+}
+
+static cudaError_t cudaGLMapBufferObjectAsync_traced(void** devPtr, unsigned int, cudaStream_t) {
+  return guard("cudaGLMapBufferObjectAsync", [&](State&) -> cudaError_t {
+    if (devPtr) *devPtr = nullptr;
+    return gl_interop_refused("cudaGLMapBufferObjectAsync", cudaErrorInvalidValue);
+  });
+}
+VGPU_EXPORT cudaError_t cudaGLMapBufferObjectAsync(void** devPtr, unsigned int buf, cudaStream_t stream) {
+  return traced_call("cudaGLMapBufferObjectAsync", cudaGLMapBufferObjectAsync_traced, devPtr, buf, stream);
+}
+
+static cudaError_t cudaGLUnmapBufferObject_traced(unsigned int) {
+  return guard("cudaGLUnmapBufferObject", [&](State&) -> cudaError_t { return gl_interop_refused("cudaGLUnmapBufferObject", cudaErrorInvalidValue); });
+}
+VGPU_EXPORT cudaError_t cudaGLUnmapBufferObject(unsigned int buf) {
+  return traced_call("cudaGLUnmapBufferObject", cudaGLUnmapBufferObject_traced, buf);
+}
+
+static cudaError_t cudaGLUnmapBufferObjectAsync_traced(unsigned int, cudaStream_t) {
+  return guard("cudaGLUnmapBufferObjectAsync", [&](State&) -> cudaError_t { return gl_interop_refused("cudaGLUnmapBufferObjectAsync", cudaErrorInvalidValue); });
+}
+VGPU_EXPORT cudaError_t cudaGLUnmapBufferObjectAsync(unsigned int buf, cudaStream_t stream) {
+  return traced_call("cudaGLUnmapBufferObjectAsync", cudaGLUnmapBufferObjectAsync_traced, buf, stream);
+}
+
+static cudaError_t cudaGLSetBufferObjectMapFlags_traced(unsigned int, unsigned int) {
+  return guard("cudaGLSetBufferObjectMapFlags", [&](State&) -> cudaError_t { return gl_interop_refused("cudaGLSetBufferObjectMapFlags", cudaErrorInvalidValue); });
+}
+VGPU_EXPORT cudaError_t cudaGLSetBufferObjectMapFlags(unsigned int buf, unsigned int flags) {
+  return traced_call("cudaGLSetBufferObjectMapFlags", cudaGLSetBufferObjectMapFlags_traced, buf, flags);
+}
+
 // ---- graphics interop -----------------------------------------------------------------------------------------------------
 // OpenGL, Direct3D, EGL and VDPAU resources cannot be registered (the cudaGraphics*Register* calls are in
 // cuda_gl_interop.h and the like, which this does not export), so no cudaGraphicsResource_t is ever valid: every

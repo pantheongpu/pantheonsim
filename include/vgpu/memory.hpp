@@ -218,6 +218,11 @@ class MemoryManager {
   // is only where to look first: the answer is the same with any value, with none, or with another thread's (it is read and written relaxed).
   bool load_run(uint64_t addr, void* dst, uint64_t len, uint32_t unit, uint8_t* hint = nullptr) const;
   bool store_run(uint64_t addr, const void* src, uint64_t len, uint32_t unit, uint8_t* hint = nullptr);
+  // load_run / store_run for a run wholly inside ONE host-mapped buffer (zero-copy, managed): each element the relaxed atomic access of its
+  // width that load_scalar / store_scalar make there, in order, one lookup for the lot. False, having done nothing, for anything else (no
+  // mapping, a run that leaves it or is misaligned, a fault armed, a store to a read-only mapping): the caller then goes lane by lane.
+  bool load_host_run(uint64_t addr, void* dst, uint64_t len, uint32_t unit) const;
+  bool store_host_run(uint64_t addr, const void* src, uint64_t len, uint32_t unit);
 
   // The accesses of one warp-wide load or store, made together, for the ordinary
   // case: `count` accesses of `size` bytes, in order. They return true having
@@ -936,6 +941,7 @@ class MemoryManager {
   };
   bool lookup_host(uint64_t addr, uint64_t len, HostHit* out) const;
   bool host_batch_hit(const uint64_t* addrs, size_t count, uint32_t size, bool store, HostHit* h) const;
+  bool host_run_hit(uint64_t addr, uint64_t len, uint32_t unit, bool store, HostHit* h) const;
   static uint64_t fresh_generation();
  public:
   // The cache is on unless VGPU_HOSTMAP_CACHE=0. This switches it for the whole process (a benchmark compares the

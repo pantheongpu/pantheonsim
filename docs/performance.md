@@ -7381,6 +7381,55 @@ Timing tests (looks 24 ms, 48 ms, 500 ms in with margins of 12 to 60 ms): a mach
 ### Not verified
 No AMD run. No kernel with a real cross-block wait at more than one thread on PTX (the programs here are single-thread); the one-core test_lockstep_yield stays green. Zen 5 and Intel not measured. The layout effect above is understood only by the control, not by a disassembly comparison.
 
+## Round sp26 (zero-copy): host-pinned memory as runs and host batches (branch `sp26-zerocopy`, base `origin/main` dfbf2dc1)
+
+The worst non-tensor rows of Phase 0 were the HeCBench `zerocopy` program on both engines (`amd-hecbench/zerocopy` 183 ns an instruction, `hecbench/zerocopy-cuda` 98): a vector add over three `cudaHostAlloc(mapped)` / `hipHostRegister` buffers. Profile first (server3, Zen 4, `perf record -e cycles:u`, one thread, whole program; the program's own `random()` initialisation is 15 to 37 % of every profile and is left out below):
+
+* AMD: `tier_global` 15.8 %, `lookup_host` 11.8 %, `load_scalar` 10.7 %, `scalar_location` 10.1 %, `load_words` 8.6 %, `store_words` 4.2 %, `store_scalar` 4.2 %, `__tls_get_addr` 3.5 %. `memory_run` asks `load_run`, which declines every address that may be in a host mapping, and `wave_scalars` asks `load_batch` / `store_batch`, which decline it too, so each of the 64 lanes went through `load_words` -> `load_scalar` -> `scalar_location` -> `lookup_host` (a thread-local cache: the `__tls_get_addr`).
+* SASS: `exec_mem` 25 % (the 32-lane loops), `find_ordinary_miss` 4.7 % + `lock_shared` 1.6 % + `batch_addresses_ok` 2.9 % + `batch_ok` / `load_batch` / `store_batch` / `run_allocation` ~3 %, `host_batch_hit` 3.3 %. The tier's `h_global` asked `load_run` (declines), then `load_batch` (a lookup in the allocation table under the shared lock for an address that is in no allocation: a miss, every warp), then `exec_mem`, which makes the addresses a second time and ends in the host batch.
+
+Changes (all of them the same accesses as before, in the same order, each element the relaxed atomic access of its width that `load_scalar` / `store_scalar` make on host memory):
+
+* `MemoryManager::load_host_run` / `store_host_run`: a run wholly inside ONE host mapping, one `lookup_host` for the run. Declines (and the lane path meets the error) for a fault armed, a misaligned run or host bytes, a run that leaves the mapping, a store to a read-only mapping.
+* AMD `memory_run` (words, pairs, sixteen-byte quads as two 8-byte elements, as `load_quad` does on host memory) tries the host run after `load_run` / `store_run`; `wave_scalars` asks `host_load_batch` / `host_store_batch` first when the first address may be in a host mapping.
+* SASS: `tier_ops.inc` `h_global` and `exec_mem` try the host run after the ordinary run and the host batch before the ordinary batch (a store resets `idle_yields` as the host batch always did; a load of one address stays on the single-read path of `exec_mem`).
+
+The reorder is exact because the ordinary calls decline every access the host calls take: `batch_addresses_ok`, `load_run`, `store_strided`, `load_broadcast` refuse an allocation whose span is not host-map free, and an address in a host mapping is either in no allocation or in one the mapping overlaps (a managed buffer in a device window, where `load_scalar` also takes the host bytes). A unit test pins that.
+
+Results (server3, Zen 4, cpu 9, one thread, 15 interleaved runs of A = `origin/main`, A2 = a copy of A's libraries made at the same time, W = this branch; medians; "kernel" is the sum of the program's own `Average kernel execution time` lines, that is the launches and the synchronisation, without the program's `rand()` set-up and its CPU check):
+
+| row | wall A / A2 / W | W/A wall | user W/A | kernel ms A / A2 / W | W/A kernel | A2/A |
+|---|---:|---:|---:|---:|---:|---:|
+| hecbench/zerocopy-cuda (SASS) | 27.78 / 27.82 / 15.55 s | 0.560 | 0.515 | 10,024 / 10,020 / 3,899 | 0.389 | 1.000 |
+| amd-hecbench/zerocopy (gfx942) | 44.18 / 44.40 / 14.77 s | 0.334 | 0.293 | 17,978 / 17,999 / 3,194 | 0.178 | 1.001 |
+
+Counters and results: `VGPU_KERNEL_DIGEST` and `VGPU_COUNTERS_FILE` (without the pid) of the SASS program, and `VGPU_DISPATCH_STATS` of the AMD one, are byte-identical to A at 1 and 4 threads; the SASS program prints the same output. The profile after: the SASS tier keeps `step_warp` 13.7 %, the host run is `host_run_hit` + `run_out` + `lookup_host` ~4 %, and the allocation-table functions are gone; AMD is left with `h_l64_avx2`, `run_groups`, `memory_run` (4.4 %). Neither row was a flat row: the A/A copies agree within 0.5 %, so no layout lottery is claimed or needed.
+
+Tests (CI-wired): `test_hostmap_cache` (host runs against `load_scalar` / `store_scalar` at every unit and offset, the declines, a run does not outlive its mapping, and "the ordinary batch declines every warp the host batch takes", also over a mapping laid on a live device allocation), and `test_amd_gcn_memruns` run again with `src` and `dst` host-mapped (the whole pattern x mask matrix of runs, gathers and errors, runs on against off, and once with `dst` read-only). The SASS wiring is covered by the host section of `e2e_sass_fastpath` (nvcc; not run here: no nvcc on the servers). The reorder itself is a performance change with no observable result, so no test can fail without it; what pins it is the precondition test above.
+
+Mutants (each built and run on server3, all killed): `host_run_hit` without the read-only check (`test_hostmap_cache` and `test_amd_gcn_memruns` fail), without the alignment test (hostmap_cache), looking up one byte instead of the run (both), ignoring an armed fault (hostmap_cache); `load_host_run` / `store_host_run` at the wrong source offset (both); `batch_addresses_ok` accepting host-mapped addresses (the precondition test). Dropping the wiring in the AMD/SASS call sites is a pure speed change and is seen only in the profile.
+
+## Round sp30 (atomic-heavy real programs): MATCH.ANY classes by hash
+
+Base: origin/main 2db5dd65. Server2 (Zen 5), nice 19, one builder, `VGPU_GPU=nvidia/rtx3060` (SASS), one thread, Release/LTO.
+
+### Why atomicCost is big and slow
+atomicCost (HeCBench) allocates `length = 922,521,600` elements: two device buffers and two host `malloc` buffers of `length / N` values each, so about 4 x 7.4 GB for the FP64 case. Phase 0 saw 14 GB RSS because the memory manager spills device chunks to its file once the host runs short. This is the program's own memory: with the constant in the binary divided by 16 (the three `mov $0x36fc9000,%edi` immediates, 57,657,600 threads, same kernels), RSS is 1,810 MB = 4 x 461 MB, i.e. exactly the four buffers, and the simulator adds nothing per address (zero-filled chunks of `cudaMemset` are not materialised; `atomicAdd` touches only the pages the kernel writes). The AMD build is stopped by the host-memory guard on a box with 1.8 GB free, which is the guard working. Nothing to cut in memory.
+Speed: the reduced run is 276 M warp instructions in 4.1 s at one thread (about 15 ns per instruction), the profile is flat (`step_warp` 20 %, `exec_mem` 7 %, `init_block` 8 % of which most is the per-warp register-file clear, the atomic lane loops `global_lanes` about 4 %). Full size is simply 16 times that. No lever of 5 % was found there. atomicReduction (16 M elements, repeat 3) is `load_batch` 24 % and `h_global` 11 %: a streaming gather, not an atomic cost.
+
+### The hot spot that was there: atomicAggregate
+atomicAggregate (warp-aggregated increments built on `__match_any_sync`) spent 28 % of its samples in the tier handler `h_match`. MATCH.ANY found each class of equal values by scanning all lanes once per class, so a warp of 32 different values (the 32-address case of the program) took 32 x 32 steps. `sasslanes::match_any` (include/vgpu/exec/sass_lanes.hpp) now sorts the lanes into classes with one pass over a 64-slot open-addressing table keyed on the whole 64-bit value (the hash only chooses the first slot, equality is the full value) and gives each lane its class in a second pass: 2 x popcount(ex) steps whatever the number of classes. `match_any_reference` keeps the old scan for the test. MATCH.ALL is unchanged.
+
+### Results
+`atomicAggregate 1` (6 launches, 65,536 blocks of 256), user+sys, 15 interleaved rounds of A1, A2 (two copies of the same A build, made at the same time) and W, the three on rotating CPUs: A1 3.780 s, A2 3.760 s (A1/A2 = 1.005), W 3.080 s (min 3.04, max 3.15; A's range 3.74 to 3.81, no overlap): **W/A = 0.817 (-18 %)**. The profile after: `h_match` 533 -> 208 samples (28 % -> 13.5 %). atomicCost (reduced) 4.30 / 4.02 / 4.09 s in one round: unchanged within noise, as expected. Peak RSS is unchanged in both programs (atomicAggregate 11 MB, atomicCost reduced 1.8 GB).
+Same bits: `VGPU_COUNTERS_FILE` and `VGPU_KERNEL_DIGEST` (pid removed) byte-identical to A at 1 and at 4 threads for atomicAggregate and atomicCost (reduced), and the programs' stdout (timings removed) equal.
+
+### Test and mutants
+`tests/unit/test_sass_lanes.cpp` `match_any_gives_each_lane_the_lanes_that_hold_its_value`: 60,000 random warps (full and partial masks) against `match_any_reference` and against a lane-by-lane definition, with values that differ only in the high half, only in the low half, values that fall in one table slot (chains of 32 different values), one class, 0 / all-ones; the lanes outside the mask must keep their old contents. Killed: key compared on the low 32 bits only, no probing, class overwritten instead of OR-ed. Survived, equivalent: the hash forced to slot 0 (all values chain from one slot; correct, only slower). The handler's wiring (that `h_match` writes the destination) is covered by the existing `e2e_sass_tier` / `sass_tier_steps` MATCH.ANY checks, which need nvcc and were not run on server2.
+
+### Not verified
+No PTX engine change (its MATCH is separate). No AMD run. The sass_tier e2e tests were not run (no nvcc on server2): CI is the check. One program (atomicAggregate) gains; the others of the list (aidw, aligned-types, babelstream, base64e, binomial) were not profiled for a lever.
+
 ## Round sp28 (lockstep on the PTX and AMD engines): small grids of load polls use the host threads there too; the AMD pool is left as it is (branch `sp28-lockstep`, base `origin/main` fe3c0a02)
 
 The question: #501 (round sp25) stopped the SASS engine from holding a lockstep grid of fewer than 16 blocks to one host thread when its kernel only polls with loads (CUB's onesweep look-back: radixsort2-cuda 2x at 8 threads), and let a small launch go wide on trial (`PoolTrial`, JACOBI1D 2x). The PTX engine (`VGPU_SASS=0`, `ptx_kernel_polls`) and the AMD engine (`amd_kernel_polls`, its own pool `amd/src/gcn_pool.hpp`) have their own poll searches. Do they have the same two blind spots? Measured on server3 (Ryzen 7 PRO 8840U, Zen 4, 8 cores / 16 threads, shared with another session, load 1 to 7 during the timed runs), 15 interleaved runs, medians; A = `origin/main` fe3c0a02, A2 = a copy of A's libraries made at the same time (the A/A control), W = this branch's lockstep commit.

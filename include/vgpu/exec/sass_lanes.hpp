@@ -228,4 +228,40 @@ inline bool row_uniform(const uint32_t* r, uint32_t& v) {
 #endif
 }
 
+// MATCH.ANY: out[l], for each lane l of `ex`, is the set of lanes of `ex` whose value equals v[l] (the lanes outside `ex` are not read or
+// written). The lanes are sorted into classes by one pass over a 64-slot open-addressing table keyed on the full 64-bit value (a hash only
+// picks the first slot; equality is always the whole value, so a collision cannot merge two classes), and a second pass gives each lane its
+// class: the work is 2 x popcount(ex) whatever the number of classes. The class-by-class scan this replaces cost popcount(ex) per class, so a
+// warp of 32 different values (warp-aggregated atomics on 32 addresses) took 1,024 steps. match_any_reference is that scan, for the test.
+inline void match_any(const uint64_t* v, Mask ex, uint32_t* out) {
+  uint64_t key[64];
+  uint32_t cls[64] = {};   // a slot is free while its class is empty: every insertion sets a lane's bit
+  uint8_t slot[32];
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    const uint64_t x = v[l];
+    unsigned s = static_cast<unsigned>((x * 0x9E3779B97F4A7C15ull) >> 58);
+    while (cls[s] != 0 && key[s] != x) s = (s + 1) & 63;
+    key[s] = x;
+    cls[s] |= Mask{1} << l;
+    slot[l] = static_cast<uint8_t>(s);
+  }
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    out[l] = cls[slot[l]];
+  }
+}
+inline void match_any_reference(const uint64_t* v, Mask ex, uint32_t* out) {
+  for (Mask todo = ex; todo;) {
+    const uint64_t x = v[std::countr_zero(todo)];
+    Mask cls = 0;
+    for (Mask m = ex; m; m &= m - 1) {
+      const unsigned k = static_cast<unsigned>(std::countr_zero(m));
+      cls |= static_cast<Mask>(v[k] == x) << k;
+    }
+    for (Mask m = cls; m; m &= m - 1) out[std::countr_zero(m)] = cls;
+    todo &= ~cls;
+  }
+}
+
 }  // namespace vgpu::exec::sasslanes

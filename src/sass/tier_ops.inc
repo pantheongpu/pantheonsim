@@ -981,6 +981,13 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
   count_access(blk.st, 0, Store, addrs, ex, 16);
 }
 
+// Whether all `n` (>= 1) addresses are the first's.
+static inline bool tier_all_equal(const uint64_t* a, unsigned n) {
+  uint64_t differ = 0;
+  for (unsigned i = 1; i < n; ++i) differ |= a[i] ^ a[0];
+  return differ == 0;
+}
+
 // Global loads and stores of 1, 2, 4 or 8 bytes, as exec_mem does them: a coalesced run in one call, or the lanes'
 // accesses together when the memory manager can make them as one-by-one would; anything else (a constant-window
 // address, a misaligned or faulting access, an armed fault) is exec_mem's own, which has not been started.
@@ -1075,16 +1082,17 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
         // Words of consecutive lanes are consecutive words of the register's row: moved straight between it and memory (a load that
         // declines has written nothing; the lanes' addresses were read before).
         uint32_t* row = c.R + op.dst * 32u + first;
-        done = Store ? mem.store_run(g0, row, uint64_t{count} * 4, 4, &op.way) : mem.load_run(g0, row, uint64_t{count} * 4, 4, &op.way);
+        done = Store ? mem.store_run(g0, row, uint64_t{count} * 4, 4, &op.way) || mem.store_host_run(g0, row, uint64_t{count} * 4, 4)
+                     : mem.load_run(g0, row, uint64_t{count} * 4, 4, &op.way) || mem.load_host_run(g0, row, uint64_t{count} * 4, 4);
       } else if (Store) {
         for (unsigned i = 0; i < count; ++i) {
           uint32_t v[4] = {};
           data(first + i, v);
           tier_put(buf + i * bytes, v, bytes);
         }
-        done = mem.store_run(g0, buf, uint64_t{count} * bytes, bytes, &op.way);
+        done = mem.store_run(g0, buf, uint64_t{count} * bytes, bytes, &op.way) || mem.store_host_run(g0, buf, uint64_t{count} * bytes, bytes);
       } else {
-        done = mem.load_run(g0, buf, uint64_t{count} * bytes, bytes, &op.way);
+        done = mem.load_run(g0, buf, uint64_t{count} * bytes, bytes, &op.way) || mem.load_host_run(g0, buf, uint64_t{count} * bytes, bytes);
         if (done && dreg) {
           uint32_t* d = c.R + op.dst * 32u;
           for (unsigned i = 0; i < count; ++i) {
@@ -1141,11 +1149,16 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
       bool done;
       if (Store) {
         exec::sassmem::full_warp_store_values(dreg, bytes, fv);   // (the registers' rows widened four lanes to a vector)
-        done = (rows && ri.progression && mem.store_strided(ri.a0, static_cast<int64_t>(ri.stride), 32, bytes, fv, nullptr, &op.way)) ||
+        // (The lanes in one host-mapped buffer first where the first address may be in one: the ordinary calls decline every such access,
+        // each after a miss in the allocation table, and exec_mem would make the same host batch after making the addresses again.)
+        done = (mem.host_map_possible(addrs[0]) && mem.host_store_batch(addrs, 32, bytes, fv)) ||
+               (rows && ri.progression && mem.store_strided(ri.a0, static_cast<int64_t>(ri.stride), 32, bytes, fv, nullptr, &op.way)) ||
                mem.store_batch(addrs, 32, bytes, fv, nullptr, &op.way);
       } else {
         // (every lane the same address: one load)
-        done = (rows && ri.progression && ri.stride == 0 && mem.load_broadcast(ri.a0, 32, bytes, fv, &op.way)) ||
+        // (A load of one address is read once by exec_mem: it keeps that.)
+        done = (mem.host_map_possible(addrs[0]) && !tier_all_equal(addrs, 32) && mem.host_load_batch(addrs, 32, bytes, fv)) ||
+               (rows && ri.progression && ri.stride == 0 && mem.load_broadcast(ri.a0, 32, bytes, fv, &op.way)) ||
                mem.load_batch(addrs, 32, bytes, fv, &op.way);
         if (done && dreg) {
           uint32_t* d = c.R + op.dst * 32u;
@@ -1189,9 +1202,10 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
         data(lane_of[i], v);
         fv[i] = bytes == 8 ? (static_cast<uint64_t>(v[1]) << 32 | v[0]) : bytes == 4 ? v[0] : (v[0] & ((1u << (8 * bytes)) - 1));
       }
-      done = mem.store_batch(fa, cnt, bytes, fv, nullptr, &op.way);
+      done = (mem.host_map_possible(fa[0]) && mem.host_store_batch(fa, cnt, bytes, fv)) || mem.store_batch(fa, cnt, bytes, fv, nullptr, &op.way);
     } else {
-      done = mem.load_batch(fa, cnt, bytes, fv, &op.way);
+      done = (mem.host_map_possible(fa[0]) && !tier_all_equal(fa, cnt) && mem.host_load_batch(fa, cnt, bytes, fv)) ||
+             mem.load_batch(fa, cnt, bytes, fv, &op.way);
       if (done && dreg) {
         uint32_t* d = c.R + op.dst * 32u;
         for (unsigned i = 0; i < cnt; ++i) {
@@ -1714,17 +1728,7 @@ TIER_HANDLER(h_match) {
   }
   uint32_t* d = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
   if (op.aux & 1) {
-    for (Mask todo = ex; todo;) {
-      const uint64_t x = v[std::countr_zero(todo)];
-      Mask cls = 0;
-      for (Mask m = ex; m; m &= m - 1) {
-        const unsigned k = static_cast<unsigned>(std::countr_zero(m));
-        cls |= static_cast<Mask>(v[k] == x) << k;
-      }
-      if (d)
-        for (Mask m = cls; m; m &= m - 1) d[std::countr_zero(m)] = cls;
-      todo &= ~cls;
-    }
+    if (d) exec::sasslanes::match_any(v, ex, d);   // (v was read first, so a destination that is a source is no problem)
   } else {
     const uint64_t first = v[std::countr_zero(ex)];
     bool same = true;

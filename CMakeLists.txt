@@ -2769,6 +2769,15 @@ if(TARGET vgpucudart)
   set_tests_properties(test_runtime_exports PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
+# The cudaGL* interop functions of libcudart: exported, and refused with no GL context (pantheonsim #528).
+if(TARGET vgpucudart)
+  add_executable(test_runtime_gl_exports nvidia/tests/unit/test_runtime_gl_exports.cpp)
+  target_link_libraries(test_runtime_gl_exports PRIVATE vgpucudart ${CMAKE_DL_LIBS})
+  target_include_directories(test_runtime_gl_exports PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  target_compile_definitions(test_runtime_gl_exports PRIVATE VGPU_CUDA_INCLUDE="${CUDA_ABI_INCLUDE}")
+  add_test(NAME test_runtime_gl_exports COMMAND test_runtime_gl_exports)
+  set_tests_properties(test_runtime_gl_exports PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1")
+endif()
 # The structures the driver shim declares for itself are cuda.h's (compile-time checks only).
 if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
   add_executable(test_driver_abi_sweep nvidia/tests/unit/test_driver_abi_sweep.cpp)

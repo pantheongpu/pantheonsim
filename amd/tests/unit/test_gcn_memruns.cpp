@@ -8,8 +8,14 @@
 // allocation edges, random) and masks of lanes, runs the dispatch with the new path on and then off against twin
 // memories, and compares what was left in memory, how much of it was made real, the error (its text) or the
 // counts. The threaded checks are in test_gcn_atomics.cpp.
+//
+// The same patterns again with src and dst host-mapped (zero-copy: cudaHostAlloc / hipHostMalloc memory, MemoryManager::map_host), where
+// the runs and gathers go to the host buffer's bytes through MemoryManager::load_host_run / store_host_run / host_load_batch /
+// host_store_batch, against lane by lane (and once with dst read-only, where every store throws).
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -44,8 +50,19 @@ struct Rng {
 constexpr uint32_t kLanes = 64;
 constexpr uint64_t kRegion = 3 * kChunkSize + 4096;   // each of src and dst: chunks, the last short
 
+// 0: src and dst are device allocations; 1: they are host-mapped buffers; 2: as 1 with dst read-only.
+int g_host = 0;
+
+struct HostBlock {   // [guard | src | guard | dst | guard]: nothing around a buffer is mapped, so an access that leaves it is the same error twice
+  uint8_t* p = nullptr;
+  HostBlock() : p(static_cast<uint8_t*>(std::aligned_alloc(4096, 4 * ((kRegion + 4095) / 4096 * 4096)))) {}
+  ~HostBlock() { std::free(p); }
+  HostBlock(const HostBlock&) = delete;
+};
+
 struct Image {
   MemoryManager mem{1ull << 30};
+  HostBlock block;
   uint64_t src = 0, dst = 0, soff = 0, doff = 0, on = 0, args = 0;
 };
 
@@ -54,14 +71,32 @@ struct Image {
 void fill(Image& m, uint64_t seed, const amd::Kernel& k, bool wide_offsets, const uint64_t* so, const uint64_t* dof,
           const uint32_t* on) {
   Rng rng{seed * 2654435761ull + 1};
-  m.src = m.mem.alloc(kRegion);
-  m.dst = m.mem.alloc(kRegion);
-  // A neighbour right after dst, so an access running off its end is in another allocation or in none.
-  m.mem.alloc(8192);
   std::vector<uint8_t> junk(kRegion);
   for (auto& b : junk) b = static_cast<uint8_t>(rng.next());
-  m.mem.write(m.src, junk.data(), junk.size());
-  for (uint64_t off = 0; off + kChunkSize <= kRegion; off += kChunkSize) {
+  if (g_host) {
+    const uint64_t stride = (kRegion + 4095) / 4096 * 4096;
+    std::memset(m.block.p, 0, 4 * stride);
+    uint8_t* const s = m.block.p + stride;
+    uint8_t* const d = m.block.p + 3 * stride;
+    std::memcpy(s, junk.data(), kRegion);
+    for (uint64_t off = 0; off + 4096 <= kRegion; off += 4096) {
+      switch (rng.below(3)) {
+        case 0: std::memset(d + off, rng.below(2) ? 0xFF : 0x00, 4096); break;
+        case 1: std::memcpy(d + off, junk.data() + rng.below(1000), 512); break;
+        default: break;
+      }
+    }
+    m.src = reinterpret_cast<uint64_t>(s), m.dst = reinterpret_cast<uint64_t>(d);
+    m.mem.map_host(m.src, s, kRegion);
+    m.mem.map_host(m.dst, d, kRegion, /*read_only=*/g_host == 2);
+  } else {
+    m.src = m.mem.alloc(kRegion);
+    m.dst = m.mem.alloc(kRegion);
+    // A neighbour right after dst, so an access running off its end is in another allocation or in none.
+    m.mem.alloc(8192);
+    m.mem.write(m.src, junk.data(), junk.size());
+  }
+  for (uint64_t off = 0; !g_host && off + kChunkSize <= kRegion; off += kChunkSize) {
     switch (rng.below(3)) {
       case 0: {
         const uint8_t pat[1] = {static_cast<uint8_t>(rng.below(2) ? 0xFF : 0x00)};
@@ -125,6 +160,12 @@ Outcome run(const amd::CodeObject& o, const char* name, bool wide_offsets, uint6
     out.vmem_wr = st.counts.vmem_wr, out.flat = st.counts.flat;
   } catch (const std::exception& e) {
     out.error = e.what();
+    // (The buffers of two runs are at different host addresses: the text without them.)
+    for (size_t at; g_host && (at = out.error.find("0x")) != std::string::npos;) {
+      size_t end = at + 2;
+      while (end < out.error.size() && std::isxdigit(static_cast<unsigned char>(out.error[end]))) ++end;
+      out.error.replace(at, end - at, "ADDR");
+    }
   }
   amd::set_fast_paths(true, true);
   out.src.resize(kRegion), out.dst.resize(kRegion);
@@ -190,7 +231,9 @@ void mask(Rng& rng, uint32_t kind, uint32_t* on) {
 
 }  // namespace
 
-VTEST(runs_of_lanes_move_the_bits_lane_by_lane_would) {
+namespace {
+void check_all_patterns(int host) {
+  g_host = host;
   const amd::CodeObject o = object();
   uint64_t checked = 0, failed_runs = 0;
   for (const Case& c : kCases) {
@@ -215,10 +258,17 @@ VTEST(runs_of_lanes_move_the_bits_lane_by_lane_would) {
       }
     }
   }
+  g_host = 0;
   VCHECK(checked > 2000);
   VCHECK(failed_runs > 50);            // the error paths were met
-  VCHECK(failed_runs < checked / 2);   // and most patterns ran to the end
+  if (host == 2) VCHECK(failed_runs > checked / 2);   // a read-only dst: nearly every pattern stores, and throws
+  else VCHECK(failed_runs < checked / 2);              // and most patterns ran to the end
 }
+}  // namespace
+
+VTEST(runs_of_lanes_move_the_bits_lane_by_lane_would) { check_all_patterns(0); }
+VTEST(runs_and_gathers_on_host_mapped_buffers_move_the_bits_lane_by_lane_would) { check_all_patterns(1); }
+VTEST(stores_to_a_read_only_host_mapping_throw_as_lane_by_lane_ones_do) { check_all_patterns(2); }
 
 VTEST(a_run_of_lanes_keeps_overlapping_stores_in_lane_order) {
   // Eight lanes storing to the same word, then pairs of lanes sharing a word: the last lane's value stays.

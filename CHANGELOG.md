@@ -48,6 +48,10 @@ release says what runs and what it produces, never how fast a real GPU would run
   your own CI and allows one restriction: you may not offer it to other people as a hosted or managed service. Each version becomes
   Apache-2.0 four years after release. Versions up to 0.2.0 stay Apache-2.0 (`LICENSE-APACHE-2.0`). `docs/licensing.md` has the
   details, and contributions now need the Contributor Agreement.
+- libcudart exports the nine `cudaGL*` interop functions the CUDA 13.0 runtime does (`cudaGLRegisterBufferObject`, `cudaGLMapBufferObject`,
+  `cudaGLSetGLDevice`, `cudaGLGetDevices`, ...). A program that only names one of them, such as COLMAP's SiftGPU, failed to start when linked with
+  `-z now` ("undefined symbol: cudaGLRegisterBufferObject"). With no OpenGL context on a simulated GPU they answer what an RTX 3060 answers with none:
+  `cudaErrorInvalidGraphicsContext` for register, unregister and `cudaGLGetDevices`, `cudaErrorInvalidValue` for map, unmap and the map flags.
 - The container image builds again. `scripts/package-build.sh` left `shim/libcudss.so.1` pointing into `cudss1/`, a directory the image does not
   have, so the build stopped at "links that lead nowhere" from the cuDSS 1.0 change onward. A lint test (`lint_package_build`) now builds a small
   tree with the same layout.

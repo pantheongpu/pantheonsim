@@ -3302,8 +3302,13 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
               }
             }
             done = mem_.store_run(g0, buf, uint64_t{count} * bytes, unit);
+            // (A run in one host-mapped buffer: the lanes' atomic accesses made together; a store is progress for a warp that spins.)
+            if (!done && mem_.store_host_run(g0, buf, uint64_t{count} * bytes, unit)) {
+              w.idle_yields = 0;
+              done = true;
+            }
           } else {
-            done = mem_.load_run(g0, buf, uint64_t{count} * bytes, unit);
+            done = mem_.load_run(g0, buf, uint64_t{count} * bytes, unit) || mem_.load_host_run(g0, buf, uint64_t{count} * bytes, unit);
             if (done) {
               const Operand& d = ins.dst[0];
               if (bytes == 4 && d.kind == Kind::Reg) {
@@ -3378,18 +3383,21 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
                 vals[i] = d.reg == kRZ ? 0 : (w.reg(d.reg, l) | (static_cast<uint64_t>(w.reg(d.reg + 1, l)) << 32));
               }
             });
-            done = mem_.store_batch(dense, count, bytes, vals);
             // The lanes all in one host-mapped buffer (zero-copy, managed): their atomic accesses made together; a store is progress
-            // for a warp that spins (as mem_write has it).
-            if (!done && mem_.host_map_possible(dense[0]) && mem_.host_store_batch(dense, count, bytes, vals)) {
+            // for a warp that spins (as mem_write has it). Asked first where the first address may be in a host mapping: store_batch
+            // declines every such access, after a lookup in the allocation table under a shared lock.
+            if (mem_.host_map_possible(dense[0]) && mem_.host_store_batch(dense, count, bytes, vals)) {
               w.idle_yields = 0;
               done = true;
+            } else {
+              done = mem_.store_batch(dense, count, bytes, vals);
             }
           } else {
             // Every active lane loading the same address (a broadcast) is one load.
             const bool same = differ == 0;
-            done = mem_.load_batch(dense, same ? 1 : count, bytes, vals) ||
-                   (mem_.host_map_possible(dense[0]) && mem_.host_load_batch(dense, same ? 1 : count, bytes, vals));
+            done = mem_.host_map_possible(dense[0]) ? mem_.host_load_batch(dense, same ? 1 : count, bytes, vals) ||
+                                                          mem_.load_batch(dense, same ? 1 : count, bytes, vals)
+                                                    : mem_.load_batch(dense, same ? 1 : count, bytes, vals);
             if (done) {
               const Operand& d = ins.dst[0];
               each_active([&](unsigned l, unsigned i) {

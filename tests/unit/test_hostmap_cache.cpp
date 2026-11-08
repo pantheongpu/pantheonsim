@@ -244,4 +244,127 @@ VTEST(a_warps_batch_on_a_mapped_buffer_races_the_hosts_atomics_cleanly) {
   VCHECK_EQ(torn.load(), 0);
 }
 
+// load_host_run / store_host_run (a wave's lanes on consecutive addresses in one host-mapped buffer, made as one call) against load_scalar /
+// store_scalar lane by lane: the same values and bytes at every unit and length, at every offset into the buffer; and what they decline, with
+// nothing done (misaligned, past the end or below the start, not a unit, two buffers, a read-only store, a fault armed).
+VTEST(a_run_on_a_mapped_buffer_is_the_lane_by_lane_accesses) {
+  MemoryManager mem{1 << 20};
+  Buf b(8192, 0), twin(8192, 0);
+  mem.map_host(b.addr(), b.p, b.n);
+  mem.map_host(twin.addr(), twin.p, twin.n);
+  uint32_t seed = 777;
+  const auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+  for (size_t i = 0; i < b.n; ++i) twin.p[i] = b.p[i] = static_cast<uint8_t>(rnd());
+  for (uint32_t unit : {1u, 2u, 4u, 8u})
+    for (int iter = 0; iter < 300; ++iter) {
+      const uint64_t elems = 1 + rnd() % 70;
+      const uint64_t first = rnd() % (b.n / unit - elems + 1);
+      const uint64_t len = elems * unit;
+      uint8_t got[70 * 8], want[70 * 8], src[70 * 8];
+      for (auto& x : src) x = static_cast<uint8_t>(rnd());
+      VCHECK(mem.load_host_run(b.addr() + first * unit, got, len, unit));
+      for (uint64_t i = 0; i < elems; ++i) {
+        const uint64_t v = mem.load_scalar(b.addr() + (first + i) * unit, unit);
+        std::memcpy(want + i * unit, &v, unit);
+      }
+      VCHECK(std::memcmp(got, want, len) == 0);
+      VCHECK(mem.store_host_run(b.addr() + first * unit, src, len, unit));
+      for (uint64_t i = 0; i < elems; ++i) {
+        uint64_t v = 0;
+        std::memcpy(&v, src + i * unit, unit);
+        mem.store_scalar(twin.addr() + (first + i) * unit, unit, v);
+      }
+      VCHECK(std::memcmp(b.p, twin.p, b.n) == 0);
+    }
+  // the declines, each leaving the destination as it was
+  uint8_t out[64], mark[64];
+  std::memset(out, 0xcd, sizeof out), std::memset(mark, 0xcd, sizeof mark);
+  VCHECK(!mem.load_host_run(b.addr() + 2, out, 16, 4));                // misaligned for a word
+  VCHECK(!mem.load_host_run(b.addr(), out, 18, 4));                    // a length that is not whole words
+  VCHECK(!mem.load_host_run(b.addr() + b.n - 8, out, 16, 4));          // runs off the end
+  VCHECK(!mem.load_host_run(b.addr() - 8, out, 16, 4));                // starts below the buffer
+  VCHECK(!mem.load_host_run(b.addr(), out, 16, 3));                    // not a unit
+  VCHECK(!mem.store_host_run(b.addr() + b.n - 8, out, 16, 4));
+  VCHECK(!mem.store_host_run(b.addr() + 1, out, 16, 8));
+  VCHECK(!mem.load_host_run(b.addr(), out, 0, 4));                     // (load_run's empty run is its own)
+  VCHECK(std::memcmp(out, mark, sizeof out) == 0);
+  Buf ro(4096, 0x5a);
+  mem.map_host(ro.addr(), ro.p, ro.n, /*read_only=*/true);
+  VCHECK(mem.load_host_run(ro.addr(), out, 16, 4));
+  VCHECK_EQ(uint32_t{out[0]}, 0x5au);
+  std::memset(out, 0x11, sizeof out);
+  VCHECK(!mem.store_host_run(ro.addr(), out, 16, 4));                  // the lane-by-lane store reports the read-only write
+  VCHECK_EQ(uint32_t{ro.p[0]}, 0x5au);
+  // an address that is no host mapping at all, and one in the device window
+  uint8_t dev_buf[16];
+  VCHECK(!mem.load_host_run(mem.alloc(4096), dev_buf, 16, 4));
+  VCHECK(!mem.load_host_run(0x1000, dev_buf, 16, 4));
+  // a fault armed on loads or stores declines, as load_run does
+  struct Armed : MemoryManager::AccessFault {
+    uint64_t on = 1;
+    Armed() { store_pending = &on; }
+    uint64_t on_load(uint64_t, uint32_t, uint64_t v) override { return v; }
+    uint64_t on_store(uint64_t, uint32_t, uint64_t v) override { return v; }
+    uint64_t on_shared_load(uint64_t, uint32_t, uint64_t v) override { return v; }
+    void on_read(uint64_t, uint8_t*, uint64_t) override {}
+    uint64_t on_alu(uint64_t v, uint32_t) override { return v; }
+    void on_copy(uint64_t, uint8_t*, uint64_t) override {}
+  } armed;
+  mem.set_access_fault(&armed);
+  VCHECK(!mem.store_host_run(b.addr(), out, 16, 4));
+  VCHECK(!mem.load_host_run(b.addr(), out, 16, 4));
+  mem.set_access_fault(nullptr);
+  VCHECK(mem.load_host_run(b.addr(), out, 16, 4));
+}
+
+// A mapping that is gone or replaced is not served from the cache by a run either.
+VTEST(a_run_does_not_outlive_its_mapping) {
+  MemoryManager mem{1 << 20};
+  Buf a(4096, 0x31), c(4096, 0x32);
+  uint8_t out[16];
+  mem.map_host(a.addr(), a.p, a.n);
+  VCHECK(mem.load_host_run(a.addr(), out, 16, 4));
+  VCHECK_EQ(uint32_t{out[0]}, 0x31u);
+  mem.unmap_host(a.addr());
+  VCHECK(!mem.load_host_run(a.addr(), out, 16, 4));
+  mem.map_host(a.addr(), c.p, c.n);
+  VCHECK(mem.load_host_run(a.addr(), out, 16, 4));
+  VCHECK_EQ(uint32_t{out[0]}, 0x32u);
+}
+
+// The engines ask the host batch FIRST where the first address may be in a host mapping (the ordinary batch's lookup for such an address
+// is a miss in the allocation table, under a shared lock, every time). That is the same answer only while the ordinary batch declines every
+// access the host batch takes: pinned here, for a buffer outside the device windows and for one mapped over a live device allocation
+// (a managed buffer), where load_scalar / store_scalar also take the host's bytes.
+VTEST(the_ordinary_batch_declines_every_warp_the_host_batch_takes) {
+  MemoryManager mem{1 << 20};
+  Buf b(8192, 0x42);
+  mem.map_host(b.addr(), b.p, b.n);
+  const uint64_t dev = mem.alloc(8192);
+  Buf over(8192, 0x24);
+  for (uint32_t size : {1u, 2u, 4u, 8u}) {
+    uint64_t addrs[32], out[32], vals[32] = {1};
+    for (unsigned k = 0; k < 32; ++k) addrs[k] = b.addr() + size * k;
+    VCHECK(mem.host_load_batch(addrs, 32, size, out));
+    VCHECK(!mem.load_batch(addrs, 32, size, out));
+    VCHECK(!mem.store_batch(addrs, 32, size, vals));
+    VCHECK(!mem.load_broadcast(addrs[0], 32, size, out));
+    VCHECK(mem.host_store_batch(addrs, 32, size, vals));
+  }
+  mem.map_host(dev, over.p, over.n);   // the host's bytes now answer at the device allocation's addresses
+  for (uint32_t size : {1u, 2u, 4u, 8u}) {
+    uint64_t addrs[32], out[32], vals[32] = {7};
+    for (unsigned k = 0; k < 32; ++k) addrs[k] = dev + size * k;
+    VCHECK(mem.host_load_batch(addrs, 32, size, out));
+    for (unsigned k = 0; k < 32; ++k) VCHECK_EQ(out[k], mem.load_scalar(addrs[k], size));
+    VCHECK(!mem.load_batch(addrs, 32, size, out));
+    VCHECK(!mem.store_batch(addrs, 32, size, vals));
+    VCHECK(!mem.load_broadcast(addrs[0], 32, size, out));
+    uint8_t via_run[256];
+    VCHECK(!mem.load_run(dev, via_run, 32 * size, size));     // the ordinary run declines it too; the host run takes it
+    VCHECK(mem.load_host_run(dev, via_run, 32 * size, size));
+    VCHECK_EQ(uint32_t{via_run[0]}, 0x24u);
+  }
+}
+
 VTEST_MAIN
