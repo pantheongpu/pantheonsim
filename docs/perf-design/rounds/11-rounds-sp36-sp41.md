@@ -3452,3 +3452,123 @@ for sm_90 or sm_100) and fast-math or `-prec-div=false` builds, which do not use
 * Step 27 in CI's toolkits (12.0, 12.8): not run; it uses the same program and stand-in as steps 14 and 16.
 * Deviations: the `test_host_gpu_track` mutants were built against the tree's `libvgpu.a` (the library's own instantiations are the original's); the
   toolkit packages `cuda-cuobjdump` and `cuda-nvdisasm` (13.0, 13.2) were installed on the rig, which had neither.
+
+## Round sp68 (host-GPU exact mode: the IEEE square root idiom, `VGPU_HOST_GPU_SQRT`, pantheonsim #570)
+
+Branch `sp68-sqrt-idiom`, base `sp67-hostgpu-verify` 1ce3dcc9 (which is `hostgpu-relaxed` f55c8e65 plus Round sp67). Data, scripts and commands:
+[`data/sp68/`](../data/sp68/README.md). server3 (Ryzen 7 PRO 8840U, no card) for the build, the unit tests, the mutants, a static scan of the corpus and
+the runtime's verdicts with no driver; one A10G (g5.xlarge, driver 595.112.07, the rig ran nothing else) for the probe, the two e2e scripts and the A/B.
+
+### Why
+
+Round sp67 found that PolyBench GRAMSCHM gains nothing in exact mode: `gramschmidt_kernel1` (one thread: the norm of a column, then `sqrtf`) is refused
+for the `MUFU.RSQ` of the `sqrtf` sequence, so it runs in the simulator between two card launches of `kernel3`, and every one of the 2,048 iterations
+pulls the 48 MiB back and pushes them again: 98 GB each way. Round sp44 had measured `__fsqrt_rn` (the same sequence) bit-exact on the A10G over all
+2^32 inputs; the recogniser that would let exact mode use that was never written. This round writes it.
+
+### What ptxas emits, and how it is recognised
+
+For sm_86 (nvcc 13.0 and 13.2 give the same words, Round sp67) `sqrtf(x)` is: `IADD3 Rt, Rx, -0xd000000, RZ` and `ISETP.GT.U32` against `0x727fffff`
+(x below 2^-101, zero, negative, infinite or NaN takes the slow path), `MUFU.RSQ Ry, Rx`, and on the fast path `s = y x`, `h = y / 2` (two `FMUL.FTZ`),
+`d = fma(-s, s, x)`, `r = fma(d, h, s)`; the slow path is a subroutine (`CALL.REL.NOINC`, `RET.REL.NODEC`) that returns x for a zero or an infinity,
+0x7fffffff for a negative, x + 1 for a NaN, and otherwise does the same four steps on x 2^64 and scales by 2^-32. Kernels differ in register choice, in
+the order of the instructions, in what ptxas schedules between them, and in the slow path: GRAMSCHM's branches around its cases, CORR's and the probe's
+predicate them. Several call sites may share one slow path (HeCBench adam, four sites, one subroutine).
+
+So the recogniser (`include/vgpu/host_gpu_idiom.hpp`) compares what the code computes, not its text. From the range check to the join it runs every path
+on symbolic values: a predicate computed from the argument splits the path, one computed by the code around it guards a choice (`SEL(p, new, old)`), the
+`CALL` is followed into the subroutine and the `RET` must go back to the next instruction. Each register then holds an expression of the start values,
+products with their factors sorted. The paths (the predicate values each took) and the value they deliver must be exactly those of a reference: the
+probe's own sqrt.rn code, the 37 instructions the card ran in sp44, embedded in the header as words and decoded once. Then: one register holds that value
+on every path; every other register or predicate whose value comes from a `MUFU` is not read after the join on any path of the kernel (a search that
+follows calls and understands predicated writes and branches); nothing in the idiom touches memory, other threads or uniform registers; branches go
+forward; no branch from elsewhere lands inside the idiom or its subroutine, nothing falls into the subroutine, and only another site's `CALL` may enter
+it. A kernel is in the exact set by the idiom when every instruction outside the set is a `MUFU`, `CALL` or `RET` of a recognised site, or, with
+`VGPU_HOST_GPU_DIV=1`, of the division idiom (whose calls may not enter a square root's subroutine). With the switch off the verdicts are the old ones
+(a unit test compares them). Turbo mode admits every `MUFU` already; nothing changes there.
+
+`MUFU.RSQ64H` (the double square root) has no recogniser: every one of the 22 corpus kernels that holds it also holds `MUFU.RCP64H` (double division),
+which has none, so it would admit nothing. Integer division (`VGPU_HOST_GPU_IDIV`, sp43) was not started.
+
+### The default: opt-in, from the data
+
+With the simulator's reciprocal square root the four steps give the IEEE root for every positive float (`test_host_gpu_ref`, all 2^31, exhaustive run
+passed). With a reciprocal square root one ulp off the simulator's they do not: 383 inputs at -1 ulp and 255 at +1 (1,401 and 1,273 at 2 ulp, 10,843
+and 11,219 at 6), spread over the whole range, most on the fast path (`data/sp68/sqrt_model.txt`). The division is different: its refinement is exact
+for a reciprocal within one ulp either way (sp43). The A10G's `MUFU.RSQ` differs from the simulator's by up to 2 ulp on 10.7% of inputs (sp44) and its
+sqrt.rn still had 0 differences in 2^32, so its table is right exactly where these inputs need it: that is a fact about the A10G's unit, not about the
+code. Another architecture's `MUFU.RSQ` has to pass the probe before exact mode can trust the idiom on it, so `VGPU_HOST_GPU_SQRT` stays a switch, off
+by default (the coordinator agreed); `tools/probes/hostgpu_mufu_card_experiment.sh` says so in its `sqrtrn` verdict.
+
+### Without a card (server3)
+
+The scan (`tools/probes/hostgpu_idiom_scan.cpp`, every sm_86 kernel of the 539 cached PolyBench, Rodinia and HeCBench programs, 2,613 kernels,
+`data/sp68/scan-summary.txt`): 1,045 in the set as before, 66 more with the division idiom, and **10 more with the square root idiom**: GRAMSCHM
+`kernel1`, CORR `std_kernel` (with the division), Rodinia `nn`, HeCBench `hellinger` (6 sites), `knn` `cuParallelSqrt`, `nn`, `sobel_filter` (4 sites),
+`ced` `sobel_kernel` (with the division), `asyncAllocation` `process` and `attention-paged` `norm_fill_kernel`. The runtime agrees on the first six
+(`data/sp68/offline.md`); the last two are refused before their code is read (module variables or device calls), and ced and sobel have no input in the
+cache. HeCBench adam's four sites are recognised and the kernel stays out for an unrelated call; Rodinia hotspot's `MUFU.RSQ` is the division's NaN.
+Of 308 sites tried, the reasons the rest fail are a bare rsqrt (62), a `MUFU.RSQ` that is a slow path's own or the division's NaN (57), and a few
+real misses (8 with no slow side, 7 with a raw value read later, 4 others).
+
+Against a stand-in card that keeps memory (`data/sp68/gram_stub.txt`): on this branch alone, GRAMSCHM's `kernel1` is admitted and still stays in the
+simulator, as one thread is "too small", so the pulls would go on; on this branch merged with Round sp65's `sp65-resident-streaks` (the scratch branch
+`sp68-with-sp65`, for this measurement only) all three kernels go to the card, 48 MiB pushed and 16 MiB back in all.
+
+Tests: `test_host_gpu_idiom` (15) on real SASS words of GRAMSCHM kernels 1 and 2, CORR `std_kernel` and the probe kernel (`tests/unit/host_gpu_idiom_sass.inc`,
+from sp67's dumps; the generator checks 13.0 and 13.2 give the same words): the four verdicts of each, the probe's bare rsqrt refused; one change at a
+time to GRAMSCHM's kernel refused (no final FFMA, no residual, a quarter for the half, the residual's sign, six wrong registers, the range check's bound
+and base, the guard inverted, the slow path's scale, unscale and NaN, a store, a barrier or an EXIT inside, a branch into the fast path, the slow path or
+its entry, a wrong return address, a predicated MUFU, code falling into the slow path, a division's call into it); the liveness search on small
+sequences (a write under a predicate, under both polarities, a branch after a predicated write, `IMAD.WIDE` pairs, address and data widths).
+`test_host_gpu_ref` (9; two new: the model above, exact with the simulator's rsqrt, and wrong at pinned inputs one ulp off). `test_host_gpu_logic` 89/89.
+g++-12 `-Wall -Wextra -Werror` on every changed source. Mutants (`data/sp68/mutants.txt`): 19 of 24 killed; the five that survive drop a check another
+check makes redundant (any `MUFU` form inside, the carriers of a raw value, the taint of a predicate, a predicated `MUFU` as a site, a backward branch:
+in each case the comparison with the reference, or the path limit, refuses the same code). e2e: `run_host_gpu_stub.sh` step 28 (`sqrt`, `rsqrt`,
+`sqrtdiv` of `host_gpu_lazy.cu`: the card path only with the switch, `sqrtdiv` only with both, the bare rsqrt never, output the mode-off output) and
+`run_host_gpu.sh` step 7 (`sqrt` and `sqrtdiv` on the card with and without verify: output byte-identical, `in_set_different=0`).
+
+### On the A10G
+
+Builds `b68` (this branch) and `b65` (`sp68-with-sp65`), toolkit 13.0 for the probe and the e2e programs, the cached sm_86 corpus binaries; 3 interleaved
+runs a side, `x0` = exact with `VGPU_HOST_GPU_DIV=1` and `VGPU_HOST_GPU_SQRT=0`, `x1` = the same with `=1` (`data/sp68/card.md`).
+
+* Probe: `sqrtrn` over all 2^32 inputs `differ=0` again (nvcc 13.0, sm_86), the harness sees its own one-ulp nudge (8,128 of 16.7 million).
+  `run_host_gpu.sh` (step 7: sqrtf and sqrtf-then-division on the card, with and without verify) and `run_host_gpu_stub.sh` (step 28): PASS.
+* Medians, seconds (wall: the whole process; device: the "GPU Time" PolyBench prints):
+
+| program | build | sim wall (device) | x0 wall (device) | x1 wall (device) | x1 against x0 | what changed |
+|---|---|---|---|---|---:|---|
+| GRAMSCHM | b65 | 270.6 (45.2) | 272.7 (44.6) | 234.9 (3.08) | 1.16x wall, 14.5x device | 6,121 of 6,144 launches on the card; 48 MiB pushed and 16 MiB back, against 97,920 and 97,888 MiB |
+| GRAMSCHM | b68, one run | | 266.9 (45.1) | 251.9 (44.9) | (device equal) | `kernel1` admitted, kept as too small; the same 98 GB each way |
+| HeCBench hellinger `1` | b68 | 43.0 | 42.9 | 6.76 | 6.36x | its one launch goes to the card |
+| CORR | b68 | 66.9 (26.3) | 42.2 (2.01) | 42.1 (2.01) | 1.003 | `std_kernel` (one launch) admitted, kept as too small; the long kernel was on the card already |
+| COVAR (control) | b68 | 67.4 (26.5) | 42.4 (1.87) | 42.2 (1.87) | 1.005 | nothing to admit |
+| ADI (control) | b68 | 0.359 | 0.359 | 0.364 | 0.986 (20 runs: 1.002) | nothing to admit |
+| HeCBench knn `1` | b68 | 16.96 | 17.03 | 17.07 | 0.998 | `cuParallelSqrt` admitted, kept as too small |
+| Rodinia nn | b68 | 0.021 | 0.021 | 0.022 | 20 runs: 0.996 | admitted, kept as too small |
+| HeCBench nn | b68 | 0.027 | 0.027 | 0.027 | 20 runs: 0.993 | admitted, kept as too small |
+
+* Outputs: the same on every side of every program (stdout without its timing lines; knn's with its "done in" line dropped). Verify with the switch on,
+  every launch run on both sides and its memory compared: CORR 4, hellinger 1, knn 2, Rodinia nn 1, HeCBench nn 10, GRAMSCHM (b65) 6,144 launches
+  identical, `in_set_different=0` everywhere.
+* No program is slower with the switch on beyond the run-to-run spread: the 3-run medians of ADI (-1.4%) and Rodinia nn (one millisecond in 21) were
+  rerun 20 times a side and are within 0.7%. The recogniser runs once per kernel, only for a kernel with an instruction outside the set and only with
+  the switch on.
+
+**Result.** The idiom is exact on the A10G in every program run (no launch different), and it does what sp67 asked for, but only together with Round
+sp65's streak rule: GRAMSCHM's device part goes from 44.6 s to 3.1 s and its traffic from 98 GB each way to 64 MiB; on this branch alone the
+one-thread `kernel1`, now in the set, is still kept in the simulator by the size rule, and GRAMSCHM is where it was. HeCBench hellinger is 6.4x faster
+with the switch alone. CORR does not gain: its square root kernel is one short launch, and the long kernel already went to the card. The other admitted
+kernels are too short for the size rule. When the rounds are merged, GRAMSCHM's gain needs both branches.
+
+### What was not verified
+
+* Other cards: the switch is exact only where a card's `MUFU.RSQ` passes the probe; only the A10G (sm_86) has.
+* ced, sobel (no input in the cache), asyncAllocation and attention-paged (refused before their code is read) were not run with the idiom.
+* The PolyBench programs print mismatch counts, not results, so their equal outputs are a weak check; the verify runs compare memory to the bit.
+* The A/B of `b65` against `b68` is not a measure of sp65's rule (that is sp65's round); `b65` is a scratch merge (its docs and stand-in test are
+  this branch's) and is not to be merged as it is.
+* The stand-in step 28 and the card step 7 ran on the rig only (no nvcc on server3); CI's toolkits 12.0 and 12.8 were not tried for the new kernels
+  of `host_gpu_lazy.cu`.
+* Deviations: one syntax check (`bash -n`) of the two e2e scripts was run on the WSL machine; the rig needed `ninja-build` installed.

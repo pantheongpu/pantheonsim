@@ -44,7 +44,7 @@ global memory through the same addresses as `LDG` and `STG`. The `never` class h
 simulator's own tables, and the rest is unnamed because nobody has looked, not because it is known to be unsafe. The `extra` class is the
 judgement call of this list: no measurement backs it yet, which is why it has a switch of its own.
 
-A kernel of the exact set (the division idiom with `VGPU_HOST_GPU_DIV=1` included) is admitted whatever is switched off.
+A kernel of the exact set (the division idiom with `VGPU_HOST_GPU_DIV=1` and the square root idiom with `VGPU_HOST_GPU_SQRT=1` included, Round sp68) is admitted whatever is switched off; turbo mode itself takes every `MUFU` anyway, so the square root idiom changes nothing in it.
 
 A refused kernel is named once on stderr, with the first instruction that refused it, so that a benchmark shows what is still missing:
 

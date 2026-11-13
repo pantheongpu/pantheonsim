@@ -1,0 +1,2 @@
+PASS: first launch 74 ms against a driver start of 2000 ms; driver calls in the big run:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 1 cuInit; 1 cuMemAddressReserve; 2 cuModuleLoadData;
+rc=0

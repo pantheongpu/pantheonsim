@@ -1,0 +1,119 @@
+[
+ {
+  "prog": "GRAMSCHM",
+  "side": "sim",
+  "run": 0,
+  "rc": 0,
+  "wall": 278.35,
+  "gpu_time": 46.186649,
+  "out_hash": "c9644fd81ac7b3dc",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "GRAMSCHM",
+  "side": "x0",
+  "run": 0,
+  "rc": 0,
+  "wall": 263.011,
+  "gpu_time": 45.158089,
+  "out_hash": "c9644fd81ac7b3dc",
+  "summary": [
+   "host_gpu: 2040 launches ran on the card, 4104 in the simulator (2048 kernels not in the exact set, 2052 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 97920.0 MiB went to the card, 97888.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "GRAMSCHM",
+  "side": "x1",
+  "run": 0,
+  "rc": 0,
+  "wall": 238.609,
+  "gpu_time": 3.100634,
+  "out_hash": "c9644fd81ac7b3dc",
+  "summary": [
+   "host_gpu: 6121 launches ran on the card, 23 in the simulator (0 kernels not in the exact set, 17 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 48.0 MiB went to the card, 16.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "GRAMSCHM",
+  "side": "sim",
+  "run": 1,
+  "rc": 0,
+  "wall": 270.645,
+  "gpu_time": 45.08494,
+  "out_hash": "c9644fd81ac7b3dc",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "GRAMSCHM",
+  "side": "x0",
+  "run": 1,
+  "rc": 0,
+  "wall": 272.746,
+  "gpu_time": 44.465936,
+  "out_hash": "c9644fd81ac7b3dc",
+  "summary": [
+   "host_gpu: 2040 launches ran on the card, 4104 in the simulator (2048 kernels not in the exact set, 2052 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 97920.0 MiB went to the card, 97888.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "GRAMSCHM",
+  "side": "x1",
+  "run": 1,
+  "rc": 0,
+  "wall": 233.071,
+  "gpu_time": 3.081389,
+  "out_hash": "c9644fd81ac7b3dc",
+  "summary": [
+   "host_gpu: 6121 launches ran on the card, 23 in the simulator (0 kernels not in the exact set, 17 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 48.0 MiB went to the card, 16.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "GRAMSCHM",
+  "side": "sim",
+  "run": 2,
+  "rc": 0,
+  "wall": 269.948,
+  "gpu_time": 45.214982,
+  "out_hash": "c9644fd81ac7b3dc",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "GRAMSCHM",
+  "side": "x0",
+  "run": 2,
+  "rc": 0,
+  "wall": 274.312,
+  "gpu_time": 44.58883,
+  "out_hash": "c9644fd81ac7b3dc",
+  "summary": [
+   "host_gpu: 2040 launches ran on the card, 4104 in the simulator (2048 kernels not in the exact set, 2052 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 97920.0 MiB went to the card, 97888.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "GRAMSCHM",
+  "side": "x1",
+  "run": 2,
+  "rc": 0,
+  "wall": 234.864,
+  "gpu_time": 3.081375,
+  "out_hash": "c9644fd81ac7b3dc",
+  "summary": [
+   "host_gpu: 6121 launches ran on the card, 23 in the simulator (0 kernels not in the exact set, 17 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 48.0 MiB went to the card, 16.0 MiB came back"
+  ],
+  "idiom": []
+ }
+]

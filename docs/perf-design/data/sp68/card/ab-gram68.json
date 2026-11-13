@@ -1,0 +1,30 @@
+[
+ {
+  "prog": "GRAMSCHM",
+  "side": "x0",
+  "run": 0,
+  "rc": 0,
+  "wall": 266.885761,
+  "gpu_time": 45.062963,
+  "out_hash": "c9644fd81ac7b3dc",
+  "summary": [
+   "host_gpu: 2041 launches ran on the card, 4103 in the simulator (2048 kernels not in the exact set, 2051 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 97968.0 MiB went to the card, 97936.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "GRAMSCHM",
+  "side": "x1",
+  "run": 0,
+  "rc": 0,
+  "wall": 251.861202,
+  "gpu_time": 44.927866,
+  "out_hash": "c9644fd81ac7b3dc",
+  "summary": [
+   "host_gpu: 2041 launches ran on the card, 4103 in the simulator (0 kernels not in the exact set, 4097 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 97920.0 MiB went to the card, 97888.0 MiB came back"
+  ],
+  "idiom": []
+ }
+]

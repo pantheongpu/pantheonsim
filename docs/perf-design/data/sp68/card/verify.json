@@ -1,0 +1,88 @@
+[
+ {
+  "prog": "CORR",
+  "side": "v",
+  "run": 0,
+  "rc": 0,
+  "wall": 68.874331,
+  "gpu_time": 28.790289,
+  "out_hash": "96ba52add2de149b",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 4 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 32.0 MiB went to the card, 0.0 MiB came back",
+   "host_gpu_verify: in_set_identical=4 in_set_different=0 other_identical=0 other_different=0"
+  ],
+  "idiom": [
+   "host_gpu: _Z10std_kerneliiPfS_S_: in the exact set by the square root idiom (1 site)"
+  ]
+ },
+ {
+  "prog": "hellinger",
+  "side": "v",
+  "run": 0,
+  "rc": 0,
+  "wall": 42.984461,
+  "gpu_time": null,
+  "out_hash": "c3ef86550c5323fa",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 1 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 31.5 MiB went to the card, 0.0 MiB came back",
+   "host_gpu_verify: in_set_identical=1 in_set_different=0 other_identical=0 other_different=0"
+  ],
+  "idiom": [
+   "host_gpu: _Z9hellingerPKfS0_Pfiii: in the exact set by the square root idiom (6 sites)"
+  ]
+ },
+ {
+  "prog": "knn",
+  "side": "v",
+  "run": 0,
+  "rc": 0,
+  "wall": 17.128364,
+  "gpu_time": null,
+  "out_hash": "3290d8ea1c7e6dbd",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 3 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 66.4 MiB went to the card, 0.0 MiB came back",
+   "host_gpu_verify: in_set_identical=2 in_set_different=0 other_identical=0 other_different=0"
+  ],
+  "idiom": [
+   "host_gpu: _Z14cuParallelSqrtPfii: in the exact set by the square root idiom (1 site)",
+   "host_gpu: _Z23cuComputeDistanceGlobalPKfiS0_iiPf: not the division or square root idiom: a MUFU.RCP with no FCHK of its divisor right after"
+  ]
+ },
+ {
+  "prog": "rod_nn",
+  "side": "v",
+  "run": 0,
+  "rc": 0,
+  "wall": 0.251756,
+  "gpu_time": null,
+  "out_hash": "3c20c13a34d62746",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 1 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.5 MiB went to the card, 0.0 MiB came back",
+   "host_gpu_verify: in_set_identical=1 in_set_different=0 other_identical=0 other_different=0"
+  ],
+  "idiom": [
+   "host_gpu: _Z6euclidP7latLongPfiff: in the exact set by the square root idiom (1 site)"
+  ]
+ },
+ {
+  "prog": "hec_nn",
+  "side": "v",
+  "run": 0,
+  "rc": 0,
+  "wall": 0.259026,
+  "gpu_time": null,
+  "out_hash": "56d5fc657cda7d1d",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 10 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.5 MiB went to the card, 0.0 MiB came back",
+   "host_gpu_verify: in_set_identical=10 in_set_different=0 other_identical=0 other_different=0"
+  ],
+  "idiom": [
+   "host_gpu: _Z2nniffPK7latLongPf: in the exact set by the square root idiom (1 site)"
+  ]
+ }
+]
