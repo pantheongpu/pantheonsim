@@ -12,12 +12,16 @@ summary = []
 R_CARD = re.compile(r"^host_gpu: (\S+) on the card \(resident\): kernel ([0-9.]+) ms, total ([0-9.]+) ms \(sim estimate ([0-9.]+) ms\), ([0-9.]+) MiB pushed")
 R_STREAK = re.compile(r"^host_gpu: (\S+): sent because the card holds the memory")
 R_STAYS = re.compile(r"^host_gpu: (\S+) stays in the simulator \(sim ")
+R_BAN = re.compile(r"^host_gpu: (\S+) (took .* offloading it ends|pushed .* offloading it ends \(traffic\))")
+bans = []
 for line in sys.stdin:
     m = R_CARD.match(line)
     if m:
         card[m.group(1)].append(tuple(float(m.group(i)) for i in range(2, 6))); continue
     m = R_STREAK.match(line)
     if m: streak[m.group(1)] += 1; continue
+    m = R_BAN.match(line)
+    if m: bans.append("ban: " + line.strip()[len("host_gpu: "):][:300]); continue
     m = R_STAYS.match(line)
     if m: stays[m.group(1)] += 1; continue
     if re.match(r"^host_gpu(_turbo|_refusals|_sampled|_streak)?: ", line) and ("launches ran" in line or "MiB went" in line or "_turbo:" in line
@@ -33,4 +37,5 @@ for k in sorted(set(card) | set(streak) | set(stays)):
               statistics.median(sm), ratio, statistics.median(pm), streak[k], stays[k]))
     else:
         print("%s | 0 | - | - | - | - | - | %d | %d" % (k[:48], streak[k], stays[k]))
+for l in bans: print(l)
 for l in summary: print(l)

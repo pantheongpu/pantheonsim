@@ -7,6 +7,14 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: while the card holds memory the simulator does not (the launch before ran
+  there), a launch of a kernel with an estimate is weighed with what each side really moves: keeping it in the simulator costs its time plus
+  pulling back every chunk only the card holds, sending it costs the launch, the kernel's time on the card and the push of what only the
+  simulator holds. Before, a short launch between two card launches stayed in the simulator for its own time alone, pulled the whole live memory
+  back, and the next card launch pushed it all again. Measured on one A10G (Round sp65): PolyBench LU 11.6 s to 1.5 s in turbo mode and with
+  `VGPU_HOST_GPU_DIV=1`, Rodinia gaussian 0.99 s to 0.53 s, GRAMSCHM's traffic from 98 GB to 40 GB each way; outputs identical.
+  `VGPU_HOST_GPU_STREAK=0` keeps the old rule; the summary's `host_gpu_streak:` line counts the launches sent this way
+  ([design](docs/perf-design/12-host-gpu-turbo.md), section 9).
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the

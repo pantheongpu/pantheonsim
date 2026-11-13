@@ -11,5 +11,10 @@
 | rodinia/lud (counts differ) | 95 | 39 | 0.0338 | 355.9 | 739.4 | -390.5 | 3833 | inf |
 | rodinia/sc_gpu | 1053 | 1050 | 0.0985 | 93.5 | 62.5 | 24.0 | 604 | 25 |
 | rodinia/hotspot | 789 | 795 | 0.0148 | 18.8 | 0.0 | 11.8 | 1452 | 123 |
+| hecbench/atomicAggregate-cuda | 4 | 4 | 0.0032 | 795.5 | 0.0 | 788.5 | 564550 | 716 |
+| hecbench/axpby-cuda | 5 | 4 | 0.0028 | 553.2 | 646.3 | -100.1 | 19801 | inf |
+| hecbench/bh-cuda | 1 | 1 | 0.0025 | 2544.0 | 430.3 | 2106.7 | 343267 | 163 |
+| hecbench/bitonic-sort-cuda (counts differ) | 22 | 13 | 0.0009 | 40.4 | 4.2 | 29.2 | 1857 | 64 |
+| hecbench/silu-cuda | 24 | 25 | 0.0019 | 78.5 | 35.0 | 36.5 | 9516 | 260 |
 
-programs fitted: 8; kernel per launch: min 11.8 us, median 120.3 us; sim / kernel: min 25, median 258, max 808
+programs fitted: 11; kernel per launch: min 11.8 us, median 127.1 us; sim / kernel: min 25, median 260, max 808

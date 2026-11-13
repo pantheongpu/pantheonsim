@@ -1,4 +1,52 @@
 {
+"hecbench_adam-cuda": {
+"q1": {},
+"scale": [
+2.65,
+2.65
+],
+"too_small": 0
+},
+"hecbench_atomicAggregate-cuda": {
+"q1": {},
+"scale": [
+2.65,
+2.65
+],
+"too_small": 0
+},
+"hecbench_axpby-cuda": {
+"q1": {},
+"scale": [
+3.2,
+1.0
+],
+"too_small": 29
+},
+"hecbench_bh-cuda": {
+"q1": {},
+"scale": [
+2.65,
+1.0
+],
+"too_small": 0
+},
+"hecbench_bitonic-sort-cuda": {
+"q1": {},
+"scale": [
+3.2,
+3.2
+],
+"too_small": 121
+},
+"hecbench_silu-cuda": {
+"q1": {},
+"scale": [
+3.2,
+3.2
+],
+"too_small": 15
+},
 "polybench_2DCONV": {
 "q1": {},
 "scale": [
@@ -215,6 +263,14 @@
 ],
 "too_small": 203
 },
+"rodinia_lavaMD": {
+"q1": {},
+"scale": [
+2.65,
+2.65
+],
+"too_small": 0
+},
 "rodinia_lud": {
 "q1": {
 "_Z12lud_diagonalPfii": [
@@ -238,6 +294,14 @@
 1.0
 ],
 "too_small": 251
+},
+"rodinia_nn": {
+"q1": {},
+"scale": [
+2.65,
+2.65
+],
+"too_small": 0
 },
 "rodinia_particlefilter_float": {
 "q1": {},

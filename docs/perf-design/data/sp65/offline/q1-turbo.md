@@ -6,4 +6,4 @@
 | rodinia_lud | 1.00 | _Z12lud_diagonalPfii | 31 | 124.0 | 124.0 | 0.0070 | 0 |
 | all (4 programs) | | | 3772 | 118249.0 | 118249.0 | 0.593 | 0 |
 
-too small in all: 29925
+too small in all: 30090

@@ -1,3 +1,7 @@
+hecbench/atomicAggregate-cuda        2.73
+hecbench/bh-cuda                     3.15
+hecbench/bitonic-sort-cuda           3.79
+hecbench/silu-cuda                   3.13
 polybench/2DCONV                     3.71
 polybench/3DCONV                     2.82
 polybench/ADI                        4.96
@@ -14,7 +18,8 @@ polybench/SYR2K                      2.23
 polybench/SYRK                       2.23
 rodinia/backprop                     3.23
 rodinia/hotspot                      4.35
+rodinia/lavaMD                       3.13
 rodinia/needle                       3.07
 rodinia/particlefilter_float         2.50
 rodinia/pathfinder                   3.52
-programs 19: min 2.20 median 2.65 max 5.62
+programs 24: min 2.20 median 2.95 max 5.62

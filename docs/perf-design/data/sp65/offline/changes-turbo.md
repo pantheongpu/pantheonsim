@@ -1,5 +1,6 @@
 | program | scale | kernel | launches | today: card | today: too small | pull: card | of them by the streak rule | MiB only on the card at those launches |
 |---|---:|---|---:|---:|---:|---:|---:|---:|
+| hecbench_axpby-cuda | 3.20 / 1.00 | _Z25multi_tensor_apply_kernelI18TensorLi | 35 | 4 | 29 | 8 | 4 | 31.6 |
 | polybench_GRAMSCHM | 1.80 / 1.00 | _Z19gramschmidt_kernel1iiPfS_S_i | 2048 | 0 | 2046 | 2037 | 2037 | 97776.0 |
 | polybench_GRAMSCHM | 1.80 / 1.00 | _Z19gramschmidt_kernel2iiPfS_S_i | 2048 | 0 | 2046 | 2037 | 2037 | 97776.0 |
 | polybench_LU | 2.20 / 1.00 | _Z10lu_kernel1iPfi | 2047 | 0 | 2045 | 2040 | 2040 | 32640.0 |
