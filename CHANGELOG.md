@@ -82,6 +82,13 @@ release says what runs and what it produces, never how fast a real GPU would run
   uploaded on `uploadStream` as `hipGraphUpload` does, which queues no work here (the executable graph is already the one a launch
   runs); `result_out` and `errNode_out` are set as ROCm sets them. DeviceLaunch only shows in `hipGraphExecGetFlags`, as in ROCm.
   `hipGraphInstantiateWithFlags` still refuses both, as ROCm does. New e2e test `amd_graph_instantiate_params` (pantheonsim #628).
+- HIP: a failed `hipModuleLoad` is the thread's last error, as in ROCm's HIP, where every API returns through `HIP_RETURN`: a missing
+  file (`hipErrorFileNotFound`) and an empty one (`hipErrorInvalidImage`) were returned but not recorded, so `hipGetLastError` then said
+  `hipSuccess`. OpenMM's HIP platform reads `hipGetLastError` after a miss in its kernel cache and stopped with "Detected HIP error: no
+  error" at the first kernel of every `TestHip*` program. `hipModuleGetFunction` and `hipModuleGetGlobal` now check their arguments in
+  ROCm's order and with its codes: a null module is `hipErrorInvalidResourceHandle` (`hipModuleGetFunction` said `hipErrorInvalidValue`)
+  and an empty kernel name is `hipErrorInvalidValue`. New e2e test `amd_module_last_error`, which also holds the other module and link
+  entry points to recording their errors (pantheonsim #635).
 
 - Peer access: after `cudaDeviceEnablePeerAccess` (or `cuCtxEnablePeerAccess`), a kernel on one simulated device reads, writes and
   atomically updates the peer device's allocations in place, as on a card (unified addressing). It stopped with `[invalid-pointer]

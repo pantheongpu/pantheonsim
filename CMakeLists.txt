@@ -2657,6 +2657,9 @@ set_tests_properties(amd_graph_host_source PROPERTIES DEPENDS vgpuhip
 # hipGraphInstantiateWithParams with Upload and an uploadStream, and the other flags ROCm takes there (#628).
 add_test(NAME amd_graph_instantiate_params COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_graph_instantiate_params.sh)
 set_tests_properties(amd_graph_instantiate_params PROPERTIES DEPENDS vgpuhip
+# A failing module or function call is the thread's last error, as in ROCm's HIP (#635).
+add_test(NAME amd_module_last_error COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_module_last_error.sh)
+set_tests_properties(amd_module_last_error PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
 # The GCN decoder against the real assembler, on a code object built here and now.
 add_test(NAME amd_gcn_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_gcn_disasm.sh)
