@@ -1584,14 +1584,9 @@ Result Engine::obtain(const UnitSpec& spec) {
   cmd.push_back("-o");
   cmd.push_back(tmp_so);
   cmd.push_back(tmp_cpp);
-  Proc pr = run_process(cmd, cfg_.timeout_s * 1000u, cfg_.mem_mb, &p_->cancel);
-  if (!pch_h.empty() && !pr.timed_out && !pr.cancelled && pr.rc != 0) {
-    // (A precompiled header GCC cannot read -- damaged, half written by a process that died -- may fail the compile: it is removed, and the compile run without it.)
-    ::unlink((pch_h + ".gch").c_str());
-    cmd.erase(cmd.end() - 5, cmd.end() - 3);
-    pch_h.clear();
-    pr = run_process(cmd, cfg_.timeout_s * 1000u, cfg_.mem_mb, &p_->cancel);
-  }
+  // (A .gch that GCC cannot use -- damaged, made by another compiler -- is ignored by GCC itself, which then reads the header's text: the test makes one
+  // of garbage. One is written under a name of its own and renamed into place, so a reader never sees half of one.)
+  const Proc pr = run_process(cmd, cfg_.timeout_s * 1000u, cfg_.mem_mb, &p_->cancel);
   out.pch = !pch_h.empty();
   if (std::getenv("VGPU_JIT_KEEP")) ::rename(tmp_cpp.c_str(), (dir + "/" + key + ".cpp").c_str());   // (debugging: keep the generated source)
   else ::unlink(tmp_cpp.c_str());
