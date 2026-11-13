@@ -2654,6 +2654,10 @@ set_tests_properties(amd_hip_version PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_graph_host_source COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_graph_host_source.sh)
 set_tests_properties(amd_graph_host_source PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
+# hipGraphInstantiateWithParams with Upload and an uploadStream, and the other flags ROCm takes there (#628).
+add_test(NAME amd_graph_instantiate_params COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_graph_instantiate_params.sh)
+set_tests_properties(amd_graph_instantiate_params PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
 # The GCN decoder against the real assembler, on a code object built here and now.
 add_test(NAME amd_gcn_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_gcn_disasm.sh)
 set_tests_properties(amd_gcn_disasm PROPERTIES DEPENDS test_amd_gcn
