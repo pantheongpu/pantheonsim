@@ -3296,3 +3296,117 @@ The 10 cold: asyncAllocation, bgmv (12 ms, one ms), JACOBI1D (noise, above), SYR
 * `VGPU_JIT_LINK=1` and `VGPU_JIT_FUSE=1` on the changed build.
 * The first pass's changed build also had `vfork`; its numbers for programs that start a compiler were re-measured on the final build (the recheck table), the others start none.
 * Rule deviations: the first ctest run held the machine lock for eleven minutes in one piece; the default-thread pass is three runs a side on 18 programs.
+
+## Round sp64: the JIT's compile and the run around it: the plain loop while a compile runs, the precompiled runtime header, measured at 1 and 16 threads (branch `sp64-jit-threads`)
+
+Question: round sp63 left two blockers between `VGPU_JIT=1` and a default-on JIT that are about the compile itself. At the default thread count (16 on server3) the compile of a program of 1 to 3 s never finishes, so its later runs are never warm (gaussian, asyncAllocation, SYRK, atomicAggregate: the second run costs what a base cold run costs); and the very first cold run of a program of 3 to 10 s loses because its compile arrives late (SYRK 0.92 to 0.95, gaussian 0.93, asyncAllocation 0.91 at one thread). Measure where a compile's time goes and when it starts, try the levers (a cheaper `-O` level, fewer regions or pieces, compiles in parallel on idle CPUs, a threshold that follows the thread count, a core of its own at 16 threads), keep what clears the bar. The default is not flipped.
+
+**Answer: neither blocker is gone; both are smaller, and what is left is now measured.** The compile is the compiler proper (cc1plus; the driver, assembler and linker together 40 ms), 0.35 to 0.43 s of every compile is parsing the runtime header (`<immintrin.h>` alone 0.29 s), the rest grows with the source (40 KB: 0.8 s, 160 KB: 2.2 to 2.4 s). The threshold is reached 1.3 to 2.7 s into a program at one thread and 0.4 to 0.7 s into it at sixteen. And while a compile ran, its section stayed in the counting loop (`State::Queued`), which cost the program 2 to 8 % for as long as the compile took: at 16 threads, where the compile never ends, the whole run. Kept (commit 65b096b2): **the plain loop while a compile runs**, a **precompiled runtime header** (GCC: 0.33 to 0.37 s less a compile, half of a small section's, the same object bytes) and a **compile log** in `VGPU_JIT_STATS`. At 16 threads a run of these four programs on a cache that already holds their selection goes from 0.83 to 0.92 of the default (base) to 0.92 to 0.95 (this build), every run; at one thread their first cold run goes from 0.92 to 0.98 to 0.93 to 0.98 (no gain on SYRK and atomicAggregate there: the header's own compile shares the cores) and to 0.95 to 1.00 once the machine has the header. Built, measured, not kept: **compiling a selection in pieces** that survive the process, several at once on idle CPUs (no program got warm sooner: SYRK's selection is one region of 200 ops, asyncAllocation's first piece is longer than its run at 16 threads). Measured, not built: `-O1` (compiles 30 % faster, its code 13 to 29 % *slower* than the tier), `-fno-unroll-loops` (keeps a third of the gain), fifteen simulator threads while a compile runs at sixteen (no change), an adaptive threshold (below).
+
+Host: server3 (Ryzen 7 PRO 8840U, 8 cores / 16 threads, g++ 13.3), shared with two other sessions under `flock /tmp/pantheonsim-builder.lock`, everything `nice -n 19`, builds `-j3`, Release, `-g1`, `VGPU_LTO=OFF`, `VGPU_JIT_MUTANTS=ON`. Base B: `hostgpu-relaxed` f55c8e65 (round sp63 merged). N: B and commit 65b096b2 (the kept code). P: N and the pieces (not kept). Corpus: round sp57's prebuilt sm_86 programs with `real.py`'s sizes, `VGPU_GPU=nvidia/rtx3060`. The build trees and the JIT caches were on tmpfs (`/dev/shm`, linked from `~/.cache/sp64`): server3's root file system is a USB stick, which stalled the first build's archive step for minutes at 90 % I/O pressure. Data and scripts: `docs/perf-design/data/sp64/`.
+
+### 1. Where a compile's time goes (`timeline.md`, `probes.md`)
+
+One cold run of each program that compiles, on the base build, under `strace -f --seccomp-bpf -e trace=execve,exit_group` (the compiler's processes only; the simulator's threads make no such calls):
+
+| program | threads | run s | source | threshold (cc1plus starts) | cc1plus ends | object linked | object after the run |
+|---|---:|---:|---:|---:|---:|---:|---|
+| SYRK | 1 | 6.04 | 163 KB | 2.69 s | 5.01 s | 5.05 s | yes |
+| gaussian | 1 | 3.89 | 43 KB | 2.61 | 3.44 | 3.47 | yes |
+| asyncAllocation | 1 | 3.70 | 167 KB | 1.31 | 3.60 | 3.65 | yes, 0.04 s before the end |
+| atomicAggregate | 1 | 3.78 | 41 KB | 2.33 | 3.11 | 3.14 | yes |
+| SYRK | 16 | 1.97 | 163 KB | 0.63 | (cancelled) | | no |
+| gaussian | 16 | 1.20 | 43 KB | 0.71 | (cancelled) | | no |
+| asyncAllocation | 16 | 1.52 | 167 KB | 0.53 | (cancelled) | | no |
+| atomicAggregate | 16 | 0.96 | 41 KB | 0.63 | (cancelled) | | no |
+
+(One thread: `taskset -c 12-15`; the strace costs these runs 3 to 10 %.) The driver, `as`, `collect2` and `ld` take 40 ms of a compile; the rest is cc1plus. On the kept sources, one CPU (`ccost.sh`, `hdrcost.sh`): a file that includes only the runtime header takes 0.43 s at `-O2`, `-fsyntax-only` of it 0.35 s, of which `<immintrin.h>` is 0.29 s, `<cmath>` 0.09, `<algorithm>` 0.09; the whole sources are parsed in 0.36 to 0.39 s, so the rest of a compile is the optimiser and code generation: 0.72 to 0.77 s for 41 to 43 KB, 2.18 to 2.37 s for 163 to 167 KB (about 0.8 KB and 12 ms of compile per op: SYRK's selection is 217 ops in three regions, one of them the 200-op cap, asyncAllocation's 196 in nine).
+
+The threshold in wall time: 100 M region instructions come 1.3 to 2.7 s into a program at one thread and 0.4 to 0.7 s into it at sixteen (about four times sooner: sixteen threads on eight cores). The programs are as much shorter, so the threshold falls at the same place in the run (35 to 78 %), and what changes is that a compile of fixed length (0.8 to 2.4 s) no longer fits in what is left. A threshold that follows the thread count would move the compile earlier in wall time only by moving it earlier in the program, with the profile it chooses regions from; for these programs, at 16 threads, no threshold makes a 0.8 s compile fit in a 0.9 s run, and at one thread an earlier threshold moves the compile into programs that are now never compiled. Not built.
+
+### 2. The levers, measured before anything was built (`probes.md`)
+
+* **The counting loop while a compile runs** (`ab.py`, three runs a side, an empty cache before every run). A compiler that never finishes keeps a section Queued for the rest of the run; one that fails at once makes it Failed (the plain loop). Base build, one thread: gaussian 0.951 against 0.985 of the default, asyncAllocation 0.914 against 0.988, atomicAggregate 0.970 against 0.994, SYRK 0.962 against 0.953; sixteen threads: gaussian 0.918 against 0.956, asyncAllocation 0.906 against 0.925, atomicAggregate 0.968 against 0.994, SYRK 0.984 against 0.992. That is 2 to 8 % for as long as a compile runs, and Queued counts nothing (`Unit::note` returns for it) and has no generated code yet. With the change below the never-finishing compiler costs what the failing one does (gaussian 0.998 and 0.968, asyncAllocation 0.973 and 0.967).
+* **`-O1` and `-fno-unroll-loops`** (`VGPU_JIT_FLAGS`, warm, one thread): `-O1` compiles 25 to 36 % faster and its code is slower than the tier's (SYRK 0.866, gaussian 0.851, asyncAllocation 0.712, atomicAggregate 0.773, SYR2K 0.985 of the default, against 1.136, 1.046, 1.259, 1.132, 1.170 at `-O2`): it does not vectorise the lane loops. `-fno-unroll-loops` compiles 0 to 22 % faster and keeps a third of the gain (1.027, 1.002, 1.090, 1.050, 1.057). So "a cheap first compile and an optimised one later" has no cheap form to start with; `-O1 -ftree-vectorize` compiles 12 to 24 % faster, its code was not measured.
+* **A precompiled header** (`pchprobe.sh`): made once in 1.03 to 1.11 s (53 MB), a compile with it takes 0.35 s instead of 0.73 (atomicAggregate), 0.53 instead of 0.77 (gaussian), 1.81 instead of 2.19 (SYRK), 1.67 instead of 2.04 (asyncAllocation). With `-include` of a header holding the four lines every generated source starts with, the source unchanged, the object is the same bytes (`cmp`).
+* **A core of its own at sixteen threads** (`VGPU_THREADS=15` against the default, five runs, the second-run side of round sp63, on N): SYRK 0.922 against 0.923, gaussian 0.921 against 0.914, asyncAllocation 0.918 against 0.913, atomicAggregate 0.935 against 0.947; and 15 threads without the JIT cost nothing either (0.990 to 1.014: sixteen threads on eight cores). No compile finished in either. Not built.
+* **Compiles in parallel processes**: built as part of the pieces (section 5).
+
+### 3. Kept: the plain loop while a compile runs
+
+`Unit::hook()` is now true for Idle, Looking, Counting and Ready and false for Queued (as it was for Failed, Declined and Waiting): a section whose compile is running runs on the plain loop and is back in the hook loop when the publish makes it Ready (`step_warp` asks at every call). Queued counted nothing before either, so the regions chosen and the object are the same; the run loop's other states are unchanged. This is most of the gain at 16 threads below.
+
+### 4. Kept: the precompiled runtime header, the compile log
+
+`Engine::obtain` builds the compile's flags once, and with GCC (the compiler's identity does not name clang; `VGPU_JIT_PCH=0` turns it off) looks in the runtime directory for `vgpu_jit_pch-<hash>.h` and its `.gch`, the hash over the four lines, the flags and the compiler's identity. If they are there the compile gets `-include` of it; if not, the manager makes it after the first compile of the process that found none, once, after that compile's object is published (`Engine::build_pch`: the header's text and the `.gch` each written under a name of their own and renamed into place). GCC ignores a `.gch` that does not fit or cannot be read and reads the text (a compile that failed with one was at first run again without it; no test could reach that path, below, and it was removed). The size cap of round sp63 counts it (53 MB in the runtime directory of the directory in use, which the cap never removes). `VGPU_JIT_STATS` now ends with a `jit-pch:` line and one `jit-compile:` line a compile: why (`threshold`, `history`), regions, ops, bytes of source, when it was asked for, started and done (ms since the library was loaded), how long, and how it ended (`ok`, `cancelled`, the failure; `precompiled header`).
+
+The header is made after a compile that succeeded, so it does not exist until some program on the machine has finished a compile; at 16 threads the short programs here never do, and a cold cache in the tables below has none. The sides `bp` and `bq` of `sp64.py` keep the runtime directory (the header and the compiler's identity) and empty the rest: the first and the second run of a new program on a machine whose cache has been used.
+
+### 5. Built and not kept: compiling a selection in pieces, several at once
+
+`pieces-not-kept.patch`: a selection of more than `VGPU_JIT_PIECE_OPS` (64) ops compiled as runs of consecutive regions of about that many ops, each its own object (so that the pieces a cut-off compile finished stay for the next run, which compiles only the others, and the lookup finds the selection when every piece is in), up to `VGPU_JIT_JOBS` at once (default: the CPUs the simulator's threads leave idle). Its unit tests (the pieces of a selection, a failed piece keeping the ones before it, the next compile doing only the missing ones and the lookup then finding the whole, two jobs overlapping and one not, the default jobs from `VGPU_THREADS`) passed but one, a wrong expectation of the test itself (a last piece of exactly half the size stays a piece), corrected and not run again before the change was removed. Measured (`sequence.md`, six runs on one cache at 16 threads, four at one): no program reached an object sooner. SYRK's selection is three regions of which one is the 200-op cap: one piece. asyncAllocation's is two pieces, and at 16 threads the first is not done 1.0 s after its lookup (its run is 1.08 s), so no run finished one in six; at one thread the second run compiled both at once and finished them (two objects), but ran 3.68 s against 3.21 for N's single compile (CPUs 12 to 15 are two cores: two compilers share them with the simulator). Every piece pays the header again until the precompiled one exists. Removed.
+
+### 6. The tables
+
+Sides as round sp63's (`sp64.py`): **Ba**, **Na** the base and the changed build with nothing set; **Bbc**, **Nbc** `VGPU_JIT=1` cold (the cache emptied before every run); **Bbw**, **Nbw** warm (filled by one untimed `VGPU_JIT_SYNC=1` run); **Bbs**, **Nbs** the second run (the cache emptied, one untimed run, then the timed one); **Nbp**, **Nbq** cold and second run with the runtime directory kept. Each build's speed-ups are against its own default; **N/B** is the changed build's over the base build's (cold, warm, second run). Interleaved, medians of 5 (3 over one second). Every run writes `VGPU_COUNTERS_FILE` and `VGPU_MEMO_FINAL_HASH`.
+
+**Sixteen threads** (the default, no pinning; round sp63's 18 programs; `td.md`):
+
+| programs | n | default B/N | base cold | base warm | base second | cold | cold, header there | warm | second | N/B cold | N/B warm | N/B second |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| all | 18 | 1.004 | 0.948 | 1.033 | 0.974 | 0.947 | 0.972 | 1.032 | 0.987 | 0.999 | 0.999 | 1.013 |
+| with objects | 5 | 1.002 | 0.916 | 1.138 | 0.926 | 0.940 | 0.946 | 1.136 | 0.967 | 1.027 | 0.998 | 1.044 |
+| without | 13 | 1.005 | 0.961 | 0.995 | 0.993 | 0.950 | 0.982 | 0.995 | 0.995 | 0.988 | 1.000 | 1.001 |
+| 0.2 s and longer | 14 | 1.004 | 0.949 | 1.044 | 0.969 | 0.951 | 0.969 | 1.046 | 0.985 | 1.002 | 1.001 | 1.017 |
+
+| program (16 threads) | default s | base cold | cold | base second | second | base warm | warm |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| gaussian | 0.895 | 0.893 | 0.929 | 0.836 | 0.904 | 1.106 | 1.096 |
+| asyncAllocation | 0.988 | 0.858 | 0.903 | 0.851 | 0.909 | 1.245 | 1.232 |
+| atomicAggregate | 0.908 | 0.962 | 0.974 | 0.921 | 0.952 | 1.100 | 1.080 |
+| SYRK | 1.808 | 0.935 | 0.942 | 0.908 | 0.928 | 1.113 | 1.112 |
+| SYR2K | 3.551 | 0.933 | 0.955 | 1.146 | 1.166 | 1.130 | 1.166 |
+
+* **Blocker 1, the 16-thread second run: smaller, not gone.** No cold or second run of gaussian, asyncAllocation, atomicAggregate or SYRK left an object on either build; SYR2K (3.6 s) finishes its compile in the cold run on both. On one cache, run after run (`sequence.md`, six runs each), base against N: gaussian 0.825 to 0.920 of the default, asyncAllocation 0.835 to 0.915, atomicAggregate 0.915 to 0.951, SYRK 0.917 to 0.925, and no run was warm on either. The compile at the lookup (round sp63's history) starts 20 to 70 ms into each run and is cancelled at its end (the compile log of P's runs, `sequence.md`: SYRK 1.9 s of compile in a 1.95 s run, asyncAllocation 1.0 s of its first piece in 1.08 s). What is left is the compile itself: it is longer than the program. The precompiled header does not change that: the second run with it there (`tdq.md`, five runs) is gaussian 0.908, asyncAllocation 0.911, atomicAggregate 0.937, SYRK 0.930 of the default against 0.917, 0.918, 0.939, 0.928 without it, and no object.
+* The programs that compile nothing: 0.988 / 1.000 / 1.001 (N/B); the four that miss the 3 % bar in this pass (GEMVER 0.919 second, 0.957 warm; JACOBI1D 0.949 cold; bilateral 0.970 cold) compile nothing, and nine runs a side again (`td-recheck.md`) give JACOBI1D 0.981, bilateral 1.020, JACOBI2D 1.013 cold, and GEMVER 0.938 cold, 1.065 warm and 0.933 second run: a program of 0.31 s whose single runs spread from 0.30 to 0.40 s on every side of both builds (the sorted walls are in the file). Nine runs a side once more (`gemver-recheck.md`): GEMVER's second run 0.313 s (base), 0.311 (N), its cold run 0.331 and 0.333 at sixteen threads, 0.642 and 0.643, 0.654 and 0.660 at one; JACOBI1D 0.769 and 0.784, 0.742 and 0.762 at sixteen (and P, with the same code for a program that compiles nothing, 0.771 and 0.781).
+* "Cold, header there": the programs that compile nothing gain most from it (backprop 0.887 to 1.001, asmooth 0.898 to 0.973, ADI 0.945 to 0.982): it keeps the compiler's identity too, so the run asks no `--version` and `-dumpmachine` (two forks of a process of sixteen running threads). A user's cache keeps both after the first program.
+
+**One thread** (`VGPU_THREADS=1`, `taskset -c 12-15`, two cores; the 5 programs that compile and 10 that do not; `t1.md`):
+
+| programs | n | default B/N | base cold | base warm | base second | cold | cold, header there | warm | second | second, header there | N/B cold | N/B warm | N/B second |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| all | 15 | 1.008 | 0.969 | 1.040 | 1.023 | 0.973 | 0.988 | 1.035 | 1.020 | 1.037 | 1.004 | 0.996 | 0.997 |
+| with objects | 5 | 1.018 | 0.962 | 1.164 | 1.097 | 0.964 | 0.991 | 1.149 | 1.092 | 1.146 | 1.003 | 0.987 | 0.995 |
+| without | 10 | 1.003 | 0.972 | 0.983 | 0.988 | 0.977 | 0.986 | 0.982 | 0.986 | 0.987 | 1.005 | 1.000 | 0.997 |
+
+| program (1 thread) | default s | base cold | cold | cold, header there | base second | second | base warm | warm |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| asyncAllocation | 3.171 | 0.915 | 0.948 | 0.952 | 0.973 | 0.970 | 1.290 | 1.264 |
+| gaussian | 3.748 | 0.947 | 0.980 | 1.004 | 1.067 | 1.080 | 1.061 | 1.066 |
+| SYRK | 5.434 | 0.950 | 0.925 | 0.976 | 1.151 | 1.147 | 1.174 | 1.144 |
+| atomicAggregate | 3.667 | 0.976 | 0.960 | 0.996 | 1.129 | 1.110 | 1.121 | 1.113 |
+| SYR2K | 10.351 | 1.023 | 1.011 | 1.031 | 1.178 | 1.165 | 1.186 | 1.169 |
+
+* **Blocker 2, the first cold run: smaller for two of the four, and with the header there for all four.** asyncAllocation 0.915 to 0.948, gaussian 0.947 to 0.980 (the plain loop while the compile runs); SYRK 0.950 to 0.925 and atomicAggregate 0.976 to 0.960 are worse cold (N/B 0.974 and 0.983, inside the bar): their compile ends with a second left in the run, and the header's own compile (1 s) then runs beside the simulator on two cores (inferred: the two were not separated). With the header there (the first run of a new program on a used machine) the four are 0.952, 1.004, 0.976 and 0.996. The warm and second runs are unchanged within the noise (N/B 0.987 and 0.995 over the five).
+* Same bits: every run of every side (fills, the untimed first runs and both passes' rechecks included) equal to the default's first run in output, exit status, counters and final memory hash: 15 of 15 programs at one thread, 16 of 18 at sixteen (bh and radixsort2 differ from themselves on the default at sixteen threads, as in rounds sp57 and sp63), and every run of the probes and the sequences.
+* The default path: `Unit::hook()` is not called without `VGPU_JIT` (`step_warp` tests the unit first), and nothing else of the run loop changed; base over changed default 1.004 at sixteen threads, 1.008 at one.
+
+### Tests and mutants
+
+`tests/unit/test_jit_threads.cpp` (ctest `test_jit_threads`): the hook predicate in every state; a section whose compile (a fake compiler that sleeps) runs on the worker is Queued and not hooked (a child process of the test); the compile log (one line for a compile and none for a cache hit, its fields, after the summary); the precompiled header (a process of two compiles: the first without, the header made after it, the second with it; the next process reads it from its first compile and makes none; a damaged header does not fail a compile; `VGPU_JIT_PCH=0` makes and reads none). Mutants: copies of `jit.hpp` or `jit.cpp` with one change each, compiled outside the tree with the build's own command line and linked into the test (`scripts/mutants.sh`, `mutants_all.sh`; `mutants.log`): of eight, seven fail the test (`queued_hooked`: Queued hooked again; `no_compile_log`; `log_before_summary`; `pch_never_used`; `pch_never_built`; `pch_ignores_env`; `pch_made_first`: the header made before the first compile), the pristine build passes. `pch_no_fallback` survived: it removed the second compile without the header after a compile that failed with it, a path no test reaches because GCC ignores a `.gch` it cannot use (the test's one of garbage did not fail the compile); the path was removed (second commit), and the test passed again on that build. The unit tests of the JIT (`test_jit_cold`, `test_jit_wait`, `test_jit`, `test_jit_share`, `test_jit_threads`) and the run-loop legs `test_sass_chain_cont_jit`, `test_sass_chain_cont_jit_wait`, `test_sass_chain_cont_jit_prewait` and `test_sass_store_gate_jit` passed on N (`tests.log`). The `e2e_sass_jit` shards need nvcc and are CI-only: not run.
+
+### What is left before the JIT could be default-on
+
+| blocker | state |
+|---|---|
+| At sixteen threads a compile of 0.8 to 2.4 s never finishes in a program of 0.9 to 1.8 s, so the program is never warm | **smaller**: 5 to 8 % a run instead of 8 to 18 % (the plain loop while the compile runs); open. The work would have to survive the process: pieces do not split SYRK's 200-op region and asyncAllocation's first piece is still longer than its run; a compile that outlives the process is ruled out. Left: a compile of much less code (the region cap, or generated code that calls more and inlines less), or accepting that such a program is not compiled at sixteen threads (a threshold in instructions per thread would not compile it at all, and save the 5 to 8 %) |
+| The first cold run of a program of 3 to 10 s | **smaller** with the header there (0.95 to 1.00 at one thread); 0.93 to 0.98 on an empty cache, where the header's own compile costs SYRK and atomicAggregate 1 to 2 % |
+| A default forks a compiler out of every long user process; linking's CI; the SASS ctest legs as JIT legs | open, as round sp63 left them |
+
+### What was not verified
+
+* The 16-thread numbers are with the simulator *and* the compiler at nice 19 (the machine's rule): the compiler's own `setpriority(10)` cannot lower a nice of 19, so the two compete as equals. On a user's machine (the simulator at 0, the compiler at 10) the compiler gets about a tenth of a CPU while sixteen simulator threads run, and every compile at 16 threads is longer than measured here. Not measurable under the rule.
+* The caches were on tmpfs; a user's cache on a disk writes the 53 MB header once.
+* clang (the header is GCC's only), g++-12 beyond `-fsyntax-only -Wall -Wextra` of the changed files (no warnings), sanitizer builds: not built. `VGPU_JIT_LINK=1` and `VGPU_JIT_FUSE=1`: not measured (their compiles are two to three times as long).
+* At one thread 15 programs, not round sp63's 51: a program that compiles nothing can see the change only through `Unit::hook()` with `VGPU_JIT` set (one more compare for a section on the plain loop), and the 10 controls show none.
+* A threshold per simulator thread, and the code `-O1 -ftree-vectorize` makes: not built, not measured.

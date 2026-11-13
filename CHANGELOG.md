@@ -7,6 +7,15 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Tier 2 (`VGPU_JIT=1`, still off by default), the compile ([round sp64](docs/perf-design/rounds/11-rounds-sp36-sp41.md)): a section
+  whose compile is running is now on the plain run loop instead of the counting loop, which cost the program 2 to 8 % for as long as the
+  compile took (a whole run when the compile did not finish before the end, as at sixteen threads). With GCC the runtime header that every
+  generated source includes is compiled once into the cache's runtime directory (about 53 MB) after the first compile of a process that
+  found none, and every later compile reads it: 0.33 to 0.37 s less a compile on the measuring host, half of a small section's, the same
+  object bytes; `VGPU_JIT_PCH=0` turns it off. `VGPU_JIT_STATS` prints a `jit-compile:` line for each compile (why, size, when it was asked
+  for, started and done, how it ended) and a `jit-pch:` line. At sixteen threads a compile longer than the program still never finishes.
+  Results and counters are unchanged.
+
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the
