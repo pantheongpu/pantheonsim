@@ -2078,6 +2078,9 @@ target_compile_definitions(test_amd_gcn_cdna_gaps PRIVATE VGPU_SOURCE_DIR="${CMA
 # Three bugs other programs ran into (issues #578, #579, #580): a negative scratch offset, a scalar load into VCC, a packed constant zero.
 vgpu_unit_test(test_amd_gcn_issues_nov11 amd/tests/unit/test_gcn_issues_nov11.cpp)
 target_compile_definitions(test_amd_gcn_issues_nov11 PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# Issue #621: a whole-wave load into accumulation registers the wave had not used yet lost all but the last of them.
+vgpu_unit_test(test_amd_gcn_issue621 amd/tests/unit/test_gcn_issue621.cpp)
+target_compile_definitions(test_amd_gcn_issue621 PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # A kernel with a dynamic stack gets the device's stack size of scratch (issue #585): the code object and execute, then a HIP launch.
 vgpu_unit_test(test_amd_gcn_dyn_stack amd/tests/unit/test_gcn_dyn_stack.cpp)
 target_compile_definitions(test_amd_gcn_dyn_stack PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -2660,6 +2663,14 @@ set_tests_properties(amd_hip_version PROPERTIES DEPENDS vgpuhip
 # When a captured copy takes its host source: at launch for heap and live locals, at capture for a gone frame's.
 add_test(NAME amd_graph_host_source COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_graph_host_source.sh)
 set_tests_properties(amd_graph_host_source PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
+# hipGraphInstantiateWithParams with Upload and an uploadStream, and the other flags ROCm takes there (#628).
+add_test(NAME amd_graph_instantiate_params COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_graph_instantiate_params.sh)
+set_tests_properties(amd_graph_instantiate_params PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
+# A failing module or function call is the thread's last error, as in ROCm's HIP (#635).
+add_test(NAME amd_module_last_error COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_module_last_error.sh)
+set_tests_properties(amd_module_last_error PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
 # The GCN decoder against the real assembler, on a code object built here and now.
 add_test(NAME amd_gcn_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_gcn_disasm.sh)

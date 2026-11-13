@@ -24,6 +24,13 @@ release says what runs and what it produces, never how fast a real GPU would run
   bridge). The remote-end and setting displays (`-p`, `-R`, `-ec`, `-gLowPwrInfo`, `-gBwMode`, `-gLWidth`, `-info`) are refused on a GPU with
   links, the changes (`-re`, `-sBwMode`, ...) everywhere, and an unknown option prints `Option "X" is not recognized.` and exits 2 as nvidia-smi
   does. jpmorganchase/QOKit runs `nvidia-smi nvlink -cBridge` with `check=True` when its tests are collected (pantheonsim #640).
+- AMD: a load into accumulation registers that the wave had not used yet, made for the whole wave at once (`global_load_dwordx2 a[38:39], v2,
+  s[6:7] offset:200`, every lane at one address, as a Kokkos kernel loads a pointer out of a structure), fills every register it names. The
+  register file grows to the highest accumulation register named, and growing it for the second register moved the first one's row, which
+  then went to the freed copy: a38 kept what it held before, and the next load through the pointer stopped with "invalid-pointer ...
+  address is not inside any device allocation" at a small address (llnl/exadis on the simulated MI300X, pantheonsim #621). The file now grows
+  to the last register before any row is taken (the whole-wave loads of two, three and four dwords and the whole-wave store of three or
+  four). It surfaced with host-mapped memory taking the whole-wave path (#507): exadis's data is managed memory, which went lane by lane before.
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the
@@ -92,6 +99,19 @@ release says what runs and what it produces, never how fast a real GPU would run
 - NPP, CUDA 12 build: `nppGetStreamContext`, `nppGetStream` and `nppSetStream` (NPP 12's own stream, which CUDA 13's NPP removed)
   are exported from the shim, filling the context as NPP 12.3 does on an RTX 3060. New e2e test `e2e_npp_stream_context` (skips
   on CUDA 13). `nppiFilterGaussBorder_8u_C1R_Ctx` is still absent (pantheonsim #617).
+- HIP: `hipGraphInstantiateWithParams` takes `hipGraphInstantiateFlagUpload` and `hipGraphInstantiateFlagDeviceLaunch`, as ROCm's
+  HIP does there (all four flags); it refused anything but AutoFreeOnLaunch and UseNodePriority with `hipErrorInvalidValue`, so
+  Colvars, which instantiates its graphs with Upload and an `uploadStream`, stopped on its first frame. With Upload the graph is
+  uploaded on `uploadStream` as `hipGraphUpload` does, which queues no work here (the executable graph is already the one a launch
+  runs); `result_out` and `errNode_out` are set as ROCm sets them. DeviceLaunch only shows in `hipGraphExecGetFlags`, as in ROCm.
+  `hipGraphInstantiateWithFlags` still refuses both, as ROCm does. New e2e test `amd_graph_instantiate_params` (pantheonsim #628).
+- HIP: a failed `hipModuleLoad` is the thread's last error, as in ROCm's HIP, where every API returns through `HIP_RETURN`: a missing
+  file (`hipErrorFileNotFound`) and an empty one (`hipErrorInvalidImage`) were returned but not recorded, so `hipGetLastError` then said
+  `hipSuccess`. OpenMM's HIP platform reads `hipGetLastError` after a miss in its kernel cache and stopped with "Detected HIP error: no
+  error" at the first kernel of every `TestHip*` program. `hipModuleGetFunction` and `hipModuleGetGlobal` now check their arguments in
+  ROCm's order and with its codes: a null module is `hipErrorInvalidResourceHandle` (`hipModuleGetFunction` said `hipErrorInvalidValue`)
+  and an empty kernel name is `hipErrorInvalidValue`. New e2e test `amd_module_last_error`, which also holds the other module and link
+  entry points to recording their errors (pantheonsim #635).
 
 - Peer access: after `cudaDeviceEnablePeerAccess` (or `cuCtxEnablePeerAccess`), a kernel on one simulated device reads, writes and
   atomically updates the peer device's allocations in place, as on a card (unified addressing). It stopped with `[invalid-pointer]
