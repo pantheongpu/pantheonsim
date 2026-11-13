@@ -285,7 +285,8 @@ inline InsnClass turbo_class(const std::string& mnemonic, const std::vector<std:
   if (exact_opcode_allowed(mnemonic, mods)) return C::Exact;
   if (mnemonic == "MUFU") return C::Mufu;
   if (is_one_of({"HADD2", "HMUL2", "HFMA2", "HSETP2", "HSET2", "HMNMX2"})) return C::Half;
-  if (is_one_of({"CALL", "RET"})) return C::Call;
+  // (LEPC: the return address of an absolute call, CUDA 13's vprintf call; the card's own program counter, used by the call and its RET alone. Round sp66.)
+  if (is_one_of({"CALL", "RET", "LEPC"})) return C::Call;
   if (is_one_of({"HMMA", "IMMA", "DMMA"})) return C::Tensor;
   // (Round sp66: B2R reads the result of a block's BAR.RED, the same function on both sides; NANOSLEEP is a hint that a spin-wait backs off, as cub's
   // decoupled look-back does: neither touches anything the card lacks)

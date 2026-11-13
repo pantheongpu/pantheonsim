@@ -895,6 +895,7 @@ VTEST(turbo_classes_every_kind_of_instruction) {
   for (const char* m : {"IDP", "VABSDIFF", "VABSDIFF4", "VIADDMNMX", "VIMNMX3", "FMNMX3", "F2IP", "FSWZADD", "REDUX", "LDGSTS", "LDGDEPBAR", "LDSM", "MOVM",
                         "FFMA2", "FMUL2", "FADD2", "B2R", "NANOSLEEP"})
     VCHECK(turbo_class(m, {}) == C::Extra);
+  VCHECK(turbo_class("LEPC", {}) == C::Call && !exact_opcode_allowed("LEPC", {}));   // (Round sp66: the return address of vprintf's call)
   VCHECK(turbo_class("B2R", {"RESULT"}) == C::Extra && !exact_opcode_allowed("B2R", {"RESULT"}));   // (Round sp66; exact's set is unchanged)
   // never: textures, surfaces, what nobody named, what is not an instruction
   for (const char* m : {"TEX", "TLD", "TLD4", "TXD", "SULD", "SUST", "QMMA", "BMMA", "OMMA", "HGMMA", "JMP", "BPT", "SYNCS", "STSM", "UTCMMA",

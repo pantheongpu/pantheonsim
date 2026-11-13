@@ -30,7 +30,7 @@ external functions) is decided apart, by the same rules in both modes, in sectio
 | mufu | every `MUFU` form, `RCP64H` and `RSQ64H` included | admitted | `VGPU_HOST_GPU_TURBO_OFF=mufu` |
 | half | `HADD2`, `HMUL2`, `HFMA2`, `HSETP2`, `HSET2`, `HMNMX2` | admitted | `=half` |
 | float-red | `RED` / `REDG` on a float type (no value returned) | admitted | `=red` |
-| call | `CALL` and `RET`, when every call is relative, to a label inside the kernel's own code section, or (Round sp66) absolute, to the first instruction of another code section of the module, whose code is then classed with the kernel's | admitted | `=call` |
+| call | `CALL`, `RET` and `LEPC` (the return address of an absolute call; Round sp66), when every call is relative, to a label inside the kernel's own code section, or (Round sp66) absolute, to the first instruction of another code section of the module, whose code is then classed with the kernel's | admitted | `=call` |
 | extra | `IDP`, `VABSDIFF`, `VABSDIFF4`, `VIADDMNMX`, `VIMNMX3`, `FMNMX3`, `F2IP`, `FSWZADD`, `REDUX`, `LDGSTS`, `LDGDEPBAR`, `LDSM`, `MOVM`, `FFMA2`, `FMUL2`, `FADD2`, integer `REDG`; `B2R`, `NANOSLEEP` (Round sp66) | admitted | `=extra` |
 | tensor | `HMMA`, `IMMA`, `DMMA` | admitted | `=tensor` |
 | atomic-int | `ATOM`, `ATOMG`, `ATOMS` on integers with `ADD`, `MIN`, `MAX`, `AND`, `OR`, `XOR`, `INC`, `DEC`; `RED` with `INC`, `DEC`, `POPC` | admitted | `=atomics` |
@@ -406,4 +406,4 @@ process (the window mirrors the allocation table: an alias of one physical page 
 same on the card without mirroring the mappings themselves); arguments that point into mapped or managed host memory (the card could reach that
 memory through `cuMemHostRegister` at the same address where the device says so, `CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM`, but
 the mode would have to register every such range before a launch and the residency protocol does not cover memory the card reads over the bus; in
-the census 3.4 s are behind it, nearly all of them HeCBench `zerocopy`, a program written to time zero-copy access); cooperative and cluster launches and warp size (launch shapes the card path does not build). `VGPU_HOST_GPU_WIDER=0` restores all of the rules before the round, for A/B runs (the benchmark's forms `exactn` and `turbon`).
+the census 3.4 s are behind it, nearly all of them HeCBench `zerocopy`, a program written to time zero-copy access); cooperative and cluster launches and warp size (launch shapes the card path does not build). `VGPU_HOST_GPU_WIDER=0` restores the safety rules and the atomics opt-in of before the round, for A/B runs (the benchmark's forms `exactn` and `turbon`); the class scan's additions (calls into another section, `B2R`, `NANOSLEEP`, `LEPC`) are not switched by it.
