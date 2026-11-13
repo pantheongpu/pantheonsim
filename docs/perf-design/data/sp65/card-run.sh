@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Round sp65, the card part: run on the rig (one A10G), from the root of the source tree, after the corpora are in ~/corp
+# Round sp65, the card part: run on the rig (one A10G), from the root of the source tree, after the corpora are in ~/sp65-corp
 # (tools/bench/real/pack_corpora.sh's layout, the sm_86 binaries built with nvcc 13.0 and -cudart shared). Built on sp61's card-run.sh.
 #   docs/perf-design/data/sp65/card-run.sh <stage> [out dir]        stages: build ci target ab log all, and repeat (not part of all)
 # Forms: exact and turbo send a launch to the card while the card holds the live memory when the pull it saves repays it (the default of this
@@ -11,7 +11,7 @@ stage=${1:?stage}
 out=${2:-$HOME/sp65-out}
 root=$(pwd)
 build=$HOME/sp65-build
-corp=$HOME/corp
+corp=${SP65_CORP:-$HOME/sp65-corp}
 mkdir -p "$out"
 export PATH=/usr/local/cuda-13.0/bin:$PATH NVCC=/usr/local/cuda-13.0/bin/nvcc
 H="python3 tools/bench/hostgpu/run.py --build $build --corp $corp --gpu nvidia/a10g"
