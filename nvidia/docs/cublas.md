@@ -92,6 +92,16 @@ increment that is not positive, which is what the hardware does too.
 The level 1 routines also have their 64-bit-index forms (`cublasDnrm2_64` and
 so on, CUDA 12), with `i?amax_64` answering in an `int64_t`; a size or stride
 beyond the range of `int` is refused.
+A reduction's result pointer follows the pointer mode, with one exception an
+RTX 3060 (cuBLAS 13.1) shows and programs rely on (GauXC's `gdot`, #638): in
+host mode, a dot product (`?dot`, `?dotu`, `?dotc`, `DotEx`, `DotcEx` and their
+`_64` forms) with n > 0 stores its result through a pointer that is device
+memory, as in device mode. With n <= 0, and for every other reduction (`?nrm2`,
+`?asum`, `i?amax`, `i?amin` and their Ex and `_64` forms), the card writes to
+that pointer as host memory and the process crashes; here those calls return
+`CUBLAS_STATUS_INVALID_VALUE`, said once on stderr, and leave the device word
+alone. A managed result is host memory and is written in host mode, as on the
+card (`test_cublas_host_mode_device_result`).
 The typed level-1 routines (`DotEx`, `DotcEx`, `Nrm2Ex`, `AsumEx`,
 `I?amaxEx`, `AxpyEx`, `ScalEx`, `CopyEx`, `SwapEx` and their `_64` forms)
 take half, bfloat16, single, double and complex elements, with the table of

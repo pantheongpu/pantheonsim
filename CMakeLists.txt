@@ -2968,6 +2968,12 @@ if(TARGET vgpucublas)
   target_include_directories(test_cublas_band_heap PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
   add_test(NAME test_cublas_band_heap COMMAND test_cublas_band_heap)
   set_tests_properties(test_cublas_band_heap PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1" TIMEOUT 600)
+  # The reductions in host pointer mode with a device result: the dot products store through it, the rest are refused (#638).
+  add_executable(test_cublas_host_mode_device_result nvidia/tests/unit/test_cublas_host_mode_device_result.cpp)
+  target_link_libraries(test_cublas_host_mode_device_result PRIVATE vgpucublas vgpucudart)
+  target_include_directories(test_cublas_host_mode_device_result PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_cublas_host_mode_device_result COMMAND test_cublas_host_mode_device_result)
+  set_tests_properties(test_cublas_host_mode_device_result PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1" TIMEOUT 300)
 endif()
 # cublasGemmEx with half, bfloat16 and int8 operands, likewise.
 if(TARGET vgpucublas)
@@ -4889,6 +4895,13 @@ set_tests_properties(e2e_async_host_events_driver PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 600)
+# Copies, fills, symbol copies, cudaFreeAsync and kernel launches behind a host function that waits for the host return at once and
+# run after it, in stream order; the synchronous calls wait for them (#634).
+add_test(NAME e2e_async_host_copies COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_async_host_copies.sh)
+set_tests_properties(e2e_async_host_copies PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 300)
 # A kernel launch returns before the kernel finishes; events and streams behind it are not ready until it has run (#523).
 add_test(NAME e2e_async_launch_events COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_async_launch_events.sh)
 set_tests_properties(e2e_async_launch_events PROPERTIES

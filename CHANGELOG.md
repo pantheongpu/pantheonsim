@@ -7,6 +7,16 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Runtime: a copy, fill or kernel launch issued on a stream behind a host function that has not finished returns at once and runs
+  after it, in stream order, as on an RTX 3060. It used to run inside the call after waiting for the host function, so a host function
+  that waits for something the program does after the call (Celeritas' `AsyncSnapshotTest.device_pending`) hung the program.
+  `cudaMemcpyAsync`, `cudaMemsetAsync`, the 2D and 3D copies and fills between pointers, the symbol copies, `cudaMemcpyPeerAsync`,
+  `cudaFreeAsync` and kernel launches on any stream the runtime made are queued on the stream's lane when the memory they touch is
+  device or page-locked memory; they see what the host function wrote, and events, stream queries and every synchronizing call wait for
+  them. Copies of pageable memory, managed memory and arrays still wait in the call. `cudaFree`, `cudaFreeHost`, `cudaHostUnregister`
+  and `cudaDeviceReset` wait for queued work first. The 2D, 3D and symbol copies on a stream also follow host functions on that stream
+  now (on a non-blocking stream they ran before them), and `cudaMemcpyPeer` and the synchronous symbol copies follow host functions on
+  the legacy default stream. New e2e test `e2e_async_host_copies`; [design](docs/perf-design/streams.md) (pantheonsim #634).
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the
@@ -66,6 +76,12 @@ release says what runs and what it produces, never how fast a real GPU would run
   destroyed) return `cudaSuccess` and leave the last error alone, as an RTX 3060 does; they returned `cudaErrorInvalidValue`, which
   MaCh3's teardown left in the last error for CUDAProb3's next check to exit on. Unit test in `test_runtime_exports`
   (pantheonsim #618).
+- cuBLAS: a dot product (`?dot`, `?dotu`, `?dotc`, `DotEx`, `DotcEx`, their `_64` forms) in the default host pointer mode
+  with its result pointer in device memory stores the result there, as an RTX 3060 does; it died with SIGSEGV inside the
+  library, which stopped every device XC integration of GauXC (its `gdot` makes this call). The other reductions (`?nrm2`,
+  `?asum`, `i?amax`, `i?amin` and their Ex and `_64` forms), and a dot product with n <= 0, crash on the card with a device
+  result in host mode; they now return `CUBLAS_STATUS_INVALID_VALUE`, said once on stderr, instead of crashing. Measured per
+  routine on the card ([cuBLAS](nvidia/docs/cublas.md)). New unit test `test_cublas_host_mode_device_result` (pantheonsim #638).
 - NPP, CUDA 12 build: `nppGetStreamContext`, `nppGetStream` and `nppSetStream` (NPP 12's own stream, which CUDA 13's NPP removed)
   are exported from the shim, filling the context as NPP 12.3 does on an RTX 3060. New e2e test `e2e_npp_stream_context` (skips
   on CUDA 13). `nppiFilterGaussBorder_8u_C1R_Ctx` is still absent (pantheonsim #617).
