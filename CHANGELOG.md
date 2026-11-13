@@ -7,6 +7,13 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Host-GPU mode (experimental, opt-in), `VGPU_HOST_GPU_VERIFY`: after each compare the chunks whose bytes on the card equal the simulator's
+  stay on the card, and only the others (and what the host wrote since) are pushed before the next launch; before, all live memory was pushed
+  before every launch. The simulator still runs each launch with no card copy valid, and the program's output is the simulator's as before.
+  On a stand-in card (server3, Round sp67) PolyBench 3DCONV under verify goes from 39.3 s to 6.2 s (0.37 s plain), the other seven programs
+  measured from 1.0x to 1.4x faster; the exit summary's "MiB went to the card" is smaller accordingly
+  ([docs/perf-design/10-host-gpu-hooks.md](docs/perf-design/10-host-gpu-hooks.md) section 8, pantheonsim #569).
+
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the

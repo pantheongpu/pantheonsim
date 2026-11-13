@@ -3296,3 +3296,143 @@ The 10 cold: asyncAllocation, bgmv (12 ms, one ms), JACOBI1D (noise, above), SYR
 * `VGPU_JIT_LINK=1` and `VGPU_JIT_FUSE=1` on the changed build.
 * The first pass's changed build also had `vfork`; its numbers for programs that start a compiler were re-measured on the final build (the recheck table), the others start none.
 * Rule deviations: the first ctest run held the machine lock for eleven minutes in one piece; the default-thread pass is three runs a side on 18 programs.
+
+## Round sp67 (host-GPU verify mode's copies, pantheonsim #569; GRAMSCHM in exact mode, the driver start and nvcc 13.2's division, #570)
+
+Branch `sp67-hostgpu-verify`, base `hostgpu-relaxed` f55c8e65. Data, scripts and commands: [`data/sp67/`](../data/sp67/README.md). server3 (Ryzen 7 PRO
+8840U, stand-in card) for builds, tests and the host-side A/B; the A10G of round sp65 for the card runs, shared with that round's timed runs.
+
+### #569: verify mode, measured first
+
+The issue was written from Round sp45: 2DCONV under `VGPU_HOST_GPU_VERIFY=1` took 1.65 s against 0.41 s plain because the simulator's launch ran with
+the card copy valid, and the batched and hot-location paths are off for such an allocation. Round sp59 has since changed verify to give the card copy up
+before the simulator runs the launch (`before_simulated`), so those paths already run. Measured on the base (server3, stand-in card that keeps memory, 5
+interleaved runs): 2DCONV verify 0.70 s against 0.49 s plain, ATAX 0.76 against 0.52, BICG 0.39 against 0.17. The scalar path is gone from the gap; what
+is left is the launch's copies. And sp59's rule has a cost of its own that the issue did not name: every launch pushes all live memory again, so a program
+of many launches on large memory pays it each time: **3DCONV verify 39.3 s against 0.37 s plain** (254 launches, 128 MiB live), where sp45 measured 13.5 s.
+
+Per launch the base did: push every live byte (a read of the simulator's memory and the copy), copy every live byte back into a fresh vector per range (a
+zero fill and a page fault per page), and compare by reading every range into another fresh vector.
+
+### #569: the change
+
+After the compare, a chunk whose card bytes equal the simulator's is a valid card copy again: Host to Both (`keep_verified_chunks`,
+vgpu/host_gpu_track.hpp), and the next launch on the card pushes only the chunks still Host. The compare reads the simulator's memory one 64 KiB chunk at a
+time into a buffer that stays in the cache (`compare_with_card`), and the buffers of the card's bytes are kept from launch to launch. The gate's promises
+and why they hold (the simulator still never runs a launch with a card copy valid; the card still starts every launch from the simulator's memory; host
+writes between launches are seen; the change is made in an exclusive section and voids the lookup memories) are section 8 of
+[10-host-gpu-hooks.md](../10-host-gpu-hooks.md). Plain runs do not reach the code, nor do `exact` and `turbo` runs without verify.
+
+server3, stand-in card (`STUB_CARD_OK=1 STUB_KEEP_MEMORY=1`: the chunks a kernel writes compare different, the others equal, so the stand-in keeps fewer
+chunks than a real card in exact mode, which keeps all), 5 interleaved runs per side, median (range), seconds:
+
+| program | base plain | new plain | base verify | new verify | verify, base / new | new verify / plain |
+|---|---:|---:|---:|---:|---:|---:|
+| 2DCONV | 0.485 (0.456-0.492) | 0.479 (0.458-0.508) | 0.699 (0.680-0.703) | 0.667 (0.656-0.669) | 1.05x | 1.39 |
+| 3DCONV | 0.373 (0.359-0.378) | 0.373 (0.335-0.379) | 39.295 (39.232-39.642) | 6.224 (6.181-6.234) | 6.31x | 16.7 |
+| ATAX | 0.523 (0.514-0.527) | 0.522 (0.522-0.530) | 0.757 (0.747-0.770) | 0.638 (0.636-0.679) | 1.19x | 1.22 |
+| BICG | 0.167 (0.167-0.173) | 0.168 (0.166-0.169) | 0.393 (0.390-0.405) | 0.280 (0.277-0.285) | 1.40x | 1.67 |
+| GESUMMV | 0.239 (0.234-0.240) | 0.239 (0.236-0.241) | 0.465 (0.458-0.475) | 0.426 (0.420-0.427) | 1.09x | 1.78 |
+| MVT | 0.653 (0.639-0.669) | 0.653 (0.641-0.676) | 0.876 (0.871-0.950) | 0.768 (0.746-0.818) | 1.14x | 1.18 |
+| GEMVER | 0.367 (0.352-0.382) | 0.392 (0.359-0.405) | 0.696 (0.676-0.724) | 0.510 (0.487-0.537) | 1.36x | 1.30 |
+| JACOBI1D | 0.456 (0.454-0.463) | 0.461 (0.451-0.466) | 0.682 (0.657-0.690) | 0.662 (0.653-0.665) | 1.03x | 1.44 |
+
+The program's output (stdout without its timing lines) is the same in all 160 runs. Plain runs: the same code (the mode is never constructed), and the two
+builds agree within the run-to-run range on all eight (GEMVER's medians 0.367 and 0.392 with overlapping ranges). The other forms on 2DCONV, 3DCONV and
+ATAX (same machine, 5 runs a side, `data/sp67/ab-server3.md`): `exact` and `turbo` without verify are equal between the builds (0.487 / 0.494, 0.375 /
+0.376, 0.523 / 0.525 s exact; turbo the same to 0.002 s); turbo with verify goes 1.097 to 1.064 s, 39.9 to 6.55 s and 0.756 to 0.644 s.
+
+**On the A10G.** The card A/B was started once while the rig looked free and stopped after 2DCONV and two runs of 3DCONV, when round sp65 started a
+build and its timed runs again (so these runs were shared with that build and are not a clean comparison; `data/sp67/card-ab-part1.txt`): 2DCONV verify
+1.39 s base against 1.33 s new (5 runs each, plain 0.94 to 1.05 s), 3DCONV verify 53.6 s base (one run) against 10.33 s new (two runs), plain 0.86 s;
+every launch identical on the card (`in_set_identical=1` and `=254`, `in_set_different=0`), outputs the same in every run. A clean card A/B of the eight programs is pending: round sp65 kept the rig busy (see the hand-back).
+
+**Against the issue's goal.** 2DCONV, ATAX, MVT and GEMVER verify now run 1.2 to 1.4 times their plain time on the stand-in, and the remainder is the copy
+of all live memory back from the card after each launch and the compare; that copy is what verify is (the card may have written any byte), so a verify run
+cannot come closer to plain than its launches times one copy of live memory each. 3DCONV is the case: 254 launches on 128 MiB stay 16.7 times plain on the
+stand-in (24 ms a launch: the copy back, the compare, and on the stand-in the push of the 64 MiB that the kernel writes and the stand-in does not). Lower
+than that would need the compare on the card (a hash per chunk computed by a kernel of the mode's own, and the bytes of a chunk only when its hash
+differs) or pinned buffers for the copy back (the buffers are now kept, so pinning them would be paid once): neither was built.
+
+**Tests.** `test_host_gpu_track` (20 tests; 3 new: the compare's lists and the bytes it hands over, the chunks that may be kept, and kept chunks under the
+gate: a thread that remembered the allocation asks the gate after the change, a host write sends the chunk back to the simulator, a free drops the entry).
+Mutants (`data/sp67/mutants.txt`): 10 of 10 killed (a differing chunk listed as equal, the short last chunk compared whole, lists not cleared, a Card chunk
+made Both, Both written as Card, every chunk kept, a range of another size not skipped, lookups not voided, the count not published, the voiding inverted).
+`run_host_gpu_stub.sh` step 27 (numbered after round sp65's 24 to 26): program mode `keep`, 1 MiB written by every launch beside 8 MiB no kernel touches,
+with a host memset of 64 KiB of those after the second launch, against a stand-in that keeps memory: 12.1 MiB pushed in exact and turbo mode (36.0 on the
+base, which fails the step), exactly 16 differing chunks per launch (a missed memset would make a 17th), output equal to the mode-off output. The whole
+stand-in test (steps 1 to 23 and 27) passed on server3 against the new build, with `host_gpu_lazy` built by nvcc 13.0 on the rig and a stand-in `nvcc`
+(`data/sp67/fakenvcc.sh`: server3 has no toolkit); against the base build only step 27 failed, as it should. `test_card_gate` 10/10, `test_host_gpu_logic`
+89/89.
+
+### #570 item 1: GRAMSCHM in exact mode
+
+A logged run on the A10G (`data/sp67/card-570.md`; the rig was shared, so read the times as rough and the counts as exact). Each of the 2,048 iterations
+launches `gramschmidt_kernel1` (one thread: the norm of column k, then `sqrtf`), `kernel2` (column k of Q, a division) and `kernel3` (the rest of row k of
+R and the update of A; 2,048 threads, a loop over 2,048 rows). Three allocations of 16 MiB each are live.
+
+* `kernel1` is refused for `MUFU.RSQ R7, R0`: it is the `sqrtf` idiom (`MUFU.RSQ`, two `FMUL`s and two `FFMA`s refining it, a range check and a `CALL` to a
+  slow path that scales the argument; "not the division idiom: a CALL with no FCHK before it"). `kernel2` is refused for `MUFU.RCP`, the division idiom,
+  unless `VGPU_HOST_GPU_DIV=1`; with it, `kernel2` is admitted and kept for its size (0.16 ms in the simulator against a card path of 4.3 ms).
+* `kernel3` goes to the card 2,045 times. After each, all 768 chunks are the card's; `kernel1` then has to run in the simulator, and `reset_for_simulator`
+  pulls all 48 MiB back before it; `kernel3`'s next launch pushes all 48 MiB again. 98,160 MiB pushed and 98,128 MiB pulled in the run.
+* Where the time goes, device part 50.5 s ("GPU Time"): the card path 25.3 s (median 11.3 ms a launch, of which the kernel 1.5 ms and the push the rest), the
+  pulls about 23.4 s (between two card launches 11.2 ms median, of which the simulator's `kernel1` and `kernel2` 0.64 ms), the simulator's launches 1.3 s.
+  kernel3 in the simulator takes about 22 ms a launch on average (Round sp44: 46.06 s plain device part), so the card path plus the pull costs what it
+  saves. The program's CPU reference (about 220 to 230 s) is most of the wall time either way (282 s here). With DIV the same: 98,064 MiB pushed, device
+  part 52.1 s.
+* The traffic ban does not fire: kernel3's card path (11 ms) is under half its estimate, and the pull is charged to no one (it happens in `before_simulated`,
+  outside both the card path and the simulator's time).
+
+**Would round sp65's rule fix it? Not in exact mode.** The streak rule prices a launch that the *size rule* keeps while the card holds chunks only it has.
+`kernel1` is refused for its code before the size rule is asked, so it still runs in the simulator and still pulls the whole memory every iteration; after
+that the card holds nothing, so the rule has nothing to act on for `kernel2` either. In turbo mode `kernel1` is admitted (`MUFU`), which is where sp65 saw
+the ping-pong and where its rule applies. What would fix exact mode is the `sqrtf` idiom in the exact set, as the division idiom is under
+`VGPU_HOST_GPU_DIV`: Round sp44's exhaustive probe found `sqrt.rn` (`__fsqrt_rn`, the same `MUFU.RSQ` plus refinement plus slow path) bit-exact on the A10G
+over all 2^32 inputs (`VERDICT sqrtrn PASS`), and its recogniser was never written. With `kernel1` and `kernel2` admitted, sp65's rule (or the size rule,
+once the card holds the memory) can keep all three on the card; the device part would then be about the kernels' own time (a few seconds), and the
+program about its CPU reference, roughly 1.2x on the whole run. Pulling only the chunks a simulator launch touches (through the gate, as before sp59) would
+cut the traffic about in half here (`kernel1` and `kernel2` read all of A and write all of Q's chunks) and bring back the simulator's slow path with a card
+copy valid: not a fix.
+
+### #570 item 2: the 0.25 s driver start on long programs
+
+The start is begun and awaited at the same point: `await_start` calls `begin_start` (a thread, so that a hang can be cut at 10 s) and waits for it; the
+simulator does nothing meanwhile, so it is not overlapped with anything. Measured on this rig, call by call (`drvstart.py`): 148 to 155 ms (`cuInit`
+49 ms, the primary context about 100 ms, persistence mode on). Both forms of Round sp44's A/B pay it once, in full.
+
+What the start-cost rule (0.25 s charged in the decision) changes is which launches the simulator runs, not how many. With the default, the first launches
+of each kernel run in the simulator until 0.25 s of exact-set simulation has accumulated, and they give the size rule its estimates. With
+`VGPU_HOST_GPU_START_COST=0`, the first-launch rule sends those first launches to the card at once, and then the second launch of each such kernel runs in
+the simulator anyway, because a kernel with a card time and no simulator time has no estimate. Logged on the A10G: FDTD-2D 1,494 launches on the card and 6
+in the simulator in both forms (first card launch at 0.53 s against 0.18 s), babelstream 1,188 and 26 in both (5.11 s against 3.37 s). So the 0.25 s
+is simulation that the other form does too, later; it is not an added cost, which is why the long programs showed none. What does differ is the traffic
+(the learning launches fall between card launches in one form and before them in the other): FDTD-2D 144 / 112 MiB pushed / pulled with the default
+against 96 / 64, babelstream 2,304 / 1,152 against 3,072 / 1,920, in opposite directions, consistent with sp44's differences of a few hundredths of a
+second either way (its timing was not repeated here: the rig was shared).
+
+### #570 item 3: nvcc 13.2 and the division sequence
+
+Built with `/usr/local/cuda-13.0/bin/nvcc` (13.0.88) and `/usr/local/cuda-13.2/bin/nvcc` (13.2.51), `-arch=sm_86`: the exhaustive probe
+(`hostgpu_sfu_exhaustive.cu`, whose `div` op is the probe of Round sp44), the stand-in test's kernels (`host_gpu_lazy.cu`: `divk`, `divexp`, `rcpk` and the
+others) and PolyBench ADI, LU, GRAMSCHM, CORR, COVAR, 2DCONV. `cuobjdump -sass` of each with its own toolkit: **the SASS is identical, instruction for
+instruction and encoding for encoding, in all 31 kernels**; the only line that differs in each listing is the embedded PTX's `code version = [9,0]`
+against `[9,2]` (`data/sp67/sass-13.0-vs-13.2.txt`). The cached corpus binaries (the ones the probe and every card round used) are identical to the 13.0
+rebuild too. The recogniser (`VGPU_HOST_GPU=exact VGPU_HOST_GPU_DIV=1 VGPU_HOST_GPU_LOG=1`, no card, every launch refused for its size so that every kernel
+is classified) says the same of both builds of every program (`data/sp67/divrec-13.0-vs-13.2.txt`, identical but for how many launches fit in its 20 s): `divk`,
+`adi_kernel4` and `adi_kernel6`, both LU kernels and `gramschmidt_kernel2` reach the size rule (admitted); `rcpk` refused (a
+`MUFU.RCP` with no `FCHK`), `divexp` refused (an SFU instruction other than `RCP`), `gramschmidt_kernel1` and CORR's `std_kernel` refused (a `CALL` with no
+`FCHK`: the `sqrtf` idiom). So the 13.0 probe's result covers 13.2 binaries of these kernels on sm_86. Not covered: other architectures (13.2 may differ
+for sm_90 or sm_100) and fast-math or `-prec-div=false` builds, which do not use the idiom.
+
+### What was not verified
+
+* The card A/B of #569 on an idle rig: pending (the partial, shared runs above are the only card numbers). Verify's per-launch copy back on a real card
+  (PCIe from pageable memory) is slower than the stand-in's `memcpy`, so the card's floor for 3DCONV is higher than the stand-in's 6.2 s (10.3 s shared).
+* #570's times are from a rig shared with round sp65's timed runs (counts and bytes are exact; the seconds are not a comparison). The plain simulator's
+  device part of GRAMSCHM was not rerun (sp44's 46.06 s on another A10G is used). Why FDTD-2D's default form moved more bytes than the other: not traced.
+* The verify change under ThreadSanitizer and the sanitizer jobs: not run (CI). `host_gpu.cpp` and the test compile with g++-12 (`-fsyntax-only -Wall
+  -Wextra -Werror`) and build without warnings with GCC 13.
+* Step 27 in CI's toolkits (12.0, 12.8): not run; it uses the same program and stand-in as steps 14 and 16.
+* Deviations: the `test_host_gpu_track` mutants were built against the tree's `libvgpu.a` (the library's own instantiations are the original's); the
+  toolkit packages `cuda-cuobjdump` and `cuda-nvdisasm` (13.0, 13.2) were installed on the rig, which had neither.
