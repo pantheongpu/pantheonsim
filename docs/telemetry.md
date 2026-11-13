@@ -158,7 +158,8 @@ ECC mode) is refused.
 the limits, `Temperature` with the slowdown and shutdown thresholds,
 `Replays Since Reset` under `PCI` -- and `-d` takes `ECC`, `PAGE_RETIREMENT`,
 `ROW_REMAPPER`, `PERFORMANCE` and `ACCOUNTING` to print one. `nvidia-smi nvlink
--s` and `-e` print link state and error counters, and `nvidia-smi -r` resets a
+-s`, `-e`, `-c`, `-cBridge` and `-gt` print link state, error counters, capabilities,
+bridge presence (none: the SXM links run through the baseboard) and traffic, and `nvidia-smi -r` resets a
 GPU: a pending page retirement or row remap takes effect, the counts since the
 driver loaded are zeroed, a degraded link retrains, and the card's lifetime
 counts, retired pages and remapped rows stay. A GPU a process is using is
@@ -174,7 +175,9 @@ What is not real, because nothing public gives it:
 - NVLink links are all up, the capabilities are an x86 host's (peer access and
   peer atomics, no system-memory access), error counters are zero (nothing
   injects them yet), and the remote end is not modelled, so remote type and PCI
-  address are NOT_SUPPORTED. `nvlink -s` prints speeds only for NVLink 3 and 4.
+  address are NOT_SUPPORTED. `nvlink -s` prints speeds only for NVLink 3 and 4. `nvlink -p`, `-R`, `-ec`,
+  `-gLowPwrInfo`, `-gBwMode`, `-gLWidth` and `-info` are refused on a GPU with links
+  (a GPU without prints its name only, as the real tool does).
 - Accounting mode lives in the process that set it (the simulator has no
   driver to keep it) and covers running processes only. `-q -x` does not carry
   the new sections.
