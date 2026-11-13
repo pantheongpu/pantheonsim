@@ -655,7 +655,7 @@ inline double ban_reference_seconds(const StreakLaunch& s, const Costs& c, bool 
   return streak_rule && s.card_only_bytes > 0 ? streak_keep_seconds(s, c) : s.sim_s;
 }
 
-// A grid or block with a zero dimension is the simulator's to refuse with its own error (cudaErrorInvalidConfiguration); on the card the launch
+// A grid or block with a zero dimension is the simulator's to refuse with its own error (cudaErrorInvalidValue, as the A10G answers with the CUDA 13.0 runtime); on the card the launch
 // fails, and with memory resident there that ended the mode with an internal error (PolyBench LU's last lu_kernel1, Round sp65).
 inline bool launch_shape_empty(const uint32_t grid[3], const uint32_t block[3]) {
   return !grid[0] || !grid[1] || !grid[2] || !block[0] || !block[1] || !block[2];

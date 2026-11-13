@@ -14,7 +14,7 @@
 // short to repay a card trip by itself) goes there too. `streakread` reads both buffers back after every `scramble`, so the card holds nothing the
 // simulator does not when `bump` comes. Both print the counters and a hash of the 4 MiB.
 // `zerogrid` (step 27) launches `scramble` four times over 4 MiB and then on a grid of 0 blocks, while the card holds the memory: the last launch must
-// get the simulator's own answer (cudaErrorInvalidConfiguration), as with the mode off, and never reach the card.
+// get the simulator's own answer (cudaErrorInvalidValue with the CUDA 13.0 runtime, as the A10G answers), as with the mode off, and never reach the card.
 // `sqrt`, `rsqrt`, `sqrtdiv` (Round sp68, step 29): an IEEE sqrtf on inputs that take both of its paths (tiny floats the slow path, negatives a NaN), a bare
 // rsqrtf, and sqrtf followed by a division (the square root idiom: in the set only with VGPU_HOST_GPU_SQRT=1; the last also needs VGPU_HOST_GPU_DIV=1).
 #include <chrono>

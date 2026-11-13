@@ -1334,7 +1334,7 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   im.last = {};
   if (im.dead) return false;
   im.pending.reset();
-  // A grid or block with a zero dimension is the simulator's to refuse, with its own error (cudaErrorInvalidConfiguration): on the card the launch fails,
+  // A grid or block with a zero dimension is the simulator's to refuse, with its own error (cudaErrorInvalidValue, as the A10G answers with the CUDA 13.0 runtime): on the card the launch fails,
   // and with memory resident there that ended the mode with an internal error. PolyBench LU's last lu_kernel1 has such a grid; sp65's rule was the
   // first to send it (as verify runs did before).
   if (launch_shape_empty(cfg.grid.data(), cfg.block.data())) {

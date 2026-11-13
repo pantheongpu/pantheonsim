@@ -363,7 +363,9 @@ grep -q '^bumps 8 to 8, ' "$work/str_read.out" || { echo "FAIL: a bump went to t
 [[ "$(streak_of str_read)" == "0 1" ]] || { echo "FAIL: streakread: $(grep '^host_gpu_streak' "$work/str_read.err")"; fails=1; }
 # 27. a zero grid while the card holds the memory (Round sp65: PolyBench LU's last lu_kernel1).
 env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" zerogrid > "$work/off_zerogrid.out" 2> "$work/off_zerogrid.err" || { echo "FAIL: the zerogrid run with the mode off failed"; exit 1; }
-grep -q '^zero grid: cudaErrorInvalidConfiguration$' "$work/off_zerogrid.out" || { echo "FAIL: zerogrid with the mode off: $(cat "$work/off_zerogrid.out")"; fails=1; }
+# (cudaErrorInvalidValue: what the A10G answered with the CUDA 13.0 runtime, driver 595.112.07, at the integration of sp64-sp68; sp65 wrote
+# cudaErrorInvalidConfiguration here, a CUDA 12 runtime's answer, and the step had not run)
+grep -q '^zero grid: cudaErrorInvalidValue$' "$work/off_zerogrid.out" || { echo "FAIL: zerogrid with the mode off: $(cat "$work/off_zerogrid.out")"; fails=1; }
 for m in exact turbo; do
   run "zg_$m" zerogrid VGPU_HOST_GPU=$m "${str[@]}" || { echo "FAIL: the $m run of zerogrid failed"; tail -5 "$work/zg_$m.err"; fails=1; }
   diff -q "$work/off_zerogrid.out" "$work/zg_$m.out" > /dev/null || { echo "FAIL: $m: a zero grid did not get the simulator's answer: $(cat "$work/zg_$m.out")"; fails=1; }
