@@ -549,6 +549,12 @@ struct Costs {
   // process wall time (docs/performance.md "Round sp42": the native process of a trivial program also takes 0.24 s). 0.25 rounds it up. VGPU_HOST_GPU_START_COST
   // sets it in seconds; 0 charges nothing (the rule before sp43: the driver starts at the first launch the per-launch rule accepts).
   double start_cost_s = 0.25;
+  // While the driver is not up, a launch that only the account sends (should_offload_with_start: the program has spent start_cost_s already, but the
+  // launch does not repay the start by itself) must save at least start_cost_s / start_launches by itself: the start is then repaid within this many
+  // launches like it. 0 asks nothing more of it (the account alone, the rule from sp43 to the integration of sp64-sp68; VGPU_HOST_GPU_START_LAUNCHES).
+  double start_launches = 50;
+  // ... and the first-launch rule's launch, whose estimate is static (0.2 to 80 times off), a larger share: start_cost_s / start_launches_static.
+  double start_launches_static = 20;
 };
 
 struct Estimate {
@@ -579,12 +585,33 @@ inline bool should_offload(const Estimate& e, const Costs& c) {
 //     This is the ski-rental rule: the start is bought only after as much has been spent renting as buying costs, so a start that turns out useless costs at most
 //     the time the program had already spent, never more than doubling it, and a program that never spends that much never starts the driver.
 // With the driver up the start is paid and only should_offload applies. start_cost_s <= 0 is the old rule.
+//
+// The account alone bought starts that short programs could not repay: it says the program has run long enough, not that the launches still to
+// come will save the start. On one A10G (Round sp66) four CUDA Samples whose newly admitted kernels made the account buy it lost 0.13 to 0.24 s:
+// LargeKernelParameter (launches of under 0.5 ms), threadFenceReduction (about 3.5 ms), dct8x8 (3.8 ms), and MC_EstimatePiInlineP, whose last
+// launch (a static estimate of 3.0 ms, by the first-launch rule) was sent after a 3.3 s launch had filled the account. So a launch the account
+// sends must also save a share of the start by itself (start_share_saved, Costs::start_launches): 5 ms with the defaults, the start repaid within
+// 50 launches like it. The launches that bought the start in the programs where it paid were longer: logged on server3 (integration of sp64-sp68),
+// whose simulator ran these programs about 4 times as fast as the A10G rig's, 18 to 28 ms in PolyBench FDTD-2D, LU and GRAMSCHM, 19 ms (static) in
+// 3MM, 5.4 ms in Rodinia gaussian (about 20 ms on the rig) and 1.9 ms in HeCBench asyncAllocation's turbo run (about 8 ms on the rig: 800 launches
+// in 6.6 s; 6.6x faster in turbo mode, Round sp66). The constant is fitted to that corpus on the rig: the closest are dct8x8 below it (1.3x) and
+// asyncAllocation above it (1.6x), and a host whose simulator is much faster than the rig's sees shorter launches and buys fewer starts.
+// A first launch sent by its static estimate (first_launch_offload) must save start_cost_s / start_launches_static, 12.5 ms: the estimate does not
+// depend on the host, and on server3 it was 8.5 ms for the dct8x8 kernel whose first launch would otherwise buy the start in turbo mode, against 15.5 ms
+// in HeCBench atomicPerf (1.43x in turbo mode on the rig, Round sp66) and 19 ms in 3MM (1.25x).
+// Launches that repay the start alone (the sampled ones of SYRK, SYR2K, 2MM, COVAR, CORR and black-scholes among them) are not affected, and
+// neither is any launch once the driver is up.
+inline bool start_share_saved(const Estimate& e, const Costs& c) {
+  if (!(c.start_launches > 0)) return true;
+  return e.sim_s - card_path_seconds(e, c) >= c.start_cost_s / c.start_launches;
+}
 inline bool should_offload_with_start(const Estimate& e, const Costs& c, bool driver_started, double eligible_sim_spent_s) {
   if (!should_offload(e, c)) return false;                      // not worth a card even with the driver up
   if (driver_started || c.start_cost_s <= 0) return true;
   Estimate cold = e;
   cold.start_s = c.start_cost_s;
-  return should_offload(cold, c) || eligible_sim_spent_s >= c.start_cost_s;
+  if (should_offload(cold, c)) return true;                     // the launch repays the start by itself
+  return eligible_sim_spent_s >= c.start_cost_s && start_share_saved(e, c);   // (`e`: the card path with the driver up)
 }
 
 // ---- a launch while the card holds the live memory (Round sp65) ---------------------------------------------------------------------
@@ -790,7 +817,9 @@ inline bool first_launch_offload(const FirstLaunch& f, const Costs& c, bool driv
   e.sim_s = static_sim_seconds(f.blocks, f.threads_per_block, f.static_instrs, c);
   e.push_bytes = f.live_bytes;
   e.pull_bytes = f.live_bytes;
-  return should_offload_with_start(e, c, driver_started, eligible_sim_spent_s);
+  Costs fc = c;   // (the static estimate's share of the start, see should_offload_with_start; none when start_launches asks none)
+  if (c.start_launches > 0) fc.start_launches = c.start_launches_static;
+  return should_offload_with_start(e, fc, driver_started, eligible_sim_spent_s);
 }
 
 // ---- the first blocks of a launch, timed (docs/perf-design/12-host-gpu-turbo.md "The first blocks of a launch, timed"; Round sp60b) ----------

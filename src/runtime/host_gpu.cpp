@@ -1176,6 +1176,11 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
       const double sc = std::strtod(v, &end);
       if (end != v && sc >= 0) r->impl_->costs.start_cost_s = sc;
     }
+    if (const char* v = std::getenv("VGPU_HOST_GPU_START_LAUNCHES"); v && *v) {   // 0: the account alone buys the start (the rule before the integration of sp64-sp68)
+      char* end = nullptr;
+      const double n = std::strtod(v, &end);
+      if (end != v && n >= 0) r->impl_->costs.start_launches = n;
+    }
     if (const char* mb = std::getenv("VGPU_HOST_GPU_MAX_MIB")) r->impl_->max_bytes = std::strtoull(mb, nullptr, 10) << 20;
     g_summary_impl = r->impl_;
     std::atexit([] {
@@ -1434,6 +1439,14 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     return false;
   }
 
+  // Which rule buys the driver start (VGPU_HOST_GPU_LOG): said once, by the launch that starts it.
+  if (!im.start_sh && !im.start_failed && logging()) {
+    Estimate cold = e;
+    cold.start_s = std::max(im.costs.start_cost_s, 0.0);
+    std::fprintf(stderr, "host_gpu: %s starts the driver: %s (sim %.3f ms, card path with the start %.3f ms, %.3f s of eligible launches simulated so far)\n",
+                 fn.name.c_str(), forced ? "sampled" : im.verify ? "verify" : first_launch_rule ? "first-launch rule" : "size rule", e.sim_s * 1e3,
+                 card_path_seconds(cold, im.costs) * 1e3, im.eligible_sim_spent_s);
+  }
   // The card path. Anything that goes wrong before the kernel has run leaves the simulator's memory as it was.
   if (!im.await_start()) {   // the driver is unusable (said once on stderr): this launch and all later ones are the simulator's
     ++im.stats.simulated;

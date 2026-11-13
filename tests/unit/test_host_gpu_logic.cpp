@@ -633,7 +633,146 @@ VTEST(the_first_launch_rule_pays_the_start_too) {   // the static estimate of th
   FirstLaunch f = gemm_shape();
   f.static_instrs = 60000;                                          // 1000x the code: 5 s estimated
   VCHECK(first_launch_offload(f, c, false, 0.0));                   // that launch repays it
-  VCHECK(first_launch_offload(gemm_shape(), c, false, c.start_cost_s));   // or the program has spent as much in the simulator already
+  // or the program has spent as much in the simulator already, and the launch saves its share of the start (12.5 ms for a static estimate: the gemm
+  // shape's 2.5 ms does not)
+  VCHECK(!first_launch_offload(gemm_shape(), c, false, c.start_cost_s));
+  f.static_instrs = 240;                                            // 4x the code: 19.7 ms estimated, 17.3 ms saved
+  VCHECK(first_launch_offload(f, c, false, c.start_cost_s));
+  VCHECK(!first_launch_offload(f, c, false, c.start_cost_s * 0.99));
+  Costs before = c;
+  before.start_launches = 0;                                        // (VGPU_HOST_GPU_START_LAUNCHES=0: the account alone, as before)
+  VCHECK(first_launch_offload(gemm_shape(), before, false, c.start_cost_s));
+}
+
+// ---- the share of the start a launch must save when only the account would send it (integration of sp64-sp68) ----
+// A launch of `sim_s` with no copies: its card path with the driver up is launch_s + kernel_s_default (107 us).
+static Estimate bare(double sim_s) {
+  Estimate e;
+  e.sim_s = sim_s;
+  return e;
+}
+
+VTEST(the_start_share_is_five_ms_by_default) {
+  const Costs c;
+  VCHECK(c.start_launches == 50);
+  VCHECK(c.start_cost_s / c.start_launches == 0.005);
+}
+
+VTEST(a_launch_the_account_sends_saves_its_share_of_the_start) {
+  const Costs c;
+  const double card = c.launch_s + c.kernel_s_default;
+  // exactly at the share it goes (the share is "at least"), just under it stays
+  VCHECK(should_offload_with_start(bare(0.005 + card + 1e-9), c, false, c.start_cost_s));
+  VCHECK(!should_offload_with_start(bare(0.005 + card - 1e-9), c, false, c.start_cost_s));
+  VCHECK(start_share_saved(bare(0.005 + card + 1e-9), c) && !start_share_saved(bare(0.005 + card - 1e-9), c));
+  // the account must still be full: the share alone buys nothing
+  VCHECK(!should_offload_with_start(bare(0.1), c, false, c.start_cost_s * 0.99));
+  VCHECK(should_offload_with_start(bare(0.1), c, false, c.start_cost_s));
+  // and a launch that repays the start by itself needs neither
+  VCHECK(should_offload_with_start(bare(1.0), c, false, 0.0));
+  // what the launch moves counts against what it saves: 7.5 ms with 8 MiB each way saves 5.9 ms, with 16 MiB each way 4.3 ms
+  Estimate e = bare(0.0075);
+  e.push_bytes = e.pull_bytes = 8ull << 20;
+  VCHECK(should_offload(e, c) && should_offload_with_start(e, c, false, c.start_cost_s));
+  e.push_bytes = e.pull_bytes = 16ull << 20;
+  VCHECK(should_offload(e, c) && !should_offload_with_start(e, c, false, c.start_cost_s));
+  VCHECK(should_offload_with_start(e, c, true, 0.0));   // with the driver up, the plain rule
+  // the share is the start's: twice the start, twice the share
+  Costs dear = c;
+  dear.start_cost_s = 0.5;
+  VCHECK(should_offload_with_start(bare(0.008), c, false, 10.0) && !should_offload_with_start(bare(0.008), dear, false, 10.0));
+  Costs few = c;
+  few.start_launches = 10;   // repaid within 10 launches: 25 ms a launch
+  VCHECK(!should_offload_with_start(bare(0.02), few, false, 10.0) && should_offload_with_start(bare(0.026), few, false, 10.0));
+}
+
+VTEST(the_four_samples_that_lost_the_start_in_sp66_no_longer_buy_it) {   // A10G, Round sp66: what the launch that bought the start was
+  const Costs c;
+  VCHECK(!should_offload_with_start(bare(0.0005), c, false, 0.45));   // LargeKernelParameter: under 0.5 ms a launch
+  VCHECK(!should_offload_with_start(bare(0.0035), c, false, 0.26));   // threadFenceReduction: about 3.5 ms
+  VCHECK(!should_offload_with_start(bare(0.0038), c, false, 0.26));   // dct8x8: 3.8 ms
+  FirstLaunch pi;   // a first launch whose static estimate is MC_EstimatePiInlineP's last kernel's (3.0 ms, logged on server3), after a 3.3 s launch
+  pi.blocks = 640;
+  pi.threads_per_block = 256;
+  pi.static_instrs = 59;
+  pi.back_edge = true;
+  pi.multiprocessors = 72;
+  pi.live_bytes = 1u << 20;
+  VCHECK(static_sim_seconds(pi.blocks, pi.threads_per_block, pi.static_instrs, c) > 0.003 && first_launch_offload(pi, c, true));
+  VCHECK(!first_launch_offload(pi, c, false, 3.3));
+  Costs before = c;
+  before.start_launches = 0;   // all four bought it under the account alone
+  for (double s : {0.0005, 0.0035, 0.0038}) VCHECK(should_offload_with_start(bare(s), before, false, 0.45));
+  VCHECK(first_launch_offload(pi, before, false, 3.3));
+}
+
+VTEST(the_programs_whose_start_the_account_bought_and_repaid_still_buy_it) {   // the launch that bought it (server3 and the rig, see host_gpu.hpp)
+  const Costs c;
+  VCHECK(should_offload_with_start(bare(0.028), c, false, 0.27));   // FDTD-2D, 28 ms on server3
+  VCHECK(should_offload_with_start(bare(0.023), c, false, 0.25));   // LU
+  VCHECK(should_offload_with_start(bare(0.0186), c, false, 0.26));  // GRAMSCHM
+  VCHECK(should_offload_with_start(bare(0.020), c, false, 0.25));   // gaussian on the rig (5.4 ms on server3, whose simulator is about 4x as fast)
+  VCHECK(should_offload_with_start(bare(0.008), c, false, 0.26));   // asyncAllocation (turbo) on the rig: 800 launches in 6.6 s
+  VCHECK(!should_offload_with_start(bare(0.0019), c, false, 0.26)); // ... and on server3, 1.9 ms: a faster simulator buys fewer starts
+  FirstLaunch mm3 = gemm_shape();                                    // 3MM's last kernel: 19 ms estimated, 0.32 s spent
+  mm3.static_instrs = 232;
+  VCHECK(first_launch_offload(mm3, c, false, 0.32));
+}
+
+VTEST(a_first_launch_saves_a_larger_share_than_a_launch_with_a_history) {   // its estimate is static: 12.5 ms against 5 ms
+  const Costs c;
+  VCHECK(c.start_launches_static == 20 && c.start_cost_s / c.start_launches_static == 0.0125);
+  FirstLaunch f = gemm_shape();
+  f.live_bytes = 0;   // (the card path: launch_s + kernel_s_default, as bare())
+  const double card = c.launch_s + c.kernel_s_default;
+  const auto with_instrs_for = [&](double sim_s) {   // the static instruction count whose estimate is closest to sim_s from above
+    FirstLaunch g = f;
+    const double per_instr = static_sim_seconds(g.blocks, g.threads_per_block, 1, c);
+    g.static_instrs = static_cast<uint64_t>(std::ceil(sim_s / per_instr));
+    return g;
+  };
+  // dct8x8's quantization kernel in turbo mode: 8.5 ms static, 8.4 ms saved; a launch with a history of 8.5 ms would buy the start, this one does not
+  VCHECK(!first_launch_offload(with_instrs_for(0.0085), c, false, 0.3));
+  VCHECK(should_offload_with_start(bare(0.0085), c, false, 0.3));
+  // HeCBench atomicPerf (15.5 ms) and 3MM (19 ms) still buy it
+  VCHECK(first_launch_offload(with_instrs_for(0.0155), c, false, 0.26));
+  VCHECK(first_launch_offload(with_instrs_for(0.019), c, false, 0.32));
+  // the bar: 12.5 ms saved (the largest count whose estimate is under it, and one more)
+  const double per_instr = static_sim_seconds(f.blocks, f.threads_per_block, 1, c);
+  FirstLaunch below = f, above = f;
+  below.static_instrs = static_cast<uint64_t>(std::floor((0.0125 + card) / per_instr));
+  above.static_instrs = below.static_instrs + 1;
+  VCHECK(static_sim_seconds(below.blocks, below.threads_per_block, below.static_instrs, c) - card < 0.0125);
+  VCHECK(static_sim_seconds(above.blocks, above.threads_per_block, above.static_instrs, c) - card >= 0.0125);
+  VCHECK(first_launch_offload(above, c, false, 1.0) && !first_launch_offload(below, c, false, 1.0));
+  VCHECK(first_launch_offload(below, c, true, 0.0));   // with the driver up, the plain rule
+  // the static share is its own: a launch with a history needs only 5 ms
+  Costs other = c;
+  other.start_launches_static = 50;
+  VCHECK(first_launch_offload(with_instrs_for(0.0085), other, false, 0.3));
+  other = c;
+  other.start_launches = 10;   // (25 ms for a launch with a history; the first launch's share stays 12.5 ms)
+  VCHECK(first_launch_offload(with_instrs_for(0.019), other, false, 0.32) && !should_offload_with_start(bare(0.019), other, false, 0.32));
+  // and VGPU_HOST_GPU_START_LAUNCHES=0 asks neither
+  other = c;
+  other.start_launches = 0;
+  VCHECK(first_launch_offload(with_instrs_for(0.0085), other, false, 0.3));
+}
+
+VTEST(a_start_share_of_zero_is_the_account_alone) {   // VGPU_HOST_GPU_START_LAUNCHES=0: the rule from sp43 to sp68
+  Costs c;
+  c.start_launches = 0;
+  for (double s : {50e-6, 0.0005, 0.001, 0.0035, 0.006, 0.01, 0.05, 0.4, 4.0})
+    for (double spent : {0.0, 0.1, 0.25, 5.0})
+      for (bool up : {false, true}) {
+        Estimate e = bare(s);
+        Estimate cold = e;
+        cold.start_s = c.start_cost_s;
+        const bool old_rule = should_offload(e, c) && (up || should_offload(cold, c) || spent >= c.start_cost_s);
+        VCHECK_EQ(should_offload_with_start(e, c, up, spent), old_rule);
+      }
+  c.start_launches = -1;   // (a negative count is no requirement either)
+  VCHECK(should_offload_with_start(bare(0.001), c, false, 1.0));
 }
 
 // ---- the division idiom (host_gpu.hpp division_idiom_only), on the shape ptxas 13.0 gave `a / b` for sm_86 (cuobjdump of an own kernel) ----
