@@ -57,9 +57,13 @@ jobs:
           JOBS=3 amd/tests/rocblas/nightly/build-client.sh "$HOME/rocm" "$HOME/rocblas-client"
 
   shards:
-    name: rocblas-test ${{ matrix.gpu }} ${{ matrix.filter }} (${{ matrix.first }}-${{ matrix.last }} of 100)
+    name: rocblas-test ${{ matrix.gpu }} ${{ matrix.filter }} (${{ matrix.first }}-${{ matrix.last }} of 25)
     needs: client
     runs-on: ubuntu-24.04
+    # The suite is cut into 25 shards, not 100 (2026-11-13): each rocblas-test process
+    # spends about 57 s starting up (it re-reads rocblas_gtest.data), so 25 shards do the
+    # same tests about 1.6x faster; the mixed job spent ~47 min on process starts at 100.
+    # Each job below runs five shards, two at a time. The history at 100 shards:
     # A shard of the float and double tests takes 3 to 7 minutes on this runner and
     # two run at a time, so twenty of them fit well inside the limit (fifty did not:
     # every run since 2026-09-30 was cancelled at the limit). The MI250X shards took
@@ -71,22 +75,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {gpu: amd/mi300x, filter: fp, first: 0, last: 19}
-          - {gpu: amd/mi300x, filter: fp, first: 20, last: 39}
-          - {gpu: amd/mi300x, filter: fp, first: 40, last: 59}
-          - {gpu: amd/mi300x, filter: fp, first: 60, last: 79}
-          - {gpu: amd/mi300x, filter: fp, first: 80, last: 99}
-          - {gpu: amd/mi350x, filter: fp, first: 0, last: 19}
-          - {gpu: amd/mi350x, filter: fp, first: 20, last: 39}
-          - {gpu: amd/mi350x, filter: fp, first: 40, last: 59}
-          - {gpu: amd/mi350x, filter: fp, first: 60, last: 79}
-          - {gpu: amd/mi350x, filter: fp, first: 80, last: 99}
-          - {gpu: amd/mi250x, filter: fp, first: 0, last: 19}
-          - {gpu: amd/mi250x, filter: fp, first: 20, last: 39}
-          - {gpu: amd/mi250x, filter: fp, first: 40, last: 59}
-          - {gpu: amd/mi250x, filter: fp, first: 60, last: 79}
-          - {gpu: amd/mi250x, filter: fp, first: 80, last: 99}
-          - {gpu: amd/mi300x, filter: mixed, first: 0, last: 99}
+          - {gpu: amd/mi300x, filter: fp, first: 0, last: 4}
+          - {gpu: amd/mi300x, filter: fp, first: 5, last: 9}
+          - {gpu: amd/mi300x, filter: fp, first: 10, last: 14}
+          - {gpu: amd/mi300x, filter: fp, first: 15, last: 19}
+          - {gpu: amd/mi300x, filter: fp, first: 20, last: 24}
+          - {gpu: amd/mi350x, filter: fp, first: 0, last: 4}
+          - {gpu: amd/mi350x, filter: fp, first: 5, last: 9}
+          - {gpu: amd/mi350x, filter: fp, first: 10, last: 14}
+          - {gpu: amd/mi350x, filter: fp, first: 15, last: 19}
+          - {gpu: amd/mi350x, filter: fp, first: 20, last: 24}
+          - {gpu: amd/mi250x, filter: fp, first: 0, last: 4}
+          - {gpu: amd/mi250x, filter: fp, first: 5, last: 9}
+          - {gpu: amd/mi250x, filter: fp, first: 10, last: 14}
+          - {gpu: amd/mi250x, filter: fp, first: 15, last: 19}
+          - {gpu: amd/mi250x, filter: fp, first: 20, last: 24}
+          - {gpu: amd/mi300x, filter: mixed, first: 0, last: 24}
     permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
@@ -111,7 +115,7 @@ jobs:
           VGPU_BUILD_DIR: ${{ github.workspace }}/build
           ROCM_RUN: /home/runner/rocm
           CLIENT: /home/runner/rocblas-client
-        run: amd/tests/rocblas/nightly/run-shards.sh ${{ matrix.gpu }} ${{ matrix.filter }} ${{ matrix.first }} ${{ matrix.last }} 100 logs
+        run: amd/tests/rocblas/nightly/run-shards.sh ${{ matrix.gpu }} ${{ matrix.filter }} ${{ matrix.first }} ${{ matrix.last }} 25 logs
       - if: always()
         uses: actions/upload-artifact@v4
         with:
