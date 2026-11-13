@@ -2220,6 +2220,18 @@ hipError_t instantiate(State& s, void** out, void* graph, unsigned long long fla
   gt().execs[x->handle] = std::move(x);
   return hipSuccess;
 }
+// An upload (hipGraphUpload, or hipGraphInstantiateWithParams with
+// hipGraphInstantiateFlagUpload) has nothing to move here: instantiation has
+// already copied the graph into the executable graph a launch runs, and no
+// device memory holds it. So no work is queued on the stream, and nothing a
+// later launch on it does can see a difference; the exec and the stream are
+// checked as ROCm's ihipGraphUpload checks the exec.
+hipError_t graph_upload(State& s, void* exec, hipStream_t stream) {
+  if (!find_exec(exec)) return hipErrorInvalidValue;
+  Stream null_stream;
+  if (stream && !find_stream(s, stream, &null_stream)) return hipErrorInvalidHandle;
+  return hipSuccess;
+}
 }  // namespace
 extern "C" {
 
@@ -2233,7 +2245,9 @@ hipError_t hipGraphInstantiate(void** exec, void* graph, void** error_node, char
   return record(s, e);
 }
 // AutoFreeOnLaunch (1) and UseNodePriority (8) are taken; an upload on
-// instantiation (2) and a launch from the device (4) are not.
+// instantiation (2) and a launch from the device (4) are not, as in ROCm's
+// HIP (kValidInstantiateFlags in clr's hip_graph.cpp). This function has no
+// stream to upload on; hipGraphInstantiateWithParams has one.
 hipError_t hipGraphInstantiateWithFlags(void** exec, void* graph, unsigned long long flags) {
   const ApiCall api("hipGraphInstantiateWithFlags", exec, graph, flags);
   State& s = state();
@@ -2246,14 +2260,25 @@ hipError_t hipGraphInstantiateWithParams(void** exec, void* graph, vgpu::amd::ab
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!exec || !graph || !params) return record(s, hipErrorInvalidValue);
-  if (params->flags & ~9ull) {
+  // ROCm's HIP takes all four flags here (kValidInstantiateParamsFlags in
+  // clr's hip_graph.cpp): AutoFreeOnLaunch (1), Upload (2), DeviceLaunch (4)
+  // and UseNodePriority (8). DeviceLaunch changes nothing in ROCm but the
+  // flags hipGraphExecGetFlags reports, since HIP has no launch from the
+  // device; here too. Upload uploads the graph on params->uploadStream, as
+  // hipGraphUpload would (pantheonsim #628).
+  if (params->flags & ~15ull) {
     params->result_out = 1;   // hipGraphInstantiateError
     return record(s, hipErrorInvalidValue);
   }
   const hipError_t e = instantiate(s, exec, graph, params->flags);
-  params->result_out = e == hipSuccess ? 0 : 1;
+  if (e != hipSuccess) {
+    params->result_out = 1;   // hipGraphInstantiateError
+    return record(s, e);
+  }
+  params->result_out = 0;     // hipGraphInstantiateSuccess
   params->errNode_out = nullptr;
-  return record(s, e);
+  if (params->flags & 2) return record(s, graph_upload(s, *exec, static_cast<hipStream_t>(params->uploadStream)));
+  return record(s, hipSuccess);
 }
 hipError_t hipGraphExecGetFlags(void* exec, unsigned long long* flags) {
   const ApiCall api("hipGraphExecGetFlags", exec, flags);
@@ -2355,10 +2380,7 @@ hipError_t hipGraphUpload(void* exec, hipStream_t stream) {
   const ApiCall api("hipGraphUpload", exec, stream);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!find_exec(exec)) return record(s, hipErrorInvalidValue);
-  Stream null_stream;
-  if (stream && !find_stream(s, stream, &null_stream)) return record(s, hipErrorInvalidHandle);
-  return record(s, hipSuccess);
+  return record(s, graph_upload(s, exec, stream));
 }
 
 // ---- Changing an executable graph ----------------------------------------------------------------------
