@@ -2077,6 +2077,13 @@ target_include_directories(test_amd_hip_dyn_stack PRIVATE tests/framework amd/in
 target_compile_definitions(test_amd_hip_dyn_stack PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME test_amd_hip_dyn_stack COMMAND test_amd_hip_dyn_stack)
 set_tests_properties(test_amd_hip_dyn_stack PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1" FAIL_REGULAR_EXPRESSION "FAIL")
+# Tensile's module-by-module kernel lookup misses quietly; a kernel in no module is still said (issue #636).
+add_executable(test_amd_hip_module_probe amd/tests/unit/test_hip_module_probe.cpp)
+target_link_libraries(test_amd_hip_module_probe PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_module_probe PRIVATE amd/include)
+target_compile_definitions(test_amd_hip_module_probe PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME test_amd_hip_module_probe COMMAND test_amd_hip_module_probe)
+set_tests_properties(test_amd_hip_module_probe PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x" FAIL_REGULAR_EXPRESSION "FAIL")
 # v_div_fmas / v_div_fixup with the clamp bit or an output modifier (issue #613).
 vgpu_unit_test(test_amd_gcn_div_clamp amd/tests/unit/test_gcn_div_clamp.cpp)
 target_compile_definitions(test_amd_gcn_div_clamp PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

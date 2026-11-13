@@ -7,6 +7,11 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- AMD: `hipModuleGetFunction` no longer prints "the code object has no kernel named ..." when another loaded module has the
+  kernel. rocBLAS and hipBLASLt (Tensile) find a GEMM kernel by asking each loaded code object in turn and clear the
+  `hipErrorNotFound` of the misses, so every new GEMM kernel printed the message up to once per earlier module, which read as a
+  failed GEMM in runs whose GEMMs were right (double and complex-double GEMMs through rocBLAS 7.2 on `amd/mi300x` checked against a
+  host reference). The error code and `hipGetLastError` are unchanged, and a kernel that no loaded module has is still reported (#636).
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the
