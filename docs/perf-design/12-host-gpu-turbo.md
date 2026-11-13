@@ -21,7 +21,8 @@ mode, and exact mode is byte for byte what it was: the same set, defaults, decis
 ## 2. The classes
 
 Every instruction of a kernel is put in one class, once per kernel (`turbo_class` in `include/vgpu/host_gpu.hpp`), and a kernel is
-admitted by the classes it holds. It is still a whitelist: a mnemonic nobody named is `never`.
+admitted by the classes it holds. It is still a whitelist: a mnemonic nobody named is `never`. What a kernel needs of its module besides code (variables,
+external functions) is decided apart, by the same rules in both modes, in section 3.
 
 | class | instructions | default | switch |
 |---|---|---|---|
@@ -29,13 +30,13 @@ admitted by the classes it holds. It is still a whitelist: a mnemonic nobody nam
 | mufu | every `MUFU` form, `RCP64H` and `RSQ64H` included | admitted | `VGPU_HOST_GPU_TURBO_OFF=mufu` |
 | half | `HADD2`, `HMUL2`, `HFMA2`, `HSETP2`, `HSET2`, `HMNMX2` | admitted | `=half` |
 | float-red | `RED` / `REDG` on a float type (no value returned) | admitted | `=red` |
-| call | `CALL` and `RET`, when every call is relative, to a label inside the kernel's own code section | admitted | `=call` |
-| extra | `IDP`, `VABSDIFF`, `VABSDIFF4`, `VIADDMNMX`, `VIMNMX3`, `FMNMX3`, `F2IP`, `FSWZADD`, `REDUX`, `LDGSTS`, `LDGDEPBAR`, `LDSM`, `MOVM`, `FFMA2`, `FMUL2`, `FADD2`, integer `REDG` | admitted | `=extra` |
+| call | `CALL` and `RET`, when every call is relative, to a label inside the kernel's own code section, or (Round sp66) absolute, to the first instruction of another code section of the module, whose code is then classed with the kernel's | admitted | `=call` |
+| extra | `IDP`, `VABSDIFF`, `VABSDIFF4`, `VIADDMNMX`, `VIMNMX3`, `FMNMX3`, `F2IP`, `FSWZADD`, `REDUX`, `LDGSTS`, `LDGDEPBAR`, `LDSM`, `MOVM`, `FFMA2`, `FMUL2`, `FADD2`, integer `REDG`; `B2R`, `NANOSLEEP` (Round sp66) | admitted | `=extra` |
 | tensor | `HMMA`, `IMMA`, `DMMA` | admitted | `=tensor` |
 | atomic-int | `ATOM`, `ATOMG`, `ATOMS` on integers with `ADD`, `MIN`, `MAX`, `AND`, `OR`, `XOR`, `INC`, `DEC`; `RED` with `INC`, `DEC`, `POPC` | admitted | `=atomics` |
-| atomic-float | `ATOM`, `ATOMG`, `ATOMS` on a float type (a value is returned) | refused | `VGPU_HOST_GPU_ATOMICS=1` |
-| atomic-swap | any `CAS`, `CAST.SPIN`, `EXCH` | refused | `VGPU_HOST_GPU_ATOMICS=1` |
-| never | `TEX`, `TLD`, `TLD4`, `TXD`, `SULD`, `SUST`; `QMMA`, `BMMA`, the sm_90 and sm_100 tensor and tensor-memory instructions; `JMP`, `NANOSLEEP`, `BPT`; a call that leaves the section; `ATOMS.ARRIVE`; an instruction with a field the decoder cannot name; anything else | refused | none |
+| atomic-float | `ATOM`, `ATOMG`, `ATOMS` on a float type (a value is returned) | admitted (refused until Round sp66) | `VGPU_HOST_GPU_ATOMICS=0` |
+| atomic-swap | any `CAS`, `CAST.SPIN`, `EXCH` | admitted (refused until Round sp66) | `VGPU_HOST_GPU_ATOMICS=0` |
+| never | `TEX`, `TLD`, `TLD4`, `TXD`, `TXQ`, `TMML`, `SULD`, `SUST`, `SUATOM`, `SURED`; `QMMA`, `BMMA`, the sm_90 and sm_100 tensor and tensor-memory instructions; `JMP`, `BPT`; any other call that leaves the section (through a register, into the middle of a section, outside the module's code; the absolute call to `vprintf` excepted, section 10); `ATOMS.ARRIVE`; an instruction with a field the decoder cannot name; anything else | refused | none |
 
 Why each admitted class is safe to run on the card, as distinct from numerically equal: the card executes the module's own cubin, so any
 instruction is "supported" there. What the mode must guarantee is that the card has everything the kernel reads. The shared checks do
@@ -60,16 +61,20 @@ queue) writes the same set of elements in another order on the card than in the 
 arrival order, so its sum differs in the last places from run to run. Turbo mode admits both by default; `VGPU_HOST_GPU_TURBO_OFF=atomics,red`
 keeps them in the simulator when a reproducible result matters more than speed.
 
-A float atomic whose value is used, a compare-and-swap and an exchange are behind `VGPU_HOST_GPU_ATOMICS=1`. Section 2 of the spike found
-the card disagreeing with itself on programs built on them (HeCBench `bh` tree building, `aop`): there is no single card answer, a verify
-run can only report that the two sides differ, and a program's output can change from run to run. `tools/probes/hostgpu_atomic_repeat.cu`
-measures which kinds a card repeats.
+A float atomic whose value is used, a compare-and-swap and an exchange were behind `VGPU_HOST_GPU_ATOMICS=1` until Round sp66, and are admitted by
+default since; `VGPU_HOST_GPU_ATOMICS=0` keeps them in the simulator. Section 2 of the spike found the card disagreeing with itself on programs built
+on them (HeCBench `bh` tree building, `aop`): there is no single card answer, a verify run can only report that the two sides differ, and a program's
+output can change from run to run. `tools/probes/hostgpu_atomic_repeat.cu` measures which kinds a card repeats. Why the default changed (section 10):
+that is what the program gets on the card when it runs natively, which is turbo mode's promise; the returned values of integer atomics, admitted
+from the start, do not repeat either; the one risk that is new, a compare-and-swap loop that spins longer on the card than in the simulator, is bounded
+by the watchdog (`VGPU_HOST_GPU_TIMEOUT`); and over the corpus every such kernel ran on the card (Round sp59's opt-in runs and its verify runs, which
+send every launch: `aop`, `atomicPerf`, `bh`) and finished, with the programs' output the simulator's.
 
 ## 3. What is shared with exact mode, unchanged
 
-Everything except the class scan: the launch-shape checks (cooperative and cluster launches, texture objects, graph conditionals, warp
-size), arguments that point into mapped host memory, device memory outside the allocation table, modules with variables, external calls or
-device-side launches, the size rule and its start cost, the first-launch rule, the sample of a launch's first blocks (section 8), the bans, the
+Everything except the class scan: the launch-shape checks (cooperative and cluster launches, warp size), arguments that point into mapped host memory, device memory outside the allocation table, what a kernel needs of its module (section 10:
+its variables, which the card is given at the simulator's addresses, and the external functions it calls, of which turbo mode alone admits
+`vprintf`), the size rule and its start cost, the first-launch rule, the sample of a launch's first blocks (section 8), the bans, the
 64 KiB residency protocol, the list of diagnostics that switch the mode off, and `VGPU_HOST_GPU_MAX_MIB`.
 
 Three places were checked for an assumption that silently depended on the exact set:
@@ -77,7 +82,11 @@ Three places were checked for an assumption that silently depended on the exact 
 * **Calls.** The eligibility scan reads one code section. A kernel of the exact set could not call anything (the division idiom's slow
   path is checked instruction by instruction). In turbo mode a `CALL` is admitted only when it is relative and its label is an address
   inside the section the scan read; a call through a register, to an absolute address, or into another section makes the kernel `never`,
-  because it would run code nobody classed. Modules with external symbols were already refused. Recursion is the card's to run, on the
+  because it would run code nobody classed. Since Round sp66 an absolute call to the *first instruction of another code section of the
+  module* is followed instead (`call_to_entry`): that is a device function the compiler kept out of line, in a section of its own (every
+  `-rdc` build; the CUDA Samples' cooperative-groups and tensor-core kernels), the driver links the call to its own copy of that same code,
+  and the scan classes the callee's section with the kernel's, its own calls followed the same way, each section once. The census of the
+  round found these calls behind 157 s of simulator time on the Samples, more than every safety refusal together. Modules with external symbols were already refused. Recursion is the card's to run, on the
   card's own stack, as it is when the program runs natively.
 * **Kernels that do not return.** `cuCtxSynchronize` has no deadline, a running kernel cannot be cancelled, and while it runs the card's
   memory cannot be read back, so there is no fallback. In exact mode the card computes the simulator's bits, so a kernel loops on the card
@@ -213,11 +222,11 @@ python3 tools/bench/hostgpu/run.py --build build --corp /path/to/corp --gpu nvid
 
 | test | where it runs | what it pins |
 |---|---|---|
-| `test_host_gpu_logic` | every CI job | the mode names; exact's set against a frozen copy and every decoder mnemonic; each class; joined modifiers; calls; the switches and the off list; the sampling rule (how many blocks, what a process can afford, the estimate, what repays the card, when not to sample) |
+| `test_host_gpu_logic` | every CI job | the mode names; exact's set against a frozen copy and every decoder mnemonic; each class; joined modifiers; calls; the switches and the off list; the sampling rule (how many blocks, what a process can afford, the estimate, what repays the card, when not to sample); the kinds of external functions and what each mode admits, the texture instructions, the `printf` switch and the atomics default, the card image (each relocation kind applied, the tables shortened, what it refuses) and the code relocation writer (Round sp66) |
 | `test_host_gpu_tol` | every CI job | the rule, the three readings, NaN, infinity, denormals, signed zero, range ends, the float-array hole, parsing of the tolerances |
-| `e2e_host_gpu_stub` | CI jobs with nvcc (a stand-in driver, no card) | turbo reaches the card path for expf, rcp and division beside expf; exact does not; the lines for scripts; the atomics opt-in and the off list; unreadable values; verify against a card that computes nothing; the timeout; a contended reduction under verify |
+| `e2e_host_gpu_stub` | CI jobs with nvcc (a stand-in driver, no card) | turbo reaches the card path for expf, rcp and division beside expf; exact does not; the lines for scripts; the atomics default, `VGPU_HOST_GPU_ATOMICS=0` and the off list; unreadable values; verify against a card that computes nothing; the timeout; a contended reduction under verify; kernels with module variables in both modes, the image the card gets (no relocation of a variable left), the constant bank looked up and filled before the launch, `printf` in turbo only, a live texture object, a kernel that calls `malloc` (Round sp66, `host_gpu_vars.cu`) |
 | `hostgpu_bench_selftest` | every CI job | the harness: parsing, output classes, the table, a hang that is killed |
-| `e2e_host_gpu`, `tools/card-ci/run-card-ci.sh` | a machine with a card only (passed on an A10G, Round sp59) | section 5, item 1 |
+| `e2e_host_gpu`, `tools/card-ci/run-card-ci.sh` | a machine with a card only (passed on an A10G, Round sp59) | section 5, item 1; module variables, `printf` (the order of the lines, stdout a file) and a live texture object on the card, the output the mode-off output to the byte (Round sp66) |
 
 ## 8. The first blocks of a launch, timed (Round sp60b; both modes)
 
@@ -340,3 +349,61 @@ the error of the estimate.
 From Round sp59, less what section 8 does: a start-cost account that weighs the gain for programs of many short launches (they lose 0.1 to 0.2 s
 or gain nothing); the card's fixed-point `MUFU.SIN` / `MUFU.COS` in the simulator; `BMMA` in the tensor class and a tensor probe whose sums round;
 other cards and toolkits.
+
+## 10. What a module holds besides code (Round sp66; both modes)
+
+Until Round sp66 a kernel went to the card only if its *module* (a translation unit's cubin) had no `__device__` or `__constant__` variable, no
+external function and no device-side launch, and only if the device had no live texture object. One `printf` anywhere in a file, one `__constant__`
+table, one texture object anywhere in the program, kept every kernel of it in the simulator, whatever the kernel's own code. The round's census
+([data/sp66/census.md](data/sp66/census.md)) measured what that cost; this section says what replaced each rule and why it is sound.
+
+**Module variables.** The simulator gives each variable section of a module (`.nv.global`, `.nv.global.init`, the constant bank `.nv.constant3`)
+device memory of its own, in the window the card mirrors, and resolves the module's relocations to it. The real driver, loading the same cubin,
+would give the variables copies of its own, elsewhere, and resolve the relocations to those: two copies of one variable, of which only the
+simulator's is the one `cudaMemcpyToSymbol`, `cudaMemcpyFromSymbol`, `cudaGetSymbolAddress` and the simulator's kernels see. So the card is not given
+the module's own cubin but a copy in which every relocation whose symbol lies in a variable section has been applied with the simulator's address,
+as the simulator's loader applies it (the same code writer, `include/vgpu/sass/reloc_patch.hpp`), and taken out of the relocation table, so that
+the driver leaves it as it is (`include/vgpu/host_gpu_image.hpp`). Every other relocation (code addresses, function descriptors, `vprintf`) is the
+driver's. The kernel on the card then reads and writes the simulator's copy of each variable, which is device memory like any other: pushed when
+the simulator wrote it, pulled when the program reads what the card wrote, by the residency protocol of section 3. A pointer the host took with
+`cudaGetSymbolAddress` and passed to a kernel is the same address the kernel names the variable by, on both sides. The driver's own copies of
+the variables are still made, and nothing addresses them.
+
+What no relocation names is the constant bank as the kernel reads it, `c[0x3][offset]`: the card reads its own bank, which the driver fills from
+the cubin at load. So before every launch of such a module on the card, after the launch's memory has been pushed (the window then holds the
+simulator's bytes), each constant bank that holds a variable is copied on the card from the window into the card's bank (`cuMemcpyDtoD`). Where the
+card's bank is comes from `cuModuleGetGlobal` on the bank's variables, less each one's offset in the bank (all must agree; a bank none of whose
+variables the driver names keeps the module in the simulator). Kernels cannot write a constant bank, so nothing comes back. A `__managed__` variable
+lives in host memory the window does not hold: a module with one keeps all its kernels in the simulator, as before. The image is made once per
+module, with no card; a relocation of a variable it cannot apply (a kind the loader does not apply to variables, an offset past the end of its
+section) keeps the module in the simulator with the reason. This is sound for exact mode as much as for turbo mode: the kernel reads the bytes it
+would read in the simulator, at the addresses it would read them.
+
+**External functions, by the kernel.** The external functions a kernel can reach are its call graph's and its own code's call relocations
+(`sass::reachable`), and only those decide, by kind (`extern_kind`, `include/vgpu/host_gpu.hpp`): a kernel that calls `malloc` or `free` stays in
+the simulator (the card's heap is the card's own, outside the window: a pointer from it kept in memory means nothing to the simulator), so does one
+that calls `assert` (a failed assert on the card loses the context, and with it data only the card holds), one that launches kernels (the child
+grids, their code and their addresses would be the card's, and the scan has not seen them), and one that calls anything else not named. A kernel
+of the same module that calls none of them is judged by its own code. Turbo mode admits a kernel that calls `vprintf`: the absolute call to it is
+the one call that may leave the kernel's section (the driver links it at load). The card writes the arguments to its printf buffer and the driver
+prints them when the host synchronises with the kernel, which the card path does at once (`cuCtxSynchronize`); the mode flushes the process's
+stdout just before such a launch, so the card's lines come after everything the program printed before the launch and before anything it prints
+after, which is the simulator's order. The text is the card's formatting of the card's values, as on real hardware; a kernel that prints more than
+the card's printf buffer (1 MiB unless the program sets `cudaLimitPrintfFifoSize`, which the simulator does not pass on) loses lines on the card,
+as it does natively. Exact mode does not admit `printf` (its promise is about memory). `VGPU_HOST_GPU_TURBO_OFF=printf` keeps such kernels out.
+
+**Texture objects.** A kernel reads a texture or surface only through a texture or surface instruction (`TEX`, `TLD`, `TLD4`, `TXD`, `TXQ`, `TMML`,
+`SULD`, `SUST`, `SUATOM`, `SURED`: `texture_mnemonic`), which neither the exact set nor any turbo class admits; the handle itself is a number. So a
+launch is no longer refused because the device has a texture object: a kernel that fetches is refused by its code (class `never`), and every other
+kernel is judged as if no texture existed. Sound for both modes.
+
+**Graphs.** Every kernel launched by `cudaGraphLaunch` is given the graph's conditional handles, and until Round sp66 that refused every such
+launch. A kernel reaches the handles only by calling `cudaGraphSetConditional` (or by launching a graph from the device), and a kernel that
+calls either is kept in the simulator by what it calls; so a graph's other kernels are judged as any kernel is. Sound for both modes.
+
+**What was not lifted, and why.** The device heap and device-side launches (above); memory mapped with `cuMemMap` or shared with another
+process (the window mirrors the allocation table: an alias of one physical page at two addresses, or another process's memory, cannot be made the
+same on the card without mirroring the mappings themselves); arguments that point into mapped or managed host memory (the card could reach that
+memory through `cuMemHostRegister` at the same address where the device says so, `CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM`, but
+the mode would have to register every such range before a launch and the residency protocol does not cover memory the card reads over the bus; in
+the census 3.4 s are behind it, nearly all of them HeCBench `zerocopy`, a program written to time zero-copy access); cooperative and cluster launches and warp size (launch shapes the card path does not build). `VGPU_HOST_GPU_WIDER=0` restores all of the rules before the round, for A/B runs (the benchmark's forms `exactn` and `turbon`).

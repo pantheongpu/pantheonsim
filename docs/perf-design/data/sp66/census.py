@@ -6,12 +6,13 @@ CUDA Samples that run in the simulator) once with VGPU_HOST_GPU=turbo VGPU_HOST_
 (nvidia/tests/e2e/host_gpu_stub_driver.c, which refuses every module: a launch the mode sends "fails on the card" and the
 simulator runs it, so the program runs as it would with the mode off and every launch's simulator seconds are measured), and
 keeps the mode's lines: host_gpu_kept (per kernel and reason: launches, simulator seconds), host_gpu_refused, host_gpu_turbo,
-host_gpu_refusals. One JSON per program in --out. Each run holds the machine's build lock (flock) and is cut at --timeout.
+host_gpu_refusals. One JSON per program in --out. The runs hold the machine's build lock (flock), several to a hold of at most --hold seconds,
+and each is cut at --timeout.
 
   census.py --shim BUILD/shim --stub libstubcuda.so --corp CORP --out DIR [--corpora polybench,rodinia,hecbench,samples]
-            [--programs a,b] [--timeout 280] [--gpu nvidia/a10g --sm 86 --mp 72] [--threads 3] [--lock /tmp/pantheonsim-builder.lock]
+            [--programs a,b] [--timeout 280] [--gpu nvidia/a10g --sm 86 --mp 80] [--threads 3] [--lock /tmp/pantheonsim-builder.lock]
 """
-import argparse, json, os, re, shutil, signal, subprocess, sys, tempfile, time
+import argparse, fcntl, json, os, re, shutil, signal, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "..", "tools", "bench", "real"))
@@ -43,12 +44,15 @@ def main():
     ap.add_argument("--timeout", type=float, default=280)
     ap.add_argument("--gpu", default="nvidia/a10g")
     ap.add_argument("--sm", default="86")
-    ap.add_argument("--mp", default="72")
+    ap.add_argument("--mp", default="80")
     ap.add_argument("--threads", default="3")
     ap.add_argument("--lock", default="/tmp/pantheonsim-builder.lock")
     ap.add_argument("--env", action="append", default=[], help="extra NAME=VALUE for the run")
+    ap.add_argument("--hold", type=float, default=240, help="seconds of runs to a hold of the lock")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
+    fd = os.open(a.lock, os.O_RDWR | os.O_CREAT, 0o666)
+    since = None
     want = set(x for x in a.programs.split(",") if x)
     skip = set(x for x in a.skip.split(",") if x)
     for corpus, name, cwd, argv, copy_cwd in real.manifest(a.corp, a.corpora.split(",")):
@@ -71,12 +75,19 @@ def main():
             with open(os.path.join(scratch, "filelist"), "w") as f:
                 f.write("".join(os.path.join(dd, "cane4_%d.db\n" % i) for i in range(4)))
             cwd = scratch
+        if since is not None and time.monotonic() - since > a.hold - min(a.timeout, a.hold / 2):   # (a hold is given up before a run could take it past --hold)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            since = None
+            time.sleep(2)
+        if since is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            since = time.monotonic()
         t0 = time.monotonic()
-        p = subprocess.Popen(["flock", a.lock, "timeout", "-s", "KILL", "%g" % a.timeout, "nice", "-n", "19"] + argv, cwd=cwd, env=env, stdout=subprocess.DEVNULL,
+        p = subprocess.Popen(["timeout", "-s", "KILL", "%g" % a.timeout, "nice", "-n", "19"] + argv, cwd=cwd, env=env, stdout=subprocess.DEVNULL,
                              stderr=subprocess.PIPE, start_new_session=True)
         timed_out = False
         try:
-            _, err = p.communicate(timeout=a.timeout + 600)   # (the wait for the lock is not the program's)
+            _, err = p.communicate(timeout=a.timeout + 60)
         except subprocess.TimeoutExpired:
             os.killpg(p.pid, signal.SIGKILL)
             _, err = p.communicate()

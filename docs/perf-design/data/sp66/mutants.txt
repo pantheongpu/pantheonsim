@@ -1,0 +1,50 @@
+ 0 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables, the_card_image_refuses_what_it_cannot_apply: image: no relocation is applied
+ 1 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables: image: the symbol's offset left out
+ 2 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables: image: the addend left out
+ 3 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables: image: REL entries read as RELA
+ 4 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables: image: the table keeps its size
+ 5 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables: image: the applied entry is kept too
+ 6 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables: image: entries left are not moved down
+ 7 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables: image: data relocations not written
+ 8 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables: image: code relocations not written
+ 9 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables, the_card_image_refuses_what_it_cannot_apply: image: G64 not taken
+10 killed by the_card_image_refuses_what_it_cannot_apply: image: any data type taken
+11 killed by the_card_image_refuses_what_it_cannot_apply: image: any code type taken
+12 killed by the_card_image_refuses_what_it_cannot_apply: image: a code type in data taken
+13 killed by the_card_image_refuses_what_it_cannot_apply: image: NOBITS destinations written
+14 killed by the_card_image_refuses_what_it_cannot_apply: image: no bound on code
+15 killed by the_card_image_refuses_what_it_cannot_apply: image: a code bound of 8
+16 killed by the_card_image_refuses_what_it_cannot_apply: image: no bound on data
+17 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables, the_card_image_refuses_what_it_cannot_apply: image: a data bound of 9
+18 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables, the_card_image_refuses_what_it_cannot_apply: image: the destination is the table
+19 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables, the_card_image_refuses_what_it_cannot_apply: image: the symbol's section is the destination
+20 SURVIVED: image: the class byte not checked
+21 killed by the_card_image_refuses_what_it_cannot_apply: image: the header table not bounded
+22 killed by the_card_image_refuses_what_it_cannot_apply: image: a failure keeps the bytes
+23 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables: image: the value is the base alone
+24 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables, code_relocations_write_the_bits_the_loader_writes: patch: 56 writes the high half
+25 killed by code_relocations_write_the_bits_the_loader_writes: patch: 62 writes the high half
+26 killed by code_relocations_write_the_bits_the_loader_writes: patch: 58's high bits dropped
+27 killed by code_relocations_write_the_bits_the_loader_writes: patch: 75 not in words
+28 killed by code_relocations_write_the_bits_the_loader_writes: patch: 75's low byte at 8
+29 killed by the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables, code_relocations_write_the_bits_the_loader_writes: patch: the low word not kept
+30 killed by the_card_image_refuses_what_it_cannot_apply, code_relocations_write_the_bits_the_loader_writes: patch: 63 not a code type
+31 killed by code_relocations_write_the_bits_the_loader_writes: patch: 35 a code type
+32 killed by externs_by_kind_and_what_each_mode_admits: extern: printf admitted in exact mode
+33 killed by externs_by_kind_and_what_each_mode_admits: extern: the printf switch ignored
+34 killed by externs_by_kind_and_what_each_mode_admits: extern: the heap admitted
+35 killed by externs_by_kind_and_what_each_mode_admits: extern: assert is unknown
+36 killed by externs_by_kind_and_what_each_mode_admits: extern: free is unknown
+37 killed by externs_by_kind_and_what_each_mode_admits: extern: the device runtime second
+38 killed by externs_by_kind_and_what_each_mode_admits: extern: printf by prefix
+39 killed by texture_and_surface_instructions_are_named_and_never_admitted: texture: TLD not named
+40 killed by texture_and_surface_instructions_are_named_and_never_admitted: texture: SUST not named
+41 killed by texture_and_surface_instructions_are_named_and_never_admitted: texture: by prefix
+42 killed by turbo_off_list_parses_names_and_refuses_the_rest: switch: printf is always a bad name
+43 killed by turbo_off_list_parses_names_and_refuses_the_rest: switch: printf accepted with nowhere to put it
+44 killed by turbo_off_list_parses_names_and_refuses_the_rest: switch: printf not reset
+45 killed by turbo_admits_by_class_and_switch, turbo_takes_the_kernels_exact_refused_for_numerics: switch: atomics off by default
+45 of 46 killed
+-- mutant 20 again, after the test of a 32-bit image was added:
+20 killed by the_card_image_refuses_what_it_cannot_apply: image: the class byte not checked
+1 of 1 killed
