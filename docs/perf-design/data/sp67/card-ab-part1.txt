@@ -1,0 +1,30 @@
+2DCONV base_plain 0 0.9606 0 c9644fd81ac7b3dc
+2DCONV new_plain 0 0.9223 0 c9644fd81ac7b3dc
+2DCONV base_verify 0 1.3763 0 c9644fd81ac7b3dc host_gpu_verify: in_set_identical=1 in_set_different=0 other_identical=0 other_different=0 host_gpu: verify: kernels in the exact set: 1 identical, 0 different; other kernels: 0 identical, 0 different
+2DCONV new_verify 0 1.3281 0 c9644fd81ac7b3dc host_gpu_verify: in_set_identical=1 in_set_different=0 other_identical=0 other_different=0 host_gpu: verify: kernels in the exact set: 1 identical, 0 different; other kernels: 0 identical, 0 different
+2DCONV new_verify 1 1.3286 0 c9644fd81ac7b3dc host_gpu_verify: in_set_identical=1 in_set_different=0 other_identical=0 other_different=0 host_gpu: verify: kernels in the exact set: 1 identical, 0 different; other kernels: 0 identical, 0 different
+2DCONV base_verify 1 1.3871 0 c9644fd81ac7b3dc host_gpu_verify: in_set_identical=1 in_set_different=0 other_identical=0 other_different=0 host_gpu: verify: kernels in the exact set: 1 identical, 0 different; other kernels: 0 identical, 0 different
+2DCONV new_plain 1 0.9435 0 c9644fd81ac7b3dc
+2DCONV base_plain 1 0.9398 0 c9644fd81ac7b3dc
+2DCONV base_plain 2 0.9382 0 c9644fd81ac7b3dc
+2DCONV new_plain 2 0.944 0 c9644fd81ac7b3dc
+2DCONV base_verify 2 1.3895 0 c9644fd81ac7b3dc host_gpu_verify: in_set_identical=1 in_set_different=0 other_identical=0 other_different=0 host_gpu: verify: kernels in the exact set: 1 identical, 0 different; other kernels: 0 identical, 0 different
+2DCONV new_verify 2 1.33 0 c9644fd81ac7b3dc host_gpu_verify: in_set_identical=1 in_set_different=0 other_identical=0 other_different=0 host_gpu: verify: kernels in the exact set: 1 identical, 0 different; other kernels: 0 identical, 0 different
+2DCONV new_verify 3 1.331 0 c9644fd81ac7b3dc host_gpu_verify: in_set_identical=1 in_set_different=0 other_identical=0 other_different=0 host_gpu: verify: kernels in the exact set: 1 identical, 0 different; other kernels: 0 identical, 0 different
+2DCONV base_verify 3 1.4092 0 c9644fd81ac7b3dc host_gpu_verify: in_set_identical=1 in_set_different=0 other_identical=0 other_different=0 host_gpu: verify: kernels in the exact set: 1 identical, 0 different; other kernels: 0 identical, 0 different
+2DCONV new_plain 3 0.9632 0 c9644fd81ac7b3dc
+2DCONV base_plain 3 1.0518 0 c9644fd81ac7b3dc
+2DCONV base_plain 4 1.0494 0 c9644fd81ac7b3dc
+2DCONV new_plain 4 1.0493 0 c9644fd81ac7b3dc
+2DCONV base_verify 4 1.494 0 c9644fd81ac7b3dc host_gpu_verify: in_set_identical=1 in_set_different=0 other_identical=0 other_different=0 host_gpu: verify: kernels in the exact set: 1 identical, 0 different; other kernels: 0 identical, 0 different
+2DCONV new_verify 4 1.4335 0 c9644fd81ac7b3dc host_gpu_verify: in_set_identical=1 in_set_different=0 other_identical=0 other_different=0 host_gpu: verify: kernels in the exact set: 1 identical, 0 different; other kernels: 0 identical, 0 different
+3DCONV base_plain 0 0.8617 0 c7a94ac19f3155b4
+3DCONV new_plain 0 0.8625 0 c7a94ac19f3155b4
+3DCONV base_verify 0 53.6226 0 c7a94ac19f3155b4 host_gpu_verify: in_set_identical=254 in_set_different=0 other_identical=0 other_different=0 host_gpu: verify: kernels in the exact set: 254 identical, 0 different; other kernels: 0 identical, 0 different
+3DCONV new_verify 0 10.3343 0 c7a94ac19f3155b4 host_gpu_verify: in_set_identical=254 in_set_different=0 other_identical=0 other_different=0 host_gpu: verify: kernels in the exact set: 254 identical, 0 different; other kernels: 0 identical, 0 different
+3DCONV new_verify 1 10.3266 0 c7a94ac19f3155b4 host_gpu_verify: in_set_identical=254 in_set_different=0 other_identical=0 other_different=0 host_gpu: verify: kernels in the exact set: 254 identical, 0 different; other kernels: 0 identical, 0 different
+3DCONV base_verify 1 53.4138 0 c7a94ac19f3155b4 host_gpu_verify: in_set_identical=254 in_set_different=0 other_identical=0 other_different=0 host_gpu: verify: kernels in the exact set: 254 identical, 0 different; other kernels: 0 identical, 0 different
+3DCONV new_plain 1 0.9705 0 c7a94ac19f3155b4
+3DCONV base_plain 1 0.8747 0 c7a94ac19f3155b4
+3DCONV base_plain 2 0.9013 0 c7a94ac19f3155b4
+3DCONV new_plain 2 0.8782 0 c7a94ac19f3155b4

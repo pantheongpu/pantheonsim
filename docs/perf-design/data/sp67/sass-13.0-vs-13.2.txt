@@ -1,0 +1,73 @@
+# nvcc 13.0.88 against 13.2.51, -arch=sm_86, cuobjdump -sass of each toolkit (sass_compare.py); then the cached corpus binaries against the 13.0 rebuild
+== 2DCONV: 13.0 vs 13.2
+convolution2D_kerneliiPfS_	instrs 56 / 56	text same	renamed same	opcode-seq same	division-windows same (0 / 0)	MUFU - / -	FCHK 0 / 0
+   whole listing, diff: < code version = [9,0] > code version = [9,2] 
+== ADI: 13.0 vs 13.2
+adi_kernel1iPfS_S_	instrs 384 / 384	text same	renamed same	opcode-seq same	division-windows same (33 / 33)	MUFU MUFU.RCP,MUFU.RSQ / MUFU.RCP,MUFU.RSQ	FCHK 10 / 10
+adi_kernel2iPfS_S_	instrs 144 / 144	text same	renamed same	opcode-seq same	division-windows same (6 / 6)	MUFU MUFU.RCP,MUFU.RSQ / MUFU.RCP,MUFU.RSQ	FCHK 1 / 1
+adi_kernel3iPfS_S_	instrs 280 / 280	text same	renamed same	opcode-seq same	division-windows same (18 / 18)	MUFU MUFU.RCP,MUFU.RSQ / MUFU.RCP,MUFU.RSQ	FCHK 5 / 5
+adi_kernel4iPfS_S_i	instrs 168 / 168	text same	renamed same	opcode-seq same	division-windows same (9 / 9)	MUFU MUFU.RCP,MUFU.RSQ / MUFU.RCP,MUFU.RSQ	FCHK 2 / 2
+adi_kernel5iPfS_S_	instrs 144 / 144	text same	renamed same	opcode-seq same	division-windows same (6 / 6)	MUFU MUFU.RCP,MUFU.RSQ / MUFU.RCP,MUFU.RSQ	FCHK 1 / 1
+adi_kernel6iPfS_S_i	instrs 152 / 152	text same	renamed same	opcode-seq same	division-windows same (6 / 6)	MUFU MUFU.RCP,MUFU.RSQ / MUFU.RCP,MUFU.RSQ	FCHK 1 / 1
+   whole listing, diff: < code version = [9,0] > code version = [9,2] 
+== CORR: 13.0 vs 13.2
+std_kerneliiPfS_S_	instrs 232 / 232	text same	renamed same	opcode-seq same	division-windows same (9 / 9)	MUFU MUFU.RCP,MUFU.RSQ / MUFU.RCP,MUFU.RSQ	FCHK 1 / 1
+corr_kerneliiPfS_	instrs 144 / 144	text same	renamed same	opcode-seq same	division-windows same (0 / 0)	MUFU - / -	FCHK 0 / 0
+mean_kerneliiPfS_	instrs 176 / 176	text same	renamed same	opcode-seq same	division-windows same (5 / 5)	MUFU MUFU.RCP,MUFU.RSQ / MUFU.RCP,MUFU.RSQ	FCHK 1 / 1
+reduce_kerneliiPfS_S_	instrs 152 / 152	text same	renamed same	opcode-seq same	division-windows same (6 / 6)	MUFU MUFU.RCP,MUFU.RSQ / MUFU.RCP,MUFU.RSQ	FCHK 1 / 1
+   whole listing, diff: < code version = [9,0] > code version = [9,2] 
+== COVAR: 13.0 vs 13.2
+mean_kerneliiPfS_	instrs 176 / 176	text same	renamed same	opcode-seq same	division-windows same (5 / 5)	MUFU MUFU.RCP,MUFU.RSQ / MUFU.RCP,MUFU.RSQ	FCHK 1 / 1
+covar_kerneliiPfS_	instrs 136 / 136	text same	renamed same	opcode-seq same	division-windows same (0 / 0)	MUFU - / -	FCHK 0 / 0
+reduce_kerneliiPfS_	instrs 32 / 32	text same	renamed same	opcode-seq same	division-windows same (0 / 0)	MUFU - / -	FCHK 0 / 0
+   whole listing, diff: < code version = [9,0] > code version = [9,2] 
+== GRAMSCHM: 13.0 vs 13.2
+gramschmidt_kernel1iiPfS_S_i	instrs 112 / 112	text same	renamed same	opcode-seq same	division-windows same (4 / 4)	MUFU MUFU.RSQ / MUFU.RSQ	FCHK 0 / 0
+gramschmidt_kernel2iiPfS_S_i	instrs 152 / 152	text same	renamed same	opcode-seq same	division-windows same (6 / 6)	MUFU MUFU.RCP,MUFU.RSQ / MUFU.RCP,MUFU.RSQ	FCHK 1 / 1
+gramschmidt_kernel3iiPfS_S_i	instrs 144 / 144	text same	renamed same	opcode-seq same	division-windows same (0 / 0)	MUFU - / -	FCHK 0 / 0
+   whole listing, diff: < code version = [9,0] > code version = [9,2] 
+== LU: 13.0 vs 13.2
+lu_kernel1iPfi	instrs 144 / 144	text same	renamed same	opcode-seq same	division-windows same (6 / 6)	MUFU MUFU.RCP,MUFU.RSQ / MUFU.RCP,MUFU.RSQ	FCHK 1 / 1
+lu_kernel2iPfi	instrs 40 / 40	text same	renamed same	opcode-seq same	division-windows same (0 / 0)	MUFU - / -	FCHK 0 / 0
+   whole listing, diff: < code version = [9,0] > code version = [9,2] 
+== host_gpu_lazy: 13.0 vs 13.2
+caskPji	instrs 80 / 80	text same	renamed same	opcode-seq same	division-windows same (0 / 0)	MUFU - / -	FCHK 0 / 0
+divkPfi	instrs 152 / 152	text same	renamed same	opcode-seq same	division-windows same (6 / 6)	MUFU MUFU.RCP,MUFU.RSQ / MUFU.RCP,MUFU.RSQ	FCHK 1 / 1
+leakPPh	instrs 32 / 32	text same	renamed same	opcode-seq same	division-windows same (1 / 1)	MUFU - / -	FCHK 0 / 0
+rcpkPfi	instrs 32 / 32	text same	renamed same	opcode-seq same	division-windows same (1 / 1)	MUFU MUFU.RCP / MUFU.RCP	FCHK 0 / 0
+histkPji	instrs 72 / 72	text same	renamed same	opcode-seq same	division-windows same (0 / 0)	MUFU - / -	FCHK 0 / 0
+divexpPfi	instrs 160 / 160	text same	renamed same	opcode-seq same	division-windows same (7 / 7)	MUFU MUFU.EX2,MUFU.RCP,MUFU.RSQ / MUFU.EX2,MUFU.RCP,MUFU.RSQ	FCHK 1 / 1
+fatomkPfi	instrs 56 / 56	text same	renamed same	opcode-seq same	division-windows same (0 / 0)	MUFU - / -	FCHK 0 / 0
+iatomkPji	instrs 64 / 64	text same	renamed same	opcode-seq same	division-windows same (0 / 0)	MUFU - / -	FCHK 0 / 0
+scramblePjii	instrs 88 / 88	text same	renamed same	opcode-seq same	division-windows same (0 / 0)	MUFU - / -	FCHK 0 / 0
+use_expfPfi	instrs 40 / 40	text same	renamed same	opcode-seq same	division-windows same (1 / 1)	MUFU MUFU.EX2 / MUFU.EX2	FCHK 0 / 0
+scramble1Pjii	instrs 40 / 40	text same	renamed same	opcode-seq same	division-windows same (0 / 0)	MUFU - / -	FCHK 0 / 0
+   whole listing, diff: < code version = [9,0] > code version = [9,2] 
+== sfu_exhaustive: 13.0 vs 13.2
+runijmmmbPj	instrs 376 / 376	text same	renamed same	opcode-seq same	division-windows same (27 / 27)	MUFU MUFU.COS,MUFU.EX2,MUFU.LG2,MUFU.RCP,MUFU.RSQ,MUFU.SIN,MUFU.SQRT,MUFU.TANH / MUFU.COS,MUFU.EX2,MUFU.LG2,MUFU.RCP,MUFU.RSQ,MUFU.SIN,MUFU.SQRT,MUFU.TANH	FCHK 1 / 1
+   whole listing, diff: < code version = [9,0] > code version = [9,2] 
+== 2DCONV: cached corpus binary vs 13.0 rebuild
+convolution2D_kerneliiPfS_	instrs 56 / 56	text same
+== ADI: cached corpus binary vs 13.0 rebuild
+adi_kernel1iPfS_S_	instrs 384 / 384	text same
+adi_kernel2iPfS_S_	instrs 144 / 144	text same
+adi_kernel3iPfS_S_	instrs 280 / 280	text same
+adi_kernel4iPfS_S_i	instrs 168 / 168	text same
+adi_kernel5iPfS_S_	instrs 144 / 144	text same
+adi_kernel6iPfS_S_i	instrs 152 / 152	text same
+== CORR: cached corpus binary vs 13.0 rebuild
+std_kerneliiPfS_S_	instrs 232 / 232	text same
+corr_kerneliiPfS_	instrs 144 / 144	text same
+mean_kerneliiPfS_	instrs 176 / 176	text same
+reduce_kerneliiPfS_S_	instrs 152 / 152	text same
+== COVAR: cached corpus binary vs 13.0 rebuild
+mean_kerneliiPfS_	instrs 176 / 176	text same
+covar_kerneliiPfS_	instrs 136 / 136	text same
+reduce_kerneliiPfS_	instrs 32 / 32	text same
+== GRAMSCHM: cached corpus binary vs 13.0 rebuild
+gramschmidt_kernel1iiPfS_S_i	instrs 112 / 112	text same
+gramschmidt_kernel2iiPfS_S_i	instrs 152 / 152	text same
+gramschmidt_kernel3iiPfS_S_i	instrs 144 / 144	text same
+== LU: cached corpus binary vs 13.0 rebuild
+lu_kernel1iPfi	instrs 144 / 144	text same
+lu_kernel2iPfi	instrs 40 / 40	text same

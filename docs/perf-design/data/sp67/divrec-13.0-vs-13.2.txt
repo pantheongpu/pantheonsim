@@ -1,0 +1,68 @@
+== 13.0 ADI
+  1021 host_gpu: _Z11adi_kernel4iPfS_S_i stays in the simulator (size rule: admitted, kept for its size)
+  1020 host_gpu: _Z11adi_kernel6iPfS_S_i stays in the simulator (size rule: admitted, kept for its size)
+== 13.0 LU
+  2046 host_gpu: _Z10lu_kernel1iPfi stays in the simulator (size rule: admitted, kept for its size)
+  2046 host_gpu: _Z10lu_kernel2iPfi stays in the simulator (size rule: admitted, kept for its size)
+== 13.0 GRAMSCHM
+  1 host_gpu: _Z19gramschmidt_kernel1iiPfS_S_i: not the division idiom: a CALL with no FCHK before it
+  1 host_gpu: _Z19gramschmidt_kernel1iiPfS_S_i refused: MUFU.RSQ R7, R0
+  1 host_gpu: _Z19gramschmidt_kernel1iiPfS_S_i: SFU forms: MUFU.RSQx2; 0 FCHK, 1 CALL
+  1 host_gpu: _Z19gramschmidt_kernel1iiPfS_S_i stays in the simulator: instruction outside the exact set
+  1912 host_gpu: _Z19gramschmidt_kernel1iiPfS_S_i stays in the simulator: kernel code not in the exact set
+  1910 host_gpu: _Z19gramschmidt_kernel2iiPfS_S_i stays in the simulator (size rule: admitted, kept for its size)
+  1910 host_gpu: _Z19gramschmidt_kernel3iiPfS_S_i stays in the simulator (size rule: admitted, kept for its size)
+== 13.0 CORR
+  1 host_gpu: _Z10std_kerneliiPfS_S_: not the division idiom: a CALL with no FCHK before it
+  1 host_gpu: _Z10std_kerneliiPfS_S_ refused: CALL.REL.NOINC 0x800
+  1 host_gpu: _Z10std_kerneliiPfS_S_: SFU forms: MUFU.RCPx1 MUFU.RSQx3; 1 FCHK, 2 CALL
+  1 host_gpu: _Z10std_kerneliiPfS_S_ stays in the simulator: instruction outside the exact set
+== 13.0 COVAR
+== 13.0 host_gpu_lazy:div
+  2 host_gpu: _Z4divkPfi stays in the simulator (size rule: admitted, kept for its size)
+== 13.0 host_gpu_lazy:divexp
+  1 host_gpu: _Z6divexpPfi: not the division idiom: an SFU instruction other than RCP
+  1 host_gpu: _Z6divexpPfi refused: MUFU.RCP R6, R7
+  1 host_gpu: _Z6divexpPfi: SFU forms: MUFU.EX2x1 MUFU.RCPx2 MUFU.RSQx1; 1 FCHK, 1 CALL
+  1 host_gpu: _Z6divexpPfi stays in the simulator: instruction outside the exact set
+  3 host_gpu: _Z6divexpPfi stays in the simulator: kernel code not in the exact set
+== 13.0 host_gpu_lazy:rcp
+  1 host_gpu: _Z4rcpkPfi: not the division idiom: a MUFU.RCP with no FCHK of its divisor right after
+  1 host_gpu: _Z4rcpkPfi refused: MUFU.RCP R5, R5
+  1 host_gpu: _Z4rcpkPfi: SFU forms: MUFU.RCPx1; 0 FCHK, 0 CALL
+  1 host_gpu: _Z4rcpkPfi stays in the simulator: instruction outside the exact set
+  3 host_gpu: _Z4rcpkPfi stays in the simulator: kernel code not in the exact set
+== 13.2 ADI
+  1021 host_gpu: _Z11adi_kernel4iPfS_S_i stays in the simulator (size rule: admitted, kept for its size)
+  1020 host_gpu: _Z11adi_kernel6iPfS_S_i stays in the simulator (size rule: admitted, kept for its size)
+== 13.2 LU
+  2046 host_gpu: _Z10lu_kernel1iPfi stays in the simulator (size rule: admitted, kept for its size)
+  2046 host_gpu: _Z10lu_kernel2iPfi stays in the simulator (size rule: admitted, kept for its size)
+== 13.2 GRAMSCHM
+  1 host_gpu: _Z19gramschmidt_kernel1iiPfS_S_i: not the division idiom: a CALL with no FCHK before it
+  1 host_gpu: _Z19gramschmidt_kernel1iiPfS_S_i refused: MUFU.RSQ R7, R0
+  1 host_gpu: _Z19gramschmidt_kernel1iiPfS_S_i: SFU forms: MUFU.RSQx2; 0 FCHK, 1 CALL
+  1 host_gpu: _Z19gramschmidt_kernel1iiPfS_S_i stays in the simulator: instruction outside the exact set
+  1942 host_gpu: _Z19gramschmidt_kernel1iiPfS_S_i stays in the simulator: kernel code not in the exact set
+  1941 host_gpu: _Z19gramschmidt_kernel2iiPfS_S_i stays in the simulator (size rule: admitted, kept for its size)
+  1940 host_gpu: _Z19gramschmidt_kernel3iiPfS_S_i stays in the simulator (size rule: admitted, kept for its size)
+== 13.2 CORR
+  1 host_gpu: _Z10std_kerneliiPfS_S_: not the division idiom: a CALL with no FCHK before it
+  1 host_gpu: _Z10std_kerneliiPfS_S_ refused: CALL.REL.NOINC 0x800
+  1 host_gpu: _Z10std_kerneliiPfS_S_: SFU forms: MUFU.RCPx1 MUFU.RSQx3; 1 FCHK, 2 CALL
+  1 host_gpu: _Z10std_kerneliiPfS_S_ stays in the simulator: instruction outside the exact set
+== 13.2 COVAR
+== 13.2 host_gpu_lazy:div
+  2 host_gpu: _Z4divkPfi stays in the simulator (size rule: admitted, kept for its size)
+== 13.2 host_gpu_lazy:divexp
+  1 host_gpu: _Z6divexpPfi: not the division idiom: an SFU instruction other than RCP
+  1 host_gpu: _Z6divexpPfi refused: MUFU.RCP R6, R7
+  1 host_gpu: _Z6divexpPfi: SFU forms: MUFU.EX2x1 MUFU.RCPx2 MUFU.RSQx1; 1 FCHK, 1 CALL
+  1 host_gpu: _Z6divexpPfi stays in the simulator: instruction outside the exact set
+  3 host_gpu: _Z6divexpPfi stays in the simulator: kernel code not in the exact set
+== 13.2 host_gpu_lazy:rcp
+  1 host_gpu: _Z4rcpkPfi: not the division idiom: a MUFU.RCP with no FCHK of its divisor right after
+  1 host_gpu: _Z4rcpkPfi refused: MUFU.RCP R5, R5
+  1 host_gpu: _Z4rcpkPfi: SFU forms: MUFU.RCPx1; 0 FCHK, 0 CALL
+  1 host_gpu: _Z4rcpkPfi stays in the simulator: instruction outside the exact set
+  3 host_gpu: _Z4rcpkPfi stays in the simulator: kernel code not in the exact set
