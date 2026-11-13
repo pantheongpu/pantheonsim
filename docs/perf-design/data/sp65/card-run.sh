@@ -16,7 +16,8 @@ mkdir -p "$out"
 export PATH=/usr/local/cuda-13.0/bin:$PATH NVCC=/usr/local/cuda-13.0/bin/nvcc
 H="python3 tools/bench/hostgpu/run.py --build $build --corp $corp --gpu nvidia/a10g"
 HEC_SKIP="aidw-cuda,atomicCost-cuda,fpdc-cuda,zerocopy-cuda"
-# the programs whose decisions the offline replay says the rule changes (data/sp65/changes-*.md), and GRAMSCHM apart (about 4 minutes a run)
+# the programs whose decisions the offline replay says the rule changes (offline/changes-turbo.md: LU, gaussian, lud), two with launches kept
+# for their size that it says it does not change (sc_gpu, hotspot), and GRAMSCHM apart (about 4 minutes a run)
 TARGET=${SP65_TARGET:-polybench/LU,rodinia/gaussian,rodinia/lud,rodinia/sc_gpu,rodinia/hotspot}
 GRAMSCHM=polybench/GRAMSCHM
 
@@ -32,10 +33,10 @@ target|all)
   # the programs the rule changes: 3 runs of each form (LU: about 30 s a run in the simulator, so --long-secs 60 keeps its 3 runs)
   $H --programs "$TARGET" --runs 3 --long-secs 60 --long-runs 1 --forms sim,exact,exactn,turbo,turbon,exactdiv --timeout 600 \
      --json "$out/target.json" --md "$out/target.md" 2>&1 | tee "$out/target.txt" | tail -20
-  $H --programs "$TARGET" --runs 3 --long-secs 60 --long-runs 1 --forms exactdiv --env VGPU_HOST_GPU_STREAK=0 --timeout 600 --no-exact-stats \
+  $H --programs "$TARGET" --runs 3 --long-secs 60 --long-runs 1 --forms sim,exactdiv --env VGPU_HOST_GPU_STREAK=0 --timeout 600 --no-exact-stats \
      --json "$out/target-div0.json" --md "$out/target-div0.md" 2>&1 | tee "$out/target-div0.txt" | tail -12
-  # GRAMSCHM: one run a form (230 s in the simulator, mostly its CPU reference)
-  $H --programs "$GRAMSCHM" --runs 1 --forms sim,exact,exactn,turbo,turbon --timeout 900 \
+  # GRAMSCHM: one run a form (230 s in the simulator, mostly its CPU reference); no extra logged exact run (the log stage has its lines)
+  $H --programs "$GRAMSCHM" --runs 1 --forms sim,exact,exactn,turbo,turbon --timeout 900 --no-exact-stats \
      --json "$out/gramschm.json" --md "$out/gramschm.md" 2>&1 | tee "$out/gramschm.txt" | tail -12
   ;;&
 ab|all)

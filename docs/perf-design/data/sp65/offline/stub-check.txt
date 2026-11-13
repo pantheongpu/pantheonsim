@@ -1,0 +1,4 @@
+polybench/LU exact streak {'rc': 0, 'card': 883, 'sim': 3213, 'refused': 2048, 'too_small': 1163, 'streak_sent': 0, 'streak_mib': 0.0, 'rule': 1, 'pushed_mib': 14128.0, 'pulled_mib': 14128.0, 'banned': 1, 'failed_lines': 1}
+polybench/LU exact STREAK=0 {'rc': 0, 'card': 687, 'sim': 3409, 'refused': 2048, 'too_small': 1359, 'streak_sent': 0, 'streak_mib': 0.0, 'rule': 0, 'pushed_mib': 10992.0, 'pulled_mib': 10992.0, 'banned': 1, 'failed_lines': 1}
+polybench/LU turbo streak {'rc': 0, 'card': 4071, 'sim': 25, 'refused': 0, 'too_small': 21, 'streak_sent': 2244, 'streak_mib': 35904.0, 'rule': 1, 'pushed_mib': 16.0, 'pulled_mib': 16.0, 'banned': 0, 'failed_lines': 1}
+polybench/LU turbo STREAK=0 {'rc': 0, 'card': 772, 'sim': 3324, 'refused': 0, 'too_small': 3320, 'streak_sent': 0, 'streak_mib': 0.0, 'rule': 0, 'pushed_mib': 12352.0, 'pulled_mib': 12352.0, 'banned': 1, 'failed_lines': 1}
