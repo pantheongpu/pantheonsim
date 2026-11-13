@@ -22,6 +22,9 @@
 #   9. with a live texture object a plain kernel runs on the card in both modes, and the output is the mode-off output;
 #  10. in turbo mode a kernel that calls a device function of another section (host_gpu_rdc.cu, -rdc=true) runs on the card, output the mode-off output;
 #  11. a kernel launched from a CUDA graph runs on the card in both modes, output the mode-off output.
+# The idioms of exact mode (Round sp68):
+#  12. with VGPU_HOST_GPU_SQRT=1 (and VGPU_HOST_GPU_DIV=1) the sqrtf kernel and the sqrtf-then-division kernel of host_gpu_lazy.cu (inputs on both paths of
+#      sqrtf, negatives among them) run on the card, verify finds every launch identical, and the output is the mode-off output to the byte.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -146,5 +149,22 @@ env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/rdc" > "$w
 env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" VGPU_HOST_GPU=turbo "${send[@]}" "$work/rdc" > "$work/rturbo.out" 2> "$work/rturbo.err" || { echo "FAIL: host_gpu_rdc, turbo, failed"; tail -5 "$work/rturbo.err"; fails=1; }
 cmp -s "$work/roff.out" "$work/rturbo.out" || { echo "FAIL: turbo: a kernel that calls into another section changes the output on the card"; fails=1; }
 grep -q "calls_out[^ ]* on the card" "$work/rturbo.err" || { echo "FAIL: turbo: the kernel that calls into another section did not run on the card: $(grep -m2 'calls_out' "$work/rturbo.err")"; fails=1; }
-(( fails == 0 )) && { echo "PASS: $sum; turbo: $rline; turbo verify: $vline; module variables, printf, textures and calls into another section on the card"; exit 0; }
+# 12. the square root idiom on the card (Round sp68).
+"$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets "$root/nvidia/tests/e2e/host_gpu_lazy.cu" "$root/nvidia/tests/e2e/host_gpu_lazy_heap.cu" \
+  -o "$work/lazy" || { echo "FAIL: host_gpu_lazy.cu does not compile"; exit 1; }
+for arg in sqrt sqrtdiv; do
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/lazy" "$arg" > "$work/sq_off_$arg.out" 2> /dev/null || { echo "FAIL: the $arg run with the mode off failed"; fails=1; }
+  for v in 0 1; do
+    env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" VGPU_HOST_GPU=exact VGPU_HOST_GPU_SQRT=1 VGPU_HOST_GPU_DIV=1 VGPU_HOST_GPU_START_COST=0 \
+      VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_VERIFY=$v VGPU_HOST_GPU_LOG=1 "$work/lazy" "$arg" > "$work/sq_${arg}_$v.out" 2> "$work/sq_${arg}_$v.err" \
+      || { echo "FAIL: the $arg run with the square root idiom failed (verify=$v)"; tail -5 "$work/sq_${arg}_$v.err"; fails=1; }
+    cmp -s "$work/sq_off_$arg.out" "$work/sq_${arg}_$v.out" || { echo "FAIL: the square root idiom changes the output of $arg on the card (verify=$v)"; fails=1; }
+    grep -q 'in the exact set by the square root idiom' "$work/sq_${arg}_$v.err" || { echo "FAIL: $arg was not admitted by the square root idiom"; fails=1; }
+  done
+  n="$(sed -n 's/^host_gpu: \([0-9]*\) launches ran on the card.*/\1/p' "$work/sq_${arg}_0.err" | tail -1)"
+  (( ${n:-0} >= 1 )) || { echo "FAIL: no launch of $arg ran on the card: $(grep '^host_gpu: [0-9]* launches' "$work/sq_${arg}_0.err")"; fails=1; }
+  grep -q '^host_gpu_verify: in_set_identical=[1-9][0-9]* in_set_different=0 ' "$work/sq_${arg}_1.err" \
+    || { echo "FAIL: verify of $arg: $(grep '^host_gpu_verify' "$work/sq_${arg}_1.err")"; fails=1; }
+done
+(( fails == 0 )) && { echo "PASS: $sum; turbo: $rline; turbo verify: $vline; module variables, printf, textures and calls into another section on the card; the square root idiom on the card"; exit 0; }
 exit 1

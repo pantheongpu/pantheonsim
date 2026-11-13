@@ -5,6 +5,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -284,6 +285,56 @@ VTEST(integer_division_bounds_can_fail) {
   VCHECK(far > 0);
   VCHECK(over > 0);
   VCHECK(two > 0);
+}
+
+// ---- the square root idiom (include/vgpu/host_gpu_idiom.hpp, Round sp68): nvcc's sqrt.rn for sm_86 as scalar code ----
+// Fast path (x - 0x0d000000 <= 0x727fffff unsigned: positive floats from 2^-101 up): y = MUFU.RSQ(x), s = y x (FMUL.FTZ), h = y / 2 (FMUL.FTZ),
+// d = fma(-s, s, x), r = fma(d, h, s). Slow path for the other positive finite floats: the same on x 2^64 (an FFMA, exact), the result times 2^-32
+// (FMUL.FTZ). `k` moves the reciprocal square root k ulp away from the simulator's (the card's differs from it by up to 2 ulp on 10.7% of inputs, sp44).
+namespace {
+uint32_t sqrt_idiom_model(uint32_t x, int k) {
+  const auto f = [](uint32_t b) { return std::bit_cast<float>(b); };
+  const auto ftz = [](float v) { return ref::flush(v); };
+  if (x - 0x0d000000u <= 0x727fffffu) {
+    const float xf = f(x), y = f(ref::mufu(ref::Fn::Rsq, x) + static_cast<uint32_t>(k));
+    const float s = ftz(y * xf), h = ftz(y * 0.5f);
+    return std::bit_cast<uint32_t>(std::fmaf(std::fmaf(-s, s, xf), h, s));
+  }
+  const float sc = std::fmaf(f(x), 18446744073709551616.0f, 0.0f);
+  const float y = f(ref::mufu(ref::Fn::Rsq, std::bit_cast<uint32_t>(sc)) + static_cast<uint32_t>(k));
+  const float t = ftz(sc * y), h = ftz(y * 0.5f);
+  const float z = std::fmaf(std::fmaf(t, -t, sc), h, t);
+  return std::bit_cast<uint32_t>(ftz(z * 2.3283064365386962891e-10f));
+}
+}  // namespace
+
+VTEST(sqrt_refinement_is_correctly_rounded_for_the_simulators_reciprocal_square_root) {
+  // every positive finite float with VGPU_EXHAUSTIVE=1 (2^31 inputs, about a minute), else a stride (zero, negatives, infinities and NaNs never reach
+  // the refinement: the slow path returns them before its MUFU)
+  const uint64_t stride = exhaustive() ? 1 : 4099;
+  uint64_t wrong = 0, tested = 0;
+  uint32_t first = 0;
+  for (uint64_t x = 1; x < 0x7f800000u; x += stride, ++tested)
+    if (sqrt_idiom_model(static_cast<uint32_t>(x), 0) != ref::fsqrt_rn(static_cast<uint32_t>(x)) && !wrong++) first = static_cast<uint32_t>(x);
+  for (uint32_t x : {0x00000001u, 0x007fffffu, 0x00800000u, 0x0cffffffu, 0x0d000000u, 0x3f800000u, 0x7f7fffffu, 0x0d6e9372u, 0x7f6e9372u, 0x0d4d142au})
+    wrong += sqrt_idiom_model(x, 0) != ref::fsqrt_rn(x);
+  if (wrong) std::fprintf(stderr, "  %llu of %llu wrong, first 0x%s\n", static_cast<unsigned long long>(wrong), static_cast<unsigned long long>(tested), hex(first).c_str());
+  VCHECK_EQ(wrong, uint64_t{0});
+}
+
+VTEST(sqrt_refinement_is_not_exact_for_every_reciprocal_square_root_one_ulp_off) {
+  // Unlike the division (exact for a reciprocal one ulp either way), the square root's refinement gives a wrong root for a few inputs when the reciprocal
+  // square root is one ulp from the simulator's: of the 2^31 positive floats, 383 at -1 ulp and 255 at +1 (1,401 and 1,273 at 2 ulp; the program
+  // docs/perf-design/data/sp68/sqrt_model.cpp ran them all). So the idiom is exact on a card only if its MUFU.RSQ is right where these inputs need it,
+  // which the card run checks (sp44: the A10G's was, on all 2^32 inputs); a card of another architecture needs its own run.
+  for (uint32_t x : {0x0d6e9372u, 0x3f6e9372u, 0x7f6e9372u, 0x007749b9u}) {
+    VCHECK(sqrt_idiom_model(x, 0) == ref::fsqrt_rn(x));
+    VCHECK(sqrt_idiom_model(x, +1) != ref::fsqrt_rn(x));
+  }
+  for (uint32_t x : {0x0d4d142au, 0x00668a15u}) {
+    VCHECK(sqrt_idiom_model(x, 0) == ref::fsqrt_rn(x));
+    VCHECK(sqrt_idiom_model(x, -1) != ref::fsqrt_rn(x));
+  }
 }
 
 VTEST_MAIN

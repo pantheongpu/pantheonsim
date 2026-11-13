@@ -25,6 +25,16 @@ release says what runs and what it produces, never how fast a real GPU would run
   `VGPU_HOST_GPU_STREAK=0` keeps the old rule; the summary's `host_gpu_streak:` line counts the launches sent this way
   ([design](docs/perf-design/12-host-gpu-turbo.md), section 9). A launch with a grid or block dimension of 0 now stays in the simulator, which
   reports its own configuration error, instead of failing on the card (it ended the mode with an internal error when the card held memory).
+- Host-GPU mode (experimental, opt-in), exact mode: `VGPU_HOST_GPU_SQRT=1` also admits kernels whose only instructions outside the exact set are
+  the IEEE square root sequence nvcc builds for `sqrtf` and `__fsqrt_rn` (`MUFU.RSQ`, a range check, a refinement, a slow-path subroutine), alone or
+  beside the division sequence of `VGPU_HOST_GPU_DIV=1`. The sequence is recognised by what it computes, every path of it against the code an A10G
+  ran over all 2^32 inputs with no difference; a bare `rsqrtf` stays out. Off by default: unlike the division's, the refinement is not exact for every
+  reciprocal square root one ulp off, so it is exact only on a card whose `MUFU.RSQ` passes `tools/probes/hostgpu_mufu_card_experiment.sh` (so far the
+  A10G). On an A10G (Round sp68) every launch of the admitted kernels was identical under `VGPU_HOST_GPU_VERIFY`; HeCBench hellinger ran 6.4x faster;
+  PolyBench GRAMSCHM's device part went from 44.6 s to 3.1 s once combined with Round sp65's rule (on its own the one-thread kernel stays in the
+  simulator for its size). `tools/probes/hostgpu_idiom_scan` lists, without running a program, which of its kernels are in the exact set and by which
+  idiom ([docs/cli.md](docs/cli.md), [rounds](docs/perf-design/rounds/11-rounds-sp36-sp41.md)).
+
 - Host-GPU mode (experimental, opt-in), `VGPU_HOST_GPU_VERIFY`: after each compare the chunks whose bytes on the card equal the simulator's
   stay on the card, and only the others (and what the host wrote since) are pushed before the next launch; before, all live memory was pushed
   before every launch. The simulator still runs each launch with no card copy valid, and the program's output is the simulator's as before.

@@ -1,0 +1,10 @@
+CORR v 0 0 68.874331 28.790289 96ba52add2de149b
+hellinger v 0 0 42.984461 None c3ef86550c5323fa
+knn v 0 0 17.128364 None 3290d8ea1c7e6dbd
+rod_nn v 0 0 0.251756 None 3c20c13a34d62746
+hec_nn v 0 0 0.259026 None 56d5fc657cda7d1d
+rc=0
+   2048 host_gpu: verify _Z19gramschmidt_kernel1iiPfS_S_i (in the exact set): identical
+   2048 host_gpu: verify _Z19gramschmidt_kernel2iiPfS_S_i (in the exact set): identical
+   2048 host_gpu: verify _Z19gramschmidt_kernel3iiPfS_S_i (in the exact set): identical
+host_gpu_verify: in_set_identical=6144 in_set_different=0 other_identical=0 other_different=0

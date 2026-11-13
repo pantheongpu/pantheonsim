@@ -1412,6 +1412,8 @@ vgpu_unit_test(test_yamlish)
 vgpu_unit_test(test_check_compare)
 vgpu_unit_test(test_host_gpu_logic)
 vgpu_unit_test(test_host_gpu_ref)
+# The square root idiom of host-GPU exact mode (include/vgpu/host_gpu_idiom.hpp), on real nvcc SASS (tests/unit/host_gpu_idiom_sass.inc): no card.
+vgpu_unit_test(test_host_gpu_idiom)
 # Turbo host-GPU mode's compare by tolerance (include/vgpu/host_gpu_tol.hpp): header-only, no card.
 vgpu_unit_test(test_host_gpu_tol)
 vgpu_unit_test(test_card_gate)

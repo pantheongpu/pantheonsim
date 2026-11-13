@@ -1,0 +1,34 @@
+# gram_stub.sh build (this branch), then build65 (this branch merged with sp65-resident-streaks); the SQRT=1 run of the first was cut at 150 s
+## build
+== SQRT=0 rc=0
+   2048 _Z19gramschmidt_kernel1iiPfS_S_i stays in the simulator
+   2046 _Z19gramschmidt_kernel2iiPfS_S_i stays in the simulator
+      2 _Z19gramschmidt_kernel3iiPfS_S_i on the card
+     19 _Z19gramschmidt_kernel3iiPfS_S_i stays in the simulator
+stub/gram0.err:host_gpu: 2 launches ran on the card, 6142 in the simulator (2048 kernels not in the exact set, 4090 too small, 0 unsupported launch shapes, 0 failed on the card)
+stub/gram0.err:host_gpu: 96.0 MiB went to the card, 96.0 MiB came back
+stub/gram0.out:GPU Time in seconds:
+== SQRT=1 rc=124
+   2046 _Z19gramschmidt_kernel1iiPfS_S_i stays in the simulator
+   2046 _Z19gramschmidt_kernel2iiPfS_S_i stays in the simulator
+      2 _Z19gramschmidt_kernel3iiPfS_S_i on the card
+     18 _Z19gramschmidt_kernel3iiPfS_S_i stays in the simulator
+## build65
+== SQRT=0 rc=0
+   2048 _Z19gramschmidt_kernel1iiPfS_S_i stays in the simulator
+   2046 _Z19gramschmidt_kernel2iiPfS_S_i stays in the simulator
+      2 _Z19gramschmidt_kernel3iiPfS_S_i on the card
+     20 _Z19gramschmidt_kernel3iiPfS_S_i stays in the simulator
+stub/build65-gram0.err:host_gpu: 2 launches ran on the card, 6142 in the simulator (2048 kernels not in the exact set, 4090 too small, 0 unsupported launch shapes, 0 failed on the card)
+stub/build65-gram0.err:host_gpu: 96.0 MiB went to the card, 96.0 MiB came back
+stub/build65-gram0.out:GPU Time in seconds:
+== SQRT=1 rc=0
+   2031 _Z19gramschmidt_kernel1iiPfS_S_i on the card
+     15 _Z19gramschmidt_kernel1iiPfS_S_i stays in the simulator
+   2031 _Z19gramschmidt_kernel2iiPfS_S_i on the card
+     15 _Z19gramschmidt_kernel2iiPfS_S_i stays in the simulator
+   2032 _Z19gramschmidt_kernel3iiPfS_S_i on the card
+     14 _Z19gramschmidt_kernel3iiPfS_S_i stays in the simulator
+stub/build65-gram1.err:host_gpu: 6094 launches ran on the card, 50 in the simulator (0 kernels not in the exact set, 44 too small, 0 unsupported launch shapes, 0 failed on the card)
+stub/build65-gram1.err:host_gpu: 48.0 MiB went to the card, 16.0 MiB came back
+stub/build65-gram1.out:GPU Time in seconds:
