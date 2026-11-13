@@ -12,7 +12,9 @@ the compile log); P = N with the pieces and the jobs (not kept). Release, `-g1`,
   `t1.md`, `t1.json`: one thread (`taskset -c 12-15`, two cores), 15 programs. `tdq.md`: the second run at sixteen threads on a cache that already
   has the precompiled header.
 * `sequence.md`: runs one after the other on one cache (first, second, ... run), B, N and P, at sixteen and at one thread.
-* `pieces-not-kept.patch`: the pieces and jobs of section 5 (P against N, the source only; its unit tests are described in the round), not kept.
+* `pieces-not-kept.patch`: the pieces and jobs of section 5 (P against N, the source only; its unit tests are described in the round), not kept. It
+  was left out when the round was merged (to keep this directory under 100 KB): it is on branch `sp64-jit-threads`, commit 21787e28, at
+  `docs/perf-design/data/sp64/pieces-not-kept.patch`, and applies on 65b096b2 (build N).
 * `mutants.log`, `tests.log`: `scripts/mutants_all.sh` on the kept build N, and the unit tests and run-loop ctest legs that ran.
 
 The `.md` tables give each side's speed-up (its build's default median over the side's); "N/B cold" and the like are the changed build's speed-up over the base

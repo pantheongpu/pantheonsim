@@ -3,7 +3,8 @@
 # (tools/bench/real/pack_corpora.sh's layout, the sm_86 binaries built with nvcc 13.0 and -cudart shared; the CUDA Samples under ~/corp/samples as
 # tools/bench/real/real.py's manifest reads them, if they are wanted). Built on sp61's card-run.sh.
 #   docs/perf-design/data/sp66/card-run.sh <stage> [out dir]        stages: build changed atomics rest, and all (the four in that order)
-# Forms: exact and turbo are this round's rules; exactn and turbon the same build with VGPU_HOST_GPU_WIDER=0, the safety rules before the round
+# Forms: exact and turbo are this round's rules; exactw0 and turbow0 the same build with VGPU_HOST_GPU_WIDER=0, the safety rules before the round
+# (named exactn and turbon when the round ran; renamed when it was merged with sp65, whose exactn and turbon are VGPU_HOST_GPU_STREAK=0)
 # (a module's variables, external functions or device-side launches refuse all its kernels, a live texture object every launch, and turbo mode's
 # float atomics with a value, CAS and EXCH are an opt-in). Interleaved, run by run, with the plain simulator.
 set -u
@@ -26,14 +27,15 @@ CHANGED_CORPORA=$CORPORA
 case $stage in
 build|all)
   # builds, the unit tests, e2e_host_gpu (steps 7 to 9 are new: module variables, printf and a texture object on the card) and e2e_host_gpu_stub
-  # (steps 24 to 28 are new and have run nowhere: no nvcc on the machine the round was built on), the probes
+  # (steps 24 to 28 when the round ran, 29 to 35 since the merge with sp65 and sp67: new, and they had run nowhere: no nvcc on the machine the
+  # round was built on), the probes
   CARD_CI_JOBS=4 tools/card-ci/run-card-ci.sh "$build" 2>&1 | tee "$out/card-ci.txt"
   nice cmake --build "$build" -j4 --target vgpucuda > "$build.vgpucuda.log" 2>&1 || tail -20 "$build.vgpucuda.log"   # (the driver shim: Samples that call the driver API)
   (cd "$build" && ctest -R 'hostgpu_bench_selftest' --output-on-failure) 2>&1 | tail -3 | tee "$out/selftest.txt"
   ;;&
 changed|all)
   # 3 runs a form; one untimed verify run (VGPU_HOST_GPU_VERIFY=all) of each
-  $H --corpora "$CHANGED_CORPORA" --programs "$CHANGED" --runs 3 --long-secs 20 --long-runs 1 --forms sim,exact,exactn,turbo,turbon,verify --timeout 600 \
+  $H --corpora "$CHANGED_CORPORA" --programs "$CHANGED" --runs 3 --long-secs 20 --long-runs 1 --forms sim,exact,exactw0,turbo,turbow0,verify --timeout 600 \
      --json "$out/changed.json" --md "$out/changed.md" 2>&1 | tee "$out/changed.txt" | tail -40
   ;;&
 atomics|all)

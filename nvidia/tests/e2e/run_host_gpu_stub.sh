@@ -49,20 +49,20 @@
 #  25. ... and with VGPU_HOST_GPU_STREAK=0 they stay in the simulator (the counters read 8, nothing is counted);
 #  26. when the program reads the memory back between the two (`streakread`), the card holds nothing the simulator does not and `bump` stays.
 #  27. a launch on a grid of 0 blocks while the card holds the memory gets the simulator's error, as with the mode off, and never reaches the card.
-#  27. (Round sp67) a verify run pushes again only the chunks whose card bytes differed from the simulator's after the last launch, and the chunks the host
+#  28. (Round sp67) a verify run pushes again only the chunks whose card bytes differed from the simulator's after the last launch, and the chunks the host
 #      wrote since: an allocation no kernel touches goes to the card once, a host memset of part of it goes again, and the output is the mode-off output.
 # What a module holds besides code (Round sp66; host_gpu_vars.cu, one module with __device__ and __constant__ variables, string literals, vprintf,
 # malloc/free and assert):
-#  24. kernels that use the module's variables (by name, and through a pointer from cudaGetSymbolAddress) reach the card path in both modes, and the
+#  29. kernels that use the module's variables (by name, and through a pointer from cudaGetSymbolAddress) reach the card path in both modes, and the
 #      image the card is given has no relocation left against a variable (the mode applied them with the simulator's addresses); the output is unchanged;
-#  25. ... and on a stand-in card that loads it (a verify run), the card's constant bank is looked up (cuModuleGetGlobal) and filled from the window
+#  30. ... and on a stand-in card that loads it (a verify run), the card's constant bank is looked up (cuModuleGetGlobal) and filled from the window
 #      (cuMemcpyDtoD) before the first launch, and the output is the simulator's;
-#  26. a kernel that prints reaches the card path in turbo mode, not in exact mode nor with VGPU_HOST_GPU_TURBO_OFF=printf; the output is unchanged;
-#  27. a live texture object no longer keeps the device's launches off the card; the kernel that fetches through it stays (class never);
-#  28. a kernel that calls malloc, free and assert never reaches the driver, in either mode;
-#  29. a kernel that calls a device function of another section (host_gpu_rdc.cu, -rdc=true: an absolute call) reaches the card path in turbo mode,
+#  31. a kernel that prints reaches the card path in turbo mode, not in exact mode nor with VGPU_HOST_GPU_TURBO_OFF=printf; the output is unchanged;
+#  32. a live texture object no longer keeps the device's launches off the card; the kernel that fetches through it stays (class never);
+#  33. a kernel that calls malloc, free and assert never reaches the driver, in either mode;
+#  34. a kernel that calls a device function of another section (host_gpu_rdc.cu, -rdc=true: an absolute call) reaches the card path in turbo mode,
 #      whose scan follows the call into the callee's code, and not in exact mode; the output is unchanged;
-#  30. a kernel launched from a CUDA graph reaches the card path in both modes; the output is unchanged.
+#  35. a kernel launched from a CUDA graph reaches the card path in both modes; the output is unchanged.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -367,7 +367,7 @@ for m in exact turbo; do
   grep -q 'a grid or block dimension is 0' "$work/zg_$m.err" || { echo "FAIL: $m: no line saying the zero grid stayed in the simulator"; fails=1; }
   grep -q '^cuLaunchKernel$' "$work/zg_$m.log" || { echo "FAIL: $m: nothing went to the card before the zero grid, so the step proves nothing: $(calls "zg_$m")"; fails=1; }
 done
-# 27. (Round sp67; 24 to 26 are Round sp65's) a verify run gives the card back the chunks whose bytes agreed after a launch, and pushes only the others
+# 28. (Round sp67; 24 to 27 are Round sp65's) a verify run gives the card back the chunks whose bytes agreed after a launch, and pushes only the others
 # before the next one. `keep` is `big` (1 MiB, every chunk written by every launch) beside 8 MiB no kernel touches, with a host memset of the first 64 KiB of
 # those after the second launch. Against a card that keeps memory and computes nothing, every chunk of the 1 MiB differs after every launch (16 chunks) and every
 # chunk of the 8 MiB agrees: the 9 MiB go once, then the 1 MiB before each launch, and the memset chunk once more: 12.1 MiB in all (it was 36.0: every byte
@@ -384,7 +384,7 @@ done
 # (exact mode names the chunks: the 16 of the 1 MiB after every launch, never a 17th: the memset chunk reached the card before the third launch)
 n="$(grep -c '^host_gpu: verify [^ ]* (in the exact set): DIFFERENT, 64 KiB chunks: 16$' "$work/keep_exact.err")"
 (( n == 4 )) || { echo "FAIL: exact verify of keep: expected 4 launches with the 16 chunks of the 1 MiB different, got $n: $(grep '^host_gpu: verify' "$work/keep_exact.err" | head -4)"; fails=1; }
-# 24 to 28. what a module holds besides code (host_gpu_vars.cu).
+# 29 to 33. what a module holds besides code (host_gpu_vars.cu).
 for arg in vars printf tex heap graph; do
   env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/vars" "$arg" > "$work/off_v$arg.out" 2> "$work/off_v$arg.err" || { echo "FAIL: the $arg run of host_gpu_vars with the mode off failed"; tail -5 "$work/off_v$arg.err"; exit 1; }
 done
@@ -418,13 +418,13 @@ for m in exact turbo; do
   diff -q "$work/off_vheap.out" "$work/vh_$m.out" > /dev/null || { echo "FAIL: $m changes the output of host_gpu_vars heap"; fails=1; }
 done
 grep -q '^host_gpu_refused: kernel=[^ ]*fetch[^ ]* class=never insn=T\(EX\|LD\)' "$work/vt_turbo.err" || { echo "FAIL: the texture fetch was not refused as class never: $(grep -m2 '^host_gpu_refused' "$work/vt_turbo.err")"; fails=1; }
-# 30. a graph's launches.
+# 35. a graph's launches.
 for m in exact turbo; do
   PROG=vars run "vg_$m" graph VGPU_HOST_GPU=$m "${reach[@]}" || { echo "FAIL: the $m graph run failed"; tail -5 "$work/vg_$m.err"; fails=1; }
   grep -q '^cuModuleLoadData$' "$work/vg_$m.log" || { echo "FAIL: $m: a kernel launched from a graph did not reach the card path: $(calls "vg_$m")"; fails=1; }
   diff -q "$work/off_vgraph.out" "$work/vg_$m.out" > /dev/null || { echo "FAIL: $m changes the output of host_gpu_vars graph"; fails=1; }
 done
-# 29. a call into another section.
+# 34. a call into another section.
 env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/rdc" > "$work/off_rdc.out" 2> "$work/off_rdc.err" || { echo "FAIL: host_gpu_rdc with the mode off failed"; tail -5 "$work/off_rdc.err"; exit 1; }
 PROG=rdc run rdc_turbo x VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 "${reach[@]}" || { echo "FAIL: the turbo rdc run failed"; tail -5 "$work/rdc_turbo.err"; fails=1; }
 grep -q '^cuModuleLoadData$' "$work/rdc_turbo.log" || { echo "FAIL: a kernel that calls a function of another section did not reach the card path in turbo mode: $(calls rdc_turbo); $(grep -m2 'calls_out' "$work/rdc_turbo.err")"; fails=1; }

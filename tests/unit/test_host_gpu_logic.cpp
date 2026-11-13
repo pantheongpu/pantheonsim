@@ -1951,6 +1951,8 @@ VTEST(a_launch_with_a_zero_grid_or_block_dimension_is_the_simulator_s) {
     b2[i] = 0;
     VCHECK(launch_shape_empty(g2, b2));
   }
+}
+
 // ---- what a kernel reaches besides its code (Round sp66) ----
 
 VTEST(externs_by_kind_and_what_each_mode_admits) {

@@ -162,6 +162,6 @@ Why the gate's promises hold:
   bytes between launches (the size of live memory), where it allocated and freed one per launch.
 
 Tests: `test_host_gpu_track` (`compare_with_card_...`, `keep_verified_chunks_...`, `chunks_kept_after_a_verify_are_guarded_by_the_gate_...`), 10 of 10 mutants
-killed (data/sp67/mutants.txt); `run_host_gpu_stub.sh` step 27 (a stand-in card that keeps memory and computes nothing: an allocation no kernel touches goes once,
+killed (data/sp67/mutants.txt); `run_host_gpu_stub.sh` step 28 (a stand-in card that keeps memory and computes nothing: an allocation no kernel touches goes once,
 a host memset of part of it goes again, 12.1 MiB pushed where the base pushed 36.0, and a 17th differing chunk would show a missed memset). Measurements: Round
 sp67 in [rounds/11-rounds-sp36-sp41.md](rounds/11-rounds-sp36-sp41.md).

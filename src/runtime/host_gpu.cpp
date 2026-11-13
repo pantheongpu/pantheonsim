@@ -1339,7 +1339,10 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   if (launch_shape_empty(cfg.grid.data(), cfg.block.data())) {
     ++im.stats.refused_launch;
     ++im.stats.simulated;
-    if (logging()) std::fprintf(stderr, "host_gpu: %s stays in the simulator: a grid or block dimension is 0\n", fn.name.c_str());
+    if (logging()) {
+      im.last.kept = "safety: a grid or block dimension is 0";   // (the census of Round sp66: not the size rule's)
+      std::fprintf(stderr, "host_gpu: %s stays in the simulator: a grid or block dimension is 0\n", fn.name.c_str());
+    }
     return false;
   }
   const Impl::Decision dec = im.kernel_eligible(fn, cfg, args, mem);
@@ -1541,9 +1544,8 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     mem.card_void_lookups(newly);
   }
   if (im.verify) {   // keep the card's bytes; the simulator runs the launch next and note_simulated compares
-    im.pending.reset();
     if (logging()) std::fprintf(stderr, "host_gpu: %s on the card (verify): kernel %.3f ms\n", fn.name.c_str(), kernel_s * 1e3);
-    im.pending = {};
+    im.pending.reset();   // (not `= {}`: reset keeps sp67's per-range buffers across launches)
     im.pending.active = true;
     im.pending.in_exact_set = in_exact_set;
     im.pending.kernel = fn.name;

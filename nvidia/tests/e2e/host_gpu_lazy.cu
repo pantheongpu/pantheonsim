@@ -160,7 +160,7 @@ int main(int argc, char** argv) {
   const int rounds = !std::strcmp(mode, "acct") ? 2048 : !std::strcmp(mode, "few") ? 1 << 15 : 64;   // `acct`: `big` with 32 times the work per thread, a launch of a fraction of a second (run_host_gpu_stub.sh step 8)
   const bool heap = !std::strcmp(mode, "heap");   // `big`, after a kernel left a block of the device heap in use: no launch may go to the card
   // `keep`: `big` with an 8 MiB allocation beside it that no kernel touches, and a host memset of its first 64 KiB after the second launch (run_host_gpu_stub.sh
-  // step 27: what a verify run pushes again)
+  // step 28: what a verify run pushes again)
   const bool keep = !std::strcmp(mode, "keep");
   const int n = small ? 64 : few ? 8 * 256 : 1 << 18;
   void* d = nullptr;

@@ -4,8 +4,7 @@ This directory holds the complete, unedited measurement log that used to be `doc
 behind a number: the machine, the commands, the A/B tables, the mutation checks and the dead ends.
 
 The text of the eleven files, concatenated in order, is the old page (plus the sections *Round sp40* and *Round sp41*, which were written on
-branch `sp41-ptx-amd-counting` and appended at the end, and the rounds from *Round sp46* to *Round sp64*, each appended after them on its own branch). Nothing was edited when it was split, so a sentence such as "the section above" or
-branch `sp41-ptx-amd-counting` and appended at the end, and the rounds from *Round sp46* to *Round sp65*, each appended after them on its own branch). Nothing was edited when it was split, so a sentence such as "the section above" or
+branch `sp41-ptx-amd-counting` and appended at the end, and the rounds from *Round sp46* to *Round sp68*, each appended after them on its own branch). Nothing was edited when it was split, so a sentence such as "the section above" or
 "see 'Noise'" refers to the order of these files. Section names in source comments, `docs/cli.md` and the other docs now point at the file
 that holds the section.
 

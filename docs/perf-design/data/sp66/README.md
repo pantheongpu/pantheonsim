@@ -15,14 +15,14 @@ Rodinia, the reduced HeCBench list and the CUDA Samples (13.0) that run in the s
 | `census.md`, `census.json` | `table.py` over the census of the rules before the round (`old`, the build of commit aa0b45d6, which only names the reasons) and of this round's (`new`) |
 | `mutants.py`, `mutants.txt` | mutants of the card image, the code relocation writer and the new helpers of `include/vgpu/host_gpu.hpp`, each a copy of one header outside the tree; `tests/unit/test_host_gpu_logic.cpp` must fail against each |
 | `atomics.py` | the card's kernel time a launch against the simulator's for every kernel with a float atomic with a value, a CAS or an EXCH, from one `VGPU_HOST_GPU_VERIFY=all` run (card stage) |
-| `card-run.sh` | the card part, by stage: `build` (the card CI, with the round's new e2e steps), `changed` (the programs whose decisions change, 3 runs of sim, exact, exactn, turbo, turbon, and verify), `atomics`, `rest` (the rest of the corpus, one run of sim, exact, turbo) |
+| `card-run.sh` | the card part, by stage: `build` (the card CI, with the round's new e2e steps), `changed` (the programs whose decisions change, 3 runs of sim, exact, exactw0, turbo, turbow0, and verify), `atomics`, `rest` (the rest of the corpus, one run of sim, exact, turbo) |
 
 ## On the card (one A10G, driver 595.112.07, nvcc 13.0)
 
 | file | what |
 |---|---|
 | `card-ci.txt` | the card CI's verdict lines: the first pass (both e2e tests failed on the printf step: `LEPC`, then nvcc 13.0's call to `vprintf` through a register) and the second, on the branch head's build (unit test and both e2e tests pass) |
-| `changed.md` | the 45 programs whose decisions change: sim, exact, exactn, turbo, turbon (3 runs; programs over 20 s one), and a verify run |
+| `changed.md` | the 45 programs whose decisions change: sim, exact, exactn, turbo, turbon (3 runs; programs over 20 s one), and a verify run. Its `exactn` and `turbon` columns (and `repeat.md`'s) are `VGPU_HOST_GPU_WIDER=0`: the harness's forms of that name when the round ran, renamed `exactw0` and `turbow0` when the round was merged with sp65, whose `exactn` and `turbon` are `VGPU_HOST_GPU_STREAK=0` |
 | `rest.md` | the rest of PolyBench, Rodinia and HeCBench: sim, exact, turbo, one run |
 | `repeat.md` | ten runs of each program that read over 3 % slower than the old rules (second pass, the head's build) |
 | `exact-verify.txt` | `VGPU_HOST_GPU=exact VGPU_HOST_GPU_VERIFY=1` of every program whose exact decisions the round changed |
