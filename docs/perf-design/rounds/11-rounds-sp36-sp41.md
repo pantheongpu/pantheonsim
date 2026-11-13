@@ -3918,3 +3918,57 @@ kernels are too short for the size rule. When the rounds are merged, GRAMSCHM's 
 * The stand-in step 28 and the card step 7 ran on the rig only (no nvcc on server3); CI's toolkits 12.0 and 12.8 were not tried for the new kernels
   of `host_gpu_lazy.cu`.
 * Deviations: one syntax check (`bash -n`) of the two e2e scripts was run on the WSL machine; the rig needed `ninja-build` installed.
+
+## Integration of rounds sp64 to sp68 (branch `speed-round-sp64-sp68`): the merges, and the driver start of short programs
+
+The five rounds' branches (sp64-jit-threads, sp65-resident-streaks, sp67-hostgpu-verify, sp66-turbo-wider, exact-threads-host-reads) were merged
+in that order with every conflict resolved by putting both sides one after the other, then re-resolved by hand; sp68-sqrt-idiom was merged last,
+by hand, with `git rerere` off (a scratch merge of sp68 with sp65 had left resolutions in the shared repository). What changed in the merge:
+
+* **`src/runtime/host_gpu.cpp`.** A verify launch on the card emptied its pending copy with `reset()` (sp67, which keeps the per-range buffers) and
+  then again with `= {}` (sp65 and sp66), which freed them every launch and undid sp67's saving: one `reset()` now. A launch kept for a grid or
+  block dimension of 0 (sp65) names that reason in sp66's `host_gpu_kept` census instead of "size rule". sp68's `VGPU_HOST_GPU_SQRT` sits beside
+  sp66's `VGPU_HOST_GPU_WIDER`; sp68's `idiom::idioms_only` replaces the old `idiom_summary`, which is gone.
+* **`tests/unit/test_host_gpu_logic.cpp`.** sp65's last test had lost its closing brace to sp66's tests.
+* **Step numbers of `nvidia/tests/e2e/run_host_gpu_stub.sh`.** The rounds each numbered their new steps from 24: now sp65 24 to 27, sp67 28, sp68
+  29, sp66 30 to 36. The card test `run_host_gpu.sh`: sp66 7 to 11, sp68 12 (one PASS line for both). The round texts above keep the numbers they
+  had when they ran (sp66's "24 to 30", sp67's and sp68's "28", sp68's card "7"); `host_gpu_lazy.cu`, `10-host-gpu-hooks.md` and the test table of
+  `12-host-gpu-turbo.md` follow the new ones.
+* **Harness forms.** sp65 and sp66 both added `exactn` and `turbon` to `tools/bench/hostgpu/run.py`, for `VGPU_HOST_GPU_STREAK=0` and for
+  `VGPU_HOST_GPU_WIDER=0`: merged, one form set both switches. sp65's keep the names; sp66's are now `exactw0` and `turbow0`
+  (`data/sp66/card-run.sh` uses them; the `exactn` and `turbon` columns of `data/sp66/changed.md` and `repeat.md` are `WIDER=0`, as their README says).
+* **`12-host-gpu-turbo.md`.** Two sections 10: sp65's section 9, sp66's section 10, "What is next" 11; the duplicated intro lines and test-table rows
+  are one each.
+* `data/sp64/pieces-not-kept.patch` (11.7 KB) left the tree to keep the directory under 100 KB; it is on branch `sp64-jit-threads` (commit 21787e28).
+
+### The driver start of four short programs (Round sp66's open item)
+
+Round sp66 found four CUDA Samples slower once it admitted more kernels: LargeKernelParameter 0.51 s to 0.72 s (exact) and 0.75 s (turbo),
+threadFenceReduction 0.38 s to 0.53 s (turbo), MC_EstimatePiInlineP 3.29 s to 3.53 s (turbo), dct8x8 1.08 s to 1.22 s (both). The question was
+whether sp60b's sampled launch, which does not consult the start-cost account, starts the driver for them. It does not: the sampled decision already
+charges the start in full (`sampled_estimate` sets `start_s`, and `sample_does_not_use_the_account_of_time_already_spent` pins it), so it only
+starts the driver for a launch of more than about 0.5 s. With a log line that names the rule which starts the driver (`VGPU_HOST_GPU_LOG`:
+"`<kernel>` starts the driver: sampled | verify | first-launch rule | size rule (sim, card path with the start, the account)") and the stand-in
+driver on server3 ([`data/sp64-sp68/start-who.md`](../data/sp64-sp68/start-who.md)): threadFenceReduction and dct8x8 start it by the **size rule
+through the account** (a launch of 1.0 to 1.2 ms here, the account at the start cost; `VGPU_HOST_GPU_START_COST=0.08` stands in for the rig's
+four-times-slower simulator, since at 0.25 s their account never fills on server3), and MC_EstimatePiInlineP by the **first-launch rule through the
+account** (a kernel estimated at 3.0 ms statically, after a 3.3 s launch had filled it); LargeKernelParameter's launches (under 0.5 ms on the rig)
+are the same case. In each the account said "the program has run long enough" and the launch in hand was a few milliseconds: the start (0.15 to
+0.25 s) is repaid only by many such launches, and these programs end first.
+
+**The rule** (`include/vgpu/host_gpu.hpp` `start_share_saved`, `should_offload_with_start`, `first_launch_offload`): while the driver is down, a launch
+that only the account would send must also save `start_cost / Costs::start_launches` by itself, 5 ms (50 launches like it repay the start), and a
+first launch judged by its static estimate `start_cost / Costs::start_launches_static`, 12.5 ms (a static estimate is 0.2 to 80 times off).
+`VGPU_HOST_GPU_START_LAUNCHES=0` restores the account alone. Nothing changes for a launch that repays the start by itself (the sampled SYRK, SYR2K,
+2MM, COVAR, CORR, black-scholes) or once the driver is up (sp65's streak rule, the bans). The constants are fitted to the corpus, with the rig as the
+reference: on the rig the four's launches are at most 3.8 ms (dct8x8) and 8.5 ms static (dct8x8's quantization kernel, which would otherwise buy it
+in turbo mode), and the closest programs where the account's start paid are HeCBench asyncAllocation (turbo 6.6x; about 8 ms a launch on the rig),
+atomicPerf (turbo 1.43x; 15.5 ms static) and 3MM (1.25x; 19 ms static); FDTD-2D, LU, GRAMSCHM (17 to 38 ms on server3), gaussian (5.4 ms on
+server3, about 20 ms on the rig) and aligned-types (230 ms) are far above. A host whose simulator is much faster than the rig's sees shorter launches
+and buys fewer starts: on server3 asyncAllocation's 1.9 ms launch no longer buys it.
+
+Tests: `test_host_gpu_logic` (the defaults; the bar at exactly 5 ms and 12.5 ms saved; the account still needed; the copies counted against the
+saving; the share scales with the start; the four's launches refused and the protected programs' admitted, with the account alone as before for
+both; a first launch's share against a launch with a history's; `START_LAUNCHES=0` equal to the old rule over a grid of estimates, accounts and
+driver states): 105 of 105 pass. Mutants ([`data/sp64-sp68/mutants.py`](../data/sp64-sp68/mutants.py), `mutants.txt`): 16 of 16 killed; the one survivor of the first pass ("more than" for "at least") was killed by an exact-binary boundary check added for it.
+Not measured on a card: the four programs' times and the protected programs' under the new rule are for the rig run of this branch.

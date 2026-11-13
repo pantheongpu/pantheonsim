@@ -7,6 +7,13 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Host-GPU mode (experimental, opt-in), both modes: while the real driver is not started, a launch that would start it only because the program
+  has already simulated as long as the start costs (the start-cost account) must now also save a share of the start by itself: 5 ms, or 12.5 ms
+  for a kernel's first launch judged by its static estimate (`VGPU_HOST_GPU_START_LAUNCHES`, `0` for the rule before). Four short CUDA Samples
+  (LargeKernelParameter, threadFenceReduction, MC_EstimatePiInlineP, dct8x8) paid a 0.15 to 0.25 s start for launches of a few milliseconds and
+  ran 7 to 47 % slower than in the simulator; launches long enough to repay the start, and every launch once the driver is up, are decided as
+  before. With `VGPU_HOST_GPU_LOG` the launch that starts the driver says which rule sent it.
+
 - Tier 2 (`VGPU_JIT=1`, still off by default), the compile ([round sp64](docs/perf-design/rounds/11-rounds-sp36-sp41.md)): a section
   whose compile is running is now on the plain run loop instead of the counting loop, which cost the program 2 to 8 % for as long as the
   compile took (a whole run when the compile did not finish before the end, as at sixteen threads). With GCC the runtime header that every

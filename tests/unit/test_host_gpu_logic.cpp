@@ -665,6 +665,14 @@ VTEST(a_launch_the_account_sends_saves_its_share_of_the_start) {
   VCHECK(should_offload_with_start(bare(0.005 + card + 1e-9), c, false, c.start_cost_s));
   VCHECK(!should_offload_with_start(bare(0.005 + card - 1e-9), c, false, c.start_cost_s));
   VCHECK(start_share_saved(bare(0.005 + card + 1e-9), c) && !start_share_saved(bare(0.005 + card - 1e-9), c));
+  // exactly at the share, with every number exact in binary: 0.375 s simulated against a card path of 0.125 s saves 0.25 s, the share of 0.5 s in 2
+  Costs exact = c;
+  exact.launch_s = 0;
+  exact.kernel_s_default = 0.125;
+  exact.start_cost_s = 0.5;
+  exact.start_launches = 2;
+  VCHECK(bare(0.375).sim_s - card_path_seconds(bare(0.375), exact) == exact.start_cost_s / exact.start_launches);
+  VCHECK(start_share_saved(bare(0.375), exact) && should_offload_with_start(bare(0.375), exact, false, 0.5));
   // the account must still be full: the share alone buys nothing
   VCHECK(!should_offload_with_start(bare(0.1), c, false, c.start_cost_s * 0.99));
   VCHECK(should_offload_with_start(bare(0.1), c, false, c.start_cost_s));
