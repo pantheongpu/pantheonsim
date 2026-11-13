@@ -2928,6 +2928,17 @@ if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
   add_test(NAME test_driver_gl_stubs COMMAND test_driver_gl_stubs)
   set_tests_properties(test_driver_gl_stubs PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/a100;VGPU_QUIET=1")
 endif()
+# cuGetProcAddress by name and CUDA version, against what an RTX 3060 answered for every name (pantheonsim #626),
+# and cuProfilerInitialize (pantheonsim #627). No toolkit header needed.
+if(TARGET vgpucuda)
+  add_executable(test_driver_proc_address nvidia/tests/unit/test_driver_proc_address.cpp)
+  target_link_libraries(test_driver_proc_address PRIVATE vgpucuda ${CMAKE_DL_LIBS})
+  target_include_directories(test_driver_proc_address PRIVATE tests/framework)
+  target_compile_definitions(test_driver_proc_address PRIVATE
+    DRIVER_PROC_ADDRESS_TABLE="${CMAKE_SOURCE_DIR}/nvidia/tests/data/driver_proc_address.rtx3060.txt")
+  add_test(NAME test_driver_proc_address COMMAND test_driver_proc_address)
+  set_tests_properties(test_driver_proc_address PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/a100;VGPU_QUIET=1")
+endif()
 # Runtime entry points the toolkit exports and this one lacked (cudaMemset3D,
 # cudaChooseDevice, cudaDeviceGetByPCIBusId, the 2D array copies, the texture
 # descriptor getters, cudaFuncGetName and cudaFuncGetParamInfo, ...).
@@ -4329,6 +4340,10 @@ if(Python3_Interpreter_FOUND)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_driver_arg_sizes.py
                    ${CUDA_ABI_INCLUDE})
   set_tests_properties(lint_driver_arg_sizes PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+  # Every ABI the toolkit's typedef headers name is in the table cuGetProcAddress resolves by (pantheonsim #626).
+  add_test(NAME lint_driver_proc_versions
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/gen_driver_proc_versions.py --check "${CUDA_ABI_INCLUDE}")
+  set_tests_properties(lint_driver_proc_versions PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 60)
   # Every function cuda_runtime_api.h and cuda.h declare is a name the built shims export.
   add_test(NAME lint_header_exports
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_header_exports.py ${CUDA_ABI_INCLUDE})

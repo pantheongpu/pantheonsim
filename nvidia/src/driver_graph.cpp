@@ -1355,6 +1355,15 @@ VGPU_PT_ALIAS(cuStreamWaitValue32_v2_ptsz, cuStreamWaitValue32_v2)
 VGPU_PT_ALIAS(cuStreamWaitValue64_v2_ptsz, cuStreamWaitValue64_v2)
 VGPU_PT_ALIAS(cuStreamWriteValue32_v2_ptsz, cuStreamWriteValue32_v2)
 VGPU_PT_ALIAS(cuStreamWriteValue64_v2_ptsz, cuStreamWriteValue64_v2)
+// The per-thread forms of the CUDA 11 ABIs, which the driver still exports and hands a CUDA 11 caller that asks for the
+// per-thread default stream (pantheonsim #626, #627).
+VGPU_PT_ALIAS(cuStreamBatchMemOp_ptsz, cuStreamBatchMemOp)
+VGPU_PT_ALIAS(cuStreamBeginCapture_ptsz, cuStreamBeginCapture)
+VGPU_PT_ALIAS(cuStreamGetCaptureInfo_ptsz, cuStreamGetCaptureInfo)
+VGPU_PT_ALIAS(cuStreamWaitValue32_ptsz, cuStreamWaitValue32)
+VGPU_PT_ALIAS(cuStreamWaitValue64_ptsz, cuStreamWaitValue64)
+VGPU_PT_ALIAS(cuStreamWriteValue32_ptsz, cuStreamWriteValue32)
+VGPU_PT_ALIAS(cuStreamWriteValue64_ptsz, cuStreamWriteValue64)
 #undef VGPU_PT_ALIAS
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
