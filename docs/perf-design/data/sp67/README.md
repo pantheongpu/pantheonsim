@@ -17,7 +17,8 @@ The text is *Round sp67* in [../../rounds/11-rounds-sp36-sp41.md](../../rounds/1
 | file | what |
 |---|---|
 | `verify_ab.py` | #569: interleaved runs of PolyBench programs on several (build, environment) sides, with the stand-in card or a real one; wall time (the wait for the lock is not timed), exit status, a hash of stdout without its timing lines, the verify summary |
-| `ab-server3.md`, `ab-server3.json` | #569 on server3: base and new build, plain and verify, 8 programs, 5 runs a side |
+| `ab-server3.md`, `ab-server3.json`, `ab-server3-modes.json` | #569 on server3: base and new build, plain and verify, 8 programs, 5 runs a side; then exact, turbo and turbo with verify on 3 programs |
+| `card-ab.md`, `card-ab.json` | #569 on the A10G, rig idle: 8 programs, new plain, base and new verify, 3 runs a side |
 | `card-ab-part1.txt` | #569 on the A10G: the partial runs (2DCONV, two of 3DCONV) made while round sp65 was building on the rig; see the round text |
 | `mutants.py`, `mutants.txt` | 10 mutants of `compare_with_card` and `keep_verified_chunks` against `test_host_gpu_track`: 10 killed |
 | `fakenvcc.sh` | server3 has no nvcc: stands in for nvcc 13.0 in `run_host_gpu_stub.sh` by copying `host_gpu_lazy` built on the rig, so the whole stand-in-driver test (steps 1 to 23 and 27) ran on server3 against both builds |

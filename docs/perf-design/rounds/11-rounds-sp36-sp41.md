@@ -3345,9 +3345,25 @@ ATAX (same machine, 5 runs a side, `data/sp67/ab-server3.md`): `exact` and `turb
 **On the A10G.** The card A/B was started once while the rig looked free and stopped after 2DCONV and two runs of 3DCONV, when round sp65 started a
 build and its timed runs again (so these runs were shared with that build and are not a clean comparison; `data/sp67/card-ab-part1.txt`): 2DCONV verify
 1.39 s base against 1.33 s new (5 runs each, plain 0.94 to 1.05 s), 3DCONV verify 53.6 s base (one run) against 10.33 s new (two runs), plain 0.86 s;
-every launch identical on the card (`in_set_identical=1` and `=254`, `in_set_different=0`), outputs the same in every run. A clean card A/B of the eight programs is pending: round sp65 kept the rig busy (see the hand-back).
+every launch identical on the card (`in_set_identical=1` and `=254`, `in_set_different=0`), outputs the same in every run. Then, with the rig idle (the script checked before and after each program that no run of round sp65 was on it), 3 interleaved runs per side
+(`data/sp67/card-ab.md`), seconds:
 
-**Against the issue's goal.** 2DCONV, ATAX, MVT and GEMVER verify now run 1.2 to 1.4 times their plain time on the stand-in, and the remainder is the copy
+| program | new plain | base verify | new verify | verify, base / new | new verify / plain |
+|---|---:|---:|---:|---:|---:|
+| 2DCONV | 0.941 (0.933-0.941) | 1.378 (1.364-1.382) | 1.330 (1.325-1.331) | 1.04x | 1.41 |
+| ATAX | 1.052 (1.050-1.058) | 1.566 (1.520-1.591) | 1.395 (1.394-1.398) | 1.12x | 1.33 |
+| 3DCONV | 0.720 (0.718-0.721) | 46.471 (46.330-46.571) | 8.530 (8.526-8.576) | 5.45x | 11.8 |
+| BICG | 0.259 (0.258-0.261) | 0.734 (0.733-0.750) | 0.612 (0.605-0.623) | 1.20x | 2.36 |
+| GEMVER | 0.647 (0.624-0.712) | 1.263 (1.202-1.347) | 0.982 (0.976-0.990) | 1.29x | 1.52 |
+| MVT | 1.354 (1.288-1.356) | 1.859 (1.719-1.914) | 1.591 (1.558-1.710) | 1.17x | 1.18 |
+| GESUMMV | 0.382 (0.376-0.384) | 0.819 (0.811-0.822) | 0.773 (0.770-0.794) | 1.06x | 2.02 |
+| JACOBI1D | 2.297 (2.240-2.315) | 4.329 (4.328-4.334) | 3.788 (3.750-3.794) | 1.14x | 1.65 |
+
+Every verified launch was identical on the card in every run (`in_set_different=0`; 3DCONV 254 of 254, JACOBI1D 20,000 of 20,000), and the outputs are
+the same in all runs. On the card every chunk compares equal in exact mode, so after the first launch nothing is pushed: 3DCONV's 8.5 s is 254 copies of
+128 MiB back from the card (pageable memory) and the compares.
+
+**Against the issue's goal.** 2DCONV, ATAX, MVT and GEMVER verify now run 1.2 to 1.4 times their plain time on the stand-in (1.2 to 1.5 on the card), and the remainder is the copy
 of all live memory back from the card after each launch and the compare; that copy is what verify is (the card may have written any byte), so a verify run
 cannot come closer to plain than its launches times one copy of live memory each. 3DCONV is the case: 254 launches on 128 MiB stay 16.7 times plain on the
 stand-in (24 ms a launch: the copy back, the compare, and on the stand-in the push of the 64 MiB that the kernel writes and the stand-in does not). Lower
@@ -3427,8 +3443,8 @@ for sm_90 or sm_100) and fast-math or `-prec-div=false` builds, which do not use
 
 ### What was not verified
 
-* The card A/B of #569 on an idle rig: pending (the partial, shared runs above are the only card numbers). Verify's per-launch copy back on a real card
-  (PCIe from pageable memory) is slower than the stand-in's `memcpy`, so the card's floor for 3DCONV is higher than the stand-in's 6.2 s (10.3 s shared).
+* The card A/B has 3 runs a side (5 on server3), the base's plain side was not rerun on the card (server3 shows the two builds equal there, and the code
+  is not reached), and turbo verify was not run on the card.
 * #570's times are from a rig shared with round sp65's timed runs (counts and bytes are exact; the seconds are not a comparison). The plain simulator's
   device part of GRAMSCHM was not rerun (sp44's 46.06 s on another A10G is used). Why FDTD-2D's default form moved more bytes than the other: not traced.
 * The verify change under ThreadSanitizer and the sanitizer jobs: not run (CI). `host_gpu.cpp` and the test compile with g++-12 (`-fsyntax-only -Wall
