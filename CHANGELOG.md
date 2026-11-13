@@ -20,7 +20,8 @@ release says what runs and what it produces, never how fast a real GPU would run
   atomics with a returned value, compare-and-swap and exchange (`VGPU_HOST_GPU_ATOMICS=0` keeps them out; an opt-in before).
   `VGPU_HOST_GPU_WIDER=0` restores the earlier rules for A/B runs, and with `VGPU_HOST_GPU_LOG` the exit summary lists per kernel the launches kept
   in the simulator and why, with their simulator seconds (`host_gpu_kept:`) ([design](docs/perf-design/12-host-gpu-turbo.md), section 10;
-  Round sp66; pantheonsim #587).
+  Round sp66; pantheonsim #587). Measured on one A10G: the 45 programs whose decisions change go from 1.08x to 1.12x
+  (exact) and from 1.20x to 1.60x (turbo) against the simulator, outputs identical; four short programs lose 0.13 to 0.24 s to the driver start.
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the

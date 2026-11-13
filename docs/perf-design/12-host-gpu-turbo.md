@@ -4,7 +4,7 @@ Status: experimental, opt-in (`VGPU_HOST_GPU=turbo`). Measured on one A10G in *R
 ([rounds/11-rounds-sp36-sp41.md](rounds/11-rounds-sp36-sp41.md#round-sp59-turbo-host-gpu-mode-on-an-a10g)): over 59 programs of PolyBench/GPU, Rodinia
 and HeCBench the geometric mean speed-up is 1.23x against 1.12x for exact mode (summed wall time 1.75x against 1.20x), every program's output is the
 simulator's, and no kernel was refused for an instruction of no class. Sections 5 and 8 say what the card confirmed and what it changed.
-Tracking issue: pantheonsim #587. Read [09-host-gpu-spike.md](09-host-gpu-spike.md) first: this mode is the same machinery with a wider
+Round sp66 widened what both modes send (section 10; on an A10G the 45 programs it changes go from 1.20x to 1.60x in turbo mode and 1.08x to 1.12x in exact mode). Tracking issue: pantheonsim #587. Read [09-host-gpu-spike.md](09-host-gpu-spike.md) first: this mode is the same machinery with a wider
 door.
 
 ## 1. Why

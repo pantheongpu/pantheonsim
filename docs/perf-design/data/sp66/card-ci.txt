@@ -1,3 +1,4 @@
+== first pass (card CI, before the LEPC fix):
 GPU 0: NVIDIA A10G (UUID: GPU-a0fc543c-077c-b196-0eae-edddd0cef398)
 == build
 == unit tests
@@ -28,3 +29,7 @@ VERDICT kind=dadd varies
 VERDICT kind=cas varies
 VERDICT kind=exch varies
 FAIL: card CI on NVIDIA A10G
+== second pass (the branch head's build: unit test, e2e_host_gpu and e2e_host_gpu_stub on the A10G):
+94/94 tests passed
+100% tests passed, 0 tests failed out of 1
+100% tests passed, 0 tests failed out of 1
