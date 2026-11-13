@@ -22,8 +22,9 @@
 #  10. the kernels exact mode keeps for their numerics (expf, a bare rcp.approx, a division beside an expf) reach the card path in turbo mode, and the
 #      output is unchanged (the stand-in refuses the module, so the simulator runs them);
 #  11. turbo mode prints the two lines for scripts (host_gpu_turbo:, host_gpu_refusals:); exact mode prints them only with VGPU_HOST_GPU_LOG;
-#  12. a float atomic with a returned value and a compare-and-swap stay in the simulator (one host_gpu_refused line, class=atomics) unless
-#      VGPU_HOST_GPU_ATOMICS=1; an integer atomic is admitted, and VGPU_HOST_GPU_TURBO_OFF=atomics / =mufu keep their classes out (class=off);
+#  12. a float atomic with a returned value and a compare-and-swap reach the card path (Round sp66: admitted by default), and stay in the simulator (one
+#      host_gpu_refused line, class=atomics) with VGPU_HOST_GPU_ATOMICS=0; an integer atomic is admitted, and VGPU_HOST_GPU_TURBO_OFF=atomics / =mufu
+#      keep their classes out (class=off);
 #  13. a tolerance, an off-list or a mode that cannot be read turns the mode off with a message, and nothing reaches the driver;
 #  14. VGPU_HOST_GPU_VERIFY=1 in turbo mode compares by tolerance: with a stand-in card that computes nothing (STUB_CARD_OK=1) the compare reports words
 #      outside tolerance, per kernel and in the summary, lists at most three launches of a kernel without VGPU_HOST_GPU_LOG, and the program's output is the
@@ -50,6 +51,18 @@
 #  27. a launch on a grid of 0 blocks while the card holds the memory gets the simulator's error, as with the mode off, and never reaches the card.
 #  27. (Round sp67) a verify run pushes again only the chunks whose card bytes differed from the simulator's after the last launch, and the chunks the host
 #      wrote since: an allocation no kernel touches goes to the card once, a host memset of part of it goes again, and the output is the mode-off output.
+# What a module holds besides code (Round sp66; host_gpu_vars.cu, one module with __device__ and __constant__ variables, string literals, vprintf,
+# malloc/free and assert):
+#  24. kernels that use the module's variables (by name, and through a pointer from cudaGetSymbolAddress) reach the card path in both modes, and the
+#      image the card is given has no relocation left against a variable (the mode applied them with the simulator's addresses); the output is unchanged;
+#  25. ... and on a stand-in card that loads it (a verify run), the card's constant bank is looked up (cuModuleGetGlobal) and filled from the window
+#      (cuMemcpyDtoD) before the first launch, and the output is the simulator's;
+#  26. a kernel that prints reaches the card path in turbo mode, not in exact mode nor with VGPU_HOST_GPU_TURBO_OFF=printf; the output is unchanged;
+#  27. a live texture object no longer keeps the device's launches off the card; the kernel that fetches through it stays (class never);
+#  28. a kernel that calls malloc, free and assert never reaches the driver, in either mode;
+#  29. a kernel that calls a device function of another section (host_gpu_rdc.cu, -rdc=true: an absolute call) reaches the card path in turbo mode,
+#      whose scan follows the call into the callee's code, and not in exact mode; the output is unchanged;
+#  30. a kernel launched from a CUDA graph reaches the card path in both modes; the output is unchanged.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -74,6 +87,8 @@ nvcc_host_compiler_fix
 work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-host-gpu-stub.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 "$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_lazy.cu" "$root/nvidia/tests/e2e/host_gpu_lazy_heap.cu" -o "$work/prog" || { echo "FAIL: does not compile"; exit 1; }
+"$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_vars.cu" -o "$work/vars" || { echo "FAIL: host_gpu_vars.cu does not compile"; exit 1; }
+"$nvcc_bin" -std=c++17 -arch="sm_$cc" -rdc=true -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_rdc.cu" "$root/nvidia/tests/e2e/host_gpu_rdc_fn.cu" -o "$work/rdc" || { echo "FAIL: host_gpu_rdc.cu does not compile"; exit 1; }
 "$cc_bin" -shared -fPIC -O1 -o "$work/libstubcuda.so" "$root/nvidia/tests/e2e/host_gpu_stub_driver.c" || { echo "FAIL: the stand-in driver does not compile"; exit 1; }
 if ! require_shim_libs "$shim" "$work/prog"; then exit 0; fi
 init_ms=2000
@@ -85,7 +100,7 @@ run() {   # <tag> <program argument> [env...]: stdout in $work/<tag>.out, stderr
   # (VGPU_HOST_GPU_SAMPLE=0: steps 1 to 16 pin the rules that decide BEFORE a launch runs, as they were before launches were sampled; steps 17 to 20
   # switch the sampling back on, their own assignment coming later on the command line.)
   env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" STUB_LOG="$work/$tag.log" STUB_SM="$cc" STUB_MP="$mp" STUB_INIT_MS=$init_ms \
-      VGPU_HOST_GPU_LIBCUDA="$work/libstubcuda.so" VGPU_HOST_GPU_SAMPLE=0 "$@" "$work/prog" "$arg" > "$work/$tag.out" 2> "$work/$tag.err"
+      VGPU_HOST_GPU_LIBCUDA="$work/libstubcuda.so" VGPU_HOST_GPU_SAMPLE=0 "$@" "$work/${PROG:-prog}" "$arg" > "$work/$tag.out" 2> "$work/$tag.err"
 }
 calls() { sort "$work/$1.log" | uniq -c | tr -s ' ' | tr '\n' ';'; }
 for arg in big small mufu; do
@@ -186,18 +201,19 @@ grep -Eq '^host_gpu_turbo: mode=exact ' "$work/q_log.err" || { echo "FAIL: exact
 run exl_mufu mufu VGPU_HOST_GPU=exact VGPU_HOST_GPU_LOG=1 "${reach[@]}" || { echo "FAIL: the exact mufu run with the log failed"; fails=1; }
 rx="$(sed -n 's/^host_gpu_refusals: .* refused_exact=\([0-9]*\) .*/\1/p' "$work/exl_mufu.err" | tail -1)"
 (( ${rx:-0} >= 1 )) || { echo "FAIL: exact mode did not count the expf launches as ones turbo mode would take: $(grep '^host_gpu_refusals' "$work/exl_mufu.err")"; fails=1; }
-# 12. atomics: the opt-in and the off list.
+# 12. atomics: on by default (Round sp66), VGPU_HOST_GPU_ATOMICS=0 keeps them out, and the off list.
 for arg in fatom cas; do
-  run "rel_$arg" "$arg" VGPU_HOST_GPU=turbo "${reach[@]}" || { echo "FAIL: the turbo $arg run failed"; tail -5 "$work/rel_$arg.err"; fails=1; }
-  [[ ! -s "$work/rel_$arg.log" ]] || { echo "FAIL: $arg reached the driver without VGPU_HOST_GPU_ATOMICS: $(calls "rel_$arg")"; fails=1; }
+  run "rel_$arg" "$arg" VGPU_HOST_GPU=turbo VGPU_HOST_GPU_ATOMICS=0 "${reach[@]}" || { echo "FAIL: the turbo $arg run failed"; tail -5 "$work/rel_$arg.err"; fails=1; }
+  [[ ! -s "$work/rel_$arg.log" ]] || { echo "FAIL: $arg reached the driver with VGPU_HOST_GPU_ATOMICS=0: $(calls "rel_$arg")"; fails=1; }
   n="$(grep -c '^host_gpu_refused: kernel=[^ ]* class=atomics insn=.' "$work/rel_$arg.err")"
   (( n == 1 )) || { echo "FAIL: $arg: expected one host_gpu_refused line with class=atomics, got $n: $(grep -m2 '^host_gpu_refused' "$work/rel_$arg.err")"; fails=1; }
   ra="$(sed -n 's/^host_gpu_refusals: .* refused_atomics=\([0-9]*\) .*/\1/p' "$work/rel_$arg.err" | tail -1)"
   (( ${ra:-0} == 4 )) || { echo "FAIL: $arg: refused_atomics is ${ra:-missing}, not the 4 launches"; fails=1; }
   diff -q "$work/off_$arg.out" "$work/rel_$arg.out" > /dev/null || { echo "FAIL: turbo mode changes the output of $arg"; fails=1; }
-  run "rela_$arg" "$arg" VGPU_HOST_GPU=turbo VGPU_HOST_GPU_ATOMICS=1 "${reach[@]}" || { echo "FAIL: the turbo $arg run with atomics failed"; fails=1; }
-  grep -q '^cuModuleLoadData$' "$work/rela_$arg.log" || { echo "FAIL: $arg did not reach the card path with VGPU_HOST_GPU_ATOMICS=1: $(calls "rela_$arg")"; fails=1; }
-  diff -q "$work/off_$arg.out" "$work/rela_$arg.out" > /dev/null || { echo "FAIL: VGPU_HOST_GPU_ATOMICS=1 changes the output of $arg"; fails=1; }
+  run "rela_$arg" "$arg" VGPU_HOST_GPU=turbo "${reach[@]}" || { echo "FAIL: the turbo $arg run with the default atomics failed"; fails=1; }
+  grep -q '^cuModuleLoadData$' "$work/rela_$arg.log" || { echo "FAIL: $arg did not reach the card path by default: $(calls "rela_$arg")"; fails=1; }
+  grep -q '^host_gpu_refused:' "$work/rela_$arg.err" && { echo "FAIL: $arg was refused by default: $(grep -m1 '^host_gpu_refused:' "$work/rela_$arg.err")"; fails=1; }
+  diff -q "$work/off_$arg.out" "$work/rela_$arg.out" > /dev/null || { echo "FAIL: the default atomics change the output of $arg"; fails=1; }
 done
 run rel_iatom iatom VGPU_HOST_GPU=turbo "${reach[@]}" || { echo "FAIL: the turbo iatom run failed"; fails=1; }
 grep -q '^cuModuleLoadData$' "$work/rel_iatom.log" || { echo "FAIL: an integer atomic did not reach the card path in turbo mode: $(calls rel_iatom); $(grep -m1 '^host_gpu_refused' "$work/rel_iatom.err")"; fails=1; }
@@ -368,5 +384,53 @@ done
 # (exact mode names the chunks: the 16 of the 1 MiB after every launch, never a 17th: the memset chunk reached the card before the third launch)
 n="$(grep -c '^host_gpu: verify [^ ]* (in the exact set): DIFFERENT, 64 KiB chunks: 16$' "$work/keep_exact.err")"
 (( n == 4 )) || { echo "FAIL: exact verify of keep: expected 4 launches with the 16 chunks of the 1 MiB different, got $n: $(grep '^host_gpu: verify' "$work/keep_exact.err" | head -4)"; fails=1; }
+# 24 to 28. what a module holds besides code (host_gpu_vars.cu).
+for arg in vars printf tex heap graph; do
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/vars" "$arg" > "$work/off_v$arg.out" 2> "$work/off_v$arg.err" || { echo "FAIL: the $arg run of host_gpu_vars with the mode off failed"; tail -5 "$work/off_v$arg.err"; exit 1; }
+done
+grep -q '^vars 5: ' "$work/off_vvars.out" || { echo "FAIL: host_gpu_vars vars printed: $(head -2 "$work/off_vvars.out")"; fails=1; }
+for m in exact turbo; do
+  PROG=vars run "v_$m" vars VGPU_HOST_GPU=$m VGPU_HOST_GPU_LOG=1 "${reach[@]}" || { echo "FAIL: the $m vars run failed"; tail -5 "$work/v_$m.err"; fails=1; }
+  grep -q '^cuModuleLoadData$' "$work/v_$m.log" || { echo "FAIL: $m: kernels using module variables did not reach the card path: $(calls "v_$m"); $(grep -m2 'stays in the simulator' "$work/v_$m.err")"; fails=1; }
+  grep -q '^relocs_to_variables 0$' "$work/v_$m.log" || { echo "FAIL: $m: the card's image still has relocations against the module's variables: $(grep relocs_to "$work/v_$m.log" | head -1)"; fails=1; }
+  diff -q "$work/off_vvars.out" "$work/v_$m.out" > /dev/null || { echo "FAIL: $m changes the output of host_gpu_vars vars"; fails=1; }
+  PROG=vars run "vv_$m" vars VGPU_HOST_GPU=$m VGPU_HOST_GPU_VERIFY=1 STUB_CARD_OK=1 STUB_KEEP_MEMORY=1 "${reach[@]}" || { echo "FAIL: the $m vars verify run failed"; tail -5 "$work/vv_$m.err"; fails=1; }
+  order="$(grep -E '^(cuModuleGetGlobal|cuMemcpyDtoD|cuLaunchKernel)$' "$work/vv_$m.log" | uniq | head -3 | tr '\n' ' ')"
+  [[ "$order" == "cuModuleGetGlobal cuMemcpyDtoD cuLaunchKernel " ]] || { echo "FAIL: $m: the constant bank was not looked up and filled before the first launch on the card: $order"; fails=1; }
+  diff -q "$work/off_vvars.out" "$work/vv_$m.out" > /dev/null || { echo "FAIL: $m verify changes the output of host_gpu_vars vars"; fails=1; }
+done
+PROG=vars run vp_turbo printf VGPU_HOST_GPU=turbo "${reach[@]}" || { echo "FAIL: the turbo printf run failed"; tail -5 "$work/vp_turbo.err"; fails=1; }
+# (nvcc 13.0 calls vprintf through a register, which the scan does not follow: then the kernel is refused as class never; Round sp66)
+grep -q '^cuModuleLoadData$' "$work/vp_turbo.log" || grep -q '^host_gpu_refused: kernel=[^ ]*prints[^ ]* class=never insn=CALL.ABS.NOINC R' "$work/vp_turbo.err" \
+  || { echo "FAIL: a kernel that prints neither reached the card path in turbo mode nor was refused for a call through a register: $(calls vp_turbo); $(grep -m2 'host_gpu' "$work/vp_turbo.err")"; fails=1; }
+diff -q "$work/off_vprintf.out" "$work/vp_turbo.out" > /dev/null || { echo "FAIL: turbo mode changes the output of host_gpu_vars printf"; fails=1; }
+PROG=vars run vp_exact printf VGPU_HOST_GPU=exact "${reach[@]}" || { echo "FAIL: the exact printf run failed"; fails=1; }
+[[ ! -s "$work/vp_exact.log" ]] || { echo "FAIL: exact mode sent a kernel that prints to the card: $(calls vp_exact)"; fails=1; }
+PROG=vars run vp_off printf VGPU_HOST_GPU=turbo VGPU_HOST_GPU_TURBO_OFF=printf "${reach[@]}" || { echo "FAIL: the turbo printf run with printf off failed"; fails=1; }
+[[ ! -s "$work/vp_off.log" ]] || { echo "FAIL: VGPU_HOST_GPU_TURBO_OFF=printf did not keep the kernel that prints in the simulator: $(calls vp_off)"; fails=1; }
+diff -q "$work/off_vprintf.out" "$work/vp_off.out" > /dev/null || { echo "FAIL: VGPU_HOST_GPU_TURBO_OFF=printf changes the output"; fails=1; }
+for m in exact turbo; do
+  PROG=vars run "vt_$m" tex VGPU_HOST_GPU=$m "${reach[@]}" || { echo "FAIL: the $m tex run failed"; tail -5 "$work/vt_$m.err"; fails=1; }
+  grep -q '^cuModuleLoadData$' "$work/vt_$m.log" || { echo "FAIL: $m: a live texture object kept a plain kernel off the card: $(calls "vt_$m")"; fails=1; }
+  diff -q "$work/off_vtex.out" "$work/vt_$m.out" > /dev/null || { echo "FAIL: $m changes the output of host_gpu_vars tex"; fails=1; }
+  PROG=vars run "vh_$m" heap VGPU_HOST_GPU=$m "${reach[@]}" || { echo "FAIL: the $m heap run failed"; tail -5 "$work/vh_$m.err"; fails=1; }
+  [[ ! -s "$work/vh_$m.log" ]] || { echo "FAIL: $m: a kernel that calls malloc reached the driver: $(calls "vh_$m")"; fails=1; }
+  diff -q "$work/off_vheap.out" "$work/vh_$m.out" > /dev/null || { echo "FAIL: $m changes the output of host_gpu_vars heap"; fails=1; }
+done
+grep -q '^host_gpu_refused: kernel=[^ ]*fetch[^ ]* class=never insn=T\(EX\|LD\)' "$work/vt_turbo.err" || { echo "FAIL: the texture fetch was not refused as class never: $(grep -m2 '^host_gpu_refused' "$work/vt_turbo.err")"; fails=1; }
+# 30. a graph's launches.
+for m in exact turbo; do
+  PROG=vars run "vg_$m" graph VGPU_HOST_GPU=$m "${reach[@]}" || { echo "FAIL: the $m graph run failed"; tail -5 "$work/vg_$m.err"; fails=1; }
+  grep -q '^cuModuleLoadData$' "$work/vg_$m.log" || { echo "FAIL: $m: a kernel launched from a graph did not reach the card path: $(calls "vg_$m")"; fails=1; }
+  diff -q "$work/off_vgraph.out" "$work/vg_$m.out" > /dev/null || { echo "FAIL: $m changes the output of host_gpu_vars graph"; fails=1; }
+done
+# 29. a call into another section.
+env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/rdc" > "$work/off_rdc.out" 2> "$work/off_rdc.err" || { echo "FAIL: host_gpu_rdc with the mode off failed"; tail -5 "$work/off_rdc.err"; exit 1; }
+PROG=rdc run rdc_turbo x VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 "${reach[@]}" || { echo "FAIL: the turbo rdc run failed"; tail -5 "$work/rdc_turbo.err"; fails=1; }
+grep -q '^cuModuleLoadData$' "$work/rdc_turbo.log" || { echo "FAIL: a kernel that calls a function of another section did not reach the card path in turbo mode: $(calls rdc_turbo); $(grep -m2 'calls_out' "$work/rdc_turbo.err")"; fails=1; }
+grep -q '^host_gpu_refused:' "$work/rdc_turbo.err" && { echo "FAIL: turbo refused a kernel of host_gpu_rdc: $(grep -m1 '^host_gpu_refused:' "$work/rdc_turbo.err")"; fails=1; }
+diff -q "$work/off_rdc.out" "$work/rdc_turbo.out" > /dev/null || { echo "FAIL: turbo mode changes the output of host_gpu_rdc"; fails=1; }
+PROG=rdc run rdc_exact x VGPU_HOST_GPU=exact "${reach[@]}" || { echo "FAIL: the exact rdc run failed"; fails=1; }
+[[ ! -s "$work/rdc_exact.log" ]] || { echo "FAIL: exact mode sent a kernel with a call to the card: $(calls rdc_exact)"; fails=1; }
 (( fails == 0 )) && { echo "PASS: first launch $first ms against a driver start of $init_ms ms; driver calls in the big run: $(calls on_big)"; exit 0; }
 exit 1

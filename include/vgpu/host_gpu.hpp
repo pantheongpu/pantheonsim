@@ -229,8 +229,8 @@ enum class InsnClass : uint8_t {
                // addresses as LDG and STG, so the card needs nothing that only the simulator holds
   Tensor,      // HMMA, IMMA, DMMA
   AtomInt,     // integer atomics that return the old value (ADD, MIN, MAX, AND, OR, XOR, INC, DEC): memory ends the same, the returned values depend on the order
-  AtomFloat,   // float atomics that return a value: opt-in (VGPU_HOST_GPU_ATOMICS=1)
-  AtomSwap,    // CAS, CAST.SPIN, EXCH: opt-in; the card does not agree with itself from run to run on programs built on these (09 doc, M2)
+  AtomFloat,   // float atomics that return a value: admitted unless VGPU_HOST_GPU_ATOMICS=0 (an opt-in until Round sp66)
+  AtomSwap,    // CAS, CAST.SPIN, EXCH: as AtomFloat; the card does not agree with itself from run to run on programs built on these (09 doc, M2)
   Never,       // textures, surfaces, anything not named
 };
 inline constexpr unsigned kInsnClasses = 11;
@@ -285,10 +285,13 @@ inline InsnClass turbo_class(const std::string& mnemonic, const std::vector<std:
   if (exact_opcode_allowed(mnemonic, mods)) return C::Exact;
   if (mnemonic == "MUFU") return C::Mufu;
   if (is_one_of({"HADD2", "HMUL2", "HFMA2", "HSETP2", "HSET2", "HMNMX2"})) return C::Half;
-  if (is_one_of({"CALL", "RET"})) return C::Call;
+  // (LEPC: the return address of an absolute call, CUDA 13's vprintf call; the card's own program counter, used by the call and its RET alone. Round sp66.)
+  if (is_one_of({"CALL", "RET", "LEPC"})) return C::Call;
   if (is_one_of({"HMMA", "IMMA", "DMMA"})) return C::Tensor;
+  // (Round sp66: B2R reads the result of a block's BAR.RED, the same function on both sides; NANOSLEEP is a hint that a spin-wait backs off, as cub's
+  // decoupled look-back does: neither touches anything the card lacks)
   if (is_one_of({"IDP", "VABSDIFF", "VABSDIFF4", "VIADDMNMX", "VIMNMX3", "FMNMX3", "F2IP", "FSWZADD", "REDUX", "LDGSTS", "LDGDEPBAR", "LDSM", "MOVM", "FFMA2",
-                 "FMUL2", "FADD2"}))
+                 "FMUL2", "FADD2", "B2R", "NANOSLEEP"}))
     return C::Extra;
   return C::Never;
 }
@@ -299,18 +302,66 @@ inline bool call_stays_inside(bool relative, bool to_label, int64_t target, uint
   return relative && to_label && target >= 0 && static_cast<uint64_t>(target) >= lo && static_cast<uint64_t>(target) <= hi;
 }
 
+// ---- what a kernel reaches besides its code (Round sp66) ----------------------------------------------------------------------------
+// A function the module calls but does not define (Cubin::externs): the driver links it when it loads the module on the card, the simulator runs a
+// builtin in its place. What each kind needs on the card, and so whether a kernel that reaches one can go there:
+//   * vprintf: the card writes the arguments to its printf buffer and the driver prints them when the host synchronises with the kernel, which the
+//     card path does at once (cuCtxSynchronize), after flushing the process's stdout; the text is the card's formatting of the card's values. Turbo
+//     mode admits it (VGPU_HOST_GPU_TURBO_OFF=printf keeps it out); exact mode does not (its promise is about memory, not about a second printer);
+//   * __assertfail: a failed assert on the card ends the kernel with a sticky error, the context is lost, and data only the card holds with it;
+//   * malloc and free: the card's heap is the card's own, outside the simulator's window: a pointer from it, kept in memory, means nothing to the
+//     simulator, and the simulator's heap is not on the card;
+//   * the device runtime (device-side launches, cudaDeviceSynchronize in a kernel): the child grids would be the card's, with the card's addresses;
+//   * anything else: not known.
+enum class ExternKind : uint8_t { Printf, Assert, Heap, DeviceLaunch, Other };
+inline ExternKind extern_kind(const std::string& name, bool device_runtime) {
+  if (device_runtime) return ExternKind::DeviceLaunch;
+  if (name == "vprintf") return ExternKind::Printf;
+  if (name == "__assertfail" || name == "__assert_fail") return ExternKind::Assert;
+  if (name == "malloc" || name == "free") return ExternKind::Heap;
+  return ExternKind::Other;
+}
+inline const char* extern_kind_name(ExternKind k) {
+  static const char* const n[] = {"vprintf", "__assertfail", "malloc/free", "device-side launch", "an unknown external function"};
+  return n[static_cast<unsigned>(k)];
+}
+inline bool extern_admitted(ExternKind k, Mode mode, bool printf_off) { return k == ExternKind::Printf && mode == Mode::Turbo && !printf_off; }
+
+// The texture and surface instructions: they read the simulator's own tables (the handle in the instruction or a register is an index into
+// them), so a kernel that holds one cannot run on the card. Neither the exact set nor any turbo class names them; a kernel without one does
+// not read a texture object, whatever objects exist (until Round sp66 one live texture object kept every launch of the device off the card).
+inline bool texture_mnemonic(const std::string& m) {
+  static const char* const kTex[] = {"TEX", "TEXS", "TLD", "TLDS", "TLD4", "TLD4S", "TXD", "TXQ", "TMML", "SULD", "SUST", "SUATOM", "SURED", "SUQUERY"};
+  for (const char* t : kTex)
+    if (m == t) return true;
+  return false;
+}
+
+// An absolute call to the first instruction of a code section of the module (Round sp66): a device function the compiler kept out of line, in a
+// section of its own (a -rdc build). The driver links the call to its own copy of the same code, so the call is followed: the callee's section is
+// classed with the kernel's. `base`, `count`: the section the target lies in (its first address, its instructions; 0 is no code).
+inline bool call_to_entry(bool relative, bool to_label, int64_t target, uint64_t base, uint64_t count) {
+  return !relative && to_label && target >= 0 && count > 0 && static_cast<uint64_t>(target) == base;
+}
+
 // The classes a kernel holds, as bits, and what the mode's switches make of them.
 using ClassMask = uint32_t;
 inline constexpr ClassMask class_bit(InsnClass c) { return ClassMask{1} << static_cast<unsigned>(c); }
 
 struct TurboSwitches {
-  bool atomics = false;     // VGPU_HOST_GPU_ATOMICS=1: float atomics with a returned value, CAS, CAST.SPIN and EXCH
+  // Float atomics with a returned value, CAS, CAST.SPIN and EXCH: admitted unless VGPU_HOST_GPU_ATOMICS=0 (Round sp66; an opt-in before, see
+  // docs/perf-design/12-host-gpu-turbo.md section 2 for why the default changed).
+  bool atomics = true;
   ClassMask off = 0;        // VGPU_HOST_GPU_TURBO_OFF: classes switched off for an experiment
+  bool printf_off = false;  // VGPU_HOST_GPU_TURBO_OFF=printf: a kernel that calls vprintf stays in the simulator (Round sp66)
 };
 
-// VGPU_HOST_GPU_TURBO_OFF=mufu,tensor,half,call,atomics,red,extra (a comma list). False, with the bad name in *bad, for anything else.
-inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad = nullptr) {
+// VGPU_HOST_GPU_TURBO_OFF=mufu,tensor,half,call,atomics,red,extra,printf (a comma list). False, with the bad name in *bad, for anything else.
+// `printf` is not a class of instructions (a kernel's call to vprintf is, once admitted, of the call class): it sets *printf_off, and is a bad
+// name when printf_off is null.
+inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad = nullptr, bool* printf_off = nullptr) {
   *off = 0;
+  if (printf_off) *printf_off = false;
   if (!text) return true;
   const std::string t(text);
   for (size_t at = 0; at <= t.size();) {
@@ -325,6 +376,7 @@ inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad =
     else if (name == "atomics") *off |= class_bit(InsnClass::AtomInt) | class_bit(InsnClass::AtomFloat) | class_bit(InsnClass::AtomSwap);
     else if (name == "red") *off |= class_bit(InsnClass::FloatRed);
     else if (name == "extra") *off |= class_bit(InsnClass::Extra);
+    else if (name == "printf" && printf_off) *printf_off = true;
     else {
       if (bad) *bad = name;
       return false;
@@ -338,7 +390,7 @@ enum class TurboRefusal : uint8_t {
   None,      // admitted
   Never,     // an instruction outside every class
   Off,       // a class switched off with VGPU_HOST_GPU_TURBO_OFF
-  Atomics,   // a float atomic with a returned value, a CAS or an EXCH, without VGPU_HOST_GPU_ATOMICS=1
+  Atomics,   // a float atomic with a returned value, a CAS or an EXCH, with VGPU_HOST_GPU_ATOMICS=0
 };
 inline TurboRefusal turbo_refusal(ClassMask classes, const TurboSwitches& sw) {
   if (classes & class_bit(InsnClass::Never)) return TurboRefusal::Never;

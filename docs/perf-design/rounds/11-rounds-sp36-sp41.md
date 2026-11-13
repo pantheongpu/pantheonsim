@@ -3538,6 +3538,111 @@ change: 17 launches kept, 48 MiB moved, 225.0 s. LU, gaussian and lud were run a
   atomicReduction: almost no launch kept for its size in sp59), were not traced; the A/B ran the reduced list without the five long ones.
 * Not compiled with the sanitizers or the CUDA 12 headers: the hosted CI jobs are their first run. `g++-12 -fsyntax-only` of the two changed C++ files is clean.
 
+## Round sp66 (host-GPU mode: what keeps turbo mode's launches in the simulator, and what was lifted)
+
+Branch `sp66-turbo-wider`, on `hostgpu-relaxed` f55c8e65 (pantheonsim #587). Turbo mode's instruction classes were no longer what kept work in the
+simulator (sp59: no launch refused as `never`); the safety refusals and the atomics opt-in were. This round measured, per launch and weighted by
+simulator seconds, everything that keeps a launch off the card, and lifted each block that could be lifted soundly. Design and soundness:
+[12, section 10](../12-host-gpu-turbo.md) (and sections 2 and 3). Data, scripts and commands: [`data/sp66/`](../data/sp66/README.md). Before the card
+everything ran on server3 against the stand-in driver; the card part is one A10G (g5.xlarge, 4 vCPU, driver 595.112.07, nvcc 13.0), about 2.5 hours
+(a second pass of 25 minutes after the fixes).
+
+### A. The census (server3, `data/sp66/census.md`)
+
+Each program once in turbo mode against the stand-in driver (which refuses every module, so every launch runs in the simulator and is timed), with
+a new summary line per kernel and reason (`host_gpu_kept:`, under `VGPU_HOST_GPU_LOG`). 107 programs under the old rules (PolyBench 9 of 20,
+Rodinia 12, HeCBench 28 of 34, the CUDA Samples 13.0 that run in the simulator, 58), 498 s in the simulator:
+
+| what kept the launches (old rules) | sim s | programs | this round |
+|---|---:|---:|---|
+| sent (a card runs them) | 228 | 11 | |
+| `never`: every one a `CALL.ABS.NOINC` to another code section (-rdc builds: tf32/bf16/cudaTensorCoreGemm, histogram, interval, mergeSort, ...) | 156.9 | 11 | followed, turbo |
+| the size rule (Round sp65's subject) | 61.8 | 63 | |
+| the module holds `__device__`, `__constant__` or string literals, the kernel calls nothing external | 36.9 | 17 | lifted, both modes |
+| "inside a graph with conditionals" (every launch of `cudaGraphLaunch`) | 8.5 | 3 | lifted, both modes |
+| an argument into mapped host memory | 3.4 | 4 | not lifted |
+| the atomics opt-in | 1.0 | 4 | default on |
+| a cooperative launch | 0.45 | 1 | not lifted |
+| a live texture object on the device | 0.36 | 4 | lifted, both modes |
+| the kernel calls malloc, assert, vprintf, the device runtime | < 0.01 | 6 | vprintf admitted (immediate call only), turbo |
+
+Under the new rules (the 49 programs with a refusal) what is kept for a reason other than size falls from 207 s to 4.3 s; `B2R.RESULT` and
+`NANOSLEEP` (cub's onesweep sort, 13.9 s) showed once module variables were lifted and joined the extra class. 161 s moved to the size rule:
+nearly all of it bf16TensorCoreGemm and tf32TensorCoreGemm, one long launch each, now admitted, that no rule sends on its first launch (sp65's).
+
+### B. What was built
+
+* **Module variables (both modes).** The card is given a copy of the cubin whose relocations of variables (`.nv.global`, `.nv.global.init`, a
+  constant bank that holds variables) are applied with the simulator's addresses and taken out of the tables (`include/vgpu/host_gpu_image.hpp`;
+  the loader's code writer moved to `include/vgpu/sass/reloc_patch.hpp` and shared). The card reads and writes the simulator's one copy, which
+  the window mirrors; `cudaMemcpyToSymbol`, `cudaMemcpyFromSymbol` and `cudaGetSymbolAddress` name it already. A constant bank is copied on the card
+  from the window into the card's bank before every launch of the module (`cuModuleGetGlobal`, `cuMemcpyDtoD`). `__managed__` still refuses.
+* **External functions by the kernel (both modes)** (`sass::reachable`): malloc, free, `__assertfail`, the device runtime, any function the
+  simulator runs in place of the cubin's code and anything unknown keep the kernel; its module's other kernels are judged by their own code.
+  **vprintf** is admitted in turbo mode when the call is immediate (`LEPC`, its return address, joined the call class); stdout is flushed before
+  such a launch, the driver prints at the `cuCtxSynchronize` right after it. Not in exact mode, not in a verify run (it would print twice),
+  `VGPU_HOST_GPU_TURBO_OFF=printf` keeps it out.
+* **No device-wide texture refusal, no graph refusal (both modes):** only texture and surface instructions read a texture, and only a call
+  of `cudaGraphSetConditional` or a device graph launch reaches the conditional handles; both refuse by the kernel's own code.
+* **Calls into another code section (turbo):** an absolute call to the first instruction of another section of the module is followed and the
+  callee's code classed (`call_to_entry`). `B2R` and `NANOSLEEP` join `extra`.
+* **Atomics:** float atomics with a value, CAS and EXCH admitted by default in turbo mode, `VGPU_HOST_GPU_ATOMICS=0` keeps them out.
+* `VGPU_HOST_GPU_WIDER=0` restores the old safety rules and the atomics opt-in for A/B runs (forms `exactn`, `turbon`); it does not switch the
+  class scan's additions (calls, `B2R`, `NANOSLEEP`, `LEPC`), so the A/B shows those against the simulator, not against `turbon`.
+
+### C. On the card
+
+One A10G, `data/sp66/card-run.sh` (`changed.md`, `rest.md`, `atomics.md`, `repeat.md`, `exact-verify.txt`, `card-ci.txt`). Medians of 3 runs, the
+programs over 20 s one run; `exactn`/`turbon` are the same build with `VGPU_HOST_GPU_WIDER=0`.
+
+* **The driver loads the patched images.** Kernels with `__device__` and `__constant__` variables, a pointer from `cudaGetSymbolAddress`, new
+  constants before every launch, a live texture object, a graph and an `-rdc` call all ran on the card with the mode-off output to the byte
+  (`e2e_host_gpu` steps 7, 9, 10, 11), and exact mode's verify of those kernels found them identical. Exact-mode verify of every program whose
+  exact decisions the round changed (`exact-verify.txt`): convolutionSeparable 34 launches, dct8x8 104, segmentationTreeThrust 399,
+  sortingNetworks 285, simpleCudaGraphs 12, LargeKernelParameter 2002, particlefilter_float 18, all identical. (simpleHyperQ's two kernels
+  differ, as they would have before the round: they store `clock64()` differences, which the exact set admits through `CS2R`, and they went to the
+  card under the old rules too. A finding for the exact set, not of this round.)
+* **The first card CI failed** in both e2e tests on the printf step: nvcc 13.0 builds the return address of the call to `vprintf` with `LEPC`
+  (added to the call class), and then calls through a register (`CALL.ABS.NOINC R2`), which the scan does not follow. So no kernel that prints
+  reaches the card with that toolkit; the steps now accept that refusal and still compare the output. With the head's build: unit test 94/94,
+  `e2e_host_gpu` and `e2e_host_gpu_stub` pass on the A10G. The printf admission (and its output-order argument) stays unmeasured on a card.
+* **The 45 programs whose decisions change** (`changed.md`): geometric mean over sim 1.08x to 1.12x in exact mode, 1.20x to 1.60x in turbo mode
+  (`exactn`, `turbon` to `exact`, `turbo`). Largest: radixSortThrust 34.1 s to 1.84 s (turbo, the module's variables and `B2R`/`NANOSLEEP`),
+  jacobiCudaGraphs 19.9 s to 1.35 s (turbo, graphs and calls), convolutionSeparable 11.2 s to 2.51 s (both modes, `__constant__`), asyncAllocation
+  4.1 s to 1.0 s and aop 1.87 s to 0.84 s (turbo; aop is the atomics default), radixsort2 3.3 s to 0.57 s, particlefilter_float 3.2 s to 1.06 s
+  (turbo) and 2.2 s (exact), segmentationTreeThrust 15.5 s to 8.7 s (turbo) and 11.9 s (exact). The call lift is in `turbon` too, so it shows against
+  the simulator: histogram 13.0 s to 2.91 s, interval 15.0 s to 2.6 s, mergeSort 7.9 s to 3.2 s. bf16/tf32/cudaTensorCoreGemm (one launch each)
+  stay in the simulator: the size rule.
+* **Outputs**: identical to the simulator's in every form of every program in exact and turbo mode, except programs whose simulator runs do not
+  repeat themselves (particlefilter_float, simplePrintf, cudaGraphsPerfScaling). The rest of the corpus (`rest.md`, 45 programs, decisions the old
+  rules' by construction): outputs identical, exact 1.14x, turbo 1.41x.
+* **The bar (no program over 3 % slower than `exactn`/`turbon`), ten runs of each that read over it** (`repeat.md`): aop and asyncAllocation in
+  exact mode were noise (0 %; their exact decisions do not change; the first pass ran beside a stand-in test). Four short programs lose, because
+  a kernel the round admits makes the size rule buy the driver start, which they cannot repay: LargeKernelParameter 0.51 s to 0.72 s (exact,
+  +41 %) and 0.75 s (turbo, +47 %), threadFenceReduction 0.38 s to 0.53 s (turbo, +40 %), MC_EstimatePiInlineP 3.29 s to 3.53 s (turbo, +7 %, the
+  static first-launch rule sends a kernel of 3 ms), dct8x8 1.08 s to 1.22 s (both, +12 %). In each the card launches themselves win (dct8x8's take
+  0.02 ms against 3.8 ms simulated); the loss is the start (0.15 to 0.25 s), charged by rules this round did not touch (the ski-rental account of
+  sp43 and the first-launch rule, Round sp65's). **The bar is not met for these four**; they are listed for sp65.
+* **Atomics** (`atomics.md`, one `VGPU_HOST_GPU_VERIFY=all` run each of aop, atomicPerf, bh): every kernel with a CAS, float atomic with a value or
+  EXCH, 12 kernels, 209 launches, ran on the card in 0.06 % to 30 % of its simulator time a launch (the largest ratio a 0.07 ms launch of aop's
+  `compute_final_beta_kernel`); no watchdog, every run status 0, outputs identical. The default stays on.
+
+### D. Tests and mutants
+
+`tests/unit/test_host_gpu_logic.cpp`: the card image on a synthetic cubin (each relocation kind, the shortened tables, what it refuses), the code
+writer, the kinds of external functions and what each mode admits, the texture instructions, the printf switch, the atomics default, `call_to_entry`,
+`LEPC`, `B2R`, `NANOSLEEP`; 94 tests pass. 49 mutants of the new code (`data/sp66/mutants.py`), all killed (one survivor of the first pass, the ELF
+class byte, killed by a test added for it). e2e: `host_gpu_vars.cu` (module variables, printf, a texture object, a heap kernel, a graph) and
+`host_gpu_rdc.cu` (-rdc) in the stand-in test (steps 24 to 30) and the card test (steps 7 to 11); `host_gpu_exact_mod.cu` keeps one safety refusal
+with an assert.
+
+### E. What was not lifted, and what is left
+
+Mapped host memory (3.4 s: HeCBench zerocopy; `cuMemHostRegister` at the same address would need the residency protocol extended to memory the
+card reads over the bus), cooperative launches, warp size, calls through a register (nvcc 13.0's `vprintf` call, newdelete's virtual call), the
+device heap, device-side launches, VMM and IPC (12, section 10). The size rule's start cost, which the newly admitted kernels of four short programs
+now meet (section C), is Round sp65's.
+
 ## Round sp67 (host-GPU verify mode's copies, pantheonsim #569; GRAMSCHM in exact mode, the driver start and nvcc 13.2's division, #570)
 
 Branch `sp67-hostgpu-verify`, base `hostgpu-relaxed` f55c8e65. Data, scripts and commands: [`data/sp67/`](../data/sp67/README.md). server3 (Ryzen 7 PRO

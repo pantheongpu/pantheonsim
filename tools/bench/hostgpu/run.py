@@ -20,6 +20,7 @@ Forms.  sim, exact, exactdiv (exact with VGPU_HOST_GPU_DIV=1), turbo, exact0 and
 (exact and turbo with VGPU_HOST_GPU_SAMPLE=0: no launch is sampled), and exactw and turbow (with
 VGPU_HOST_GPU_SAMPLE=whole: whole blocks only, the rule of Round sp60b), and exactn and turbon (with
 VGPU_HOST_GPU_STREAK=0: no launch is sent because the card holds the memory, the rule of Round sp61) are timed
+VGPU_HOST_GPU_WIDER=0: the safety rules before Round sp66) are timed
 --runs times each, interleaved; a program whose first sim run takes longer
 than --long-secs gets --long-runs runs of each.
 exact prints its machine-readable lines only with VGPU_HOST_GPU_LOG, which
@@ -231,6 +232,7 @@ def form_env(form, a):
         env["VGPU_HOST_GPU_SAMPLE"] = "whole"   # whole blocks only, never inside them: the rule of Round sp60b, for A/B runs of Round sp61
     if form in ("exactn", "turbon"):
         env["VGPU_HOST_GPU_STREAK"] = "0"   # no launch is sent because the card holds the memory: the rule of Round sp61, for A/B runs of Round sp65
+        env["VGPU_HOST_GPU_WIDER"] = "0"   # the safety rules before Round sp66 (module-wide refusals, the texture refusal, the atomics opt-in), for A/B runs
     if form != "sim":
         for kv in a.env:
             k, v = kv.split("=", 1)
@@ -694,6 +696,9 @@ def selftest():
     check(form_env("exactn", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_STREAK": "0", "VGPU_HOST_GPU_ATOMICS": "1"}, "exactn env")
     check(form_env("turbon", B)["VGPU_HOST_GPU"] == "turbo" and form_env("turbon", B)["VGPU_HOST_GPU_STREAK"] == "0" and
           "VGPU_HOST_GPU_STREAK" not in form_env("turbo", B) and "VGPU_HOST_GPU_STREAK" not in form_env("exact", B), "turbon env")
+    check(form_env("exactn", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_WIDER": "0", "VGPU_HOST_GPU_ATOMICS": "1"}, "exactn env")
+    check(form_env("turbon", B)["VGPU_HOST_GPU"] == "turbo" and form_env("turbon", B)["VGPU_HOST_GPU_WIDER"] == "0" and
+          "VGPU_HOST_GPU_WIDER" not in form_env("turbo", B) and "VGPU_HOST_GPU_WIDER" not in form_env("exact", B), "turbon env")
 
     for f in fails:
         print("FAIL: " + f)
@@ -711,6 +716,7 @@ def main():
     ap.add_argument("--programs", default="", help="comma list of corpus/name or name; default all")
     ap.add_argument("--skip", default="", help="comma list of corpus/name or name to leave out")
     ap.add_argument("--forms", default="sim,exact,turbo", help="of sim,exact,exact0,exactw,exactn,exactdiv,turbo,turbo0,turbow,turbon,verify (exactdiv: exact with VGPU_HOST_GPU_DIV=1; exact0, turbo0: with VGPU_HOST_GPU_SAMPLE=0; exactw, turbow: with VGPU_HOST_GPU_SAMPLE=whole; exactn, turbon: with VGPU_HOST_GPU_STREAK=0; verify: one untimed turbo run with VGPU_HOST_GPU_VERIFY=all)")
+    ap.add_argument("--forms", default="sim,exact,turbo", help="of sim,exact,exact0,exactw,exactdiv,turbo,turbo0,turbow,verify (exactdiv: exact with VGPU_HOST_GPU_DIV=1; exact0, turbo0: with VGPU_HOST_GPU_SAMPLE=0; exactw, turbow: with VGPU_HOST_GPU_SAMPLE=whole; exactn, turbon: with VGPU_HOST_GPU_WIDER=0, the safety rules before Round sp66; verify: one untimed turbo run with VGPU_HOST_GPU_VERIFY=all)")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--long-secs", type=float, default=120, help="a program whose first sim run takes longer gets --long-runs runs")
     ap.add_argument("--long-runs", type=int, default=1)
