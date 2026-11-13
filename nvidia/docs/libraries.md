@@ -643,7 +643,7 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | cuBLASLt | `libcublasLt.so.13` | descriptor matmul in fp64/fp32/fp16/bf16/fp8/fp4 and int8 x int8 into int32 (`CUBLAS_COMPUTE_32I`, what `torch._int_mm` calls), strided batches, row-major layouts, bias/ReLU/GELU epilogues with their auxiliary outputs and the backward ones (DRELU, DGELU, bias gradients), FP8 on an Ada profile (sm_89) as an L4's cuBLAS 13.3 answers it, and none below it (see [narrow-precision probes](lowprec.md)), FP8 tensor-wise and row-wise scales with amax, an FP8 auxiliary output with its scale and amax, and the block-scaled FP8/FP4 modes with one scale tensor per batch (Hopper and Blackwell: documentation-derived) |
 | cuDNN | `libcudnn.so.9` | training and inference in the classic API: convolution forward, backward-data, backward-filter and backward-bias (every algorithm cuDNN lists, fused bias-activation), activation, pooling, softmax, LRN, batch normalization (with its fused add and activation, and as the cuDNN 8 normalization API), dropout (cuDNN's own generator, mask for mask, also between an RNN's layers), the spatial transformer, CTC loss, im2col, reductions and tensor arithmetic, each in NCHW, NHWC or any strides, in float, double, half (float or half compute) and bfloat16, INT8 convolution in NHWC and, vectorized, in `NCHW_VECT_C` (INT8x4, INT8x32), divisive normalization, tensor transforms and folding, fused-ops plans (the scale-bias-activation weight gradient among them), LSTM projections and the multi-head attention API; the graph API's convolution, matmul, pointwise, reduction, normalization (layer, instance, batch, RMS, group; backward with or without the saved statistics; batch normalization across the GPUs, in one process or several), pooling (with max pooling's index tensor), concatenation, reshape, transpose, slice, RNG, statistics-generation and softmax graphs, and scaled dot-product attention forward and backward -- the single SDPA operation and cudnn-frontend's composite graph alike, with causal, sliding-window and padding masks, bias, grouped-query heads, dropout, paged K/V caches and ragged (packed) sequences -- over ragged and INT8x4/INT8x32-vectorized tensors; RNNs |
 | cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included; multi-GPU plans (`cufftXtSetGPUs`, `cufftXtMalloc`/`cufftXtMemcpy` descriptors, `cufftXtExecDescriptor*`, `cufftXtQueryPlan`) with each GPU's part on its own simulated device, in NVIDIA's natural, shuffled and 1‑D string orders; LTO callbacks (`cufftXtSetJITCallback`) given as PTX, or as LTO-IR where the host has the CUDA toolkit (its libnvJitLink links it into machine code for the simulated device) |
-| cuRAND | `libcurand.so.10` | host-side uniform and normal generation; Sobol' direction vectors (Joe and Kuo's, the card's to the bit) and scramble constants |
+| cuRAND | `libcurand.so.10` | host-side uniform, normal, log-normal and Poisson generation; `curandCreatePoissonDistribution` for `curand_discrete` in kernels (the card's histogram); Sobol' direction vectors (Joe and Kuo's, the card's to the bit) and scramble constants |
 | cuSPARSE | `libcusparse.so.12` | every entry point NVIDIA's 13.0 exports. CSR/CSC/COO/BSR SpMV, SpMM (strided batches, fp16/bf16/int8), SpGEMM (and SpGEMMreuse), SDDMM, SpSV/SpSM (with updateMatrix), format conversion, CSR to CSC, in real and complex values (A, A^T and A^H); Blocked-ELL SpMM and sliced-ELL SpMV; sparse vectors (SpVV, Axpby, Gather, Scatter, Rot); the tridiagonal and pentadiagonal solvers (gtsv2, gtsv2_nopivot, gtsv2StridedBatch, gtsvInterleavedBatch, gpsvInterleavedBatch); legacy coo2csr, the CSR/CSC/COO sorts, csrgeam2, gemvi, the BSR family (bsrmv, bsrxmv, bsrmm, bsrsv2, bsrsm2, bsric02, bsrilu02, CSR to BSR and back, gebsr2gebsr, gebsr2gebsc), csric02 and csrilu02, pruning, csrcolor, nnz and compression, unsorted CSR. SpMV, SpMM, SDDMM, SpSV/SpSM solves, sparse to dense and CSR to CSC are recorded into a captured CUDA graph and run at each launch |
 | cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR (with `ungqr`/`unmqr` for complex), symmetric and Hermitian eigen, SVD, in real and complex types; the reductions and their back-transforms (`sytrd`/`hetrd`, `orgtr`/`ungtr`, `ormtr`/`unmtr`, `gebrd`, `orgbr`/`ungbr`), `potri`, `lauum`, selected and generalized eigen (`syevdx`/`heevdx`, `sygvd`/`hegvd`, `sygvdx`/`hegvdx`, `sygvj`/`hegvj`); symmetric indefinite (Bunch-Kaufman `sytrf`, `Xsytrs`, `sytri`), `laswp`; the iterative refinement solvers (`<t1><t2>gesv`/`gels`, `IRSXgesv`/`IRSXgels`); the 64-bit X API with `Xgetrf`/`Xgetrs`, `Xtrtri`, `Xsyevdx`, `Xgesvd`, `Xgesvdp`, `Xgesvdr` and `Xlarft`, `Xgeev` (right eigenvectors) on real and complex matrices, Jacobi (gesvdj, syevj, heevj) and batched forms, gesvdaStridedBatched. The sparse module, cusolverSp: `csrlsvlu`/`csrlsvqr`/`csrlsvchol` (host and device), `csrlsqvqr`, `csreigvsi`, `csreigs`, the reorderings (`symrcm`, `symamd` and `symmdq` give NVIDIA's own permutations), `csrperm`, `csrzfd`, batched QR, and the low-level preview API (LU on the host, QR and Cholesky on the host and the device, step by step). The refactorization module, cusolverRf, single and batched |
 | cusolverMg | `libcusolverMg.so.12` | getrf/getrs, potrf/potrs/potri and syevd on a matrix, or getrf/getrs and potrf/potrs/potri on a submatrix (IA, JA), spread over several devices in NVIDIA's column-block-cyclic layout |
@@ -838,6 +838,39 @@ Some of those numbers came out of the hardware rather than the documentation.
 cuDNN rejects `CUDNN_ACTIVATION_IDENTITY` from `cudnnActivationForward`, and
 cuRAND does *not* rewind its stream when the seed is set again. Both were found
 by differential testing and are matched deliberately.
+
+cuRAND's Poisson functions follow what an RTX 3060's cuRAND 13.0 does (pantheonsim #629; the test is
+`e2e_rand_poisson`, which passes on the card too). `curandCreatePoissonDistribution` builds, below lambda 2000,
+Marsaglia, Tsang and Wang's square histogram (`CURAND_M2`) over every value whose probability, computed as
+`exp(k log(lambda) - lambda - lgamma(k + 1))`, is not 0 in double precision; its columns are filled in the card's
+order (each column short of 1/n, scanning upwards and again until none is left, takes the rest from the
+highest-numbered column still above 1/n). Its aliases equal the card's for every lambda tried (0.001 to 1999), its
+cut-offs differ in the last bits only and no 32-bit integer's uniform falls between them, so `curand_discrete` in a
+kernel draws the card's integers. From lambda 2000 on the distribution is `CURAND_DISCRETE_GAUSS`, mean lambda and
+standard deviation its square root. The records live in device memory in the layout of `curand_discrete.h`.
+`curandGeneratePoisson` takes lambda in (0, 400000] (anything else, NaN too, is `OUT_OF_RANGE`) and one number
+of the generator per value, at the positions `curandGenerate` would use:
+
+| generator | lambda | the card's method, and this library's |
+|---|---|---|
+| pseudorandom | below 2000 | the histogram above, looked up with the generator's 32-bit integer |
+| pseudorandom | 2000 and up | a rounded normal, `lambda + sqrt(lambda) z`; the card's z is none of its normal generators' (measured), so z here is the normal quantile of the generator's integer |
+| 32-bit Sobol' | below 10 | the histogram |
+| 32-bit Sobol' | 10 to 8000 | `curand_poisson.h`'s inversion (`_curand_poisson_ITR_double`), on the (0, 1] uniform of `_curand_uniform_double` rather than the header's (0, 1) one |
+| 32-bit Sobol' | above 8000 | `lambda + sqrt(lambda) z` rounded, z the float `curandGenerateNormal` gives at that point |
+| 64-bit Sobol' | below 2000 | the inversion |
+| 64-bit Sobol' | 2000 and up | the rounded normal |
+
+The pseudorandom streams are not NVIDIA's (see the top of `nvidia/src/curand_api.cpp`), so their Poisson integers
+have the right distribution and are reproduced by seed and offset, not the card's. The unscrambled Sobol' points
+are the card's, so their Poisson integers are the card's too (65,536 of each, for lambdas from 0.5 to 400,000, in the
+test; the inversion was compared on a million points of each width on the card). What the card's inversion does
+with a uniform of exactly 1 (the integer 0xffffffff) was not measured; here the walk stops where p runs out.
+Edges: the card's lookup can read one column past the table (for the integer 0xffffffff, whose uniform is exactly
+1), which takes the last column here; `curandGeneratePoissonMethod` takes only `CURAND_DEVICE_API` and
+`CURAND_3RD`, as the card does, and answers every other method `CURAND_STATUS_INTERNAL_ERROR`; both are
+`curandGeneratePoisson` here. `curandGenerateSeeds` succeeds (there are no device states to set up) and
+`curandGetProperty` reports the header's version.
 
 cuDNN's training paths were pinned down the same way, on an RTX 3060 with
 cuDNN 9.27. Its gradients read the forward pass's input for ReLU, clipped ReLU
