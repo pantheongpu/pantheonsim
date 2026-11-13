@@ -1,0 +1,94 @@
+ 0 killed by exit -8: turns: no step gives turns
+ 1 killed by turns_left_are_the_distance_to_the_bound_in_steps: turns: the offset is ignored
+ 2 killed by turns_left_are_the_distance_to_the_bound_in_steps: turns: the offset is taken off
+ 3 killed by turns_left_are_the_distance_to_the_bound_in_steps: turns: always unsigned
+ 4 killed by turns_left_are_the_distance_to_the_bound_in_steps: turns: the bound always unsigned
+ 5 killed by turns_left_are_the_distance_to_the_bound_in_steps: turns: never unsigned
+ 6 killed by turns_left_are_the_distance_to_the_bound_in_steps: turns: a lane past the bound has turns
+ 7 killed by turns_left_are_the_distance_to_the_bound_in_steps: turns: rounded down
+ 8 killed by turns_left_are_the_distance_to_the_bound_in_steps: turns: one more
+ 9 killed by turns_left_are_the_distance_to_the_bound_in_steps: turns: the step not divided out
+10 killed by turns_left_are_the_distance_to_the_bound_in_steps: turns: a negative step is taken as is
+11 killed by turns_left_are_the_distance_to_the_bound_in_steps: turns: distance from the lane, not to the bound
+12 killed by turns_between_two_pauses_are_what_the_register_moved: between: backwards counts
+13 killed by turns_between_two_pauses_are_what_the_register_moved: between: part turns round up
+14 killed by turns_between_two_pauses_are_what_the_register_moved: between: always signed
+15 killed by exit -8: between: no step guard
+16 killed by a_measured_turn_gives_steps_and_seconds, a_launch_from_the_blocks_read: per turn: no completed turn gives none
+17 killed by a_measured_turn_gives_steps_and_seconds: per turn: a part turn divides
+18 killed by a_measured_turn_gives_steps_and_seconds, a_launch_from_the_blocks_read: per turn: the steps whatever the turns
+19 SURVIVED: per turn: no steps is a measure
+20 SURVIVED: per step: no time is a measure
+21 SURVIVED: per step: no steps divides by zero
+22 killed by a_measured_turn_gives_steps_and_seconds, a_launch_from_the_blocks_read: per step: inverted
+23 killed by a_measured_turn_gives_steps_and_seconds, a_launch_from_the_blocks_read: block: the steps taken left out
+24 killed by a_measured_turn_gives_steps_and_seconds, a_launch_from_the_blocks_read: block: the turns left out
+25 killed by a_measured_turn_gives_steps_and_seconds: block: a negative cost
+26 killed by a_launch_from_the_blocks_read: launch: no block read is an estimate
+27 killed by a_launch_from_the_blocks_read: launch: no grid is an estimate
+28 killed by a_launch_from_the_blocks_read: launch: no measure is an estimate
+29 killed by a_launch_from_the_blocks_read: launch: not shared among threads
+30 killed by a_launch_from_the_blocks_read: launch: the longest block not a floor
+31 killed by a_launch_from_the_blocks_read: launch: the blocks read are the grid
+32 SURVIVED: launch: more threads than blocks share
+33 killed by a_launch_from_the_blocks_read: launch: zero threads
+34 killed by a_launch_from_the_blocks_read: launch: the shortest block
+35 killed by blocks_read_inside_a_small_grid: inblock: the minimum grid is read inside
+36 killed by blocks_read_inside_a_small_grid: inblock: any grid is read inside
+37 killed by blocks_read_inside_a_small_grid: inblock: no cap
+38 killed by blocks_read_inside_a_small_grid: inblock: half the blocks
+39 killed by blocks_read_inside_a_small_grid: inblock stride: always 1
+40 killed by blocks_read_inside_a_small_grid: inblock: the enter time doubled
+41 killed by blocks_read_inside_a_small_grid: inblock: the measure halved
+42 killed by blocks_read_inside_a_small_grid: inblock: the budget doubled
+43 killed by sampling_is_for_grids_with_blocks_to_sample, a_small_grid_is_sampled_inside_only_with_a_followed_loop: inside: without a followed loop
+44 killed by a_small_grid_is_sampled_inside_only_with_a_followed_loop, a_small_grid_s_floor_counts_the_followed_loop_s_bound: inside: also for whole-block grids
+45 killed by sampling_is_for_grids_with_blocks_to_sample, a_small_grid_is_sampled_inside_only_with_a_followed_loop: worth: small grids without the inside test
+46 killed by a_small_grid_is_sampled_inside_only_with_a_followed_loop, a_small_grid_s_floor_counts_the_followed_loop_s_bound: worth: small grids never
+47 killed by a_small_grid_is_sampled_inside_only_with_a_followed_loop: worth: no loop test inside
+48 killed by sample_sends_only_what_repays_the_driver_start_and_the_card_path, sample_does_not_use_the_account_of_time_already_spent, sample_charges_the_memory_and_an_unknown_card_time: sampled offload: the start is never charged
+49 killed by sample_sends_only_what_repays_the_driver_start_and_the_card_path, sample_charges_the_memory_and_an_unknown_card_time, a_launch_sampled_inside_goes_by_the_rule_of_sampled_launches: sampled offload: the guessed card time is the default
+50 killed by a_small_grid_s_floor_counts_the_followed_loop_s_bound: floor: the bound not counted
+51 killed by a_small_grid_s_floor_counts_the_followed_loop_s_bound: floor: the bound counted for whole-block grids
+52 killed by a_small_grid_s_floor_counts_the_followed_loop_s_bound: floor: a bound of 0 zeroes the count
+53 killed by a_small_grid_s_floor_counts_the_followed_loop_s_bound: floor: the plain count in worth_sampling
+54 killed by a_small_grid_s_floor_counts_the_followed_loop_s_bound: bound turns: the step ignored
+55 killed by a_small_grid_s_floor_counts_the_followed_loop_s_bound: bound turns: rounded up
+56 killed by a_small_grid_s_floor_counts_the_followed_loop_s_bound: bound turns: a negative bound
+57 killed by a_small_grid_s_floor_counts_the_followed_loop_s_bound: bound turns: no step guard
+58 killed by a_loop_whose_counter_or_bound_is_not_plain_is_not_followed: finder: an indirect jump is ignored
+59 SURVIVED: finder: unreachable back edges count
+60 SURVIVED: finder: a forward branch is a back edge
+61 killed by loops_one_after_another_and_inside_one_another: finder: the first back edge, not the last
+62 killed by the_top_level_counted_loop_is_found, a_loop_whose_counter_or_bound_is_not_plain_is_not_followed, the_counter_may_be_read_through_a_register_the_loop_adds_to_it: finder: inner loops too
+63 killed by loops_one_after_another_and_inside_one_another: finder: crossed ranges too
+64 killed by loops_one_after_another_and_inside_one_another: finder: no cap
+65 killed by a_loop_whose_counter_or_bound_is_not_plain_is_not_followed: finder: the bound may be written in the loop
+66 killed by a_loop_whose_counter_or_bound_is_not_plain_is_not_followed, the_counter_may_be_read_through_a_register_the_loop_adds_to_it: finder: the counter may be written twice
+67 SURVIVED: finder: any write is a counter
+68 killed by a_loop_whose_counter_or_bound_is_not_plain_is_not_followed: finder: no step test
+69 killed by a_loop_whose_counter_or_bound_is_not_plain_is_not_followed: finder: no bound test
+70 killed by the_counter_may_be_read_through_a_register_the_loop_adds_to_it: finder: the through-register's counter need not be one
+71 killed by the_counter_may_be_read_through_a_register_the_loop_adds_to_it: finder: the through-register offset dropped
+72 SURVIVED: finder: any last writer of the predicate
+73 SURVIVED: finder: the compare may be before the loop
+74 killed by a_loop_whose_counter_or_bound_is_not_plain_is_not_followed: finder: the compare need not write the branch's predicate
+75 killed by the_top_level_counted_loop_is_found: finder: the bound side only
+76 SURVIVED: finder: unconditional back edges decide
+77 killed by a_loop_left_by_a_branch_out_of_it_is_followed: finder: exit branches do not decide
+78 killed by the_top_level_counted_loop_is_found: finder: signedness lost
+69 of 79 killed
+
+# What was done about the 10 survivors of the pass above (indices of that pass, 79 mutants):
+# 19 per turn: no steps is a measure       -> equivalent (0 steps gives 0 either way): the guard was removed from the header, the mutant from the list
+# 32 launch: more threads than blocks share -> equivalent (with blocks <= threads the longest block decides): min() removed, the mutant from the list
+# 20 per step: no time is a measure        -> test added (a negative time); rerun as 19 of the final list: killed
+# 21 per step: no steps divides by zero    -> test added (a time and no step); rerun as 20: killed
+# 59 finder: unreachable back edges count  -> test added (a counted loop after the EXIT); rerun as 57: killed
+# 73 finder: the compare may be before the loop -> test added (a compare of the counter before the loop only); rerun as 71: killed
+# 60 finder: a forward branch is a back edge -> equivalent: such a range has hi < lo, holds no instruction and cannot hold or cross a real one
+# 67 finder: any write is a counter        -> equivalent: a writer that is not an add has add_src -1 and is refused by the `iv < 0` test after it
+# 72 finder: any last writer of the predicate -> equivalent: a writer that is not a compare has cmp_pred -1 and is refused by the predicate test after it
+# 76 finder: unconditional back edges decide -> equivalent: such a branch has predicate -1, which no instruction writes, so no compare is found
+# Final list (mutants.py): 77 mutants, 73 killed (69 in the pass above, 4 rerun on the final headers: 19, 20, 57, 71; also 28 and 31 rerun, killed),
+# 4 argued equivalent. The unit test: 89/89 on the final commit; the harness self-test (exactw, turbow forms): PASS.

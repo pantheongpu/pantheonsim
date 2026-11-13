@@ -356,8 +356,10 @@ hsa_status_t dispatch(Queue* q, const hsa_kernel_dispatch_packet_t& p, std::stri
     }
   // What the packet asks for beyond the kernel's own LDS is the launch's.
   const uint32_t lds = p.group_segment_size > ref.kernel->group_segment ? p.group_segment_size - ref.kernel->group_segment : 0;
+  // The scratch a work-item gets is what the packet asks for (the packet processor reserves private_segment_size), and never less
+  // than the kernel's static size here: a kernel with a dynamic stack is given more by the runtime that made the packet (#585).
   if (!shared::run(q->device, ref.loaded, *ref.kernel, grid, wg, lds, reinterpret_cast<uint64_t>(p.kernarg_address),
-                   q->q.type == HSA_QUEUE_TYPE_COOPERATIVE, why))
+                   q->q.type == HSA_QUEUE_TYPE_COOPERATIVE, why, p.private_segment_size))
     return HSA_STATUS_ERROR_EXCEPTION;
   return HSA_STATUS_SUCCESS;
 }
@@ -1702,7 +1704,7 @@ hsa_status_t hsa_executable_symbol_get_info(hsa_executable_symbol_t symbol, hsa_
       break;
     case HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_DYNAMIC_CALLSTACK:
       if (!kernel) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-      put<bool>(value, false);
+      put<bool>(value, s.kernel->uses_dynamic_stack);   // (ROCr: the descriptor's USES_DYNAMIC_STACK bit)
       break;
     case 3: put<uint32_t>(value, 0); break;   // MODULE_NAME_LENGTH: a program symbol has none
     case 4: break;                            // MODULE_NAME

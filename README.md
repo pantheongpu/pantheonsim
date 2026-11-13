@@ -72,11 +72,22 @@ All settings:
 | `counters` | `true` or `false` | `false` | Print exact per-launch performance counters |
 | `quiet` | `true` or `false` | `false` | Silence every simulator message on stderr |
 | `trace` | `true` or `false` | `false` | Log every runtime and driver entry point |
-| `host_gpu` | `off` or `exact` | `off` | Experimental: run bit-exact kernels on this machine's real NVIDIA GPU (the simulated model); the rest stays simulated |
+| `host_gpu` | `off`, `exact` or `turbo` | `off` | Experimental: run bit-exact kernels (`exact`), or also kernels whose result is the card's own (`turbo`), on this machine's real NVIDIA GPU (the simulated model); the rest stays simulated |
 | `host_gpu_log` | `true` or `false` | `false` | Print each host_gpu decision with its numbers |
 
 Each setting is described in [docs/config.md](docs/config.md). It also runs [in a browser](https://pantheonsim.com/play/), [in CI](docs/github-action.md) and [in Docker](docs/docker.md).
 
+## Exact and turbo modes
+
+PantheonSim runs everything on the CPU by default, and every run gives the same bits. On a machine that has the real NVIDIA GPU being simulated, two experimental modes hand kernel launches to that card to save time:
+
+| Mode | Setting | What runs on the card | What the program gets |
+|---|---|---|---|
+| Simulator (default) | `host_gpu: off` | Nothing | The simulator's result, the same bits every run |
+| Exact | `host_gpu: exact` or `VGPU_HOST_GPU=exact` | Only kernels the card computes bit for bit as the simulator does (integer and IEEE arithmetic) | The simulator's bits |
+| **Turbo** | `host_gpu: turbo` or `VGPU_HOST_GPU=turbo` | Every kernel that is safe to send: also approximate math (`sin`, `exp`, `rsqrt`...), half precision, tensor-core instructions and integer atomics | The card's own values, as on real hardware. They can differ from the simulator's in the last bits |
+
+**Turbo mode is the fast mode: it trades bit-for-bit equality with the simulator for speed.** Memory safety, synchronisation and launch checks are the same in all three. Measured on an A10G over 59 programs of PolyBench/GPU, Rodinia and HeCBench: total run time about 1.7x shorter in turbo and 1.2x in exact, and every program's output equal to the simulator's. `VGPU_HOST_GPU_VERIFY=1` runs each launch both ways and compares, in turbo within a tolerance (`VGPU_HOST_GPU_ATOL`, `VGPU_HOST_GPU_RTOL`). Counters, fault injection and the simulator's checks do not apply to launches that run on the card. Details: [turbo mode](docs/perf-design/12-host-gpu-turbo.md), [all variables](docs/cli.md).
 ## How PantheonSim is developed
 
 PantheonSim has one maintainer, Saqib Khan. Most of its code, tests and documentation were written with AI coding assistants (Anthropic's Claude), directed and reviewed by the maintainer, and pull requests here have no second reviewer. What it is checked against, and what is not checked, is in [CONTRIBUTING.md](CONTRIBUTING.md), "How PantheonSim is developed"; what does not work is in [status and limits](docs/status.md).

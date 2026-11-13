@@ -739,6 +739,7 @@ Reading: ranks 1 to 5 are all in the simulator's own interpretation and memory p
 A spin loop fast-forward (simpleHyperQ's `clock64` delay) would be a 3x on that program but needs the instruction counters and the clock register to be advanced analytically per lane for a loop the kernel defines; it applies to one program of 124 (and to `clock`-style Samples only).
 
 Verdict: no lever with a class-wide 5 % geometric mean or 1.3x exists in this corpus beyond what the earlier rounds measured out. The remaining ratios (20 to 60x) are the cost of interpreting a warp's instruction stream, which is where sp37, sp40 and sp41 already looked. No source change was made, so there are no new tests or mutants. Candidates for a later round, with their ceilings above: instrument which warps reach `sass_bank_passes_table` in the Thrust programs; a `run_out` that stays an atomic per 8 bytes but unrolls and prefetches. Not unresolved but worth knowing: the timed numbers of this round are single runs under heavy shared load (server2 load 9 to 70; the builder lock queue was over an hour long), so a ratio can be off by 30 %; the ranking of the first five, which differ by 1.5x or more from the sixth, is not in doubt.
+
 ## Round sp47 (the blocks of one launch on several host threads, with the bits of running them in order: `VGPU_EXACT_THREADS`; branch `sp47-parallel-blocks`, base `origin/main` 27f09add)
 
 Question: can a launch whose result must be that of `VGPU_THREADS=1` (blocks in order: the reference of `tools/verify`, of the counter checks and of the result cache) use several host cores, and what is that worth on Rodinia, PolyBench and HeCBench?
@@ -981,6 +982,7 @@ The 1.046 in cycles for `gaussian` was mostly the shared host: on the quiet one 
 * `config.md` / `vgpu` configuration key: the mode is an environment variable only.
 * After a stopped trial, chunks the trial stored to stay materialized (bytes equal; host memory higher). No program in the corpora showed it as a problem; it is not measured.
 * The five longest PolyBench programs and the eight HeCBench programs that do not finish at one thread within the limit have no A/B rows.
+
 ## Round sp48 (compiling whole blocks to host code): the ceiling measured per instruction kind, the design of the next stage, and fused runs of register-only ops built and measured (branch `sp48-block-compiler`, base `origin/main` 27f09add)
 
 Question: tier 2 (the JIT, `VGPU_JIT=1`) is worth about 1.10 over the tier on warm caches (round sp38). Would compiling whole basic blocks to straight-line host code, with guest registers in host registers, counters added once per block and side exits that restore the state, give the step that the op-by-op generated code did not? Staged: (1) measure what share of the executed work is dispatch, operand decode, register-file traffic and counting, against the lane arithmetic itself; that share bounds the gain; (2) design the next stage; (3) build the smallest slice that gives a real number; keep it only at 5 % or more on three compute-bound programs.
@@ -1110,6 +1112,7 @@ The bar set beforehand was 5 % or more on at least three compute-bound programs.
 * How many of the executed ops ran in fused runs was not counted (the statistics have no counter for it and the cache keeps no source).
 * Not measured for the fused form: the cold run (a run is written twice, so the compile is larger), the full form (`VGPU_JIT_RESIDENCE=1`: fused runs are off there), AVX-512 (16 lanes a register), the seven `e2e_sass_jit` shards with `VGPU_JIT_FUSE=1`, a sanitizer build, a build without the mutation hooks, g++-12. The unit test and the five programs' same-bits comparison are what holds the patch.
 * Cleanup: the scratch tree of this round on server3 (`~/.cache/sp48`) was removed by exact path.
+
 ## Round sp50 (16-lane AVX-512 forms of the SASS lane kernels): ceiling measured, built with the same bits, measured on Zen 5, one program over the bar, not kept (branch `sp50-avx512`, base `origin/main` 27f09add)
 
 Question: the 32-lane kernels the SASS tier calls for every arithmetic instruction (`src/simd/kernels.inc`, `avx2_impl`) take a warp as four steps of eight lanes. The AVX-512 table that is the default on a host with AVX-512 F/BW/DQ/VL and VNNI replaces only the tensor-core tile kernels (rounds sp3, sp8, sp12, sp13, sp26, sp27); every other entry of it is the AVX2 kernel. Would 16-lane forms of the lane kernels, with mask registers for the lane masks, pay on a CPU with full-width 512-bit units? Rule set beforehand: keep the change only if at least three real programs gain 5 % or more.
@@ -1201,6 +1204,7 @@ Caveats and what is left:
 * polybench/LU dies of `SIGPROF` under the sampler (exit status -27 after about 20 s, no samples file); the other six programs do not. Not looked into.
 * The JIT (off by default) compiles `kernels.inc` at the level the host's compiler reports and was not touched: generated code keeps the 256-bit lane kernels either way.
 * No Intel host was measured.
+
 ## Round sp51 (persistent on-disk caches for short programs): the split measured first, load, decode and compile are 3 percent of a short program, nothing built (branch `sp51-disk-cache`, base `origin/main` 27f09add)
 
 Question: most CI programs run well under a second, so does work a process repeats at every start (decoding a module's SASS, building the tier's micro-ops, parsing PTX) dominate them, and would an opt-in directory of decoded modules or compiled kernels (`VGPU_CACHE_DIR`), read back by the next process, pay? Rule set beforehand: split the wall time of about 15 short programs first; build the cache only if decode and compile are 15 % or more of the wall on them; keep it only if warm runs gain 10 % or more in the geometric mean. Result: on the default engine the four phases a cache of decoded modules could replace (module load, SASS check and decode, tier analysis, PTX parse) are 2.9 % of the samples in the mean of 20 short programs and at most 13.7 % in one; removing every one of those samples and adding nothing would be 1.031x in the geometric mean. On the PTX engine it is 6.1 % and 1.069x. Both gates fail by a wide margin, so no cache was built. What is kept: the tool that makes the split (`tools/bench/real/short.py`) with a CMake-wired self-test of its rules, the tables, and this section.
@@ -2007,6 +2011,7 @@ Caveats and what is left:
 * Not run on the branch: the rest of the test suite (only the five tests named above), the sanitizer builds, a g++-12 compile, hosted CI (nothing was pushed), and a host without AVX-512 (the skip path of `test_lanes512` was not seen to run; its condition is `simd::supported(Level::Avx512)`).
 * The JIT (off by default) compiles `kernels.inc` at the level the host's compiler reports and was not touched: generated code keeps the 256-bit `dop_m` either way.
 * The other binary64 forms (`dcmp`, the `f2f` conversions, `i2d`) stay at 256 bits and were not looked at.
+
 ## Round sp55 (the cost of the proof of exact parallel launches: pages that are only read noted as a whole, what a worker remembers, two words at once; branch `sp55-exact-shadow`, base `speed-round-sp46-sp51` 49d02daa)
 
 Question: Round sp47 built `VGPU_EXACT_THREADS` and found the trial's note (one atomic word per four bytes, a compare-and-swap before every first touch, the old bytes kept on a first write) to cost 1.38x per thread, so that 21 of 53 programs were slower at 2 exact threads than at one. Where does that factor go, and how much of it can be removed without weakening the proof (a kept trial is the run in order, a conflict is found before the access, a stopped trial is undone to the byte, atomics are writes)?
@@ -2233,6 +2238,7 @@ Reading:
 * **fpdc-cuda has no row** (52 programs, not sp47's 53): each run writes its compressed output, hundreds of megabytes, into its directory, and on this host's disk (a USB stick) a run took 30 to 190 s at 3 to 7 % CPU.
 * As in round sp47: the five longest PolyBench programs and the eight HeCBench programs that do not finish at one thread have no rows; the liveness rule has no test; only the SASS engine is tried.
 * Round sp47's table (server2, eight Zen 5 cores) is not reproduced here: on this host the same base build gives 1.09x / 1.39x / 1.62x at 2 / 4 / 8 exact threads where sp47 measured 1.11x / 1.59x / 2.01x, and plain `VGPU_THREADS=8` gives 2.28x where it measured 2.91x.
+
 ## Round sp57: the JIT as the default, measured, not flipped; the count on the way to the threshold moved to the plain loop (branch `sp57-jit-default`)
 
 Question: every per-instruction lever of the tier has been used, so the largest speed-up left for a user who sets nothing may be to turn tier 2 on for them (`VGPU_JIT=1`, with or without `VGPU_JIT_LINK=1` and `VGPU_JIT_FUSE=1`). What would that buy and cost with the *default* settings (threshold 100,000,000 region instructions, the compile in the background), on a cold and on a warm cache; what stands in the way; and should it be the default. The earlier JIT rounds (15, sp33, sp38, sp48, sp52, sp53) all measured with `VGPU_JIT_THRESHOLD=100000 VGPU_JIT_SYNC=1` on a filled cache: the best case, on the programs that reach generated code. The reason given for "off by default" is round 14's: a section that is kept by the share rule is counted in the hook loop until it is compiled, which cost four bench workloads 2 to 5 % in a cold run.
@@ -2514,6 +2520,578 @@ What would put the line over the bar, from what was measured: a page whose lines
 * **The census has no row for s3d-cuda**, and was taken at 2 threads only.
 * As in rounds sp47 and sp55: only the SASS engine is tried; the five longest PolyBench programs have no rows.
 
+## Round sp59 (turbo host-GPU mode on an A10G)
+
+Branch `hostgpu-turbo`. `VGPU_HOST_GPU=turbo` ([design](../12-host-gpu-turbo.md), pantheonsim #587) on one real A10G: the card CI, the probes, and
+PolyBench/GPU, Rodinia and the reduced HeCBench list as plain simulator, `exact`, `exact` with `VGPU_HOST_GPU_DIV=1` and `turbo`. Data, commands and the
+rig: [`data/sp59/`](../data/sp59/README.md). One rig, single runs for the long programs, one toolkit (13.0): read the caveats.
+
+### Headline
+
+* **Speed.** Over the 59 programs with a simulator time: geometric mean 1.12x for `exact`, 1.12x for `exact` + DIV, 1.23x for `turbo`; summed wall time
+  1172 s in the simulator, 978 s, 972 s and 669 s (1.20x, 1.21x, 1.75x). Four more programs pass 300 s in the simulator: three finish in 8 to 14 s in
+  every card form, and `binomial` in 7.5 s in `turbo` only.
+* **Coverage.** Launches on the card: 21,279 of 57,014 (`exact`), 21,290 (`exact` + DIV), 25,221 of 58,014 (`turbo`); programs with at least one: 13, 13, 22
+  of 64. No launch was refused for an instruction of no class. What keeps launches in the simulator in turbo mode is the size rule (30,812 launches too
+  small), the shared safety checks (1,499), the atomics opt-in (209), and the first-launch rule, which is not counted and which holds most of the time left.
+* **Correctness.** The output of every program that can be compared is the simulator's in every card form: 58 of 59 identical, none merely within
+  tolerance, none different. The 59th, Rodinia `particlefilter_float`, does not print the same output twice in the simulator. Verify (52 programs, after the
+  fix below): 8 programs have words that differ, 2 have words outside the default tolerance (`aobench`: a byte of an image; `bh`: forces of 1e-3 that differ
+  by 4e-7), both explained, neither a fault of the mode.
+* **A bug of verify, in both modes, found and fixed.** Under `VGPU_HOST_GPU_VERIFY` the simulator ran its launch while the card copy was still valid, and
+  its atomics lost updates between host threads: HeCBench `atomicAggregate` printed FAIL under verify and PASS without.
+* **The probes changed two claims.** The card's `MUFU.SIN`/`COS` is accurate to about 3.6e-7 absolute, not to a unit in the last place, and for arguments
+  beyond ordinary size the simulator's own sine is not the card's at all. Tensor-core kernels (`HMMA`, `IMMA`, `DMMA`, and `BMMA`) gave the simulator's
+  bits in all 394 launches.
+
+### A. Card CI (`tools/card-ci/run-card-ci.sh`)
+
+Passed on the first run, with nothing changed: unit tests, `e2e_host_gpu` (the turbo steps: the expf kernel on the card, verify with 2,139,207 words
+different and none outside tolerance, largest relative difference 1.19e-7), `e2e_host_gpu_stub` (steps 10 to 15, their first run anywhere), the division
+check, the sp44 `MUFU` lines (the same shares as sp44). Passed again on the final sources.
+
+### B. Probes
+
+`sin.approx`, `cos.approx`, `tanh.approx` over all 2^32 float patterns against the simulator (`hostgpu_sfu_exhaustive`, about 2 minutes each):
+
+| op | differ of 2^32 | share | outside atol 1e-8 + rtol 1e-5 | largest difference | inputs of ordinary size (2^-20 <= abs(x) < 2^10, 503 M): outside tolerance | largest difference there |
+|---|---:|---:|---:|---:|---:|---:|
+| sin | 4,100,660,130 | 95.5% | 1,973,810,306 | 1 | 189,088,948 (37.6%) | 3.58e-7 |
+| cos | 1,959,021,478 | 45.6% | 1,361,487,864 | 2 | 1,553,340 (0.3%) | 3.58e-7 |
+| tanh | 239,361,664 | 5.6% | 86,770 | 7.99e-6 | 86,770 | 7.99e-6 |
+
+Reading: nvcc compiles `sin.approx` as `FMUL.RZ` by 1/(2 pi) and `MUFU.SIN` on turns (read from the kernel's SASS with `VGPU_HOST_GPU_LOG=2`; the first model
+in the probe, a product rounded to nearest, was wrong and is corrected, which moved the share from 96.7% to 95.5%, so the model was not the cause). The
+card's sine and cosine are fixed-point: about 3.6e-7 absolute error whatever the size of the result, so a sine near zero is far outside a relative
+tolerance (the first difference is the card's 0 against the simulator's 7e-38), and for an argument of many turns the card gives sin 0 and cos 1 where the
+simulator, which multiplies by 2 pi in double, gives a value anywhere in [-1, 1]. For programs: a result of `sinf` or `cosf` near zero differs from the
+simulator's by up to 3.6e-7, which the default `atol` of 1e-8 does not cover. The simulator's `MUFU.SIN` and `MUFU.COS` are not the card's beyond ordinary
+arguments; that is a finding about the simulator, not about this mode, and nothing was changed for it.
+
+Atomics, 8 runs of each kernel on the card from the same memory (`hostgpu_atomic_repeat`, 4,194,304 threads onto 256 words):
+
+| kind | SASS class | the target words repeat | what each thread got back repeats |
+|---|---|---|---|
+| integer max, no value used (control) | exact | 7 of 7 | (nothing returned) |
+| integer add, old value used | atomic-int | 7 of 7 | 0 of 7 (4,170,784 of 4,194,304 words differ) |
+| float add, no value used | float-red | 0 of 7 (242 of 256 sums differ, up to 17 ulp) | (nothing returned) |
+| float add, old value used | atomic-float | 0 of 7 (up to 13 ulp) | 0 of 7 |
+| double add, no value used | float-red | 0 of 7 (246 of 256, up to 23 ulp) | (nothing returned) |
+| compare-and-swap | atomic-swap | 0 of 7 | 0 of 7 |
+| exchange | atomic-swap | 0 of 7 | 0 of 7 |
+
+As designed: integer atomics leave the same memory and return order-dependent values; float sums differ in their last places from run to run; swaps have
+no single answer.
+
+Tensor instructions under `VGPU_HOST_GPU_VERIFY=all` (`wmma_gemm`, `wmma_types`, `mma_forms`; 4 + 21 + 369 launches, each at rtol 1e-5, 2e-3, and 2e-3 read as
+halves): 0 words different in every run, the 18 + 2 `BMMA` launches (not admitted, run by `all`) included. These programs feed values that are exact in
+every format, so this shows that layouts and exact products agree; it says nothing about the rounding of an accumulation that is not exact.
+
+### C. The three suites
+
+`tools/bench/hostgpu/run.py`, 3 runs a form (1 for a program over 30 s in the simulator), per-run limit 1200 s (PolyBench, Rodinia) or 300 s (HeCBench), median
+wall seconds of the whole process. Tables per program: `data/sp59/{rodinia,polybench,hecbench}.md`.
+
+| suite | programs | `exact` | `exact` + DIV | `turbo` | summed wall: sim, exact, DIV, turbo (s) | launches on card: exact, turbo, of | programs with a card launch: exact, turbo |
+|---|---:|---:|---:|---:|---|---|---|
+| Rodinia | 12 | 1.17x | 1.18x | 1.25x | 17, 13, 13, 12 | 1,632, 2,433 of 3,971 | 3, 5 |
+| PolyBench/GPU | 20 | 1.30x | 1.30x | 1.30x | 786, 595, 589, 582 | 4,965, 4,967 of 34,109 | 6, 6 |
+| HeCBench (reduced) | 27 of 32 | 0.99x | 0.98x | 1.18x | 370, 370, 370, 75 | 14,682 of 18,934; 17,821 of 19,934 | 4, 11 |
+| all | 59 of 64 | 1.12x | 1.12x | 1.23x | 1172, 978, 972, 669 | 21,279 of 57,014; 25,221 of 58,014 | 13, 22 |
+
+The programs whose time moved (the rest are within 15% of the simulator in every form):
+
+| program | sim s | exact | exact + DIV | turbo | launches on card: exact, turbo, of |
+|---|---:|---:|---:|---:|---|
+| HeCBench atomicReduction | 297.0 | 1.00x | 1.00x | 78.0x (3.81 s) | 0, 2090 of 2100 |
+| PolyBench FDTD-2D | 106.1 | 22.9x | 21.7x | 22.9x | 1494, 1494 of 1500 |
+| Rodinia gaussian | 4.13 | 4.47x | 4.51x | 4.49x | 495, 495 of 1022 |
+| PolyBench LU | 30.7 | 2.76x | 2.76x | 2.75x | 1405, 1405 of 4096 |
+| HeCBench atomicAggregate | 3.58 | 1.00x | 1.00x | 2.46x | 0, 4 of 6 |
+| Rodinia hotspot | 1.18 | 0.99x | 0.99x | 2.30x | 0, 789 of 1000 |
+| PolyBench 2MM | 251.2 | 1.66x | 1.68x | 1.65x | 1, 1 of 2 |
+| Rodinia sc_gpu | 1.03 | 1.32x | 1.32x | 1.39x | 1087, 1053 of 1432 |
+| PolyBench 3MM | 2.42 | 1.33x | 1.32x | 1.35x | 2, 2 of 3 |
+| Rodinia lud | 3.52 | 1.19x | 1.30x | 1.23x | 50, 95 of 190 |
+| HeCBench bh | 0.88 | 0.99x | 0.98x | 1.25x | 0, 1 of 17 |
+| PolyBench GRAMSCHM | 228.6 | 0.83x | 0.85x | 0.87x | 2041, 2043 of 6144 |
+| Rodinia backprop | 0.61 | 0.99x | 0.99x | 0.86x | 0, 1 of 2 |
+| HeCBench atomicPerf | 1.13 | 1.00x | 1.00x | 0.84x | 0, 1 of 18 |
+| HeCBench axpby | 0.47 | 0.73x | 0.73x | 0.73x | 6, 5 of 35 |
+| HeCBench bitonic-sort | 0.32 | 0.99x | 1.00x | 0.62x | 0, 22 of 136 |
+| HeCBench aligned-types | over 300 | 8.37 s | 8.31 s | 8.44 s | 12974 of 13000 |
+| HeCBench babelstream | over 300 | 13.46 s | 13.50 s | 13.47 s | 1188 of 1214 |
+| HeCBench base64e | over 300 | 8.75 s | 8.75 s | 8.76 s | 514 of 516 |
+| HeCBench binomial | over 300 | over 300 | over 300 | 7.45 s | 998 of 1000 |
+
+What turbo adds over exact is five programs: `atomicReduction` (78x), `binomial` (from over 300 s to 7.5 s), `atomicAggregate`, `hotspot`, `bh`. On
+PolyBench it adds nothing: no PolyBench launch that exact refuses for its code is large enough to go. `exact` + DIV adds 45 launches of Rodinia `lud`. The
+losses are short programs that pay the driver start for a launch or two (`bitonic-sort` 0.32 s to 0.52 s, `backprop`, `atomicPerf`, `axpby` in every form):
+the start-cost rule lets them through because their kernels' time adds up to the 0.25 s account while the gain does not.
+
+Not in the table: `fpdc` and `zerocopy` were skipped (known simulator timeouts of `tools/bench/real`); `aidw` passed 300 s in every form; `atomicCost` was killed
+(status -9, not by the harness) after about 22 s in every form, the plain simulator included, which was not looked into.
+
+With the atomics opt-in (`VGPU_HOST_GPU_ATOMICS=1`, the three programs that had launches refused for it, 3 runs): `aop` 1.86 s to 0.83 s (2.25x, 291 of 301
+launches on the card), `atomicPerf` 1.12 s to 0.78 s (1.44x), `bh` unchanged at 1.25x (one more kernel admitted, too small to go). The outputs are the
+simulator's in all three. Verify: `aop` 32,785 words different and none outside tolerance; `bh` as below.
+
+#### Where the simulator's time is left under turbo mode
+
+Not in refused instructions: `host_gpu_refused` named 12 kernels in all (5 of `aop`, 6 of `atomicPerf`, 1 of `bh`), every one for `ATOMS.CAST.SPIN` or
+`ATOMG.CAS` (the opt-in), none for the `never` class. The time is in launches the size rule keeps:
+
+| program | turbo s | launches on card | seconds in the simulator's launches | why |
+|---|---:|---|---:|---|
+| PolyBench 2MM | 152.0 | 1 of 2 | 29.1 | the first kernel's only launch is not sent |
+| PolyBench COVAR, CORR | 62.9, 62.7 | 0 of 3, 0 of 4 | 23.3 | every kernel launches once |
+| HeCBench black-scholes | 24.9 | 0 of 1 | 19.7 | one launch, admitted (`mufu`, `call`), not sent |
+| PolyBench SYR2K, SYRK | 9.8, 5.2 | 0 of 1 | 7.7 | one launch |
+| PolyBench GRAMSCHM | 261.8 | 2043 of 6144 | 1.3 | the rest is the program's CPU reference |
+
+A kernel's first launch goes to the card only when the static estimate of its simulator time beats the card path with the driver start charged (sp43), and
+that estimate is far too low for a kernel with a loop: SYR2K's launch is estimated at 45 ms and takes 7.7 s. With `VGPU_HOST_GPU_START_COST=0` (one run, 28
+PolyBench and Rodinia programs, `data/sp59/start-cost-0.md`): SYR2K 9.78 s to 2.30 s, SYRK 5.19 s to 1.28 s, GEMM 1.3x, JACOBI2D 1.7x, 3MM 1.6x, hotspot 3.6x
+in turbo, and the geometric mean of the 28 goes from 1.27x (exact) and 1.30x (turbo) to 1.47x in both, with identical outputs; it also brings back
+the losses the start cost was made for (`pathfinder` 0.85x, `srad_v2` 0.06 s to 0.44 s in turbo). This rule is shared by both modes and was not changed.
+
+One more thing that is not the mode: the plain simulator is slower than a host-GPU run that sends nothing to the card (SYRK 6.48 s against 5.19 s with **Corrected by Round sp60a:** launch-level result caching is opt-in (`VGPU_MEMO=1`) and was off in both forms, so it is not the cause; on a second machine the default, `VGPU_MEMO=0` and a host-GPU run that sends nothing take the same time (geometric mean 1.00). Only SYRK and CORR read slow in the plain form here, the rig's plain timings did not repeat between passes, and with those two set to 1.00 the headline is 1.115x exact and 1.221x turbo (summed wall 1.18x and 1.73x).
+0 launches on the card, CORR 78 s against 63 s). `runtime.cpp` switches launch-level result caching on only when `VGPU_HOST_GPU` is unset; that is the likely
+cause, and it was not measured apart. It flatters every speed-up above by up to 1.25x on such programs, and may be what makes GRAMSCHM read 0.83x (one run).
+
+### D. Differences, by cause
+
+| program | what differs | cause |
+|---|---|---|
+| Rodinia particlefilter_float | the printed result, in every form | the simulator does not repeat itself on this program (its 3 sim runs differ); every launch stays in the simulator (module variables) |
+| HeCBench aobench | verify: 4 words different, 2 outside | the kernel writes an image of bytes; one byte is `0xf5` on the card and `0xf4` in the simulator: a float one or two ulp apart (`mufu`) rounded to the other byte. The compare reads bytes as floats and doubles (hence a "largest difference" of 1e242). Output identical |
+| HeCBench bh, ForceCalculationKernel | verify: about 8,500 words different and 12 outside per launch, largest 4.2e-7 absolute, 3.2e-4 relative | forces of about 1e-3 summed over many bodies from `MUFU.RSQ` results one or two ulp apart: cancellation. Inside tolerance with `VGPU_HOST_GPU_ATOL=1e-6`. Output identical |
+| HeCBench bh, TreeBuildingKernel | verify: about 6,000 words outside per launch | compare-and-swap tree building (not admitted; run by `VERIFY=all`): node indices in another order, as the atomics probe says |
+| HeCBench atomicAggregate, atomicPerf, atomicIntrinsics | the verify run printed FAIL, or other lines, where the simulator prints PASS (first pass only) | the bug of verify below; identical after the fix |
+
+No difference was traced to the mode sending a kernel it should not have, and no class was switched off. The six other programs with words that differ
+under verify have none outside tolerance.
+
+#### The bug of verify (both modes)
+
+Under `VGPU_HOST_GPU_VERIFY` the card copy of each allocation stayed valid while the simulator ran the same launch, so the simulator's accesses went through
+the gate's slow path, where an atomic of one host thread could lose the update of another. `atomicAggregate` under `VERIFY=all`: FAIL in
+each of 4 runs with 4 host threads (3 in exact mode, 1 in turbo), PASS in 2 of 2 with `VGPU_THREADS=1`; after the fix PASS in 6 of 6 with 4 threads (3 and 3). It also
+meant that the next launch on the card started from the card's own earlier results, so in turbo mode differences carried from launch to launch on the
+card's side, which is not what the design said. Fix: the copy is given up before the simulator runs (nothing is pulled: the simulator's memory is the
+truth), so a verify run now pushes all live memory before every launch. Plain runs are not touched. The verify numbers of this section are from a second
+pass with the fix (52 programs; the long ones were not repeated). A step was added to the stand-in-driver test (a contended integer reduction under verify);
+it passes, but it also passed on the library before the fix in 10 runs, so it does not reproduce the bug and the evidence is `atomicAggregate` on the card.
+
+### What changed in the tree because of the card
+
+* The verify fix above (`src/runtime/host_gpu.cpp`), with the test step.
+* The probe's model of `sin.approx` / `cos.approx` (`FMUL.RZ`), and its RESULT lines now also count results outside the default tolerance and give the
+  largest absolute difference, over all inputs and over those of ordinary size.
+* The harness: a form `exactdiv`, and `--long-secs` / `--long-runs`.
+* Defaults: none. `tensor` and `extra` stay on (`tensor`: 394 launches bit-identical; `extra`: `atomicAggregate`'s kernel holds one and verifies clean, which is
+  thin). The atomics opt-in stays an opt-in (the probe).
+
+### What to do next
+
+1. The first-launch rule. It is where the time is: a static estimate that sees the loop (trip counts from the launch's arguments, or the instruction count
+   times the grid as a floor that is raised by the kernel's back edges) would send 2MM's first kernel, COVAR, CORR, SYR2K, SYRK and black-scholes. Both modes gain.
+2. Short programs that lose 0.1 to 0.2 s to the driver start: the account should weigh the expected gain, not the simulator time spent.
+3. Measure the plain simulator with result caching off against a host-GPU run with nothing sent, and report speed-ups against the faster one.
+4. `MUFU.SIN` / `MUFU.COS` in the simulator: model the card's turns in fixed point, at least for arguments beyond 2^10; then an absolute tolerance for
+   results of these two.
+5. Name `BMMA` in the tensor class (20 launches identical), and give the tensor probe inputs whose accumulation is not exact.
+6. Make the stand-in-driver test reproduce the lost update (it needs two host threads inside the gate at once).
+7. Other cards and toolkits: everything here is one A10G, nvcc 13.0.
+
+### Caveats
+
+* One rig, one card. Programs over 30 s in the simulator had one run of each form (2MM, CORR, COVAR, FDTD-2D, GRAMSCHM, LU in the main pass, atomicReduction);
+  GRAMSCHM's 0.83x to 0.87x is one run of each, against 1.00x to 1.02x in sp44.
+* The timed passes ran on the build before the verify fix; the fix touches only verify runs. The verify of 2MM, FDTD-2D, GRAMSCHM, aligned-types,
+  atomicReduction, babelstream, base64e and binomial timed out (600 s or 300 s) and says nothing; these are the programs with the most launches on the card.
+* The exact form of a long program has no `card_s` / `sim_s` (the extra run with the log is skipped for it).
+* "Identical output" is the program's printed text and files with timing lines dropped: most of these programs print a checksum to a few digits or PASS, so
+  it is a weaker statement than verify's.
+* The harness, the probes and the mode were changed during the run (listed above); the card CI passed again on the final sources.
+
+### Before the card: what ran without one (server3, GCC 13.3, `Release`, `-Werror`, no LTO; every build and run under the machine lock, `-j3`, `nice 19`)
+
+* The build is clean (0 warnings); `host_gpu.cpp` and `config.cpp` also compile alone with `-Wall -Wextra -Werror -Wformat-security`.
+* `ctest -R 'host_gpu|card_gate|hostgpu'`: 8 tests, 6 pass (`test_host_gpu_logic` 62 cases, `test_host_gpu_ref` 7, `test_host_gpu_tol` 15,
+  `test_host_gpu_track` 17, `test_card_gate` 10, `hostgpu_bench_selftest`), 2 skip (`e2e_host_gpu`: no card; `e2e_host_gpu_stub`: no nvcc). The turbo steps
+  10 to 15 of the stand-in-driver test have therefore never run: CI is their first run.
+* Mutants, each a copy of one file with one change, built outside the tree: 91 of 91 killed (41 of the compare by tolerance, 34 of the classes and
+  switches, 4 of exact mode's reduction check, 12 of the harness). None of `host_gpu.cpp`: what could kill them is the stand-in-driver test.
+* No driver on the machine: PolyBench 2DCONV, ATAX and GESUMMV, each with the mode off, `exact`, `exact` with the log, `turbo` (with and without
+  `VGPU_HOST_GPU_START_COST=0`), `turbo` with verify, `VGPU_HOST_GPU=approx` and a bad `VGPU_HOST_GPU_ATOL`. The program's output is the mode-off
+  output in all 27 runs; the mode says `cannot load the real driver ...; mode off` where a launch was sent, the summary with 0 launches on the card
+  where none was, and `not a mode` / `not a number` for the last two. The stderr of the `exact` runs equals, line for line, that of an earlier build of
+  main (another round's baseline tree on the same machine), apart from the two lines for scripts that `VGPU_HOST_GPU_LOG` now adds.
+
+## Round sp60a (does launch-level result caching slow the default simulator? the baseline of round sp59): measured, it does not; nothing to fix (branch `sp60a-memo-cost`, base `origin/main` 1baa3ad3)
+
+Round sp59 (branch `hostgpu-relaxed`, an A10G rig) saw a host-GPU run that sent nothing to the card finish before the plain simulator (PolyBench SYRK 5.19 s
+against 6.48 s, CORR 63 s against 78 s) and named a likely cause it did not measure: `runtime.cpp` attaches launch-level result caching only when
+`VGPU_HOST_GPU` is unset, so the plain simulator would pay for a cache that never hits. Two questions followed: are sp59's speed-ups overstated, and is the
+default simulator slower than it need be for everyone? Data, scripts and the box: [`data/sp60a/`](../data/sp60a/README.md). No source file changed.
+
+### Answer
+
+* **The cache is not on in the default simulator, so it cannot be the cause.** `memo::Config::from_env` sets `enabled` only for `VGPU_MEMO=1`
+  (`src/runtime/memo.cpp`); the test of `VGPU_HOST_GPU` in `Device::Device` is a second condition on a switch that is already off. The harness of sp59 removes
+  every `VGPU_` variable before a run, so its plain form had no cache. The same lines are on `hostgpu-relaxed`. What is left of the cache when it is off: one
+  hash of each module's image at load (14 GB/s, round sp35) and null tests in the memory manager's cold paths.
+* **Measured: default, `VGPU_MEMO=0` and `VGPU_HOST_GPU=exact` take the same time.** 56 programs at default threads, 55 at `VGPU_THREADS=1`, alternating
+  runs, medians of 5 (3 over 4 s, 1 over 30 s):
+
+  | threads | programs of 0.3 s or more | default / `VGPU_MEMO=0`, geometric mean (range) | default / `VGPU_HOST_GPU=exact` | summed medians: default, memo off, host-GPU (s) |
+  |---|---:|---:|---:|---:|
+  | default | 27 | 1.003 (0.977 to 1.040) | 1.005 (0.994 to 1.033) | 181.3, 180.6, 179.9 |
+  | 1, pinned | 40 | 0.999 (0.959 to 1.032) | 1.003 (0.949 to 1.150) | 291.0, 293.0, 277.4 |
+
+  No program is outside its own spread. The largest ratios are GEMVER (1.040 and 1.033 at spreads of 8 to 16 %) and, at one thread, COVAR 1.150 and CORR
+  1.052, which are single runs made while two other programs ran on neighbouring cores (the same pair reads 1.010 and 1.033 at default threads, and CORR
+  reads 0.959 against `VGPU_MEMO=0` in that same pass). SYRK: 1.000 and 0.999 at default threads, 0.985 and 0.996 at one. With no driver on the box the mode
+  stays armed for the whole run (its own account with `VGPU_HOST_GPU_LOG=1`: 27,252 launches, all in the simulator, none failed, no "mode off"), so form `c`
+  is the path of a card run that sends nothing.
+* **Nothing was fixed, because there is no loss to remove.** The bar (5 % on three programs) has nothing to reach, and no profile was taken: there is no gap
+  to attribute.
+* **sp59's speed-ups are not overstated across the board.** Its own records show it (next section): of the 34 programs of 0.3 s or more to which the exact
+  form sent no launch, 32 are within 5 % of the plain simulator (median 1.000), and the two that are not are SYRK and CORR. With those two set to 1.00 the
+  headline moves in the third digit: 1.123x to 1.115x (exact), 1.121x to 1.113x (exact + DIV), 1.231x to 1.221x (turbo).
+
+### sp59's records, read again (`data/sp60a/sp59-baseline.md`, from its `bench.json`)
+
+1. *Forms that sent nothing to the card.* If a switch tied to `VGPU_HOST_GPU` slowed the plain simulator, every such program would show it. They do not:
+   exact, 34 programs of 0.3 s or more, geometric mean 1.012, median 1.000, outside 5 %: CORR 1.234 and SYRK 1.248 only. SYR2K, the twin of SYRK (same
+   kernel shape, one launch, 9.8 s), is 1.000 in all three card forms; COVAR, the twin of CORR, is 1.000.
+2. *The plain simulator against itself on that rig.* The `START_COST=0` pass timed the plain simulator again, one run a program: SYRK took 5.19 s there,
+   the time of the card forms in the main pass. Of the 24 programs of 0.3 s or more in both passes, 6 moved by more than 5 %: LU 30.7 s and 46.5 s, SYRK
+   6.48 and 5.19, particlefilter 2.97 and 2.56, GEMVER 0.65 and 0.76, MVT 1.21 and 1.36, 3MM 2.42 and 2.30. The plain simulator on that rig does not
+   repeat its own time to better than a factor of 1.25 on some programs, in both directions.
+3. *Corrected headline.* A form that used no card cannot have gained from it; where such a form read above 1.05 it is set to 1.00 (CORR and SYRK in each
+   form). Geometric means over the 59 programs: exact 1.123x to **1.115x**, exact + DIV 1.121x to **1.113x**, turbo 1.231x to **1.221x**; summed wall time
+   1.199x to 1.183x, 1.207x to 1.192x, 1.753x to 1.728x. No factor measured on server3 is applied to sp59's numbers: the measured factor is 1.00, and a
+   ratio of another CPU would not be valid for a rig whose own baseline moves by more than the effect. The rows that are not affected at all are the ones
+   that carry sp59's claims (gaussian, FDTD-2D, LU, sc_gpu, lud and the others with launches on the card): their gains are several times the 1.25 at issue,
+   and the `START_COST=0` figures for SYRK and SYR2K (4.04x, 4.2x) were taken against a 5.19 s and a 9.78 s baseline, the fast one.
+
+What made SYRK's median of three slow in the plain form alone was **not found**. It is not reproduced on server3: on four logical CPUs of two cores
+(`taskset -c 0-3`, the rig's shape) SYRK takes 3.10 s in both forms over 7 runs each, spread 2 to 3 %, and SYR2K, LU, GEMVER and MVT are within 1 %
+(`4cpu.md`). One property of sp59's harness fits the pattern and is offered as a guess, not a finding: with three runs and the order of the forms reversed
+on every other run, the second and third runs of the first form (the plain simulator) are consecutive, so one disturbance of 10 to 15 s on the rig moves
+that form's median and no other's. The per-run times were not kept, so this cannot be checked. A harness that rotates the forms instead of reversing them,
+or keeps every run's time, would have settled it; CORR is a single run and needs no mechanism.
+
+### The cache when it is asked for (`VGPU_MEMO=1`)
+
+Not the question of the round, measured in passing so that a later change knows what there is to keep:
+
+* *In one run, entries in memory* (`memo-stats-default.md`, default threads): **0 hits in 32,572 launches of 56 programs.** No program of these three
+  suites repeats a launch on unchanged memory. Recording and the hashing of host writes took 424 ms against 84.7 s of kernel time (0.50 %); default over
+  cache-on is 0.997 over the 27 programs of 0.3 s or more, the worst radixsort2 0.956 and pathfinder 0.970. This is the cost round sp38 reported.
+* *A second run with `VGPU_MEMO_DIR`* (`warm-t1.md`, one thread, one cold run and two warm ones): 28 of 50 programs hit when warm; the gains are where
+  round sp35 found them, in programs whose launches are replayed whole (atomicAggregate 3.7 s to 0.004 s, atomicPerf 111x, atomicIntrinsics 24x, bilateral
+  7.1x, bh 2.0x, hotspot 1.60x, 3MM 1.58x, radixsort2 1.35x); summed over the 34 programs of 0.3 s or more, 60.0 s off, 53.3 s warm.
+* *A lead, not followed:* the cold run with a directory reads below 0.97 against off in 12 of those 34 (aobench 0.75, aop 0.81, particlefilter 0.87,
+  JACOBI2D 0.89, gaussian 0.93), geometric mean 0.962. These are single runs (sortKV's cold run read 3.2 s against 0.22 s, plainly a disturbed run), and the
+  budget of `VGPU_MEMO_BUDGET` covers hashing, not the writing of entries to disk; the mode is opt-in and the round's question was the default, so it was
+  not measured further.
+
+### Same results
+
+`identity-t1.md`, `VGPU_THREADS=1`, one run of default, default again, `VGPU_MEMO=0`, `VGPU_HOST_GPU=exact` and `VGPU_MEMO=1`: normalised output, exit
+status, `VGPU_MEMO_FINAL_HASH`, `VGPU_COUNTERS_FILE` without the pid, `VGPU_KERNEL_DIGEST`. 49 programs compared: 44 the same in every form; 4 do not
+repeat themselves between two default runs (`backprop` of Rodinia and of HeCBench and `sc_gpu` in the digest only, `particlefilter_float` in output,
+counters and digest, as sp59 found); 1 differs in a form only: `pathfinder` under `VGPU_HOST_GPU`, whose output differs by the mode's own message
+(`VGPU_COUNTERS_FILE is set ...; mode off`) printed onto an unterminated line of the program, with the three files equal. Two cautions: the final memory
+hash is the same value in every program of this corpus (they free their memory before they exit), so the digest after every launch is the check that
+bites; and with `VGPU_COUNTERS_FILE` set the host-GPU mode is off, so for form `c` the files were compared with the variable set and the mode not armed.
+With the mode armed (the timing passes) the normalised output of form `c` is the default's in every program but `particlefilter_float`.
+
+### Not done, and deviations
+
+* No profile (nothing to attribute), no source change, so no test and no mutants. The off state is already held by `test_memo` and `e2e_memo_api_matrix`
+  (round sp35).
+* Not run: the nine programs of 100 s or more and `fpdc-cuda`; `atomicCost` at one thread (130 s a run; one of its three runs was killed in the first
+  pass); 3DCONV in the identity pass (the digest of 254 launches passed the 40 s limit); CORR, COVAR, LU, atomicCost, black-scholes and zerocopy in the
+  identity pass (their outputs are compared in the timing passes only). Programs over 30 s have one run a form, not three.
+* The first one-thread pass ran three programs side by side on three cores, against the rule of one timed run at a time. It was a mistake: runs were killed
+  or failed in all three forms at once (most likely memory: three device images of an A10G), and single runs came out 15 % apart. The 11 programs it
+  disturbed were run again one at a time and those rows replace the first ones; the other 44 rows are of the side-by-side pass and their spreads are in
+  the table. The ratios are between forms of one program on one core, which the neighbours disturb equally, but the absolute one-thread times of those
+  44 rows are about 25 % above what the box gives alone and should not be quoted.
+* No card: everything about the A10G is read from sp59's records, not measured. Whether a card form that sends nothing differs from the plain simulator
+  on a machine with a driver (the driver's library loaded, its threads) was not measured anywhere; sp59's 32 of 34 say it does not.
+* The round's text is appended to this file on a branch cut from `origin/main`, which does not have *Round sp59* (that section is on `hostgpu-relaxed`):
+  the two appends will meet when both are merged, and sp59's paragraph "One more thing that is not the mode" should then point here.
+* Cleanup: the scratch tree on server3 (`~/.cache/sp60a`) was removed by exact path.
+
+## Round sp60b (host-GPU mode: the first blocks of a launch, timed)
+
+Branch `sp60b-first-launch`, on `hostgpu-relaxed` (pantheonsim #587). Round sp59 found that what keeps time in the simulator in both modes of the
+host-GPU mode is the size rule, and in it the first launch of a kernel: it goes to the card only on a static estimate that is far too low for a
+kernel with a loop, and programs that launch each kernel once have no second launch. This round replaces the guess with a measurement: a launch
+with no estimate is **sampled** in a forked copy of the process, and goes to the card when the measured time repays the card path and the
+driver start. Design and soundness: [12, section 8](../12-host-gpu-turbo.md). Data, scripts and commands: [`data/sp60b/`](../data/sp60b/README.md).
+Before the card everything ran on server3 (no driver); the card part is one A10G (g5.xlarge, 4 vCPU, driver 595.112.07, nvcc 13.0), about 4 hours.
+
+### Headline (one A10G; `exact0` and `turbo0` are the same build with `VGPU_HOST_GPU_SAMPLE=0`, the rule of sp59; medians of 3 interleaved runs, 1 for a program over 30 s)
+
+| program | mode | before (`exact0` / `turbo0`) s | now s | | what happened |
+|---|---|---:|---:|---:|---|
+| PolyBench SYRK | exact | 5.16 | 1.30 | 3.98x | its one launch sampled (6 ms) and sent: 12.6 ms on the card path |
+| | turbo | 5.19 | 1.30 | 3.99x | |
+| PolyBench SYR2K | exact | 9.81 | 2.37 | 4.13x | sampled (11 ms), sent: 21.5 ms on the card path |
+| | turbo | 9.72 | 2.37 | 4.10x | |
+| PolyBench 2MM | exact | 171.8 | 122.2 | 1.41x | the first kernel sampled (14 ms) and sent; the second goes by the old rules, now with the driver up. One run of each; the 122 s left are the program's CPU reference |
+| | turbo | 154.4 | 122.0 | 1.26x | |
+| HeCBench black-scholes | turbo | 25.11 | 6.07 | 4.14x | its one launch sampled (65 ms, 59 of them the fork of a process with 1.9 GiB live) and sent: 394 ms on the card path, 1.9 GiB pushed. From the rerun on the last build (C); in the A/B the copy was ended before it answered and the launch stayed (25.18 s). Not admitted in exact mode |
+| HeCBench binomial | turbo | 7.45 | 1.36 | 5.5x | not one of the four: its 1,000 launches went from the third on before, now from the first (one run of each) |
+| HeCBench shmembench | turbo | 6.17 | 0.30 | 20.3x | not one of the four: one launch, sampled and sent |
+
+Geometric mean of the speed-up over the plain simulator, and of the sampled form over the unsampled one:
+
+| suite | programs | exact | exact0 | exact over exact0 | turbo | turbo0 | turbo over turbo0 | summed seconds: exact, exact0, turbo, turbo0 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| Rodinia | 12 | 1.17x | 1.17x | 1.004x | 1.23x | 1.24x | 0.994x | 12.6, 12.9, 12.3, 12.2 |
+| PolyBench/GPU (without GRAMSCHM) | 19 | 1.51x | 1.29x | 1.174x | 1.51x | 1.29x | 1.176x | 281, 342, 281, 325 |
+| HeCBench (reduced; 25 programs have a simulator time within 120 s) | 30 | 0.99x | 0.99x | 1.001x (28) | 1.13x | 1.00x | 1.177x | 82, 82, 79, 92 |
+| all | 61 | 1.18x (56) | 1.12x | 1.054x (59) | 1.27x (56) | 1.14x | 1.138x | 376, 437, 372, 428 |
+
+* **Outputs.** The output is the simulator's in all four forms (`identical`) for 55 of the 61 programs. Five have no simulator output to
+  compare with (aligned-types, atomicReduction, babelstream, base64e, binomial: their simulator run was cut at 120 s; binomial, the one of them with a sampled
+  launch, prints the same lines sampled and unsampled apart from its three timing lines), and Rodinia
+  `particlefilter_float` does not print the same output twice in the simulator (as in sp59). In exact mode a sampled launch that is sent is a launch the card
+  computes bit for bit, as any launch it takes.
+* **More than 3% slower than the unsampled form: three programs by the medians, none by the rule.** Rodinia `backprop` in turbo (+7.0%),
+  `sc_gpu` in exact (+6.6%) and PolyBench `JACOBI2D` in exact (+9.5%): in all three NO launch was sampled in either form (their summary lines say
+  `sampled=0`), so both forms ran the same code, and each form's three runs fall in two groups 50 ms apart (`sc_gpu` exact0: 0.778, 0.727,
+  0.728 s). Ten more runs of each
+  form of the three (`card-run.sh repeat`): `backprop` turbo 0.708 s against 0.710 s, `JACOBI2D` exact 0.556 against 0.555, `sc_gpu` exact 0.732
+  against 0.778 (medians; every form of every one has runs at both levels). A median of three cannot tell these apart.
+* **Not reached: PolyBench COVAR and CORR** (64.5 s and 63.2 s, unchanged). Their long kernel is launched on 8 blocks of 256 threads, each thread
+  looping over the whole matrix (COVAR's `covar_kernel`: 819 M warp instructions in 64 warps): no block ends for seconds, so there is nothing
+  to time, and grids under 256 blocks are not sampled. In exact mode CORR's kernels are not admitted at all. The next step is progress inside a
+  block (a loop's trip count read from the code or from the first iterations); not built here.
+
+### A. Why the static estimate is low
+
+`static_sim_seconds` is blocks x warps per block x the instructions of the code / 100 M a second: every instruction once a warp. PolyBench SYR2K's
+kernel is `for (k = 0; k < NJ; k++) c[i][j] += ...` in every thread, with `NJ` a constant of the program: the count sees the loop's body once.
+Measured in the plain simulator (server3, 4 host threads), launch time over static estimate: SYR2K 76, the first kernel of 2MM 31, HeCBench binomial
+29, SYRK 22; kernels whose threads leave early or run straight through, 0.3 to 0.6 (2DCONV, GEMVER, JACOBI2D, Rodinia backprop, gaussian, lud). So the
+count is no bound in either direction, and no constant factor repairs it.
+
+A second finding on the way: the first-launch rule's "the kernel has a loop" (`has_back_edge`: a branch to its own or a lower address) is true of
+every kernel of the corpus. nvcc ends each kernel with a branch to itself after its `EXIT`. The rule of sp15 therefore never used that condition;
+it is left as it is (changing it changes which first launches go today), and the sampling rule has its own test, a cycle in the control flow
+that the entry reaches (`code_has_loop`), which says no for 2DCONV, 3DCONV, GEMVER, JACOBI2D, backprop's `bpnn_adjust_weights_cuda`, gaussian's
+`Fan2` and lud's `lud_internal`, and yes for SYRK, SYR2K, GEMM, black-scholes, binomial.
+
+### B. What was built, in order, and what went
+
+| variant | what it did | result (server3, 4 threads, no card; a stand-in driver where one was needed) | kept |
+|---|---|---|---|
+| move a running launch (idea 1) | the whole live memory is copied, the simulator runs the launch, a watcher thread reads the blocks done; when what is left repays the card path the driver is started beside the simulator, and when it is up the simulator stops between two blocks and the card runs the whole launch from the copy (or the simulator goes on from the first block not taken) | worked: PolyBench ATAX's second kernel was stopped at block 12 of 128 and resumed, output unchanged. The copy is paid by every watched launch: 128 MiB cost 66 ms the first time and 16 ms after; 3DCONV went from 0.33 s to 0.43 s, ATAX +6% | no |
+| sample in the process, undo through the card gate (idea 2) | the first blocks run in the process with every allocation's slot raised, so that each access asks the gate, which saves every 4 KiB page before its first access; the pages are put back if the card takes the launch, else the simulator runs the blocks that are left | the undo is exact (every byte of live memory compared before and after: GEMM, SYR2K). A block that runs through the gate is 14 times (SYR2K) to 26 times (GEMM) slower than a block of the launch: 2 blocks of GEMM cost 29 ms in a program of 0.47 s, and GEMM's 0.13 s launch was estimated at 0.88 s | no |
+| sample in a forked copy, first blocks, one run each | the copy runs blocks 0 to 31, the blocks after the first are the measure | Rodinia gaussian's first blocks do 9 times the work of its average block (estimate 9.3 times the launch) | no |
+| ... blocks spread over the grid | every (blocks / 32)-th block | gaussian 1.5; but each sampled block of PolyBench GEMVER now wrote a fresh 64 KiB chunk and looked 7 times as long as it is: 0.82 s estimated, 0.11 s taken, it would have been sent | no |
+| ... each block run twice, the second run timed | the first run pays what a launch pays once | 68 sampled launches: the 8 the rule would send took 0.9 to 1.6 times the estimate; the highest estimate was 6 times the launch, on a launch of 40 ms | yes |
+| the process's age as the only guard | a sample only when the samples' cost is within 2% of the time the process has run | programs launch 2 to 20 ms after they start (SYRK 13 ms): nothing that matters would be sampled | as the second condition |
+| a static floor of 30 ms as the guard | | the 13 ms and 22 ms HeCBench programs are no longer sampled (they paid 22% and 24%); but see C: Rodinia backprop | with the loop test |
+
+Idea 3 (a better static estimate) was not built: A says why a factor cannot do it, and a trip count read from the code would be a second analysis
+beside a measurement that already answers. Idea 5 (batching) was not touched.
+
+### C. The rule as kept, and what the card changed in it
+
+A launch is sampled when the rules of sp15 and sp43 leave it to the simulator for want of an estimate, its kernel is admitted and has a loop, its
+grid has 256 blocks or more, the driver's start has not begun, and either its static estimate is at least 30 ms (and three times 0.6 ms per MiB
+of live memory) or the process can afford the sample (2% of its age). The copy runs up to 32 blocks spread over the grid, each twice, for 2 ms
+of timed runs; the estimate is per-block time x blocks / host threads; the launch goes when that is over twice the card path with the driver
+start, the copies each way and a card kernel time of 1/8 of the estimate. `VGPU_HOST_GPU_SAMPLE=0|log|always`.
+
+Three things came from the card:
+
+* **A fork costs more than the wait.** The first A/B on the rig (the floor alone, no loop test) had Rodinia `backprop` in exact mode at 0.640 s
+  against 0.615 s (+4.1%, three runs each within 1%) with one launch sampled for 6 ms: the other 19 ms are the page faults of a process whose
+  pages the fork write-protected (36 MiB live). On server3, 12 interleaved runs: 274 ms without the sample, 290 ms with it, and the same when the
+  process waits for the copy to end. The static estimate cannot tell this launch (105 ms estimated, 67 ms taken) from SYR2K's (45 ms estimated,
+  3.4 s taken). What can is whether the code has a loop: `bpnn_adjust_weights_cuda` has none. With the loop test `backprop` is not sampled
+  (0.997x), nor are 2DCONV, GEMVER, JACOBI2D, gaussian and lud; the floor also rises with the live memory.
+* **A copy of a large process answers late.** In the A/B black-scholes (1.9 GiB live) was sampled and not sent: the fork alone took 60 ms on
+  the rig (22 ms on server3), the copy was ended at the 50 ms limit and the launch stayed, for a loss of 0.12 s in 25 s. The limit now grows
+  with the live memory (0.2 ms per MiB: 0.43 s here, a ninth of what the floor asks of such a launch's static estimate). On the rebuilt
+  rig: 25.11 s to 6.07 s, the estimate 12.1 s against 19.7 s in the simulator. Seven programs were run again on that last build, 3 runs a
+  form: SYRK 5.16 to 1.30 s in both modes, SYR2K 9.71 to 2.33 (exact) and 2.37 (turbo), binomial 7.47 to 1.36, shmembench 6.16 to 0.30,
+  `backprop` 0.61 and 0.61 (exact), 0.71 and 0.71 (turbo), `atomicPerf` 1.13 and 1.13, 1.36 and 1.34: as in the A/B. The tables above are the
+  A/B's, except the black-scholes row.
+* **The estimate errs low on the rig as on server3**: SYRK 2.58 s estimated against 4.17 s in the simulator (sp59), SYR2K 4.74 against 7.7,
+  2MM's first kernel 19.9 against 29.1: the launch took 1.5 to 1.6 times the estimate (host threads do not scale perfectly). The card's kernel
+  time, assumed to be 1/8 of the estimate, was 1/290 (SYRK, 9.0 ms), 1/270 (SYR2K, 17.5 ms) and 1/770 (2MM, 26 ms).
+
+What a sample cost on the rig: 6 to 14 ms waited for the launches that were sent (the fork 0.6 to 3.4 ms), 1 to 2 ms each for the kept ones
+of `atomicPerf` (8 in turbo, 9 ms in all, of 1.36 s).
+
+### D. The fork: what was checked
+
+* *Never after the driver's start.* The decision to sample is refused once the start has begun, and asked again at the fork under the lock that
+  guards the start. Every run prints `after_driver=`: 0 in all 170 runs of the A/B whose summary line the harness kept (22 launches sampled, 7
+  sent, 2 copies that did not answer: black-scholes (C) and Rodinia `srad_v2`, whose kernel faults in the copy as it does in the simulator).
+* *No child left.* A copy that has answered is reaped at once if it has ended, else at the next sample or by the mode's exit handler, which
+  waits. `copies_running_at_exit=0` and `copies_left=0` in all 170 runs; after the whole A/B the rig had no zombie and no process of the corpus.
+* *The caches on disk.* Read: the code cache writes a temporary file named by pid and renames it, and the cache of modules appends one 16-byte
+  key in one `write`, so a copy could not have left a broken file. It now writes nothing at all: it queues no compile and remembers no module
+  (`exec::g_sample_copy`), so not even a temporary file is left when it is ended.
+* *A program that reaps children it did not make* can see the copy: `VGPU_HOST_GPU_SAMPLE=0` is for it. Not tested.
+
+### E. Tests and mutants
+
+* `test_host_gpu_logic` (every CI job): 76 cases, 14 of them new: the constants the texts quote; how many blocks and which; how long a copy is
+  given; what a process
+  can afford; the estimate; what repays the card (the bar found by bisection against the formula); that the account of time spent is not used;
+  the memory and the unknown card time; when not to sample (a small grid, a short whole launch, no loop, the floor and how live memory raises
+  it, the process's age); `SimTimeTable`'s peek and extrapolated history; `code_has_loop` on twelve shapes of flow.
+* Mutants (`data/sp60b/mutants.py`: a copy of `include/vgpu/host_gpu.hpp` with one change, outside the tree, the test compiled against it):
+  69 of 69 killed, none by failing to compile. One more was equivalent (a guard that a sample with no estimate does not go, which the floor of any offload already
+  refuses) and the guard was removed instead.
+* `e2e_host_gpu_stub` (CI jobs with nvcc; passed on the rig on each of its three builds, its first runs anywhere): steps 17 to 20. A launch its sample says is long is sent, the
+  stand-in driver refuses it, the simulator runs it and the output is the mode-off output; against a stand-in that keeps memory and computes
+  nothing (`STUB_KEEP_MEMORY=1`, new) the program prints what a program that launches nothing prints; a short launch stays and the driver is never
+  touched; a process a few milliseconds old is not sampled by default, and `VGPU_HOST_GPU_SAMPLE=log` sends nothing. Steps 1 to 16 run with
+  `VGPU_HOST_GPU_SAMPLE=0` and pin what they pinned.
+* `hostgpu_bench_selftest`: the harness's new forms `exact0` and `turbo0` and its reading of the `host_gpu_sampled:` line.
+* Not covered by a test: the fork itself against a real driver (it is never made once the driver's start has begun; the A/B's summary lines
+  count 0 such samples), a copy that hangs on a lock (the 50 ms limit), a program that reaps children it did not make.
+
+### F. Starting the driver early (idea 4): measured, not kept, removed
+
+An experiment switch (`VGPU_HOST_GPU_EARLY_START=1`) started the driver, on its thread, at the first launch of an admitted kernel with a back
+edge on a grid of 8 blocks or more per multiprocessor, whether or not that launch went; every later decision then found the start paid. On the
+26 PolyBench and Rodinia programs under 30 s, 3 runs, against the default of the same build:
+
+| | faster by more than 3% | slower by more than 3% | geometric mean, default over early |
+|---|---|---|---:|
+| exact | JACOBI2D 0.60 to 0.36 s, GEMM 0.86 to 0.68, 3MM 1.85 to 1.48, gaussian 0.95 to 0.75, 2DCONV 0.96 to 0.89, lud | backprop 0.61 to 0.71 s (+16%), GEMVER 0.66 to 0.72 (+10%), particlefilter_float | 1.038x |
+| turbo | backprop 0.76 to 0.45 s, GEMM 0.89 to 0.63, JACOBI2D, 3MM, gaussian, lud | srad_v2 0.06 to 0.49 s, sc_gpu (+6%, within its run-to-run spread) | 0.984x |
+
+It gains where the start cost holds back launches of 0.1 to 0.5 s (what `VGPU_HOST_GPU_START_COST=0` showed in sp59) and loses where the
+launches it then sends do not repay their copies (`backprop` and GEMVER in exact mode push 36 and 64 MiB for a launch the card saves little
+on). It does not clear the bar of no program more than 3% slower, so the switch is removed. `srad_v2` in turbo is another matter: its kernel is
+sent, fails on the card with error 700 (it reads outside its buffers, which the simulator tolerates) and the mode goes off, after the 0.4 s of a
+driver start; by default it is not sent only because it is short.
+
+Whether a process can end while the driver is still starting was not answered: the probe (`card-run.sh exit`: the switch with no wait at exit,
+10 runs each of BICG, GESUMMV and `srad_v2`) never had a start under way at exit (BICG's and GESUMMV's grids are too small to trigger it, and
+`srad_v2` waits for the start it uses). All 90 runs ended with status 0.
+
+### G. Caveats and what was not run
+
+* One rig, one card, one toolkit. 3 runs a form (1 for the programs over 30 s: 2MM, CORR, COVAR, FDTD-2D, LU, and binomial's and
+  atomicReduction's card forms); programs that start the driver vary by 50 ms from run to run, which is 5 to 10% of the short ones.
+* Cut for the rig's hours: PolyBench GRAMSCHM was not run (25 minutes); HeCBench runs were limited to 120 s, so aligned-types, atomicReduction,
+  babelstream, base64e and binomial have no simulator time and atomicReduction and binomial no exact time; no verify pass was made (verify does
+  not sample; the kernels that were sent are the ones sp59 verified, sent earlier).
+* The static floor and the 0.6 ms per MiB are fitted to this corpus. A kernel with a loop, a static estimate over the floor and a launch of
+  tens of milliseconds pays its sample and the faults after it: `atomicPerf` (8 samples in turbo, 1.363 s against 1.350 s), `atomicAggregate` and
+  CORR's `reduce_kernel` are the corpus's cases (1% or less).
+* The estimate was up to 6 times too high on launches of a few tens of milliseconds (server3); none of those came near the bar, but a launch of
+  0.2 s estimated at 0.7 s would be sent and lose the driver start.
+* `has_back_edge` in the first-launch rule of sp15 is always true (A); not changed.
+* Not compiled with g++-12 or the sanitizers, nor against the CUDA 12 headers: the hosted CI jobs are their first run.
+
+## Round sp61 (host-GPU mode: progress inside a block)
+
+Branch `sp61-inblock-progress`, on `hostgpu-relaxed` (pantheonsim #587). Round sp60b could not reach PolyBench COVAR and CORR: their long kernel
+runs on 8 blocks of 256 threads, so no block ends within a sample and a grid under 256 blocks was not sampled at all. This round samples such a
+launch *inside* its blocks: the forked copy runs each block until its warps stand in the kernel's top-level counted loop, reads per lane how far the
+loop's induction register is from the bound its compare reads, and times one turn of the loop on one warp. Design and soundness:
+[12, section 8](../12-host-gpu-turbo.md). Data, scripts and commands: [`data/sp61/`](../data/sp61/README.md). Before the card everything ran on server3
+(no driver); the card part is one A10G (g5.xlarge, 4 vCPU, driver 595.112.07, nvcc 13.0), about 2.5 hours.
+
+### Headline (one A10G; `exactw` and `turbow` are the same build with `VGPU_HOST_GPU_SAMPLE=whole`, the rule of sp60b; medians of 3 runs)
+
+| program | mode | sp60b's rule s | now s | | what happened |
+|---|---|---:|---:|---:|---|
+| PolyBench COVAR | exact | 64.65 | 41.82 | 1.55x | `covar_kernel` sampled inside its 8 blocks (10 ms) and sent: 1.67 s on the card path against 24.5 s in the simulator |
+| | turbo | 64.39 | 41.95 | 1.53x | |
+| PolyBench CORR | exact | 64.84 | 42.01 | 1.54x | `corr_kernel` sampled (14 ms) and sent: 1.67 s against 24.8 s |
+| | turbo | 64.77 | 42.07 | 1.54x | |
+
+* What is left of the 42 s is the programs' CPU reference. Both kernels are admitted in exact mode (the brief expected CORR's to be refused: its
+  module's other kernels are, for `MUFU`, but `corr_kernel` is in the exact set), so the gain is the same in both modes.
+* Outputs: the simulator's in every form of every program (`particlefilter_float` excepted, which does not repeat itself in the simulator).
+* No other program's decisions changed: in the A/B of the nine other programs with a launch that could be sampled inside its blocks, nothing was
+  sent on a sample (one sampled launch of `bh` in turbo mode stayed in the simulator; the others are under the floor), and the 20 other PolyBench and Rodinia programs have no launch that is a candidate inside its blocks (see C for the
+  five that read more than 3 % apart in one run).
+
+### A. What the 8-block kernels look like, and what can be read
+
+`covar_kernel` (sm_86 SASS, `VGPU_HOST_GPU_LOG=2`): a guard, then a top-level loop [0x3a0, 0x780] over `j2` with counter R9 (`IADD3 R9, R9, 0x1`)
+compared with the parameter `m` (`ISETP.GE.AND P1, PT, R9, c[0x0][0x160]`, `@!P1 BRA 0x3a0`); inside it the loop over `i`, unrolled by 4 and counted
+through `IMAD.IADD R16, R10, 0x1, R15` against 0; two small loops for `n <= 0`. `corr_kernel` has the same shape. A thread of `covar_kernel` makes
+`m - j1` turns of the outer loop, so the grid is triangular: block 0's warps have about 2,000 turns left, block 7's about 250. What a pause shows: per
+lane the counter, which stays live through the loop (a pause between the add and the compare is one turn off), and the bound (a parameter); per
+warp its step count. What it does not show: how many steps the turns still to come take, which the copy measures on one warp.
+
+### B. What was built
+
+* The loop finder (`find_probe_loops`, `include/vgpu/host_gpu.hpp`), and the arithmetic of a reading (`include/vgpu/exec/block_progress.hpp`), pure.
+* The copy's run (`Runner::probe_block`, `src/sass/exec.cpp`, used only when `LaunchPart::probe` is set): rounds of 256-instruction turns until every
+  warp is in a followed loop (1 ms at most), the reading, and in the first block the warp with the most turns left alone for 4 ms; 12 ms in all.
+* The rule: a grid under 256 blocks with a followed loop is sampled inside its blocks; the floor is asked of the static count times the loop's bound
+  as the launch's arguments give it (`covar_kernel`: 87 us counted, which no floor admits; bounded by `m` = 2048, 0.18 s). The estimate goes by
+  `sampled_offload`, the rule of sampled launches. `VGPU_HOST_GPU_SAMPLE=whole` keeps sp60b's rule; the harness has forms `exactw` and `turbow`.
+* A bug found before the card: the decision first pointed at a stack copy of the kernel's verdict (its loops read as garbage in the copy: every
+  warp "in no loop"); it now points into the table of verdicts.
+
+### C. Before the card, and on it
+
+Offline (server3, `VGPU_HOST_GPU_SAMPLE=log`, every candidate sampled, nothing sent; `data/sp61/offline-*.md`): the launches that are candidates inside
+their blocks are COVAR's and CORR's long kernels, ATAX (2), BICG (2), GEMVER (2), GESUMMV, MVT (2), Rodinia `sc_gpu` and HeCBench `aop` and `bh` (4).
+Estimate over what the simulator took: COVAR 1.02 to 1.15, CORR 1.30 to 1.62; the others 0.67 to 1.78 on launches of 0.03 to 0.22 s, and 8 to 14
+on four launches of about 1 ms. Only COVAR and CORR pass the floor. The launches the whole-block sample would send are sp60b's (SYRK, SYR2K, binomial,
+black-scholes, shmembench).
+
+On the rig the estimate was 18.4 s for `covar_kernel` (24.5 s taken: 0.75; the engine's step is 79 ns there against 41 ns on server3, and the measured
+warp's turn cost does not see four threads sharing the caches) and 29.8 to 31.1 s for `corr_kernel` (24.8 s: 1.2 to 1.25; on the rig a first block
+took the whole 12 ms, so only block 0, the heaviest of the triangle, was read). Both are far above the bar (twice a card path of 0.25 s plus the
+copies and an assumed card time of 1/8 of the estimate); the card took 1.656 s for the kernel, 1.671 s with 32 MiB pushed.
+
+The A/B against sp60b's rule (`data/sp61/ab-*.md`): the nine other candidates, 3 runs: none more than 3 % slower, nothing sent on a sample. The rest of PolyBench and Rodinia, one run a form: five read more than 3 % apart in one run none of them with a candidate inside its blocks
+(3MM turbo +5.6 %, gaussian exact +6.0 %, srad_v2 exact +3.6 %, particlefilter_float turbo +3.0 %, bfs exact +4.4 %); ten more runs of each
+(`data/sp61/repeat.md`): exact over exactw 3MM 1.81 s against 1.86, gaussian 0.92 and 0.92, srad_v2 0.06 and 0.06, particlefilter_float 2.96
+against 3.31, bfs 0.01 and 0.01; turbo over turbow 1.80 against 1.84, 0.92 and 0.92, 0.06 and 0.06, 3.07 against 2.99 (2.7 %, a program whose
+simulator runs do not repeat), 0.01 and 0.01. None is more than 3 % slower; the single runs were noise. After everything the rig had no zombie and no
+process of the corpus.
+
+### D. Tests and mutants
+
+* `test_host_gpu_logic`: 89 cases, 13 of them new (turns left, turns between two pauses, the measure, which blocks, the launch, the floor with the
+  bound, the loop finder on about 25 code shapes). Passed on server3 and on the rig.
+* Mutants (`data/sp61/mutants.py`, one header copied outside the tree per mutant): 79 in a first pass, 69 killed. Of the ten survivors, two were
+  redundant code (removed), four were covered by new checks and then killed, four are equivalent (argued in `data/sp61/mutants-pass1.txt`). The
+  final list: 77, 73 killed, 4 equivalent.
+* `e2e_host_gpu_stub` steps 21 to 23 (a kernel on 8 blocks with a long loop is sampled inside its blocks and sent; on a stand-in card that computes
+  nothing the program reads the memory as it was; a short one stays and the driver is never touched). The first run on the rig failed at step 22:
+  nvcc unrolls the test kernel's loop by four and counts the unrolled part through a register added to the counter, which is not followed, so the
+  launch had no estimate. The test kernel now has its loop under `#pragma unroll 1`; all three tests of the card stage pass.
+* The stand-in driver on server3: COVAR, CORR and SYRK are sent and refused with the simulator's output, and sent to a card that computes nothing
+  with the output changed (`data/sp61/stub.txt`).
+
+### E. Caveats and what was not run
+
+* One rig, one card, one toolkit; 3 runs a form for the candidates, one for the rest of PolyBench and Rodinia; GRAMSCHM, 2MM, LU and FDTD-2D and
+  HeCBench outside the candidates were not run on the card (their launches are on grids the whole-block sample takes, so their decisions are sp60b's).
+* The estimate's error is in the cost of a turn: one warp's turns stand for every warp's. A loop whose later turns cost more than its first ones is
+  estimated low, one whose later turns cost less, high; and a block that takes the whole budget leaves one block read (CORR on the rig).
+* A loop counted the way nvcc counts an unrolled loop (`IADD3 R7, R8, UR4` against 0) is not followed (A, D); COVAR's and CORR's outer loops are not
+  unrolled, their inner ones are, and only the outer ones are needed.
+* The floor's bound assumes the loop starts at 0; it decides whether a sample is paid for, not whether a launch goes.
+* Not compiled with g++-12, the sanitizers or the CUDA 12 headers: the hosted CI jobs are their first run.
+
 ## Round sp62 (exact parallel launches, kernels that update in place, again: round sp58's line record under ThreadSanitizer and a race test that holds its windows open, a page whose lines keep being written out sent to words, pairs of words back; sound, same bits, LU and backprop 13 to 24 % faster, gaussian, SYRK, lavaMD, bh and perplexity 3 to 6 % slower, not kept; branch `sp62-exact-lines`, base `speed-round-sp46-sp51` 651b41f5)
 
 Question: round sp58's line record (a 64-byte line held as one 64-bit record while one block alone holds it, its commit ce540d04) gained on LU and backprop and lost on gaussian, and its evidence had two holes: ThreadSanitizer was never run, and two mutants that are not equivalent survived because the race test could not hold a thread inside a window of the record. Close the holes first, then find where gaussian (and SYRK, perplexity) lose, fix it, and keep the line only if it meets the bar: sound, the same bits in every run, at least 5 % on at least three programs, no program of at least 0.2 s more than 3 % slower at any thread count.
@@ -2613,3 +3191,108 @@ What the data says about the rest: the loss is not where round sp58 put it. With
 * As before: the SASS engine only; the race test covers the record's windows, not the page states'.
 
 
+## Round sp63: the JIT's cold run: the wait before the lookup, history, the cache cap, the notices (branch `sp63-jit-cold`)
+
+Question: round sp57 left five things between `VGPU_JIT=1` and a default-on JIT besides the product decision and linking's CI: the hook loop before the cache lookup, 1 to 2 ms of per-process setup, the cold run of 3 to 10 s programs (the compile late, or cancelled at exit so that a program shorter than its compile is never warm), a cache with no cap keyed by the build's date, and the notice on standard error. Remove what the data allows, keeping a fix only if the default path is unchanged, the bits are the same in every run, and no program of 0.2 s or more becomes more than 3 % slower. The default is not flipped in this round.
+
+**Answer: four of the five are gone, one is smaller.** Over the 51 programs measured at one thread, `VGPU_JIT=1` cold goes from 0.981 (base build, this round's run) to 0.990, warm is 1.007, a second run 1.005; programs more than 2 % slower cold go from 23 to 10, and of those of 0.2 s or more the only ones left are the compile-bound ones (asyncAllocation, SYRK, gaussian). "Per-process setup" turned out to be the same thing as the first blocker: it is the hook loop on the way to the lookup, not setup, and goes with it. At the default thread count (18 programs) cold goes from 0.912 to 0.960, but a second run is no better than a cold one there: no compile finishes before such a program ends (below). What stays: the first cold run of a program of 3 to 10 s (asyncAllocation 0.89, SYRK 0.92, gaussian 0.93; their second run is 1.00, 1.15 and 0.93 to warm, their third warm), and 2 to 3 % on a few programs of 0.2 to 0.4 s with sections that do reach the lookup (s3d 0.973, sortKV 0.977).
+
+Host: server3 (Ryzen 7 PRO 8840U, 8 cores / 16 threads, g++ 13.3), shared with two other sessions under `flock /tmp/pantheonsim-builder.lock` (3,140 s of the first pass were spent waiting for it). Builds Release, `-g1`, `VGPU_LTO=OFF`, `VGPU_JIT_MUTANTS=ON`, `nice -n 19`, `-j3`. Base: `origin/main` 4e2c1c18 (the merge of #590). Programs: round sp57's corpus (`tools/bench/real` sizes, `VGPU_GPU=nvidia/rtx3060`), without the eight programs over 120 s, fpdc, CORR, COVAR and FDTD-2D, and with LU, atomicCost and black-scholes left out for their length (over 15 s): 51 programs. Data and scripts: `docs/perf-design/data/sp63/`.
+
+### Protocol
+
+`scripts/sp63.py` (round sp57's driver with two builds). Sides, interleaved (a round in order, the next reversed), every run writing `VGPU_COUNTERS_FILE` and `VGPU_MEMO_FINAL_HASH`: **Ba**, **Na** the base and the changed build with nothing set; **Bbc**, **Nbc** `VGPU_JIT=1` cold (the side's cache emptied before every run); **Nbw** warm (filled by one untimed run with `VGPU_JIT_SYNC=1`); **Nbs** the second run (before every timed run the cache is emptied and the program run once, untimed, with the defaults: what a user's second run sees). Medians of 5, of 3 for programs over one second. One thread: `VGPU_THREADS=1`, `taskset -c 12-15` (four CPUs: the compiler has cores of its own, as on a user's machine). Each build's speed-ups are against its own default; "default B/N" is the base build's default over the changed one's (the default path, an A/A check: no file of the run loop changed). The first pass ran on an intermediate build that also started the compiler with `vfork` (below: not kept); the programs whose numbers that could touch (the ones that start a compiler) were run again on the final build, five runs each (`t1-recheck`).
+
+### 1. The hook loop before the lookup (blockers 1 and 2)
+
+Measured first (`setup-probe.txt`, 15 runs a side, one thread, a cache that already holds the compiler's identity): on the base build `VGPU_JIT=1` costs ADI 9.7 ms, asmooth 9.5, sortKV 15.3, s3d 18.5, atan2 1.6, adam 1.9; with `VGPU_JIT_MIN_REGION=4096` (the same process with no section given a unit: the manager, the region discovery, everything but the hook loop) it costs 0.0 to 0.4 ms (s3d 1.5). So the "setup" of round sp57's short programs is not setup: it is what a kept section pays in the hook loop between the share rule's sample and the lookup, which a short program spends its whole life in. A `strace` of ADI shows no fork, no file access but the telemetry file's on the default side, and only the cache directory's `cid` file and the worker thread with `VGPU_JIT=1`.
+
+Built (`Unit::sample`, `Unit::wait_then`, `Unit::wait_over`, `kPrewaitMin`): when the share rule keeps a section that is at least 4,096 instructions from its lookup, the section waits for the lookup on the plain loop, as round sp57's sections wait for their threshold (`State::Waiting`, all of its instructions counted by `wait_note`, a thread bringing a 64th of the wait to the shared count at a time), and when the wait is over it is Idle again (`wait_then`), so that the next check of its total asks the cache. The wait counts towards the lookup and the threshold (`credit` is added to, and the miss's distance to the threshold includes it). The lookup comes up to 2.5 times earlier, since all instructions count; a section whose lookup misses then waits for its threshold as before. `VGPU_JIT_PROFILE=0` turns both waits off.
+
+The same probe on the changed build: ADI 1.2 ms, asmooth 1.3, sortKV 4.9, s3d 8.0, atan2 0.2, adam 0.2, backprop 0.6, blockAccess 0.3. In the A/B (`t1.md`): ADI 0.933 to 1.004 cold, asmooth 0.952 to 1.000, sortKV 0.926 to 0.977, atan2 0.930 to 1.005, adam 0.931 to 0.988, backprop-cuda 0.907 to 0.973, blockAccess 0.935 to 0.986, pathfinder 0.962 to 0.983, JACOBI2D 0.971 to 0.993; the 45 programs that compile nothing 0.983 to 0.992 cold. What is left on s3d and sortKV is the sample itself (50,000 instructions in the hook loop, and one call of the hook loop runs up to 14,000 of a chained kernel's instructions, so a sample overshoots) and the lookup; not looked at further.
+
+### 2. The cold run of 3 to 10 s programs (blocker 3)
+
+Built: the selection of a section is recorded (its `.sel` file) before its compile, not after (`Engine::obtain_selected`); a compile that is cancelled because the process ends gives no notice (`Result::cancelled`); and a lookup that finds a selection without its object (`Result::pending`) compiles that selection at once (`Manager::run`, `stats().history`) instead of counting to the threshold. `VGPU_JIT_HISTORY=0` turns the last off. A failed compile also leaves its selection, so its next run tries again at the lookup instead of at the threshold, as it would have later.
+
+| program (one thread, 5 runs, final build) | default s | base cold | cold | warm | second run | objects after the cold runs / the second runs |
+|---|---:|---:|---:|---:|---:|---|
+| asyncAllocation | 3.263 | 0.934 | 0.911 | 1.240 | 0.996 | 0 of 5 / 5 of 5 |
+| SYRK | 5.402 | 0.924 | 0.924 | 1.127 | 1.149 | 5 / 5 |
+| gaussian | 3.693 | 0.946 | 0.934 | 1.081 | 0.934 | 2 / 5 |
+| JACOBI1D (first pass: 0.903 cold, 0.870 warm, 3 runs) | 1.059 | 0.978 | 0.989 | 0.991 | 0.988 | 0 |
+
+* **asyncAllocation is warm from its third run** (before: never). Its first run still loses 9 to 11 % (the 2.1 to 2.4 s compile starts at the threshold and is cancelled at exit: no object after any cold run, on either build); the second compiles at its lookup and finishes before the end (0.996 of the default, and an object after every one), the third is warm (1.24 to 1.33).
+* SYRK's and the other compiling programs' first runs are unchanged (SYRK 0.924 on both builds: the compile of 2.3 s is asked for at the threshold): the history only helps a compile that did not finish. Finishing a nearly done compile at exit was not built: the time a compile has left is not known (a cancelled one has no time on record), and keeping a user's process alive for it, or leaving a compiler behind it, is what a default must not do.
+* gaussian's compile ends near the program's end: two of five cold runs left their object; where the first run did not, the second compiled at its lookup and was not warm before its end either (0.934), the third is warm.
+* JACOBI1D's 0.870 warm and 0.903 cold in the first pass (three runs, a machine whose other sessions were building) are 0.991 and 0.989 in five runs on the final build: noise, not the change.
+
+### 3. The cache: its directory, a cap, old builds' directories (blocker 4)
+
+Built (`cache_tag`, `Engine::trim`): the default directory is `.../pantheonsim/jit/<12 hex digits>` of a hash of the GNU build id of the library the JIT is in (read from the loaded image, no I/O; the build's date and time without one, as before), so a rebuild that is the same file shares its directory. libcuda and libcudart both contain the JIT, so a driver-API and a runtime program have a directory each. After each install the cache is trimmed: in the default directory's parent, every directory of 12 hex digits owned by the user is in scope (nothing else is touched; an explicit `VGPU_JIT_CACHE` is trimmed by itself, its siblings are not the cache's); another build's directory none of whose files changed in 14 days is removed; over `VGPU_JIT_CACHE_MAX_MB` (default 256; `0`: no cap) objects are removed least recently used first (a load renews an object's time) down to 90 % of the cap, never the object just made nor the runtime headers of the directory in use; another build's directory left without an object and an hour old is removed. The 33 directories server3 held at the end of round sp57 would go at the first compile after 14 days. Sizes for scale (round sp57): 236 KiB for hotspot's object with the headers, 2.0 MB for the whole corpus's objects.
+
+### 4. The notices (blocker 5)
+
+Built (`Manager::notice`, `auto_mode`): a notice of a kind is given once a process (as before) and at most once a day from one cache directory (a `notice-<kind>` stamp there; where the directory cannot be used, every process gives it). `VGPU_JIT=auto` runs the JIT as `1` does without the notices that only say it cannot run here (no compiler, a cache that cannot be used); a later round that turns the JIT on by default can make the default `auto`. A compile cancelled at exit says nothing (it was the "compile was cancelled" line of round sp57's failure modes).
+
+### 5. Tried and not kept: `vfork` for the compiler
+
+The compiler and its two identity queries were started with `fork`; the comment of round sp53 put the cost at about 7 ms of kernel time in a simulator with a large address space. Built with `vfork` (every signal blocked across it, the child resetting caught signals) and measured (`spawn-fork-vfork.txt`, `strace -T` of a cold hotspot run, three runs a build): `fork` returned in 0.20 to 0.30 ms, `vfork` (which returns only when the child has exec'd) in 1.3 to 1.7 ms, on the JIT's worker thread in both. No gain to show at this program's size, so it was reverted; it may matter for a program with gigabytes mapped, which was not measured.
+
+### Same bits and the default path
+
+Every run of every side (fills and the untimed first runs of the second-run side too) against the default's first run: 49 of 51 programs equal in every run; particlefilter_float differs from itself on the default (as in every round), pathfinder's fill run differs in its output's hash only (the statistics line in the middle of the program's output through one pipe, round sp57's driver artefact). The recheck: 5 of 5 programs equal. The default path (no file of the run loop or the tier changed: `jit.cpp`, `jit.hpp` and tests only): base over changed default, geometric mean 1.000 over 51 programs (3MM 0.924 and GEMVER 0.955 are single slow runs of the changed build's default under the other sessions' builds; bfs 9 ms).
+
+### The table (one thread, 51 programs, `t1.md`; base and changed build in the same pass)
+
+| programs | n | default B/N | base JIT cold | JIT cold | JIT warm | JIT second run |
+|---|---:|---:|---:|---:|---:|---:|
+| PolyBench/GPU | 14 | 0.992 | 0.981 | 1.000 | 1.014 | 1.023 |
+| Rodinia | 12 | 1.008 | 0.992 | 0.990 | 1.000 | 0.999 |
+| HeCBench | 25 | 1.000 | 0.977 | 0.984 | 1.007 | 0.998 |
+| all | 51 | 1.000 | 0.981 | 0.990 | 1.007 | 1.005 |
+| with objects (SYRK, SYR2K, gaussian, asyncAllocation, atomicAggregate, zerocopy) | 6 | 1.009 | 0.969 | 0.974 | 1.131 | 1.089 |
+| without | 45 | 0.998 | 0.983 | 0.992 | 0.992 | 0.994 |
+| 0.2 s and longer | 39 | 1.001 | 0.985 | 0.992 | 1.015 | 1.011 |
+| more than 2 % slower | | 5 | 23 | 10 | 9 | 9 |
+
+The 10 cold: asyncAllocation, bgmv (12 ms, one ms), JACOBI1D (noise, above), SYRK, gaussian, s3d, backprop-cuda (11 ms), sortKV, nn (14 ms), bfs (9 ms). Round sp57's numbers (0.954 cold, 0.985 warm over 57, then 0.985 and 1.010 over 54 after its fix) are on another build and partly other programs; this round's base column is the comparison.
+
+### The default thread count (16 threads, round sp57's 18 programs, three runs a side, final build; `td.md`)
+
+| programs | n | default B/N | base JIT cold | JIT cold | JIT warm | JIT second run |
+|---|---:|---:|---:|---:|---:|---:|
+| all | 18 | 0.975 | 0.912 | 0.960 | 1.047 | 0.967 |
+| with objects (SYRK, SYR2K, gaussian, asyncAllocation, atomicAggregate) | 5 | 0.988 | 0.877 | 0.912 | 1.144 | 0.892 |
+| without | 13 | 0.969 | 0.926 | 0.979 | 1.012 | 0.998 |
+| more than 2 % slower | | 6 | 16 | 10 | 1 | 8 |
+
+* The machine was noisy: the A/A column is 0.975 (GEMVER 0.827, 2DCONV 0.910, backprop 0.916 are single slow default runs while the other sessions built; three runs a side). Read the columns against each other, not to the third digit.
+* **The wait before the lookup is the larger part of the gain at sixteen threads** (the programs without objects 0.926 to 0.979 cold; asmooth 0.855 to 0.903, ADI 0.926 to 1.012, GEMVER 0.851 to 0.993, 2DCONV 0.883 to 0.995, backprop 0.875 to 0.943, bh 0.941 to 0.971, bitonic-sort 0.946 to 0.969). JACOBI2D (0.925, 0.169 s) is the one that stays below.
+* **The history does not help at sixteen threads, and the second run is not warm.** These programs run 0.9 to 3.4 s there, the compiler (niced by 10) shares the cores with sixteen simulator threads, and no cold run and no second run left an object: the compile at the second run's lookup was cancelled at its exit as the first run's was. So the second run is a cold run with the compiler started earlier, and costs about what the base build's cold run costs (gaussian 0.823 against the base build's 0.796, asyncAllocation 0.832 against 0.842, SYRK 0.910 against 0.927, atomicAggregate 0.930 against 0.936), 1 to 6 % less than this build's own cold run, where the compile starts later. Every run repeats it: at this thread count only a run of the warm side's kind (a compile allowed to finish) makes these programs warm. What would: letting a compile that has a selection on record finish at exit within a bound, or compiling it from a process of its own; not built.
+
+### Tests and mutants
+
+`tests/unit/test_jit_cold.cpp` (ctest `test_jit_cold`): the wait before the lookup driven as the run loop drives it (kept, waiting, the batch, a stray hook-loop count, the wait's end to the instruction, Idle again, the lookup at the next check with the waited instructions, the miss's wait for the threshold with both counted), the cases without it (near the lookup, declined), a selection whose compile was cut off (a time limit of nothing) found as pending and compiled at the next lookup, the default directory's name against the test executable's own build id, the cap and the age rule on a made-up cache (three other builds' directories and one that is not the cache's), a hit renewing an object's time, and in child processes of the test itself the notices (once a day, again after two days, none with `auto`) and a compile cancelled at exit (a fake compiler that sleeps: no notice, its selection left, no object). ctest `test_sass_chain_cont_jit_prewait`: the run-loop test's kernels with the share rule on, compared with the interpreter word for word and counter for counter, and the counts that say three sections waited for the lookup, then for the threshold, and were compiled. `test_jit_share` now expects the wait after a kept sample. Mutants (`mutants.log`): `prewait_never`, `prewait_stuck`, `prewait_to_counting`, `wait_no_credit`, `history_never`, `history_after`, `trim_no_age`, `trim_no_cap`, `trim_no_touch`, `cachedir_date`, `notice_every_run`, `auto_loud`, `cancel_notice` each fail `test_jit_cold`; `wait_stuck` fails round sp57's `test_jit_wait`; the pristine build passes both. The 25 ctest legs of the JIT's unit tests and the run-loop tests passed (`tests.log`; two failed in the first run, both test expectations: fixed and run again). The `e2e_sass_jit` shards need nvcc and are CI-only: not run.
+
+### What is left before the JIT could be default-on
+
+| blocker | state |
+|---|---|
+| The hook loop before the lookup, and the "per-process setup" of short programs | **fixed** (the same cost): 0 to 1 % on programs under 0.3 s, 2 to 3 % left on s3d and sortKV (the sample and the lookup) |
+| The first cold run of a 3 to 10 s program (the compile at the threshold arrives late or is cancelled) | **smaller**: a cancelled compile starts at the next run's lookup (asyncAllocation warm from its third run, 0.996 in its second); the very first run is unchanged (asyncAllocation 0.91, SYRK 0.92, gaussian 0.93) |
+| No cache cap, the directory keyed by the build's date | **fixed**: build id, 256 MB cap, LRU, 14-day rule for other builds |
+| The notice when there is no compiler or the cache cannot be used | **fixed** for a default: `VGPU_JIT=auto` is silent, `1` says it once a day |
+| A default forks a C++ compiler out of every long user process (SIGCHLD, programs that manage their own children) | open: the product decision of round sp57; not looked at |
+| Linking and fused runs have not run the `e2e_sass_jit` shards | open (CI) |
+| A JIT on by default makes every SASS ctest leg a JIT leg | open: the legs would need `VGPU_JIT=0` or a private cache |
+| The default thread count: compiles never finish in a 1 to 3 s program at sixteen threads, so its later runs are never warm (the history starts each one earlier and it is cancelled again) | open: finish a recorded compile at exit within a bound, or in a process of its own |
+
+### What was not verified
+
+* LU, atomicCost, black-scholes, CORR, COVAR, FDTD-2D and the eight programs over 120 s: not run (time). The second-run side does not show what a run after a compile that failed for another reason does.
+* g++-12, clang, a sanitizer build, a build without the mutation hooks: not built. The `e2e_sass_jit` shards: not run (no nvcc on server3).
+* The trim on a real cache full of objects (it ran on the test's made-up files and after every install of these runs, which never came near the cap), a `noexec` mount, a full disk; two builds trimming one another's directories at once.
+* `VGPU_JIT_LINK=1` and `VGPU_JIT_FUSE=1` on the changed build.
+* The first pass's changed build also had `vfork`; its numbers for programs that start a compiler were re-measured on the final build (the recheck table), the others start none.
+* Rule deviations: the first ctest run held the machine lock for eleven minutes in one piece; the default-thread pass is three runs a side on 18 programs.

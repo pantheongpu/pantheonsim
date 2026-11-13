@@ -1,8 +1,12 @@
 // Tier 2 of the SASS executor, milestone 1: see jit.hpp.
+#include "vgpu/exec/launch.hpp"
 #include "jit.hpp"
 
+#include <dirent.h>
 #include <dlfcn.h>
+#include <elf.h>
 #include <fcntl.h>
+#include <link.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/file.h>
@@ -268,6 +272,7 @@ Config Config::from_env() {
   if (const std::string r = env("VGPU_JIT_FUSE"); !r.empty() && r != "0") c.fuse = true;
   if (const std::string t = env("VGPU_JIT_TIMEOUT"); !t.empty()) c.timeout_s = static_cast<unsigned>(std::strtoul(t.c_str(), nullptr, 10));
   if (const std::string m = env("VGPU_JIT_MEM_MB"); !m.empty()) c.mem_mb = static_cast<unsigned>(std::strtoul(m.c_str(), nullptr, 10));
+  if (const std::string m = env("VGPU_JIT_CACHE_MAX_MB"); !m.empty()) c.max_bytes = static_cast<uint64_t>(std::strtoull(m.c_str(), nullptr, 10)) << 20;
   return c;
 }
 
@@ -976,6 +981,61 @@ std::string Engine::compiler_id(std::string* why) {
   return p_->cxx_id;
 }
 
+namespace {
+// The GNU build id of the object this code is in, as hex ("" without one): the linker's hash of the whole file, read from the loaded image (no i/o).
+struct IdSearch {
+  uintptr_t where;
+  std::string id;
+};
+int find_build_id(struct dl_phdr_info* info, size_t, void* data) {
+  IdSearch& s = *static_cast<IdSearch*>(data);
+  bool inside = false;
+  for (int i = 0; i < info->dlpi_phnum; ++i) {
+    const ElfW(Phdr)& p = info->dlpi_phdr[i];
+    const uintptr_t lo = info->dlpi_addr + p.p_vaddr;
+    if (p.p_type == PT_LOAD && s.where >= lo && s.where < lo + p.p_memsz) inside = true;
+  }
+  if (!inside) return 0;
+  for (int i = 0; i < info->dlpi_phnum; ++i) {
+    const ElfW(Phdr)& p = info->dlpi_phdr[i];
+    if (p.p_type != PT_NOTE) continue;
+    const unsigned char* at = reinterpret_cast<const unsigned char*>(info->dlpi_addr + p.p_vaddr);
+    const unsigned char* end = at + p.p_memsz;
+    while (static_cast<size_t>(end - at) >= sizeof(ElfW(Nhdr))) {
+      ElfW(Nhdr) n;
+      std::memcpy(&n, at, sizeof n);
+      const size_t name = (n.n_namesz + 3u) & ~3u, desc = (n.n_descsz + 3u) & ~3u;
+      if (static_cast<size_t>(end - at) < sizeof n + name + desc) break;
+      if (n.n_type == NT_GNU_BUILD_ID && n.n_namesz == 4 && std::memcmp(at + sizeof n, "GNU", 4) == 0 && n.n_descsz > 0) {
+        static const char hex[] = "0123456789abcdef";
+        const unsigned char* d = at + sizeof n + name;
+        for (uint32_t k = 0; k < n.n_descsz && k < 32; ++k) {
+          s.id += hex[d[k] >> 4];
+          s.id += hex[d[k] & 15];
+        }
+        return 1;
+      }
+      at += sizeof n + name + desc;
+    }
+  }
+  return 1;
+}
+}  // namespace
+
+// What names the default cache directory (round sp63): the GNU build id of the library this code is in, so that a rebuild of the same sources that
+// is the same file shares its directory and a different file has one of its own (until then the build's date and time, which made every build a
+// directory of its own, never removed: server3 had 33). Without a build id the date and time, as before. libcuda and libcudart both contain the JIT
+// (a runtime program runs libcudart's), so each has its directory.
+static const std::string& cache_tag() {
+  static const std::string tag = [] {
+    IdSearch s{reinterpret_cast<uintptr_t>(&find_build_id), {}};
+    dl_iterate_phdr(find_build_id, &s);
+    const std::string id = mutant("cachedir_date") || s.id.empty() ? std::string("date " __DATE__ " " __TIME__) : "build-id " + s.id;
+    return hash_text(id + " abi" + std::to_string(kAbiVersion)).substr(0, 12);
+  }();
+  return tag;
+}
+
 std::string Engine::cache_path() const {
   if (!cfg_.cache_dir.empty()) return cfg_.cache_dir;
   std::string root;
@@ -983,7 +1043,144 @@ std::string Engine::cache_path() const {
   if (const char* x = std::getenv("XDG_CACHE_HOME"); x && *x) root = x;
   else if (const char* h = std::getenv("HOME"); h && *h) root = std::string(h) + "/.cache";
   else root = "/tmp";
-  return root + "/pantheonsim/jit/" + hash_text(std::string(__DATE__ " " __TIME__ " abi") + std::to_string(kAbiVersion)).substr(0, 12);
+  return root + "/pantheonsim/jit/" + cache_tag();
+}
+
+namespace {
+bool hex_name(const char* n, size_t len) {
+  if (std::strlen(n) != len) return false;
+  for (size_t i = 0; i < len; ++i)
+    if (!((n[i] >= '0' && n[i] <= '9') || (n[i] >= 'a' && n[i] <= 'f'))) return false;
+  return true;
+}
+// Removes a directory of the cache and what is in it (two levels: the objects and the runtime headers' directory), never following a link.
+void remove_tree(const std::string& d, int depth = 0) {
+  if (DIR* dir = ::opendir(d.c_str())) {
+    while (const dirent* e = ::readdir(dir)) {
+      if (!std::strcmp(e->d_name, ".") || !std::strcmp(e->d_name, "..")) continue;
+      const std::string p = d + "/" + e->d_name;
+      struct stat st;
+      if (::lstat(p.c_str(), &st) != 0) continue;
+      if (S_ISDIR(st.st_mode)) {
+        if (depth < 2) remove_tree(p, depth + 1);
+      } else {
+        ::unlink(p.c_str());
+      }
+    }
+    ::closedir(dir);
+  }
+  ::rmdir(d.c_str());
+}
+}  // namespace
+
+// The cache's size cap and age rule (round sp63; Config::max_bytes, Config::stale_days). Run after an object is installed, so a run that compiles
+// nothing never pays for it. In scope: the cache directory, and with the default directory its siblings under .../pantheonsim/jit (other builds'
+// directories, named by 12 hex digits; nothing else there is touched). A sibling none of whose files changed in stale_days days is removed. Over the cap,
+// the objects least recently used (an object's time is renewed when it is loaded) are removed until the cache is at 90 % of it, never `keep` (the
+// object just made) and never the runtime headers of the directory in use; a sibling left with no object and an hour old is removed with what it holds.
+// A process of another build that is using a removed object has it mapped already, and one that looks it up again compiles it again.
+void Engine::trim(const std::string& keep) {
+  const std::string cur = cache_path();
+  const bool siblings = cfg_.trim_siblings || (cfg_.cache_dir.empty() && !(std::getenv("VGPU_JIT_CACHE") && *std::getenv("VGPU_JIT_CACHE")));
+  std::vector<std::string> dirs{cur};
+  const size_t slash = cur.rfind('/');
+  if (siblings && slash != std::string::npos && slash > 0) {
+    const std::string parent = cur.substr(0, slash);
+    if (DIR* dir = ::opendir(parent.c_str())) {
+      while (const dirent* e = ::readdir(dir)) {
+        const std::string p = parent + "/" + e->d_name;
+        struct stat st;
+        if (hex_name(e->d_name, 12) && p != cur && ::lstat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == ::geteuid()) dirs.push_back(p);
+      }
+      ::closedir(dir);
+    }
+  }
+  const time_t now = ::time(nullptr);
+  struct Obj {
+    size_t dir;
+    std::string key;
+    time_t mtime;
+    uint64_t bytes;
+  };
+  std::vector<Obj> objs;
+  std::vector<time_t> newest(dirs.size(), 0);
+  std::vector<bool> gone(dirs.size(), false);
+  uint64_t total = 0;
+  for (size_t di = 0; di < dirs.size(); ++di) {
+    uint64_t bytes = 0;
+    std::map<std::string, size_t> at;   // key -> its element of objs
+    std::map<std::string, uint64_t> side;   // key -> the bytes of its other files (.sum)
+    DIR* dir = ::opendir(dirs[di].c_str());
+    if (!dir) continue;
+    while (const dirent* e = ::readdir(dir)) {
+      if (e->d_name[0] == '.') continue;
+      const std::string p = dirs[di] + "/" + e->d_name;
+      struct stat st;
+      if (::lstat(p.c_str(), &st) != 0) continue;
+      newest[di] = std::max(newest[di], st.st_mtime);
+      if (S_ISDIR(st.st_mode)) {   // (the runtime headers)
+        if (DIR* sub = ::opendir(p.c_str())) {
+          while (const dirent* f = ::readdir(sub)) {
+            struct stat fs;
+            if (f->d_name[0] != '.' && ::lstat((p + "/" + f->d_name).c_str(), &fs) == 0) {
+              bytes += static_cast<uint64_t>(fs.st_size);
+              newest[di] = std::max(newest[di], fs.st_mtime);
+            }
+          }
+          ::closedir(sub);
+        }
+        continue;
+      }
+      bytes += static_cast<uint64_t>(st.st_size);
+      const std::string n = e->d_name;
+      if (n.size() == 35 && hex_name(n.substr(0, 32).c_str(), 32) && n.compare(32, 3, ".so") == 0) {
+        at[n.substr(0, 32)] = objs.size();
+        objs.push_back({di, n.substr(0, 32), st.st_mtime, static_cast<uint64_t>(st.st_size)});
+      } else if (n.size() == 36 && hex_name(n.substr(0, 32).c_str(), 32) && n.compare(32, 4, ".sum") == 0) {
+        side[n.substr(0, 32)] += static_cast<uint64_t>(st.st_size);
+      }
+    }
+    ::closedir(dir);
+    for (const auto& [k, b] : side)
+      if (auto it = at.find(k); it != at.end()) objs[it->second].bytes += b;
+    if (di != 0 && cfg_.stale_days && newest[di] + static_cast<time_t>(cfg_.stale_days) * 86400 < now && !mutant("trim_no_age")) {
+      remove_tree(dirs[di]);
+      gone[di] = true;
+      stats().evicted.fetch_add(1);
+      continue;
+    }
+    total += bytes;
+  }
+  if (cfg_.max_bytes && total > cfg_.max_bytes && !mutant("trim_no_cap")) {
+    std::stable_sort(objs.begin(), objs.end(), [](const Obj& a, const Obj& b) { return a.mtime < b.mtime; });
+    const uint64_t goal = cfg_.max_bytes / 10 * 9;
+    for (const Obj& o : objs) {
+      if (total <= goal) break;
+      if (gone[o.dir] || (o.dir == 0 && o.key == keep)) continue;
+      const std::string stem = dirs[o.dir] + "/" + o.key;
+      ::unlink((stem + ".sum").c_str());   // (the checksum first: an object without one is a miss)
+      if (::unlink((stem + ".so").c_str()) == 0) {
+        total -= std::min(total, o.bytes);
+        stats().evicted.fetch_add(1);
+      }
+      if (o.dir != 0) ::unlink((stem + ".lock").c_str());
+    }
+  }
+  for (size_t di = 1; di < dirs.size(); ++di) {   // a sibling with no object left
+    if (gone[di] || newest[di] + 3600 >= now) continue;
+    bool any = false;
+    if (DIR* dir = ::opendir(dirs[di].c_str())) {
+      while (const dirent* e = ::readdir(dir)) {
+        const size_t n = std::strlen(e->d_name);
+        any |= n > 3 && std::strcmp(e->d_name + n - 3, ".so") == 0;
+      }
+      ::closedir(dir);
+    }
+    if (!any) {
+      remove_tree(dirs[di]);
+      stats().evicted.fetch_add(1);
+    }
+  }
 }
 
 std::string Engine::object_path(const std::string& key) const { return cache_path() + "/" + key + ".so"; }
@@ -1128,21 +1325,43 @@ Result Engine::lookup_selected(const UnitSpec& full, std::vector<uint32_t>* sel)
   }
   const UnitSpec sub = selected_spec(full, idx);
   Result l = lookup(sub);
-  if (l.found && sel) *sel = idx;
+  if (sel && (l.found || l.status == Status::Ok)) *sel = idx;
+  // (round sp63) A selection without its object: an earlier run chose these regions and its compile did not finish (cancelled at its exit, or the
+  // object was evicted); the caller may compile them now rather than count to the threshold again.
+  if (!l.found && l.status == Status::Ok) l.pending = true;
   return l;
 }
 
+// The selection is recorded before the compile (round sp63): a compile that does not finish -- the process ends first, and its compile is cancelled --
+// leaves it behind, so that the next run of the program finds it at its lookup and compiles at once (Result::pending) instead of counting to the
+// threshold again, and is warm from the run after. (Until then a program shorter than its compile never became warm: asyncAllocation, 3.2 s.)
 Result Engine::obtain_selected(const UnitSpec& full, const std::vector<uint32_t>& sel) {
+  const auto record = [&] {
+    std::string why;
+    const std::string skey = section_key(full, &why);
+    {
+      std::lock_guard<std::mutex> g(p_->mu);
+      if (!p_->dir_checked) {
+        p_->dir = cache_path();
+        p_->dir_err = ensure_dir(p_->dir);
+        p_->dir_checked = true;
+      }
+      if (!p_->dir_err.empty()) return;
+    }
+    std::string text = "VJSEL1 " + std::to_string(sel.size());
+    for (uint32_t i : sel) text += " " + std::to_string(i);
+    text += "\n";
+    const std::string dir = cache_path();
+    const std::string selp = dir + "/" + skey + ".sel";
+    std::string have;
+    if (!skey.empty() && !(read_file(selp, have) && have == text)) {
+      const std::string tmp = dir + "/" + skey + "." + std::to_string(::getpid()) + "." + std::to_string(g_seq.fetch_add(1)) + ".seltmp";
+      if (!write_file(tmp, text) || ::rename(tmp.c_str(), selp.c_str()) != 0) ::unlink(tmp.c_str());   // (a failure only costs the next run its lookup)
+    }
+  };
+  if (!mutant("history_after")) record();
   Result r = obtain(selected_spec(full, sel));
-  if (!r.found) return r;
-  std::string why;
-  const std::string skey = section_key(full, &why);
-  std::string text = "VJSEL1 " + std::to_string(sel.size());
-  for (uint32_t i : sel) text += " " + std::to_string(i);
-  text += "\n";
-  const std::string dir = cache_path();
-  const std::string tmp = dir + "/" + skey + "." + std::to_string(::getpid()) + "." + std::to_string(g_seq.fetch_add(1)) + ".seltmp";
-  if (!write_file(tmp, text) || ::rename(tmp.c_str(), (dir + "/" + skey + ".sel").c_str()) != 0) ::unlink(tmp.c_str());   // (a failure only costs the next run its lookup)
+  if (r.found) record();
   return r;
 }
 
@@ -1227,6 +1446,10 @@ Result Engine::load_(const UnitSpec& spec, const std::string& key, bool fresh) {
   r.lib = lib;
   r.found = true;
   r.hit = true;
+  if (!fresh && !mutant("trim_no_touch")) {   // (use renews an object's time: the size cap removes the least recently used first)
+    const struct timespec ts[2] = {{0, UTIME_OMIT}, {0, UTIME_NOW}};
+    ::utimensat(AT_FDCWD, so.c_str(), ts, 0);
+  }
   return r;
 }
 
@@ -1325,6 +1548,7 @@ Result Engine::obtain(const UnitSpec& spec) {
   if (pr.timed_out || pr.cancelled || pr.rc != 0) {
     ::unlink(tmp_so.c_str());
     out.status = pr.timed_out ? Status::CompileTimeout : Status::CompileFailed;
+    out.cancelled = pr.cancelled;
     out.message = pr.timed_out ? "the compile took more than " + std::to_string(cfg_.timeout_s) + " s and was killed"
                   : pr.cancelled ? "the compile was cancelled"
                                  : "the compiler failed (status " + std::to_string(pr.rc) + "): " + pr.out.substr(0, 600);
@@ -1347,6 +1571,7 @@ Result Engine::obtain(const UnitSpec& spec) {
     return out;
   }
   Result fresh = load_(spec, key, true);
+  if (fresh.found) trim(key);
   fresh.compiled = true;
   fresh.hit = false;
   fresh.compile_ms = out.compile_ms;
@@ -1393,6 +1618,7 @@ struct Manager {
   ShareRule share;         // the share rule (jit.hpp)
   uint64_t profile;        // a section whose threshold is more than twice this far away after its lookup waits on the plain loop until it is this near (0: never waits)
   unsigned min_gen_percent;   // a region is compiled only if at least this share of its ops are computed by generated code (VGPU_JIT_MIN_GEN)
+  bool history;            // a lookup that finds a selection without its object compiles it at once (VGPU_JIT_HISTORY=0: counts to the threshold again; round sp63)
   bool worth(const Region& r) const { return r.gen * 100u >= r.k * min_gen_percent; }
   std::atomic<bool> disabled{false};
   std::mutex mu;
@@ -1428,6 +1654,7 @@ struct Manager {
     min_region = static_cast<unsigned>(std::clamp<uint64_t>(num("VGPU_JIT_MIN_REGION", 4), 1, 4096));
     max_ops = num("VGPU_JIT_MAX_OPS", 1500);
     profile = num("VGPU_JIT_PROFILE", kDefaultProfile);
+    history = num("VGPU_JIT_HISTORY", 1) != 0;
     min_gen_percent = static_cast<unsigned>(std::min<uint64_t>(num("VGPU_JIT_MIN_GEN", 50), 100));
     // The share rule: VGPU_JIT_MIN_SHARE (percent of the sample; 0: no rule) and VGPU_JIT_SAMPLE (warp instructions). A sample is never taken from fewer than
     // kMinSample instructions (a threshold of 1, "compile everything now", has no sample to judge), and not when every region is to be compiled (HOT_PERMILLE=0).
@@ -1447,12 +1674,26 @@ struct Manager {
   }
   void report();
 
+  // One notice of a kind a process (as before), and since round sp63 one a day: a notice that was given less than a day ago from the same cache directory
+  // (a stamp file there, notice-<kind>) is not given again; where the directory cannot be used for that, every process gives it. VGPU_JIT=auto, the JIT
+  // as a default would run it, gives none of the notices that only say where it cannot run (no compiler, a cache that cannot be used).
   void notice(const std::string& kind, const std::string& msg) {
     {
       std::lock_guard<std::mutex> g(mu);
       if (!told.insert(kind).second) return;
     }
-    if (!quiet) std::fprintf(stderr, "pantheonsim: JIT: %s; those regions stay on the tier\n", msg.c_str());
+    if (quiet) return;
+    if (auto_mode() && (kind == status_name(Status::NoCompiler) || kind == status_name(Status::CacheUnusable)) && !mutant("auto_loud")) return;
+    if (!mutant("notice_every_run")) {
+      const std::string dir = engine.cache_path();
+      if (ensure_dir(dir).empty()) {
+        const std::string stamp = dir + "/notice-" + kind;
+        struct stat st;
+        if (::stat(stamp.c_str(), &st) == 0 && st.st_mtime + 86400 > ::time(nullptr) && st.st_mtime <= ::time(nullptr) + 60) return;
+        write_file(stamp, msg + "\n");   // (best effort: a failure gives the notice again next time)
+      }
+    }
+    std::fprintf(stderr, "pantheonsim: JIT: %s; those regions stay on the tier\n", msg.c_str());
   }
 
   void publish(Unit& u, Result& r, const std::vector<uint32_t>& sel) {
@@ -1498,6 +1739,7 @@ struct Manager {
   void fail(Unit& u, const Result& r) {
     u.state.store(static_cast<int>(State::Failed), std::memory_order_release);
     stats().failures.fetch_add(1);
+    if (r.cancelled && !mutant("cancel_notice")) return;   // (the process is ending: its selection is on record for the next run, nothing to tell; round sp63)
     notice(status_name(r.status), r.message);
     if (r.status == Status::CacheUnusable || r.status == Status::NoCompiler) disabled.store(true);   // nothing will work: stop trying
   }
@@ -1547,15 +1789,24 @@ struct Manager {
         publish(*u, r, sel);
       } else if (r.status != Status::Ok) {
         fail(*u, r);
+      } else if (r.pending && history && !sel.empty() && !mutant("history_never")) {
+        // (round sp63) An earlier run chose these regions and did not finish their compile: compile them now (the section is Queued, on the hook loop's
+        // counting until the object is in), not at the threshold. A program shorter than its compile is warm from its third run on.
+        int exp = static_cast<int>(State::Looking);
+        if (u->state.compare_exchange_strong(exp, static_cast<int>(State::Queued))) {
+          stats().history.fetch_add(1);
+          compile(*u, sel);
+        }
       } else {
         // A miss. The threshold far away: the section waits on the plain loop until it is `profile` instructions short of it (State::Waiting); near: it counts on.
-        const uint64_t done = u->executed.load(std::memory_order_relaxed);
+        const uint64_t done = u->executed.load(std::memory_order_relaxed) + u->credit.load(std::memory_order_relaxed);   // (credit: a wait before the lookup)
         const bool wait = profile != 0 && threshold > done && threshold - done > 2 * profile && !mutant("wait_never");
         if (wait) {
           const uint64_t n = threshold - done - (mutant("wait_no_profile") ? 0 : profile);
           u->wait_for.store(n, std::memory_order_relaxed);
           u->wait_batch.store(n >= kWaitBatchFrom && !mutant("wait_no_batch") ? kWaitBatch : 1, std::memory_order_relaxed);
           u->waited.store(0, std::memory_order_relaxed);
+          u->wait_then.store(static_cast<int>(State::Counting), std::memory_order_relaxed);
         }
         int exp = static_cast<int>(State::Looking);
         if (u->state.compare_exchange_strong(exp, static_cast<int>(wait ? State::Waiting : State::Counting)) && wait) stats().waits.fetch_add(1);
@@ -1566,22 +1817,26 @@ struct Manager {
         u->state.store(static_cast<int>(State::Failed), std::memory_order_release);
         return;
       }
-      Result r = engine.obtain_selected(u->spec, sel);
-      if (r.compiled) {
-        stats().compiles.fetch_add(1);
-        stats().compile_us.fetch_add(static_cast<uint64_t>(r.compile_ms * 1000));
-      }
-      if (r.replaced_corrupt) stats().corrupt.fetch_add(1);
-      if (r.found) {
-        if (r.hit) stats().cache_hits.fetch_add(1);
-        publish(*u, r, sel);
-      } else {
-        fail(*u, r);
-      }
+      compile(*u, sel);
+    }
+  }
+  void compile(Unit& u, const std::vector<uint32_t>& sel) {
+    Result r = engine.obtain_selected(u.spec, sel);
+    if (r.compiled) {
+      stats().compiles.fetch_add(1);
+      stats().compile_us.fetch_add(static_cast<uint64_t>(r.compile_ms * 1000));
+    }
+    if (r.replaced_corrupt) stats().corrupt.fetch_add(1);
+    if (r.found) {
+      if (r.hit) stats().cache_hits.fetch_add(1);
+      publish(u, r, sel);
+    } else {
+      fail(u, r);
     }
   }
 
   void submit(Job job, std::shared_ptr<Unit> u) {
+    if (exec::g_sample_copy.load(std::memory_order_relaxed)) return;   // (a sample's copy of the process compiles nothing and writes no cache)
     if (sync) {
       run(job, u);
       return;
@@ -1658,11 +1913,13 @@ void Unit::wait_note(uint64_t instr) {
 }
 
 // The wait is over: what it ran counts towards the threshold, and the section is Counting again (the hook loop, the regions' counts) for the last stretch.
+// (Round sp63: a wait before the lookup ends in Idle, the hook loop's counting up to the lookup; what it ran counts towards the lookup and the threshold.)
 void Unit::wait_over() {
-  if (mutant("wait_stuck")) return;
+  const int then = wait_then.load(std::memory_order_relaxed);
+  if (mutant(then == static_cast<int>(State::Idle) ? "prewait_stuck" : "wait_stuck")) return;
   int exp = static_cast<int>(State::Waiting);
-  if (!state.compare_exchange_strong(exp, static_cast<int>(State::Counting), std::memory_order_acq_rel)) return;
-  if (!mutant("wait_no_credit")) credit.store(wait_for.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  if (!state.compare_exchange_strong(exp, then, std::memory_order_acq_rel)) return;
+  if (!mutant("wait_no_credit")) credit.fetch_add(wait_for.load(std::memory_order_relaxed), std::memory_order_relaxed);
   stats().wait_ends.fetch_add(1);
 }
 
@@ -1688,6 +1945,26 @@ void Unit::sample(uint64_t instr) {
                                (unsigned long long)t, (unsigned long long)(gw * 1000 / (t ? t : 1)), r.min_share_permille, ok ? "kept" : "declined");
   if (ok) {
     stats().accepted.fetch_add(1);
+    // (Round sp63) The way to the lookup on the plain loop too: a kept section still far from the lookup waits for it as a section far from its threshold
+    // does (State::Waiting), and is Idle again, in the hook loop, once all of its instructions make up the rest of VGPU_JIT_LOOKUP_AFTER. Until then a kept
+    // section was counted region by region in the hook loop all the way to the lookup, or for its whole life when it never got there (round sp57: ADI,
+    // asmooth, sortKV 6 to 8 % slower cold). The lookup comes up to 2.5 times earlier (all instructions count, not only those in regions).
+    Manager& mgr = manager();
+    if (mgr.profile != 0 && !mutant("prewait_never")) {
+      uint64_t done = 0;
+      for (size_t i = 0; i < regions.size(); ++i) done += counts[i].load(std::memory_order_relaxed);
+      if (mgr.lookup_after > done && mgr.lookup_after - done >= kPrewaitMin) {
+        const uint64_t n = mgr.lookup_after - done;
+        wait_for.store(n, std::memory_order_relaxed);
+        // (a thread brings its share to the count in batches of a 64th of the wait: sixteen threads end it at most a quarter late, and none passes the
+        // count's cache line around on every call of the loop)
+        wait_batch.store(n >= kWaitBatch && !mutant("wait_no_batch") ? n >> 6 : 1, std::memory_order_relaxed);
+        waited.store(0, std::memory_order_relaxed);
+        wait_then.store(static_cast<int>(mutant("prewait_to_counting") ? State::Counting : State::Idle), std::memory_order_relaxed);
+        int exp = static_cast<int>(State::Idle);
+        if (state.compare_exchange_strong(exp, static_cast<int>(State::Waiting), std::memory_order_acq_rel)) stats().prewaits.fetch_add(1);
+      }
+    }
     return;
   }
   stats().declined.fetch_add(1);
@@ -1731,6 +2008,12 @@ void Manager::report() {
                (unsigned long long)s.accepted.load(), (unsigned long long)s.continued.load());
   if (s.waits.load())   // (after the summary, and not a "jit: " line: what reads a statistics file takes its last "jit: " line for the summary)
     std::fprintf(out, "jit-wait: %llu sections waited on the plain loop for their threshold, %llu came back to count\n", (unsigned long long)s.waits.load(), (unsigned long long)s.wait_ends.load());
+  if (s.prewaits.load())   // (round sp63)
+    std::fprintf(out, "jit-prewait: %llu sections waited on the plain loop for their lookup\n", (unsigned long long)s.prewaits.load());
+  if (s.history.load())
+    std::fprintf(out, "jit-history: %llu sections compiled at their lookup the regions an earlier run chose\n", (unsigned long long)s.history.load());
+  if (s.evicted.load())
+    std::fprintf(out, "jit-cache: %llu objects and directories removed by the size cap and the age rule\n", (unsigned long long)s.evicted.load());
   if (out != stderr) std::fclose(out);
 }
 
@@ -1769,7 +2052,15 @@ bool requested() {
   static const bool on = [] {
     if (kSanitized) return false;
     const char* v = std::getenv("VGPU_JIT");
-    return v && v[0] == '1' && !v[1] && tier::requested();
+    return v && ((v[0] == '1' && !v[1]) || std::strcmp(v, "auto") == 0) && tier::requested();
+  }();
+  return on;
+}
+
+bool auto_mode() {
+  static const bool on = [] {
+    const char* v = std::getenv("VGPU_JIT");
+    return v && std::strcmp(v, "auto") == 0;
   }();
   return on;
 }

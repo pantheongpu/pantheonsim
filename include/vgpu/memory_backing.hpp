@@ -121,4 +121,16 @@ struct KernelCalls {
 };
 KernelCalls kernel_calls();
 
+// The process's own heap (glibc malloc), which the simulated program and the host-computed libraries (cuBLAS, cuSPARSE,
+// ...) share: a library call that loads its operands into vectors of a few hundred KiB to a few MiB and frees them again
+// made glibc grow the heap and give it back to the kernel on every call, and fault the pages in again on the next (SCS
+// on cuSPARSE SpMV: 1.1 million page faults a second, half the run in the kernel; #551). This fixes glibc's two
+// thresholds where its own dynamic rule ends up (allocations up to 32 MiB from the heap, up to 64 MiB of free heap
+// kept), from the start. Called when a device is made; once per process. It does nothing when the environment sets
+// either threshold itself (MALLOC_MMAP_THRESHOLD_, MALLOC_TRIM_THRESHOLD_, MALLOC_TOP_PAD_, or their
+// glibc.malloc.* names in GLIBC_TUNABLES), when VGPU_HOST_HEAP=0, under a sanitizer, or without glibc. The heap's layout is all it changes.
+void tune_host_heap();
+// Whether tune_host_heap() set the thresholds in this process.
+bool host_heap_tuned();
+
 }  // namespace vgpu::backing

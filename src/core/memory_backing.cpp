@@ -1,6 +1,7 @@
 #include "vgpu/memory_backing.hpp"
 
 #include <fcntl.h>
+#include <malloc.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -577,5 +578,27 @@ uint64_t host_guard_samples() {
 KernelCalls kernel_calls() {
   return {g_madvise_dontneed.load(std::memory_order_relaxed), g_arena_maps.load(std::memory_order_relaxed)};
 }
+
+namespace {
+std::atomic<bool> g_heap_tuned{false};
+}
+
+void tune_host_heap() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+#if defined(__GLIBC__) && !defined(VGPU_HEAP_CHUNKS) && !defined(__SANITIZE_THREAD__)
+    if (const char* e = std::getenv("VGPU_HOST_HEAP"); e && e[0] == '0' && e[1] == 0) return;
+    for (const char* v : {"MALLOC_MMAP_THRESHOLD_", "MALLOC_TRIM_THRESHOLD_", "MALLOC_TOP_PAD_"})
+      if (std::getenv(v)) return;
+    if (const char* t = std::getenv("GLIBC_TUNABLES"))
+      for (const char* k : {"glibc.malloc.mmap_threshold", "glibc.malloc.trim_threshold", "glibc.malloc.top_pad"})
+        if (std::strstr(t, k)) return;
+    const bool ok = ::mallopt(M_MMAP_THRESHOLD, 32 << 20) == 1 && ::mallopt(M_TRIM_THRESHOLD, 64 << 20) == 1;
+    g_heap_tuned.store(ok, std::memory_order_relaxed);
+#endif
+  });
+}
+
+bool host_heap_tuned() { return g_heap_tuned.load(std::memory_order_relaxed); }
 
 }  // namespace vgpu::backing

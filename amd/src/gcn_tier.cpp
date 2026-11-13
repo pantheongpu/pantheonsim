@@ -1066,7 +1066,8 @@ int h_permlane(const Op& o, Regs& R) {
 
 // v_div_scale_*, v_div_fmas_* and v_div_fixup_* (gcn_divide.hpp): per lane, the interpreter's divide_step. `sub`: 0 scale, 1 fmas, 2 fixup,
 // plus 4 for the double forms. The scale writes a mask of the lanes whose condition holds to its scalar destination, whatever EXEC says;
-// fmas reads VCC. The sources carry the float modifiers; the result is written whole (no output modifier or clamp).
+// fmas reads VCC. The sources carry the float modifiers; the result is written whole: an fmas or a fixup with an output modifier or a clamp
+// is the interpreter's (write_float / write_double, issue #613).
 [[gnu::noinline]] int h_div(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
   const unsigned what = o.sub & 3;
@@ -3304,6 +3305,7 @@ void tier_classify(Inst& in) {
       const bool dbl = e.k >= 4, scale = (e.k & 3) == 0;
       if (!vgpr_dst(in.dst.empty() ? Operand() : in.dst[0], f.dst, dbl ? 2 : 1)) return fail();
       if (scale ? (in.dst.size() != 2 || !scalar_dst(in.dst[1], f.dst2)) : in.dst.size() != 1) return fail();
+      if (!scale && (in.clamp || in.omod)) return fail();   // (the interpreter's write_float / write_double, issue #613)
       for (int k = 0; k < 3; ++k)
         if (!(dbl ? lane_src64(in.src[k], f.src[k], true) : lane_src32(in.src[k], f.src[k], true))) return fail();
       f.sub = static_cast<uint32_t>(e.k);

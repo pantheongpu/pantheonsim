@@ -1,0 +1,57 @@
+== polybench/SYRK exact
+host_gpu: _Z11syrk_kerneliiffPfS_: sent by the time of its first blocks (2.582 s in the simulator, at least)
+host_gpu: _Z11syrk_kerneliiffPfS_ on the card (resident): kernel 9.018 ms, total 12.596 ms (sim estimate 2582.448 ms), 8.00 MiB pushed
+host_gpu_sample: kernel=_Z11syrk_kerneliiffPfS_ blocks=4096 threads_per_block=256 instrs=256 back_edge=1 loop=1 whole_samples=0 live_bytes=8388608 static_s=0.083886 age_s=0.017987 affordable=1 answered=1 ran=1 first_block_s=0.003037 timed_s=0.002522 cost_s=0.006436 fork_s=0.000619 threads=4 estimate_s=2.582448 would_send=1 launch_s=-1
+host_gpu: 1 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+== polybench/SYRK turbo
+host_gpu: _Z11syrk_kerneliiffPfS_: sent by the time of its first blocks (2.613 s in the simulator, at least)
+host_gpu: _Z11syrk_kerneliiffPfS_ on the card (resident): kernel 9.020 ms, total 12.510 ms (sim estimate 2612.831 ms), 8.00 MiB pushed
+host_gpu_sample: kernel=_Z11syrk_kerneliiffPfS_ blocks=4096 threads_per_block=256 instrs=256 back_edge=1 loop=1 whole_samples=0 live_bytes=8388608 static_s=0.083886 age_s=0.017705 affordable=1 answered=1 ran=1 first_block_s=0.003054 timed_s=0.002552 cost_s=0.006432 fork_s=0.000575 threads=4 estimate_s=2.612831 would_send=1 launch_s=-1
+host_gpu: 1 launches ran on the card, 0 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+== polybench/SYR2K exact
+host_gpu: _Z12syr2k_kerneliiffPfS_S_: sent by the time of its first blocks (4.742 s in the simulator, at least)
+host_gpu: _Z12syr2k_kerneliiffPfS_S_ on the card (resident): kernel 17.460 ms, total 21.504 ms (sim estimate 4741.996 ms), 12.00 MiB pushed
+host_gpu_sample: kernel=_Z12syr2k_kerneliiffPfS_S_ blocks=4096 threads_per_block=256 instrs=136 back_edge=1 loop=1 whole_samples=0 live_bytes=12582912 static_s=0.044564 age_s=0.020358 affordable=1 answered=1 ran=1 first_block_s=0.005156 timed_s=0.004631 cost_s=0.010826 fork_s=0.000779 threads=4 estimate_s=4.741996 would_send=1 launch_s=-1
+host_gpu: 1 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+== polybench/SYR2K turbo
+host_gpu: _Z12syr2k_kerneliiffPfS_S_: sent by the time of its first blocks (4.705 s in the simulator, at least)
+host_gpu: _Z12syr2k_kerneliiffPfS_S_ on the card (resident): kernel 17.473 ms, total 21.522 ms (sim estimate 4705.469 ms), 12.00 MiB pushed
+host_gpu_sample: kernel=_Z12syr2k_kerneliiffPfS_S_ blocks=4096 threads_per_block=256 instrs=136 back_edge=1 loop=1 whole_samples=0 live_bytes=12582912 static_s=0.044564 age_s=0.020432 affordable=1 answered=1 ran=1 first_block_s=0.005128 timed_s=0.004595 cost_s=0.010740 fork_s=0.000759 threads=4 estimate_s=4.705469 would_send=1 launch_s=-1
+host_gpu: 1 launches ran on the card, 0 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+== polybench/2MM exact
+host_gpu: _Z11mm2_kernel1iiiiffPfS_S_: sent by the time of its first blocks (19.914 s in the simulator, at least)
+host_gpu: _Z11mm2_kernel1iiiiffPfS_S_ on the card (resident): kernel 25.989 ms, total 49.710 ms (sim estimate 19913.646 ms), 80.00 MiB pushed
+host_gpu_sample: kernel=_Z11mm2_kernel1iiiiffPfS_S_ blocks=16384 threads_per_block=256 instrs=256 back_edge=1 loop=1 whole_samples=0 live_bytes=83886080 static_s=0.335544 age_s=0.061013 affordable=1 answered=1 ran=1 first_block_s=0.005666 timed_s=0.004862 cost_s=0.014253 fork_s=0.003430 threads=4 estimate_s=19.913646 would_send=1 launch_s=-1
+host_gpu: _Z11mm2_kernel2iiiiffPfS_S_ on the card (resident): kernel 25.392 ms, total 25.439 ms (sim estimate 304.087 ms), 0.00 MiB pushed
+== polybench/2MM turbo
+host_gpu: _Z11mm2_kernel1iiiiffPfS_S_: sent by the time of its first blocks (19.788 s in the simulator, at least)
+host_gpu: _Z11mm2_kernel1iiiiffPfS_S_ on the card (resident): kernel 26.038 ms, total 50.014 ms (sim estimate 19787.977 ms), 80.00 MiB pushed
+host_gpu_sample: kernel=_Z11mm2_kernel1iiiiffPfS_S_ blocks=16384 threads_per_block=256 instrs=256 back_edge=1 loop=1 whole_samples=0 live_bytes=83886080 static_s=0.335544 age_s=0.061014 affordable=1 answered=1 ran=1 first_block_s=0.005819 timed_s=0.004831 cost_s=0.014305 fork_s=0.003366 threads=4 estimate_s=19.787977 would_send=1 launch_s=-1
+host_gpu: _Z11mm2_kernel2iiiiffPfS_S_ on the card (resident): kernel 25.425 ms, total 25.485 ms (sim estimate 304.087 ms), 0.00 MiB pushed
+== polybench/GEMM exact
+host_gpu: 0 launches ran on the card, 1 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+== polybench/GEMM turbo
+host_gpu: 0 launches ran on the card, 1 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+== polybench/2DCONV exact
+host_gpu: 0 launches ran on the card, 1 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+== polybench/2DCONV turbo
+host_gpu: 0 launches ran on the card, 1 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+== polybench/GEMVER exact
+host_gpu: 0 launches ran on the card, 3 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+== polybench/GEMVER turbo
+host_gpu: 0 launches ran on the card, 3 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+== rodinia/backprop exact
+host_gpu: 0 launches ran on the card, 2 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+== rodinia/backprop turbo
+host_gpu: _Z24bpnn_adjust_weights_cudaPfiS_iS_S_ on the card (resident): kernel 0.398 ms, total 17.770 ms (sim estimate 104.858 ms), 36.00 MiB pushed
+host_gpu: 1 launches ran on the card, 1 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+== hecbench/black-scholes-cuda exact
+host_gpu: 0 launches ran on the card, 1 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+== hecbench/black-scholes-cuda turbo
+host_gpu_sample: kernel=_Z15getOutValOptionPK17optionInputStructPfi blocks=195313 threads_per_block=256 instrs=728 back_edge=1 loop=1 whole_samples=0 live_bytes=2000000000 static_s=11.375029 age_s=1.509523 affordable=1 answered=0 ran=9 first_block_s=-1.000000 timed_s=0.000000 cost_s=0.121001 fork_s=0.060106 threads=1 estimate_s=0.000000 would_send=0 launch_s=19.748315
+host_gpu: 0 launches ran on the card, 1 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+== hecbench/binomial-cuda turbo
+host_gpu: _Z21binomialOptionsKernelPK13__TOptionDataPf: sent by the time of its first blocks (2.059 s in the simulator, at least)
+host_gpu: _Z21binomialOptionsKernelPK13__TOptionDataPf on the card (resident): kernel 0.806 ms, total 1.177 ms (sim estimate 2058.956 ms), 0.02 MiB pushed
+host_gpu_sample: kernel=_Z21binomialOptionsKernelPK13__TOptionDataPf blocks=1024 threads_per_block=128 instrs=888 back_edge=1 loop=1 whole_samples=0 live_bytes=24576 static_s=0.036372 age_s=0.002377 affordable=1 answered=1 ran=1 first_block_s=0.008693 timed_s=0.008043 cost_s=0.017152 fork_s=0.000175 threads=4 estimate_s=2.058956 would_send=1 launch_s=-1
+host_gpu: _Z21binomialOptionsKernelPK13__TOptionDataPf on the card (resident): kernel 0.769 ms, total 0.770 ms (sim estimate 2058.956 ms), 0.00 MiB pushed

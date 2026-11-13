@@ -1,0 +1,21 @@
+Ten runs of each form (card-run.sh repeat), wall seconds sorted: the programs the A/B showed more than 3% apart with no launch sampled in either form.
+
+polybench/JACOBI2D     exact   median 0.556  0.552 0.552 0.553 0.555 0.556 0.556 0.557 0.557 0.560 0.561
+polybench/JACOBI2D     exact0  median 0.555  0.552 0.552 0.552 0.553 0.554 0.557 0.559 0.608 0.608 0.611
+polybench/JACOBI2D     turbo   median 0.555  0.551 0.552 0.553 0.554 0.555 0.556 0.557 0.559 0.560 0.603
+polybench/JACOBI2D     turbo0  median 0.553  0.548 0.551 0.551 0.552 0.553 0.553 0.555 0.557 0.606 0.610
+rodinia/backprop       exact   median 0.613  0.611 0.612 0.612 0.613 0.613 0.613 0.614 0.614 0.618 0.621
+rodinia/backprop       exact0  median 0.613  0.611 0.612 0.612 0.612 0.613 0.614 0.614 0.615 0.616 0.616
+rodinia/backprop       turbo   median 0.708  0.705 0.706 0.707 0.707 0.707 0.708 0.709 0.713 0.761 0.765
+rodinia/backprop       turbo0  median 0.710  0.706 0.707 0.708 0.708 0.709 0.710 0.712 0.715 0.758 0.762
+rodinia/sc_gpu         exact   median 0.732  0.725 0.726 0.728 0.731 0.732 0.732 0.777 0.777 0.777 0.778
+rodinia/sc_gpu         exact0  median 0.778  0.727 0.732 0.734 0.777 0.778 0.778 0.780 0.780 0.781 0.781
+rodinia/sc_gpu         turbo   median 0.789  0.734 0.739 0.741 0.783 0.788 0.789 0.790 0.791 0.792 0.795
+rodinia/sc_gpu         turbo0  median 0.787  0.742 0.742 0.783 0.785 0.785 0.789 0.790 0.791 0.794 0.794
+rodinia/hotspot        exact   median 1.178  1.175 1.175 1.176 1.176 1.177 1.179 1.181 1.181 1.187 1.188
+rodinia/hotspot        exact0  median 1.182  1.175 1.177 1.178 1.180 1.181 1.183 1.184 1.194 1.218 1.225
+rodinia/hotspot        turbo   median 0.516  0.512 0.513 0.514 0.514 0.515 0.517 0.517 0.518 0.519 0.522
+rodinia/hotspot        turbo0  median 0.518  0.513 0.515 0.515 0.516 0.517 0.519 0.519 0.520 0.523 0.564
+
+zombies: 0
+processes of the corpus left: 0

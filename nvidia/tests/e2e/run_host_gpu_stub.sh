@@ -18,6 +18,30 @@
 #      time already spent can, so the driver starts at the first launch that has an estimate;
 #   9. VGPU_QUIET=1 silences the end-of-run summary only when nobody asked for it: with VGPU_HOST_GPU_VERIFY or VGPU_HOST_GPU_LOG set the summary lines
 #      ("host_gpu: N launches ran on the card", "host_gpu_verify: in_set_identical=...") still reach stderr, and with neither set nothing is printed.
+# Turbo mode (VGPU_HOST_GPU=turbo, docs/perf-design/12-host-gpu-turbo.md), with the same stand-in driver:
+#  10. the kernels exact mode keeps for their numerics (expf, a bare rcp.approx, a division beside an expf) reach the card path in turbo mode, and the
+#      output is unchanged (the stand-in refuses the module, so the simulator runs them);
+#  11. turbo mode prints the two lines for scripts (host_gpu_turbo:, host_gpu_refusals:); exact mode prints them only with VGPU_HOST_GPU_LOG;
+#  12. a float atomic with a returned value and a compare-and-swap stay in the simulator (one host_gpu_refused line, class=atomics) unless
+#      VGPU_HOST_GPU_ATOMICS=1; an integer atomic is admitted, and VGPU_HOST_GPU_TURBO_OFF=atomics / =mufu keep their classes out (class=off);
+#  13. a tolerance, an off-list or a mode that cannot be read turns the mode off with a message, and nothing reaches the driver;
+#  14. VGPU_HOST_GPU_VERIFY=1 in turbo mode compares by tolerance: with a stand-in card that computes nothing (STUB_CARD_OK=1) the compare reports words
+#      outside tolerance, per kernel and in the summary, lists at most three launches of a kernel without VGPU_HOST_GPU_LOG, and the program's output is the
+#      simulator's;
+#  15. a launch that does not come back from the card (STUB_SYNC_MS) ends the process with status 124 and a message after VGPU_HOST_GPU_TIMEOUT seconds.
+#  16. the simulator's launch of a verify run is not disturbed by the card copy of the launch before it: an integer reduction onto 64 contended words gives
+#      the mode-off sums under VGPU_HOST_GPU_VERIFY=1 with 4 host threads, in both modes, five times over (the card copy used to stay valid through the
+#      simulator's launch, whose atomics then went through the gate and lost updates).
+#  17. the first blocks of a launch, timed in a forked copy of the process (Round sp60b): a launch they say is long is sent to the card; when the card
+#      refuses it the simulator runs it and the output is the mode-off output (nothing the copy did is in the program's memory);
+#  18. ... and when the card takes it, the card is sent the memory as it was before the launch: against a stand-in that keeps memory and computes nothing
+#      (STUB_CARD_OK=1 STUB_KEEP_MEMORY=1) the program prints what the program that launches nothing prints;
+#  19. a launch its first blocks say is short stays in the simulator and the driver is never touched;
+#  20. a process too young to afford a sample is not sampled (the default), and VGPU_HOST_GPU_SAMPLE=log sends nothing.
+#  21. progress inside the blocks (Round sp61): a launch on 8 blocks whose threads loop long is sampled inside its blocks (its line says inside=1) and
+#      sent; the stand-in refuses it and the output is the mode-off output;
+#  22. ... against a stand-in that keeps memory and computes nothing, the program prints what the program that launches nothing prints;
+#  23. the same kernel with a short loop is sampled inside its blocks and stays, and the driver is never touched.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -50,8 +74,10 @@ run() {   # <tag> <program argument> [env...]: stdout in $work/<tag>.out, stderr
   local tag=$1 arg=$2
   shift 2
   : > "$work/$tag.log"
+  # (VGPU_HOST_GPU_SAMPLE=0: steps 1 to 16 pin the rules that decide BEFORE a launch runs, as they were before launches were sampled; steps 17 to 20
+  # switch the sampling back on, their own assignment coming later on the command line.)
   env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" STUB_LOG="$work/$tag.log" STUB_SM="$cc" STUB_MP="$mp" STUB_INIT_MS=$init_ms \
-      VGPU_HOST_GPU_LIBCUDA="$work/libstubcuda.so" "$@" "$work/prog" "$arg" > "$work/$tag.out" 2> "$work/$tag.err"
+      VGPU_HOST_GPU_LIBCUDA="$work/libstubcuda.so" VGPU_HOST_GPU_SAMPLE=0 "$@" "$work/prog" "$arg" > "$work/$tag.out" 2> "$work/$tag.err"
 }
 calls() { sort "$work/$1.log" | uniq -c | tr -s ' ' | tr '\n' ';'; }
 for arg in big small mufu; do
@@ -126,5 +152,164 @@ run q_ver big VGPU_QUIET=1 VGPU_HOST_GPU=exact VGPU_HOST_GPU_VERIFY=1 STUB_CARD_
 grep -Eq '^host_gpu_verify: in_set_identical=[0-9]+ in_set_different=[0-9]+ other_identical=[0-9]+ other_different=[0-9]+$' "$work/q_ver.err" || { echo "FAIL: VGPU_QUIET=1 with VGPU_HOST_GPU_VERIFY=1 printed no host_gpu_verify summary line"; fails=1; }
 grep -Eq '^host_gpu: [0-9]+ launches ran on the card' "$work/q_ver.err" || { echo "FAIL: VGPU_QUIET=1 with VGPU_HOST_GPU_VERIFY=1 printed no 'launches ran on the card' line"; fails=1; }
 diff -q "$work/off_big.out" "$work/q_ver.out" > /dev/null || { echo "FAIL: verify under VGPU_QUIET changes the output"; fails=1; }
+# ---- turbo mode ----
+reach=(VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=0)
+for arg in iatom fatom cas; do
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" "$arg" > "$work/off_$arg.out" 2> "$work/off_$arg.err" || { echo "FAIL: the $arg run with the mode off failed"; tail -5 "$work/off_$arg.err"; exit 1; }
+done
+# 10. what exact keeps for its numerics goes to the card in turbo.
+for arg in mufu rcp divexp; do
+  run "rel_$arg" "$arg" VGPU_HOST_GPU=turbo "${reach[@]}" || { echo "FAIL: the turbo $arg run failed"; tail -5 "$work/rel_$arg.err"; fails=1; }
+  grep -q '^cuModuleLoadData$' "$work/rel_$arg.log" || { echo "FAIL: $arg did not reach the card path in turbo mode: $(calls "rel_$arg"); $(grep -m2 'host_gpu' "$work/rel_$arg.err")"; fails=1; }
+  diff -q "$work/off_$arg.out" "$work/rel_$arg.out" > /dev/null || { echo "FAIL: turbo mode with a card that refuses the module changes the output of $arg"; fails=1; }
+  grep -q '^host_gpu_refused:' "$work/rel_$arg.err" && { echo "FAIL: turbo mode refused a kernel of $arg: $(grep -m1 '^host_gpu_refused:' "$work/rel_$arg.err")"; fails=1; }
+done
+run ex_mufu mufu VGPU_HOST_GPU=exact "${reach[@]}" || { echo "FAIL: the exact mufu run failed"; fails=1; }
+[[ ! -s "$work/ex_mufu.log" ]] || { echo "FAIL: exact mode sent the expf kernel to the card: $(calls ex_mufu)"; fails=1; }
+# 11. the lines for scripts.
+rl='^host_gpu_turbo: mode=turbo launches_card=[0-9]+ launches_sim=[0-9]+ card_s=[0-9.]+ sim_s=[0-9.]+ words_compared=[0-9]+ words_different=[0-9]+ words_outside=[0-9]+ words_subnormal=[0-9]+ kernels_outside=[0-9]+ max_abs=[^ ]+ max_rel=[^ ]+$'
+fl='^host_gpu_refusals: refused_never=[0-9]+ refused_atomics=[0-9]+ refused_off=[0-9]+ refused_exact=[0-9]+ refused_safety=[0-9]+ too_small=[0-9]+ failed=[0-9]+$'
+grep -Eq "$rl" "$work/rel_mufu.err" || { echo "FAIL: turbo mode printed no host_gpu_turbo line: $(grep '^host_gpu_turbo' "$work/rel_mufu.err")"; fails=1; }
+grep -Eq "$fl" "$work/rel_mufu.err" || { echo "FAIL: turbo mode printed no host_gpu_refusals line: $(grep '^host_gpu_refusals' "$work/rel_mufu.err")"; fails=1; }
+grep -Eq '^host_gpu: [0-9]+ launches ran on the card, [0-9]+ in the simulator \([0-9]+ kernels not admitted by turbo mode' "$work/rel_mufu.err" || { echo "FAIL: turbo mode's summary line is missing"; fails=1; }
+grep -q '^host_gpu_turbo:\|^host_gpu_refusals:\|^host_gpu_refused:' "$work/on_big.err" "$work/ex_mufu.err" && { echo "FAIL: exact mode without VGPU_HOST_GPU_LOG printed turbo mode's lines"; fails=1; }
+grep -Eq '^host_gpu: [0-9]+ launches ran on the card, [0-9]+ in the simulator \([0-9]+ kernels not in the exact set, [0-9]+ too small, [0-9]+ unsupported launch shapes, [0-9]+ failed on the card\)$' "$work/ex_mufu.err" || { echo "FAIL: exact mode's summary line changed: $(grep 'launches ran' "$work/ex_mufu.err")"; fails=1; }
+grep -Eq '^host_gpu_turbo: mode=exact ' "$work/q_log.err" || { echo "FAIL: exact mode with VGPU_HOST_GPU_LOG=1 printed no host_gpu_turbo line"; fails=1; }
+run exl_mufu mufu VGPU_HOST_GPU=exact VGPU_HOST_GPU_LOG=1 "${reach[@]}" || { echo "FAIL: the exact mufu run with the log failed"; fails=1; }
+rx="$(sed -n 's/^host_gpu_refusals: .* refused_exact=\([0-9]*\) .*/\1/p' "$work/exl_mufu.err" | tail -1)"
+(( ${rx:-0} >= 1 )) || { echo "FAIL: exact mode did not count the expf launches as ones turbo mode would take: $(grep '^host_gpu_refusals' "$work/exl_mufu.err")"; fails=1; }
+# 12. atomics: the opt-in and the off list.
+for arg in fatom cas; do
+  run "rel_$arg" "$arg" VGPU_HOST_GPU=turbo "${reach[@]}" || { echo "FAIL: the turbo $arg run failed"; tail -5 "$work/rel_$arg.err"; fails=1; }
+  [[ ! -s "$work/rel_$arg.log" ]] || { echo "FAIL: $arg reached the driver without VGPU_HOST_GPU_ATOMICS: $(calls "rel_$arg")"; fails=1; }
+  n="$(grep -c '^host_gpu_refused: kernel=[^ ]* class=atomics insn=.' "$work/rel_$arg.err")"
+  (( n == 1 )) || { echo "FAIL: $arg: expected one host_gpu_refused line with class=atomics, got $n: $(grep -m2 '^host_gpu_refused' "$work/rel_$arg.err")"; fails=1; }
+  ra="$(sed -n 's/^host_gpu_refusals: .* refused_atomics=\([0-9]*\) .*/\1/p' "$work/rel_$arg.err" | tail -1)"
+  (( ${ra:-0} == 4 )) || { echo "FAIL: $arg: refused_atomics is ${ra:-missing}, not the 4 launches"; fails=1; }
+  diff -q "$work/off_$arg.out" "$work/rel_$arg.out" > /dev/null || { echo "FAIL: turbo mode changes the output of $arg"; fails=1; }
+  run "rela_$arg" "$arg" VGPU_HOST_GPU=turbo VGPU_HOST_GPU_ATOMICS=1 "${reach[@]}" || { echo "FAIL: the turbo $arg run with atomics failed"; fails=1; }
+  grep -q '^cuModuleLoadData$' "$work/rela_$arg.log" || { echo "FAIL: $arg did not reach the card path with VGPU_HOST_GPU_ATOMICS=1: $(calls "rela_$arg")"; fails=1; }
+  diff -q "$work/off_$arg.out" "$work/rela_$arg.out" > /dev/null || { echo "FAIL: VGPU_HOST_GPU_ATOMICS=1 changes the output of $arg"; fails=1; }
+done
+run rel_iatom iatom VGPU_HOST_GPU=turbo "${reach[@]}" || { echo "FAIL: the turbo iatom run failed"; fails=1; }
+grep -q '^cuModuleLoadData$' "$work/rel_iatom.log" || { echo "FAIL: an integer atomic did not reach the card path in turbo mode: $(calls rel_iatom); $(grep -m1 '^host_gpu_refused' "$work/rel_iatom.err")"; fails=1; }
+diff -q "$work/off_iatom.out" "$work/rel_iatom.out" > /dev/null || { echo "FAIL: turbo mode changes the output of iatom"; fails=1; }
+for pair in iatom:atomics mufu:mufu; do
+  arg="${pair%%:*}"; cls="${pair##*:}"
+  run "cls_$cls" "$arg" VGPU_HOST_GPU=turbo VGPU_HOST_GPU_TURBO_OFF="call,$cls" "${reach[@]}" || { echo "FAIL: the run with VGPU_HOST_GPU_TURBO_OFF=$cls failed"; fails=1; }
+  [[ ! -s "$work/cls_$cls.log" ]] || { echo "FAIL: $arg reached the driver with its class switched off: $(calls "cls_$cls")"; fails=1; }
+  grep -q '^host_gpu_refused: kernel=[^ ]* class=off insn=.' "$work/cls_$cls.err" || { echo "FAIL: no host_gpu_refused line with class=off for $arg"; fails=1; }
+  diff -q "$work/off_$arg.out" "$work/cls_$cls.out" > /dev/null || { echo "FAIL: VGPU_HOST_GPU_TURBO_OFF=$cls changes the output of $arg"; fails=1; }
+done
+# 13. values that cannot be read: the mode is off, said once, and the driver is never touched.
+bad() {   # <tag> <the message's text> [env...]
+  local tag=$1 text=$2
+  shift 2
+  run "$tag" mufu VGPU_QUIET=1 "${reach[@]}" "$@" || { echo "FAIL: the $tag run failed"; fails=1; }
+  [[ ! -s "$work/$tag.log" ]] || { echo "FAIL: $tag: the driver was reached: $(calls "$tag")"; fails=1; }
+  local n
+  n="$(grep -c "$text" "$work/$tag.err")"
+  (( n == 1 )) || { echo "FAIL: $tag: expected one line with '$text', got $n: $(grep -m2 host_gpu "$work/$tag.err")"; fails=1; }
+  grep -q 'mode off$' "$work/$tag.err" || { echo "FAIL: $tag: no 'mode off'"; fails=1; }
+  diff -q "$work/off_mufu.out" "$work/$tag.out" > /dev/null || { echo "FAIL: $tag changes the output"; fails=1; }
+}
+bad bad_atol 'VGPU_HOST_GPU_ATOL=-1e-6 is not a number' VGPU_HOST_GPU=turbo VGPU_HOST_GPU_ATOL=-1e-6
+bad bad_rtol 'VGPU_HOST_GPU_RTOL=1e-5x is not a number' VGPU_HOST_GPU=turbo VGPU_HOST_GPU_RTOL=1e-5x
+bad bad_off 'VGPU_HOST_GPU_TURBO_OFF: sfu is not a class' VGPU_HOST_GPU=turbo VGPU_HOST_GPU_TURBO_OFF=mufu,sfu
+bad bad_time 'VGPU_HOST_GPU_TIMEOUT=soon is not a number' VGPU_HOST_GPU=turbo VGPU_HOST_GPU_TIMEOUT=soon
+bad bad_type 'VGPU_HOST_GPU_TOL_TYPE=half is not auto, f32, f64 or f16' VGPU_HOST_GPU=turbo VGPU_HOST_GPU_TOL_TYPE=half
+bad bad_mode 'VGPU_HOST_GPU=approx is not a mode (off, exact or turbo)' VGPU_HOST_GPU=approx
+# (exact mode does not read turbo mode's tolerances: a bad one there is nobody's)
+run ex_atol big VGPU_HOST_GPU=exact VGPU_HOST_GPU_ATOL=-1 "${reach[@]}" || { echo "FAIL: the exact run with a turbo-only variable failed"; fails=1; }
+grep -q '^cuModuleLoadData$' "$work/ex_atol.log" || { echo "FAIL: exact mode was switched off by VGPU_HOST_GPU_ATOL"; fails=1; }
+# 14. verify by tolerance, against a card that computes nothing.
+run rel_ver mufu VGPU_QUIET=1 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_VERIFY=1 STUB_CARD_OK=1 "${reach[@]}" || { echo "FAIL: the turbo verify run failed"; tail -5 "$work/rel_ver.err"; fails=1; }
+diff -q "$work/off_mufu.out" "$work/rel_ver.out" > /dev/null || { echo "FAIL: turbo verify changes the output (the simulator's result is the program's)"; fails=1; }
+line="$(grep '^host_gpu_turbo:' "$work/rel_ver.err" | tail -1)"
+field() { echo "$line" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
+wc_="$(field words_compared)"; wd="$(field words_different)"; wo="$(field words_outside)"; ko="$(field kernels_outside)"; lc="$(field launches_card)"
+(( ${lc:-0} == 4 && ${wc_:-0} >= 4 * 262144 )) || { echo "FAIL: turbo verify compared ${wc_:-no} words over ${lc:-no} card launches: $line"; fails=1; }
+(( ${wo:-0} > 0 && ${wd:-0} >= ${wo:-0} && ${ko:-0} == 1 )) || { echo "FAIL: a card that computed nothing was not reported outside tolerance: $line"; fails=1; }
+n="$(grep -c '^host_gpu: verify .* outside tolerance' "$work/rel_ver.err")"
+(( n == 3 )) || { echo "FAIL: expected the first three launches outside tolerance to be listed without the log, got $n"; fails=1; }
+grep -Eq '^host_gpu: verify .*: [0-9]+ words compared, [0-9]+ different, [1-9][0-9]* outside tolerance, .* first outside at 0x[0-9a-f]+: card 0x[0-9a-f]{8} sim 0x[0-9a-f]{8}' "$work/rel_ver.err" || { echo "FAIL: the per-launch report has no first address: $(grep -m1 '^host_gpu: verify' "$work/rel_ver.err")"; fails=1; }
+grep -Eq '^host_gpu_outside: kernel=[^ ]+ words_compared=[0-9]+ words_different=[0-9]+ words_outside=[1-9][0-9]* max_abs=[^ ]+ max_rel=[^ ]+ first=0x[0-9a-f]+:card=0x[0-9a-f]{8}:sim=0x[0-9a-f]{8}$' "$work/rel_ver.err" || { echo "FAIL: no host_gpu_outside line"; fails=1; }
+grep -Eq '^host_gpu_verify: in_set_identical=0 in_set_different=4 other_identical=0 other_different=0$' "$work/rel_ver.err" || { echo "FAIL: turbo verify's host_gpu_verify line: $(grep '^host_gpu_verify' "$work/rel_ver.err")"; fails=1; }
+# ... and exact mode's verify of a kernel of its set is what it was: the stand-in's empty card differs, in 64 KiB chunks, with no tolerance report.
+run ex_ver big VGPU_HOST_GPU=exact VGPU_HOST_GPU_VERIFY=1 STUB_CARD_OK=1 "${reach[@]}" || { echo "FAIL: the exact verify run failed"; fails=1; }
+grep -Eq '^host_gpu: verify [^ ]+ \(in the exact set\): DIFFERENT, 64 KiB chunks: [0-9]+$' "$work/ex_ver.err" || { echo "FAIL: exact verify's per-launch line changed: $(grep -m1 '^host_gpu: verify' "$work/ex_ver.err")"; fails=1; }
+grep -q 'outside tolerance\|^host_gpu_turbo:\|^host_gpu_outside:' "$work/ex_ver.err" && { echo "FAIL: exact verify printed turbo mode's report"; fails=1; }
+# 15. a kernel that does not come back.
+t0=$SECONDS
+run hang mufu VGPU_HOST_GPU=turbo VGPU_HOST_GPU_TIMEOUT=1 STUB_CARD_OK=1 STUB_SYNC_MS=20000 "${reach[@]}"
+rc=$?
+(( rc == 124 )) || { echo "FAIL: a launch that hung on the card ended with status $rc, not 124"; tail -3 "$work/hang.err"; fails=1; }
+(( SECONDS - t0 < 15 )) || { echo "FAIL: the hung launch was waited for ($(( SECONDS - t0 )) s)"; fails=1; }
+grep -q 'has been on the card for more than 1 s (VGPU_HOST_GPU_TIMEOUT)' "$work/hang.err" || { echo "FAIL: no message for the hung launch"; fails=1; }
+# (a verify run, so that the launches do reach the stand-in's wait and the output is still the simulator's)
+run nohang mufu VGPU_HOST_GPU=turbo VGPU_HOST_GPU_VERIFY=1 VGPU_HOST_GPU_TIMEOUT=30 STUB_CARD_OK=1 STUB_SYNC_MS=50 "${reach[@]}" || { echo "FAIL: a launch inside its time limit ended the process"; tail -3 "$work/nohang.err"; fails=1; }
+grep -q '^cuLaunchKernel$' "$work/nohang.log" || { echo "FAIL: the run inside the time limit launched nothing on the stand-in card"; fails=1; }
+diff -q "$work/off_mufu.out" "$work/nohang.out" > /dev/null || { echo "FAIL: the time limit changes the output"; fails=1; }
+# 16. verify with contended atomics in the simulator.
+env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" hist > "$work/off_hist.out" 2> "$work/off_hist.err" || { echo "FAIL: the hist run with the mode off failed"; exit 1; }
+for m in exact turbo; do
+  for i in 1 2 3 4 5; do
+    run "hist_$m" hist VGPU_HOST_GPU=$m VGPU_HOST_GPU_VERIFY=1 STUB_CARD_OK=1 "${reach[@]}" || { echo "FAIL: the $m verify run of hist failed"; fails=1; }
+    diff -q "$work/off_hist.out" "$work/hist_$m.out" > /dev/null || { echo "FAIL: $m verify changes the sums of an integer reduction (run $i): the simulator lost updates"; fails=1; break; }
+  done
+  grep -q '^cuLaunchKernel$' "$work/hist_$m.log" || { echo "FAIL: the $m verify run of hist launched nothing on the stand-in card"; fails=1; }
+done
+# 17 to 20. the first blocks of a launch, timed (include/vgpu/host_gpu.hpp "The first blocks of a launch, timed"). VGPU_HOST_GPU_SAMPLE=always: this
+# program launches within milliseconds of its start, and by default a process that young is not delayed by a sample (step 20).
+sampled_of() { sed -n 's/^host_gpu_sampled: sampled=\([0-9]*\) sent=\([0-9]*\) .*/\1 \2/p' "$work/$1.err" | head -1; }
+smp=(VGPU_HOST_GPU=exact VGPU_HOST_GPU_SAMPLE=always VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 STUB_INIT_MS=50)
+# 17. a launch that its first blocks say is long is sent; the stand-in refuses the module, the simulator runs the launch, and the output is the mode-off
+# output (the kernel reads what it writes: a block the copy ran that showed in the program's memory would change the hashes).
+run smp_acct acct "${smp[@]}" VGPU_HOST_GPU_START_COST=0 || { echo "FAIL: the sampled run of acct failed"; tail -5 "$work/smp_acct.err"; fails=1; }
+read -r smp_n smp_sent <<< "$(sampled_of smp_acct)"
+(( ${smp_n:-0} >= 1 )) || { echo "FAIL: no launch of acct was sampled: $(grep host_gpu_sampled "$work/smp_acct.err")"; fails=1; }
+grep -q '^cuModuleLoadData$' "$work/smp_acct.log" || { echo "FAIL: the sampled launch of acct did not reach the card path: $(calls smp_acct)"; fails=1; }
+diff -q "$work/off_acct.out" "$work/smp_acct.out" > /dev/null || { echo "FAIL: a sampled launch that the card refused changes the output of acct"; fails=1; }
+# 18. the same against a card that keeps memory and computes nothing: the launch is sent, and the program reads the memory as it was before the launch:
+# the output of the program that launches nothing.
+env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" none > "$work/off_none.out" 2> "$work/off_none.err" || { echo "FAIL: the none run with the mode off failed"; exit 1; }
+run smp_nop acct "${smp[@]}" VGPU_HOST_GPU_START_COST=0 STUB_CARD_OK=1 STUB_KEEP_MEMORY=1 || { echo "FAIL: the sampled run of acct on a card that computes nothing failed"; tail -5 "$work/smp_nop.err"; fails=1; }
+read -r smp_n smp_sent <<< "$(sampled_of smp_nop)"
+(( ${smp_sent:-0} >= 1 )) || { echo "FAIL: the sampled launch of acct was not sent: $(grep host_gpu_sampled "$work/smp_nop.err")"; fails=1; }
+diff -q "$work/off_none.out" "$work/smp_nop.out" > /dev/null || { echo "FAIL: a sampled launch sent to a card that computes nothing does not leave the memory as it was before the launch"; fails=1; }
+diff -q "$work/off_acct.out" "$work/smp_nop.out" > /dev/null && { echo "FAIL: the run on a card that computes nothing printed the simulator's results: nothing was sent"; fails=1; }
+# 19. a launch that its first blocks say is short stays, and the driver is never touched (the default start cost: nothing here repays 0.25 s).
+run smp_big big "${smp[@]}" || { echo "FAIL: the sampled run of big failed"; tail -5 "$work/smp_big.err"; fails=1; }
+read -r smp_n smp_sent <<< "$(sampled_of smp_big)"
+(( ${smp_n:-0} >= 1 && ${smp_sent:-1} == 0 )) || { echo "FAIL: big: expected a sampled launch and none sent: $(grep host_gpu_sampled "$work/smp_big.err")"; fails=1; }
+[[ ! -s "$work/smp_big.log" ]] || { echo "FAIL: a short launch reached the driver after its sample: $(calls smp_big)"; fails=1; }
+diff -q "$work/off_big.out" "$work/smp_big.out" > /dev/null || { echo "FAIL: sampling changes the output of big"; fails=1; }
+# 20. by default a process this young is not sampled at all; and `log` samples but sends nothing, even a launch worth sending.
+run smp_young acct VGPU_HOST_GPU=exact VGPU_HOST_GPU_SAMPLE=1 VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=1000 || { echo "FAIL: the default run of acct failed"; fails=1; }
+read -r smp_n smp_sent <<< "$(sampled_of smp_young)"
+[[ "${smp_n:-x}" == 0 ]] || { echo "FAIL: a process a few milliseconds old was sampled: $(grep host_gpu_sampled "$work/smp_young.err")"; fails=1; }
+run smp_log acct VGPU_HOST_GPU=exact VGPU_HOST_GPU_SAMPLE=log VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=1000 || { echo "FAIL: the log run of acct failed"; fails=1; }
+grep -q '^host_gpu_sample: ' "$work/smp_log.err" || { echo "FAIL: VGPU_HOST_GPU_SAMPLE=log printed no host_gpu_sample line"; fails=1; }
+[[ ! -s "$work/smp_log.log" ]] || { echo "FAIL: a log run reached the driver: $(calls smp_log)"; fails=1; }
+diff -q "$work/off_acct.out" "$work/smp_log.out" > /dev/null || { echo "FAIL: the log run changes the output of acct"; fails=1; }
+# 21 to 23. progress inside the blocks (include/vgpu/host_gpu.hpp "progress inside a block"): `few` is 8 blocks of 256 threads, each looping 32,768 times.
+inside_of() { grep '^host_gpu_sample: ' "$work/$1.err" | grep -c ' inside=1 '; }
+for arg in few fewshort fewnone; do
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" "$arg" > "$work/off_$arg.out" 2> "$work/off_$arg.err" || { echo "FAIL: the $arg run with the mode off failed"; exit 1; }
+done
+run in_few few "${smp[@]}" VGPU_HOST_GPU_START_COST=0 || { echo "FAIL: the sampled run of few failed"; tail -5 "$work/in_few.err"; fails=1; }
+read -r smp_n smp_sent <<< "$(sampled_of in_few)"
+(( ${smp_n:-0} >= 1 && $(inside_of in_few) >= 1 )) || { echo "FAIL: no launch of few was sampled inside its blocks: $(grep -E 'host_gpu_sampled|host_gpu_sample:' "$work/in_few.err" | head -3)"; fails=1; }
+grep -q '^cuModuleLoadData$' "$work/in_few.log" || { echo "FAIL: the launch of few sampled inside its blocks did not reach the card path: $(calls in_few)"; fails=1; }
+diff -q "$work/off_few.out" "$work/in_few.out" > /dev/null || { echo "FAIL: a launch sampled inside its blocks that the card refused changes the output of few"; fails=1; }
+run in_nop few "${smp[@]}" VGPU_HOST_GPU_START_COST=0 STUB_CARD_OK=1 STUB_KEEP_MEMORY=1 || { echo "FAIL: the run of few on a card that computes nothing failed"; tail -5 "$work/in_nop.err"; fails=1; }
+read -r smp_n smp_sent <<< "$(sampled_of in_nop)"
+(( ${smp_sent:-0} >= 1 )) || { echo "FAIL: the launch of few sampled inside its blocks was not sent: $(grep host_gpu_sampled "$work/in_nop.err")"; fails=1; }
+diff -q "$work/off_fewnone.out" "$work/in_nop.out" > /dev/null || { echo "FAIL: a launch sampled inside its blocks and sent to a card that computes nothing does not leave the memory as it was"; fails=1; }
+run in_short fewshort "${smp[@]}" || { echo "FAIL: the sampled run of fewshort failed"; tail -5 "$work/in_short.err"; fails=1; }
+read -r smp_n smp_sent <<< "$(sampled_of in_short)"
+(( ${smp_n:-0} >= 1 && ${smp_sent:-1} == 0 && $(inside_of in_short) >= 1 )) || { echo "FAIL: fewshort: expected a launch sampled inside its blocks and none sent: $(grep -E 'host_gpu_sampled|host_gpu_sample:' "$work/in_short.err" | head -3)"; fails=1; }
+[[ ! -s "$work/in_short.log" ]] || { echo "FAIL: a short launch sampled inside its blocks reached the driver: $(calls in_short)"; fails=1; }
+diff -q "$work/off_fewshort.out" "$work/in_short.out" > /dev/null || { echo "FAIL: sampling inside the blocks changes the output of fewshort"; fails=1; }
 (( fails == 0 )) && { echo "PASS: first launch $first ms against a driver start of $init_ms ms; driver calls in the big run: $(calls on_big)"; exit 0; }
 exit 1

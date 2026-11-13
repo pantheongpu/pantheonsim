@@ -1,0 +1,29 @@
+== COVAR exact
+host_gpu: _Z12covar_kerneliiPfS_: sent by the time of its first blocks (18.488 s in the simulator, at least)
+host_gpu: _Z12covar_kerneliiPfS_ on the card (resident): kernel 1656.135 ms, total 1670.956 ms (sim estimate 18488.207 ms), 32.01 MiB pushed
+host_gpu_sample: kernel=_Z12covar_kerneliiPfS_ blocks=8 threads_per_block=256 instrs=136 back_edge=1 loop=1 whole_samples=0 live_bytes=33562624 static_s=0.000087 age_s=0.055221 affordable=1 answered=1 ran=8 first_block_s=0.007836 timed_s=0.007888 cost_s=0.009697 fork_s=0.001470 threads=4 estimate_s=18.488207 would_send=1 launch_s=-1 inside=1 bound_turns=2048 followed=64 unfollowed=0 read_steps=1408 read_turns=66560 measure_steps=97915 measure_turns=7 measure_s=0.007777 left=0 per_turn=13987.9 step_ns=79.431
+host_gpu: 1 launches ran on the card, 2 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu_turbo: mode=exact launches_card=1 launches_sim=2 card_s=1.670991 sim_s=0.026662 words_compared=0 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+host_gpu_sampled: sampled=1 sent=1 timeouts=0 cost_s=0.009697 after_driver=0 copies_running_at_exit=0 copies_left=0
+== COVAR turbo
+host_gpu: _Z12covar_kerneliiPfS_: sent by the time of its first blocks (18.356 s in the simulator, at least)
+host_gpu: _Z12covar_kerneliiPfS_ on the card (resident): kernel 1656.412 ms, total 1671.324 ms (sim estimate 18355.819 ms), 32.01 MiB pushed
+host_gpu_sample: kernel=_Z12covar_kerneliiPfS_ blocks=8 threads_per_block=256 instrs=136 back_edge=1 loop=1 whole_samples=0 live_bytes=33562624 static_s=0.000087 age_s=0.056869 affordable=1 answered=1 ran=8 first_block_s=0.007778 timed_s=0.007828 cost_s=0.009616 fork_s=0.001481 threads=4 estimate_s=18.355819 would_send=1 launch_s=-1 inside=1 bound_turns=2048 followed=64 unfollowed=0 read_steps=1408 read_turns=66560 measure_steps=97915 measure_turns=7 measure_s=0.007722 left=0 per_turn=13987.9 step_ns=78.862
+host_gpu: 1 launches ran on the card, 2 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu_turbo: mode=turbo launches_card=1 launches_sim=2 card_s=1.671357 sim_s=0.028206 words_compared=0 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+host_gpu_sampled: sampled=1 sent=1 timeouts=0 cost_s=0.009616 after_driver=0 copies_running_at_exit=0 copies_left=0
+== CORR exact
+host_gpu: _Z11corr_kerneliiPfS_: sent by the time of its first blocks (29.751 s in the simulator, at least)
+host_gpu: _Z11corr_kerneliiPfS_ on the card (resident): kernel 1655.566 ms, total 1670.596 ms (sim estimate 29750.700 ms), 32.02 MiB pushed
+host_gpu_sample: kernel=_Z11corr_kerneliiPfS_ blocks=8 threads_per_block=256 instrs=144 back_edge=1 loop=1 whole_samples=0 live_bytes=33570816 static_s=0.000092 age_s=0.207612 affordable=1 answered=1 ran=1 first_block_s=0.012265 timed_s=0.012265 cost_s=0.014157 fork_s=0.001513 threads=4 estimate_s=29.750700 would_send=1 launch_s=-1 inside=1 bound_turns=2048 followed=8 unfollowed=0 read_steps=48880 read_turns=15480 measure_steps=97880 measure_turns=8 measure_s=0.007686 left=0 per_turn=12235.0 step_ns=78.520
+host_gpu: 1 launches ran on the card, 3 in the simulator (3 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu_turbo: mode=exact launches_card=1 launches_sim=3 card_s=1.670631 sim_s=0.178084 words_compared=0 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+host_gpu_sampled: sampled=1 sent=1 timeouts=0 cost_s=0.014157 after_driver=0 copies_running_at_exit=0 copies_left=0
+== CORR turbo
+host_gpu_sample: kernel=_Z13reduce_kerneliiPfS_S_ blocks=16384 threads_per_block=256 instrs=152 back_edge=1 loop=1 whole_samples=0 live_bytes=33570816 static_s=0.199229 age_s=0.061610 affordable=1 answered=1 ran=32 first_block_s=0.000225 timed_s=0.001103 cost_s=0.004924 fork_s=0.001405 threads=4 estimate_s=0.141238 would_send=0 launch_s=0.145857 inside=0 bound_turns=0 followed=0 unfollowed=0 read_steps=0 read_turns=0 measure_steps=0 measure_turns=0 measure_s=0.000000 left=0 per_turn=0.0 step_ns=0.000
+host_gpu: _Z11corr_kerneliiPfS_: sent by the time of its first blocks (31.120 s in the simulator, at least)
+host_gpu: _Z11corr_kerneliiPfS_ on the card (resident): kernel 1655.040 ms, total 1670.480 ms (sim estimate 31119.548 ms), 32.02 MiB pushed
+host_gpu_sample: kernel=_Z11corr_kerneliiPfS_ blocks=8 threads_per_block=256 instrs=144 back_edge=1 loop=1 whole_samples=0 live_bytes=33570816 static_s=0.000092 age_s=0.212786 affordable=1 answered=1 ran=1 first_block_s=0.012519 timed_s=0.012519 cost_s=0.014239 fork_s=0.001366 threads=4 estimate_s=31.119548 would_send=1 launch_s=-1 inside=1 bound_turns=2048 followed=8 unfollowed=0 read_steps=48880 read_turns=15480 measure_steps=97880 measure_turns=8 measure_s=0.008039 left=0 per_turn=12235.0 step_ns=82.133
+host_gpu: 1 launches ran on the card, 3 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu_turbo: mode=turbo launches_card=1 launches_sim=3 card_s=1.670512 sim_s=0.178788 words_compared=0 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+host_gpu_sampled: sampled=2 sent=1 timeouts=0 cost_s=0.019164 after_driver=0 copies_running_at_exit=0 copies_left=0

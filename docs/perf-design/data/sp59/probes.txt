@@ -1,0 +1,54 @@
+card: NVIDIA A10G (sm_86), toolkit: Build cuda_13.0.r13.0/compiler.36424714_0
+RESULT kind=imax part=sums runs=8 repeats=7 words=512 max_words_different=0 max_ulp=0
+RESULT kind=imax part=seen runs=8 repeats=7 words=4194304 max_words_different=0 max_ulp=0
+VERDICT kind=imax repeats
+RESULT kind=iadd part=sums runs=8 repeats=7 words=512 max_words_different=0 max_ulp=0
+RESULT kind=iadd part=seen runs=8 repeats=0 words=4194304 max_words_different=4170784 max_ulp=495
+VERDICT kind=iadd varies
+RESULT kind=fred part=sums runs=8 repeats=0 words=512 max_words_different=242 max_ulp=17
+RESULT kind=fred part=seen runs=8 repeats=7 words=4194304 max_words_different=0 max_ulp=0
+VERDICT kind=fred varies
+RESULT kind=fatom part=sums runs=8 repeats=0 words=512 max_words_different=228 max_ulp=13
+RESULT kind=fatom part=seen runs=8 repeats=0 words=4194304 max_words_different=4194264 max_ulp=1164359374
+VERDICT kind=fatom varies
+RESULT kind=dadd part=sums runs=8 repeats=0 words=256 max_words_different=246 max_ulp=23
+RESULT kind=dadd part=seen runs=8 repeats=7 words=4194304 max_words_different=0 max_ulp=0
+VERDICT kind=dadd varies
+RESULT kind=cas part=sums runs=8 repeats=0 words=512 max_words_different=256 max_ulp=23040
+RESULT kind=cas part=seen runs=8 repeats=0 words=4194304 max_words_different=4194304 max_ulp=23712
+VERDICT kind=cas varies
+RESULT kind=exch part=sums runs=8 repeats=0 words=512 max_words_different=256 max_ulp=6656
+RESULT kind=exch part=seen runs=8 repeats=0 words=4194304 max_words_different=4176256 max_ulp=125440
+VERDICT kind=exch varies
+card: NVIDIA A10G (sm_86), toolkit: Build cuda_13.0.r13.0/compiler.36424714_0
+card: NVIDIA A10G (sm_86), toolkit: Build cuda_13.0.r13.0/compiler.36424714_0
+RESULT op=sin tested=4294967296 differ=4100660130 max_ulp=4294967295 first=0x01c90fdc:card=0x00000000:sim=0x01c90fdb share=95.476% outside_tol=1973810306 max_abs=1 ordinary_outside_tol=189088948 ordinary_max_abs=3.57627869e-07
+RESULT op=cos tested=4294967296 differ=1959021478 max_ulp=4294967295 first=0x35afede0:card=0x3f7fffff:sim=0x3f800000 share=45.612% outside_tol=1361487864 max_abs=2 ordinary_outside_tol=1553340 ordinary_max_abs=3.57627869e-07
+RESULT op=tanh tested=4294967296 differ=239361664 max_ulp=134 first=0x39b89ba4:card=0x39b89ba4:sim=0x39b89ba3 share=5.573% outside_tol=86770 max_abs=7.9870224e-06 ordinary_outside_tol=86770 ordinary_max_abs=7.9870224e-06
+TENSOR wmma_gemm rtol=1e-5: launches_card=4 launches_sim=4 card_s=0.000829 sim_s=0.001035 words_compared=3840 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+TENSOR wmma_gemm rtol=1e-5: host_gpu_verify: in_set_identical=4 in_set_different=0 other_identical=0 other_different=0
+TENSOR wmma_gemm rtol=1e-5 output: same
+TENSOR wmma_gemm rtol=2e-3: launches_card=4 launches_sim=4 card_s=0.000824 sim_s=0.001024 words_compared=3840 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+TENSOR wmma_gemm rtol=2e-3: host_gpu_verify: in_set_identical=4 in_set_different=0 other_identical=0 other_different=0
+TENSOR wmma_gemm rtol=2e-3 output: same
+TENSOR wmma_gemm rtol=f16: launches_card=4 launches_sim=4 card_s=0.000832 sim_s=0.001053 words_compared=3840 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+TENSOR wmma_gemm rtol=f16: host_gpu_verify: in_set_identical=4 in_set_different=0 other_identical=0 other_different=0
+TENSOR wmma_gemm rtol=f16 output: same
+TENSOR wmma_types rtol=1e-5: launches_card=21 launches_sim=21 card_s=0.002690 sim_s=0.002174 words_compared=11968 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+TENSOR wmma_types rtol=1e-5: host_gpu_verify: in_set_identical=19 in_set_different=0 other_identical=2 other_different=0
+TENSOR wmma_types rtol=1e-5 output: same
+TENSOR wmma_types rtol=2e-3: launches_card=21 launches_sim=21 card_s=0.002761 sim_s=0.002207 words_compared=11968 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+TENSOR wmma_types rtol=2e-3: host_gpu_verify: in_set_identical=19 in_set_different=0 other_identical=2 other_different=0
+TENSOR wmma_types rtol=2e-3 output: same
+TENSOR wmma_types rtol=f16: launches_card=21 launches_sim=21 card_s=0.002695 sim_s=0.002132 words_compared=11968 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+TENSOR wmma_types rtol=f16: host_gpu_verify: in_set_identical=19 in_set_different=0 other_identical=2 other_different=0
+TENSOR wmma_types rtol=f16 output: same
+TENSOR mma_forms rtol=1e-5: launches_card=369 launches_sim=369 card_s=0.019299 sim_s=0.018436 words_compared=188928 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+TENSOR mma_forms rtol=1e-5: host_gpu_verify: in_set_identical=351 in_set_different=0 other_identical=18 other_different=0
+TENSOR mma_forms rtol=1e-5 output: same
+TENSOR mma_forms rtol=2e-3: launches_card=369 launches_sim=369 card_s=0.019916 sim_s=0.019239 words_compared=188928 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+TENSOR mma_forms rtol=2e-3: host_gpu_verify: in_set_identical=351 in_set_different=0 other_identical=18 other_different=0
+TENSOR mma_forms rtol=2e-3 output: same
+TENSOR mma_forms rtol=f16: launches_card=369 launches_sim=369 card_s=0.019607 sim_s=0.018983 words_compared=188928 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+TENSOR mma_forms rtol=f16: host_gpu_verify: in_set_identical=351 in_set_different=0 other_identical=18 other_different=0
+TENSOR mma_forms rtol=f16 output: same

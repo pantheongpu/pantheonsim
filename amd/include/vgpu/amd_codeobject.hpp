@@ -45,6 +45,9 @@ struct Kernel {
   uint32_t kernarg_align = 8;
   uint32_t group_segment = 0;             // LDS the kernel reserves, bytes
   uint32_t private_segment = 0;           // scratch per work-item, bytes
+  // The kernel's stack grows past private_segment at run time (recursion, indirect or virtual calls): kernel_code_properties
+  // bit 11, .amdhsa_uses_dynamic_stack. ROCm's HIP then gives each work-item the device's stack size (Dispatch::private_segment).
+  bool uses_dynamic_stack = false;
   uint32_t sgpr_count = 0, vgpr_count = 0, agpr_count = 0;
   uint32_t max_flat_workgroup_size = 0;
   // gfx1250: the cluster the kernel was built for, in work-groups per dimension (.cluster_dims; 1, 1, 1: none).

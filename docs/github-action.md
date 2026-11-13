@@ -83,6 +83,7 @@ and 4 when the program did not run at all (`vgpu test --help`).
 | `rocm` | `7.1` for AMD, `none` for NVIDIA | The ROCm version whose `hipcc` to install -- `6.4`, `7.0`, `7.1` and `7.2` are the releases whose programs are checked on the simulator; `none` uses one the job already installed |
 | `library-path` | `true` | Puts the simulator's libraries on `LD_LIBRARY_PATH`, so programs run directly (ctest, scripts) as well as under `vgpu run`. Set `false` when the build links the toolkit's own vendor libraries (see below) |
 | `prebuilt` | `true` | Uses the release's prebuilt simulator when there is one for this runner and toolkit and its sha256 matches; `false` always builds from source |
+| `huge-pages` | `true` | On a GitHub-hosted runner whose transparent huge pages are `madvise` (as they ship), sets them to `always` for the job when sudo works, so the simulated program's own memory gets 2 MiB pages too; the step says what it did and never fails on it. Self-hosted runners are left alone; `false` leaves the setting as it is |
 
 ## Outputs
 

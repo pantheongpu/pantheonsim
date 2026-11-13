@@ -1,0 +1,8 @@
+# strace -f -T of the spawn calls of one cold VGPU_JIT=1 run of rodinia/hotspot (two compiler-identity queries), seconds in the call: fork (base) against vfork (an intermediate build; vfork was not kept)
+bbase run1: <0.000231> <0.000206>   rss=9
+bbase run2: <0.000249> <0.000299>   rss=9
+bbase run3: <0.000240> <0.000198>   rss=9
+bnew run1: <0.001547> <0.001744>   rss=9
+bnew run2: <0.001307> <0.001353>   rss=9
+bnew run3: <0.001742> <0.001581>   rss=9
+

@@ -4,7 +4,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <algorithm>
+#include <initializer_list>
+#include <map>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -13,12 +17,15 @@
 
 using namespace vgpu::hostgpu;
 
-VTEST(mode_is_exact_or_off) {
+VTEST(mode_is_exact_turbo_or_off) {
   VCHECK(mode_from_text("exact") == Mode::Exact);
+  VCHECK(mode_from_text("turbo") == Mode::Turbo);
   VCHECK(mode_from_text(nullptr) == Mode::Off);
   VCHECK(mode_from_text("") == Mode::Off);
-  VCHECK(mode_from_text("approx") == Mode::Off);   // not built: a typo must not turn a mode on
+  VCHECK(mode_from_text("approx") == Mode::Off);   // not a mode: a typo must not turn one on
   VCHECK(mode_from_text("EXACT") == Mode::Off);
+  VCHECK(mode_from_text("TURBO") == Mode::Off);
+  VCHECK(mode_from_text("turbo ") == Mode::Off);
   VCHECK(mode_from_text("1") == Mode::Off);
 }
 
@@ -39,6 +46,13 @@ VTEST(exact_set_refuses_what_differed_in_the_spike) {
   VCHECK(!exact_opcode_allowed("RED", {"E", "ADD", "F64"}));
   VCHECK(!exact_opcode_allowed("RED", {"E", "CAS"}));
   VCHECK(!exact_opcode_allowed("RED", {"E", "EXCH"}));
+  // ... in the decoder's own spelling, where the type and its rounding are one modifier (src/sass/decode.cpp kAtomType, dec_atom_f)
+  VCHECK(!exact_opcode_allowed("RED", {"E", "ADD", "F32.FTZ.RN", "STRONG", "GPU"}));
+  VCHECK(!exact_opcode_allowed("RED", {"E", "ADD", "F64.RN", "STRONG", "GPU"}));
+  VCHECK(!exact_opcode_allowed("RED", {"E", "ADD", "F16x2.RN"}));
+  VCHECK(!exact_opcode_allowed("RED", {"ADD", "F32x4.FTZ.RN"}) && !exact_opcode_allowed("RED", {"MAX", "BF16x2.RN"}));
+  VCHECK(!exact_opcode_allowed("RED", {"E.ADD.FTZ"}) && !exact_opcode_allowed("RED", {"S32.CAS"}) && exact_opcode_allowed("RED", {"E.ADD.S32"}));   // every part of a joined modifier is read
+  VCHECK(exact_opcode_allowed("RED", {"E", "ADD", "S32", "STRONG", "GPU"}) && exact_opcode_allowed("RED", {"E", "MIN", "64"}) && exact_opcode_allowed("RED", {"E", "OR", "S64", "WEAK", "SYS"}));
   VCHECK(!exact_opcode_allowed("", {}));
   VCHECK(!exact_opcode_allowed("imad", {}));   // names are SASS's, upper case; an unknown spelling is unknown
 }
@@ -631,6 +645,7 @@ static CodeInsn ci(K kind, uint64_t pc, int64_t target = -1, int src0 = -1, int 
 // main line: ... MUFU.RCP R8, R3 ; FCHK P0, R0, R3 ; FFMA x5 ; @!P0 BRA ; MOV ; CALL -> slow ; ... EXIT ; slow: ALU..., MUFU.RCP R8, R3, ALU..., RET
 static std::vector<CodeInsn> division_kernel() {
   std::vector<CodeInsn> c;
+  c.reserve(64);   // (GCC 13 at -O3 warns of a write past the end in the growth path of push_back here, a false positive under -Werror)
   uint64_t pc = 0;
   const auto add = [&](K k, int64_t target = -1, int s0 = -1, int s1 = -1) { c.push_back(ci(k, pc, target, s0, s1)); pc += 16; };
   add(K::Other);                    // LDG is Memory only inside a subroutine: here it is the kernel's own load
@@ -771,7 +786,8 @@ VTEST(idiom_classification_by_mnemonic) {
 // The start-up refusals (08 section 3): a mode value that is not a mode is said, and every diagnostic that only the simulator gives switches the mode off.
 VTEST(mode_text_known_and_diagnostic_switches) {
   VCHECK(mode_text_is_known(nullptr) && mode_text_is_known("") && mode_text_is_known("off") && mode_text_is_known("exact") && mode_text_is_known("0"));
-  VCHECK(!mode_text_is_known("approx") && !mode_text_is_known("EXACT") && !mode_text_is_known("on") && !mode_text_is_known("1"));
+  VCHECK(mode_text_is_known("turbo"));
+  VCHECK(!mode_text_is_known("approx") && !mode_text_is_known("EXACT") && !mode_text_is_known("on") && !mode_text_is_known("1") && !mode_text_is_known("Turbo"));
   for (const char* v : kIncompatibleVars) {
     const std::string name(v);
     VCHECK(!diagnostic_switched_on(name, nullptr));
@@ -791,6 +807,949 @@ VTEST(mode_text_known_and_diagnostic_switches) {
     if (!found) std::fprintf(stderr, "%s is not in kIncompatibleVars\n", m);
     VCHECK(found);
   }
+}
+
+// ---- turbo mode (docs/perf-design/12-host-gpu-turbo.md) -------------------------------------------------------------------------------------
+
+// Exact mode is what it was: the mnemonics it takes are this list and no other name the decoder can print. The list is a copy made when turbo mode
+// was added; a change to exact_mnemonic_allowed has to change it here too, on purpose.
+VTEST(exact_set_is_the_list_it_was_before_turbo_mode) {
+  const std::set<std::string> frozen = {
+      "IMAD", "IADD3", "IADD", "LOP3", "LOP", "LEA", "SHF", "SHL", "SHR", "ISETP", "IMNMX", "IABS", "POPC", "FLO", "BREV", "PRMT", "SEL", "MOV", "R2P", "P2R",
+      "PLOP3", "UPLOP3", "PSETP", "ISET", "FSET", "DSET", "I2I", "I2IP", "SGXT", "BMSK", "VIADD", "VIMNMX", "FADD", "FMUL", "FFMA", "FSETP", "FSEL", "FMNMX",
+      "DADD", "DMUL", "DFMA", "DSETP", "DMNMX", "I2F", "I2FP", "F2I", "F2F", "F2FP", "FRND", "FCHK", "LDG", "STG", "LDS", "STS", "LDL", "STL", "LD", "ST",
+      "LDC", "ULDC", "S2R", "S2UR", "CS2R", "UMOV", "UIADD3", "UIMAD", "ULOP3", "USHF", "ULEA", "UISETP", "USEL", "UPRMT", "UFLO", "UPOPC", "UP2UR", "R2UR",
+      "VOTEU", "BRA", "BRX", "BSSY", "BSYNC", "BREAK", "BMOV", "EXIT", "NOP", "YIELD", "WARPSYNC", "BAR", "MEMBAR", "ERRBAR", "DEPBAR", "CCTL", "SHFL", "VOTE",
+      "MATCH", "RED"};
+  VCHECK_EQ(frozen.size(), size_t{96});
+  for (const std::string& m : frozen) VCHECK(exact_opcode_allowed(m, {}));
+  // every instruction the decoder knows, and a few names it does not
+  std::vector<std::string> names = {"REDG", "OMMA", "VPRINTF", "", "imad", "MUFU.RCP"};
+#define VGPU_SASS_OP(name) names.push_back(#name);
+#include "vgpu/sass/ops.inc"
+#undef VGPU_SASS_OP
+  VCHECK(names.size() > 150);
+  unsigned taken = 0;
+  for (const std::string& m : names) {
+    const bool want = frozen.count(m) != 0;
+    if (exact_opcode_allowed(m, {}) != want) std::fprintf(stderr, "%s: exact mode %s it\n", m.c_str(), want ? "no longer takes" : "now takes");
+    VCHECK_EQ(exact_opcode_allowed(m, {}), want);
+    taken += want;
+  }
+  VCHECK_EQ(taken, 89u);   // (the other 7 are spellings that are no instruction of the decoder: LOP, SHL, SHR, ISET, DSET, DMNMX, PSETP)
+  // RED's modifiers, as before
+  for (const char* bad : {"F16", "F32", "F64", "BF16", "FTZ", "CAS", "EXCH", "INC", "DEC", "SPIN", "CAST", "POPC"}) VCHECK(!exact_opcode_allowed("RED", {"E", bad}));
+  for (const char* good : {"E", "ADD", "MIN", "MAX", "AND", "OR", "XOR", "S32", "64", "S64", "STRONG", "GPU"}) VCHECK(exact_opcode_allowed("RED", {good}));
+}
+
+VTEST(turbo_classes_every_kind_of_instruction) {
+  using C = InsnClass;
+  // exact: whatever the exact set takes
+  for (const char* m : {"IMAD", "FFMA", "DFMA", "LDG", "STG", "BAR", "BRA", "EXIT", "SHFL", "FCHK", "S2R"}) VCHECK(turbo_class(m, {}) == C::Exact);
+  VCHECK(turbo_class("RED", {"E", "ADD", "STRONG", "GPU"}) == C::Exact);
+  // approximate
+  for (const char* f : {"COS", "SIN", "EX2", "LG2", "RCP", "RSQ", "RCP64H", "RSQ64H", "SQRT", "TANH"}) VCHECK(turbo_class("MUFU", {f}) == C::Mufu);
+  VCHECK(turbo_class("MUFU", {"(10)"}) == C::Never);   // a function the decoder cannot name
+  for (const char* m : {"HADD2", "HMUL2", "HFMA2", "HSETP2", "HSET2", "HMNMX2"}) VCHECK(turbo_class(m, {}) == C::Half);
+  VCHECK(turbo_class("HFMA2", {"MMA"}) == C::Half);
+  VCHECK(turbo_class("CALL", {"REL", "NOINC"}) == C::Call);
+  VCHECK(turbo_class("RET", {"REL", "NODEC"}) == C::Call);
+  // the decoder's own spellings of a float reduction: the type is ONE modifier, "F32.FTZ.RN"
+  VCHECK(turbo_class("RED", {"E", "ADD", "F32.FTZ.RN", "STRONG", "GPU"}) == C::FloatRed);
+  VCHECK(turbo_class("RED", {"E", "ADD", "F64.RN", "STRONG", "GPU"}) == C::FloatRed);
+  VCHECK(turbo_class("RED", {"E", "ADD", "F16x2.RN"}) == C::FloatRed);
+  VCHECK(turbo_class("REDG", {"E", "ADD", "F32x2.FTZ.RN"}) == C::FloatRed);
+  VCHECK(turbo_class("REDG", {"E", "MAX", "BF16x4.RN"}) == C::FloatRed);
+  VCHECK(turbo_class("RED", {"E", "ADD", "F32", "FTZ", "RN"}) == C::FloatRed);   // and split
+  // the two modes agree on what a float reduction is: exact refuses exactly the reductions turbo does not class as exact
+  for (const std::vector<std::string>& mods : std::vector<std::vector<std::string>>{{"E", "ADD", "F32.FTZ.RN"}, {"E", "ADD", "F64.RN"}, {"ADD", "F16x2.RN"}, {"E", "INC"}, {"E", "EXCH"},
+                                                                                     {"E", "ADD"}, {"E", "MAX", "S32"}, {"E", "AND", "64"}})
+    VCHECK_EQ(exact_opcode_allowed("RED", mods), turbo_class("RED", mods) == C::Exact);
+  VCHECK(turbo_class("REDG", {"E", "ADD", "STRONG", "GPU"}) == C::Extra);
+  VCHECK(turbo_class("RED", {"E", "INC"}) == C::AtomInt);
+  VCHECK(turbo_class("RED", {"E", "EXCH"}) == C::AtomSwap);
+  // tensor
+  for (const char* m : {"HMMA", "IMMA", "DMMA"}) VCHECK(turbo_class(m, {"16816", "F32"}) == C::Tensor);
+  // atomics
+  for (const char* m : {"ATOM", "ATOMG", "ATOMS"}) {
+    for (const char* op : {"ADD", "MIN", "MAX", "INC", "DEC", "AND", "OR", "XOR"}) {
+      VCHECK(turbo_class(m, {"E", op}) == C::AtomInt);
+      VCHECK(turbo_class(m, {"E", op, "S32"}) == C::AtomInt);
+      VCHECK(turbo_class(m, {op, "64", "STRONG", "GPU"}) == C::AtomInt);
+    }
+    VCHECK(turbo_class(m, {"E", "ADD", "F32.FTZ.RN"}) == C::AtomFloat);
+    VCHECK(turbo_class(m, {"E", "ADD", "F64.RN"}) == C::AtomFloat);
+    VCHECK(turbo_class(m, {"E", "MIN", "F16x2.RN"}) == C::AtomFloat);
+    VCHECK(turbo_class(m, {"E", "CAS", "STRONG", "GPU"}) == C::AtomSwap);
+    VCHECK(turbo_class(m, {"CAST", "SPIN", "64"}) == C::AtomSwap);
+    VCHECK(turbo_class(m, {"E", "EXCH"}) == C::AtomSwap);
+    VCHECK(turbo_class(m, {"E", "EXCH", "F32.FTZ.RN"}) == C::AtomSwap);   // an exchange is an exchange whatever its type
+    VCHECK(turbo_class(m, {"E", "(9)"}) == C::Never);
+  }
+  VCHECK(turbo_class("ATOMS", {"POPC", "INC", "32"}) == C::AtomInt);
+  VCHECK(turbo_class("ATOMS", {"ARRIVE", "64"}) == C::Never);
+  // extra: named one by one
+  for (const char* m : {"IDP", "VABSDIFF", "VABSDIFF4", "VIADDMNMX", "VIMNMX3", "FMNMX3", "F2IP", "FSWZADD", "REDUX", "LDGSTS", "LDGDEPBAR", "LDSM", "MOVM",
+                        "FFMA2", "FMUL2", "FADD2"})
+    VCHECK(turbo_class(m, {}) == C::Extra);
+  // never: textures, surfaces, what nobody named, what is not an instruction
+  for (const char* m : {"TEX", "TLD", "TLD4", "TXD", "SULD", "SUST", "QMMA", "BMMA", "OMMA", "HGMMA", "JMP", "NANOSLEEP", "BPT", "SYNCS", "STSM", "UTCMMA",
+                        "LDTM", "STTM", "UTMALDG", "VPRINTF", "", "mufu", "Unknown"})
+    VCHECK(turbo_class(m, {}) == C::Never);
+}
+
+// Every instruction the decoder knows has a class, and the classes of the ones turbo mode adds are the ones the doc lists: a new instruction in ops.inc is
+// Never until someone names it here and there.
+VTEST(turbo_whitelist_covers_the_decoder_and_nothing_unnamed) {
+  std::vector<std::string> names;
+#define VGPU_SASS_OP(name) names.push_back(#name);
+#include "vgpu/sass/ops.inc"
+#undef VGPU_SASS_OP
+  std::map<InsnClass, unsigned> n;
+  for (const std::string& m : names) ++n[turbo_class(m, {})];
+  VCHECK_EQ(n[InsnClass::Mufu], 1u);
+  VCHECK_EQ(n[InsnClass::Half], 6u);
+  VCHECK_EQ(n[InsnClass::Call], 2u);
+  VCHECK_EQ(n[InsnClass::Tensor], 3u);
+  VCHECK_EQ(n[InsnClass::AtomInt], 3u);   // ATOM, ATOMG, ATOMS with no modifier
+  VCHECK_EQ(n[InsnClass::Extra], 16u);
+  VCHECK_EQ(n[InsnClass::FloatRed] + n[InsnClass::AtomFloat] + n[InsnClass::AtomSwap], 0u);
+  VCHECK_EQ(n[InsnClass::Exact] + n[InsnClass::Never] + 31u, static_cast<unsigned>(names.size()));
+  VCHECK(n[InsnClass::Never] >= 30);
+  for (unsigned c = 0; c < kInsnClasses; ++c) VCHECK(std::string(insn_class_name(static_cast<InsnClass>(c))).size() > 3);
+  VCHECK(std::string(insn_class_name(InsnClass::Never)) == "never" && std::string(insn_class_name(InsnClass::Exact)) == "exact");
+}
+
+VTEST(modifier_parts_are_read_inside_joined_modifiers) {
+  VCHECK(mods_have({"E", "ADD", "F32.FTZ.RN"}, "FTZ"));
+  VCHECK(mods_have({"F32.FTZ.RN"}, "RN") && mods_have({"F32.FTZ.RN"}, "F32"));
+  VCHECK(!mods_have({"F32.FTZ.RN"}, "F3") && !mods_have({"F32.FTZ.RN"}, "FTZ.RN") && !mods_have({}, "E") && !mods_have({"", "."}, ""));
+  VCHECK(!mods_have({"CAST"}, "CAS") && !mods_have({"EXCHANGE"}, "EXCH"));
+  VCHECK(mods_float_typed({"F16x2.RN"}) && mods_float_typed({"E", "BF16x8.RN"}) && mods_float_typed({"F64"}) && mods_float_typed({"X", "F32x4.FTZ.RN"}));
+  VCHECK(!mods_float_typed({"E", "ADD", "S32", "64", "FTZ", "RN"}) && !mods_float_typed({}));
+  VCHECK(mods_undecoded({"E", "(9)"}) && mods_undecoded({"X.(3)"}) && !mods_undecoded({"E", "ADD"}) && !mods_undecoded({}));
+}
+
+VTEST(a_call_must_stay_inside_the_kernel) {
+  VCHECK(call_stays_inside(true, true, 0x100, 0x0, 0x400));
+  VCHECK(call_stays_inside(true, true, 0x0, 0x0, 0x400) && call_stays_inside(true, true, 0x400, 0x0, 0x400));   // the first and the last instruction
+  VCHECK(!call_stays_inside(true, true, 0x410, 0x0, 0x400));    // past the end
+  VCHECK(!call_stays_inside(true, true, 0x70, 0x80, 0x400));    // before the start
+  VCHECK(!call_stays_inside(true, true, -16, 0x0, 0x400));
+  VCHECK(!call_stays_inside(false, true, 0x100, 0x0, 0x400));   // CALL.ABS
+  VCHECK(!call_stays_inside(true, false, 0x100, 0x0, 0x400));   // through a register
+}
+
+VTEST(turbo_admits_by_class_and_switch) {
+  using C = InsnClass;
+  const TurboSwitches def;
+  const auto mask = [](std::initializer_list<C> cs) {
+    ClassMask m = 0;
+    for (C c : cs) m |= class_bit(c);
+    return m;
+  };
+  // the defaults: everything but float atomics with a value, swaps and what has no class
+  VCHECK(turbo_refusal(mask({C::Exact}), def) == TurboRefusal::None);
+  VCHECK(turbo_refusal(0, def) == TurboRefusal::None);
+  for (C c : {C::Mufu, C::Half, C::FloatRed, C::Call, C::Extra, C::Tensor, C::AtomInt}) VCHECK(turbo_refusal(mask({C::Exact, c}), def) == TurboRefusal::None);
+  VCHECK(turbo_refusal(mask({C::Exact, C::Mufu, C::Half, C::FloatRed, C::Call, C::Extra, C::Tensor, C::AtomInt}), def) == TurboRefusal::None);
+  VCHECK(turbo_refusal(mask({C::Exact, C::AtomFloat}), def) == TurboRefusal::Atomics);
+  VCHECK(turbo_refusal(mask({C::Exact, C::AtomSwap}), def) == TurboRefusal::Atomics);
+  VCHECK(turbo_refusal(mask({C::Never}), def) == TurboRefusal::Never);
+  // the opt-in
+  TurboSwitches at;
+  at.atomics = true;
+  VCHECK(turbo_refusal(mask({C::Exact, C::AtomFloat, C::AtomSwap, C::AtomInt}), at) == TurboRefusal::None);
+  VCHECK(turbo_refusal(mask({C::AtomSwap, C::Never}), at) == TurboRefusal::Never);   // nothing opts into Never
+  // the off list: each name switches its class off, and only its class
+  const struct { const char* name; std::vector<C> off; } rows[] = {
+      {"mufu", {C::Mufu}}, {"tensor", {C::Tensor}}, {"half", {C::Half}}, {"call", {C::Call}}, {"red", {C::FloatRed}}, {"extra", {C::Extra}},
+      {"atomics", {C::AtomInt, C::AtomFloat, C::AtomSwap}}};
+  for (const auto& row : rows) {
+    TurboSwitches sw;
+    sw.atomics = true;
+    VCHECK(parse_turbo_off(row.name, &sw.off));
+    for (unsigned c = 0; c < kInsnClasses; ++c) {
+      const C cls = static_cast<C>(c);
+      const bool is_off = std::find(row.off.begin(), row.off.end(), cls) != row.off.end();
+      const TurboRefusal want = cls == C::Never ? TurboRefusal::Never : is_off ? TurboRefusal::Off : TurboRefusal::None;
+      VCHECK(turbo_refusal(class_bit(cls), sw) == want);
+    }
+  }
+  // the order: no class beats a switched-off class beats the opt-in
+  TurboSwitches sw;
+  VCHECK(parse_turbo_off("mufu", &sw.off));
+  VCHECK(turbo_refusal(mask({C::Mufu, C::AtomSwap}), sw) == TurboRefusal::Off);
+  VCHECK(turbo_refusal(mask({C::Mufu, C::AtomSwap, C::Never}), sw) == TurboRefusal::Never);
+  // the exact class cannot be switched off
+  VCHECK(parse_turbo_off("mufu,tensor,half,call,atomics,red,extra", &sw.off));
+  VCHECK(turbo_refusal(mask({C::Exact}), sw) == TurboRefusal::None);
+  VCHECK((sw.off & (class_bit(C::Exact) | class_bit(C::Never))) == 0);
+}
+
+VTEST(turbo_off_list_parses_names_and_refuses_the_rest) {
+  ClassMask off = 99;
+  std::string bad;
+  VCHECK(parse_turbo_off(nullptr, &off) && off == 0);
+  VCHECK(parse_turbo_off("", &off) && off == 0);
+  VCHECK(parse_turbo_off("mufu,call", &off) && off == (class_bit(InsnClass::Mufu) | class_bit(InsnClass::Call)));
+  VCHECK(parse_turbo_off(",mufu,,", &off) && off == class_bit(InsnClass::Mufu));
+  VCHECK(!parse_turbo_off("mufu,sfu", &off, &bad) && bad == "sfu");
+  VCHECK(!parse_turbo_off("MUFU", &off, &bad) && bad == "MUFU");
+  VCHECK(!parse_turbo_off("mufu call", &off, &bad) && bad == "mufu call");
+  VCHECK(!parse_turbo_off("exact", &off, &bad) && !parse_turbo_off("never", &off) && !parse_turbo_off("all", &off));
+}
+
+// The kernels of the spike again, as turbo mode sees them (the classes of exact_set_matches_the_measured_kernels above).
+VTEST(turbo_takes_the_kernels_exact_refused_for_numerics) {
+  const auto classes = [](const std::vector<std::pair<std::string, std::vector<std::string>>>& code) {
+    ClassMask m = 0;
+    for (const auto& [mn, mods] : code) m |= class_bit(turbo_class(mn, mods));
+    return m;
+  };
+  const TurboSwitches def;
+  TurboSwitches at;
+  at.atomics = true;
+  // HeCBench silu forward (expf): refused in exact, admitted in turbo
+  const ClassMask silu = classes({{"FFMA", {}}, {"MUFU", {"EX2"}}, {"MUFU", {"RCP"}}, {"FCHK", {}}, {"FADD", {"FTZ"}}});
+  VCHECK(turbo_refusal(silu, def) == TurboRefusal::None);
+  // HeCBench aop compute_partial_beta (double atomicAdd as a compare-and-swap loop): only with the opt-in
+  const ClassMask aop = classes({{"DADD", {}}, {"ATOMS", {"CAST", "SPIN", "64"}}, {"DFMA", {}}});
+  VCHECK(turbo_refusal(aop, def) == TurboRefusal::Atomics && turbo_refusal(aop, at) == TurboRefusal::None);
+  // HeCBench bh TreeBuildingKernel (ATOMG.E.CAS)
+  const ClassMask bh = classes({{"FSETP", {"GEU", "AND"}}, {"ATOMG", {"E", "CAS", "STRONG", "GPU"}}});
+  VCHECK(turbo_refusal(bh, def) == TurboRefusal::Atomics && turbo_refusal(bh, at) == TurboRefusal::None);
+  // a histogram (integer atomicAdd whose old value is used) and a float reduction: admitted
+  VCHECK(turbo_refusal(classes({{"LDG", {"E"}}, {"ATOMG", {"E", "ADD", "STRONG", "GPU"}}, {"RED", {"E", "ADD", "F32.FTZ.RN", "STRONG", "GPU"}}}), def) == TurboRefusal::None);
+  // a texture fetch: never, whatever is switched on
+  VCHECK(turbo_refusal(classes({{"TEX", {"SCR", "LL"}}, {"FMUL", {}}}), at) == TurboRefusal::Never);
+}
+
+// ---- the first blocks of a launch, timed (Round sp60b) ----
+
+VTEST(sample_constants_are_the_ones_the_round_measured) {
+  // (the text of Round sp60b and docs/perf-design/12-host-gpu-turbo.md quote these: a change here is a change there)
+  VCHECK(kSampleMinBlocks == 256 && kSampleMaxBlocks == 32);
+  VCHECK(kSampleBudgetSeconds == 0.002 && kSampleTimeoutSeconds == 0.050 && kSampleShareOfAge == 0.02 && kSampleCostGuessSeconds == 0.003);
+  VCHECK(kSampleStaticFloorSeconds == 0.030 && kSampleSecondsPerLiveByte == 6e-10 && kSampleCardSpeedup == 8.0);
+  VCHECK(kSampleTimeoutSecondsPerLiveByte == 2e-10);
+}
+
+VTEST(sample_runs_a_few_blocks_and_none_of_a_small_grid) {
+  VCHECK(sample_blocks(0) == 0 && sample_blocks(1) == 0 && sample_blocks(kSampleMinBlocks - 1) == 0);
+  VCHECK(sample_blocks(kSampleMinBlocks) == kSampleMaxBlocks);
+  VCHECK(sample_blocks(4096) == kSampleMaxBlocks);                    // PolyBench SYRK's grid
+  VCHECK(sample_blocks(uint64_t{1} << 40) == kSampleMaxBlocks);       // never more
+  for (uint64_t b : {kSampleMinBlocks, uint64_t{300}, uint64_t{4096}, uint64_t{1} << 30})
+    VCHECK(sample_blocks(b) >= 2 && sample_blocks(b) * 2 <= b);       // half the grid at most
+}
+
+VTEST(a_copy_is_given_longer_to_answer_with_more_live_memory) {
+  VCHECK(sample_timeout_seconds(0) == kSampleTimeoutSeconds);
+  VCHECK(sample_timeout_seconds(8ull << 20) > 0.0516 && sample_timeout_seconds(8ull << 20) < 0.0517);   // SYRK: 8 MiB
+  VCHECK(sample_timeout_seconds(2000ull << 20) > 0.469 && sample_timeout_seconds(2000ull << 20) < 0.470);   // black-scholes: 1.9 GiB
+  // never more than a ninth of the static estimate the floor asks for (the wait is lost when the copy does not answer)
+  for (uint64_t live : {uint64_t{0}, uint64_t{8} << 20, uint64_t{80} << 20, uint64_t{1} << 30, uint64_t{16} << 30})
+    VCHECK(sample_timeout_seconds(live) - kSampleTimeoutSeconds <= sample_static_floor(live) / 9 + 1e-12);
+}
+
+VTEST(sampled_blocks_are_spread_over_the_grid) {
+  VCHECK(sample_stride(0) == 1 && sample_stride(kSampleMinBlocks - 1) == 1);   // nothing sampled: any stride
+  VCHECK(sample_stride(kSampleMinBlocks) == kSampleMinBlocks / kSampleMaxBlocks);
+  VCHECK(sample_stride(4096) == 128 && sample_stride(16384) == 512);
+  for (uint64_t b : {kSampleMinBlocks, uint64_t{300}, uint64_t{463}, uint64_t{4096}, uint64_t{16384}, uint64_t{65536}, (uint64_t{1} << 30) + 7}) {
+    const uint64_t n = sample_blocks(b), st = sample_stride(b);
+    VCHECK(st >= 2);                                   // never the first blocks alone
+    VCHECK((n - 1) * st < b);                          // the last sampled block is a block of the grid
+    VCHECK(n * st + st > b - b / n);                   // ... and in its last part: the samples reach across the grid
+  }
+}
+
+VTEST(samples_may_cost_a_share_of_the_time_the_process_has_run) {
+  // a young process is not delayed by a sample: 3 ms is 2% of 150 ms
+  VCHECK(!sample_affordable(0.060, 0.0, kSampleCostGuessSeconds));    // Rodinia srad_v2 is over in 60 ms
+  VCHECK(!sample_affordable(0.149, 0.0, 0.003));
+  VCHECK(sample_affordable(0.151, 0.0, 0.003));
+  // what was spent counts: 2 s old, 38 ms spent, 3 ms more would pass 40 ms
+  VCHECK(sample_affordable(2.0, 0.036, 0.003));
+  VCHECK(!sample_affordable(2.0, 0.038, 0.003));
+  // a dearer expected sample needs an older process
+  VCHECK(!sample_affordable(1.0, 0.0, 0.050));
+  VCHECK(sample_affordable(2.6, 0.0, 0.050));
+  // a negative expectation is none, not a credit
+  VCHECK(!sample_affordable(1.0, 0.021, -1.0));
+  VCHECK(sample_affordable(1.0, 0.019, -1.0));
+}
+
+// `timed` blocks, whose second runs took `seconds`.
+// ---- code_has_loop: a cycle that the entry reaches ----
+
+static FlowInsn flow(int64_t target, bool falls_through = true, bool indirect = false) {
+  FlowInsn f;
+  f.target = target;
+  f.falls_through = falls_through;
+  f.indirect = indirect;
+  return f;
+}
+
+VTEST(a_loop_is_a_cycle_the_entry_reaches) {
+  VCHECK(!code_has_loop({}));
+  VCHECK(!code_has_loop({flow(-1), flow(-1), flow(-1, false)}));                       // straight code, EXIT
+  // a bounds check that skips to the exit, then the compiler's branch to itself after the EXIT: a back edge, no loop (2DCONV, GEMVER)
+  VCHECK(!code_has_loop({flow(3), flow(-1), flow(-1), flow(-1, false), flow(4, false)}));
+  // a shared exit placed first, reached by a branch back: still no loop (the exit does not go on)
+  VCHECK(!code_has_loop({flow(2, false), flow(-1, false), flow(-1), flow(1, false)}));
+  // a counted loop: the conditional branch at 3 goes back to 1 (SYRK, SYR2K)
+  VCHECK(code_has_loop({flow(-1), flow(-1), flow(-1), flow(1), flow(-1, false)}));
+  // a loop closed by an unconditional branch, left by a conditional one
+  VCHECK(code_has_loop({flow(-1), flow(4), flow(-1), flow(1, false), flow(-1, false)}));
+  // a branch to itself that IS reached (a spin)
+  VCHECK(code_has_loop({flow(-1), flow(1)}));
+  // a cycle the entry cannot reach is not one
+  VCHECK(!code_has_loop({flow(-1), flow(-1, false), flow(-1), flow(2, false)}));
+  // a diamond (two paths that meet) is not a cycle
+  VCHECK(!code_has_loop({flow(2), flow(3, false), flow(-1), flow(-1, false)}));
+  // anything indirect (a jump through a register, a call) is taken to be one
+  VCHECK(code_has_loop({flow(-1), flow(-1, true, true), flow(-1, false)}));
+  // a target outside the code is no edge; the last instruction falling off the end is none either
+  VCHECK(!code_has_loop({flow(99), flow(-1)}));
+  // a long straight run does not overflow anything (the walk is not recursive)
+  std::vector<FlowInsn> big(200000, flow(-1));
+  VCHECK(!code_has_loop(big));
+  big.back() = flow(0);
+  VCHECK(code_has_loop(big));
+}
+
+static Sample sample_of(double seconds, uint64_t timed, uint64_t total, unsigned threads = 4) {
+  Sample s;
+  s.seconds = seconds;
+  s.timed = timed;
+  s.total = total;
+  s.threads = threads;
+  return s;
+}
+
+VTEST(sample_extrapolates_the_launch_from_the_timed_blocks) {
+  // 15 blocks of 4096 in 15 ms, for what would be 4 threads: 1 ms a block, 4096 blocks, shared among the threads
+  const auto whole = sampled_launch_seconds(sample_of(0.015, 15, 4096, 4));
+  VCHECK(whole.has_value());
+  const double want = 0.001 * 4096 / 4;
+  VCHECK(*whole > want * 0.999 && *whole < want * 1.001);
+  // linear in the time and the grid, inverse in the threads; a thread count of 0 is read as 1
+  VCHECK(*sampled_launch_seconds(sample_of(0.030, 15, 4096, 4)) > 1.999 * *whole && *sampled_launch_seconds(sample_of(0.030, 15, 4096, 4)) < 2.001 * *whole);
+  VCHECK(*sampled_launch_seconds(sample_of(0.015, 15, 8192, 4)) > 1.999 * *whole && *sampled_launch_seconds(sample_of(0.015, 15, 8192, 4)) < 2.001 * *whole);
+  VCHECK(*sampled_launch_seconds(sample_of(0.015, 15, 4096, 8)) > 0.499 * *whole && *sampled_launch_seconds(sample_of(0.015, 15, 4096, 8)) < 0.501 * *whole);
+  VCHECK(*sampled_launch_seconds(sample_of(0.015, 15, 4096, 0)) == *sampled_launch_seconds(sample_of(0.015, 15, 4096, 1)));
+  // per timed block: the same time over fewer blocks is more per block
+  VCHECK(*sampled_launch_seconds(sample_of(0.015, 5, 4096, 4)) > 2.99 * *whole && *sampled_launch_seconds(sample_of(0.015, 5, 4096, 4)) < 3.01 * *whole);
+  // nothing to say when no block was timed (the copy did not answer, or the launch's blocks take turns), or there is no time or grid
+  VCHECK(!sampled_launch_seconds(sample_of(0.015, 0, 4096)));
+  VCHECK(!sampled_launch_seconds(sample_of(0.0, 15, 4096)));
+  VCHECK(!sampled_launch_seconds(sample_of(-1.0, 15, 4096)));
+  VCHECK(!sampled_launch_seconds(sample_of(0.015, 15, 0)));
+}
+
+// A sample whose estimate of the launch is `launch_s` (4 threads, 15 blocks of 4096).
+static Sample sample_saying(double launch_s) { return sample_of(launch_s * 15 * 4 / 4096, 15, 4096, 4); }
+
+VTEST(sample_sends_only_what_repays_the_driver_start_and_the_card_path) {
+  const Costs c;
+  const uint64_t live = 8ull << 20;   // SYRK's 8 MiB
+  VCHECK(sample_offload(sample_saying(4.0), live, live, c, false));      // PolyBench SYRK on the A10G rig: 4.2 s in the simulator
+  VCHECK(sample_offload(sample_saying(7.0), live, live, c, false));      // SYR2K
+  VCHECK(!sample_offload(sample_saying(0.3), live, live, c, false));     // 0.3 s: the start alone (0.25 s, margin 2) is more
+  VCHECK(sample_offload(sample_saying(0.3), live, live, c, true));       // ... worth it once the driver is up
+  VCHECK(!sample_offload(sample_saying(0.0001), live, live, c, true));   // under the floor of any offload
+  VCHECK(!sample_offload(sample_of(0.0, 0, 4096), 0, 0, c, true));       // a copy that did not answer: no estimate, nothing sent
+  VCHECK(!sample_offload(sample_of(0.015, 0, 4096), 0, 0, c, true));
+  // the bar, by bisection: the launch must take more than margin x (start + copies each way + launch + the card's assumed kernel time)
+  double lo = 0.3, hi = 4.0;
+  for (int i = 0; i < 60; ++i) {
+    const double mid = (lo + hi) / 2;
+    (sample_offload(sample_saying(mid), live, live, c, false) ? hi : lo) = mid;
+  }
+  const double path = c.start_cost_s + c.launch_s + hi / kSampleCardSpeedup + double(live) / c.push_bytes_per_s + double(live) / c.pull_bytes_per_s;
+  VCHECK(hi > c.margin * path * 0.999 && hi < c.margin * path * 1.001);
+  VCHECK(hi > 2 * c.start_cost_s);                                       // never under twice the start
+}
+
+VTEST(sample_does_not_use_the_account_of_time_already_spent) {
+  // should_offload_with_start buys the start once the program has spent as much in the simulator: that is how a short program paid for a start it
+  // could not use. The sampled decision has no such argument: the same sample gives the same answer whatever was spent before.
+  const Costs c;
+  const Estimate e = sample_estimate(sample_saying(0.3), 8ull << 20, 8ull << 20, c, true);
+  VCHECK(should_offload_with_start(e, c, false, 10.0));                  // the account would send it ...
+  VCHECK(!sample_offload(sample_saying(0.3), 8ull << 20, 8ull << 20, c, false));   // ... the sample does not
+}
+
+VTEST(sample_charges_the_memory_and_an_unknown_card_time) {
+  const Costs c;
+  // 1 s with the driver up: goes with 8 MiB live, not with 5 GiB to push (0.45 s) nor with 4 GiB charged for coming back (0.43 s) and 2 GiB to push
+  VCHECK(sample_offload(sample_saying(1.0), 8ull << 20, 8ull << 20, c, true));
+  VCHECK(!sample_offload(sample_saying(1.0), 5ull << 30, 8ull << 20, c, true));
+  VCHECK(sample_offload(sample_saying(1.0), 8ull << 20, 2ull << 30, c, true));
+  VCHECK(!sample_offload(sample_saying(1.0), 2ull << 30, 4ull << 30, c, true));
+  const Estimate e = sample_estimate(sample_saying(1.0), 3ull << 20, 8ull << 20, c, true);
+  VCHECK(e.push_bytes == (3ull << 20) && e.pull_bytes == (8ull << 20) && e.start_s == 0);
+  VCHECK(e.sim_s > 0.999 && e.sim_s < 1.001);
+  VCHECK(e.card_kernel_s.has_value() && *e.card_kernel_s > 1.0 / kSampleCardSpeedup * 0.999 && *e.card_kernel_s < 1.0 / kSampleCardSpeedup * 1.001);
+  VCHECK(sample_estimate(sample_saying(1.0), 0, 0, c, false).start_s == c.start_cost_s);
+  // never under the default kernel time for a short launch
+  VCHECK(*sample_estimate(sample_saying(0.0001), 0, 0, c, true).card_kernel_s == c.kernel_s_default);
+  // a kernel the card has run before: its measured time is used
+  VCHECK(*sample_estimate(sample_saying(1.0), 0, 0, c, true, 0.4).card_kernel_s == 0.4);
+  VCHECK(sample_offload(sample_saying(1.0), 0, 0, c, true, 0.4));        // 1 s against 2 x 0.4 s
+  VCHECK(!sample_offload(sample_saying(1.0), 0, 0, c, true, 0.6));       // not against 2 x 0.6 s
+  // a start cost of 0 (VGPU_HOST_GPU_START_COST=0) charges nothing; a negative one is no credit
+  Costs free_start;
+  free_start.start_cost_s = 0;
+  VCHECK(sample_offload(sample_saying(0.3), 8ull << 20, 8ull << 20, free_start, false));
+  free_start.start_cost_s = -5;
+  VCHECK(sample_estimate(sample_saying(0.3), 0, 0, free_start, false).start_s == 0);
+}
+
+static SampleCandidate old_enough(uint64_t blocks) {
+  SampleCandidate w;
+  w.blocks = blocks;
+  w.loop = true;
+  w.age_s = 10.0;
+  return w;
+}
+
+VTEST(sampling_is_for_grids_with_blocks_to_sample) {
+  const Costs c;
+  VCHECK(worth_sampling(old_enough(4096), c, 0.26));
+  VCHECK(!worth_sampling(old_enough(kSampleMinBlocks - 1), c, 0.26));
+  VCHECK(worth_sampling(old_enough(kSampleMinBlocks), c, 0.26));
+  VCHECK(!worth_sampling(old_enough(8), c, 0.26));   // PolyBench COVAR's long kernel runs on 8 blocks: nothing to sample
+  SampleCandidate big = old_enough(8);
+  big.static_s = 100.0;                              // ... whatever its static estimate
+  VCHECK(!worth_sampling(big, c, 0.26));
+}
+
+VTEST(sampling_is_not_repeated_for_a_kernel_whose_whole_launch_was_short) {
+  const Costs c;
+  SampleCandidate w = old_enough(4096);
+  w.whole_s = 0.003;                               // PolyBench 3DCONV: 254 launches of 3 ms
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.whole_s = c.margin * 0.26;                     // at the bar: not above it
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.whole_s = c.margin * 0.26 * 1.01;
+  VCHECK(worth_sampling(w, c, 0.26));
+}
+
+VTEST(sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it) {
+  const Costs c;
+  SampleCandidate w = old_enough(4096);
+  w.age_s = 0.015;                                 // PolyBench SYR2K launches 15 ms into the process ...
+  w.static_s = 0.0446;                             // ... with a static estimate of 45 ms: sampled
+  VCHECK(worth_sampling(w, c, 0.26));
+  w.static_s = 0.0016;                             // HeCBench backprop, a program of 14 ms: 1.6 ms, not sampled
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.static_s = kSampleStaticFloorSeconds;          // the floor itself is enough
+  VCHECK(worth_sampling(w, c, 0.26));
+  w.static_s = kSampleStaticFloorSeconds * 0.999;
+  VCHECK(!worth_sampling(w, c, 0.26));
+  // the floor rises with the live memory (the faults after the fork): three times 0.6 ms a MiB, once that is over 30 ms
+  VCHECK(sample_static_floor(0) == kSampleStaticFloorSeconds && sample_static_floor(12ull << 20) == kSampleStaticFloorSeconds);   // SYR2K: 12 MiB, 45 ms
+  VCHECK(sample_static_floor(80ull << 20) > 0.150 && sample_static_floor(80ull << 20) < 0.152);    // 2MM's first kernel: 80 MiB, 335 ms
+  VCHECK(sample_static_floor(1ull << 30) > 1.93 && sample_static_floor(1ull << 30) < 1.94);
+  w.live_bytes = 1ull << 30;
+  w.static_s = 1.9;
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.static_s = 2.0;
+  VCHECK(worth_sampling(w, c, 0.26));
+  w.live_bytes = 0;
+  // a kernel with no loop is not sampled, whatever its estimate and however old the process (Rodinia backprop: 105 ms, 36 MiB, no loop)
+  w.static_s = 0.105;
+  w.age_s = 100.0;
+  w.loop = false;
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.loop = true;
+  VCHECK(worth_sampling(w, c, 0.26));
+  w.age_s = 0.015;
+  w.static_s = 1.0;                                // the floor does not lift the other conditions
+  w.whole_s = 0.003;
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.whole_s.reset();
+  w.static_s = 0;
+  w.age_s = 0.060;                                 // under the floor: by the process's age. Too young for the first sample's guess
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.age_s = 0.2;
+  VCHECK(worth_sampling(w, c, 0.26));
+  w.spent_s = 0.002;                               // 2 ms spent and 3 ms expected are more than 2% of 0.2 s
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.age_s = 1.0;
+  VCHECK(worth_sampling(w, c, 0.26));
+  w.expected_s = 0.050;                            // the process's dearest sample so far was a copy that never answered
+  VCHECK(!worth_sampling(w, c, 0.26));
+}
+
+VTEST(sim_time_table_peeks_at_one_sample_and_takes_an_extrapolation_as_history) {
+  SimTimeTable t;
+  VCHECK(!t.peek("k", 100).has_value());
+  t.record("k", 100, 0.01);                        // one short sample: no prediction, but a peek
+  VCHECK(!t.predict("k", 100).has_value());
+  VCHECK(t.peek("k", 100).has_value() && *t.peek("k", 100) > 0.0099 && *t.peek("k", 100) < 0.0101);
+  VCHECK(*t.peek("k", 1000) > 0.099 && *t.peek("k", 1000) < 0.101);
+  VCHECK(!t.peek("other", 100).has_value());
+  // a launch sent on its sample: what the simulator was on course for is a full history at once
+  SimTimeTable m;
+  m.record_extrapolated("long", 65536, 7.7);
+  VCHECK(m.samples("long") >= SimTimeTable::kSamplesNeeded);
+  VCHECK(m.predict("long", 65536).has_value() && *m.predict("long", 65536) > 7.69 && *m.predict("long", 65536) < 7.71);
+  // ... and not limited to the two offloaded launches of the one-sample allowance
+  for (int i = 0; i < 5; ++i) m.note_offload("long");
+  VCHECK(m.predict("long", 65536).has_value());
+  // a later whole launch in the simulator still lowers it (the estimate is the smallest per-block time seen)
+  m.record("long", 65536, 3.0);
+  VCHECK(*m.predict("long", 65536) < 3.01);
+  // an extrapolation under kOneSampleMinSeconds is a history too (record() alone would not be)
+  SimTimeTable q;
+  q.record_extrapolated("quick", 100, 0.1);
+  VCHECK(q.predict("quick", 100).has_value());
+}
+
+// ---- progress inside a block (vgpu/exec/block_progress.hpp, find_probe_loops; Round sp61) ----
+
+static vgpu::exec::ProbeLoop counted(int64_t step, int64_t offset = 0, bool is_unsigned = false) {
+  vgpu::exec::ProbeLoop l;
+  l.step = step;
+  l.iv_offset = offset;
+  l.is_unsigned = is_unsigned;
+  return l;
+}
+
+VTEST(turns_left_are_the_distance_to_the_bound_in_steps) {
+  using vgpu::exec::lane_turns_left;
+  VCHECK(lane_turns_left(1, 2049, counted(1)) == 2048);          // COVAR: j2 from 1 to M + 1 = 2049
+  VCHECK(lane_turns_left(2048, 2049, counted(1)) == 1);
+  VCHECK(lane_turns_left(2049, 2049, counted(1)) == 0);          // at the bound: none
+  VCHECK(lane_turns_left(3000, 2049, counted(1)) == 0);          // past it: none
+  VCHECK(lane_turns_left(0, 10, counted(4)) == 3);               // unrolled by 4: a part turn is a turn
+  VCHECK(lane_turns_left(0, 12, counted(4)) == 3);
+  VCHECK(lane_turns_left(0, 13, counted(4)) == 4);
+  VCHECK(lane_turns_left(100, 0, counted(-1)) == 100);           // counting down to 0
+  VCHECK(lane_turns_left(100, 0, counted(-3)) == 34);
+  VCHECK(lane_turns_left(0, 100, counted(-1)) == 0);             // moving away from the bound: none
+  VCHECK(lane_turns_left(5, 10, counted(0)) == 0);               // no step: none
+  VCHECK(lane_turns_left(10, 5, counted(0)) == 0);               // ... on either side of the bound
+  VCHECK(lane_turns_left(4, 10, counted(1, 1)) == 5);            // the compare reads iv + 1
+  VCHECK(lane_turns_left(4, 10, counted(1, -2)) == 8);
+  // signed by default: -1 is below any positive bound; unsigned, 0xffffffff is above it
+  VCHECK(lane_turns_left(0xffffffffu, 3, counted(1)) == 4);
+  VCHECK(lane_turns_left(0xffffffffu, 3, counted(1, 0, true)) == 0);
+  VCHECK(lane_turns_left(0x80000000u, 0x80000010u, counted(1, 0, true)) == 16);
+  VCHECK(lane_turns_left(0x7ffffff0u, 0x7fffffffu, counted(1)) == 15);
+  VCHECK(lane_turns_left(0xfffffff0u, 0xfffffff8u, counted(1)) == 8);     // -16 to -8, signed
+  VCHECK(lane_turns_left(0xfffffff8u, 0xfffffff0u, counted(-2)) == 4);
+}
+
+VTEST(turns_between_two_pauses_are_what_the_register_moved) {
+  using vgpu::exec::turns_between;
+  VCHECK(turns_between(10, 13, counted(1)) == 3);
+  VCHECK(turns_between(10, 10, counted(1)) == 0);
+  VCHECK(turns_between(13, 10, counted(1)) == 0);                // backwards against the step: none
+  VCHECK(turns_between(0, 9, counted(4)) == 2);                  // whole turns only
+  VCHECK(turns_between(20, 8, counted(-4)) == 3);
+  VCHECK(turns_between(8, 20, counted(-4)) == 0);
+  VCHECK(turns_between(1, 5, counted(0)) == 0);
+  VCHECK(turns_between(5, 1, counted(0)) == 0);
+  VCHECK(turns_between(0xfffffffeu, 1, counted(1)) == 3);        // signed: -2 to 1
+  VCHECK(turns_between(0xfffffffeu, 1, counted(1, 0, true)) == 0);
+}
+
+VTEST(a_measured_turn_gives_steps_and_seconds) {
+  using vgpu::exec::TurnMeasure;
+  TurnMeasure m;
+  VCHECK(vgpu::exec::steps_per_turn(m) == 0 && vgpu::exec::seconds_per_step(m) == 0);   // nothing measured
+  m.steps = 40000;
+  m.turns = 4;
+  m.seconds = 0.004;
+  VCHECK(vgpu::exec::steps_per_turn(m) == 10000);
+  VCHECK(vgpu::exec::seconds_per_step(m) > 0.99e-7 && vgpu::exec::seconds_per_step(m) < 1.01e-7);
+  m.turns = 0;                                       // no turn completed: the run is the least a turn takes
+  VCHECK(vgpu::exec::steps_per_turn(m) == 40000);
+  m.turns = 0.5;
+  VCHECK(vgpu::exec::steps_per_turn(m) == 40000);
+  m.turns = 1;
+  VCHECK(vgpu::exec::steps_per_turn(m) == 40000);
+  m.seconds = 0;
+  VCHECK(vgpu::exec::seconds_per_step(m) == 0);
+  m.seconds = -0.001;                                // (a clock that went back: no measure)
+  VCHECK(vgpu::exec::seconds_per_step(m) == 0);
+  TurnMeasure none;                                  // a time and no step: no measure, and no division by zero
+  none.seconds = 0.004;
+  VCHECK(vgpu::exec::seconds_per_step(none) == 0 && vgpu::exec::steps_per_turn(none) == 0);
+  vgpu::exec::BlockReading b;
+  b.steps = 1000;
+  b.turns = 50;
+  VCHECK(vgpu::exec::block_steps(b, 200) == 11000);
+  VCHECK(vgpu::exec::block_steps(b, -5) == 1000);  // (no negative cost)
+}
+
+VTEST(blocks_read_inside_a_small_grid) {
+  VCHECK(inblock_blocks(8) == 8 && inblock_stride(8) == 1);       // COVAR: every block
+  VCHECK(inblock_blocks(1) == 1 && inblock_stride(1) == 1);
+  VCHECK(inblock_blocks(0) == 0);
+  VCHECK(inblock_blocks(kSampleMaxBlocks) == kSampleMaxBlocks);
+  VCHECK(inblock_blocks(kSampleMaxBlocks + 1) == kSampleMaxBlocks);
+  VCHECK(inblock_blocks(255) == kSampleMaxBlocks && inblock_stride(255) == 255 / kSampleMaxBlocks);
+  VCHECK(inblock_blocks(kSampleMinBlocks) == 0);                 // the whole-block sample's grids are not read inside
+  VCHECK(inblock_blocks(4096) == 0 && inblock_stride(4096) == 1);
+  VCHECK(kInBlockEnterSeconds == 0.001 && kInBlockMeasureSeconds == 0.004 && kInBlockBudgetSeconds == 0.012);   // what section 8 quotes
+}
+
+static vgpu::exec::BlockReading reading(double steps, double turns) {
+  vgpu::exec::BlockReading b;
+  b.steps = steps;
+  b.turns = turns;
+  return b;
+}
+
+VTEST(a_launch_from_the_blocks_read) {
+  vgpu::exec::TurnMeasure m;
+  m.steps = 30000;
+  m.turns = 3;
+  m.seconds = 0.003;                                 // 10,000 steps a turn, 0.1 us a step
+  // no block, no measure, no grid: no estimate
+  VCHECK(!inblock_launch_seconds({}, m, 8, 4).has_value());
+  VCHECK(!inblock_launch_seconds({reading(0, 10)}, vgpu::exec::TurnMeasure{}, 8, 4).has_value());
+  VCHECK(!inblock_launch_seconds({reading(0, 10)}, m, 0, 4).has_value());
+  // 8 blocks read on 4 threads, 2048 turns of 10,000 steps left in each of 8 warps: 8 x 8 x 2048 x 1e4 steps / 4 x 1e-7 s
+  std::vector<vgpu::exec::BlockReading> eight(8, reading(0, 8 * 2048));
+  const auto e = inblock_launch_seconds(eight, m, 8, 4);
+  VCHECK(e.has_value() && *e > 32.7 && *e < 32.8);
+  // the steps taken count
+  const auto e2 = inblock_launch_seconds({reading(1e6, 0)}, m, 1, 1);
+  VCHECK(e2.has_value() && *e2 > 0.0999 && *e2 < 0.1001);
+  // a grid of fewer blocks than threads: the longest block, not a share of it
+  const auto one = inblock_launch_seconds({reading(0, 100), reading(0, 300)}, m, 2, 4);
+  VCHECK(one.has_value() && *one > 0.2999 && *one < 0.3001);
+  // the blocks read stand for the grid: two read of 16, on 4 threads
+  const auto many = inblock_launch_seconds({reading(0, 100), reading(0, 300)}, m, 16, 4);
+  VCHECK(many.has_value() && *many > 0.7999 && *many < 0.8001);
+  // threads 0 is taken as 1
+  const auto t0 = inblock_launch_seconds({reading(0, 100)}, m, 2, 0);
+  VCHECK(t0.has_value() && *t0 > 0.1999 && *t0 < 0.2001);
+  // no turn completed in the measure: a turn takes at least the run's 30,000 steps
+  vgpu::exec::TurnMeasure slow = m;
+  slow.turns = 0;
+  const auto low = inblock_launch_seconds(eight, slow, 8, 4);
+  VCHECK(low.has_value() && *low > 98.2 && *low < 98.4);
+}
+
+VTEST(a_small_grid_is_sampled_inside_only_with_a_followed_loop) {
+  const Costs c;
+  SampleCandidate w = old_enough(8);
+  VCHECK(!sample_inside(w) && !worth_sampling(w, c, 0.26));
+  w.followed = true;
+  VCHECK(sample_inside(w) && worth_sampling(w, c, 0.26));
+  w.loop = false;                                    // the loop test still holds
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.loop = true;
+  w.whole_s = 0.003;                                 // so does a short whole launch
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.whole_s.reset();
+  w.age_s = 0.015;                                   // and the floor or the process's age
+  w.static_s = 0.001;
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.static_s = kSampleStaticFloorSeconds;
+  VCHECK(worth_sampling(w, c, 0.26));
+  SampleCandidate g = old_enough(4096);              // a grid the whole-block sample takes is not read inside
+  g.followed = true;
+  VCHECK(!sample_inside(g) && worth_sampling(g, c, 0.26));
+  g.blocks = 0;
+  VCHECK(!sample_inside(g) && !worth_sampling(g, c, 0.26));
+}
+
+VTEST(a_launch_sampled_inside_goes_by_the_rule_of_sampled_launches) {
+  const Costs c;
+  VCHECK(!sampled_offload(0, 0, 0, c, true));
+  VCHECK(sampled_offload(1.0, 0, 0, c, true, 0.4));
+  VCHECK(!sampled_offload(1.0, 0, 0, c, true, 0.6));
+  // COVAR: 23 s in the simulator, 64 MiB live, driver not started: the card kernel is guessed at 1/8 of it
+  VCHECK(sampled_offload(23.0, 64ull << 20, 64ull << 20, c, false));
+  const Estimate e = sampled_estimate(23.0, 64ull << 20, 64ull << 20, c, false);
+  VCHECK(e.card_kernel_s && *e.card_kernel_s > 2.87 && *e.card_kernel_s < 2.88 && e.start_s == c.start_cost_s);
+  // a launch of 50 ms does not repay the start
+  VCHECK(!sampled_offload(0.05, 64ull << 20, 64ull << 20, c, false));
+  // the old entry point is the same rule
+  Sample s;
+  s.seconds = 1.0;
+  s.timed = 1;
+  s.total = 1;
+  VCHECK(sample_offload(s, 0, 0, c, true, 0.4) == sampled_offload(1.0, 0, 0, c, true, 0.4));
+}
+
+// The shapes of nvcc's counted loops, as find_probe_loops is given them: registers 0..254, uniform ones 256 + n; predicates 0..6, uniform 8 + n.
+static LoopCodeInsn op_other(std::vector<int> writes = {}) {
+  LoopCodeInsn c;
+  c.flow = flow(-1);
+  c.writes = std::move(writes);
+  return c;
+}
+static LoopCodeInsn op_add(int dst, int src, int64_t imm) {
+  LoopCodeInsn c = op_other({dst});
+  c.kind = LoopCodeInsn::Kind::AddImm;
+  c.add_dst = dst;
+  c.add_src = src;
+  c.add_imm = imm;
+  return c;
+}
+static vgpu::exec::ProbeOperand opnd_reg(int n) { return probe_reg_operand(n); }
+static vgpu::exec::ProbeOperand opnd_imm(int64_t v) {
+  vgpu::exec::ProbeOperand o;
+  o.kind = vgpu::exec::ProbeOperand::Imm;
+  o.imm = v;
+  return o;
+}
+static vgpu::exec::ProbeOperand opnd_param(int64_t off) {
+  vgpu::exec::ProbeOperand o;
+  o.kind = vgpu::exec::ProbeOperand::CBank;
+  o.reg = 0;
+  o.imm = off;
+  return o;
+}
+static LoopCodeInsn op_cmp(int pred, vgpu::exec::ProbeOperand a, vgpu::exec::ProbeOperand b, bool is_unsigned = false) {
+  LoopCodeInsn c = op_other();
+  c.kind = LoopCodeInsn::Kind::Compare;
+  c.cmp_pred = pred;
+  c.cmp_a = a;
+  c.cmp_b = b;
+  c.cmp_unsigned = is_unsigned;
+  c.pred_writes = {pred};
+  return c;
+}
+static LoopCodeInsn op_bra(int64_t target, int pred = -1) {
+  LoopCodeInsn c = op_other();
+  c.flow = flow(target, pred >= 0);
+  c.branch_pred = pred;
+  return c;
+}
+static LoopCodeInsn op_exit(bool conditional = false) {
+  LoopCodeInsn c = op_other();
+  c.flow = flow(-1, conditional);
+  return c;
+}
+
+// COVAR's covar_kernel, in the shape nvcc gives it: a guard, the outer loop over j2 (R5, bound the parameter M + 1 at c[0x0][0x160]) and inside it
+// the loop over i (R7).
+static std::vector<LoopCodeInsn> covar_shape() {
+  return {
+      op_other({0}),                                   // 0: S2R / IMAD: j1
+      op_cmp(0, opnd_reg(0), opnd_param(0x160)),       // 1
+      op_exit(true),                                   // 2: @P0 EXIT
+      op_other({5}),                                   // 3: MOV R5, R0
+      op_other({7}),                                   // 4: the outer head: MOV R7, 0x1
+      op_other({8}),                                   // 5: the inner head: DFMA
+      op_add(7, 7, 1),                                 // 6
+      op_cmp(1, opnd_reg(7), opnd_param(0x164)),       // 7
+      op_bra(5, 1),                                    // 8: @P1 BRA 5
+      op_add(5, 5, 1),                                 // 9
+      op_cmp(0, opnd_reg(5), opnd_param(0x160)),       // 10
+      op_bra(4, 0),                                    // 11: @!P0 BRA 4
+      op_exit(),                                       // 12
+      op_bra(13),                                      // 13: BRA 13, never reached
+  };
+}
+
+VTEST(the_top_level_counted_loop_is_found) {
+  const auto f = find_probe_loops(covar_shape());
+  VCHECK(f.size() == 1);
+  VCHECK(f[0].lo == 4 && f[0].hi == 11);
+  VCHECK(f[0].loop.iv.kind == vgpu::exec::ProbeOperand::Reg && f[0].loop.iv.reg == 5 && f[0].loop.step == 1 && f[0].loop.iv_offset == 0);
+  VCHECK(f[0].loop.bound.kind == vgpu::exec::ProbeOperand::CBank && f[0].loop.bound.reg == 0 && f[0].loop.bound.imm == 0x160);
+  VCHECK(!f[0].loop.is_unsigned);
+  // an unsigned compare says so
+  auto u = covar_shape();
+  u[10] = op_cmp(0, opnd_reg(5), opnd_param(0x160), true);
+  VCHECK(find_probe_loops(u).size() == 1 && find_probe_loops(u)[0].loop.is_unsigned);
+  // the bound on the left
+  auto sw = covar_shape();
+  sw[10] = op_cmp(0, opnd_param(0x160), opnd_reg(5));
+  VCHECK(find_probe_loops(sw).size() == 1 && find_probe_loops(sw)[0].loop.iv.reg == 5);
+  // an immediate bound, or a register the loop does not write
+  auto im = covar_shape();
+  im[10] = op_cmp(0, opnd_reg(5), opnd_imm(2049));
+  VCHECK(find_probe_loops(im).size() == 1 && find_probe_loops(im)[0].loop.bound.kind == vgpu::exec::ProbeOperand::Imm);
+  auto rb = covar_shape();
+  rb[10] = op_cmp(0, opnd_reg(5), opnd_reg(9));
+  VCHECK(find_probe_loops(rb).size() == 1 && find_probe_loops(rb)[0].loop.bound.reg == 9);
+  // a branch on the uniform predicate of a uniform counter
+  auto ur = covar_shape();
+  ur[9] = op_add(256 + 4, 256 + 4, 2);
+  ur[10] = op_cmp(8, opnd_reg(256 + 4), opnd_param(0x160));
+  ur[11] = op_bra(4, 8);
+  const auto uf = find_probe_loops(ur);
+  VCHECK(uf.size() == 1 && uf[0].loop.iv.kind == vgpu::exec::ProbeOperand::UReg && uf[0].loop.iv.reg == 4 && uf[0].loop.step == 2);
+}
+
+VTEST(a_loop_whose_counter_or_bound_is_not_plain_is_not_followed) {
+  auto bw = covar_shape();   // the bound register is written in the loop
+  bw[10] = op_cmp(0, opnd_reg(5), opnd_reg(8));
+  VCHECK(find_probe_loops(bw).empty());
+  auto twice = covar_shape();   // the counter is written twice
+  twice[5] = op_other({5});
+  VCHECK(find_probe_loops(twice).empty());
+  auto other = covar_shape();   // the counter's one write is not an add of a constant to itself
+  other[9] = op_other({5});
+  VCHECK(find_probe_loops(other).empty());
+  auto fromb = covar_shape();   // an add from another register that is not itself a counter
+  fromb[9] = op_add(5, 8, 1);
+  VCHECK(find_probe_loops(fromb).empty());
+  auto zero = covar_shape();    // no step
+  zero[9] = op_add(5, 5, 0);
+  VCHECK(find_probe_loops(zero).empty());
+  auto between = covar_shape();   // another instruction writes the predicate after the compare
+  between[11].flow = flow(4, true);
+  between.insert(between.begin() + 11, op_other());
+  between[11].pred_writes = {0};
+  for (auto& c : between)
+    if (c.flow.target > 11) ++c.flow.target;
+  VCHECK(find_probe_loops(between).empty());
+  auto before = covar_shape();   // the predicate is set before the loop only
+  before[10] = op_other();
+  VCHECK(find_probe_loops(before).empty());
+  auto pre = covar_shape();      // ... even when that compare reads the counter
+  pre[1] = op_cmp(0, opnd_reg(5), opnd_param(0x160));
+  pre[10] = op_other();
+  VCHECK(find_probe_loops(pre).empty());
+  auto notcmp = covar_shape();   // the last write of the predicate is not a compare
+  notcmp[10] = op_other();
+  notcmp[10].pred_writes = {0};
+  VCHECK(find_probe_loops(notcmp).empty());
+  auto wrongp = covar_shape();   // the compare writes another predicate than the branch reads
+  wrongp[10].cmp_pred = 3;
+  VCHECK(find_probe_loops(wrongp).empty());
+  auto none = covar_shape();   // no register side at all
+  none[10] = op_cmp(0, opnd_imm(1), opnd_param(0x160));
+  VCHECK(find_probe_loops(none).empty());
+  auto nob = covar_shape();   // no bound operand
+  nob[10] = op_cmp(0, opnd_reg(5), vgpu::exec::ProbeOperand{});
+  VCHECK(find_probe_loops(nob).empty());
+  auto ind = covar_shape();   // a jump through a register: nothing is followed
+  ind[3].flow.indirect = true;
+  VCHECK(find_probe_loops(ind).empty());
+  auto uncond = covar_shape();   // an unconditional back edge and no exit branch: nothing decides
+  uncond[11] = op_bra(4);
+  uncond[10] = op_other();
+  VCHECK(find_probe_loops(uncond).empty());
+}
+
+VTEST(the_counter_may_be_read_through_a_register_the_loop_adds_to_it) {
+  auto t = covar_shape();
+  t[9] = op_add(5, 5, 2);       // R5 += 2
+  t[10] = op_cmp(0, opnd_reg(6), opnd_param(0x160));
+  t.insert(t.begin() + 10, op_add(6, 5, 1));   // R6 = R5 + 1, compared
+  for (auto& c : t)
+    if (c.flow.target > 10) ++c.flow.target;
+  const auto f = find_probe_loops(t);
+  VCHECK(f.size() == 1 && f[0].loop.iv.reg == 5 && f[0].loop.iv_offset == 1 && f[0].loop.step == 2 && f[0].hi == 12);
+  auto t2 = t;   // ... but R5 must be a counter
+  t2[9] = op_other({5});
+  VCHECK(find_probe_loops(t2).empty());
+}
+
+VTEST(a_loop_left_by_a_branch_out_of_it_is_followed) {
+  // while (true) { if (i >= n) break; ...; i += 1 }
+  std::vector<LoopCodeInsn> c = {
+      op_other({5}),                                   // 0: MOV R5, RZ
+      op_cmp(2, opnd_reg(5), opnd_param(0x168)),       // 1: the head
+      op_bra(6, 2),                                    // 2: @P2 BRA 6 (out)
+      op_other({8}),                                   // 3
+      op_add(5, 5, 1),                                 // 4
+      op_bra(1),                                       // 5: BRA 1
+      op_exit(),                                       // 6
+  };
+  const auto f = find_probe_loops(c);
+  VCHECK(f.size() == 1 && f[0].lo == 1 && f[0].hi == 5 && f[0].loop.bound.imm == 0x168);
+}
+
+VTEST(loops_one_after_another_and_inside_one_another) {
+  // two top-level loops in a row: both; the inner loop of the first is not top-level
+  std::vector<LoopCodeInsn> c = {
+      op_other({5, 6}),                                // 0
+      op_add(5, 5, 1),                                 // 1: loop A head
+      op_cmp(0, opnd_reg(5), opnd_imm(100)),           // 2
+      op_bra(1, 0),                                    // 3
+      op_add(6, 6, -1),                                // 4: loop B head
+      op_cmp(1, opnd_reg(6), opnd_imm(0)),             // 5
+      op_bra(4, 1),                                    // 6
+      op_exit(),                                       // 7
+  };
+  const auto f = find_probe_loops(c);
+  VCHECK(f.size() == 2 && f[0].lo == 1 && f[0].hi == 3 && f[1].lo == 4 && f[1].hi == 6 && f[1].loop.step == -1);
+  // ranges that cross without one holding the other: neither
+  std::vector<LoopCodeInsn> x = {
+      op_other({5, 6}),                                // 0
+      op_add(5, 5, 1),                                 // 1: head of A
+      op_add(6, 6, 1),                                 // 2: head of B
+      op_cmp(0, opnd_reg(5), opnd_imm(100)),           // 3
+      op_bra(1, 0),                                    // 4: A = [1, 4]
+      op_cmp(1, opnd_reg(6), opnd_imm(100)),           // 5
+      op_bra(2, 1),                                    // 6: B = [2, 6]
+      op_exit(),                                       // 7
+  };
+  VCHECK(find_probe_loops(x).empty());
+  // two back edges to one head make one loop, to the last of them
+  std::vector<LoopCodeInsn> two = {
+      op_other({5}),                                   // 0
+      op_add(5, 5, 1),                                 // 1: head
+      op_cmp(0, opnd_reg(5), opnd_imm(100)),           // 2
+      op_bra(1, 0),                                    // 3: continue
+      op_other(),                                      // 4
+      op_cmp(0, opnd_reg(5), opnd_imm(100)),           // 5
+      op_bra(1, 0),                                    // 6: continue again
+      op_exit(),                                       // 7
+  };
+  const auto t = find_probe_loops(two);
+  VCHECK(t.size() == 1 && t[0].lo == 1 && t[0].hi == 6);
+  // no more than kProbeLoops (each loop's counter is written once in its own range, which is all a loop is asked about)
+  std::vector<LoopCodeInsn> many = {op_other({5})};
+  for (int k = 0; k < 6; ++k) {
+    const int64_t h = static_cast<int64_t>(many.size());
+    many.push_back(op_add(5, 5, 1));
+    many.push_back(op_cmp(0, opnd_reg(5), opnd_imm(100)));
+    many.push_back(op_bra(h, 0));
+  }
+  many.push_back(op_exit());
+  const auto m = find_probe_loops(many);
+  VCHECK(m.size() == vgpu::exec::kProbeLoops && m[0].lo == 1 && m[3].lo == 10);
+  // an unreachable back edge is no loop (nvcc's BRA to itself after the EXIT), nor is a branch to a later instruction
+  VCHECK(find_probe_loops({op_exit(), op_bra(1)}).empty());
+  // ... even a whole counted loop after the EXIT
+  VCHECK(find_probe_loops({op_exit(), op_add(5, 5, 1), op_cmp(0, opnd_reg(5), opnd_imm(100)), op_bra(1, 0), op_exit()}).empty());
+  VCHECK(find_probe_loops({op_other({5}), op_add(5, 5, 1), op_cmp(0, opnd_reg(5), opnd_imm(100)), op_bra(1, 0), op_exit()}).size() == 1);   // (reached: found)
+  VCHECK(find_probe_loops({op_cmp(0, opnd_reg(5), opnd_imm(1)), op_bra(3, 0), op_other(), op_exit()}).empty());
+  VCHECK(find_probe_loops({}).empty());
+}
+
+VTEST(a_small_grid_s_floor_counts_the_followed_loop_s_bound) {
+  VCHECK(bound_turns(2048, 1) == 2048 && bound_turns(2048, 4) == 512 && bound_turns(2049, 4) == 512);
+  VCHECK(bound_turns(-100, -1) == 100 && bound_turns(100, -3) == 33 && bound_turns(5, 0) == 0 && bound_turns(0, 1) == 0);
+  const Costs c;
+  // COVAR's covar_kernel, as server3's log has it: 8 blocks, 87 us counted, 32 MiB live, 39 ms into the process, its loop bounded by m = 2048
+  SampleCandidate w;
+  w.blocks = 8;
+  w.loop = true;
+  w.followed = true;
+  w.static_s = 0.000087;
+  w.live_bytes = 33562624;
+  w.age_s = 0.039;
+  VCHECK(!worth_sampling(w, c, 0.26));               // the count alone: under the floor, and too young
+  w.bound_turns = 2048;
+  VCHECK(sample_static_estimate(w) > 0.178 && sample_static_estimate(w) < 0.179);
+  VCHECK(worth_sampling(w, c, 0.26));
+  w.bound_turns = 100;                                 // a short bound: 9 ms, under the 60 ms that 32 MiB ask
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.bound_turns = 0;                                   // (no bound known: the count alone)
+  VCHECK(sample_static_estimate(w) == w.static_s);
+  // a grid the whole-block sample takes is not scaled by the bound
+  SampleCandidate g = w;
+  g.blocks = 4096;
+  g.bound_turns = 2048;
+  VCHECK(sample_static_estimate(g) == g.static_s && !worth_sampling(g, c, 0.26));
 }
 
 VTEST_MAIN

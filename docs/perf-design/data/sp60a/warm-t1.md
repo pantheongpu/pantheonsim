@@ -1,0 +1,54 @@
+| program | off s | cold s | warm s | off / cold | off / warm | launches | hits (warm) | outputs |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| hecbench/adam-cuda | 0.023 | 0.024 | 0.006 | 0.983 | 4.088 | 1 | 1 | same |
+| hecbench/aobench-cuda | 0.643 | 0.855 | 0.684 | 0.752 | 0.941 | 1 | 1 | same |
+| hecbench/aop-cuda | 1.806 | 2.221 | 2.061 | 0.813 | 0.876 | 301 | 10 | same |
+| hecbench/asmooth-cuda | 0.220 | 0.225 | 0.165 | 0.977 | 1.335 | 3 | 2 | same |
+| hecbench/asyncAllocation-cuda | 2.977 | 3.066 | 2.979 | 0.971 | 0.999 | 800 | 56 | same |
+| hecbench/atan2-cuda | 0.019 | 0.019 | 0.019 | 0.984 | 0.990 | 3 | 0 | same |
+| hecbench/atomicAggregate-cuda | 3.728 | 3.710 | 0.004 | 1.005 | 856.966 | 6 | 6 | same |
+| hecbench/atomicIntrinsics-cuda | 0.179 | 0.181 | 0.007 | 0.992 | 24.216 | 4 | 4 | same |
+| hecbench/atomicPerf-cuda | 1.065 | 1.077 | 0.010 | 0.989 | 110.979 | 18 | 18 | same |
+| hecbench/attention-cuda | 0.022 | 0.024 | 0.025 | 0.937 | 0.911 | 3 | 0 | same |
+| hecbench/axpby-cuda | 0.411 | 0.405 | 0.407 | 1.015 | 1.009 | 35 | 0 | same |
+| hecbench/background-subtract-cuda | 0.004 | 0.004 | 0.003 | 0.946 | 1.077 | 0 | 0 | same |
+| hecbench/backprop-cuda | 0.009 | 0.010 | 0.007 | 0.904 | 1.353 | 2 | 1 | same |
+| hecbench/bgmv-cuda | 0.011 | 0.011 | 0.009 | 0.973 | 1.137 | 12 | 5 | same |
+| hecbench/bh-cuda | 0.727 | 0.735 | 0.364 | 0.989 | 1.996 | 17 | 12 | same |
+| hecbench/bilateral-cuda | 1.259 | 1.342 | 0.178 | 0.938 | 7.067 | 3 | 3 | same |
+| hecbench/bitonic-sort-cuda | 0.256 | 0.262 | 0.229 | 0.979 | 1.119 | 136 | 25 | same |
+| hecbench/blockAccess-cuda | 0.018 | 0.018 | 0.015 | 0.962 | 1.193 | 4 | 1 | same |
+| hecbench/perplexity-cuda | 0.396 | 0.396 | 0.393 | 1.000 | 1.009 | 1 | 0 | same |
+| hecbench/radixsort2-cuda | 2.660 | 2.840 | 1.965 | 0.937 | 1.354 | 600 | 348 | same |
+| hecbench/s3d-cuda | 0.388 | 0.409 | 0.386 | 0.948 | 1.005 | 54 | 4 | same |
+| hecbench/shmembench-cuda | 4.861 | 4.872 | 4.929 | 0.998 | 0.986 | 1 | 0 | same |
+| hecbench/silu-cuda | 0.445 | 0.451 | 0.435 | 0.986 | 1.023 | 50 | 2 | same |
+| hecbench/sortKV-cuda | 0.221 | 3.240 | 0.205 | 0.068 | 1.077 | 48 | 18 | same |
+| polybench/2DCONV | 0.713 | 0.693 | 0.707 | 1.029 | 1.008 | 1 | 0 | same |
+| polybench/3DCONV | 0.676 | 0.681 | 0.676 | 0.993 | 1.000 | 254 | 0 | same |
+| polybench/3MM | 2.065 | 2.079 | 1.311 | 0.993 | 1.575 | 3 | 2 | same |
+| polybench/ADI | 0.217 | 0.226 | 0.228 | 0.962 | 0.952 | 2049 | 2 | same |
+| polybench/ATAX | 1.442 | 1.456 | 1.479 | 0.990 | 0.974 | 2 | 0 | same |
+| polybench/BICG | 0.283 | 0.285 | 0.280 | 0.995 | 1.011 | 2 | 0 | same |
+| polybench/GEMM | 0.733 | 0.751 | 0.756 | 0.976 | 0.970 | 1 | 0 | same |
+| polybench/GEMVER | 0.642 | 0.633 | 0.634 | 1.015 | 1.013 | 3 | 0 | same |
+| polybench/GESUMMV | 0.387 | 0.391 | 0.391 | 0.991 | 0.988 | 1 | 0 | same |
+| polybench/JACOBI1D | 0.934 | 0.962 | 0.958 | 0.971 | 0.975 | 20000 | 424 | same |
+| polybench/JACOBI2D | 0.550 | 0.621 | 0.619 | 0.887 | 0.889 | 40 | 4 | same |
+| polybench/MVT | 1.549 | 1.542 | 1.551 | 1.004 | 0.999 | 2 | 0 | same |
+| polybench/SYR2K | 10.354 | 10.376 | 10.458 | 0.998 | 0.990 | 1 | 0 | same |
+| polybench/SYRK | 5.443 | 5.393 | 5.388 | 1.009 | 1.010 | 1 | 0 | same |
+| rodinia/backprop | 0.530 | 0.536 | 0.537 | 0.989 | 0.987 | 2 | 0 | same |
+| rodinia/bfs | 0.009 | 0.009 | 0.009 | 0.977 | 0.977 | 26 | 3 | same |
+| rodinia/gaussian | 3.632 | 3.896 | 4.041 | 0.932 | 0.899 | 1022 | 150 | same |
+| rodinia/hotspot | 0.986 | 1.028 | 0.616 | 0.958 | 1.600 | 1000 | 542 | same |
+| rodinia/lavaMD | 1.754 | 1.762 | 1.772 | 0.996 | 0.990 | 1 | 0 | same |
+| rodinia/lud | 2.974 | 3.047 | 2.932 | 0.976 | 1.014 | 190 | 24 | same |
+| rodinia/needle | 0.326 | 0.345 | 0.341 | 0.946 | 0.956 | 255 | 2 | same |
+| rodinia/nn | 0.013 | 0.013 | 0.012 | 0.926 | 1.046 | 1 | 1 | same |
+| rodinia/particlefilter_float | 1.744 | 2.006 | 1.762 | 0.869 | 0.990 | 36 | 0 | DIFFER |
+| rodinia/pathfinder | 0.530 | 0.549 | 0.882 | 0.966 | 0.601 | 5 | 0 | same |
+| rodinia/sc_gpu | 0.665 | 0.694 | 0.690 | 0.958 | 0.965 | 1432 | 0 | same |
+| rodinia/srad_v2 | 0.027 | 0.028 | 0.027 | 0.957 | 0.978 | 1 | 0 | same |
+
+34 programs of 0.3 s or more: off / cold geometric mean 0.9624 (smallest 0.752), off / warm 1.521; summed off 60.0 s, cold 61.8 s, warm 53.3 s; programs with a warm hit: 28 of 50; warm at 1.05x or better: 7; cold below 0.97: aobench-cuda 0.752, aop-cuda 0.813, bilateral-cuda 0.938, radixsort2-cuda 0.937, s3d-cuda 0.948, JACOBI2D 0.887, gaussian 0.932, hotspot 0.958, needle 0.946, particlefilter_float 0.869, pathfinder 0.966, sc_gpu 0.958

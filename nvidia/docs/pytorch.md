@@ -3,8 +3,7 @@
 PyTorch's official CUDA build runs unmodified, under `vgpu run --preload`, on
 the simulated NVIDIA GPUs, from the T4 to the B200 and the RTX 5090. Without
 `--preload`, PyTorch loads NVIDIA's own CUDA runtime, which finds no driver
-(see below). Under `--preload`, importing some packages crashes, ThrustRTC
-for one ([#597](https://github.com/pantheongpu/pantheonsim/issues/597)):
+(see below):
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cu130
@@ -38,7 +37,13 @@ PyTorch reaches NVIDIA's libraries through an RPATH into its `nvidia-*`
 packages, which `LD_LIBRARY_PATH` does not override, and `python` itself
 names no CUDA library. `--preload` preloads every CUDA library the simulator
 carries in that case, and a library already loaded under a soname is the one
-every later request for that soname gets. Without it, NVIDIA's real runtime
+every later request for that soname gets. The driver's libraries
+(`libcuda.so.1`, NVML) and NVRTC are not put in `LD_PRELOAD` but loaded
+privately by the preloaded runtime as it starts (`VGPU_PRELOAD_PRIVATE`):
+loaded first all the same, but out of the global scope, where a library that
+keeps their functions in exported pointers of the same names (ThrustRTC)
+would have its pointers bound to them, and crash writing over their code
+([#597](https://github.com/pantheongpu/pantheonsim/issues/597)). Without it, NVIDIA's real runtime
 loads, finds no NVIDIA driver, and PyTorch reports "integrity checks failed"
 (error 103). NVIDIA's cuFile, cuSPARSELt and NVSHMEM load as they are; the
 paths tested here do not call them.

@@ -14,7 +14,9 @@
 //
 // Three digests were recorded after a fix, from the tree that has it (gfx1030's VOP3 v_ashrrev_i16, v_max_i16 and v_min_i16, lines 14927, 15810 and
 // 15838): the baseline's digest of them was the text of "decoded but not implemented", and a real RX 6800 runs the instructions (the bench-amd probe
-// workload p_pk16 uses all three and matches its host reference there). Every other digest is the baseline's.
+// workload p_pk16 uses all three and matches its host reference there). Nine more were recorded after the fix of issue #613, from the tree that has
+// it: gfx1250's v_div_fmas_f32/f64 and v_div_fixup_f32/f64 with a clamp or an output modifier (lines 12493 to 12577), which the baseline wrote
+// unclamped and unscaled. Every other digest is the baseline's.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>

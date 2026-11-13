@@ -7514,6 +7514,50 @@ VTEST(weak_ld_st_and_huge_register_ranges_parse) {
   VCHECK(err.code() == Err::PtxParse);
 }
 
+// The explicit .param state spaces (PTX ISA 8.3): ld.param::entry reads a kernel's parameter (jax 0.12's XLA writes it,
+// #589), ld.param::func and st.param::func a device function's, as ld.param and st.param do. A kernel's parameters are
+// read-only, so st.param::entry is refused (ptxas: "Illegal modifier '::entry' for instruction 'st'").
+VTEST(ld_param_entry_and_func_state_spaces) {
+  const std::string ptx = std::string(kHeader) + R"(
+.func (.param .b32 r) f(.param .b32 a)
+{
+    .reg .b32 %r<3>;
+    ld.param::func.b32 %r1, [a];
+    add.s32 %r2, %r1, 1;
+    st.param::func.b32 [r], %r2;
+    ret;
+}
+.visible .entry k(.param .u64 p, .param .u32 x)
+{
+    .reg .b64 %rd<3>;
+    .reg .b32 %r<4>;
+    ld.param::entry.u64 %rd1, [p];
+    ld.param::entry.u32 %r1, [x];
+    {
+    .param .b32 pa;
+    .param .b32 pr;
+    st.param.b32 [pa], %r1;
+    call (pr), f, (pa);
+    ld.param.b32 %r2, [pr];
+    }
+    st.global.u32 [%rd1], %r2;
+    ret;
+}
+)";
+  const ptx::Module m = ptx::parse(ptx);
+  Env e;
+  const uint64_t out = e.mem.alloc(4);
+  const uint32_t x = 41;
+  std::vector<uint8_t> ax(4);
+  std::memcpy(ax.data(), &x, 4);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out), ax}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), 42ull);
+  auto err = VCAPTURE(Error, ptx::parse(std::string(kHeader) +
+                                        ".visible .entry k(.param .u32 x)\n{\n    .reg .b32 %r<2>;\n"
+                                        "    mov.u32 %r1, 1;\n    st.param::entry.u32 [x], %r1;\n    ret;\n}\n"));
+  VCHECK_CONTAINS(err.what(), "param::entry");
+}
+
 // Malformed PTX gets a precise parse error, never a crash, a wrong register or
 // a silently truncated number.
 VTEST(malformed_ptx_is_refused_with_a_reason) {

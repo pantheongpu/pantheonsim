@@ -137,6 +137,15 @@ class MemoryManager {
     return host_maps_ && is_host_mapped(addr);
   }
 
+  // Peer access (cudaDeviceEnablePeerAccess, cuCtxEnablePeerAccess): while it is enabled from this device to `peer`, an access of this
+  // device's that lands in `peer`'s window resolves against `peer`'s allocations (unified addressing), as a kernel on a card reaches its
+  // peer's memory. Without it such an access is the invalid-pointer error it always was ("belongs to a different device"): a kernel that
+  // dereferences a peer's pointer before peer access is enabled faults on a card too. Counted, so the runtime and the driver API may
+  // each enable the same pair; the link goes when both have disabled it. Only the miss path of resolve() looks: nothing else changes.
+  void set_peer(MemoryManager& peer, bool enabled);
+  // Whether any peer link is enabled from or to this device (the launch cache cannot see such accesses: memo_untrackable).
+  bool peer_linked() const { return peers_->links.load(std::memory_order_relaxed) != 0; }
+
   // Allocates `size` bytes of virtual device memory. size == 0 is invalid.
   // `align` (a power of two) starts the allocation on a multiple of it if that
   // is more than the allocator's own alignment.
@@ -1050,6 +1059,16 @@ class MemoryManager {
   // thread reads this pointer while the program maps a buffer (hipHostMalloc
   // while a launch runs), so it must never change after construction.
   std::unique_ptr<HostMaps> host_maps_ = std::make_unique<HostMaps>();
+  // set_peer: the peer whose window an access may resolve in, one slot per device window (null: none), how many times each was
+  // enabled, and the links from and to this device. Made with the manager, as host_maps_ is: a kernel's thread reads it while the
+  // program enables a peer.
+  struct Peers {
+    std::mutex mu;
+    std::atomic<const MemoryManager*> by_window[kDeviceVaWindows] = {};
+    unsigned enabled[kDeviceVaWindows] = {};
+    std::atomic<int> links{0};
+  };
+  std::unique_ptr<Peers> peers_ = std::make_unique<Peers>();
   const HostMap* find_host_map_locked(uint64_t addr, uint64_t len) const;
   // The mapping that holds [addr, addr + len), without taking the lock when this thread has just used it (a
   // small per-thread cache validated by HostMaps::gen). False where nothing is mapped over the whole range.

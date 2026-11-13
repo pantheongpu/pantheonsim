@@ -1,0 +1,12 @@
+== build
+== unit tests
+== e2e (card present: a skip is a failure)
+100% tests passed, 0 tests failed out of 1
+The following tests FAILED:
+FAIL: e2e_host_gpu_stub did not pass
+== verify run, machine-readable summary
+== turbo verify run, machine-readable summary
+host_gpu_refusals: refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=4 too_small=0 failed=0
+== SFU and division exhaustive checks (stride 257)
+== turbo mode's probes (reported; stride 257)
+FAIL: card CI on NVIDIA A10G

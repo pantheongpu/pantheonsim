@@ -16,6 +16,11 @@
 #      MUFU is not in the exact set). The lines are in the log so that a driver or architecture that changes them is seen.
 #   6. the verify run of the e2e program (VGPU_HOST_GPU_VERIFY=1) found no kernel of the exact set that differs (the machine-readable line
 #      "host_gpu_verify: in_set_identical=N in_set_different=0 ..."), and ran at least two on the card.
+#   7. turbo mode (docs/perf-design/12-host-gpu-turbo.md): the verify run of the same program with VGPU_HOST_GPU=turbo ran more launches on the card
+#      than exact mode's (the expf kernel), found no word outside the default tolerance ("host_gpu_turbo: ... words_outside=0 ... kernels_outside=0"), and
+#      printed the mode-off output; unit test host_gpu_tol passes. (e2e_host_gpu, step 1, also runs turbo mode without verify.)
+#   8. hostgpu_sfu_exhaustive sin/cos/tanh and the atomics repeat probe (tools/probes/hostgpu_turbo_card_probes.sh): REPORTED, never failing, except
+#      that the atomics probe's control (an integer max) must repeat.
 # Negative control: with HOSTGPU_SFU_MUTATE=1 the script runs ONLY step 4 with the card side nudged by one ulp at a few inputs, and exits 0 exactly when the
 # check notices (differ>0), 1 when it does not: the check is shown able to fail on this machine. The workflow's `mutation` input runs it.
 set -uo pipefail
@@ -41,10 +46,10 @@ fi
 say "build"
 mkdir -p "$build"
 cmake -S "$root" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVGPU_LTO=OFF > "$build.cfg.log" 2>&1 || { tail -20 "$build.cfg.log"; exit 1; }
-nice cmake --build "$build" -j"$jobs" --target vgpucudart test_host_gpu_logic test_host_gpu_ref test_card_gate > "$build.build.log" 2>&1 || { tail -30 "$build.build.log"; exit 1; }
+nice cmake --build "$build" -j"$jobs" --target vgpucudart test_host_gpu_logic test_host_gpu_ref test_host_gpu_tol test_card_gate > "$build.build.log" 2>&1 || { tail -30 "$build.build.log"; exit 1; }
 
 say "unit tests"
-for t in test_host_gpu_logic test_host_gpu_ref test_card_gate; do "$build/$t" > "$build.$t.log" 2>&1 || { echo "FAIL: $t"; tail -5 "$build.$t.log"; fails=1; }; done
+for t in test_host_gpu_logic test_host_gpu_ref test_host_gpu_tol test_card_gate; do "$build/$t" > "$build.$t.log" 2>&1 || { echo "FAIL: $t"; tail -5 "$build.$t.log"; fails=1; }; done
 
 say "e2e (card present: a skip is a failure)"
 for t in e2e_host_gpu e2e_host_gpu_stub; do
@@ -70,6 +75,17 @@ if [[ -x "$work/exact" ]]; then
   diff="$(echo "$line" | sed -n 's/.*in_set_different=\([0-9]*\).*/\1/p')"
   (( ${same:-0} >= 2 )) || { echo "FAIL: fewer than 2 kernels of the exact set compared"; fails=1; }
   (( ${diff:-1} == 0 )) || { echo "FAIL: a kernel of the exact set differs on the card"; fails=1; }
+  say "turbo verify run, machine-readable summary"
+  VGPU_GPU="nvidia/$id" VGPU_THREADS=4 LD_LIBRARY_PATH="$build/shim" "$work/exact" > "$work/off.out" 2> "$work/off.err"
+  ecard="$(grep '^host_gpu_verify:' "$work/v.err" | tail -1 | sed -n 's/.*in_set_identical=\([0-9]*\) in_set_different=\([0-9]*\).*/\1 \2/p' | awk '{ print $1 + $2 }')"
+  VGPU_GPU="nvidia/$id" VGPU_THREADS=4 LD_LIBRARY_PATH="$build/shim" VGPU_HOST_GPU=turbo VGPU_HOST_GPU_VERIFY=1 "$work/exact" > "$work/rv.out" 2> "$work/rv.err"
+  rline="$(grep '^host_gpu_turbo: mode=turbo ' "$work/rv.err" | tail -1)"
+  echo "$rline"
+  grep '^host_gpu_refusals:\|^host_gpu_outside:\|^host_gpu_refused:' "$work/rv.err"
+  rf() { echo "$rline" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
+  (( $(rf launches_card) > ${ecard:-0} )) 2>/dev/null || { echo "FAIL: turbo verify ran $(rf launches_card) launches on the card, exact verify ${ecard:-?}: the expf kernel should add to them"; fails=1; }
+  [[ "$(rf words_outside)" == 0 && "$(rf kernels_outside)" == 0 ]] || { echo "FAIL: turbo verify found words outside the default tolerance"; fails=1; }
+  cmp -s "$work/off.out" "$work/rv.out" || { echo "FAIL: turbo verify changed the program's output"; fails=1; }
 fi
 
 say "SFU and division exhaustive checks (stride $stride)"
@@ -79,6 +95,11 @@ if [[ -x "$work/sfu" ]]; then
   [[ "${PIPESTATUS[0]}" == 0 ]] || { echo "FAIL: the card's division differs from the correctly rounded quotient"; fails=1; }
   for op in rcp rsq sqrt ex2 lg2; do "$work/sfu" "$op" "$stride" | grep '^RESULT' || true; done   # reported, not judged
 fi
+say "turbo mode's probes (reported; stride $stride)"
+"$root/tools/probes/hostgpu_turbo_card_probes.sh" sfu "$work/probes" "$stride" | grep '^RESULT\|^FAIL\|^NOTE' || true
+"$root/tools/probes/hostgpu_turbo_card_probes.sh" atomics "$work/probes" 4 > "$work/atomics.txt" 2>&1
+[[ $? == 0 ]] || { echo "FAIL: the atomics probe (its control must repeat)"; fails=1; }
+grep '^VERDICT\|^FAIL' "$work/atomics.txt" || true
 (( fails == 0 )) && { echo "PASS: card CI on $name"; exit 0; }
 echo "FAIL: card CI on $name"
 exit 1

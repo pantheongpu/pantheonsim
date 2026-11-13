@@ -20,8 +20,10 @@
 // Note on the CUDA 13 headers: NPP's global stream helpers (nppSetStream and
 // friends) are no longer declared, only the application-managed
 // NppStreamContext forms. Programs compiled against this toolkit cannot call
-// them, so they are not implemented -- guessing at an undeclared vendor
-// signature is how this repository has produced garbage before.
+// them, so a CUDA 13 build does not implement them -- guessing at an undeclared
+// vendor signature is how this repository has produced garbage before. A CUDA 12
+// build (the shim is built per toolkit) has the ones its headers declare and
+// programs use (nppGetStream, nppSetStream, nppGetStreamContext; "core", below).
 #include <npp.h>
 
 #include <algorithm>
@@ -29,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <type_traits>
 #include <vector>
 
@@ -179,6 +182,57 @@ VGPU_EXPORT const NppLibraryVersion* nppGetLibVersion(void) {
   static const NppLibraryVersion v{NPP_VER_MAJOR, NPP_VER_MINOR, NPP_VER_PATCH};
   return &v;
 }
+
+#if NPP_VER_MAJOR < 13
+// The stream NPP manages itself, which NPP 12 has and CUDA 13's NPP removed (see the note at the top of this file): a
+// CUDA 12 program asks for it to fill the NppStreamContext of its _Ctx calls (saiga's NppiHelper.h, #617). Measured
+// with NPP 12.3 (CUDA 12.6) on an RTX 3060: until nppSetStream it is stream 0; nppGetStreamContext fills the
+// device's fields from the device current when NPP first answered -- a later cudaSetDevice does not move them, nor
+// does nppSetStream -- takes nStreamFlags from cudaStreamGetFlags, leaves nReserved0 as it was, and answers a null
+// pointer with NPP_INVALID_HOST_POINTER_ERROR.
+namespace {
+std::mutex g_npp_stream_mu;
+cudaStream_t g_npp_stream = nullptr;
+bool g_npp_have_device = false;
+NppStreamContext g_npp_device{};
+}  // namespace
+
+VGPU_EXPORT cudaStream_t nppGetStream(void) {
+  std::lock_guard<std::mutex> lock(g_npp_stream_mu);
+  return g_npp_stream;
+}
+
+VGPU_EXPORT NppStatus nppSetStream(cudaStream_t stream) {
+  std::lock_guard<std::mutex> lock(g_npp_stream_mu);
+  g_npp_stream = stream;
+  return NPP_SUCCESS;
+}
+
+VGPU_EXPORT NppStatus nppGetStreamContext(NppStreamContext* ctx) {
+  if (!ctx) return NPP_INVALID_HOST_POINTER_ERROR;
+  std::lock_guard<std::mutex> lock(g_npp_stream_mu);
+  if (!g_npp_have_device) {
+    NppStreamContext& d = g_npp_device;
+    if (cudaGetDevice(&d.nCudaDeviceId) != cudaSuccess) return NPP_CUDA_KERNEL_EXECUTION_ERROR;
+    cudaDeviceProp p{};
+    if (cudaGetDeviceProperties(&p, d.nCudaDeviceId) != cudaSuccess) return NPP_CUDA_KERNEL_EXECUTION_ERROR;
+    d.nMultiProcessorCount = p.multiProcessorCount;
+    d.nMaxThreadsPerMultiProcessor = p.maxThreadsPerMultiProcessor;
+    d.nMaxThreadsPerBlock = p.maxThreadsPerBlock;
+    d.nSharedMemPerBlock = p.sharedMemPerBlock;
+    cudaDeviceGetAttribute(&d.nCudaDevAttrComputeCapabilityMajor, cudaDevAttrComputeCapabilityMajor, d.nCudaDeviceId);
+    cudaDeviceGetAttribute(&d.nCudaDevAttrComputeCapabilityMinor, cudaDevAttrComputeCapabilityMinor, d.nCudaDeviceId);
+    g_npp_have_device = true;
+  }
+  const int reserved = ctx->nReserved0;
+  *ctx = g_npp_device;
+  ctx->nReserved0 = reserved;
+  ctx->hStream = g_npp_stream;
+  unsigned int flags = 0;
+  if (cudaStreamGetFlags(g_npp_stream, &flags) == cudaSuccess) ctx->nStreamFlags = flags;
+  return NPP_SUCCESS;
+}
+#endif
 
 /* ---- image memory ---- */
 

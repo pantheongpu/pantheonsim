@@ -646,4 +646,27 @@ VTEST(a_section_waits_for_a_far_threshold_on_the_plain_loop_and_is_compiled_afte
   VCHECK(s.units_ready.load() >= r0 + 3);
 }
 
+// The wait before the lookup (round sp63): with the share rule on, a kept section waits on the plain loop for its lookup too and is hooked again when all of
+// its instructions make up the rest of VGPU_JIT_LOOKUP_AFTER; then the lookup misses, it waits for the threshold, is hooked again and compiled. Five
+// stretches inside one kernel, the interpreter's words and counters (compare), and the counts that say it happened (ctest test_sass_chain_cont_jit_prewait).
+VTEST(a_kept_section_waits_for_its_lookup_and_its_threshold_on_the_plain_loop_and_is_compiled_after_them) {
+  if (!std::getenv("VGPU_JIT_EXPECT_PREWAIT") || !sass::jit::requested()) return;
+  const auto& s = sass::jit::stats();
+  const unsigned long long p0 = s.prewaits.load(), w0 = s.waits.load(), e0 = s.wait_ends.load(), r0 = s.units_ready.load(), f0 = s.failures.load(),
+                           a0 = s.accepted.load();
+  const unsigned salt = static_cast<unsigned>(::getpid()) % 1000u + 7u;
+  compare(loop_kernel(20000 + salt, 3), 32, "one warp, a wait for the lookup and one for the threshold");
+  compare(loop_kernel(20000 + salt, 1), 64, "two warps, likewise");
+  compare(diamond_loop_kernel(9000 + salt, 16, 2), 64, "diamond, two warps, likewise");
+  if (s.failures.load() != f0) return;   // (no compiler on PATH)
+  std::printf("  kept by the share rule: %llu, waited for the lookup: %llu, for the threshold: %llu, waits ended: %llu, compiled: %llu\n",
+              static_cast<unsigned long long>(s.accepted.load()) - a0, static_cast<unsigned long long>(s.prewaits.load()) - p0,
+              static_cast<unsigned long long>(s.waits.load()) - w0, static_cast<unsigned long long>(s.wait_ends.load()) - e0,
+              static_cast<unsigned long long>(s.units_ready.load()) - r0);
+  VCHECK(s.prewaits.load() >= p0 + 3);
+  VCHECK(s.waits.load() >= w0 + 3);
+  VCHECK(s.wait_ends.load() >= e0 + 6);
+  VCHECK(s.units_ready.load() >= r0 + 3);
+}
+
 VTEST_MAIN

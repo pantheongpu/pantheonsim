@@ -45,6 +45,7 @@
 #include <cstring>
 #include <memory>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace vgpu::exec {
@@ -203,10 +204,12 @@ inline uint64_t lockstep_fold(uint64_t h, const void* data, size_t n) {
 // millisecond: a block waiting on the host, or on a block that is running on a thread the host has
 // descheduled, does not take a core from it. It starts again at once when anything moves.
 // An exception from `turn` or `admit` leaves the worker: the caller records it.
-template <class Block, class Admit, class Turn, class Stored, class Fingerprint, class Retire, class Stop>
+//   nap(unsigned us)            sleeps that long between passes (the engines: std::this_thread::sleep_for; a test counts the naps,
+//                               which tells it that standing still was found out without measuring how fast turns go)
+template <class Block, class Admit, class Turn, class Stored, class Fingerprint, class Retire, class Stop, class Nap>
 void lockstep_worker(std::atomic<uint64_t>& ticket, std::atomic<uint64_t>& beat, uint64_t units, uint64_t window,
                      uint64_t initial, uint64_t chunk, Admit&& admit, Turn&& turn, Stored&& stored, Fingerprint&& fingerprint,
-                     Retire&& retire, Stop&& stop) {
+                     Retire&& retire, Stop&& stop, Nap&& nap) {
   std::vector<std::unique_ptr<Block>> live, spare;
   bool drained = false;
   uint64_t target = std::max<uint64_t>(1, std::min(initial, window)), done_stores = 0;
@@ -304,7 +307,7 @@ void lockstep_worker(std::atomic<uint64_t>& ticket, std::atomic<uint64_t>& beat,
     // polls never stands still, and does not sleep; it gives way to whatever else there is to run.)
     if (same >= 2) {
       nap_us = nap_us ? std::min(nap_us * 2, 500u) : 5u;
-      std::this_thread::sleep_for(std::chrono::microseconds(nap_us));
+      nap(nap_us);
     } else {
       // A pass that stored nothing and finished nothing: these blocks wait for something. Give the host core up for a
       // moment, so that when the block waited for is on a thread the host has not scheduled (a loaded machine, more
@@ -328,6 +331,16 @@ void lockstep_worker(std::atomic<uint64_t>& ticket, std::atomic<uint64_t>& beat,
       }
     }
   }
+}
+
+// The engines' worker: a nap is a sleep.
+template <class Block, class Admit, class Turn, class Stored, class Fingerprint, class Retire, class Stop>
+void lockstep_worker(std::atomic<uint64_t>& ticket, std::atomic<uint64_t>& beat, uint64_t units, uint64_t window,
+                     uint64_t initial, uint64_t chunk, Admit&& admit, Turn&& turn, Stored&& stored, Fingerprint&& fingerprint,
+                     Retire&& retire, Stop&& stop) {
+  lockstep_worker<Block>(ticket, beat, units, window, initial, chunk, std::forward<Admit>(admit), std::forward<Turn>(turn),
+                         std::forward<Stored>(stored), std::forward<Fingerprint>(fingerprint), std::forward<Retire>(retire),
+                         std::forward<Stop>(stop), [](unsigned us) { std::this_thread::sleep_for(std::chrono::microseconds(us)); });
 }
 
 }  // namespace vgpu::exec

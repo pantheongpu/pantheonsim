@@ -1,0 +1,29 @@
+VGPU_HOST_GPU_EARLY_START=1 (card-run.sh early) against the default of the same build (the A/B's exact and turbo), median seconds of 3 runs.
+
+program	exact default	exact early	turbo default	turbo early	note
+polybench/2DCONV	0.962	0.888	0.962	0.937	
+polybench/3DCONV	0.773	0.770	0.767	0.768	
+polybench/3MM	1.850	1.479	1.891	1.502	
+polybench/ADI	0.395	0.398	0.405	0.400	
+polybench/ATAX	1.082	1.081	1.078	1.077	
+polybench/BICG	0.263	0.263	0.264	0.271	
+polybench/GEMM	0.858	0.675	0.885	0.630	
+polybench/GEMVER	0.658	0.724	0.660	0.673	
+polybench/GESUMMV	0.379	0.383	0.382	0.383	
+polybench/JACOBI1D	2.493	2.491	2.493	2.478	
+polybench/JACOBI2D	0.605	0.356	0.557	0.412	
+polybench/MVT	1.213	1.213	1.212	1.209	
+polybench/SYR2K	2.374	2.310	2.370	2.309	
+polybench/SYRK	1.297	1.284	1.299	1.284	
+rodinia/backprop	0.613	0.710	0.758	0.447	
+rodinia/gaussian	0.951	0.751	0.954	0.787	
+rodinia/lud	2.979	2.870	2.852	2.711	
+rodinia/needle	0.365	0.363	0.361	0.370	
+rodinia/pathfinder	1.066	1.079	1.069	1.067	
+rodinia/srad_v2	0.063	0.063	0.064	0.486	_Z11srad_cuda_1PfS_S_S_S_S_iif failed on the card (error 700); mode off, the sim
+rodinia/particlefilter_float	2.842	3.243	3.147	3.062	
+rodinia/sc_gpu	0.775	0.780	0.745	0.791	
+rodinia/hotspot	1.187	1.196	0.515	0.515	
+rodinia/bfs	0.014	0.014	0.013	0.014	
+rodinia/nn	0.021	0.021	0.021	0.021	
+rodinia/lavaMD	1.771	1.772	1.769	1.772	

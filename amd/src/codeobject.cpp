@@ -507,6 +507,7 @@ CodeObject load_code_object(std::string_view bytes, const std::string& origin) {
     kern.dispatch_id = d.properties & (1u << 4);
     kern.flat_scratch_init = d.properties & (1u << 5);
     kern.wave32 = d.properties & (1u << 10);
+    kern.uses_dynamic_stack = d.properties & (1u << 11);   // (KERNEL_CODE_PROPERTY_USES_DYNAMIC_STACK, LLVM's AMDHSAKernelDescriptor.h)
     kern.group_id_x = (d.rsrc2 >> 7) & 1;
     kern.group_id_y = (d.rsrc2 >> 8) & 1;
     kern.group_id_z = (d.rsrc2 >> 9) & 1;

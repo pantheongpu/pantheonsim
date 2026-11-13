@@ -60,7 +60,7 @@ echo "wrote $(pwd)/memory.gfx90a.o"
 
 # Kernels written in assembly, for instructions a compiler emits only now and
 # then (test_amd_gcn_asm).
-for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait asm_realtime asm_isa_gaps asm_lds64 asm_ldsf32 asm_cvt_ubyte asm_dot_clamp asm_hwid asm_quad asm_mulhi asm_xf32 asm_permute_exec asm_barrier_order asm_vop3_gaps asm_mfma_order asm_buffer_lds_cdna3; do
+for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait asm_realtime asm_isa_gaps asm_lds64 asm_ldsf32 asm_cvt_ubyte asm_dot_clamp asm_hwid asm_quad asm_mulhi asm_xf32 asm_permute_exec asm_barrier_order asm_vop3_gaps asm_mfma_order asm_buffer_lds_cdna3 asm_atomic_race asm_dyn_stack; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx942 -c "$src.s" -o "$src.gfx942.o"
   echo "wrote $(pwd)/$src.gfx942.o"
 done
@@ -102,6 +102,12 @@ done
 for t in gfx90a gfx942; do
   "$clang" -x assembler-with-cpp -D"$(echo "$t" | tr a-z A-Z)" -target amdgcn-amd-amdhsa -mcpu=$t -c asm_issues_nov11.s -o asm_issues_nov11.$t.o
   echo "wrote $(pwd)/asm_issues_nov11.$t.o"
+done
+
+# The clamp and output modifier of v_div_fmas and v_div_fixup (test_amd_gcn_div_clamp, issue #613): the same scheme, gfx90a and gfx942.
+for t in gfx90a gfx942; do
+  "$clang" -x assembler-with-cpp -D"$(echo "$t" | tr a-z A-Z)" -target amdgcn-amd-amdhsa -mcpu=$t -c asm_div_clamp.s -o asm_div_clamp.$t.o
+  echo "wrote $(pwd)/asm_div_clamp.$t.o"
 done
 
 # gfx1250's: the same for what the CDNA 5 document defines and the executor refused (test_amd_gcn_cdna_gaps).

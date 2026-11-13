@@ -65,7 +65,7 @@ has that address unmapped or backed with zeros inside the span `ensure_mapped` f
 * `MemoryManager::card_blocker()` (include/vgpu/memory.hpp, src/core/memory.cpp), used by `Runtime::kernel_eligible` (not cached: a mapping can appear between two
   launches). Nothing on an access path changed.
 * `kIncompatibleVars`, `diagnostic_switched_on`, `mode_text_is_known` (include/vgpu/host_gpu.hpp): the start-up refusal is pure logic now and unit tested.
-  The message is printed even under `VGPU_QUIET`; `VGPU_HOST_GPU=<not off or exact>` prints "not a mode; mode off".
+  The message is printed even under `VGPU_QUIET`; `VGPU_HOST_GPU=<not off, exact or turbo>` prints "not a mode; mode off".
 * Config keys `host_gpu` (`off`, `exact`) and `host_gpu_log` (src/cli/config.cpp, docs/config.md, README.md, pantheonsim.example.yaml).
 * Tests: the table test over every `MemoryManager` entry, `card_blocker_*`, `mode_text_known_and_diagnostic_switches`, step 6 of `run_host_gpu_stub.sh`.
 

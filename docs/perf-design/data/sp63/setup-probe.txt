@@ -1,0 +1,20 @@
+# setup_probe.py --build bbase --build2 bnew --runs 15 --sides a,b,u,2a,2b --cpus 12-15 (one thread; b and 2b with a cache directory that holds the compiler's identity; u: VGPU_JIT=1 VGPU_JIT_MIN_REGION=4096, no section gets a unit). Median wall ms.
+hecbench/atan2-cuda              a=19.90 b=21.50 u=19.90 2a=20.30 2b=20.50  | b-a=+1.60 u-a=+0.00 2a-a=+0.40 2b-a=+0.60
+hecbench/adam-cuda               a=23.60 b=25.50 u=23.80 2a=23.80 2b=24.00  | b-a=+1.90 u-a=+0.20 2a-a=+0.20 2b-a=+0.40
+hecbench/backprop-cuda           a=10.90 b=11.30 u=10.80 2a=10.90 2b=11.50  | b-a=+0.40 u-a=-0.10 2a-a=+0.00 2b-a=+0.60
+hecbench/blockAccess-cuda        a=14.00 b=14.90 u=14.00 2a=14.30 2b=14.60  | b-a=+0.90 u-a=+0.00 2a-a=+0.30 2b-a=+0.60
+polybench/ADI                    a=231.60 b=241.30 u=231.50 2a=232.00 2b=233.20  | b-a=+9.70 u-a=-0.10 2a-a=+0.40 2b-a=+1.60
+hecbench/asmooth-cuda            a=225.00 b=234.50 u=225.40 2a=226.30 2b=227.60  | b-a=+9.50 u-a=+0.40 2a-a=+1.30 2b-a=+2.60
+hecbench/sortKV-cuda             a=174.80 b=190.10 u=174.80 2a=174.40 2b=179.30  | b-a=+15.30 u-a=+0.00 2a-a=-0.40 2b-a=+4.50
+hecbench/s3d-cuda                a=389.80 b=408.30 u=391.30 2a=391.10 2b=399.10  | b-a=+18.50 u-a=+1.50 2a-a=+1.30 2b-a=+9.30
+
+
+# the same, first pass, base build only (u was VGPU_JIT_MIN_GEN=101, which still gives units: min_gen is capped at 100)
+hecbench/atan2-cuda              a=19.20 b=21.20 u=20.70 s=20.80  | b-a=+2.00 u-a=+1.50 s-a=+1.60
+hecbench/adam-cuda               a=23.00 b=25.90 u=23.80 s=25.20  | b-a=+2.90 u-a=+0.80 s-a=+2.20
+hecbench/bgmv-cuda               a=12.00 b=12.50 u=12.40 s=12.90  | b-a=+0.50 u-a=+0.40 s-a=+0.90
+hecbench/attention-cuda          a=22.80 b=23.20 u=22.90 s=23.10  | b-a=+0.40 u-a=+0.10 s-a=+0.30
+polybench/ADI                    a=228.80 b=240.50 u=239.20 s=239.50  | b-a=+11.70 u-a=+10.40 s-a=+10.70
+hecbench/asmooth-cuda            a=224.20 b=233.50 u=229.80 s=229.40  | b-a=+9.30 u-a=+5.60 s-a=+5.20
+hecbench/sortKV-cuda             a=174.30 b=188.90 u=188.60 s=189.00  | b-a=+14.60 u-a=+14.30 s-a=+14.70
+

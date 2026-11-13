@@ -11,6 +11,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "vgpu/exec/block_progress.hpp"
 #include "vgpu/exec/scheduler.hpp"
 #include "vgpu/exec/texture.hpp"
 #include "vgpu/memory.hpp"
@@ -59,6 +60,39 @@ struct DeviceGraphLauncher {
 };
 
 struct LaunchEnv;   // vgpu/exec/launch_env.hpp
+
+// A few blocks of a launch, run alone and timed (docs/perf-design/12-host-gpu-turbo.md, "The first blocks of a launch, timed"). The run is not
+// a launch: the other blocks are never run. It is made in a copy of the process that is thrown away (the host-GPU mode's sample), and only
+// the SASS engine's plain block loop makes it: a cooperative or clustered launch, and one whose blocks take turns (lockstep), runs no block at all.
+// True in the forked copy of the process that runs a LaunchPart, and only there (set after the fork, before anything runs). A copy is thrown
+// away and may be ended at any instant, so it leaves nothing on disk: it queues no compile for the code cache and adds no key to the cache of
+// modules. (Both caches write a whole file and rename it, or append one 16-byte key; this is so that not even a temporary file is left.)
+inline std::atomic<bool> g_sample_copy{false};
+
+struct LaunchPart {
+  // In:
+  uint64_t limit = 0;               // how many blocks are run at most
+  uint64_t stride = 1;              // the blocks run are 0, stride, 2 x stride, ...: spread over the grid, whose blocks need not be alike
+  double budget_s = 0;              // above 0: no further block is taken once the timed runs have lasted this long, or the whole run five times it
+  // Out, written by the run before it returns:
+  uint64_t next = 0;                // how many blocks were run and timed, on the calling thread
+  double timed_s = 0;               // the sum of their timed runs: each block is run twice and its second run is the timed one (the first pays
+                                    // what a launch pays once: decode, set-up, memory the launch is the first to write)
+  uint64_t total = 0;               // the blocks of the grid
+  unsigned threads = 0;             // the host threads the whole launch would run on
+  double first_block_s = -1;        // when the first run of the first block ended, in seconds from the run's start
+  double run_s = 0;                 // when the last block ended, on the same clock
+  // Progress inside a block (Round sp61; vgpu/exec/block_progress.hpp): not null, the blocks are not run whole. Each block taken is run until its
+  // warps stand in one of the probe's loops (or have ended, or BlockProbe::enter_s has passed) and is read there; in the first, the warp with the most
+  // turns left then runs alone for BlockProbe::measure_s. `next` counts the blocks read, `timed_s` the time they took (the budget applies to it), and
+  // `first_block_s` and `run_s` are kept as above.
+  const BlockProbe* probe = nullptr;
+  static constexpr unsigned kReadings = 32;
+  BlockReading readings[kReadings];   // the blocks read, in order (the first `next`, kReadings at most)
+  TurnMeasure measure;
+  uint64_t warps_followed = 0;        // warps read in a followed loop
+  uint64_t warps_unfollowed = 0;      // warps read neither in one nor ended (they add no turns)
+};
 
 struct LaunchConfig {
   std::array<uint32_t, 3> grid{1, 1, 1};
@@ -148,6 +182,9 @@ struct LaunchConfig {
   // The environment variables a launch reads, found in one pass by the caller (vgpu/exec/launch_env.hpp) and good for this launch
   // alone; null: the launch reads them itself.
   const LaunchEnv* env = nullptr;
+  // The first blocks of the grid only (host-GPU mode's sample of a launch, vgpu/host_gpu.hpp "The first blocks of a launch, timed"); null for every
+  // other launch. The SASS engine's plain block loop is the only one that honours it.
+  LaunchPart* part = nullptr;
 };
 
 // Invoked periodically during a launch so long-running kernels can still

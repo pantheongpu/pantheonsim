@@ -10,6 +10,11 @@
 #      the same with the mode on, in either form, and off; and the persistent run has to move less than the write-through one;
 #   4. VGPU_HOST_GPU_VERIFY=1 (every launch the mode would offload also runs in the simulator, and the memory is compared) finds every
 #      kernel of the exact set identical and ran at least two on the card.
+# Turbo mode (VGPU_HOST_GPU=turbo, docs/perf-design/12-host-gpu-turbo.md):
+#   5. the expf kernel, which exact mode keeps in the simulator, runs on the card; the lines of the program that do not hold expf results are the ones the
+#      mode-off run prints, and exact mode's summary still counts the expf launches as outside its set (exact is unchanged);
+#   6. VGPU_HOST_GPU_VERIFY=1 in turbo mode compares by tolerance: the expf kernel ran on the card, no word is outside the default tolerance, and the
+#      program's output is the mode-off output to the byte (under verify the simulator's result is the program's).
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -71,5 +76,26 @@ diffc="$(echo "$vline" | sed -n 's/.*identical, \([0-9]*\) different;.*/\1/p')"
 (( ${same:-0} >= 2 )) || { echo "FAIL: verify compared fewer than 2 kernels of the exact set: $vline"; fails=1; }
 (( ${diffc:-1} == 0 )) || { echo "FAIL: a kernel of the exact set gave other bits on the card: $vline"; grep DIFFERENT "$work/v.err" | head; fails=1; }
 cmp -s "$work/off.out" "$work/v.out" || { echo "FAIL: the verify run changed the program's output"; fails=1; }
-(( fails == 0 )) && { echo "PASS: $sum"; exit 0; }
+# 5. turbo mode: the expf kernel goes to the card. Its results are the card's (one or two ulp from the simulator's), so the fields that hash them are
+# left out of the comparison: "expf <hash>" of the pass lines and the first hash of the "fma after simulator" lines (db, which use_expf wrote).
+no_expf() { sed -e 's/ expf [0-9a-f]\{16\}/ expf -/' -e 's/\(fma after simulator  \)[0-9a-f]\{16\}/\1-/' "$1"; }
+run "$work/rel.out" "$work/rel.err" VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the turbo run failed"; tail -5 "$work/rel.err"; fails=1; }
+diff -u <(no_expf "$work/off.out") <(no_expf "$work/rel.out") > "$work/d.txt" || { echo "FAIL: turbo mode changes output that does not come from expf:"; head -20 "$work/d.txt"; fails=1; }
+grep -q 'use_expf[^ ]* on the card' "$work/rel.err" || { echo "FAIL: the expf kernel did not run on the card in turbo mode: $(grep -m3 'use_expf' "$work/rel.err")"; fails=1; }
+grep -q '^host_gpu_refused:' "$work/rel.err" && { echo "FAIL: turbo mode refused a kernel of this program: $(grep -m1 '^host_gpu_refused:' "$work/rel.err")"; fails=1; }
+rline="$(grep '^host_gpu_turbo: mode=turbo ' "$work/rel.err" | tail -1)"
+rcard="$(echo "$rline" | sed -n 's/.* launches_card=\([0-9]*\) .*/\1/p')"
+(( ${rcard:-0} > ${onc:-0} )) || { echo "FAIL: turbo mode ran ${rcard:-no} launches on the card, exact $onc: the expf launches should add to them: $rline"; fails=1; }
+fline="$(grep '^host_gpu_refusals: ' "$work/rel.err" | tail -1)"
+echo "$fline" | grep -q 'refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=[1-9]' || { echo "FAIL: turbo mode's refusals: $fline"; fails=1; }
+# 6. turbo verify.
+run "$work/rv.out" "$work/rv.err" VGPU_HOST_GPU=turbo VGPU_HOST_GPU_VERIFY=1 VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the turbo verify run failed"; tail -5 "$work/rv.err"; fails=1; }
+cmp -s "$work/off.out" "$work/rv.out" || { echo "FAIL: the turbo verify run changed the program's output"; fails=1; }
+vline="$(grep '^host_gpu_turbo: mode=turbo ' "$work/rv.err" | tail -1)"
+vf() { echo "$vline" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
+(( $(vf launches_card) >= 3 && $(vf words_compared) > 0 )) 2>/dev/null || { echo "FAIL: turbo verify compared nothing: $vline"; fails=1; }
+[[ "$(vf words_outside)" == 0 && "$(vf kernels_outside)" == 0 ]] || { echo "FAIL: turbo verify found words outside the default tolerance: $vline"; grep '^host_gpu_outside:' "$work/rv.err" | head -5; fails=1; }
+grep -Eq '^host_gpu: verify [^ ]*use_expf[^ ]* \(admitted\): [0-9]+ words compared, [0-9]+ different, 0 outside tolerance' "$work/rv.err" \
+  || { echo "FAIL: the expf kernel was not verified on the card: $(grep -m2 'verify.*use_expf' "$work/rv.err")"; fails=1; }
+(( fails == 0 )) && { echo "PASS: $sum; turbo: $rline; turbo verify: $vline"; exit 0; }
 exit 1

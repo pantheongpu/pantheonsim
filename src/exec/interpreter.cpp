@@ -47,6 +47,7 @@ asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.skip 2816\n.popsection")
 #include <optional>
 #include <unordered_map>
 
+#include "vgpu/exec/host_fp.hpp"
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/libm.hpp"
 #include "vgpu/exec/device_printf.hpp"
@@ -17526,6 +17527,7 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& in_cfg,
                    const std::vector<std::vector<uint8_t>>& in_args, MemoryManager& mem,
                    const DeviceProfile& in_profile, const SymbolTable* symbols,
                    const ProgressFn& progress) {
+  const DeviceFpScope fp;   // host FP traps do not reach the kernel, nor its flags the host (vgpu/exec/host_fp.hpp, #605)
   // The launch's warp width (LaunchConfig::warp_size): the grid runs on a copy of the profile that has it, so the
   // interpreter, the occupancy figures and the child grids all see one width, and the caller's profile is untouched.
   DeviceProfile widened;

@@ -7,6 +7,7 @@
 //
 // The file is trusted only if it is a regular file of this user's that nobody else can write, in a directory of the
 // same kind; a short tail (a torn append) is ignored and never appended to. It is on by default; `VGPU_SASS_CACHE=0` turns it off.
+#include "vgpu/exec/launch.hpp"
 #include "ok_cache.hpp"
 
 #include <fcntl.h>
@@ -227,6 +228,7 @@ bool known(const Key& k) {
 }
 
 void remember(const Key& k) {
+  if (exec::g_sample_copy.load(std::memory_order_relaxed)) return;   // (a sample's copy of the process writes no cache)
   const std::string path = cache_path();
   if (path.empty()) return;
   State& s = state();

@@ -13,6 +13,7 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "vgpu/exec/lockstep.hpp"
 #include "vtest.hpp"
@@ -56,11 +57,21 @@ unsigned launch(unsigned units, unsigned run_ms, unsigned fold_us) {
   return folds;
 }
 
-// The same, for a block that stands still; its own call site. Returns the number of turns it was given in `run_ms`.
+// A block that stands still (it stores nothing, and its fingerprint never changes), or one that computes (a new fingerprint at every
+// look); its own call site. The worker's naps are counted instead of slept (lockstep_worker's `nap`), so what is checked is what the
+// worker decides, not how many turns a thread managed in some stretch of wall time (which a loaded machine or a sanitizer build changes
+// by an order of magnitude). The block runs until the worker has napped `naps` times or has looked `looks` times, whichever comes first;
+// a worker that does neither is given up on after a minute, which only a broken worker reaches.
+struct Looked {
+  unsigned looks = 0;               // fingerprints taken, in all
+  unsigned looks_before_nap = 0;    // ... before the first nap
+  std::vector<unsigned> naps;       // the length of each, in microseconds
+  bool gave_up = false;
+};
 template <int Tag>
-uint64_t spin(unsigned run_ms) {
+Looked look_at(bool computes, unsigned naps, unsigned looks) {
   std::atomic<uint64_t> ticket{0}, beat{0};
-  uint64_t turns = 0;
+  Looked r;
   vgpu::exec::lockstep_worker<Block>(
       ticket, beat, 1, 1, 1, 1, [](Block& b, uint64_t, size_t) { b = Block{}; },
       [&](Block& b) {
@@ -68,24 +79,21 @@ uint64_t spin(unsigned run_ms) {
           b.started = true;
           b.start = Clock::now();
         }
-        ++turns;
-        return Clock::now() - b.start >= std::chrono::milliseconds(run_ms);
+        if (r.naps.size() >= naps || r.looks >= looks) return true;
+        if (Clock::now() - b.start >= std::chrono::seconds(60)) return r.gave_up = true;
+        return false;
       },
-      [](const Block&) -> uint64_t { return 0; }, [](const Block&) -> uint64_t { return 42; }, [](Block&) {}, [] { return false; });
-  return turns;
-}
-
-// How many turns of spin()'s kind a thread takes in a microsecond on this machine and in this build (a turn reads the clock twice and yields): the
-// answer differs by an order of magnitude between a plain build and a sanitizer build, and a fixed bound on the turns taken cannot be
-// right for both.
-double turns_per_us() {
-  uint64_t n = 0;
-  const auto start = Clock::now();
-  while (Clock::now() - start < std::chrono::milliseconds(2)) {
-    ++n;
-    std::this_thread::yield();   // (a pass that waits gives the core up, as the worker does)
-  }
-  return static_cast<double>(n) / 2000.0;
+      [](const Block&) -> uint64_t { return 0; },
+      [&](const Block&) -> uint64_t {
+        ++r.looks;
+        return computes ? r.looks : 42;
+      },
+      [](Block&) {}, [] { return false; },
+      [&](unsigned us) {
+        if (r.naps.empty()) r.looks_before_nap = r.looks;
+        r.naps.push_back(us);
+      });
+  return r;
 }
 
 // Its own call site again, for the cap on the wait.
@@ -146,13 +154,19 @@ VTEST(the_first_look_of_a_launch_waits_for_what_the_last_look_cost) {
 }
 
 VTEST(a_block_that_stands_still_is_still_found_out_and_slept_on) {
-  // Looks 250 microseconds apart (a look costs nothing), the third finding nothing changed: the thread then sleeps between passes. Without
-  // that it would take a turn every microsecond or so for the 100 ms. With it, the turns are the ones before the third look (about
-  // 750 microseconds' worth) and a few hundred more: about one hundredth of the others. The bound is a quarter, measured on this machine.
-  VCHECK(eventually([](auto tag) {
-    const double bound = turns_per_us() * 100000.0 / 4.0;
-    return static_cast<double>(spin<decltype(tag)::value>(100)) < bound;
-  }));
+  // The first look finds a fingerprint it has not seen, the second and third the same one again: standing still twice running, so the
+  // thread naps from then on between passes, for twice as long each time, to half a millisecond. (Not before the third look, and never
+  // for a block that computes.) The wall clock decides only when the looks come, not what they find, so the answers are the same on a
+  // loaded machine and under a sanitizer (#612).
+  const Looked still = look_at<0>(false, 10, 1000);
+  VCHECK(!still.gave_up);
+  VCHECK_EQ(still.looks_before_nap, 3u);
+  const std::vector<unsigned> want{5, 10, 20, 40, 80, 160, 320, 500, 500, 500};
+  VCHECK(still.naps == want);
+  const Looked moving = look_at<1>(true, 1, 20);
+  VCHECK(!moving.gave_up);
+  VCHECK_EQ(moving.looks, 20u);
+  VCHECK(moving.naps.empty());
 }
 
 VTEST(the_wait_for_the_first_look_has_a_ceiling) {

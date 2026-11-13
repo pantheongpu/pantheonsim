@@ -65,11 +65,12 @@ while IFS= read -r line; do
     grep -qw -- "$v" Makefile || bad "README gives '$v=' to make, but the Makefile does not read $v  (in: $line)"
   done < <(grep -oE '(^|[[:space:]])[A-Z][A-Z_]*=' <<<"$line" | tr -d ' \t=')
 done < "$tmp/code.txt"
-# a span that is just VAR=value is a make variable
+# a span that is just VAR=value is a make variable, unless it is one of the simulator's VGPU_*
+# environment variables, which the section below checks against docs/cli.md and docs/config.md
 while IFS= read -r line; do
   v=${line%%=*}
   grep -qw -- "$v" Makefile || bad "README shows '$line', but the Makefile does not read $v"
-done < <(grep -E '^[A-Z][A-Z_]*=' "$tmp/code.txt")
+done < <(grep -E '^[A-Z][A-Z_]*=' "$tmp/code.txt" | grep -v '^VGPU_')
 
 # --- ./run, and the front door's shape ------------------------------------------------------
 if grep -qE '(^|[^[:alnum:]_/.-])\./run( |$)' "$tmp/code.txt"; then

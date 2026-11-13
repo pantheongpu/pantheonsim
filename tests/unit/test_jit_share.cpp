@@ -153,7 +153,10 @@ VTEST(jit_a_section_whose_regions_are_most_of_its_work_is_kept_and_asks_after_th
   u->sample(2000);    // 1200 of 2000: exactly the bar (600 per thousand)
   VCHECK(!u->sampling.load());
   VCHECK(u->state.load() != static_cast<int>(jit::State::Declined));
-  VCHECK(u->hook());
+  // Kept, and far from its lookup: it waits for it on the plain loop (round sp63), counted by the instruction, to be hooked again at the lookup.
+  VCHECK(u->state.load() == static_cast<int>(jit::State::Waiting));
+  VCHECK(!u->hook());
+  VCHECK_EQ(u->wait_then.load(), static_cast<int>(jit::State::Idle));
   VCHECK_EQ(jit::stats().accepted.load(), accepted0 + 1);
   VCHECK_EQ(jit::stats().declined.load(), declined0);
   u->sample(1'000'000);   // (decided: a later sample changes nothing)

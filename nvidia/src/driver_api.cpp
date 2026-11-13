@@ -293,10 +293,32 @@ ShimState& state() {
 // thread holds a bare pointer, which has no destructor, and a pthread key frees the vector when a thread other
 // than the exiting main thread ends (key destructors do not run for the main thread at exit(), whose stack is
 // reachable through its thread-local pointer to the end).
+// Peer access from context `from` to context `to` (cuCtxEnablePeerAccess): the memory of `from`'s device reaches `to`'s device's
+// (MemoryManager::set_peer), or no longer does. Both contexts must still be in s.contexts.
+static void peer_link(ShimState& s, uintptr_t from, uintptr_t to, bool enabled) {
+  const auto f = s.contexts.find(from), t = s.contexts.find(to);
+  if (f == s.contexts.end() || t == s.contexts.end() || f->second == t->second) return;
+  s.rt->device(f->second).memory().set_peer(s.rt->device(t->second).memory(), enabled);
+}
+
 static thread_local std::vector<uintptr_t>* t_ctx_stack = nullptr;
 static void drop_ctx_stack(void* p) {
   delete static_cast<std::vector<uintptr_t>*>(p);
   t_ctx_stack = nullptr;   // the next call from this thread, if any, starts a fresh stack
+}
+}  // namespace
+extern "C" int vgpu_driver_bind_primary_v1(int dev);
+namespace {
+// A thread the runtime has used before this library was loaded (cudaGetDriverEntryPoint loads it on first use, for a
+// program that does not link libcuda: #604) has the runtime's primary context current on the card, as every thread the
+// runtime has used does. The runtime could not hand it over then (bind_driver_context in runtime_api.cpp finds no
+// driver), so the thread's first driver call takes it: the device the runtime made current for it, -1 for a thread
+// the runtime has not used, which starts with no context as before.
+void adopt_runtime_context() {
+  using Fn = int (*)();
+  static const Fn device_of = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "vgpu_runtime_thread_device_v1"));
+  if (!device_of) return;
+  if (const int dev = device_of(); dev >= 0) vgpu_driver_bind_primary_v1(dev);
 }
 std::vector<uintptr_t>& ctx_stack() {
   if (!t_ctx_stack) {
@@ -307,6 +329,7 @@ std::vector<uintptr_t>& ctx_stack() {
     }();
     t_ctx_stack = new std::vector<uintptr_t>;
     pthread_setspecific(key, t_ctx_stack);
+    adopt_runtime_context();
   }
   return *t_ctx_stack;
 }
@@ -1291,12 +1314,16 @@ static CUresult cuCtxDestroy_v2_impl(CUcontext ctx) {
     if (!s.contexts.count(h)) return CUDA_ERROR_INVALID_CONTEXT;
     // A subscriber is told before the context goes, while it can still be asked about.
     vgpu::profiling::notify_resource(vgpu::profiling::Resource::ContextDestroyStarting, h, profiled_device(s));
+    std::erase_if(s.peer_access, [&](const auto& p) {
+      if (p.first != h && p.second != h) return false;
+      peer_link(s, p.first, p.second, false);   // (before the context is forgotten: the link names its device)
+      return true;
+    });
     s.contexts.erase(h);
     s.ctx_state.erase(h);
     // Measured on an RTX 3060: destroying the thread's current context makes the one below it
     // current; destroying one further down the stack leaves it there, and a pop hands it back.
     if (!ctx_stack().empty() && ctx_stack().back() == h) ctx_stack().pop_back();
-    std::erase_if(s.peer_access, [h](const auto& p) { return p.first == h || p.second == h; });
     s.attached.erase(h);
     return CUDA_SUCCESS;
   });
@@ -6315,9 +6342,9 @@ static CUresult cuDeviceGetP2PAttribute_impl(int* value, int attrib, CUdevice sr
   });
 }
 
-// Peer mappings are implicit here -- device address windows are disjoint and
-// every kernel reaches all of them -- but whether one is enabled is state the
-// documented answers depend on: enabling twice is PEER_ACCESS_ALREADY_ENABLED,
+// Once enabled, a kernel in the current context reaches the peer context's
+// device memory (MemoryManager::set_peer), as on a card; the documented
+// answers: enabling twice is PEER_ACCESS_ALREADY_ENABLED,
 // disabling what was never enabled PEER_ACCESS_NOT_ENABLED, and a context on
 // the same device as the current one is no peer (PEER_ACCESS_UNSUPPORTED, as
 // the card answers). Flags must be 0.
@@ -6333,6 +6360,7 @@ static CUresult cuCtxEnablePeerAccess_impl(CUcontext peerContext, unsigned int f
     // Without a peer path (an RTX 3060 pair, measured) a context on the other device is unsupported too.
     if (!peer_path(s, current_device(s), it->second)) return CUDA_ERROR_PEER_ACCESS_UNSUPPORTED;
     if (!s.peer_access.emplace(ctx_stack().back(), peer).second) return CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED;
+    peer_link(s, ctx_stack().back(), peer, true);
     return CUDA_SUCCESS;
   });
 }
@@ -6345,6 +6373,7 @@ static CUresult cuCtxDisablePeerAccess_impl(CUcontext peerContext) {
     if (!s.contexts.count(peer)) return CUDA_ERROR_INVALID_CONTEXT;
     (void)current_device(s);
     if (!s.peer_access.erase({ctx_stack().back(), peer})) return CUDA_ERROR_PEER_ACCESS_NOT_ENABLED;
+    peer_link(s, ctx_stack().back(), peer, false);
     return CUDA_SUCCESS;
   });
 }

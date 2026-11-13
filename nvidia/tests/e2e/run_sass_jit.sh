@@ -99,6 +99,34 @@ runit() {
 }
 jitenv=(VGPU_TIER=1 VGPU_JIT=1 VGPU_JIT_THRESHOLD=1 VGPU_JIT_SYNC=1 VGPU_JIT_HOT_PERMILLE=0 VGPU_JIT_MAX_OPS=100000000 VGPU_JIT_MIN_REGION=2 "VGPU_JIT_CACHE=$cache")
 
+# A JIT run of one of sass_tier_steps' fault programs (or of the step limit), whose whole output, stderr and all, is compared with the
+# tier's: jit_fault <cache> [VAR=value ...] -- <program arguments>. The comparison means something only for a run in which the JIT did
+# compile. On a loaded machine a compile can outlast its time limit (120 s by default; the compiler runs at a lower priority) or the
+# compiler be killed; the regions then stay on the tier, which reports the same fault, and the JIT says so on stderr ("pantheonsim: JIT:
+# ... stay on the tier"), which was then the only difference: "the scatter fault is reported differently with the JIT", now and then, on
+# the busiest runner (#611; 72 runs of tier, JIT and JIT without exceptions on an idle machine and under load print the same, byte for
+# byte). So these runs give a compile 840 s, and a run that still could not compile is taken once more, with a cache of its own; if that
+# one cannot either, its output is what is compared, and the failure names the notice.
+jit_fault() {
+  local c=$1 out try
+  shift
+  local -a envs=()
+  while (( $# )) && [[ $1 != -- ]]; do envs+=("$1"); shift; done
+  shift
+  for try in 1 2; do
+    out="$(cd "$work" && env "${fenv[@]}" "${jitenv[@]}" VGPU_JIT_TIMEOUT=840 "VGPU_JIT_CACHE=$c" "${envs[@]}" timeout 900 "$bin" "$@" 2>&1)"
+    grep -q '^pantheonsim: JIT: ' <<< "$out" || break
+    c="$c-again"; rm -rf "$c"
+  done
+  printf '%s\n' "$out"
+}
+# Why a fault run of the JIT ($2) differs from the tier's ($1), for the message: the JIT's notice if it could not compile, else the diff.
+jit_fault_diff() {
+  local n
+  n="$(grep -m1 '^pantheonsim: JIT: ' <<< "$2")"
+  if [[ -n $n ]]; then echo "  (it could not compile: ${n#pantheonsim: JIT: })"; else echo "  ($(diff <(echo "$1") <(echo "$2") | grep '^[<>]' | head -4 | tr '\n' ' '))"; fi
+}
+
 # The "jit: ..." line of a statistics file, and one number from it.
 jit_line() { grep -h '^jit: ' "$1" 2>/dev/null | tail -1; }
 jit_num() { sed -n "s/.*[ ,;]\([0-9][0-9]*\) $2.*/\1/p" <<< "$1" | tail -1; }
@@ -180,13 +208,23 @@ check() {
     for f in gather scatter local shared atomic trap forever; do
       fa="$(cd "$work" && env "${fenv[@]}" VGPU_TIER=1 timeout 300 "$bin" fault $f 2>&1)"
       fsf="$work/fault.$f.stats"; rm -f "$fsf"
-      fb="$(cd "$work" && env "${fenv[@]}" "${jitenv[@]}" VGPU_JIT_STATS=1 VGPU_JIT_STATS_FILE="$fsf" timeout 300 "$bin" fault $f 2>&1)"
+      fb="$(jit_fault "$cache" VGPU_JIT_STATS=1 VGPU_JIT_STATS_FILE="$fsf" -- fault $f)"
       thr=$(( thr + $(sed -n 's/.* \([0-9][0-9]*\) exceptions unwound.*/\1/p' "$fsf" 2>/dev/null | tail -1 | grep . || echo 0) ))
-      fc="$(cd "$work" && env "${fenv[@]}" "${jitenv[@]}" VGPU_JIT_FLAGS=-fno-exceptions "VGPU_JIT_CACHE=$cache-noexc" timeout 300 "$bin" fault $f 2>&1)"
+      fc="$(jit_fault "$cache-noexc" VGPU_JIT_FLAGS=-fno-exceptions -- fault $f)"
       if ! grep -q "^fault $f: " <<< "$fa" || grep -q "^fault $f: no error" <<< "$fa"; then why="${why:+$why; }the $f fault did not happen"
-      elif [[ "$fa" != "$fb" ]]; then why="${why:+$why; }the $f fault is reported differently with the JIT"
-      elif [[ "$fa" != "$fc" ]]; then why="${why:+$why; }the $f fault is reported differently with the JIT built without exceptions"; fi
+      elif [[ "$fa" != "$fb" ]]; then why="${why:+$why; }the $f fault is reported differently with the JIT$(jit_fault_diff "$fa" "$fb")"
+      elif [[ "$fa" != "$fc" ]]; then why="${why:+$why; }the $f fault is reported differently with the JIT built without exceptions$(jit_fault_diff "$fa" "$fc")"; fi
     done
+    # The retry of jit_fault, checked (#611): with a compiler that is killed on its first compile (a stand-in for one that outlasts its
+    # limit on a loaded machine), the scatter fault is still reported as the tier reports it.
+    local flaky="$work/flaky-c++" real_cxx fl ft
+    real_cxx="$(command -v c++ || command -v g++ || command -v clang++)"
+    printf '#!/bin/sh\ncase " $* " in *" -shared "*) mkdir "%s.once" 2>/dev/null && kill -9 $$ ;; esac\nexec "%s" "$@"\n' "$flaky" "$real_cxx" > "$flaky"
+    chmod +x "$flaky"; rm -rf "$flaky.once" "$cache-flaky" "$cache-flaky-again"
+    ft="$(cd "$work" && env "${fenv[@]}" VGPU_TIER=1 timeout 300 "$bin" fault scatter 2>&1)"
+    fl="$(jit_fault "$cache-flaky" VGPU_JIT_CXX="$flaky" -- fault scatter)"
+    if [[ ! -d $flaky.once ]]; then why="${why:+$why; }the compiler that fails once was never asked to compile"
+    elif [[ "$ft" != "$fl" ]]; then why="${why:+$why; }after one failed compile the scatter fault is reported differently with the JIT$(jit_fault_diff "$ft" "$fl")"; fi
     # The step budget is checked once for a whole region (steps + k): a limit that falls inside the region the fault is in must give the
     # limit's error, not the fault's. For each fault that is thrown inside a region: the smallest VGPU_MAX_STEPS at which the tier reports the
     # fault (found by bisection), then the limits just below it, tier against JIT.
@@ -204,7 +242,7 @@ check() {
         lim=$(( lo - off ))
         (( lim >= 1 )) || continue
         la="$(cd "$work" && env "${fenv[@]}" VGPU_MAX_STEPS=$lim VGPU_TIER=1 timeout 300 "$bin" fault $f 2>&1)"
-        lb="$(cd "$work" && env "${fenv[@]}" "${jitenv[@]}" VGPU_MAX_STEPS=$lim timeout 300 "$bin" fault $f 2>&1)"
+        lb="$(jit_fault "$cache" VGPU_MAX_STEPS=$lim -- fault $f)"
         [[ "$la" == "$lb" ]] || why="${why:+$why; }$f with VGPU_MAX_STEPS=$lim (the fault is at step $lo): the JIT reports '$(head -c 80 <<< "$lb")' where the tier reports '$(head -c 80 <<< "$la")'"
       done
     done

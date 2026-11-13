@@ -62,18 +62,70 @@ CMat packed_full(const std::vector<cd>& ap, int n, bool lower, bool mirror, bool
   return f;
 }
 
-// y = alpha op(M) x + beta y over a dense host copy of M (rows x cols before
-// the operation). beta 0 leaves y unread, so NaN in it stays out.
-template <class T>
-void mv_into(cublasHandle_t h, const CMat& M, vgpu_la::Op op, int rows, int cols, cd alpha, const T* x, int incx,
+// A band or packed matrix read where it is stored, as band_full() and packed_full() would lay it out: el(i, j) is the
+// element (i, j) of the full matrix, zero outside the stored band. The matrix-vector routines below loop over these
+// elements and never build the full n x n copy: tbmv on a vector of 1500 made a 34 MiB matrix on every call, which
+// glibc maps and unmaps each time (8,000 page faults a call, and the O(n^2) loop over it; #551).
+struct BandView {
+  const std::vector<cd>* band;
+  int lda, n, k;   // k < 0: a packed triangle
+  bool lower, mirror, hermitian;
+  // Whether (i, j) is in the stored triangle, and its element there.
+  bool stored(int i, int j) const {
+    if (lower ? i < j : i > j) return false;
+    return k < 0 || (lower ? i - j : j - i) <= k;
+  }
+  cd at(int i, int j) const {
+    return k < 0 ? (*band)[packed_at(lower, n, i, j)] : (*band)[(size_t)j * lda + (lower ? i - j : k + i - j)];
+  }
+  cd operator()(int i, int j) const {
+    if (stored(i, j)) {
+      const cd v = at(i, j);
+      return hermitian && i == j ? cd(v.real()) : v;
+    }
+    if (mirror && stored(j, i)) {
+      const cd v = at(j, i);
+      return hermitian ? std::conj(v) : v;
+    }
+    return 0;
+  }
+  // The columns [lo, hi] of row i of op(M) that can be other than zero.
+  void cols(vgpu_la::Op op, int i, int* lo, int* hi) const {
+    const int w = k < 0 ? n : k;
+    const bool low = mirror ? false : (lower == (op == vgpu_la::Op::N));   // op(M) lower triangular
+    *lo = mirror || low ? std::max(0, i - w) : i;
+    *hi = mirror || !low ? std::min(n - 1, i + w) : i;
+  }
+};
+inline cd opel(const BandView& a, vgpu_la::Op op, int i, int j) {
+  return op == vgpu_la::Op::N ? a(i, j) : vgpu_la::apply_op(a(j, i), op);
+}
+
+// Whether every element is finite. Over a finite x the products the band leaves out are zeros, and adding a zero to
+// a running sum that started at +0 changes no bit (no such sum is ever -0), so summing the band alone gives the full
+// loop's answer exactly. An infinity or NaN in x would turn a left-out zero product into a NaN, so then the loops run
+// over every column as they always did.
+inline bool all_finite(const std::vector<cd>& v) {
+  for (const cd& e : v)
+    if (!std::isfinite(e.real()) || !std::isfinite(e.imag())) return false;
+  return true;
+}
+
+// y = alpha op(M) x + beta y, M (rows x cols before the operation) read through `el` (el(op, i, j) is op(M)(i, j));
+// cols(i, &lo, &hi) bounds the columns of row i of op(M) that can be other than zero. beta 0 leaves y unread, so
+// NaN in it stays out.
+template <class T, class El, class Cols>
+void mv_into(const El& el, const Cols& cols, vgpu_la::Op op, int rows, int ncols, cd alpha, const T* x, int incx,
              cd beta, T* y, int incy) {
-  const int ylen = op == vgpu_la::Op::N ? rows : cols, xlen = op == vgpu_la::Op::N ? cols : rows;
-  (void)h;
+  const int ylen = op == vgpu_la::Op::N ? rows : ncols, xlen = op == vgpu_la::Op::N ? ncols : rows;
   const auto xv = load_vec(x, xlen, incx);
+  const bool band = all_finite(xv);
   auto yv = beta == cd(0) ? std::vector<cd>(ylen, 0) : load_vec(y, ylen, incy);
   for (int i = 0; i < ylen; ++i) {
+    int lo = 0, hi = xlen - 1;
+    if (band) cols(i, &lo, &hi);
     cd s = 0;
-    for (int j = 0; j < xlen; ++j) s += opel(M, op, i, j) * xv[j];
+    for (int j = lo; j <= hi; ++j) s += el(i, j) * xv[j];
     yv[i] = beta == cd(0) ? alpha * s : alpha * s + beta * yv[i];
   }
   store_vec(y, ylen, incy, yv);
@@ -91,10 +143,15 @@ cublasStatus_t gbmv(cublasHandle_t h, cublasOperation_t t, int m, int n, int kl,
   return run_c(h, alpha, beta, sizeof(T), [=](const void* al, const void* be) {
     const cd a_ = cscalar(h, static_cast<const T*>(al)), b_ = cscalar(h, static_cast<const T*>(be));
     const auto band = load_c(A, extent(lda, n, kl + ku + 1));
-    CMat M{std::vector<cd>((size_t)m * n, 0), m};
-    for (int j = 0; j < n; ++j)
-      for (int i = std::max(0, j - ku); i <= std::min(m - 1, j + kl); ++i) M(i, j) = band[(size_t)j * lda + ku + i - j];
-    mv_into(h, M, to_op(t), m, n, a_, x, incx, b_, y, incy);
+    const auto op = to_op(t);
+    // A(i, j) is stored for j - ku <= i <= j + kl.
+    auto M = [&](int i, int j) { return i >= j - ku && i <= j + kl ? band[(size_t)j * lda + ku + i - j] : cd(0); };
+    auto el = [&](int i, int j) { return op == vgpu_la::Op::N ? M(i, j) : vgpu_la::apply_op(M(j, i), op); };
+    auto cols = [&](int i, int* lo, int* hi) {
+      if (op == vgpu_la::Op::N) *lo = std::max(0, i - kl), *hi = std::min(n - 1, i + ku);
+      else *lo = std::max(0, i - ku), *hi = std::min(m - 1, i + kl);
+    };
+    mv_into(el, cols, op, m, n, a_, x, incx, b_, y, incy);
     return CUBLAS_STATUS_SUCCESS;
   });
 }
@@ -110,9 +167,10 @@ cublasStatus_t sbmv(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, int
   if (!alpha || !beta) return CUBLAS_STATUS_INVALID_VALUE;
   return run_c(h, alpha, beta, sizeof(T), [=](const void* al, const void* be) {
     const cd a_ = cscalar(h, static_cast<const T*>(al)), b_ = cscalar(h, static_cast<const T*>(be));
-    const CMat M = band_full(load_c(A, extent(lda, n, k + 1)), lda, n, k, uplo == CUBLAS_FILL_MODE_LOWER, true,
-                             hermitian);
-    mv_into(h, M, vgpu_la::Op::N, n, n, a_, x, incx, b_, y, incy);
+    const auto band = load_c(A, extent(lda, n, k + 1));
+    const BandView M{&band, lda, n, k, uplo == CUBLAS_FILL_MODE_LOWER, true, hermitian};
+    mv_into(M, [&](int i, int* lo, int* hi) { M.cols(vgpu_la::Op::N, i, lo, hi); }, vgpu_la::Op::N, n, n, a_, x, incx,
+            b_, y, incy);
     return CUBLAS_STATUS_SUCCESS;
   });
 }
@@ -127,8 +185,10 @@ cublasStatus_t spmv(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, int
   if (!alpha || !beta) return CUBLAS_STATUS_INVALID_VALUE;
   return run_c(h, alpha, beta, sizeof(T), [=](const void* al, const void* be) {
     const cd a_ = cscalar(h, static_cast<const T*>(al)), b_ = cscalar(h, static_cast<const T*>(be));
-    const CMat M = packed_full(load_c(AP, packed_len(n)), n, uplo == CUBLAS_FILL_MODE_LOWER, true, hermitian);
-    mv_into(h, M, vgpu_la::Op::N, n, n, a_, x, incx, b_, y, incy);
+    const auto ap = load_c(AP, packed_len(n));
+    const BandView M{&ap, 0, n, -1, uplo == CUBLAS_FILL_MODE_LOWER, true, hermitian};
+    mv_into(M, [&](int i, int* lo, int* hi) { M.cols(vgpu_la::Op::N, i, lo, hi); }, vgpu_la::Op::N, n, n, a_, x, incx,
+            b_, y, incy);
     return CUBLAS_STATUS_SUCCESS;
   });
 }
@@ -176,16 +236,23 @@ cublasStatus_t tri_band(cublasHandle_t h, bool solve, cublasFillMode_t uplo, cub
   if (n == 0) return CUBLAS_STATUS_SUCCESS;
   return run_c(h, nullptr, nullptr, 0, [=](const void*, const void*) {
     const bool lower = uplo == CUBLAS_FILL_MODE_LOWER, unit = diag == CUBLAS_DIAG_UNIT;
-    const CMat a = packed ? packed_full(load_c(A, packed_len(n)), n, lower, false, false)
-                          : band_full(load_c(A, extent(lda, n, k + 1)), lda, n, k, lower, false, false);
     auto xv = load_vec(x, n, incx);
     const auto op = to_op(t);
     if (solve) {
+      const CMat a = packed ? packed_full(load_c(A, packed_len(n)), n, lower, false, false)
+                            : band_full(load_c(A, extent(lda, n, k + 1)), lda, n, k, lower, false, false);
       vgpu_la::tri_solve(a, n, lower, op, unit, xv.data(), 1);
     } else {
+      // Over the band only, read where it is stored (see BandView and all_finite).
+      const auto stored = packed ? load_c(A, packed_len(n)) : load_c(A, extent(lda, n, k + 1));
+      const BandView a{&stored, lda, n, packed ? -1 : k, lower, false, false};
+      const bool band = all_finite(xv);
       std::vector<cd> out(n, 0);
-      for (int i = 0; i < n; ++i)
-        for (int j = 0; j < n; ++j) out[i] += (i == j && unit) ? xv[j] : opel(a, op, i, j) * xv[j];
+      for (int i = 0; i < n; ++i) {
+        int lo = 0, hi = n - 1;
+        if (band) a.cols(op, i, &lo, &hi);
+        for (int j = lo; j <= hi; ++j) out[i] += (i == j && unit) ? xv[j] : opel(a, op, i, j) * xv[j];
+      }
       xv = out;
     }
     store_vec(x, n, incx, xv);

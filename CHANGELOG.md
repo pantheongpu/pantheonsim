@@ -18,6 +18,126 @@ release says what runs and what it produces, never how fast a real GPU would run
   libraries) give the same digests before and after. `VGPU_LOAD_PLAIN=1` reads them as before (`test_amd_codeobject_same_bits_plain`);
   `test_amd_bundle` adds bundles larger than the buffer, read both ways. AMD's `rocblas-test` gains nothing from it: its start-up
   (57 s a process, reading `rocblas_gtest.data`, against 0.1 to 0.4 s of loading) is AMD's client, not the simulator (pantheonsim #565).
+- Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
+  judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
+  loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the
+  launch's simulator time is the turns left at that cost. Measured on one A10G (Round sp61): PolyBench COVAR 64.7 s to 41.8 s and CORR 64.8 s to
+  42.0 s in both modes (their long kernel, 24.5 s in the simulator, takes 1.67 s on the card path), outputs identical. Grids of 256 blocks or more
+  are sampled as before; `VGPU_HOST_GPU_SAMPLE=whole` keeps the rule of Round sp60b ([design](docs/perf-design/12-host-gpu-turbo.md), section 8).
+- Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch of a kernel with a loop that the mode knows nothing of yet is now *sampled*
+  before the simulator is left to run it. The process is forked, the copy runs a few of the launch's blocks (up to 32, a few milliseconds), reports
+  their times and ends; if they say that the launch repays the card path and the start of the real driver, the card runs the launch, otherwise
+  the simulator does. Before, such a launch went to the card only on a static count of the kernel's instructions, which is low by the trip
+  count of its loops, so programs that launch each kernel once kept their one long launch in the simulator. `VGPU_HOST_GPU_SAMPLE=0` switches
+  the sampling off; `=log` reports what it would do with no card. Measured on one A10G (Round sp60b): PolyBench SYRK 5.16 s to 1.30 s, SYR2K
+  9.81 s to 2.37 s, 2MM 172 s to 122 s in both modes, HeCBench black-scholes 25.1 s to 6.1 s in turbo; geometric mean over 61 programs from 1.12x
+  to 1.18x (`exact`) and from 1.14x to 1.27x (`turbo`) against the simulator, outputs identical. Kernels launched on a few large blocks (PolyBench
+  COVAR, CORR) are not reached ([design](docs/perf-design/12-host-gpu-turbo.md), section 8; pantheonsim #587).
+- Host-GPU mode (experimental, opt-in): `VGPU_HOST_GPU=turbo` also runs on the machine's real GPU the kernels whose result is the
+  card's own and not the simulator's bits: the approximate functions (`MUFU`), packed half arithmetic, float reductions, calls inside the
+  kernel, tensor-core instructions and integer atomics that return a value; float atomics with a returned value, compare-and-swap and
+  exchange only with `VGPU_HOST_GPU_ATOMICS=1`; textures and unnamed instructions never. `VGPU_HOST_GPU_TURBO_OFF` switches classes
+  off. With `VGPU_HOST_GPU_VERIFY` the card's memory is compared with the simulator's by tolerance (`VGPU_HOST_GPU_ATOL`,
+  `VGPU_HOST_GPU_RTOL`, `VGPU_HOST_GPU_TOL_TYPE`) instead of byte for byte, and the exit summary has lines for scripts (`host_gpu_turbo:`, `host_gpu_refusals:`,
+  `host_gpu_outside:`). A launch that does not come back from the card ends the process after `VGPU_HOST_GPU_TIMEOUT` seconds (600 in
+  turbo mode). `exact` mode is unchanged, except for two bugs: a kernel refused for its module is no longer reported as "not in the
+  exact set" from its second launch on, and a float reduction (`RED.ADD.F32`, which adds in arrival order) is now refused on sm_75 to
+  sm_89 as it was meant to be (the check did not recognise the decoder's spelling of the type). Measured on one A10G (Round sp59): geometric mean 1.23x over 59 programs
+  of PolyBench/GPU, Rodinia and HeCBench against 1.12x for `exact`, outputs identical. `VGPU_HOST_GPU_VERIFY` now gives the card copy up before the
+  simulator runs the launch, in both modes: the simulator's atomics could lose updates under verify, and the card ran on its own earlier results.
+  [Design and limits](docs/perf-design/12-host-gpu-turbo.md); the benchmark harness is
+  `tools/bench/hostgpu/run.py`, the card probes `tools/probes/hostgpu_turbo_card_probes.sh`. `docs/cli.md` now lists every
+  `VGPU_HOST_GPU_*` variable (pantheonsim #587).
+- Tier 2 (`VGPU_JIT=1`, still off by default), the cold run ([round sp63](docs/perf-design/rounds/11-rounds-sp36-sp41.md)): a section the
+  share rule keeps waits for its cache lookup on the plain run loop too, so short programs no longer pay for the counting loop before
+  the lookup (ADI, asmooth, sortKV, atan2, adam lost 1 to 9 % with `VGPU_JIT=1`; now within 0 to 2 %). The regions chosen for a section
+  are recorded before its compile, so a compile that the end of the program cancels (silently now) is started at the next run's lookup
+  instead of at the threshold (`VGPU_JIT_HISTORY=0` turns that off): asyncAllocation, shorter than its compile, is warm from its third run
+  instead of never at one thread (at sixteen threads such compiles still never finish). The cache directory is named by the library's GNU build id, other builds' directories untouched for 14 days are
+  removed, and the cache is capped (`VGPU_JIT_CACHE_MAX_MB`, default 256, least recently loaded objects first). The notice about a missing
+  compiler or an unusable cache is given at most once a day per cache directory, and `VGPU_JIT=auto` turns the JIT on without those notices.
+  Results and counters are unchanged.
+- Kernels no longer die with SIGFPE when the host program enabled floating-point traps (`feenableexcept`, gfortran
+  `-ffpe-trap=invalid,zero,overflow`, which SPECFEM3D's configure puts in `FLAGS_CHECK`). The engines did the device's arithmetic
+  under the host's traps, on the launching thread and on the worker threads that copy its environment, so the first inf or NaN a
+  kernel made killed the process; an RTX 3060 runs the same program with the traps on. A launch (PTX, SASS and AMD) now runs with
+  the traps masked, and the host gets its whole floating-point environment back afterwards, traps, rounding mode and sticky flags,
+  none raised by the kernel (`include/vgpu/exec/host_fp.hpp`). New unit tests `test_launch_fp_traps` and `test_amd_gcn_fp_traps`
+  (pantheonsim #605).
+- Runtime: driver functions taken from `cudaGetDriverEntryPoint` / `cudaGetDriverEntryPointByVersion` by a program that does not
+  link libcuda (gputools does this) see what the runtime has done, as on an RTX 3060: the driver is initialised (they returned
+  `CUDA_ERROR_NOT_INITIALIZED`), a thread the runtime has used has its primary context current (they returned
+  `CUDA_ERROR_INVALID_CONTEXT` from `cuModuleLoadData`), and a thread it has not used has none. Before any runtime call,
+  `cudaGetDriverEntryPoint` initialises the driver and makes no context current, as on the card. New e2e test
+  `e2e_driver_entry_late` (pantheonsim #604).
+- PTX: `ld.param::entry`, `ld.param::func` and `st.param::func`, the explicit `.param` state spaces of PTX ISA 8.3, are accepted as
+  `ld.param` / `st.param`; jax 0.12's kernels failed to load ("unrecognized ld/st modifier '.param::entry'"). `st.param::entry`
+  stays refused, as ptxas refuses it. Unit test `ld_param_entry_and_func_state_spaces` in `test_exec3` (pantheonsim #589).
+- Runtime: `cudaDestroyTextureObject` and `cudaDestroySurfaceObject` of a handle that is no object (0, one never made, one already
+  destroyed) return `cudaSuccess` and leave the last error alone, as an RTX 3060 does; they returned `cudaErrorInvalidValue`, which
+  MaCh3's teardown left in the last error for CUDAProb3's next check to exit on. Unit test in `test_runtime_exports`
+  (pantheonsim #618).
+- NPP, CUDA 12 build: `nppGetStreamContext`, `nppGetStream` and `nppSetStream` (NPP 12's own stream, which CUDA 13's NPP removed)
+  are exported from the shim, filling the context as NPP 12.3 does on an RTX 3060. New e2e test `e2e_npp_stream_context` (skips
+  on CUDA 13). `nppiFilterGaussBorder_8u_C1R_Ctx` is still absent (pantheonsim #617).
+
+- Peer access: after `cudaDeviceEnablePeerAccess` (or `cuCtxEnablePeerAccess`), a kernel on one simulated device reads, writes and
+  atomically updates the peer device's allocations in place, as on a card (unified addressing). It stopped with `[invalid-pointer]
+  ... (belongs to a different device)` and `cudaErrorIllegalAddress`, so a program that asks `cudaDeviceCanAccessPeer` and takes the
+  direct route when the answer is yes failed (accl-kaust/GPU-IBS on two simulated H100s, pantheonsim #598). Without peer access, or
+  after `cudaDeviceDisablePeerAccess`, the access still faults, as it does on two RTX 3060s (measured). Only an access that missed every
+  allocation of the device looks at the peer; launch caching (`VGPU_MEMO=1`) and host-GPU mode stand aside while a peer link exists.
+  New test `e2e_peer_kernel` (SASS and PTX paths).
+- `vgpu run --preload`: `import ThrustRTC` (PyPI 0.3.20) no longer crashes with a segmentation fault (pantheonsim #597). ThrustRTC
+  keeps the driver's and NVRTC's functions in exported pointers named like them (`cuInit`, `nvrtcVersion`, ...), and with the shim's
+  `libcuda.so.1` preloaded its references to its own `cuInit` bound to the shim's function, whose code its `dlsym` result then
+  overwrote (NVIDIA's own `libcuda.so.1` preloaded does the same). The driver's libraries and NVRTC are now loaded privately
+  (`RTLD_LOCAL`) by the preloaded runtime as it starts (`VGPU_PRELOAD_PRIVATE`), so every later request for those sonames still gets
+  the simulator's, and the global scope no longer holds their functions. New test `e2e_preload_fnptr`. ThrustRTC's kernels still do
+  not compile through the simulator's NVRTC (its own `cstdint` meets the host's `/usr/include`).
+- `e2e_sass_jit` (steps shard): a fault run whose compile did not happen (it outlasted its time limit on a loaded runner, or the
+  compiler was killed) no longer fails the comparison with the tier. The JIT's notice on stderr ("pantheonsim: JIT: ... stay on the
+  tier") was the only difference: the fault itself was reported the same, byte for byte, in 72 runs of the tier, the JIT and the JIT
+  without exceptions on an idle and on a loaded machine (pantheonsim #611). The fault runs give a compile 840 s and take a run that
+  could not compile once more; a failure now names the notice or shows the diff, and a compiler killed on its first compile checks the
+  retry.
+- `test_lockstep_look`: `a_block_that_stands_still_is_still_found_out_and_slept_on` no longer depends on how many turns a thread
+  takes in 100 ms of wall time, which failed under load and under ThreadSanitizer (pantheonsim #612). `lockstep_worker` takes the
+  nap it sleeps between passes as a callable (the engines' sleeps, unchanged); the test counts the naps: the first after the third
+  look, then 5, 10, 20 ... 500 microseconds, and none for a block that computes.
+- AMD: `v_div_fixup_f32`/`_f64` and `v_div_fmas_f32`/`_f64` with the VOP3 `clamp` bit or an output modifier (`mul:2`, `mul:4`,
+  `div:2`) wrote the result unchanged, in the interpreter and in the tier. clang folds `fmin(fmax(a / b, 0), 1)` into the clamp of the
+  division's last instruction (`v_div_fixup_f64 ... clamp`) at -O2 and up, so such code got the unclamped quotient (llnl/exadis on gfx942).
+  They now clamp and scale as every other VOP3 float result does; `v_div_fixup_f16` already did. New test `test_amd_gcn_div_clamp`
+  (pantheonsim #613).
+- AMD: an atomic add (or any read-modify-write) of a dispatch that started while another dispatch ran alone could be lost. The lone
+  dispatch decided at the start of an atomic instruction that it needed no lock, and the other's atomic landed between its read and its
+  write. A dispatch now marks such an instruction before it looks at the count of running dispatches, and a dispatch that starts waits
+  for that instruction to end; results of programs that run one dispatch at a time are unchanged. New test
+  `a_dispatch_that_starts_while_another_runs_alone_does_not_lose_atomic_adds` in `test_amd_gcn_atomics` (pantheonsim #610).
+- AMD: a kernel built with `.amdhsa_uses_dynamic_stack 1` (recursion, indirect or virtual calls) gets
+  max(`hipLimitStackSize`, its static `private_segment_fixed_size`) bytes of scratch per work-item, as ROCm's HIP gives it
+  (CLR `VirtualGPU::submitKernelInternal`), instead of only its static size; an HSA dispatch packet's `private_segment_size` is
+  honoured where it is larger, `HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_DYNAMIC_CALLSTACK` reports the descriptor's bit, and
+  `hipDeviceSetLimit(hipLimitStackSize)` rounds up to 16 bytes and refuses more than a wave's scratch offset addresses (131004 bytes on
+  gfx9), as CLR does. New tests `test_amd_gcn_dyn_stack` and `test_amd_hip_dyn_stack` (pantheonsim #585).
+- Tests: `e2e_group_ballot_barrier`, a cell-list neighbour build in the shape of fastMD's `nl_build_kernel` (groups of four lanes
+  at different copies of a group-masked `__ballot_sync`, then a full-mask `__shfl_down_sync` and `__syncthreads`), on a simulated
+  H100 as PTX and as SASS, every count and listed neighbour checked against the host; it passes on an RTX 3060. fastMD's
+  `VerletList.GrowsOnOverflowAndStaysComplete` (and the rest of `test_verlet`) and `Simulation.LayerStressSumRules` pass on main
+  on both paths (pantheonsim #574).
+- cuBLAS: the band and packed matrix-vector routines (`tbmv`, `tpmv`, `gbmv`, `sbmv`/`hbmv`, `spmv`/`hpmv`, every type) read the
+  band where it is stored and loop over it, instead of building the full n x n matrix on every call. SCS's diagonal scaling
+  (`cublasDtbmv` with k = 0 on a vector of 1500) mapped 34 MiB, took 8,000 page faults and summed 2.25 million products on each
+  call; with transparent huge pages at `madvise`, as GitHub's runners ship them, that was most of the run. SCS's `max_ent` solve
+  on a 7.0 kernel with `madvise`: 574 s before, 5.5 s after, the same iterations; the answers are the full loops' bits (an
+  infinity or NaN in x still runs the full loops, which make NaN of the zeros it meets). `tbsv`/`tpsv` still use the full matrix.
+  Making a device also fixes glibc's heap thresholds where its dynamic rule ends up (32 MiB mmap, 64 MiB trim), so a
+  host-computed library call that loads and frees a few MiB of operands (cuSPARSE SpMV) no longer gives the heap back to the
+  kernel and faults it in again each time (`VGPU_HOST_HEAP=0`, or a threshold set in the environment, keeps glibc's own).
+  The setup action has a `huge-pages` input (default `true`): on a GitHub-hosted runner whose transparent huge pages are
+  `madvise` it sets `always` for the job when sudo works, says what it did, and never fails the step
+  (`scripts/thp-always.sh`). New tests `test_cublas_band_heap`, `test_host_heap` and `lint_thp_always` (pantheonsim #551).
 - Setup action: a release carries the simulator prebuilt for linux-x86_64, one tarball and `.sha256` per runner and toolkit the
   action sets up (ubuntu-24.04 with CUDA 12.0, 12.6, 13.0 or none, ubuntu-22.04 with CUDA 12.6 or none), built and attached by
   `.github/workflows/release-binaries.yml` when a `v*` tag is pushed. The action, pinned at that release, downloads the tarball,

@@ -58,8 +58,10 @@ uint64_t code_base(const Loaded* m);
 // A cooperative dispatch has every work-group resident at once, so they may
 // wait on one another; the kernarg segment is used as the caller wrote it,
 // hidden arguments and all.
+// `private_segment`: the scratch a work-item is given where it is more than the kernel's static size (an AQL packet's
+// private_segment_size).
 bool run(int ordinal, const Loaded* m, const Kernel& k, const uint32_t grid[3], const uint32_t group_size[3],
-         uint32_t dynamic_lds, uint64_t kernarg, bool cooperative, std::string* why);
+         uint32_t dynamic_lds, uint64_t kernarg, bool cooperative, std::string* why, uint32_t private_segment = 0);
 
 // Lets device `from`'s kernels reach device `to`'s memory, as
 // hipDeviceEnablePeerAccess does.

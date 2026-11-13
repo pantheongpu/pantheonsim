@@ -1,0 +1,70 @@
+ 0 killed by sample_runs_a_few_blocks_and_none_of_a_small_grid, sampled_blocks_are_spread_over_the_grid, sampling_is_for_grids_with_blocks_to_sample: sample_blocks: a grid of exactly the minimum is not sampled
+ 1 killed by sample_runs_a_few_blocks_and_none_of_a_small_grid, sampled_blocks_are_spread_over_the_grid: sample_blocks: no cap
+ 2 killed by sample_runs_a_few_blocks_and_none_of_a_small_grid, sampled_blocks_are_spread_over_the_grid: sample_blocks: the whole grid
+ 3 killed by sample_runs_a_few_blocks_and_none_of_a_small_grid, sampled_blocks_are_spread_over_the_grid, sampling_is_for_grids_with_blocks_to_sample: sample_blocks: no minimum grid
+ 4 killed by samples_may_cost_a_share_of_the_time_the_process_has_run, sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: affordable: what was spent does not count
+ 5 killed by samples_may_cost_a_share_of_the_time_the_process_has_run, sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: affordable: what is expected does not count
+ 6 killed by samples_may_cost_a_share_of_the_time_the_process_has_run: affordable: a negative expectation is a credit
+ 7 killed by samples_may_cost_a_share_of_the_time_the_process_has_run, sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: affordable: the whole age, not a share
+ 8 killed by samples_may_cost_a_share_of_the_time_the_process_has_run, sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: affordable: always
+ 9 killed by sample_extrapolates_the_launch_from_the_timed_blocks: estimate: a sample that timed nothing extrapolates
+10 killed by sample_extrapolates_the_launch_from_the_timed_blocks: estimate: no time is a sample
+11 killed by sample_extrapolates_the_launch_from_the_timed_blocks: estimate: no grid is a sample
+12 killed by sample_extrapolates_the_launch_from_the_timed_blocks, sample_sends_only_what_repays_the_driver_start_and_the_card_path, sample_does_not_use_the_account_of_time_already_spent: estimate: not divided by the threads
+13 killed by sample_extrapolates_the_launch_from_the_timed_blocks: estimate: zero threads divide by zero
+14 killed by sampled_blocks_are_spread_over_the_grid: stride: the first blocks alone
+15 killed by sampled_blocks_are_spread_over_the_grid: stride: past the end of the grid
+16 killed by sampled_blocks_are_spread_over_the_grid: stride: half the grid
+17 killed by sampled_blocks_are_spread_over_the_grid: stride: a division by zero for a grid that is not sampled
+18 killed by sample_extrapolates_the_launch_from_the_timed_blocks, sample_sends_only_what_repays_the_driver_start_and_the_card_path, sample_charges_the_memory_and_an_unknown_card_time: estimate: one block more than were timed
+19 killed by sample_extrapolates_the_launch_from_the_timed_blocks, sample_sends_only_what_repays_the_driver_start_and_the_card_path, sample_charges_the_memory_and_an_unknown_card_time: estimate: the timed blocks taken off the grid
+20 killed by sample_sends_only_what_repays_the_driver_start_and_the_card_path, sample_charges_the_memory_and_an_unknown_card_time: path: nothing pushed
+21 killed by sample_sends_only_what_repays_the_driver_start_and_the_card_path, sample_charges_the_memory_and_an_unknown_card_time: path: nothing charged for coming back
+22 killed by sample_charges_the_memory_and_an_unknown_card_time: path: the live memory pushed whatever the card holds
+23 killed by sample_sends_only_what_repays_the_driver_start_and_the_card_path, sample_charges_the_memory_and_an_unknown_card_time: path: the card's kernel time is the default whatever the launch
+24 killed by sample_charges_the_memory_and_an_unknown_card_time: path: the card's kernel time may be under the default
+25 killed by sample_charges_the_memory_and_an_unknown_card_time: path: a measured card time is ignored
+26 killed by sample_sends_only_what_repays_the_driver_start_and_the_card_path, sample_does_not_use_the_account_of_time_already_spent, sample_charges_the_memory_and_an_unknown_card_time: path: the start is charged with the driver up
+27 killed by sample_sends_only_what_repays_the_driver_start_and_the_card_path, sample_does_not_use_the_account_of_time_already_spent, sample_charges_the_memory_and_an_unknown_card_time: path: the start is never charged
+28 killed by sample_charges_the_memory_and_an_unknown_card_time: path: a negative start cost is a credit
+29 killed by sample_sends_only_what_repays_the_driver_start_and_the_card_path, sample_does_not_use_the_account_of_time_already_spent, sample_charges_the_memory_and_an_unknown_card_time: offload: any sample with an estimate goes
+30 killed by sample_sends_only_what_repays_the_driver_start_and_the_card_path, sample_does_not_use_the_account_of_time_already_spent: offload: the start is dropped from the decision
+31 killed by sample_charges_the_memory_and_an_unknown_card_time: offload: the measured card time is dropped from the decision
+32 killed by sampling_is_for_grids_with_blocks_to_sample: worth: a grid with nothing to sample is sampled
+33 killed by sampling_is_not_repeated_for_a_kernel_whose_whole_launch_was_short, sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: worth: a short whole launch does not stop the sampling
+34 killed by sampling_is_not_repeated_for_a_kernel_whose_whole_launch_was_short: worth: a whole launch at the bar is sampled
+35 killed by sampling_is_not_repeated_for_a_kernel_whose_whole_launch_was_short: worth: the bar has no margin
+36 killed by sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: worth: neither the floor nor the age is asked
+37 killed by sampling_is_for_grids_with_blocks_to_sample, sampling_is_not_repeated_for_a_kernel_whose_whole_launch_was_short, sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: worth: the floor alone
+38 killed by sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: worth: the age alone
+39 killed by sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: worth: the floor excludes its own value
+40 killed by sampling_is_for_grids_with_blocks_to_sample, sampling_is_not_repeated_for_a_kernel_whose_whole_launch_was_short, sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: worth: the floor and the age
+41 killed by sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: worth: what the samples cost so far is not asked
+42 killed by sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: worth: the expected cost is the guess whatever was seen
+43 killed by sim_time_table_peeks_at_one_sample_and_takes_an_extrapolation_as_history: peek: not scaled by the grid
+44 killed by sim_time_table_peeks_at_one_sample_and_takes_an_extrapolation_as_history: peek: needs a full history
+45 killed by sim_time_table_peeks_at_one_sample_and_takes_an_extrapolation_as_history: record_extrapolated: one sample like any other
+46 killed by sim_time_table_peeks_at_one_sample_and_takes_an_extrapolation_as_history: record_extrapolated: records nothing
+47 killed by a_copy_is_given_longer_to_answer_with_more_live_memory, sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: floor: the live memory does not raise it
+48 killed by a_copy_is_given_longer_to_answer_with_more_live_memory, sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: floor: the faults' cost alone, not three times it
+49 killed by sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: floor: the two added
+50 killed by sample_constants_are_the_ones_the_round_measured, a_copy_is_given_longer_to_answer_with_more_live_memory, sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: constant: the faults' cost per byte
+51 killed by sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: worth: a kernel with no loop is sampled
+52 killed by a_loop_is_a_cycle_the_entry_reaches: loop: a cycle the entry cannot reach counts
+53 killed by a_loop_is_a_cycle_the_entry_reaches: loop: an instruction seen before counts as a cycle
+54 killed by a_loop_is_a_cycle_the_entry_reaches: loop: no cycle is ever found
+55 killed by a_loop_is_a_cycle_the_entry_reaches: loop: an exit goes on
+56 killed by a_loop_is_a_cycle_the_entry_reaches: loop: a branch is never taken
+57 killed by a_loop_is_a_cycle_the_entry_reaches: loop: indirect flow is ignored
+58 killed by a_copy_is_given_longer_to_answer_with_more_live_memory: timeout: the live memory does not lengthen it
+59 killed by a_copy_is_given_longer_to_answer_with_more_live_memory: timeout: the live memory alone
+60 killed by sample_constants_are_the_ones_the_round_measured, a_copy_is_given_longer_to_answer_with_more_live_memory: constant: the timeout per byte
+61 killed by sample_constants_are_the_ones_the_round_measured, sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: constant: the static floor
+62 killed by sample_constants_are_the_ones_the_round_measured, sample_charges_the_memory_and_an_unknown_card_time: constant: the card's assumed speed-up
+63 killed by sample_constants_are_the_ones_the_round_measured, sample_runs_a_few_blocks_and_none_of_a_small_grid, sampled_blocks_are_spread_over_the_grid: constant: the most blocks
+64 killed by sample_constants_are_the_ones_the_round_measured, sample_runs_a_few_blocks_and_none_of_a_small_grid, sampled_blocks_are_spread_over_the_grid: constant: the smallest grid
+65 killed by sample_constants_are_the_ones_the_round_measured: constant: the budget
+66 killed by sample_constants_are_the_ones_the_round_measured, a_copy_is_given_longer_to_answer_with_more_live_memory: constant: the timeout
+67 killed by sample_constants_are_the_ones_the_round_measured, samples_may_cost_a_share_of_the_time_the_process_has_run, sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: constant: the share of the age
+68 killed by sample_constants_are_the_ones_the_round_measured, samples_may_cost_a_share_of_the_time_the_process_has_run, sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it: constant: the first sample's guess
+69 of 69 killed

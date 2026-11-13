@@ -10,6 +10,10 @@
 // a program would get by running the lanes in order, which is what these
 // tests compare against.
 #include <algorithm>
+#include <pthread.h>
+#include <sched.h>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -267,6 +271,82 @@ VTEST(dispatches_on_different_threads_do_not_lose_each_others_atomic_adds) {
   for (int i = 0; i < kN; ++i) per_launch += static_cast<uint64_t>(in[i]);
   VCHECK_EQ(download<uint64_t>(mem, pq, 1)[0], per_launch * kThreads * kLaunches);
   VCHECK_EQ(download<float>(mem, pf, 1)[0], static_cast<float>(per_launch * kThreads * kLaunches));
+}
+
+// The same, made to happen (#610). One thread runs long dispatches that are nothing but a wave's atomic adds to one word; the other
+// short ones that add to it too, with a pause between them in which the long one runs alone. The long dispatch decided at the start of
+// an atomic instruction that no other dispatch was running and did its read-modify-writes unlocked; a short dispatch that started
+// meanwhile added between one of those reads and its write, and the add was lost. On a loaded host that takes the long thread being
+// descheduled in the middle of an instruction, which is why the test above failed only now and then; here both threads are held to one
+// CPU, so the scheduler switches between them hundreds of times a second at whatever point the long thread is, and without the fix
+// every run loses adds. amd/tests/data/asm_atomic_race.s, for gfx942: global_atomic_add and buffer_atomic_add.
+VTEST(a_dispatch_that_starts_while_another_runs_alone_does_not_lose_atomic_adds) {
+  if (vtest::amd_target() != "gfx942") return;   // (the kernels are gfx942's; once is enough)
+  const std::string path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/asm_atomic_race.gfx942.o";
+  std::ifstream file(path, std::ios::binary);
+  if (!file) throw vtest::Failure("no code object at " + path);
+  const amd::CodeObject o = amd::load_code_object(std::string((std::istreambuf_iterator<char>(file)), {}), path);
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  VCHECK_EQ(sched_getaffinity(0, sizeof allowed, &allowed), 0);
+  int cpu = 0;
+  while (cpu < CPU_SETSIZE && !CPU_ISSET(cpu, &allowed)) ++cpu;
+  cpu_set_t one;
+  CPU_ZERO(&one);
+  CPU_SET(cpu, &one);
+  for (const char* name : {"race_global", "race_buffer"}) {
+    const amd::Kernel* k = amd::find_kernel(o, name);
+    if (!k) throw vtest::Failure(std::string("no kernel named ") + name);
+    MemoryManager mem(64ull << 20);
+    const uint64_t counter = upload(mem, std::vector<uint32_t>{0});
+    constexpr uint32_t kLong = 400, kShort = 1, kShorts = 4000;
+    const uint64_t long_args = kernargs(mem, *k, {counter, kLong}), short_args = kernargs(mem, *k, {counter, kShort});
+    amd::DecodeCache cache(o.text.size());
+    const auto launch = [&](uint64_t kernarg) {
+      amd::Dispatch d;
+      d.object = &o;
+      d.kernel = k;
+      d.kernarg = kernarg;
+      d.decoded = &cache;
+      d.groups[0] = 1;
+      d.group_size[0] = 64;
+      amd::execute(d, mem);
+    };
+    std::atomic<bool> done{false};
+    std::atomic<int> failed{0};
+    uint64_t longs = 0;
+    std::thread long_thread([&] {
+      pthread_setaffinity_np(pthread_self(), sizeof one, &one);
+      try {
+        while (!done.load()) launch(long_args), ++longs;
+      } catch (...) {
+        ++failed;
+      }
+    });
+    std::thread short_thread([&] {
+      pthread_setaffinity_np(pthread_self(), sizeof one, &one);
+      try {
+        for (uint32_t i = 0; i < kShorts; ++i) {
+          const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(50);
+          while (std::chrono::steady_clock::now() < until) {
+          }
+          launch(short_args);
+        }
+      } catch (...) {
+        ++failed;
+      }
+      done.store(true);
+    });
+    short_thread.join();
+    long_thread.join();
+    VCHECK_EQ(failed.load(), 0);
+    const uint64_t want = 64 * (longs * kLong + uint64_t{kShorts} * kShort);
+    const uint64_t got = download<uint32_t>(mem, counter, 1)[0];
+    if (got != want)
+      std::fprintf(stderr, "  %s: %llu of %llu adds (%llu long dispatches)\n", name, (unsigned long long)got, (unsigned long long)want,
+                   (unsigned long long)longs);
+    VCHECK_EQ(got, want);
+  }
 }
 
 VTEST_MAIN

@@ -1,5 +1,11 @@
 #include "vgpu/ras.hpp"
 #include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <cerrno>
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -23,6 +29,7 @@
 #include "vgpu/host_gpu_rt.hpp"
 #include "vgpu/exec/launch_env.hpp"
 #include "vgpu/host_stats.hpp"
+#include "vgpu/memory_backing.hpp"
 #include "vgpu/exec/lockstep.hpp"
 
 #include <map>
@@ -1149,6 +1156,7 @@ Device::Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemet
     : profile_(std::move(profile)), ordinal_(ordinal), physical_(physical < 0 ? ordinal : physical),
       mem_(profile_.vram_bytes, static_cast<uint32_t>(physical_)), telemetry_(telemetry) {
   host_stats_start();   // VGPU_HOST_STATS (vgpu/host_stats.hpp)
+  backing::tune_host_heap();   // glibc's heap thresholds (vgpu/memory_backing.hpp, #551)
   if (const char* c = std::getenv("VGPU_LAUNCH_CACHE"); c && c[0] == '0' && c[1] == 0) launch_cache_ = false;
   // AMD's HIP allocates device memory by the 4 KB page (MemoryManager::
   // set_page_size says what that lets a kernel read).
@@ -1256,6 +1264,18 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
       if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(physical_), 0.0);
       return;
     }
+    // Host-GPU mode: the first blocks of a launch nothing is known of are timed in a forked copy of the process, and what they say may send the
+    // launch to the card (vgpu/host_gpu.hpp "The first blocks of a launch, timed"). Nothing of the sample exists in this process afterwards.
+    if (hostgpu::Runtime::SamplePlan plan; hg && hg->sample_plan(fn, &plan)) {
+      hostgpu::Runtime::SampleRun run;
+      run.driver_started_at_fork = hg->driver_start_begun();
+      run.answered = sample_in_copy(fn, cfg, args, syms, plan.limit, plan.stride, plan.budget_s, plan.timeout_s, plan.probe, &run.part, &run.wall_s, &run.fork_s);
+      if (hg->sample_decide(fn, cfg, args, mem_, run)) {
+        if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(physical_), 0.0);
+        digest_launch(mem_, fn.name, args);
+        return;
+      }
+    }
     if (hg) hg->before_simulated(mem_);
     // Launch-level result caching (vgpu/runtime/memo.hpp): a stored result is applied instead of running the kernel.
     memo::Ticket mt;
@@ -1338,6 +1358,137 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
     }
     throw;
   }
+}
+
+// Runs the launch's first blocks in a forked copy of the process and returns what the copy measured. The copy has this thread alone (fork), runs the
+// blocks on it, writes the part's times to a pipe and ends with _exit: no handler, destructor or buffered output of the program runs in it, and what
+// it wrote to memory was its own (copy-on-write). A copy that does not answer within `timeout_s` (a lock another thread held when the process was
+// forked, a first block that is longer than that) is ended, and the caller has no estimate.
+namespace {
+std::mutex g_copies_mu;
+std::vector<pid_t> g_copies;   // sampled copies that answered and had not ended when last asked
+
+// Reaps the sampled copies that have ended; with `wait`, waits for the others too (they have answered and are on their way out). Returns how
+// many were still running when it was called.
+size_t reap_sample_copies(bool wait) {
+  std::lock_guard<std::mutex> g(g_copies_mu);
+  size_t running = 0;
+  for (size_t i = 0; i < g_copies.size();) {
+    pid_t r = waitpid(g_copies[i], nullptr, WNOHANG);
+    if (r == 0) {
+      ++running;
+      if (wait) {
+        while ((r = waitpid(g_copies[i], nullptr, 0)) < 0 && errno == EINTR) {}
+      }
+    }
+    if (r != 0) g_copies.erase(g_copies.begin() + static_cast<std::ptrdiff_t>(i));
+    else ++i;
+  }
+  return running;
+}
+}  // namespace
+
+bool Device::sample_in_copy(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, const std::vector<std::vector<uint8_t>>& args,
+                            const exec::SymbolTable* syms, uint64_t limit, uint64_t stride, double budget_s, double timeout_s, const exec::BlockProbe* probe,
+                            exec::LaunchPart* out, double* wall_s, double* fork_s) {
+  *wall_s = *fork_s = 0;
+  // Copies that answered are not waited for (a process takes a millisecond to be torn down): they are reaped at the next sample, and the mode's
+  // exit handler waits for the ones still there (reap_sample_copies), so the process leaves no child behind.
+  reap_sample_copies(false);
+  struct Message {
+    uint64_t next, total;
+    uint32_t threads;
+    double first_block_s, run_s, timed_s;
+    // progress inside the blocks (Round sp61): what LaunchPart::probe's run read
+    exec::BlockReading readings[exec::LaunchPart::kReadings];
+    exec::TurnMeasure measure;
+    uint64_t warps_followed, warps_unfollowed;
+  } msg{};
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto since = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
+  int fds[2];
+  if (pipe2(fds, O_CLOEXEC) != 0) return false;
+  std::fflush(nullptr);   // (nothing buffered is in the copy to be written twice, whatever it does)
+  const pid_t pid = fork();
+  if (pid < 0) {
+    close(fds[0]);
+    close(fds[1]);
+    return false;
+  }
+  if (pid == 0) {
+    exec::g_sample_copy.store(true, std::memory_order_relaxed);
+    int status = 3;
+    try {
+      exec::LaunchPart part;
+      part.limit = limit;
+      part.stride = stride;
+      part.budget_s = budget_s;
+      part.probe = probe;
+      exec::LaunchConfig part_cfg = cfg;
+      part_cfg.part = &part;
+      run_kernel(fn, part_cfg, args, syms);
+      msg.next = part.next;
+      msg.total = part.total;
+      msg.threads = part.threads;
+      msg.first_block_s = part.first_block_s;
+      msg.run_s = part.run_s;
+      msg.timed_s = part.timed_s;
+      std::copy(std::begin(part.readings), std::end(part.readings), std::begin(msg.readings));
+      msg.measure = part.measure;
+      msg.warps_followed = part.warps_followed;
+      msg.warps_unfollowed = part.warps_unfollowed;
+      status = write(fds[1], &msg, sizeof msg) == static_cast<ssize_t>(sizeof msg) ? 0 : 4;
+    } catch (const std::exception& e) {
+      // (a launch that faults says so when the simulator runs it for the program; here only under VGPU_HOST_GPU_LOG=2)
+      if (const char* v = std::getenv("VGPU_HOST_GPU_LOG"); v && v[0] == '2') {
+        const std::string text = std::string("host_gpu: the sampled blocks of ") + fn.name + " threw: " + e.what() + "\n";
+        if (write(2, text.data(), text.size()) < 0) status = 3;
+      }
+    } catch (...) {
+    }
+    _exit(status);
+  }
+  *fork_s = since();
+  close(fds[1]);
+  size_t got = 0;
+  for (;;) {
+    const double left = timeout_s - since();
+    if (left <= 0) break;
+    pollfd p{fds[0], POLLIN, 0};
+    const int r = poll(&p, 1, std::max(1, static_cast<int>(left * 1000)));
+    if (r < 0 && errno == EINTR) continue;
+    if (r <= 0) break;
+    const ssize_t n = read(fds[0], reinterpret_cast<char*>(&msg) + got, sizeof msg - got);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) break;   // (the copy ended without a whole answer)
+    got += static_cast<size_t>(n);
+    if (got == sizeof msg) break;
+  }
+  close(fds[0]);
+  if (got != sizeof msg) {
+    kill(pid, SIGKILL);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    // (what became of it, for the log: 3 is a launch that threw in the copy, 9 a copy that was ended for not answering)
+    out->next = WIFEXITED(st) ? static_cast<uint64_t>(WEXITSTATUS(st)) : WIFSIGNALED(st) ? static_cast<uint64_t>(WTERMSIG(st)) : 0;
+  } else if (waitpid(pid, nullptr, WNOHANG) == 0) {
+    std::lock_guard<std::mutex> g(g_copies_mu);
+    g_copies.push_back(pid);
+  }
+  if (got == sizeof msg) {
+    out->next = msg.next;
+    out->total = msg.total;
+    out->threads = msg.threads;
+    out->first_block_s = msg.first_block_s;
+    out->run_s = msg.run_s;
+    out->timed_s = msg.timed_s;
+    std::copy(std::begin(msg.readings), std::end(msg.readings), std::begin(out->readings));
+    out->measure = msg.measure;
+    out->warps_followed = msg.warps_followed;
+    out->warps_unfollowed = msg.warps_unfollowed;
+  }
+  *wall_s = since();
+  return got == sizeof msg;
 }
 
 void Device::check_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg) const {
@@ -1438,3 +1589,5 @@ Device& Runtime::device(int ordinal) {
 }
 
 }  // namespace vgpu::runtime
+
+size_t vgpu::hostgpu::sample_copies_reap(bool wait) { return vgpu::runtime::reap_sample_copies(wait); }

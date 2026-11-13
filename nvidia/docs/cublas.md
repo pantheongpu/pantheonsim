@@ -122,7 +122,11 @@ The band and packed level-2 routines (`gbmv`, `sbmv`/`hbmv`, `spmv`/`hpmv`,
 the batched GEMVs (`gemvBatched` and `gemvStridedBatched` in S, D, C, Z and the
 half and bfloat16 forms `HSH`, `HSS`, `TST`, `TSS`), `getriBatched` and
 `matinvBatched`, `syrkx` and `herkx`, the complex `dgmm`, the `gemm3m` forms
-and the batched `Hgemm`s (`cublas_batched.inc`). Each refuses what an RTX
+and the batched `Hgemm`s (`cublas_batched.inc`). The matrix-vector ones
+(`gbmv`, `sbmv`/`hbmv`, `spmv`/`hpmv`, `tbmv`, `tpmv`) read the band where it
+is stored and sum only over it, holding no full n x n copy, with the bits the
+full loops gave (an infinity or NaN in x runs the full loops); `tbsv` and
+`tpsv` still solve over the full matrix (#551). Each refuses what an RTX
 3060 refuses, measured -- with one exception: the card's batched GEMVs check
 only the leading dimension, and run (sometimes hang) with a negative size, an
 unknown operation or a zero y increment, which this refuses instead.

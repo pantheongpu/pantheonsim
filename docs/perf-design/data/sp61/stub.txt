@@ -1,0 +1,12 @@
+polybench/CORR                     off        38.91s rc=0 out=96ba52add2de sampled=- sent=- says=eyond Error Threshold of 1.05 Percent: 0
+polybench/CORR                     stub       39.76s rc=0 out=96ba52add2de sampled=1 sent=0 says=eyond Error Threshold of 1.05 Percent: 0
+polybench/CORR                     tstub      40.02s rc=0 out=96ba52add2de sampled=1 sent=0 says=eyond Error Threshold of 1.05 Percent: 0
+polybench/CORR                     stubnop    29.74s rc=0 out=8f111e1cd70d sampled=1 sent=1 says=Error Threshold of 1.05 Percent: 4190209
+polybench/COVAR                    off        39.14s rc=0 out=96ba52add2de sampled=- sent=- says=eyond Error Threshold of 1.05 Percent: 0
+polybench/COVAR                    stub       42.71s rc=0 out=96ba52add2de sampled=1 sent=0 says=eyond Error Threshold of 1.05 Percent: 0
+polybench/COVAR                    tstub      39.62s rc=0 out=96ba52add2de sampled=1 sent=0 says=eyond Error Threshold of 1.05 Percent: 0
+polybench/COVAR                    stubnop    29.82s rc=0 out=8f111e1cd70d sampled=1 sent=1 says=Error Threshold of 1.05 Percent: 4190209
+polybench/SYRK                     off         2.54s rc=0 out=c9644fd81ac7 sampled=- sent=- says=eyond Error Threshold of 0.05 Percent: 0
+polybench/SYRK                     stub        2.62s rc=0 out=c9644fd81ac7 sampled=1 sent=0 says=eyond Error Threshold of 0.05 Percent: 0
+polybench/SYRK                     tstub       2.64s rc=0 out=c9644fd81ac7 sampled=1 sent=0 says=eyond Error Threshold of 0.05 Percent: 0
+polybench/SYRK                     stubnop     0.84s rc=0 out=12c7bb70ed55 sampled=1 sent=1 says=Error Threshold of 0.05 Percent: 1046529

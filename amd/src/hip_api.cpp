@@ -884,6 +884,8 @@ struct LaunchJob {
   // kernel's own work-group limit holds (vgpu/amd_exec.hpp): an HSA packet's.
   uint32_t grid_items[3] = {0, 0, 0};
   bool kernel_limits = true;
+  // The scratch a work-item is given where it is more than the kernel's static size (vgpu::amd::Dispatch::private_segment).
+  uint32_t private_segment = 0;
 };
 
 const Stream* find_stream(State& s, hipStream_t stream, Stream* null_stream);
@@ -921,6 +923,8 @@ hipError_t check_launch(State& s, int ordinal, const Kernel& kernel, vgpu::amd::
   return hipSuccess;
 }
 
+size_t stack_size_locked();   // hipLimitStackSize (below); the caller holds s.mutex
+
 hipError_t prepare_launch(State& s, int ordinal, const Module& module, const Kernel& kernel,
                           vgpu::amd::abi::Dim3 grid, vgpu::amd::abi::Dim3 block, uint32_t shared,
                           std::vector<uint8_t> args, hipStream_t stream, bool cooperative, LaunchJob* job) {
@@ -953,6 +957,11 @@ hipError_t prepare_launch(State& s, int ordinal, const Module& module, const Ker
   job->stream = stream;
   job->cooperative = cooperative;
   job->hostcall = hostcall.get();
+  // A kernel whose stack grows at run time is given the device's stack size per work-item, or its static size where that is
+  // more: ROCm's HIP (CLR, VirtualGPU::submitKernelInternal) sets the packet's private_segment_size to
+  // max(StackSize(), privateMemSize_) when the kernel has a dynamic call stack (#585).
+  if (kernel.uses_dynamic_stack)
+    job->private_segment = static_cast<uint32_t>(std::max<size_t>(stack_size_locked(), kernel.private_segment));
   const auto reach = [&](int to) {
     // By the peer's address window: its physical device's (vgpu/memory.hpp).
     const size_t window = static_cast<size_t>(s.rt->device(to).physical());
@@ -1079,6 +1088,7 @@ hipError_t run_launch(const LaunchJob& job) {
     dispatch.group_size[2] = block.z;
     for (int i = 0; i < 3; ++i) dispatch.grid_items[i] = job.grid_items[i];
     dispatch.kernel_limits = job.kernel_limits;
+    dispatch.private_segment = job.private_segment;
     dispatch.fill_hidden = !job.kernarg_at;   // a packet's segment is the caller's, hidden arguments and all
     dispatch.wave_size = static_cast<uint32_t>(d.profile().warp_size);
     dispatch.dynamic_lds = shared;   // what the launch adds to the kernel's own LDS
@@ -1108,7 +1118,7 @@ hipError_t run_launch(const LaunchJob& job) {
         launch.group_size[i] = dispatch.group_size[i];
       }
       launch.group_segment = kernel.group_segment + shared;
-      launch.private_segment = kernel.private_segment;
+      launch.private_segment = std::max(kernel.private_segment, job.private_segment);
       if (prof->launching) token = prof->launching(launch);
       if (token && prof->sampling && prof->size >= offsetof(vgpu::amd::hipprof::Hooks, sampling) + sizeof(prof->sampling)) {
         prof->sampling(token, &pc_sampler);
@@ -4981,6 +4991,15 @@ hipError_t hipFuncSetCacheConfig(const void* function, int config) {
 // one it does not handle is unsupported.
 namespace {
 size_t g_limits[3] = {1024, 64 << 20, 8 << 20};   // stack, printf FIFO, heap
+// The most a work-item's stack may be (CLR's GetMaxStackSize): what the scratch wave offset's bits (15 on gfx8 to gfx11, 18 from
+// gfx12) address in 256-byte units, over the lanes of a wave (64 on gfx8 and gfx9, 32 on the others), less the 64 bytes the
+// compiler keeps for itself.
+size_t max_stack_size(const std::string& arch) {
+  if (arch.rfind("gfx9", 0) == 0 || arch.rfind("gfx8", 0) == 0) return ((1u << 15) - 1) * 256 / 64 - 64;
+  if (arch.rfind("gfx11", 0) == 0 || arch.rfind("gfx10", 0) == 0) return ((1u << 15) - 1) * 256 / 32 - 64;
+  return ((1u << 18) - 1) * 256 / 32 - 64;
+}
+extern "C++" size_t stack_size_locked() { return g_limits[0]; }   // (prepare_launch's, which is not in the extern "C" part)
 constexpr int kLimitScratchMin = 0x1000, kLimitScratchMax = 0x1001, kLimitScratchCurrent = 0x1002,
               kLimitRange = 0x1003;
 constexpr size_t kScratchMax = vgpu::amd::shared::kScratchLimitMax;
@@ -5005,7 +5024,13 @@ hipError_t hipDeviceSetLimit(int limit, size_t value) {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (limit >= kLimitRange) return record(s, hipErrorInvalidValue);
-  if (limit == 0 || limit == 2) {   // hipLimitStackSize, hipLimitMallocHeapSize
+  if (limit == 0) {   // hipLimitStackSize: as CLR's Device::UpdateStackSize, at most max_stack_size and kept a multiple of 16
+    const vgpu::runtime::Device* d = device(s);
+    if (d && value > max_stack_size(d->profile().gcn_arch)) return record(s, hipErrorInvalidValue);
+    g_limits[0] = (value + 15) / 16 * 16;
+    return record(s, hipSuccess);
+  }
+  if (limit == 2) {   // hipLimitMallocHeapSize
     g_limits[limit] = value;
     return record(s, hipSuccess);
   }
@@ -7886,7 +7911,7 @@ const std::vector<uint8_t>& host_image(const Loaded* m) { return m->host_image; 
 uint64_t code_base(const Loaded* m) { return m->code_base; }
 
 bool run(int ordinal, const Loaded* m, const Kernel& k, const uint32_t grid[3], const uint32_t group_size[3],
-         uint32_t dynamic_lds, uint64_t kernarg, bool cooperative, std::string* why) {
+         uint32_t dynamic_lds, uint64_t kernarg, bool cooperative, std::string* why, uint32_t private_segment) {
   State& s = state();
   uint32_t groups[3];
   for (int i = 0; i < 3; ++i) groups[i] = group_size[i] ? (grid[i] + group_size[i] - 1) / group_size[i] : 0;
@@ -7904,6 +7929,7 @@ bool run(int ordinal, const Loaded* m, const Kernel& k, const uint32_t grid[3], 
   job.kernarg_at = kernarg;
   for (int i = 0; i < 3; ++i) job.grid_items[i] = grid[i] % group_size[i] ? grid[i] : 0;
   job.kernel_limits = false;   // a packet goes to the hardware as it is
+  job.private_segment = private_segment;   // (and its private_segment_size is what the packet processor reserves)
   const hipError_t e = run_launch(job);
   if (e != hipSuccess && why) *why = "the kernel " + k.name + " failed";
   return e == hipSuccess;

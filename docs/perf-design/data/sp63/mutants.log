@@ -1,0 +1,16 @@
+# scripts/mutants.sh bnew tt (the build of the first measurement pass, commit c52e34dc's tree with vfork; the JIT logic the mutants touch is the same as the final build's)
+mutant=none cold rc=0 wait rc=0 | 
+mutant=prewait_never cold rc=1 wait rc=0 | tests/unit/test_jit_cold.cpp:185: VCHECK_EQ(state_of(*u), kWaiting) failed
+mutant=prewait_stuck cold rc=1 wait rc=0 | tests/unit/test_jit_cold.cpp:197: VCHECK_EQ(state_of(*u), kIdle) failed
+mutant=prewait_to_counting cold rc=1 wait rc=0 | tests/unit/test_jit_cold.cpp:190: VCHECK_EQ(u->wait_then.load(), kIdle) failed
+mutant=wait_no_credit cold rc=1 wait rc=1 | tests/unit/test_jit_cold.cpp:199: VCHECK_EQ(u->credit.load(), kLookup - 8192) failed
+mutant=wait_stuck cold rc=0 wait rc=1 | 
+mutant=history_never cold rc=1 wait rc=0 | tests/unit/test_jit_cold.cpp:275: VCHECK(u->ready()) failed
+mutant=history_after cold rc=1 wait rc=0 | tests/unit/test_jit_cold.cpp:259: VCHECK(l.pending) failed
+mutant=trim_no_age cold rc=1 wait rc=0 | tests/unit/test_jit_cold.cpp:393: VCHECK_EQ(jit::stats().evicted.load(), ev0 + 5) failed
+mutant=trim_no_cap cold rc=1 wait rc=0 | tests/unit/test_jit_cold.cpp:382: VCHECK(!fs::exists(emptied / (key('5') + ".so"))) failed
+mutant=trim_no_touch cold rc=1 wait rc=0 | tests/unit/test_jit_cold.cpp:432: VCHECK(st.st_mtime > std::time(nullptr) - 1000) failed
+mutant=cachedir_date cold rc=1 wait rc=0 | tests/unit/test_jit_cold.cpp:336: VCHECK_EQ(path, want) failed
+mutant=notice_every_run cold rc=1 wait rc=0 | tests/unit/test_jit_cold.cpp:447: VCHECK_EQ(count_of(b.err, line), size_t{0}) failed
+mutant=auto_loud cold rc=1 wait rc=0 | tests/unit/test_jit_cold.cpp:457: VCHECK_EQ(count_of(d.err, "pantheonsim: JIT"), size_t{0}) failed
+mutant=cancel_notice cold rc=1 wait rc=0 | tests/unit/test_jit_cold.cpp:474: VCHECK_EQ(count_of(a.err, "pantheonsim: JIT"), size_t{0}) failed

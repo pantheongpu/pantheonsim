@@ -389,6 +389,10 @@ const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t 
                         " bytes past the end of the ", a.size, "-byte allocation at ", Hex{base});
   }
   if (const Allocation* mapped = resolve_mapped(addr, len, op, base_out, writing)) return *mapped;
+  // Another device's window, with peer access enabled to it (set_peer): that device's allocation, and its diagnostics.
+  if (is_device_va(addr) && (addr < va_base_ || addr - va_base_ >= kDeviceVaStride))
+    if (const MemoryManager* peer = peers_->by_window[(addr - kDeviceVaBase) / kDeviceVaStride].load(std::memory_order_acquire))
+      return peer->resolve(addr, len, op, base_out, writing, page_slack);
   // Freed allocation?
   auto fup = freed_.upper_bound(addr);
   if (fup != freed_.begin()) {
@@ -1997,7 +2001,27 @@ const char* MemoryManager::card_blocker() const {
     if (!shared_.empty()) return "memory shared with another process (IPC) is outside the card copy";
   }
   if (heap_used() != 0) return "the device heap (kernel malloc) holds device memory the card copy would lack";
+  if (peer_linked()) return "peer access links this device's memory with another device's, which the card copy would lack";
   return nullptr;
+}
+
+void MemoryManager::set_peer(MemoryManager& peer, bool enabled) {
+  if (&peer == this) return;
+  const uint64_t w = (peer.va_base_ - kDeviceVaBase) / kDeviceVaStride;
+  if (w >= kDeviceVaWindows) return;
+  std::lock_guard<std::mutex> g(peers_->mu);
+  unsigned& n = peers_->enabled[w];
+  if (enabled) {
+    if (n++ == 0) {
+      peers_->by_window[w].store(&peer, std::memory_order_release);
+      peers_->links.fetch_add(1, std::memory_order_relaxed);
+      peer.peers_->links.fetch_add(1, std::memory_order_relaxed);
+    }
+  } else if (n && --n == 0) {
+    peers_->by_window[w].store(nullptr, std::memory_order_release);
+    peers_->links.fetch_sub(1, std::memory_order_relaxed);
+    peer.peers_->links.fetch_sub(1, std::memory_order_relaxed);
+  }
 }
 
 bool MemoryManager::find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const {
@@ -2484,6 +2508,8 @@ bool MemoryManager::load_texels(const uint64_t* addrs, unsigned n, uint32_t size
 namespace vgpu {
 
 bool MemoryManager::memo_untrackable() const {
+  // (a peer's kernel may write this device's memory, and this device's kernels a peer's, out of sight of the history)
+  if (peer_linked()) return true;
   SharedGuard table_guard(table_lock_.get());
   return !maps_.empty() || !handles_.empty() || !reserved_.empty() || !shared_.empty();
 }

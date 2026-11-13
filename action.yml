@@ -46,6 +46,14 @@ inputs:
       its sha256 checks out, and builds from source otherwise. `false` always
       builds from source.
     default: 'true'
+  huge-pages:
+    description: >
+      `true`, on a GitHub-hosted runner whose transparent huge pages are
+      `madvise` (as they ship), sets them to `always` for the job when sudo
+      works, so the simulated program's own memory gets 2 MiB pages too; the
+      step says what it did and never fails on it. `false` leaves the setting
+      alone. Self-hosted runners are always left alone.
+    default: 'true'
 
 outputs:
   build-dir:
@@ -376,4 +384,17 @@ runs:
         case "$GPU" in
           amd/*) VGPU_GPU="$GPU" VGPU_DEVICE_COUNT="$COUNT" "$BUILD/bin/rocm-smi" ;;
           *)     VGPU_GPU="$GPU" VGPU_DEVICE_COUNT="$COUNT" "$BUILD/bin/nvidia-smi" -L ;;
+        esac
+
+    - name: Transparent huge pages
+      shell: bash
+      env:
+        SUDO: ${{ steps.want.outputs.sudo }}
+        HUGE_PAGES: ${{ inputs.huge-pages }}
+      run: |
+        # scripts/thp-always.sh says what it did and always exits 0 (#551).
+        case "$HUGE_PAGES" in
+          true) [ ! -x "${GITHUB_ACTION_PATH}/scripts/thp-always.sh" ] || "${GITHUB_ACTION_PATH}/scripts/thp-always.sh" || true ;;
+          false) echo "transparent huge pages: left as they are (huge-pages: false)" ;;
+          *) echo "::error::huge-pages must be true or false, not '$HUGE_PAGES'"; exit 1 ;;
         esac

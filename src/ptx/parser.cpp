@@ -1787,6 +1787,10 @@ class Parser {
         if (p == "acquire") acquire = true;
         else if (p == "release") release = true;
         else if (p == "param") space = Space::Param;
+        // The explicit spellings of .param (PTX ISA 8.3; the XLA of jax 0.12 writes ld.param::entry: #589): ld.param::entry reads
+        // a kernel's parameter and ld.param::func a function's, what ld.param reads in the one and the other; st takes
+        // only ::func, a kernel's parameters being read-only.
+        else if (p == "param::func" || (p == "param::entry" && op0 == "ld")) space = Space::Param;
         else if (p == "global") space = Space::Global;
         // __constant__ variables are parsed into the module's globals, so a
         // constant-bank read is a global read of a range nothing writes. The

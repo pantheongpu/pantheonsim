@@ -98,11 +98,12 @@ count: 1
 # true or false; default: false
 # trace: false
 
-# Experimental. Run launches of kernels whose results are defined bit for bit on this
-# machine's real NVIDIA GPU (it must be the simulated model); everything else stays
-# simulated. Refused, with a message, when counters, trace, race, strict, faults or
-# another check that needs the simulator is on.
-# off or exact; default: off
+# Experimental. Run launches on this machine's real NVIDIA GPU (it must be the simulated
+# model); everything else stays simulated. exact: only kernels whose results are defined
+# bit for bit. turbo: also kernels whose result is the card's and close to the
+# simulator's, not its bits. Refused, with a message, when counters, trace, race, strict,
+# faults or another check that needs the simulator is on.
+# off, exact or turbo; default: off
 # host_gpu: off
 
 # Print each host_gpu decision (offloaded, kept in the simulator and why) with its numbers.

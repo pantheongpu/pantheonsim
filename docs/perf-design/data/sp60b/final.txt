@@ -1,0 +1,29 @@
+The last build (the timeout that grows with the live memory; no early-start switch): seven programs again, 3 runs a form, median wall seconds (timeout 60 s).
+
+polybench/SYR2K                      sim 9.70s exact 2.33s exact0 9.71s turbo 2.37s turbo0 9.71s
+polybench/SYRK                       sim 5.16s exact 1.30s exact0 5.16s turbo 1.30s turbo0 5.16s
+rodinia/backprop                     sim 0.62s exact 0.61s exact0 0.61s turbo 0.71s turbo0 0.71s
+hecbench/atomicPerf-cuda             sim 1.13s exact 1.13s exact0 1.13s turbo 1.36s turbo0 1.34s
+hecbench/binomial-cuda               sim TIMEOUT exact TIMEOUT exact0 TIMEOUT turbo 1.36s turbo0 7.47s
+hecbench/black-scholes-cuda          sim 25.04s exact 25.13s exact0 25.05s turbo 6.07s turbo0 25.11s
+hecbench/shmembench-cuda             sim 6.17s exact 6.23s exact0 6.17s turbo 0.30s turbo0 6.16s
+
+black-scholes in turbo with VGPU_HOST_GPU_LOG=1:
+host_gpu: _Z15getOutValOptionPK17optionInputStructPfi: sent by the time of its first blocks (12.085 s in the simulator, at least)
+host_gpu: _Z15getOutValOptionPK17optionInputStructPfi on the card (resident): kernel 5.084 ms, total 394.042 ms (sim estimate 12084.862 ms), 1907.35 MiB pushed
+host_gpu_sample: kernel=_Z15getOutValOptionPK17optionInputStructPfi blocks=195313 threads_per_block=256 instrs=728 back_edge=1 loop=1 whole_samples=0 live_bytes=2000000000 static_s=11.375029 age_s=1.509114 affordable=1 answered=1 ran=9 first_block_s=0.001010 timed_s=0.002227 cost_s=0.064798 fork_s=0.059187 threads=4 estimate_s=12.084862 would_send=1 launch_s=-1
+host_gpu: 1 launches ran on the card, 0 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu_sampled: sampled=1 sent=1 timeouts=0 cost_s=0.064798 after_driver=0 copies_running_at_exit=0 copies_left=0
+
+ctest on that build:
+2/4 Test #769: e2e_host_gpu .....................   Passed   34.97 sec
+    Start 770: e2e_host_gpu_stub
+3/4 Test #770: e2e_host_gpu_stub ................   Passed   92.40 sec
+    Start 771: hostgpu_bench_selftest
+4/4 Test #771: hostgpu_bench_selftest ...........   Passed    1.08 sec
+
+100% tests passed, 0 tests failed out of 4
+
+Total Test time (real) = 128.52 sec
+zombies: 0
+processes of the corpus left: 0

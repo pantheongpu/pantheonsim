@@ -122,6 +122,10 @@ struct Dispatch {
   } layout;
   // A profiler sampling the waves' program counters (PcSampler); null for none.
   const PcSampler* sampler = nullptr;
+  // The scratch each work-item is given, in bytes, where the launch asks for more than the kernel's static size
+  // (Kernel::private_segment): an AQL packet's private_segment_size, which ROCm's HIP makes at least the device's stack size
+  // (hipLimitStackSize) for a kernel that uses a dynamic stack. 0, or anything less than the static size: the static size.
+  uint32_t private_segment = 0;
 };
 
 // What the GPU's performance counters would count for a dispatch: every

@@ -234,6 +234,41 @@ VTEST(a_surface_object_hands_back_its_resource_descriptor) {
   VCHECK_EQ(cudaFreeArray(arr), cudaSuccess);
 }
 
+// Destroying a handle that is no object -- 0, one never made, one already destroyed -- is cudaSuccess and leaves the last
+// error alone, as on an RTX 3060 with the CUDA 13.0 runtime (#618: MaCh3 destroys a texture member that starts at 0 and
+// was never created, and the error it got here sat in the last error until CUDAProb3's next check exited).
+VTEST(destroying_no_texture_or_surface_object_succeeds_and_keeps_the_last_error) {
+  VCHECK_EQ(cudaFree(nullptr), cudaSuccess);
+  (void)cudaGetLastError();
+  VCHECK_EQ(cudaDestroyTextureObject(0), cudaSuccess);
+  VCHECK_EQ(cudaGetLastError(), cudaSuccess);
+  VCHECK_EQ(cudaDestroySurfaceObject(0), cudaSuccess);
+  VCHECK_EQ(cudaGetLastError(), cudaSuccess);
+  VCHECK_EQ(cudaDestroyTextureObject(0x7fff1234), cudaSuccess);   // never made
+  VCHECK_EQ(cudaDestroySurfaceObject(0x7fff1234), cudaSuccess);
+  VCHECK_EQ(cudaGetLastError(), cudaSuccess);
+
+  const cudaChannelFormatDesc fmt = cudaCreateChannelDesc<uint32_t>();
+  cudaArray_t arr = nullptr;
+  VCHECK_EQ(cudaMallocArray(&arr, &fmt, 8, 8, cudaArraySurfaceLoadStore), cudaSuccess);
+  cudaResourceDesc res;
+  std::memset(&res, 0, sizeof res);
+  res.resType = cudaResourceTypeArray;
+  res.res.array.array = arr;
+  cudaSurfaceObject_t surf = 0;
+  VCHECK_EQ(cudaCreateSurfaceObject(&surf, &res), cudaSuccess);
+  VCHECK_EQ(cudaDestroySurfaceObject(surf), cudaSuccess);
+  VCHECK_EQ(cudaDestroySurfaceObject(surf), cudaSuccess);   // already destroyed
+  VCHECK_EQ(cudaGetLastError(), cudaSuccess);
+
+  // An error the program has not collected yet is still there after destroying 0.
+  VCHECK_EQ(cudaSetDevice(99), cudaErrorInvalidDevice);
+  VCHECK_EQ(cudaDestroyTextureObject(0), cudaSuccess);
+  VCHECK_EQ(cudaGetLastError(), cudaErrorInvalidDevice);
+  VCHECK_EQ(cudaGetLastError(), cudaSuccess);
+  VCHECK_EQ(cudaFreeArray(arr), cudaSuccess);
+}
+
 // --- memory advice with a location ------------------------------------------
 
 #if CUDART_VERSION >= 12020 && CUDART_VERSION < 13000

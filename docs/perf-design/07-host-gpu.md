@@ -6,6 +6,10 @@ runs on, on by default with an opt-out; "lets prototype and see if running on th
 can go that route". The parent's prior, which this round tried to disprove with data: default-on changes results from machine to machine and drops the
 simulator's diagnostics, and a simulated H100 cannot be computed by an A10G, so at most an opt-in mode with an equivalence guarantee.
 
+Later rounds built the opt-in mode ([09](09-host-gpu-spike.md), [12](12-host-gpu-turbo.md)). One number of this study is used by its size rule: the
+card was at least 8 times faster than the simulator on the device phase of every workload here (section 2.1), which is what the rule that samples a
+launch's first blocks (Round sp60b, [12 section 8](12-host-gpu-turbo.md)) assumes for a kernel the card has not run yet.
+
 ## 0. The result in ten lines
 
 1. **The ceiling is enormous.** Same binary, same architecture (sm_86): the A10G runs the stress workloads' kernels at 17.8 TOPS (`int_virus`),

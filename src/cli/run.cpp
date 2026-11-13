@@ -448,6 +448,23 @@ int cmd_run(const std::vector<std::string>& args) {
     // later request for one of those sonames gets VirtualGPU's. The runtime
     // and the driver share one simulated machine (shared_runtime.cpp), so
     // loading both stands up no second set of devices.
+    // The driver's libraries (libcuda.so.1, NVML, the video codecs: one soname each, never in a directory an RPATH names) and NVRTC are
+    // not preloaded but loaded privately (RTLD_LOCAL) by the runtime shim's constructor, before the program's own code runs
+    // (VGPU_PRELOAD_PRIVATE, runtime_api.cpp): already loaded under their sonames, they are what every later request for one gets, as a
+    // preloaded library is, but their symbols are not in the global scope. A library that loads the driver or NVRTC itself and keeps
+    // what dlsym gives in exported function pointers named like the API (ThrustRTC's `cuInit`, `nvrtcVersion`, ...) has its references
+    // to those pointers bound to the first definition in the global scope: a preloaded shim's function, whose code it then overwrote
+    // (a segmentation fault on `import ThrustRTC`, #597; NVIDIA's own libcuda.so.1 preloaded does the same).
+    std::string priv;
+    const bool runtime_preloaded = [&] {
+      for (int major = 0; major < 32; ++major)
+        if (is_file(shim + "/libcudart.so." + std::to_string(major))) return true;
+      return false;
+    }();
+    const auto is_private = [&](const std::string& found) {
+      return runtime_preloaded && (found.rfind("libcuda.so.", 0) == 0 || found.rfind("libnvidia-", 0) == 0 || found.rfind("libnvcuvid.", 0) == 0 ||
+                                   found.rfind("libnvrtc.so.", 0) == 0);
+    };
     if (pre.empty()) {
       static const char* kCuda[] = {"libcuda.so.1", "libcudart.so", "libcublasLt.so", "libcublas.so",
                                     "libcudnn.so", "libcufft.so", "libcurand.so", "libcusparse.so",
@@ -465,11 +482,14 @@ int cmd_run(const std::vector<std::string>& args) {
             if (is_file(shim + "/" + stem + "." + std::to_string(major)))
               found = std::string(stem) + "." + std::to_string(major);
         }
-        if (!found.empty()) pre += (pre.empty() ? "" : " ") + shim + "/" + found;
+        if (found.empty()) continue;
+        std::string& list = is_private(found) ? priv : pre;
+        list += (list.empty() ? "" : " ") + shim + "/" + found;
       }
     }
     const char* old_pre = std::getenv("LD_PRELOAD");
     env.emplace_back("LD_PRELOAD", pre + (old_pre && old_pre[0] ? " " + std::string(old_pre) : ""));
+    if (!priv.empty()) env.emplace_back("VGPU_PRELOAD_PRIVATE", priv);
   }
 
   if (o.print_env) {

@@ -1,0 +1,56 @@
+| program | kernel | blocks | live MiB | static est s | age s | sample cost ms | fork ms | blocks timed | first block ms | timed runs ms | plain extrapolation s | launch took s | ratio | launch / static | estimate s | would send |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| hecbench/aobench-cuda | _Z13render_kernelPhPK7_Sphere6_Planeiii | 256 | 0.2 | 0.0097 | 0.001 | 10.39 | 0.16 | 17 | 0.686 | 4.229 | 0.0159 | 0.1799 | 0.09 | 18.6 | 0.0159 | 0 |
+| hecbench/asmooth-cuda | _Z15smoothingFilteriiiiPKfPiPf | 1024 | 4.0 | 0.0249 | 0.004 | 7.06 | 0.15 | 3 | 1.672 | 2.860 | 0.2441 | 0.0396 | 6.16 | 1.6 | 0.2441 | 0 |
+| hecbench/asmooth-cuda | _Z15normalizeFilteriiPfPKf | 1024 | 4.0 | 0.0033 | 0.051 | 1.48 | 0.38 | 32 | 0.103 | 0.170 | 0.0014 | 0.0023 | 0.60 | 0.7 | 0.0014 | 0 |
+| hecbench/asmooth-cuda | _Z9outFilteriiPKfPKiPf | 1024 | 4.0 | 0.0151 | 0.056 | 6.28 | 0.37 | 7 | 1.215 | 2.300 | 0.0841 | 0.0172 | 4.89 | 1.1 | 0.0841 | 0 |
+| hecbench/atan2-cuda | _Z9compute_fiPKfS0_Pf | 391 | 1.7 | 0.0068 | 0.002 | 2.22 | 0.11 | 32 | 0.384 | 0.672 | 0.0021 | 0.0024 | 0.85 | 0.4 | 0.0021 | 0 |
+| hecbench/atan2-cuda | _Z9compute_iiPKfS0_Pi | 391 | 1.7 | 0.0065 | 0.009 | 1.91 | 0.16 | 32 | 0.326 | 0.510 | 0.0016 | 0.0021 | 0.74 | 0.3 | 0.0016 | 0 |
+| hecbench/atan2-cuda | _Z9compute_siPKfS0_Ps | 391 | 1.7 | 0.0058 | 0.014 | 1.54 | 0.17 | 32 | 0.295 | 0.338 | 0.0010 | 0.0019 | 0.54 | 0.3 | 0.0010 | 0 |
+| hecbench/atomicAggregate-cuda | _Z1kPii | 65536 | 0.0 | 0.3775 | 0.001 | 2.14 | 0.09 | 32 | 0.642 | 0.496 | 0.2540 | 0.2463 | 1.03 | 0.7 | 0.2540 | 0 |
+| hecbench/atomicIntrinsics-cuda | _Z10testKernelIiEvPT_m | 4096 | 0.0 | 0.0184 | 0.001 | 2.39 | 0.11 | 32 | 0.392 | 0.645 | 0.0206 | 0.0158 | 1.31 | 0.9 | 0.0206 | 0 |
+| hecbench/atomicIntrinsics-cuda | _Z10testKernelIjEvPT_m | 4096 | 0.0 | 0.0184 | 0.039 | 1.93 | 0.19 | 32 | 0.316 | 0.462 | 0.0148 | 0.0166 | 0.89 | 0.9 | 0.0148 | 0 |
+| hecbench/atomicPerf-cuda | _Z27BlockRangeAtomicOnGlobalMemIdEvPT_i | 6048 | 0.0 | 0.0155 | 0.001 | 1.31 | 0.15 | 32 | 0.358 | 0.170 | 0.0080 | 0.0137 | 0.59 | 0.9 | 0.0080 | 0 |
+| hecbench/atomicPerf-cuda | _Z26WarpRangeAtomicOnGlobalMemIdEvPT_i | 6048 | 0.0 | 0.0155 | 0.018 | 0.82 | 0.19 | 32 | 0.088 | 0.173 | 0.0082 | 0.0133 | 0.62 | 0.9 | 0.0082 | 0 |
+| hecbench/atomicPerf-cuda | _Z28SingleRangeAtomicOnGlobalMemIdEvPT_i | 6048 | 0.0 | 0.0155 | 0.034 | 1.28 | 0.15 | 32 | 0.217 | 0.252 | 0.0119 | 0.0079 | 1.50 | 0.5 | 0.0119 | 0 |
+| hecbench/atomicPerf-cuda | _Z27BlockRangeAtomicOnGlobalMemIiEvPT_i | 6048 | 0.0 | 0.0155 | 0.190 | 1.97 | 0.23 | 32 | 0.345 | 0.459 | 0.0217 | 0.0121 | 1.79 | 0.8 | 0.0217 | 0 |
+| hecbench/atomicPerf-cuda | _Z26WarpRangeAtomicOnGlobalMemIiEvPT_i | 6048 | 0.0 | 0.0155 | 0.204 | 1.15 | 0.17 | 32 | 0.194 | 0.175 | 0.0083 | 0.0147 | 0.56 | 1.0 | 0.0083 | 0 |
+| hecbench/atomicPerf-cuda | _Z28SingleRangeAtomicOnGlobalMemIiEvPT_i | 6048 | 0.0 | 0.0155 | 0.222 | 1.01 | 0.32 | 32 | 0.105 | 0.110 | 0.0052 | 0.0068 | 0.76 | 0.4 | 0.0052 | 0 |
+| hecbench/atomicPerf-cuda | _Z27BlockRangeAtomicOnSharedMemIiEvPT_i | 6048 | 0.0 | 0.0155 | 0.230 | 0.99 | 0.30 | 32 | 0.078 | 0.099 | 0.0047 | 0.0052 | 0.91 | 0.3 | 0.0047 | 0 |
+| hecbench/atomicPerf-cuda | _Z26WarpRangeAtomicOnSharedMemIiEvPT_i | 6048 | 0.0 | 0.0194 | 0.236 | 1.56 | 0.37 | 32 | 0.196 | 0.270 | 0.0128 | 0.0057 | 2.24 | 0.3 | 0.0128 | 0 |
+| hecbench/atomicPerf-cuda | _Z28SingleRangeAtomicOnSharedMemIiEvPT_i | 6048 | 0.0 | 0.0194 | 0.243 | 1.43 | 0.35 | 32 | 0.211 | 0.212 | 0.0100 | 0.0057 | 1.75 | 0.3 | 0.0100 | 0 |
+| hecbench/atomicPerf-cuda | _Z27BlockRangeAtomicOnGlobalMemIfEvPT_i | 6048 | 0.0 | 0.0155 | 0.251 | 1.49 | 0.36 | 32 | 0.267 | 0.250 | 0.0118 | 0.0133 | 0.89 | 0.9 | 0.0118 | 0 |
+| hecbench/atomicPerf-cuda | _Z26WarpRangeAtomicOnGlobalMemIfEvPT_i | 6048 | 0.0 | 0.0155 | 0.267 | 0.89 | 0.20 | 32 | 0.105 | 0.185 | 0.0087 | 0.0163 | 0.54 | 1.1 | 0.0087 | 0 |
+| hecbench/atomicPerf-cuda | _Z28SingleRangeAtomicOnGlobalMemIfEvPT_i | 6048 | 0.0 | 0.0155 | 0.285 | 1.47 | 0.13 | 32 | 0.225 | 0.357 | 0.0169 | 0.0096 | 1.76 | 0.6 | 0.0169 | 0 |
+| hecbench/axpby-cuda | _Z25multi_tensor_apply_kernelI18TensorLi | 320 | 11.8 | 0.0172 | 0.015 | 2.86 | 0.26 | 32 | 0.477 | 0.787 | 0.0020 | 0.0039 | 0.51 | 0.2 | 0.0020 | 0 |
+| hecbench/backprop-cuda | _Z19kernel_layerforwardPKfPfS1_i | 256 | 0.3 | 0.0016 | 0.002 | 2.23 | 0.13 | 32 | 0.460 | 0.569 | 0.0011 | 0.0022 | 0.52 | 1.3 | 0.0011 | 0 |
+| hecbench/backprop-cuda | _Z21kernel_adjust_weightsPKfPfS0_S1_i | 256 | 0.6 | 0.0011 | 0.007 | 2.02 | 0.16 | 32 | 0.246 | 0.505 | 0.0010 | 0.0012 | 0.85 | 1.0 | 0.0010 | 0 |
+| hecbench/binomial-cuda | _Z21binomialOptionsKernelPK13__TOptionDa | 1024 | 0.0 | 0.0364 | 0.002 | 9.59 | 0.14 | 1 | 4.555 | 4.323 | 1.1067 | 1.0068 | 1.10 | 27.7 | 1.1067 | 1 |
+| hecbench/bitonic-sort-cuda | _Z12bitonic_sortiiPi | 256 | 0.2 | 0.0018 | 0.001 | 1.97 | 0.11 | 32 | 0.294 | 0.471 | 0.0009 | 0.0019 | 0.50 | 1.0 | 0.0009 | 0 |
+| hecbench/black-scholes-cuda | _Z15getOutValOptionPK17optionInputStruct | 195313 | 1907.3 | 11.3750 | 0.988 | 26.75 | 21.55 | 25 | 0.496 | 2.011 | 3.9277 | 5.9709 | 0.66 | 0.5 | 3.9277 | 1 |
+| hecbench/blockAccess-cuda | _Z9referencePKfPhm | 1280 | 1.5 | 0.0049 | 0.003 | 0.98 | 0.10 | 32 | 0.263 | 0.090 | 0.0009 | 0.0015 | 0.60 | 0.3 | 0.0009 | 0 |
+| hecbench/blockAccess-cuda | _Z6kernelILi256ELi4EEvPKfPhm | 1280 | 1.5 | 0.0066 | 0.006 | 0.58 | 0.14 | 32 | 0.108 | 0.080 | 0.0008 | 0.0010 | 0.80 | 0.2 | 0.0008 | 0 |
+| hecbench/shmembench-cuda | _Z15benchmark_shmemP6float4 | 1024 | 8.0 | 0.0668 | 0.004 | 11.77 | 0.19 | 1 | 5.999 | 5.096 | 1.3046 | 1.7610 | 0.74 | 26.3 | 1.3046 | 1 |
+| hecbench/silu-cuda | _Z19silu_forward_kernelPKfPfm | 4096 | 4.0 | 0.0131 | 0.029 | 1.46 | 0.28 | 32 | 0.344 | 0.109 | 0.0035 | 0.0052 | 0.67 | 0.4 | 0.0035 | 0 |
+| hecbench/silu-cuda | _Z20silu_forward_kernel2PKfPfm | 1024 | 4.0 | 0.0057 | 0.054 | 2.30 | 0.66 | 32 | 0.220 | 0.486 | 0.0039 | 0.0030 | 1.28 | 0.5 | 0.0039 | 0 |
+| hecbench/silu-cuda | _Z20silu_backward_kernelPKfS0_Pfm | 4096 | 4.0 | 0.0144 | 0.074 | 1.82 | 0.68 | 32 | 0.203 | 0.283 | 0.0091 | 0.0059 | 1.53 | 0.4 | 0.0091 | 0 |
+| hecbench/silu-cuda | _Z21silu_backward_kernel2PKfS0_Pfm | 4096 | 4.0 | 0.0092 | 0.103 | 1.69 | 0.36 | 32 | 0.316 | 0.186 | 0.0060 | 0.0033 | 1.82 | 0.4 | 0.0060 | 0 |
+| hecbench/silu-cuda | _Z21silu_backward_kernel3PKfS0_Pfm | 1024 | 4.0 | 0.0052 | 0.119 | 2.01 | 0.34 | 32 | 0.242 | 0.396 | 0.0032 | 0.0035 | 0.91 | 0.7 | 0.0032 | 0 |
+| polybench/2DCONV | _Z20convolution2D_kerneliiPfS_ | 65536 | 128.0 | 0.2936 | 0.123 | 2.94 | 1.39 | 32 | 0.550 | 0.176 | 0.0901 | 0.1329 | 0.68 | 0.5 | 0.0901 | 0 |
+| polybench/3DCONV | _Z20convolution3D_kerneliiiPfS_i | 256 | 128.0 | 0.0015 | 0.066 | 3.43 | 1.90 | 32 | 0.328 | 0.295 | 0.0006 | 0.0019 | 0.31 | 1.3 | 0.0006 | 0 |
+| polybench/3MM | _Z11mm3_kernel1iiiiiPfS_S_ | 1024 | 7.0 | 0.0190 | 0.012 | 5.39 | 0.26 | 6 | 0.825 | 2.079 | 0.0887 | 0.1009 | 0.88 | 5.3 | 0.0887 | 0 |
+| polybench/3MM | _Z11mm3_kernel2iiiiiPfS_S_ | 1024 | 7.0 | 0.0190 | 0.119 | 5.96 | 0.51 | 5 | 1.382 | 2.027 | 0.1038 | 0.1143 | 0.91 | 6.0 | 0.1038 | 0 |
+| polybench/3MM | _Z11mm3_kernel3iiiiiPfS_S_ | 1024 | 7.0 | 0.0190 | 0.240 | 5.90 | 0.30 | 5 | 1.210 | 2.154 | 0.1103 | 0.1214 | 0.91 | 6.4 | 0.1103 | 0 |
+| polybench/GEMM | _Z11gemm_kerneliiiffPfS_S_ | 1024 | 3.0 | 0.0210 | 0.010 | 6.05 | 0.14 | 6 | 1.287 | 2.282 | 0.0974 | 0.1407 | 0.69 | 6.7 | 0.0974 | 0 |
+| polybench/GEMVER | _Z14gemver_kernel1iffPfS_S_S_S_ | 65536 | 64.1 | 0.2097 | 0.042 | 3.27 | 1.43 | 32 | 0.310 | 0.143 | 0.0732 | 0.0989 | 0.74 | 0.5 | 0.0732 | 0 |
+| polybench/JACOBI2D | _Z21runJacobiCUDA_kernel1iPfS_ | 4000 | 7.6 | 0.0128 | 0.013 | 1.78 | 0.23 | 32 | 0.337 | 0.134 | 0.0042 | 0.0051 | 0.82 | 0.4 | 0.0042 | 0 |
+| polybench/JACOBI2D | _Z21runJacobiCUDA_kernel2iPfS_ | 4000 | 7.6 | 0.0102 | 0.020 | 1.81 | 0.50 | 32 | 0.188 | 0.121 | 0.0038 | 0.0069 | 0.55 | 0.7 | 0.0038 | 0 |
+| polybench/SYR2K | _Z12syr2k_kerneliiffPfS_S_ | 4096 | 12.0 | 0.0446 | 0.016 | 6.40 | 0.38 | 1 | 3.261 | 2.300 | 2.3552 | 3.4677 | 0.68 | 77.8 | 2.3552 | 1 |
+| polybench/SYRK | _Z11syrk_kerneliiffPfS_ | 4096 | 8.0 | 0.0839 | 0.013 | 5.95 | 0.26 | 2 | 1.805 | 2.299 | 1.1771 | 1.8354 | 0.64 | 21.9 | 1.1771 | 1 |
+| rodinia/backprop | _Z22bpnn_layerforward_CUDAPfS_S_S_ii | 16384 | 19.0 | 0.1783 | 0.067 | 3.48 | 1.46 | 32 | 0.483 | 0.447 | 0.0572 | 0.0849 | 0.67 | 0.5 | 0.0572 | 0 |
+| rodinia/backprop | _Z24bpnn_adjust_weights_cudaPfiS_iS_S_ | 16384 | 36.0 | 0.1049 | 0.163 | 3.66 | 1.59 | 32 | 0.414 | 0.431 | 0.0552 | 0.0715 | 0.77 | 0.7 | 0.0552 | 0 |
+| rodinia/gaussian | _Z4Fan2PfS_S_iii | 16384 | 2.0 | 0.0092 | 0.003 | 1.01 | 0.16 | 32 | 0.316 | 0.103 | 0.0132 | 0.0053 | 2.49 | 0.6 | 0.0132 | 0 |
+| rodinia/lud | _Z12lud_internalPfii | 3969 | 4.0 | 0.0254 | 0.008 | 2.49 | 0.33 | 32 | 0.175 | 0.382 | 0.0118 | 0.0152 | 0.78 | 0.6 | 0.0118 | 0 |
+| rodinia/pathfinder | _Z14dynproc_kerneliPiS_S_iiii | 463 | 38.5 | 0.0036 | 0.329 | 6.25 | 0.92 | 28 | 0.505 | 2.072 | 0.0086 | 0.0123 | 0.70 | 3.5 | 0.0086 | 0 |
+
+launches 52; ratio min 0.09, median 0.78, 90th percentile 1.79, max 6.16; estimated high (ratio over 1.0): 14

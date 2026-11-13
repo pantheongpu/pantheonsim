@@ -136,7 +136,7 @@ story of each one.
 | `counters` | `true` or `false` | `VGPU_COUNTERS` | `false` | Print exact per-launch performance counters. |
 | `quiet` | `true` or `false` | `VGPU_QUIET` | `false` | Silence every simulator message on stderr, errors included. |
 | `trace` | `true` or `false` | `VGPU_TRACE` | `false` | Log every runtime and driver entry point. |
-| `host_gpu` | `off` or `exact` | `VGPU_HOST_GPU` | `off` | Experimental. Run launches of kernels whose results are defined bit for bit on this machine's real NVIDIA GPU, which must be the simulated model; everything else stays simulated. Refused, with a message, when counters, trace, race, strict, faults or another check that needs the simulator is on. See [the host-GPU study](perf-design/09-host-gpu-spike.md). |
+| `host_gpu` | `off`, `exact` or `turbo` | `VGPU_HOST_GPU` | `off` | Experimental. Run launches on this machine's real NVIDIA GPU, which must be the simulated model; everything else stays simulated. `exact`: only kernels whose results are defined bit for bit. `turbo`: also kernels whose result is the card's and close to the simulator's, not its bits (approximate functions, half and tensor arithmetic, atomics). Refused, with a message, when counters, trace, race, strict, faults or another check that needs the simulator is on. See [the host-GPU study](perf-design/09-host-gpu-spike.md) and [turbo mode](perf-design/12-host-gpu-turbo.md). |
 | `host_gpu_log` | `true` or `false` | `VGPU_HOST_GPU_LOG` | `false` | Print each host_gpu decision (offloaded, kept in the simulator and why) with its numbers. |
 
 Switching a key off (`false`, `off`, `auto`) means "as if the key were not

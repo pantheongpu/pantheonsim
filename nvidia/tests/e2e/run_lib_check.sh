@@ -82,6 +82,12 @@ if grep -q cudnn_dlhandle "$src"; then
     if [[ "$rt" =~ \.so\.[0-9]+$ ]]; then export CUDNN_FRONTEND_CUDART_LIB_NAME="$rt"; fi
   done
 fi
+# A program that takes driver functions from the runtime (cudaGetDriverEntryPoint) loads libcuda beside libcudart:
+# both_shims_env is what a sanitizer build needs for that.
+if grep -q cudaGetDriverEntryPoint "$src"; then
+  both="$(both_shims_env "$shim")"
+  [[ -n "$both" ]] && export "$both"
+fi
 status=0
 # VGPU_E2E_GPU picks another profile (the FP8 and block-scaled checks need a GPU that has them).
 # VGPU_E2E_ARGS is the program's command line (nvshmem_host peerless).

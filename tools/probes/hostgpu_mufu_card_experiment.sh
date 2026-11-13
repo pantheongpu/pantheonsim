@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # The card experiment that decides whether more of the MUFU family may join the host-GPU exact set (docs/performance.md "Round sp43", finding 3).
-# It needs ONE NVIDIA card (the A10G of the card CI is the reference; any sm_75+ card gives a valid answer for that card's family) and a CUDA toolkit. No card was
-# available in sp43, so nothing below has been run; the simulator side of every comparison is unit tested without a card (tests/unit/test_host_gpu_ref.cpp).
+# It needs ONE NVIDIA card (the A10G of the card CI is the reference; any sm_75+ card gives a valid answer for that card's family) and a CUDA toolkit. It was run
+# on an A10G at stride 1 in Round sp44 (docs/perf-design/rounds/11-rounds-sp36-sp41.md): div, sqrtrn, rcprn and the harness PASS, the bare MUFU forms differ on
+# 4% to 25% of the patterns. The simulator side of every comparison is unit tested without a card (tests/unit/test_host_gpu_ref.cpp). The probes of turbo
+# mode (sin, cos, tanh, atomics, tensor instructions) are in tools/probes/hostgpu_turbo_card_probes.sh.
 #
 #   usage: tools/probes/hostgpu_mufu_card_experiment.sh <out-dir> [stride]       (stride 1 = all 2^32 patterns; the full run takes about 10 minutes on an A10G)
 #

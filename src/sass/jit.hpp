@@ -232,6 +232,9 @@ struct Config {
   bool fuse = false;                // generate runs of register-only ops block by block of eight lanes (gen_fused_run; from_env: VGPU_JIT_FUSE=1 turns it on)
   unsigned timeout_s = 120;         // wall limit of one compile
   unsigned mem_mb = 4096;           // RLIMIT_AS of the compiler
+  uint64_t max_bytes = uint64_t{256} << 20;   // the cache's size cap over its directories (Engine::trim; from_env: VGPU_JIT_CACHE_MAX_MB, 0: none)
+  unsigned stale_days = 14;         // another build's directory none of whose files changed for this long is removed (0: never)
+  bool trim_siblings = false;       // (tests) trim the cache directory's siblings as with the default directory
   // For tests: replaces dlopen (returns null and fills the error on a failure), and the ISA level the key and flags use.
   std::function<void*(const char* path, std::string* err)> dlopen_fn;
   std::string isa;                  // "": the running CPU's
@@ -263,6 +266,8 @@ struct Result {
   bool hit = false;                 // came from the cache
   bool compiled = false;            // this call ran the compiler
   bool replaced_corrupt = false;    // a file of the key was damaged and has been removed
+  bool pending = false;             // lookup_selected(): a miss of a section that has a selection on record (a compile of an earlier run that did not finish)
+  bool cancelled = false;           // obtain(): the compile was cancelled (the process is ending)
   double compile_ms = 0, lookup_ms = 0;
   std::string key;
   std::string message;
@@ -301,6 +306,7 @@ class Engine {
   std::string object_path(const std::string& key) const;
   std::string compiler_id(std::string* why = nullptr);
   std::string ensure_rt();                         // writes the embedded headers the generated code includes; "" or the error
+  void trim(const std::string& keep);              // the size cap and the age rule (round sp63; run after an install): `keep` is a key never removed
 
  private:
   struct Impl;
@@ -333,6 +339,9 @@ struct Region {
 enum class State : int { Idle, Looking, Counting, Queued, Ready, Failed, Declined, Waiting };
 inline constexpr uint64_t kWaitBatch = 65536;        // warp instructions a thread adds up by itself while a section waits
 inline constexpr uint64_t kWaitBatchFrom = 1 << 20;  // ... when the wait is at least this long
+// (round sp63) A section the share rule has kept waits on the plain loop for its lookup too (Unit::sample), when the lookup is at least this many instructions away;
+// that wait ends in Idle (Unit::wait_then), the hook loop's counting up to the lookup.
+inline constexpr uint64_t kPrewaitMin = 4096;
 
 // The share rule (round 14). The hook (tier_run_t<true>, the counting, the cache lookup) costs the instructions of a section that are not in a compiled
 // region something, and a section whose regions are a small part of its work never earns it back (`warp`, `shared`, `f64_fma`, `divergent`, `texture`
@@ -371,7 +380,8 @@ struct Unit : std::enable_shared_from_this<Unit> {
   std::atomic<uint64_t> waited{0};     // warp instructions of the section run on the plain loop while Waiting (all of them, in regions or not)
   std::atomic<uint64_t> wait_for{0};   // ... and how many of them end the wait
   std::atomic<uint64_t> wait_batch{1}; // ... and how many a thread adds up before it brings them to `waited` (set with wait_for)
-  std::atomic<uint64_t> credit{0};     // what the wait counts for towards the threshold once it is over (wait_for; Unit::note adds it to the regions' counts)
+  std::atomic<uint64_t> credit{0};     // what the waits count for towards the lookup and the threshold once over (their wait_for; Unit::note adds it to the regions' counts)
+  std::atomic<int> wait_then{static_cast<int>(State::Counting)};   // the state a wait ends in: Counting (after a miss of the lookup), Idle (a wait before the lookup)
   // Merging (linking): `regions` has one more element than spec.regions, a placeholder until a merged selection is published; then it is the merged region
   // (its spec is `merged`), the only one with entries in active_at and a function.
   RegionSpec merged;
@@ -404,8 +414,11 @@ inline constexpr uint32_t kMutHostPs = 2, kMutHostChain = 4, kMutHostMaxreg = 8,
 inline constexpr uint32_t kMutHostOlo = 32, kMutHostSpins = 64;   // host_olo: the other lanes are taken to stand above everything; host_spins: the generated code counts its taken backward branches somewhere else
 uint32_t host_mutants();
 
-// Whether VGPU_JIT=1 is set, the tier is on, and this is not a sanitizer build. Read once.
+// Whether VGPU_JIT=1 (or auto) is set, the tier is on, and this is not a sanitizer build. Read once.
 bool requested();
+// Whether VGPU_JIT=auto is set (round sp63): on as with 1, the way a default-on JIT would run, without the notices that only say it cannot run here
+// (no C++ compiler, a cache directory that cannot be used). Read once.
+bool auto_mode();
 // Whether VGPU_JIT_LINK=1 is set (linking, see Ctx::olo): the host then works out kFlagLink and Ctx::olo for a region call in a diverged warp. Read once.
 bool link_requested();
 
@@ -421,7 +434,10 @@ struct Stats {
   std::atomic<uint64_t> regions_run{0}, instructions_run{0}, generated_run{0}, region_throws{0};   // calls of generated regions, and the warp instructions in them
   std::atomic<uint64_t> compile_us{0}, lookup_us{0}, units_ready{0};
   std::atomic<uint64_t> declined{0}, accepted{0};   // the share rule's decisions
-  std::atomic<uint64_t> waits{0}, wait_ends{0};     // sections that went to the plain loop on the way to the threshold (State::Waiting), and those that came back to count
+  std::atomic<uint64_t> waits{0}, wait_ends{0};     // sections that went to the plain loop on the way to the threshold (State::Waiting), and waits that ended (either kind)
+  std::atomic<uint64_t> prewaits{0};                // sections that went to the plain loop on the way to the lookup (round sp63)
+  std::atomic<uint64_t> history{0};                 // lookups that found a selection without its object and compiled it at once (round sp63)
+  std::atomic<uint64_t> evicted{0};                 // objects and directories the cache's size cap and age rule removed (Engine::trim)
   std::atomic<uint64_t> continued{0};   // branches and register-only ops the generated code went on past (the loop's chain steps it took over)
   // Why generated code was left (round sp52), per reason (ExitWhy): [0] the group was every runnable lane of the warp, [1] other runnable lanes stood elsewhere
   // (a diverged warp: the loop's chain conditions do not hold), [2] the calls of these that left at their entry with nothing run.
