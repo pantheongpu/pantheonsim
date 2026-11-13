@@ -568,6 +568,20 @@ inline bool streak_offload(const StreakLaunch& s, const Costs& c, bool driver_st
   return keep >= c.min_sim_s && keep > c.margin * streak_card_seconds(s, c);
 }
 
+// What the bans (offload_paid_off, TrafficTable) weigh a card launch's path against: the simulator's estimate, and while the card holds chunks the
+// simulator does not (`card_only_bytes` > 0, the streak rule on), the pull that keeping the launch would have cost as well, whichever rule sent it.
+// Against the estimate alone, one slow launch of GRAMSCHM's 1-block kernel1 (0.15 ms on the card, 0.29 ms estimated, sent by the size rule)
+// ended its offloading and broke the streak for the rest of the run (Round sp65, D).
+inline double ban_reference_seconds(const StreakLaunch& s, const Costs& c, bool streak_rule) {
+  return streak_rule && s.card_only_bytes > 0 ? streak_keep_seconds(s, c) : s.sim_s;
+}
+
+// A grid or block with a zero dimension is the simulator's to refuse with its own error (cudaErrorInvalidConfiguration); on the card the launch
+// fails, and with memory resident there that ended the mode with an internal error (PolyBench LU's last lu_kernel1, Round sp65).
+inline bool launch_shape_empty(const uint32_t grid[3], const uint32_t block[3]) {
+  return !grid[0] || !grid[1] || !grid[2] || !block[0] || !block[1] || !block[2];
+}
+
 // ---- start-up of the real driver ---------------------------------------------------------------------------------------------------
 // Loading the driver and making its context costs 0.15 to 0.35 s (09 doc, section 5; 0.23 s on the A10G of docs/performance.md "Round sp42"). Nothing touches
 // the driver, and no thread is started for it, until should_offload_with_start has decided that a launch goes to the card: the start is then made at that launch

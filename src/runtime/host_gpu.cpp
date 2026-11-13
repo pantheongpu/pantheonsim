@@ -1130,7 +1130,7 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   // A grid or block with a zero dimension is the simulator's to refuse, with its own error (cudaErrorInvalidConfiguration): on the card the launch fails,
   // and with memory resident there that ended the mode with an internal error. PolyBench LU's last lu_kernel1 has such a grid; sp65's rule was the
   // first to send it (as verify runs did before).
-  if (!cfg.grid[0] || !cfg.grid[1] || !cfg.grid[2] || !cfg.block[0] || !cfg.block[1] || !cfg.block[2]) {
+  if (launch_shape_empty(cfg.grid.data(), cfg.block.data())) {
     ++im.stats.refused_launch;
     ++im.stats.simulated;
     if (logging()) std::fprintf(stderr, "host_gpu: %s stays in the simulator: a grid or block dimension is 0\n", fn.name.c_str());
@@ -1207,17 +1207,13 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   // Round sp65: while the card holds chunks the simulator does not, keeping this launch would pull them back first, and sending it moves only what
   // the simulator holds alone (streak_offload). `ref_s` is what the simulator side was expected to cost: the bans below weigh the card path against it.
   bool streak = false;
-  double ref_s = e.sim_s;
   if (!by_size && im.resident && im.streak_rule && total <= im.max_bytes) {
     const StreakLaunch sl{e.sim_s, card_only_bytes, push_bytes, e.card_kernel_s};
     streak = streak_offload(sl, im.costs, im.start_sh != nullptr);
   }
-  // Whichever rule sends it, a launch while the card holds chunks the simulator does not saves the pull that keeping it would cost, so the bans weigh
-  // its card path against both. (Weighed against the simulator time alone, a launch of 0.29 ms that the size rule sent and whose card path once took
-  // longer, as can happen to GRAMSCHM's 1-block kernel1, 0.15 ms on the card against 0.29 ms estimated, on a busy host, ended its kernel's offloading for good, and every later
-  // launch of it and of the kernel after it went back to pulling and pushing the whole memory: Round sp65.)
-  if (im.resident && im.streak_rule && card_only_bytes > 0)
-    ref_s = streak_keep_seconds(StreakLaunch{e.sim_s, card_only_bytes, push_bytes, e.card_kernel_s}, im.costs);
+  // Whichever rule sends it, a launch while the card holds chunks the simulator does not is weighed by the bans against the pull it saves too
+  // (ban_reference_seconds, vgpu/host_gpu.hpp).
+  const double ref_s = ban_reference_seconds(StreakLaunch{e.sim_s, card_only_bytes, push_bytes, e.card_kernel_s}, im.costs, im.resident && im.streak_rule);
   if (total > im.max_bytes || (!by_size && !streak)) {
     ++im.stats.refused_size;
     ++im.stats.simulated;

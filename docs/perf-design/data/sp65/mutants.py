@@ -37,6 +37,19 @@ M = [
     (HG, "the push not charged", "  return c.launch_s + s.card_kernel_s.value_or(c.kernel_s_default) + static_cast<double>(s.push_bytes) / c.push_bytes_per_s;", "  return c.launch_s + s.card_kernel_s.value_or(c.kernel_s_default);"),
     (HG, "the push at the pull rate", "  return c.launch_s + s.card_kernel_s.value_or(c.kernel_s_default) + static_cast<double>(s.push_bytes) / c.push_bytes_per_s;", "  return c.launch_s + s.card_kernel_s.value_or(c.kernel_s_default) + static_cast<double>(s.push_bytes) / c.pull_bytes_per_s;"),
     (HG, "the card's side priced with the card-only bytes", "  return c.launch_s + s.card_kernel_s.value_or(c.kernel_s_default) + static_cast<double>(s.push_bytes) / c.push_bytes_per_s;", "  return c.launch_s + s.card_kernel_s.value_or(c.kernel_s_default) + static_cast<double>(s.push_bytes + s.card_only_bytes) / c.push_bytes_per_s;"),
+    # the bans' reference (Round sp65, D)
+    (HG, "ban: the pull never counted", "  return streak_rule && s.card_only_bytes > 0 ? streak_keep_seconds(s, c) : s.sim_s;", "  return s.sim_s;"),
+    (HG, "ban: the pull always counted", "  return streak_rule && s.card_only_bytes > 0 ? streak_keep_seconds(s, c) : s.sim_s;", "  return streak_keep_seconds(s, c);"),
+    (HG, "ban: the switch ignored", "  return streak_rule && s.card_only_bytes > 0 ? streak_keep_seconds(s, c) : s.sim_s;", "  return s.card_only_bytes > 0 ? streak_keep_seconds(s, c) : s.sim_s;"),
+    (HG, "ban: the card's side added", "  return streak_rule && s.card_only_bytes > 0 ? streak_keep_seconds(s, c) : s.sim_s;", "  return streak_rule && s.card_only_bytes > 0 ? streak_keep_seconds(s, c) + streak_card_seconds(s, c) : s.sim_s;"),
+    (HG, "ban: the switch inverted", "  return streak_rule && s.card_only_bytes > 0 ? streak_keep_seconds(s, c) : s.sim_s;", "  return !streak_rule && s.card_only_bytes > 0 ? streak_keep_seconds(s, c) : s.sim_s;"),
+    # the zero-grid check
+    (HG, "shape: never empty", "  return !grid[0] || !grid[1] || !grid[2] || !block[0] || !block[1] || !block[2];", "  return false;"),
+    (HG, "shape: grid x only", "  return !grid[0] || !grid[1] || !grid[2] || !block[0] || !block[1] || !block[2];", "  return !grid[0];"),
+    (HG, "shape: the grid only", "  return !grid[0] || !grid[1] || !grid[2] || !block[0] || !block[1] || !block[2];", "  return !grid[0] || !grid[1] || !grid[2];"),
+    (HG, "shape: the block only", "  return !grid[0] || !grid[1] || !grid[2] || !block[0] || !block[1] || !block[2];", "  return !block[0] || !block[1] || !block[2];"),
+    (HG, "shape: z ignored", "  return !grid[0] || !grid[1] || !grid[2] || !block[0] || !block[1] || !block[2];", "  return !grid[0] || !grid[1] || !block[0] || !block[1];"),
+    (HG, "shape: all must be zero", "  return !grid[0] || !grid[1] || !grid[2] || !block[0] || !block[1] || !block[2];", "  return !grid[0] && !grid[1] && !grid[2] && !block[0] && !block[1] && !block[2];"),
 ]
 
 

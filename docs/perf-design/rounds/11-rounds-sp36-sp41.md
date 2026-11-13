@@ -3401,14 +3401,20 @@ change: 17 launches kept, 48 MiB moved, 225.0 s. LU, gaussian and lud were run a
 
 ### E. Tests and mutants
 
-* `test_host_gpu_logic`: 92 cases, 3 new (when the rule acts; both sides by the formula; the floor and the margin, at exact binary edges and by bisection). Passed on
-  server3 and on the rig.
+* `test_host_gpu_logic`: 94 cases, 5 new (when the rule acts; both sides by the formula; the floor and the margin, at exact binary edges and by bisection;
+  after the card, the bans' reference (`ban_reference_seconds`: a slow launch the estimate alone bans and the pull it saved does not, for the slow-launch ban
+  and the traffic ban, and the reverse with nothing only on the card or the rule off) and the zero-grid check (`launch_shape_empty`, each dimension)).
+  92 of them passed on the rig; all 94 on server3, and the two changed C++ files compile clean with `g++-12 -Wall -Wextra -Werror`.
 * Mutants (`data/sp65/mutants.py`, a copy of the header outside the tree per mutant): 23; the first pass killed 19, the four survivors (no card data
-  needed, a negative estimate, the floor and the margin taken strictly) were killed by tests added at those edges: 23 of 23.
-* `e2e_host_gpu_stub` steps 24 to 26 (a short launch follows a long one to a card that keeps memory and computes nothing, in both modes; not with
+  needed, a negative estimate, the floor and the margin taken strictly) were killed by tests added at those edges: 23 of 23. Eleven more for the two
+  card fixes (the bans' reference never, always, ignoring or inverting the switch, adding the card's side; the zero-grid check never, on x only, the grid
+  only, the block only, without z, all at once): 34 of 34 killed (`data/sp65/mutants.txt`).
+* `e2e_host_gpu_stub` step 27 (after the card: `zerogrid` launches over 4 MiB until the card holds it, then on a grid of 0 blocks; the answer must be the
+  mode-off answer, `cudaErrorInvalidConfiguration`, in both modes, and the log must say it stayed): written for CI, **not run** (no nvcc on server3, and the
+  rig was given back). Steps 24 to 26 (a short launch follows a long one to a card that keeps memory and computes nothing, in both modes; not with
   `VGPU_HOST_GPU_STREAK=0`; not after the program read the memory back): first run on the rig, passed, as did the card CI (`card-ci.txt`).
-* Not covered by a test: the ban's new reference (D; runtime code, no stand-in can make a launch slow on purpose), and the zero-grid refusal (the
-  stand-in program has no such launch; seen on the rig with LU).
+* The two fixes of D are pure functions now (`ban_reference_seconds`, `launch_shape_empty` in vgpu/host_gpu.hpp), which the runtime calls and the unit
+  test pins; the runtime's call sites themselves are pinned only by step 27 (the zero grid), which has not run yet.
 
 ### F. Caveats and what was not run
 

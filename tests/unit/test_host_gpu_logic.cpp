@@ -1884,4 +1884,49 @@ VTEST(a_streak_launch_keeps_the_margin_and_the_floor) {
   VCHECK(streak_offload(m, one, true) && !streak_offload(m, c, true));
 }
 
+VTEST(the_bans_weigh_a_launch_against_the_pull_it_saves_while_the_card_holds_memory) {
+  const Costs c;
+  // GRAMSCHM's kernel1 on the rig: 0.29 ms estimated, a card path that once took 0.5 ms, 48 MiB only on the card
+  StreakLaunch s;
+  s.sim_s = 0.00029;
+  s.card_only_bytes = 48ull << 20;
+  const double card_total = 0.0005;
+  VCHECK(ban_reference_seconds(s, c, true) == streak_keep_seconds(s, c));
+  VCHECK(!offload_paid_off(card_total, s.sim_s));                          // judged by the estimate alone: banned
+  VCHECK(offload_paid_off(card_total, ban_reference_seconds(s, c, true)));  // with the pull it saved: not
+  // the traffic ban's "slow" side reads the same reference: two launches that push a quarter of the memory, slow against the estimate alone
+  TrafficTable old_t, new_t;
+  const uint64_t live = 64ull << 20, push = 20ull << 20;
+  const double total = 0.002;   // over half of 0.29 ms, under half of 0.29 ms + 5 ms
+  VCHECK(!old_t.record("k", push, live, total, s.sim_s) && old_t.record("k", push, live, total, s.sim_s));
+  VCHECK(!new_t.record("k", push, live, total, ban_reference_seconds(s, c, true)) && !new_t.record("k", push, live, total, ban_reference_seconds(s, c, true)));
+  // and the reverse: with nothing only on the card, or with the rule switched off, the estimate alone, and the same slow launch is banned
+  StreakLaunch none = s;
+  none.card_only_bytes = 0;
+  VCHECK(ban_reference_seconds(none, c, true) == none.sim_s && !offload_paid_off(card_total, ban_reference_seconds(none, c, true)));
+  VCHECK(ban_reference_seconds(s, c, false) == s.sim_s && !offload_paid_off(card_total, ban_reference_seconds(s, c, false)));
+  // a launch slower than even the pull it saves is still banned
+  VCHECK(!offload_paid_off(0.1, ban_reference_seconds(s, c, true)));
+  // what is pushed does not enter the reference (it is the card's side), nor the card's kernel time
+  StreakLaunch pushed = s;
+  pushed.push_bytes = 1ull << 30;
+  pushed.card_kernel_s = 1.0;
+  VCHECK(ban_reference_seconds(pushed, c, true) == ban_reference_seconds(s, c, true));
+}
+
+VTEST(a_launch_with_a_zero_grid_or_block_dimension_is_the_simulator_s) {
+  const uint32_t one[3] = {1, 1, 1};
+  VCHECK(!launch_shape_empty(one, one));
+  const uint32_t big[3] = {65535, 65535, 64};
+  VCHECK(!launch_shape_empty(big, big));
+  for (int i = 0; i < 3; ++i) {
+    uint32_t g[3] = {4, 4, 4}, b[3] = {32, 8, 1};
+    g[i] = 0;
+    VCHECK(launch_shape_empty(g, b));   // PolyBench LU's last launches: grid 0x1x1 and 0x0x1
+    uint32_t g2[3] = {4, 4, 4}, b2[3] = {32, 8, 1};
+    b2[i] = 0;
+    VCHECK(launch_shape_empty(g2, b2));
+  }
+}
+
 VTEST_MAIN

@@ -47,6 +47,7 @@
 #      host_gpu_streak counts them), in both modes;
 #  25. ... and with VGPU_HOST_GPU_STREAK=0 they stay in the simulator (the counters read 8, nothing is counted);
 #  26. when the program reads the memory back between the two (`streakread`), the card holds nothing the simulator does not and `bump` stays.
+#  27. a launch on a grid of 0 blocks while the card holds the memory gets the simulator's error, as with the mode off, and never reaches the card.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -339,5 +340,14 @@ diff -q "$work/off_streak.out" "$work/str_off.out" > /dev/null && { echo "FAIL: 
 run str_read streakread VGPU_HOST_GPU=exact "${str[@]}" || { echo "FAIL: the run of streakread failed"; fails=1; }
 grep -q '^bumps 8 to 8, ' "$work/str_read.out" || { echo "FAIL: a bump went to the card although the program had read the memory back: $(cat "$work/str_read.out")"; fails=1; }
 [[ "$(streak_of str_read)" == "0 1" ]] || { echo "FAIL: streakread: $(grep '^host_gpu_streak' "$work/str_read.err")"; fails=1; }
+# 27. a zero grid while the card holds the memory (Round sp65: PolyBench LU's last lu_kernel1).
+env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" zerogrid > "$work/off_zerogrid.out" 2> "$work/off_zerogrid.err" || { echo "FAIL: the zerogrid run with the mode off failed"; exit 1; }
+grep -q '^zero grid: cudaErrorInvalidConfiguration$' "$work/off_zerogrid.out" || { echo "FAIL: zerogrid with the mode off: $(cat "$work/off_zerogrid.out")"; fails=1; }
+for m in exact turbo; do
+  run "zg_$m" zerogrid VGPU_HOST_GPU=$m "${str[@]}" || { echo "FAIL: the $m run of zerogrid failed"; tail -5 "$work/zg_$m.err"; fails=1; }
+  diff -q "$work/off_zerogrid.out" "$work/zg_$m.out" > /dev/null || { echo "FAIL: $m: a zero grid did not get the simulator's answer: $(cat "$work/zg_$m.out")"; fails=1; }
+  grep -q 'a grid or block dimension is 0' "$work/zg_$m.err" || { echo "FAIL: $m: no line saying the zero grid stayed in the simulator"; fails=1; }
+  grep -q '^cuLaunchKernel$' "$work/zg_$m.log" || { echo "FAIL: $m: nothing went to the card before the zero grid, so the step proves nothing: $(calls "zg_$m")"; fails=1; }
+done
 (( fails == 0 )) && { echo "PASS: first launch $first ms against a driver start of $init_ms ms; driver calls in the big run: $(calls on_big)"; exit 0; }
 exit 1

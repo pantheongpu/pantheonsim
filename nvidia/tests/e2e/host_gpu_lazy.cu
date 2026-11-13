@@ -13,6 +13,8 @@
 // memory back only at the end: once `scramble` runs on the card, the card holds the whole live memory when each `bump` comes, and `bump` (far too
 // short to repay a card trip by itself) goes there too. `streakread` reads both buffers back after every `scramble`, so the card holds nothing the
 // simulator does not when `bump` comes. Both print the counters and a hash of the 4 MiB.
+// `zerogrid` (step 27) launches `scramble` four times over 4 MiB and then on a grid of 0 blocks, while the card holds the memory: the last launch must
+// get the simulator's own answer (cudaErrorInvalidConfiguration), as with the mode off, and never reach the card.
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -129,8 +131,24 @@ static int streak_program(bool read_between) {
   return 0;
 }
 
+static int zerogrid_program() {
+  const int n = 1 << 20;
+  void* d = nullptr;
+  cudaMalloc(&d, n * 4);
+  cudaMemset(d, 1, n * 4);
+  for (int launch = 0; launch < 4; ++launch) scramble<<<n / 256, 256>>>(static_cast<uint32_t*>(d), n, 64);
+  cudaDeviceSynchronize();
+  scramble<<<0, 256>>>(static_cast<uint32_t*>(d), n, 64);
+  const cudaError_t e = cudaGetLastError();
+  cudaDeviceSynchronize();
+  std::printf("zero grid: %s\n", cudaGetErrorName(e));
+  cudaFree(d);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "big";
+  if (!std::strcmp(mode, "zerogrid")) return zerogrid_program();
   if (!std::strcmp(mode, "streak") || !std::strcmp(mode, "streakread")) return streak_program(!std::strcmp(mode, "streakread"));
   const bool small = !std::strcmp(mode, "small"), mufu = !std::strcmp(mode, "mufu");
   const bool div = !std::strcmp(mode, "div"), rcp = !std::strcmp(mode, "rcp"), divexp_mode = !std::strcmp(mode, "divexp");

@@ -1,25 +1,2 @@
-hecbench/atomicAggregate-cuda        2.73
-hecbench/bh-cuda                     3.15
-hecbench/bitonic-sort-cuda           3.79
-hecbench/silu-cuda                   3.13
-polybench/2DCONV                     3.71
-polybench/3DCONV                     2.82
-polybench/ADI                        4.96
-polybench/ATAX                       2.65
-polybench/BICG                       2.21
-polybench/CORR                       2.29
-polybench/COVAR                      2.37
-polybench/GEMM                       3.36
-polybench/GEMVER                     2.61
-polybench/GESUMMV                    2.20
-polybench/JACOBI1D                   5.62
-polybench/MVT                        2.63
-polybench/SYR2K                      2.23
-polybench/SYRK                       2.23
-rodinia/backprop                     3.23
-rodinia/hotspot                      4.35
-rodinia/lavaMD                       3.13
-rodinia/needle                       3.07
-rodinia/particlefilter_float         2.50
-rodinia/pathfinder                   3.52
+The rig's simulator over server3's, programs wholly in the simulator in sp59: atomicAggregate-cuda 2.73, bh-cuda 3.15, bitonic-sort-cuda 3.79, silu-cuda 3.13, 2DCONV 3.71, 3DCONV 2.82, ADI 4.96, ATAX 2.65, BICG 2.21, CORR 2.29, COVAR 2.37, GEMM 3.36, GEMVER 2.61, GESUMMV 2.20, JACOBI1D 5.62, MVT 2.63, SYR2K 2.23, SYRK 2.23, backprop 3.23, hotspot 4.35, lavaMD 3.13, needle 3.07, particlefilter_float 2.50, pathfinder 3.52.
 programs 24: min 2.20 median 2.95 max 5.62
