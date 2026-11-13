@@ -41,6 +41,7 @@ extern const char* const kEmbeddedRuntime __attribute__((visibility("hidden")));
 namespace {
 
 using Clock = std::chrono::steady_clock;
+const Clock::time_point g_loaded = Clock::now();   // (when the library was loaded: the times of the compile log count from it)
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
@@ -268,6 +269,7 @@ Config Config::from_env() {
   c.specialize = false;
   if (const std::string r = env("VGPU_JIT_RESIDENCE"); !r.empty() && r != "0") c.residence = true;
   if (const std::string r = env("VGPU_JIT_SPECIALIZE"); !r.empty() && r != "0") c.specialize = true;
+  if (env("VGPU_JIT_PCH") == "0") c.pch = false;
   if (env("VGPU_JIT_LINK") == "1") c.link = true;
   if (const std::string r = env("VGPU_JIT_FUSE"); !r.empty() && r != "0") c.fuse = true;
   if (const std::string t = env("VGPU_JIT_TIMEOUT"); !t.empty()) c.timeout_s = static_cast<unsigned>(std::strtoul(t.c_str(), nullptr, 10));
@@ -903,6 +905,10 @@ struct Engine::Impl {
   std::string rt_dir, rt_err;
   std::atomic<uint64_t> seq{0};
   std::atomic<bool> cancel{false};
+  // The precompiled runtime header (round sp64): what the next build_pch() makes (the header's path, its text, the command), once a process.
+  bool pch_tried = false;
+  std::string pch_h, pch_text;
+  std::vector<std::string> pch_cmd;
 };
 
 Engine::Engine(Config cfg) : cfg_(std::move(cfg)), p_(new Impl) {}
@@ -1522,24 +1528,66 @@ Result Engine::obtain(const UnitSpec& spec) {
     return out;
   }
   const std::string isa = cfg_.isa.empty() ? detect_isa() : cfg_.isa;
-  if (!write_file(tmp_cpp, source(spec, isa == "avx2", cfg_.residence, cfg_.specialize, cfg_.link && !spec.nolink, cfg_.fuse))) {
+  const std::string src = source(spec, isa == "avx2", cfg_.residence, cfg_.specialize, cfg_.link && !spec.nolink, cfg_.fuse);
+  out.source_bytes = src.size();
+  if (!write_file(tmp_cpp, src)) {
     out.status = Status::CacheUnusable;
     out.message = "cannot write to " + dir + ": " + std::strerror(errno);
     return out;
   }
   // The flags that are not the distribution's defaults (Ubuntu's compilers add a stack protector, stack-clash probes and control-flow instrumentation, which a region call of 10 to 30
   // ops pays for on every call: the canary and the probes of a frame of rows, an `endbr64` and `notrack` on the entry switch).
-  std::vector<std::string> cmd{p_->cxx_path, "-std=c++20", "-O2", "-funroll-loops", "-I" + p_->rt_dir, "-fPIC", "-shared", "-fexceptions", "-ffp-contract=off", "-fvisibility=hidden", "-w",
-                               "-fno-stack-protector", "-fno-stack-clash-protection"};
+  std::vector<std::string> flags{"-std=c++20", "-O2", "-funroll-loops", "-I" + p_->rt_dir, "-fPIC", "-fexceptions", "-ffp-contract=off", "-fvisibility=hidden", "-w",
+                                 "-fno-stack-protector", "-fno-stack-clash-protection"};
 #if defined(__x86_64__)
-  cmd.push_back("-fcf-protection=none");
+  flags.push_back("-fcf-protection=none");
 #endif
-  for (const std::string& f : split_words(isa_flags(isa))) cmd.push_back(f);
-  for (const std::string& f : split_words(cfg_.extra_flags)) cmd.push_back(f);
+  for (const std::string& f : split_words(isa_flags(isa))) flags.push_back(f);
+  for (const std::string& f : split_words(cfg_.extra_flags)) flags.push_back(f);
+  // (Round sp64) The runtime header, precompiled. The generated source starts with the same four lines in every compile (two standard headers, the ISA
+  // level, the runtime header with the lane kernels and <immintrin.h>), and parsing them is 0.35 to 0.43 s of every compile on server3 (<immintrin.h>
+  // alone 0.29 s): half of a small section's compile (atomicAggregate 0.73 s, 0.36 s with it). GCC reads a header compiled once (`<name>.gch`, 53 MB)
+  // in its place when the header is named with -include and the flags are the same; it ignores one that does not fit and reads the text, and the
+  // object is the same bytes either way (checked on four sections). The header is made after the first compile of a process that found none, so
+  // that no compile waits for it (build_pch); GCC only (clang has its own form), VGPU_JIT_PCH=0 turns it off.
+  std::string pch_h;
+  if (cfg_.pch && p_->cxx_id.find("clang") == std::string::npos) {
+    const std::string first = "#include <cstddef>\n", last = "#include \"vgpu_jit_rt.h\"\n";
+    const size_t a = src.find(first), b = src.find(last);
+    if (a != std::string::npos && b != std::string::npos && b > a) {
+      const std::string text = src.substr(a, b + last.size() - a);
+      std::string ftext;
+      for (const std::string& f : flags) ftext += f + "\n";
+      const std::string h = p_->rt_dir + "/vgpu_jit_pch-" + hash_text(text + "|" + ftext + "|" + p_->cxx_id).substr(0, 16) + ".h";
+      std::string have;
+      struct stat gst;
+      if (::stat((h + ".gch").c_str(), &gst) == 0 && read_file(h, have) && have == text) {
+        pch_h = h;
+      } else {
+        std::lock_guard<std::mutex> g(p_->mu);
+        if (!p_->pch_tried && p_->pch_h.empty()) {
+          p_->pch_h = h;
+          p_->pch_text = text;
+          p_->pch_cmd.assign(1, p_->cxx_path);
+          for (const std::string& f : flags) p_->pch_cmd.push_back(f);
+        }
+      }
+    }
+  }
+  std::vector<std::string> cmd{p_->cxx_path};
+  for (const std::string& f : flags) cmd.push_back(f);
+  cmd.push_back("-shared");
+  if (!pch_h.empty()) {
+    cmd.push_back("-include");
+    cmd.push_back(pch_h);
+  }
   cmd.push_back("-o");
   cmd.push_back(tmp_so);
   cmd.push_back(tmp_cpp);
+  // (A .gch that GCC cannot use -- damaged, made by another compiler -- is ignored by GCC itself, which then reads the header's text: the test makes one
+  // of garbage. One is written under a name of its own and renamed into place, so a reader never sees half of one.)
   const Proc pr = run_process(cmd, cfg_.timeout_s * 1000u, cfg_.mem_mb, &p_->cancel);
+  out.pch = !pch_h.empty();
   if (std::getenv("VGPU_JIT_KEEP")) ::rename(tmp_cpp.c_str(), (dir + "/" + key + ".cpp").c_str());   // (debugging: keep the generated source)
   else ::unlink(tmp_cpp.c_str());
   out.compile_ms = ms_since(t0);
@@ -1575,6 +1623,8 @@ Result Engine::obtain(const UnitSpec& spec) {
   fresh.compiled = true;
   fresh.hit = false;
   fresh.compile_ms = out.compile_ms;
+  fresh.source_bytes = out.source_bytes;
+  fresh.pch = out.pch;
   fresh.replaced_corrupt = out.replaced_corrupt;
   if (!fresh.found) {
     ::unlink(sum.c_str());
@@ -1582,6 +1632,43 @@ Result Engine::obtain(const UnitSpec& spec) {
     if (fresh.status == Status::Ok) fresh.status = Status::CacheUnusable;
   }
   return fresh;
+}
+
+// (Round sp64) Makes the precompiled runtime header the last compile found missing (obtain), once a process: the header's text in the runtime directory
+// and its .gch, each written under a name of its own and renamed into place, so that a compile never reads half of one. Run by the manager after the
+// object of that compile is published. True if one was made.
+bool Engine::build_pch() {
+  std::string h, text;
+  std::vector<std::string> cmd;
+  {
+    std::lock_guard<std::mutex> g(p_->mu);
+    if (p_->pch_tried || p_->pch_h.empty()) return false;
+    p_->pch_tried = true;
+    h = p_->pch_h;
+    text = p_->pch_text;
+    cmd = p_->pch_cmd;
+  }
+  const std::string stem = h + "." + std::to_string(::getpid()) + "." + std::to_string(g_seq.fetch_add(1));
+  std::string have;
+  if (!(read_file(h, have) && have == text)) {
+    if (!write_file(stem + ".tmp", text) || ::rename((stem + ".tmp").c_str(), h.c_str()) != 0) {
+      ::unlink((stem + ".tmp").c_str());
+      return false;
+    }
+  }
+  const std::string gch = stem + ".gch.tmp";
+  cmd.push_back("-x");
+  cmd.push_back("c++-header");
+  cmd.push_back("-o");
+  cmd.push_back(gch);
+  cmd.push_back(h);
+  const Proc pr = run_process(cmd, cfg_.timeout_s * 1000u, cfg_.mem_mb, &p_->cancel);
+  struct stat st;
+  if (pr.timed_out || pr.cancelled || pr.rc != 0 || ::stat(gch.c_str(), &st) != 0 || st.st_size == 0 || ::rename(gch.c_str(), (h + ".gch").c_str()) != 0) {
+    ::unlink(gch.c_str());
+    return false;
+  }
+  return true;
 }
 
 // ---- the manager: statistics, the worker, the notices ------------------------------------------------------------------------------------
@@ -1623,7 +1710,15 @@ struct Manager {
   std::atomic<bool> disabled{false};
   std::mutex mu;
   std::condition_variable cv, idle_cv;
-  std::deque<std::pair<Job, std::shared_ptr<Unit>>> q;
+  struct Item {
+    Job job;
+    std::shared_ptr<Unit> u;
+    double at;   // when it was submitted, ms since the library was loaded (the compile log)
+  };
+  std::deque<Item> q;
+  // The compile log (VGPU_JIT_STATS, round sp64): one line a compile, printed at exit after the summary.
+  std::mutex log_mu;
+  std::vector<std::string> compile_log;
   std::thread worker;
   bool stop = false, busy = false;
   std::set<std::string> told;
@@ -1775,7 +1870,7 @@ struct Manager {
     return sel;
   }
 
-  void run(Job job, const std::shared_ptr<Unit>& u) {
+  void run(Job job, const std::shared_ptr<Unit>& u, double at) {
     if (disabled.load()) {
       u->state.store(static_cast<int>(State::Failed), std::memory_order_release);
       return;
@@ -1795,7 +1890,7 @@ struct Manager {
         int exp = static_cast<int>(State::Looking);
         if (u->state.compare_exchange_strong(exp, static_cast<int>(State::Queued))) {
           stats().history.fetch_add(1);
-          compile(*u, sel);
+          compile(*u, sel, at, "history");
         }
       } else {
         // A miss. The threshold far away: the section waits on the plain loop until it is `profile` instructions short of it (State::Waiting); near: it counts on.
@@ -1817,19 +1912,32 @@ struct Manager {
         u->state.store(static_cast<int>(State::Failed), std::memory_order_release);
         return;
       }
-      compile(*u, sel);
+      compile(*u, sel, at, "threshold");
     }
   }
-  void compile(Unit& u, const std::vector<uint32_t>& sel) {
+  void compile(Unit& u, const std::vector<uint32_t>& sel, double at, const char* why) {
+    const double t0 = stats_on() ? ms_since(g_loaded) : 0.0;
     Result r = engine.obtain_selected(u.spec, sel);
     if (r.compiled) {
       stats().compiles.fetch_add(1);
       stats().compile_us.fetch_add(static_cast<uint64_t>(r.compile_ms * 1000));
     }
+    if (stats_on()) {
+      size_t ops = 0;
+      for (uint32_t i : sel) ops += u.spec.regions[i].ops.size();
+      char line[320];
+      std::snprintf(line, sizeof line, "jit-compile: %s, %zu regions, %zu ops, %llu bytes of source; asked at %.0f ms, started %.0f, done %.0f (%.0f ms); %s%s\n", why, sel.size(), ops,
+                    (unsigned long long)r.source_bytes, at, t0, ms_since(g_loaded), r.compile_ms,
+                    r.found ? (r.compiled ? "ok" : "found in the cache") : r.cancelled ? "cancelled" : status_name(r.status), r.pch ? ", precompiled header" : "");
+      std::lock_guard<std::mutex> g(log_mu);
+      compile_log.emplace_back(line);
+    }
     if (r.replaced_corrupt) stats().corrupt.fetch_add(1);
+    if (r.pch) stats().pch_used.fetch_add(1);
     if (r.found) {
       if (r.hit) stats().cache_hits.fetch_add(1);
       publish(u, r, sel);
+      if (r.compiled && engine.build_pch()) stats().pch_built.fetch_add(1);   // (round sp64: after the publish, so that this section does not wait for it)
     } else {
       fail(u, r);
     }
@@ -1837,14 +1945,15 @@ struct Manager {
 
   void submit(Job job, std::shared_ptr<Unit> u) {
     if (exec::g_sample_copy.load(std::memory_order_relaxed)) return;   // (a sample's copy of the process compiles nothing and writes no cache)
+    const double at = stats_on() ? ms_since(g_loaded) : 0.0;
     if (sync) {
-      run(job, u);
+      run(job, u, at);
       return;
     }
     std::unique_lock<std::mutex> g(mu);
     if (stop) return;
     if (!worker.joinable()) worker = std::thread([this] { loop(); });
-    q.emplace_back(job, std::move(u));
+    q.push_back(Item{job, std::move(u), at});
     cv.notify_one();
   }
   void loop() {
@@ -1852,11 +1961,11 @@ struct Manager {
     for (;;) {
       cv.wait(g, [&] { return stop || !q.empty(); });
       if (stop) return;
-      auto [job, u] = std::move(q.front());
+      Item it = std::move(q.front());
       q.pop_front();
       busy = true;
       g.unlock();
-      run(job, u);
+      run(it.job, it.u, it.at);
       g.lock();
       busy = false;
       idle_cv.notify_all();
@@ -2012,6 +2121,9 @@ void Manager::report() {
     std::fprintf(out, "jit-prewait: %llu sections waited on the plain loop for their lookup\n", (unsigned long long)s.prewaits.load());
   if (s.history.load())
     std::fprintf(out, "jit-history: %llu sections compiled at their lookup the regions an earlier run chose\n", (unsigned long long)s.history.load());
+  if (s.pch_used.load() || s.pch_built.load())   // (round sp64)
+    std::fprintf(out, "jit-pch: %llu compiles read the precompiled runtime header, %llu made it\n", (unsigned long long)s.pch_used.load(), (unsigned long long)s.pch_built.load());
+  for (const std::string& l : compile_log) std::fputs(l.c_str(), out);   // (round sp64)
   if (s.evicted.load())
     std::fprintf(out, "jit-cache: %llu objects and directories removed by the size cap and the age rule\n", (unsigned long long)s.evicted.load());
   if (out != stderr) std::fclose(out);

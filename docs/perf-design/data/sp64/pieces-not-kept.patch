@@ -1,0 +1,198 @@
+--- a/src/sass/jit.hpp	2026-11-13 07:55:20.301610698 -0600
++++ b/src/sass/jit.hpp	2026-11-13 07:55:20.307712296 -0600
+@@ -234,2 +234,4 @@
+   bool pch = true;                  // GCC: the runtime header precompiled once in the runtime directory, read by every compile after (round sp64; from_env: VGPU_JIT_PCH=0 off)
++  unsigned piece_ops = 0;           // a selection of more ops than this is compiled in pieces of about this many, each its own object (round sp64; 0: one object; from_env: VGPU_JIT_PIECE_OPS, default kPieceOps)
++  unsigned jobs = 1;                // pieces compiled at once (from_env: VGPU_JIT_JOBS, else the CPUs the simulator's threads leave idle, at least 1)
+   unsigned mem_mb = 4096;           // RLIMIT_AS of the compiler
+@@ -260,2 +262,3 @@
+   void* handle = nullptr;
++  std::vector<std::shared_ptr<Loaded>> more;   // (round sp64) a selection compiled in pieces: the pieces' objects, whose functions `fns` holds
+ };
+@@ -273,2 +276,3 @@
+   uint64_t source_bytes = 0;        // obtain(): the size of the generated source it compiled (the compile log of VGPU_JIT_STATS, round sp64)
++  unsigned pieces = 1, pieces_found = 0;   // obtain_selected(), lookup_selected(): the pieces of the selection, and those that were in the cache (round sp64)
+   bool pch = false;                 // obtain(): the compile read the precompiled runtime header (round sp64)
+@@ -303,2 +307,6 @@
+   Result obtain_selected(const UnitSpec& full, const std::vector<uint32_t>& sel);   // compile (or find) the selection, and record it
++  // (Round sp64) The pieces a selection is compiled in: runs of consecutive selected regions of about Config::piece_ops ops, each its own object, so that a
++  // compile cut off by the process's end keeps the pieces it finished, and pieces can be compiled at once. One piece (the whole selection) when it is
++  // small, merged (linking) or piece_ops is 0: then the object's key is the selection's, as before.
++  std::vector<std::vector<uint32_t>> pieces(const UnitSpec& full, const std::vector<uint32_t>& sel) const;
+   std::string section_key(const UnitSpec& full, std::string* why = nullptr);
+@@ -321,2 +329,3 @@
+   Result load_(const UnitSpec& spec, const std::string& key, bool fresh);
++  static Result combine(std::vector<Result>& rs);
+ };
+@@ -345,2 +354,7 @@
+ inline constexpr uint64_t kWaitBatch = 65536;        // warp instructions a thread adds up by itself while a section waits
++// The states in which the run loop with the region hook is wanted (Unit::hook): Idle, Looking, Counting and Ready. Not Queued since round sp64 (the compile is
++// running: nothing is counted and no region has a function yet), nor Failed, Declined or Waiting (the plain loop). One shift, as the test it replaces.
++inline constexpr unsigned kHookStates = (1u << static_cast<int>(State::Idle)) | (1u << static_cast<int>(State::Looking)) | (1u << static_cast<int>(State::Counting)) |
++                                        (1u << static_cast<int>(State::Ready));
++inline constexpr unsigned kPieceOps = 64;            // (round sp64) ops in a piece of a compile (Config::piece_ops): about 50 KB of source and 0.8 s of the compiler on server3
+ inline constexpr uint64_t kWaitBatchFrom = 1 << 20;  // ... when the wait is at least this long
+@@ -399,6 +413,3 @@
+   // as long as the compile took, a whole run when the compile started at the lookup and did not finish before the end).
+-  bool hook() const {
+-    const int s = state.load(std::memory_order_relaxed);
+-    return s <= static_cast<int>(State::Counting) || s == static_cast<int>(State::Ready);
+-  }
++  bool hook() const { return (kHookStates >> state.load(std::memory_order_relaxed)) & 1u; }
+   // Waiting: the plain loop is used, and step_warp tells wait_note what each call of it ran.
+@@ -451,2 +462,4 @@
+   std::atomic<uint64_t> pch_used{0}, pch_built{0};  // compiles that read the precompiled runtime header, and headers made (round sp64)
++  std::atomic<uint64_t> pieces{0}, pieces_found{0}; // pieces of compiles in pieces, and of them those found in the cache (an earlier run's) (round sp64)
++  std::atomic<uint64_t> pieces_overlap{0};          // pieces whose compile started while another piece's was running (round sp64)
+   std::atomic<uint64_t> continued{0};   // branches and register-only ops the generated code went on past (the loop's chain steps it took over)
+--- a/src/sass/jit.cpp	2026-11-13 07:55:20.301502325 -0600
++++ b/src/sass/jit.cpp	2026-11-13 07:55:20.307385725 -0600
+@@ -30,2 +30,3 @@
+ #include "tier.hpp"
++#include "vgpu/host_cpus.hpp"
+ #include "vgpu/simd/simd.hpp"
+@@ -272,2 +273,13 @@
+   if (env("VGPU_JIT_PCH") == "0") c.pch = false;
++  // (Round sp64) Pieces, and how many compile at once: by default the CPUs the simulator's threads leave idle (VGPU_THREADS, else every CPU it may use).
++  c.piece_ops = kPieceOps;
++  if (const std::string v = env("VGPU_JIT_PIECE_OPS"); !v.empty()) c.piece_ops = static_cast<unsigned>(std::strtoul(v.c_str(), nullptr, 10));
++  {
++    const unsigned cpus = host_cpus();
++    const std::string t = env("VGPU_THREADS");
++    const int n = t.empty() ? static_cast<int>(cpus) : std::max(1, std::atoi(t.c_str()));
++    c.jobs = cpus > static_cast<unsigned>(n) ? cpus - static_cast<unsigned>(n) : 1;
++  }
++  if (const std::string v = env("VGPU_JIT_JOBS"); !v.empty()) c.jobs = static_cast<unsigned>(std::max(1L, std::strtol(v.c_str(), nullptr, 10)));
++  c.jobs = std::min(c.jobs, 16u);
+   if (env("VGPU_JIT_LINK") == "1") c.link = true;
+@@ -1333,2 +1345,11 @@
+   Result l = lookup(sub);
++  const std::vector<std::vector<uint32_t>> ps = pieces(full, idx);
++  if (!l.found && l.status == Status::Ok && ps.size() > 1) {   // (round sp64: compiled in pieces; an object of the whole selection, an earlier build's, is used first)
++    std::vector<Result> rs;
++    for (const std::vector<uint32_t>& p : ps) {
++      rs.push_back(lookup(selected_spec(full, p)));
++      if (rs.back().status != Status::Ok) return rs.back();
++    }
++    l = combine(rs);
++  }
+   if (sel && (l.found || l.status == Status::Ok)) *sel = idx;
+@@ -1340,2 +1361,39 @@
+ 
++// (Round sp64) The results of a selection's pieces as one: found when every piece is, the functions in the selection's order (the pieces are runs of it).
++// Otherwise the first piece that failed (its status and message), or a plain miss when none failed: a pending selection, some of whose pieces may be in.
++Result Engine::combine(std::vector<Result>& rs) {
++  Result out;
++  unsigned found = 0;
++  for (const Result& x : rs) {
++    found += x.found && !x.compiled ? 1u : 0u;
++    out.compiled |= x.compiled;
++    out.replaced_corrupt |= x.replaced_corrupt;
++    out.pch |= x.pch;
++    out.compile_ms += x.compile_ms;
++    out.lookup_ms += x.lookup_ms;
++    out.source_bytes += x.source_bytes;
++  }
++  out.pieces = static_cast<unsigned>(rs.size());
++  out.pieces_found = found;
++  for (const Result& x : rs)
++    if (!x.found) {
++      out.status = x.status;
++      out.message = x.message;
++      out.cancelled = x.cancelled;
++      out.key = x.key;
++      return out;
++    }
++  auto lib = std::make_shared<Loaded>();
++  for (const Result& x : rs) {
++    lib->fns.insert(lib->fns.end(), x.lib->fns.begin(), x.lib->fns.end());
++    lib->more.push_back(x.lib);
++  }
++  lib->handle = rs.front().lib->handle;
++  out.lib = lib;
++  out.found = true;
++  out.hit = !out.compiled;
++  out.key = rs.front().key;
++  return out;
++}
++
+ // The selection is recorded before the compile (round sp63): a compile that does not finish -- the process ends first, and its compile is cancelled --
+@@ -1368,3 +1426,34 @@
+   if (!mutant("history_after")) record();
+-  Result r = obtain(selected_spec(full, sel));
++  const std::vector<std::vector<uint32_t>> ps = pieces(full, sel);
++  Result r;
++  if (ps.size() == 1) {
++    r = obtain(selected_spec(full, sel));
++  } else {
++    // (Round sp64) In pieces: each is looked up and, if missing, compiled and installed by itself, so that what is done survives a cancel; up to
++    // Config::jobs at once (the CPUs the simulator leaves idle). The first piece that fails stops the others from starting.
++    std::vector<Result> rs(ps.size());
++    std::atomic<size_t> next{0};
++    std::atomic<bool> stop{false};
++    std::atomic<unsigned> running{0};
++    std::atomic<uint64_t> overlap{0};
++    const auto work = [&] {
++      while (!stop.load()) {
++        const size_t i = next.fetch_add(1);
++        if (i >= ps.size()) break;
++        if (running.fetch_add(1) > 0) overlap.fetch_add(1);
++        rs[i] = obtain(selected_spec(full, ps[i]));
++        running.fetch_sub(1);
++        if (!rs[i].found) stop.store(true);
++      }
++    };
++    const unsigned extra = std::min<unsigned>(cfg_.jobs, static_cast<unsigned>(ps.size())) - 1;
++    std::vector<std::thread> helpers;
++    for (unsigned k = 0; k < extra; ++k) helpers.emplace_back(work);
++    work();
++    for (std::thread& t : helpers) t.join();
++    r = combine(rs);
++    stats().pieces.fetch_add(ps.size());
++    stats().pieces_found.fetch_add(r.pieces_found);
++    stats().pieces_overlap.fetch_add(overlap.load());
++  }
+   if (r.found) record();
+@@ -1373,2 +1462,27 @@
+ 
++// (Round sp64) Runs of consecutive selected regions of about piece_ops ops each (a last run of less than half that joins the one before it).
++std::vector<std::vector<uint32_t>> Engine::pieces(const UnitSpec& full, const std::vector<uint32_t>& sel) const {
++  std::vector<std::vector<uint32_t>> out;
++  if (sel.size() < 2 || cfg_.piece_ops == 0 || merges(full, sel)) {
++    out.push_back(sel);
++    return out;
++  }
++  size_t ops = 0, last = 0;
++  for (uint32_t i : sel) {
++    if (out.empty() || ops >= cfg_.piece_ops) {
++      out.emplace_back();
++      ops = 0;
++    }
++    out.back().push_back(i);
++    ops += full.regions[i].ops.size();
++    last = ops;
++  }
++  if (out.size() > 1 && last * 2 < cfg_.piece_ops) {
++    const std::vector<uint32_t> tail = out.back();
++    out.pop_back();
++    out.back().insert(out.back().end(), tail.begin(), tail.end());
++  }
++  return out;
++}
++
+ // The two headers the generated code includes, in a directory of their own inside the cache, named by their hash: written (temp file and
+@@ -1933,5 +2047,6 @@
+       char line[320];
+-      std::snprintf(line, sizeof line, "jit-compile: %s, %zu regions, %zu ops, %llu bytes of source; asked at %.0f ms, started %.0f, done %.0f (%.0f ms); %s%s\n", why, sel.size(), ops,
++      std::snprintf(line, sizeof line, "jit-compile: %s, %zu regions, %zu ops, %llu bytes of source; asked at %.0f ms, started %.0f, done %.0f (%.0f ms); %s%s%s\n", why, sel.size(), ops,
+                     (unsigned long long)r.source_bytes, at, t0, ms_since(g_loaded), r.compile_ms,
+-                    r.found ? (r.compiled ? "ok" : "found in the cache") : r.cancelled ? "cancelled" : status_name(r.status), r.pch ? ", precompiled header" : "");
++                    r.found ? (r.compiled ? "ok" : "found in the cache") : r.cancelled ? "cancelled" : status_name(r.status), r.pch ? ", precompiled header" : "",
++                    r.pieces > 1 ? (", in " + std::to_string(r.pieces) + " pieces, " + std::to_string(r.pieces_found) + " found").c_str() : "");
+       std::lock_guard<std::mutex> g(log_mu);
+@@ -2128,2 +2243,5 @@
+     std::fprintf(out, "jit-history: %llu sections compiled at their lookup the regions an earlier run chose\n", (unsigned long long)s.history.load());
++  if (s.pieces.load())   // (round sp64)
++    std::fprintf(out, "jit-pieces: %llu pieces of compiles in pieces, %llu of them found in the cache, %llu started while another was compiling\n", (unsigned long long)s.pieces.load(),
++                 (unsigned long long)s.pieces_found.load(), (unsigned long long)s.pieces_overlap.load());
+   if (s.pch_used.load() || s.pch_built.load())   // (round sp64)

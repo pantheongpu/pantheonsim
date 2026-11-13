@@ -1,0 +1,20 @@
+# Tests on the kept build N (65b096b2), server3, under the machine lock.
+## unit tests (TMPDIR in the scratch directory)
+test_jit_cold rc=0 8/8 tests passed
+test_jit_wait rc=0 3/3 tests passed
+test_jit rc=0 25/25 tests passed
+test_jit_share rc=0 6/6 tests passed
+test_jit_threads rc=0 4/4 tests passed
+## run-loop ctest legs of the JIT (ctest -j3 -R 'chain_cont_jit|store_gate_jit' -E link)
+    Start 73: test_sass_chain_cont_jit
+    Start 74: test_sass_store_gate_jit
+    Start 77: test_sass_chain_cont_jit_wait
+1/4 Test #77: test_sass_chain_cont_jit_wait ......   Passed    6.53 sec
+    Start 78: test_sass_chain_cont_jit_prewait
+2/4 Test #78: test_sass_chain_cont_jit_prewait ...   Passed    4.06 sec
+3/4 Test #74: test_sass_store_gate_jit ...........   Passed   14.24 sec
+4/4 Test #73: test_sass_chain_cont_jit ...........   Passed   28.14 sec
+100% tests passed, 0 tests failed out of 4
+Total Test time (real) =  28.15 sec
+## not kept, the pieces build P: test_jit_threads 7 tests, 6 passed on the first build (a wrong expectation of the test: a last piece of exactly half the size stays a piece), the test corrected and not run again before P was removed
+## after the second commit (the fallback path removed): test_jit_threads 4/4 tests passed; g++-12 -fsyntax-only -Wall -Wextra of src/sass/jit.cpp: no warnings
