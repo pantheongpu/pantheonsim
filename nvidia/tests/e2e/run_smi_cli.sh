@@ -83,6 +83,31 @@ else
 fi
 smi -l 0 >/dev/null; expect "-l 0 is refused" "2" "$?"
 
+# --- nvlink (#640: `nvlink -cBridge` was exit 2; QOKit runs it with check=True) ---
+sxm() { env VGPU_GPU=nvidia/h100 VGPU_DEVICE_COUNT=1 VGPU_TELEMETRY_PATH=/nonexistent-so-idle "$vgpu" smi "$@" 2>&1; }
+for o in -c --capabilities -cBridge --checkBridge "-gt d" -p -R -ec -info; do
+  out=$(smi nvlink $o -i 0); rc=$?
+  expect "nvlink $o on a GPU without NVLink: its name only, exit 0" "0 1" "$rc $(wc -l <<< "$out" | tr -d ' ')"
+done
+out=$(smi nvlink); rc=$?
+expect "bare nvlink prints its usage and succeeds" "0 yes" "$rc $(yes_if grep -q -- '-cBridge' <<< "$out")"
+out=$(smi nvlink -bogus); rc=$?
+expect "an unknown nvlink option is refused as nvidia-smi does" 'Option "-bogus" is not recognized. / 2' "$out / $rc"
+out=$(smi nvlink -gt); rc=$?
+expect "nvlink -gt without its value is refused" 'Option "-gt" is missing its value. / 2' "$out / $rc"
+smi nvlink -re >/dev/null; expect "nvlink -re (a change) is refused" "2" "$?"
+out=$(sxm nvlink -c); rc=$?
+expect "nvlink -c on H100 SXM: 6 capability lines per link" "0 108 yes" \
+  "$rc $(grep -c '^	 Link [0-9]*, ' <<< "$out") $(yes_if grep -q '^	 Link 17, P2P is supported: true$' <<< "$out")"
+out=$(sxm nvlink -cBridge); rc=$?
+expect "nvlink -cBridge on H100 SXM: no bridge on an SXM board" "0 1" "$rc $(wc -l <<< "$out" | tr -d ' ')"
+out=$(sxm nvlink -i 0 -l 3 -s -e); rc=$?
+expect "nvlink -l limits to one link and displays combine" "0 4 yes" \
+  "$rc $(grep -c 'Link 3:' <<< "$out") $(yes_if grep -q '^	 Link 3: 26.562 GB/s$' <<< "$out")"
+out=$(sxm nvlink -gt d -l 0); rc=$?
+expect "nvlink -gt d prints zero traffic" $'0 \t Link 0: Data Tx: 0 KiB' "$rc $(sed -n 2p <<< "$out")"
+sxm nvlink -p >/dev/null; expect "nvlink -p on a GPU with links needs data no profile has" "2" "$?"
+
 # --- the drop-in nvidia-smi script ---
 ns() { "${idle[@]}" "$build/bin/nvidia-smi" "$@" 2>&1; }
 expect "nvidia-smi -L -i 1 lists only GPU 1" "GPU 1" "$(ns -L -i 1 | cut -d: -f1)"

@@ -7,6 +7,13 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- `nvidia-smi nvlink` takes the options of the real subcommand, not only `-s` and `-e`: `-c`/`--capabilities`, `-cBridge`/`--checkBridge`,
+  `-gt d|r`, `-i` and `-l` after `nvlink`, several displays at once, and `-h` or no option for nvidia-smi's own usage text. A GPU without NVLink
+  prints its name and exit 0 for every display, as the real tool does; on the SXM profiles `-c` prints each link's capabilities as
+  `nvmlDeviceGetNvLinkCapability` reports them, `-gt` zero traffic, and `-cBridge` no link lines (the links run through the baseboard, not a
+  bridge). The remote-end and setting displays (`-p`, `-R`, `-ec`, `-gLowPwrInfo`, `-gBwMode`, `-gLWidth`, `-info`) are refused on a GPU with
+  links, the changes (`-re`, `-sBwMode`, ...) everywhere, and an unknown option prints `Option "X" is not recognized.` and exits 2 as nvidia-smi
+  does. jpmorganchase/QOKit runs `nvidia-smi nvlink -cBridge` with `check=True` when its tests are collected (pantheonsim #640).
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the
