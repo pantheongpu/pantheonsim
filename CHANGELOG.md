@@ -48,6 +48,16 @@ release says what runs and what it produces, never how fast a real GPU would run
   libraries) give the same digests before and after. `VGPU_LOAD_PLAIN=1` reads them as before (`test_amd_codeobject_same_bits_plain`);
   `test_amd_bundle` adds bundles larger than the buffer, read both ways. AMD's `rocblas-test` gains nothing from it: its start-up
   (57 s a process, reading `rocblas_gtest.data`, against 0.1 to 0.4 s of loading) is AMD's client, not the simulator (pantheonsim #565).
+- NVRTC without the toolkit's libnvrtc (the shim's nvcc path, or `VGPU_NVRTC=nvcc`) now searches includes as NVRTC does: no host
+  directory, the toolkit headers in `__CUDACC_RTC__` mode, the headers given to `nvrtcCreateProgram` and the `-I`/`--include-path`
+  directories. A program that brings its own `<cstdint>` (ThrustRTC 0.3.20) or defines `int64_t` itself (PyTorch's jiterator) compiles,
+  where nvcc's host headers made it fail with "invalid redeclaration of type name int64_t"; `#include <stdint.h>` and the other host headers
+  fail to open, as with NVRTC. Where the toolkit's headers share `/usr/include` with glibc's (Debian's and Ubuntu's
+  `nvidia-cuda-toolkit`), the compile sees links to the CUDA headers alone. What NVRTC predefines (`size_t`, `ptrdiff_t`, `clock_t`, `NULL`, `std::move`, `std::forward`,
+  `std::initializer_list`, `printf`, `assert`) is there without an include, measured on CUDA 13.0's NVRTC; the PTX matches NVRTC's for the
+  programs compared. ThrustRTC's fill and reduce run under `vgpu run` on `nvidia/a100` (ThrustRTC 0.3.20's own occupancy calculator does not
+  know compute capability 9.x, so its kernels fail on an H100, real or simulated). The nvcc path also no longer leaves an empty
+  `$TMPDIR/vgpu-nvrtc-<pid>` directory behind per process. New test `e2e_nvrtc_paths_nvcc` (pantheonsim #619).
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the
