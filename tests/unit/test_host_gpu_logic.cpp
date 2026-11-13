@@ -2,10 +2,12 @@
 // protocol, and the size rule (include/vgpu/host_gpu.hpp). The part that drives the real GPU is run by
 // nvidia/tests/e2e/run_host_gpu.sh, on a machine with a card.
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <algorithm>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <random>
 #include <set>
@@ -1750,6 +1752,109 @@ VTEST(a_small_grid_s_floor_counts_the_followed_loop_s_bound) {
   g.blocks = 4096;
   g.bound_turns = 2048;
   VCHECK(sample_static_estimate(g) == g.static_s && !worth_sampling(g, c, 0.26));
+}
+
+// ---- Round sp65: a launch while the card holds the live memory ----
+
+VTEST(a_streak_launch_needs_the_driver_up_data_on_the_card_and_an_estimate) {
+  const Costs c;
+  StreakLaunch s;
+  s.sim_s = 0.00015;
+  s.card_only_bytes = 48ull << 20;   // GRAMSCHM: three 2048 x 2048 float matrices
+  s.card_kernel_s = 20e-6;
+  VCHECK(streak_offload(s, c, true));
+  VCHECK(!streak_offload(s, c, false));   // never what starts the driver
+  StreakLaunch none = s;
+  none.card_only_bytes = 0;               // the simulator holds everything: nothing to pull, today's rule decides
+  VCHECK(!streak_offload(none, c, true));
+  none.card_only_bytes = 1;
+  VCHECK(streak_offload(none, c, true) == (streak_keep_seconds(none, c) >= c.min_sim_s && streak_keep_seconds(none, c) > c.margin * streak_card_seconds(none, c)));
+  StreakLaunch no_estimate = s;
+  no_estimate.sim_s = 0;
+  VCHECK(!streak_offload(no_estimate, c, true));
+  no_estimate.sim_s = -1;
+  VCHECK(!streak_offload(no_estimate, c, true));
+  no_estimate.sim_s = std::numeric_limits<double>::quiet_NaN();
+  VCHECK(!streak_offload(no_estimate, c, true));
+}
+
+VTEST(a_streak_launch_is_priced_with_the_pull_it_saves_and_the_push_it_needs) {
+  const Costs c;
+  StreakLaunch s;
+  s.sim_s = 0.00015;
+  s.card_only_bytes = 48ull << 20;
+  s.card_kernel_s = 20e-6;
+  // the two sides, by the formula
+  VCHECK(streak_keep_seconds(s, c) == s.sim_s + static_cast<double>(s.card_only_bytes) / c.pull_bytes_per_s);
+  VCHECK(streak_card_seconds(s, c) == c.launch_s + 20e-6);
+  s.push_bytes = 1 << 20;
+  VCHECK(streak_card_seconds(s, c) == c.launch_s + 20e-6 + static_cast<double>(1 << 20) / c.push_bytes_per_s);
+  // the same launch judged by should_offload alone stays: 150 us is under the floor, and the pull is not seen
+  Estimate e;
+  e.sim_s = s.sim_s;
+  e.push_bytes = s.push_bytes;
+  e.card_kernel_s = s.card_kernel_s;
+  VCHECK(!should_offload(e, c));
+  VCHECK(streak_offload(s, c, true));
+  // before the kernel has run on the card its time there is kernel_s_default
+  StreakLaunch fresh = s;
+  fresh.card_kernel_s.reset();
+  VCHECK(streak_card_seconds(fresh, c) == c.launch_s + c.kernel_s_default + static_cast<double>(1 << 20) / c.push_bytes_per_s);
+  // what the card needs pushed counts against it: much to push and little to pull back stays
+  StreakLaunch heavy = s;
+  heavy.card_only_bytes = 1 << 20;
+  heavy.push_bytes = 64ull << 20;
+  VCHECK(!streak_offload(heavy, c, true));
+  heavy.push_bytes = 0;
+  VCHECK(streak_offload(heavy, c, true));
+  // the rates are the Costs'
+  Costs free_pull = c;
+  free_pull.pull_bytes_per_s = 1e15;   // only the simulator's 150 us is left: under the floor
+  VCHECK(!streak_offload(s, free_pull, true));
+  Costs dear_push = c;
+  dear_push.push_bytes_per_s = 1e7;    // 1 MiB to push costs 0.1 s
+  VCHECK(!streak_offload(s, dear_push, true));
+  Costs slow_launch = c;
+  slow_launch.launch_s = 1.0;
+  VCHECK(!streak_offload(s, slow_launch, true));
+  Costs slow_default = c;
+  slow_default.kernel_s_default = 1.0;
+  VCHECK(streak_offload(s, slow_default, true) && !streak_offload(fresh, slow_default, true));
+}
+
+VTEST(a_streak_launch_keeps_the_margin_and_the_floor) {
+  const Costs c;
+  // a small live memory: 64 KiB to pull (6.6 us) and a kernel of 5 us; 50 us of simulator time beats 2 x 12 us, but the floor of 200 us asks more
+  StreakLaunch s;
+  s.card_only_bytes = 64 * 1024;
+  s.card_kernel_s = 5e-6;
+  s.sim_s = 50e-6;
+  VCHECK(streak_keep_seconds(s, c) > c.margin * streak_card_seconds(s, c));
+  VCHECK(!streak_offload(s, c, true));
+  // the floor is on the simulator's whole side, time plus pull
+  const double pull = static_cast<double>(s.card_only_bytes) / c.pull_bytes_per_s;
+  s.sim_s = c.min_sim_s - pull + 1e-9;
+  VCHECK(streak_offload(s, c, true));
+  s.sim_s = c.min_sim_s - pull - 1e-9;
+  VCHECK(!streak_offload(s, c, true));
+  // the margin, found by bisection on the simulator's time against the formula: the launch goes just above margin x the card side, not at it
+  StreakLaunch m;
+  m.card_only_bytes = 1ull << 20;
+  m.push_bytes = 8ull << 20;
+  m.card_kernel_s = 300e-6;
+  const double card = streak_card_seconds(m, c);
+  const double mpull = static_cast<double>(m.card_only_bytes) / c.pull_bytes_per_s;
+  double lo = 0, hi = 1;
+  for (int i = 0; i < 200; ++i) {
+    m.sim_s = (lo + hi) / 2;
+    (streak_offload(m, c, true) ? hi : lo) = m.sim_s;
+  }
+  VCHECK(std::abs(hi - (c.margin * card - mpull)) < 1e-12);
+  VCHECK(c.margin * card - mpull > c.min_sim_s);   // (the bar found is the margin's, not the floor's)
+  Costs one = c;
+  one.margin = 1.0;
+  m.sim_s = card - mpull + 1e-9;
+  VCHECK(streak_offload(m, one, true) && !streak_offload(m, c, true));
 }
 
 VTEST_MAIN

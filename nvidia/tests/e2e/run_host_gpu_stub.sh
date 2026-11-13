@@ -42,6 +42,11 @@
 #      sent; the stand-in refuses it and the output is the mode-off output;
 #  22. ... against a stand-in that keeps memory and computes nothing, the program prints what the program that launches nothing prints;
 #  23. the same kernel with a short loop is sampled inside its blocks and stays, and the driver is never touched.
+#  24. a launch while the card holds the live memory (Round sp65, include/vgpu/host_gpu.hpp streak_offload): against a stand-in that keeps memory and
+#      computes nothing, `streak`'s short `bump` launches after the first two follow `scramble` to the card (the counters read 2, not 8; the log says why, and
+#      host_gpu_streak counts them), in both modes;
+#  25. ... and with VGPU_HOST_GPU_STREAK=0 they stay in the simulator (the counters read 8, nothing is counted);
+#  26. when the program reads the memory back between the two (`streakread`), the card holds nothing the simulator does not and `bump` stays.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -311,5 +316,28 @@ read -r smp_n smp_sent <<< "$(sampled_of in_short)"
 (( ${smp_n:-0} >= 1 && ${smp_sent:-1} == 0 && $(inside_of in_short) >= 1 )) || { echo "FAIL: fewshort: expected a launch sampled inside its blocks and none sent: $(grep -E 'host_gpu_sampled|host_gpu_sample:' "$work/in_short.err" | head -3)"; fails=1; }
 [[ ! -s "$work/in_short.log" ]] || { echo "FAIL: a short launch sampled inside its blocks reached the driver: $(calls in_short)"; fails=1; }
 diff -q "$work/off_fewshort.out" "$work/in_short.out" > /dev/null || { echo "FAIL: sampling inside the blocks changes the output of fewshort"; fails=1; }
+# 24 to 26. a launch while the card holds the live memory. The counters are what a card that computes nothing leaves: 2 when every bump after the
+# first two (the history) went to the card, 8 when none did.
+streak_of() { sed -n 's/^host_gpu_streak: sent=\([0-9]*\) card_only_mib=[0-9.]* rule=\([01]\)$/\1 \2/p' "$work/$1.err" | head -1; }
+str=(VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=0 STUB_CARD_OK=1 STUB_KEEP_MEMORY=1 STUB_INIT_MS=50)
+for arg in streak streakread; do
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" "$arg" > "$work/off_$arg.out" 2> "$work/off_$arg.err" || { echo "FAIL: the $arg run with the mode off failed"; exit 1; }
+  grep -q '^bumps 8 to 8, ' "$work/off_$arg.out" || { echo "FAIL: $arg with the mode off: $(cat "$work/off_$arg.out")"; fails=1; }
+done
+for m in exact turbo; do
+  run "str_$m" streak VGPU_HOST_GPU=$m "${str[@]}" || { echo "FAIL: the $m run of streak failed"; tail -5 "$work/str_$m.err"; fails=1; }
+  grep -q '^bumps 2 to 2, ' "$work/str_$m.out" || { echo "FAIL: $m: the bumps after the first two did not follow scramble to the card: $(cat "$work/str_$m.out"); $(grep -m3 'bump' "$work/str_$m.err")"; fails=1; }
+  read -r st_n st_rule <<< "$(streak_of "str_$m")"
+  [[ "${st_n:-x} ${st_rule:-x}" == "6 1" ]] || { echo "FAIL: $m: host_gpu_streak says ${st_n:-nothing} sent (rule ${st_rule:-?}), not 6: $(grep '^host_gpu_streak' "$work/str_$m.err")"; fails=1; }
+  n="$(grep -c 'bump.*: sent because the card holds the memory' "$work/str_$m.err")"
+  (( n == 6 )) || { echo "FAIL: $m: expected 6 lines saying why bump was sent, got $n"; fails=1; }
+done
+run str_off streak VGPU_HOST_GPU=exact VGPU_HOST_GPU_STREAK=0 "${str[@]}" || { echo "FAIL: the run of streak with VGPU_HOST_GPU_STREAK=0 failed"; fails=1; }
+grep -q '^bumps 8 to 8, ' "$work/str_off.out" || { echo "FAIL: with VGPU_HOST_GPU_STREAK=0 a bump went to the card: $(cat "$work/str_off.out")"; fails=1; }
+[[ "$(streak_of str_off)" == "0 0" ]] || { echo "FAIL: with VGPU_HOST_GPU_STREAK=0: $(grep '^host_gpu_streak' "$work/str_off.err")"; fails=1; }
+diff -q "$work/off_streak.out" "$work/str_off.out" > /dev/null && { echo "FAIL: scramble did not go to the card in the streak runs (the hash is the simulator's)"; fails=1; }
+run str_read streakread VGPU_HOST_GPU=exact "${str[@]}" || { echo "FAIL: the run of streakread failed"; fails=1; }
+grep -q '^bumps 8 to 8, ' "$work/str_read.out" || { echo "FAIL: a bump went to the card although the program had read the memory back: $(cat "$work/str_read.out")"; fails=1; }
+[[ "$(streak_of str_read)" == "0 1" ]] || { echo "FAIL: streakread: $(grep '^host_gpu_streak' "$work/str_read.err")"; fails=1; }
 (( fails == 0 )) && { echo "PASS: first launch $first ms against a driver start of $init_ms ms; driver calls in the big run: $(calls on_big)"; exit 0; }
 exit 1

@@ -535,6 +535,39 @@ inline bool should_offload_with_start(const Estimate& e, const Costs& c, bool dr
   return should_offload(cold, c) || eligible_sim_spent_s >= c.start_cost_s;
 }
 
+// ---- a launch while the card holds the live memory (Round sp65) ---------------------------------------------------------------------
+// With the residency of the live memory (Residency), a launch on the card leaves every live chunk the card's alone (Where::Card), and a launch the
+// simulator runs first pulls every such chunk back and leaves every chunk the simulator's (Residency::sim_launch), so the next card launch pushes them
+// all again. should_offload weighs the launch's simulator time alone against the card path: a short launch between two card launches (PolyBench
+// GRAMSCHM's two small kernels between its long one, Rodinia gaussian's Fan1 between its Fan2) is then kept in the simulator, which pulls the whole
+// live memory back for it, and the card launch after it pushes it all again: Round sp65 measured X MiB moved that way over the corpus.
+// So, once the card holds chunks the simulator does not, a launch of a kernel with an estimate is priced with what each side really moves:
+//   keeping it costs its simulator time AND the pull of every chunk only the card holds (`card_only_bytes`), at the size rule's pull rate;
+//   sending it costs the launch, the card's time for the kernel (its last time there; kernel_s_default before it has run there) and the push of the
+//   chunks the simulator holds alone (`push_bytes`): nothing else moves, the card copy stays.
+// It goes when keeping it costs `margin` times sending it, and at least min_sim_s (the same margin and floor as should_offload, now on both sides'
+// real costs). The pushes the next card launch would make after a simulator launch are not counted: they are not paid if no card launch follows,
+// so the rule errs towards the simulator. Only with the driver up (a launch is never what starts it: the start-cost rules are untouched) and only
+// when the card holds data (`card_only_bytes` > 0, which needs the last launch that touched the memory to have run on the card).
+struct StreakLaunch {
+  double sim_s = 0;                       // the history's estimate (SimTimeTable::predict)
+  uint64_t card_only_bytes = 0;           // live bytes in Where::Card chunks: what the simulator pulls before it runs the launch
+  uint64_t push_bytes = 0;                // live bytes in Where::Host chunks: what the card needs first
+  std::optional<double> card_kernel_s;    // this kernel's last time on the card
+};
+// What keeping the launch in the simulator costs, and what sending it does.
+inline double streak_keep_seconds(const StreakLaunch& s, const Costs& c) {
+  return s.sim_s + static_cast<double>(s.card_only_bytes) / c.pull_bytes_per_s;
+}
+inline double streak_card_seconds(const StreakLaunch& s, const Costs& c) {
+  return c.launch_s + s.card_kernel_s.value_or(c.kernel_s_default) + static_cast<double>(s.push_bytes) / c.push_bytes_per_s;
+}
+inline bool streak_offload(const StreakLaunch& s, const Costs& c, bool driver_started) {
+  if (!driver_started || s.card_only_bytes == 0 || !(s.sim_s > 0)) return false;
+  const double keep = streak_keep_seconds(s, c);
+  return keep >= c.min_sim_s && keep > c.margin * streak_card_seconds(s, c);
+}
+
 // ---- start-up of the real driver ---------------------------------------------------------------------------------------------------
 // Loading the driver and making its context costs 0.15 to 0.35 s (09 doc, section 5; 0.23 s on the A10G of docs/performance.md "Round sp42"). Nothing touches
 // the driver, and no thread is started for it, until should_offload_with_start has decided that a launch goes to the card: the start is then made at that launch

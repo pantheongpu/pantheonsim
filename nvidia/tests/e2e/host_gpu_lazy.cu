@@ -9,6 +9,10 @@
 // card that computes nothing leaves (step 18: a sampled launch sent to such a card must print exactly this).
 // `few` is `big` on 8 blocks with a long loop in every thread (Round sp61: a grid too small to sample by whole blocks, sampled inside its blocks),
 // `fewshort` the same with a short loop, and `fewnone` `few` with no launch (steps 21 to 23).
+// `streak` (Round sp65, steps 24 to 26) alternates `scramble` over 4 MiB with `bump`, one warp adding 1 to 32 counters, eight times each, and reads the
+// memory back only at the end: once `scramble` runs on the card, the card holds the whole live memory when each `bump` comes, and `bump` (far too
+// short to repay a card trip by itself) goes there too. `streakread` reads both buffers back after every `scramble`, so the card holds nothing the
+// simulator does not when `bump` comes. Both print the counters and a hash of the 4 MiB.
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -42,6 +46,7 @@ __global__ void scramble1(uint32_t* d, int n, int rounds) {
   }
   d[i] = x;
 }
+__global__ void bump(uint32_t* c) { c[threadIdx.x] += 1; }
 __global__ void use_expf(float* d, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) d[i] = expf(d[i] * 0.001f) + float(i);
@@ -94,8 +99,39 @@ __global__ void histk(unsigned* d, int n) {   // an integer reduction onto 64 wo
 
 void leak_heap();   // host_gpu_lazy_heap.cu: a kernel of a module of its own (a kernel that calls malloc keeps every kernel of its module in the simulator)
 
+static int streak_program(bool read_between) {
+  const int n = 1 << 20;
+  void *d = nullptr, *c = nullptr;
+  cudaMalloc(&d, n * 4);
+  cudaMemset(d, 1, n * 4);
+  cudaMalloc(&c, 32 * 4);
+  cudaMemset(c, 0, 32 * 4);
+  std::vector<unsigned char> back(n * 4);
+  std::vector<uint32_t> cnt(32);
+  for (int launch = 0; launch < 8; ++launch) {
+    scramble<<<n / 256, 256>>>(static_cast<uint32_t*>(d), n, 64);
+    if (read_between) {
+      cudaMemcpy(back.data(), d, n * 4, cudaMemcpyDeviceToHost);
+      cudaMemcpy(cnt.data(), c, 32 * 4, cudaMemcpyDeviceToHost);
+    }
+    bump<<<1, 32>>>(static_cast<uint32_t*>(c));
+  }
+  cudaDeviceSynchronize();
+  cudaMemcpy(back.data(), d, n * 4, cudaMemcpyDeviceToHost);
+  cudaMemcpy(cnt.data(), c, 32 * 4, cudaMemcpyDeviceToHost);
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char b : back) h = (h ^ b) * 0x100000001b3ull;
+  unsigned lo = cnt[0], hi = cnt[0];
+  for (uint32_t v : cnt) lo = v < lo ? v : lo, hi = v > hi ? v : hi;
+  std::printf("bumps %u to %u, scrambled %016llx\n", lo, hi, static_cast<unsigned long long>(h));
+  cudaFree(c);
+  cudaFree(d);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "big";
+  if (!std::strcmp(mode, "streak") || !std::strcmp(mode, "streakread")) return streak_program(!std::strcmp(mode, "streakread"));
   const bool small = !std::strcmp(mode, "small"), mufu = !std::strcmp(mode, "mufu");
   const bool div = !std::strcmp(mode, "div"), rcp = !std::strcmp(mode, "rcp"), divexp_mode = !std::strcmp(mode, "divexp");
   const bool hist = !std::strcmp(mode, "hist");
