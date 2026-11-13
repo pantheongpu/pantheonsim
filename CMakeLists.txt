@@ -3146,6 +3146,15 @@ if(TARGET vgpucublas)
       TIMEOUT 300)
   endforeach()
 
+  # The same NVRTC program on the shim's nvcc path (no toolkit libnvrtc): NVRTC's include search, no host
+  # headers, so programs with their own <cstdint> (ThrustRTC) or int64_t (the jiterator) compile (#619).
+  add_test(NAME e2e_nvrtc_paths_nvcc
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh nvrtc_paths nvrtc cuda)
+  set_tests_properties(e2e_nvrtc_paths_nvcc PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_NVRTC=nvcc"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
   # The same TF32 program with NVIDIA_TF32_OVERRIDE=0: TF32 is off everywhere, explicit FAST_TF32 included.
   add_test(NAME e2e_blas_tf32_override
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh blas_tf32_rounding cublas cublasLt)
