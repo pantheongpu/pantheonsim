@@ -1254,7 +1254,7 @@ hipError_t module_on(State& s, FatBinary& fb, int ordinal, Module** out) {
                                             ". Build it with --offload-arch=" + gfx + ".");
   try {
     auto m = std::make_unique<Module>();
-    m->object = vgpu::amd::load_code_object(std::string(*code), "the program's " + gfx + " code");
+    m->object = vgpu::amd::load_code_object(*code, "the program's " + gfx + " code");
     m->device = ordinal;
     place(*m, d.memory());
     // Its __managed__ variables' pointers, to the memory each already has.
@@ -2046,7 +2046,7 @@ hipError_t load_module(State& s, vgpu::runtime::Device* d, const void* image, Mo
   const uint64_t size = shoff + uint64_t{shentsize} * shnum;
   try {
     auto m = std::make_unique<Module>();
-    m->object = vgpu::amd::load_code_object(std::string(reinterpret_cast<const char*>(bytes), size), "the image");
+    m->object = vgpu::amd::load_code_object(std::string_view(reinterpret_cast<const char*>(bytes), size), "the image");
     // VGPU_DUMP_CODE_OBJECTS=<dir> keeps a copy of every code object a
     // program loads, named for its first kernel: what a library builds at
     // run time (MIOpen's convolutions, rocFFT's plans) is otherwise nowhere
@@ -7459,7 +7459,7 @@ hipError_t hipLinkComplete(void* link, void** binary, size_t* size) {
           bytes = reinterpret_cast<const uint8_t*>(code->data());
           size = code->size();
         }
-        const vgpu::amd::CodeObject o = vgpu::amd::load_code_object(std::string(reinterpret_cast<const char*>(bytes), size), "link input");
+        const vgpu::amd::CodeObject o = vgpu::amd::load_code_object(std::string_view(reinterpret_cast<const char*>(bytes), size), "link input");
         if (o.isa != arch.substr(0, o.isa.size()) && !arch.empty())
           return record(state(), fail(hipErrorInvalidImage, "link input " + std::to_string(i) + " is built for " + o.isa +
                                                                ", and this device is " + arch));
@@ -7851,7 +7851,7 @@ const Loaded* load(int ordinal, const void* bytes, size_t size, std::string* why
   }
   try {
     auto m = std::make_unique<Loaded>();
-    m->object = load_code_object(std::string(static_cast<const char*>(bytes), size), "the code object");
+    m->object = load_code_object(std::string_view(static_cast<const char*>(bytes), size), "the code object");
     m->host_image = m->object.image;   // place() gives up the object's own copy
     vgpu::runtime::Device& d = s.rt->device(ordinal);
     place(*m, d.memory());

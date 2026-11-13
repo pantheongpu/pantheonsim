@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vgpu::amd {
@@ -183,7 +184,7 @@ const GlobalVar* find_global(const CodeObject& o, const std::string& name);
 // Reads a code object. Throws Err::ProfileParse naming what is wrong: not an
 // ELF, not AMDGPU, a note that is not MessagePack, a kernel whose descriptor
 // is missing.
-CodeObject load_code_object(const std::string& bytes, const std::string& origin);
+CodeObject load_code_object(std::string_view bytes, const std::string& origin);
 
 // The kernel of that name, or null.
 const Kernel* find_kernel(const CodeObject& o, const std::string& name);

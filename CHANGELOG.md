@@ -7,6 +7,17 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- AMD: loading a library's code objects takes 40 % less time. The 62 Tensile code objects of a small rocBLAS program (`amd/tests/rocblas/blas`,
+  sgemm, dgemm and the rest, ROCm 7.1 rocBLAS on a simulated MI300X) loaded in 0.44 s instead of 0.75 s and the program ran in 1.61 s
+  instead of 1.96 s (median of 8 alternating runs on an ubuntu-24.04 runner; best 1.53 s against 1.84 s). The time was page faults
+  and copies, not arithmetic: a kept bundle entry is inflated straight into its place instead of through a buffer that is then
+  copied, the zstd buffer is kept from one load to the next, the code object is read where it lies instead of from a copy, `.text`
+  and a linked image are written once instead of zeroed first, and the buffers of tens of megabytes are asked for in 2 MB pages
+  (`madvise(MADV_HUGEPAGE)`); the process took 190,000 page faults instead of 350,000. The bytes read are the same:
+  `test_amd_codeobject_same_bits` gives the recorded digests, and the 2,838 code objects ROCm 7.1 ships (rocBLAS's and hipBLASLt's
+  libraries) give the same digests before and after. `VGPU_LOAD_PLAIN=1` reads them as before (`test_amd_codeobject_same_bits_plain`);
+  `test_amd_bundle` adds bundles larger than the buffer, read both ways. AMD's `rocblas-test` gains nothing from it: its start-up
+  (57 s a process, reading `rocblas_gtest.data`, against 0.1 to 0.4 s of loading) is AMD's client, not the simulator (pantheonsim #565).
 - Setup action: a release carries the simulator prebuilt for linux-x86_64, one tarball and `.sha256` per runner and toolkit the
   action sets up (ubuntu-24.04 with CUDA 12.0, 12.6, 13.0 or none, ubuntu-22.04 with CUDA 12.6 or none), built and attached by
   `.github/workflows/release-binaries.yml` when a `v*` tag is pushed. The action, pinned at that release, downloads the tarball,
