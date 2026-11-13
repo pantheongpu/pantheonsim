@@ -7,6 +7,25 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Driver: `cuGetProcAddress` / `cuGetProcAddress_v2`, and with them `cudaGetDriverEntryPoint` and `...ByVersion`, resolve a
+  function's base name by the CUDA version asked for, as an RTX 3060 does: `cuGraphExecUpdate` at 12000 or later is
+  `cuGraphExecUpdate_v2` (it was not found, so cuda-core 1.3.0 refused the driver and every numba-cuda launch failed),
+  `cuCtxCreate` is `_v3` at 12000 and `_v4` at 13000, `cuStreamGetCaptureInfo` is `_v3` at 13000 (it was `_v2`), and so on for every
+  name. The table comes from NVIDIA's typedef headers (`PFN_<name>_v<version>`; `scripts/gen_driver_proc_versions.py`,
+  `nvidia/src/driver_proc_versions.inc`), with the per-thread-stream forms for `CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM`. As on
+  the card, a name asked for at a version older than the function is `CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT`, and a name that
+  is not found returns `CUDA_SUCCESS` with a null function and the status (it returned `CUDA_ERROR_NOT_FOUND`). The card maps
+  `cuGraphInstantiate` to `cuGraphInstantiate_v2` at every version from 11.0, not to `cuGraphInstantiateWithFlags`, and so does the
+  shim. New unit test `test_driver_proc_address` compares all 3,976 answers the card's driver gave (497 names at 11040, 12000,
+  12040 and 13000, both stream modes; `tools/probes/driver_proc_address_probe.cpp`) with the shim's; `lint_driver_proc_versions`
+  checks the table against the toolkit at hand (pantheonsim #626).
+- Driver: `cuProfilerInitialize` is exported (deprecated, still in the CUDA 13 driver; cudarc 0.19 binds it when it loads libcuda and
+  panicked without it). It answers `CUDA_ERROR_NOT_INITIALIZED` before `cuInit` and `CUDA_ERROR_NOT_SUPPORTED` after, whatever the
+  arguments and with or without a context, as an RTX 3060 does. Of the other names the CUDA 13.0 driver stub exports, the shim
+  now also exports the per-thread forms of the CUDA 11 stream memory-operation and capture calls (`cuStreamWaitValue32_ptsz`,
+  `cuStreamBatchMemOp_ptsz`, `cuStreamBeginCapture_ptsz`, `cuStreamGetCaptureInfo_ptsz` and the rest, which the card hands a CUDA
+  11 caller that asks for the per-thread default stream) and the unsuffixed `cuMemGetAddressRange`; only the debugger's `cudbg*`
+  entry points remain unexported (pantheonsim #627).
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the
