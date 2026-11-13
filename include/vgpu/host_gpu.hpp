@@ -287,8 +287,10 @@ inline InsnClass turbo_class(const std::string& mnemonic, const std::vector<std:
   if (is_one_of({"HADD2", "HMUL2", "HFMA2", "HSETP2", "HSET2", "HMNMX2"})) return C::Half;
   if (is_one_of({"CALL", "RET"})) return C::Call;
   if (is_one_of({"HMMA", "IMMA", "DMMA"})) return C::Tensor;
+  // (Round sp66: B2R reads the result of a block's BAR.RED, the same function on both sides; NANOSLEEP is a hint that a spin-wait backs off, as cub's
+  // decoupled look-back does: neither touches anything the card lacks)
   if (is_one_of({"IDP", "VABSDIFF", "VABSDIFF4", "VIADDMNMX", "VIMNMX3", "FMNMX3", "F2IP", "FSWZADD", "REDUX", "LDGSTS", "LDGDEPBAR", "LDSM", "MOVM", "FFMA2",
-                 "FMUL2", "FADD2"}))
+                 "FMUL2", "FADD2", "B2R", "NANOSLEEP"}))
     return C::Extra;
   return C::Never;
 }
