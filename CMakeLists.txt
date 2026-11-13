@@ -4871,6 +4871,13 @@ set_tests_properties(e2e_async_host_events_driver PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 600)
+# Copies, fills, symbol copies, cudaFreeAsync and kernel launches behind a host function that waits for the host return at once and
+# run after it, in stream order; the synchronous calls wait for them (#634).
+add_test(NAME e2e_async_host_copies COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_async_host_copies.sh)
+set_tests_properties(e2e_async_host_copies PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 300)
 # A kernel launch returns before the kernel finishes; events and streams behind it are not ready until it has run (#523).
 add_test(NAME e2e_async_launch_events COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_async_launch_events.sh)
 set_tests_properties(e2e_async_launch_events PROPERTIES

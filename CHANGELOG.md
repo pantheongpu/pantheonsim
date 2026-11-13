@@ -7,6 +7,16 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Runtime: a copy, fill or kernel launch issued on a stream behind a host function that has not finished returns at once and runs
+  after it, in stream order, as on an RTX 3060. It used to run inside the call after waiting for the host function, so a host function
+  that waits for something the program does after the call (Celeritas' `AsyncSnapshotTest.device_pending`) hung the program.
+  `cudaMemcpyAsync`, `cudaMemsetAsync`, the 2D and 3D copies and fills between pointers, the symbol copies, `cudaMemcpyPeerAsync`,
+  `cudaFreeAsync` and kernel launches on any stream the runtime made are queued on the stream's lane when the memory they touch is
+  device or page-locked memory; they see what the host function wrote, and events, stream queries and every synchronizing call wait for
+  them. Copies of pageable memory, managed memory and arrays still wait in the call. `cudaFree`, `cudaFreeHost`, `cudaHostUnregister`
+  and `cudaDeviceReset` wait for queued work first. The 2D, 3D and symbol copies on a stream also follow host functions on that stream
+  now (on a non-blocking stream they ran before them), and `cudaMemcpyPeer` and the synchronous symbol copies follow host functions on
+  the legacy default stream. New e2e test `e2e_async_host_copies`; [design](docs/perf-design/streams.md) (pantheonsim #634).
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the
