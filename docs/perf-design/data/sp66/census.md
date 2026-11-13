@@ -9,8 +9,8 @@ first-launch rule or a sample (Round sp65's subject, not this round's).
   PolyBench in Round sp59, have no launch refused for anything but size), Rodinia 12, HeCBench 28 of 34 (aidw, aligned-types, babelstream,
   base64e, binomial and atomicCost run past the census's time limit in the simulator; none had a refusal in sp59), the CUDA Samples 13.0 that run
   in the simulator, 58: 107 programs.
-* `new`: this round's rules (the branch head), on the 46 programs the old census found a refusal in; the other programs' decisions cannot change (so the `new` columns
-  are over those 46, the `old` columns over all 107).
+* `new`: this round's rules (the branch head), on the 49 programs the old census found a refusal in; the other programs' decisions cannot change (so the `new` columns
+  are over those 49, the `old` columns over all 107).
   HeCBench atomicReduction (all its launches `sent` in both) is left out of `new`: it runs past the time limit.
 
 Refusals that the old census found and that remain (`new`): mapped host memory (HeCBench zerocopy, Samples simpleIPC and simpleZeroCopy: 3.4 s),
@@ -26,20 +26,20 @@ scalarProd, shfl_scan, simpleHyperQ, jacobiCudaGraphs); `ATOMS.CAST.SPIN`, `ATOM
 simpleAtomicIntrinsics). Once module variables were lifted the census showed `B2R.RESULT` and `NANOSLEEP` (cub's onesweep radix sort and its
 decoupled look-back: radixSortThrust, segmentationTreeThrust, radixsort2, sortKV, 13.9 s), which joined the extra class.
 
-Programs: old 107 (0 timed out: none), new 46 (0 timed out: none)
+Programs: old 107 (0 timed out: none), new 49 (0 timed out: none)
 
-Simulator seconds of all launches: old 497.7 s, new 226.0 s
+Simulator seconds of all launches: old 497.7 s, new 227.0 s
 
 | reason | old launches | old sim s | old programs | new launches | new sim s | new programs |
 |---|---:|---:|---:|---:|---:|---:|
 | sent | 4383 | 228.42 | 11 | 4384 | 60.68 | 16 |
-| size rule | 6072 | 61.78 | 63 | 2582 | 161.00 | 34 |
+| size rule | 6072 | 61.78 | 63 | 4792 | 162.02 | 37 |
 | class: never | 161 | 156.91 | 11 | 23 | 0.35 | 5 |
 | safety: the module holds __device__, string literals (the kernel calls none) | 1114 | 20.79 | 2 | 0 | 0 | 0 |
 | safety: inside a graph with conditionals | 3178 | 8.52 | 3 | 0 | 0 | 0 |
 | safety: the module holds __device__ (the kernel calls none) | 1805 | 8.19 | 10 | 0 | 0 | 0 |
 | safety: the module holds __constant__ (the kernel calls none) | 2142 | 4.88 | 3 | 0 | 0 | 0 |
-| safety: argument points into mapped host memory | 38 | 3.39 | 4 | 30 | 3.45 | 3 |
+| safety: argument points into mapped host memory | 38 | 3.39 | 4 | 38 | 3.45 | 4 |
 | safety: the module holds __constant__, __device__ (the kernel calls none) | 5 | 3.03 | 2 | 0 | 0 | 0 |
 | class: atomics | 210 | 0.97 | 4 | 0 | 0 | 0 |
 | safety: cooperative or cluster launch | 1 | 0.45 | 1 | 1 | 0.46 | 1 |
@@ -74,6 +74,7 @@ Per program, the simulator seconds kept for a reason other than the size rule (`
 | rodinia/particlefilter_float | old | 1.28 | 0.00 | 0.00 | 1.28 | safety: the module holds __device__ (the kernel calls none) 1.28 |
 | rodinia/particlefilter_float | new | 1.16 | 0.84 | 0.32 | 0.00 |  |
 | samples/LargeKernelParameter | old | 0.21 | 0.00 | 0.00 | 0.21 | safety: the module holds __constant__ (the kernel calls none) 0.21 |
+| samples/LargeKernelParameter | new | 0.21 | 0.00 | 0.21 | 0.00 |  |
 | samples/MC_EstimatePiInlineP | old | 1.39 | 0.00 | 0.00 | 1.39 | safety: the module holds __constant__, __device__ (the kernel calls none) 1.39 |
 | samples/MC_EstimatePiInlineP | new | 1.49 | 0.00 | 1.48 | 0.00 |  |
 | samples/MC_SingleAsianOptionP | old | 1.64 | 0.00 | 0.00 | 1.64 | safety: the module holds __constant__, __device__ (the kernel calls none) 1.64 |
@@ -119,4 +120,5 @@ Per program, the simulator seconds kept for a reason other than the size rule (`
 | samples/threadFenceReduction | old | 0.14 | 0.00 | 0.00 | 0.14 | safety: the module holds __device__ (the kernel calls none) 0.14 |
 | samples/threadFenceReduction | new | 0.14 | 0.00 | 0.14 | 0.00 |  |
 | samples/warpAggregatedAtomicsCG | old | 0.80 | 0.00 | 0.00 | 0.80 | safety: the module holds __device__ (the kernel calls none) 0.80 |
+| samples/warpAggregatedAtomicsCG | new | 0.81 | 0.00 | 0.81 | 0.00 |  |
 

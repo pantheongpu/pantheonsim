@@ -48,3 +48,8 @@
 -- mutant 20 again, after the test of a 32-bit image was added:
 20 killed by the_card_image_refuses_what_it_cannot_apply: image: the class byte not checked
 1 of 1 killed
+-- the three mutants added for call_to_entry, and the atomics default again (the list renumbered):
+45 killed by a_call_must_stay_inside_the_kernel: entry: anywhere in the section
+46 killed by a_call_must_stay_inside_the_kernel: entry: a relative call followed
+47 killed by a_call_must_stay_inside_the_kernel: entry: an empty section followed
+48 killed by turbo_admits_by_class_and_switch, turbo_takes_the_kernels_exact_refused_for_numerics: switch: atomics off by default

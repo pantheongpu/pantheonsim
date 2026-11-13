@@ -16,8 +16,9 @@ mkdir -p "$out"
 export PATH=/usr/local/cuda-13.0/bin:$PATH NVCC=/usr/local/cuda-13.0/bin/nvcc
 H="python3 tools/bench/hostgpu/run.py --build $build --corp $corp --gpu nvidia/a10g"
 HEC_SKIP="aidw-cuda,atomicCost-cuda,fpdc-cuda,zerocopy-cuda"
-# The programs whose decisions change (data/sp66/census.md: a launch kept by a rule this round lifts, in the census of either rule).
-CHANGED=${SP66_CHANGED:?the programs of census.md, comma separated}
+# The programs whose decisions change (data/sp66/census.md: a launch kept by a rule this round lifts, in the old census); the CUDA Samples among them
+# run only when ~/corp/samples holds them (sim_main.txt and the sm_86 binaries, the layout of tools/bench/real/real.py's manifest).
+CHANGED=${SP66_CHANGED:-hecbench/aop-cuda,hecbench/asyncAllocation-cuda,hecbench/atomicPerf-cuda,hecbench/attention-cuda,hecbench/bgmv-cuda,hecbench/bh-cuda,hecbench/radixsort2-cuda,hecbench/sortKV-cuda,rodinia/particlefilter_float,samples/LargeKernelParameter,samples/MC_EstimatePiInlineP,samples/MC_SingleAsianOptionP,samples/bf16TensorCoreGemm,samples/binaryPartitionCG,samples/cdpBezierTessellation,samples/cdpQuadtree,samples/cdpSimplePrint,samples/cdpSimpleQuicksort,samples/convolutionSeparable,samples/cudaGraphsPerfScaling,samples/cudaTensorCoreGemm,samples/dct8x8,samples/histogram,samples/interval,samples/jacobiCudaGraphs,samples/mergeSort,samples/newdelete,samples/ptxjit,samples/radixSortThrust,samples/reduction,samples/scalarProd,samples/segmentationTreeThrust,samples/shfl_scan,samples/simpleAtomicIntrinsics,samples/simpleCooperativeGroups,samples/simpleCubemapTexture,samples/simpleCudaGraphs,samples/simpleHyperQ,samples/simpleLayeredTexture,samples/simplePrintf,samples/simpleSurfaceWrite,samples/sortingNetworks,samples/tf32TensorCoreGemm,samples/threadFenceReduction,samples/warpAggregatedAtomicsCG}
 CORPORA=${SP66_CORPORA:-polybench,rodinia,hecbench}
 CHANGED_CORPORA=$CORPORA
 [[ -f $corp/samples/sim_main.txt ]] && CHANGED_CORPORA=$CORPORA,samples   # (the CUDA Samples, when they were copied: census.md has some of them)
@@ -27,11 +28,12 @@ build|all)
   # builds, the unit tests, e2e_host_gpu (steps 7 to 9 are new: module variables, printf and a texture object on the card) and e2e_host_gpu_stub
   # (steps 24 to 28 are new and have run nowhere: no nvcc on the machine the round was built on), the probes
   CARD_CI_JOBS=4 tools/card-ci/run-card-ci.sh "$build" 2>&1 | tee "$out/card-ci.txt"
+  nice cmake --build "$build" -j4 --target vgpucuda > "$build.vgpucuda.log" 2>&1 || tail -20 "$build.vgpucuda.log"   # (the driver shim: Samples that call the driver API)
   (cd "$build" && ctest -R 'hostgpu_bench_selftest' --output-on-failure) 2>&1 | tail -3 | tee "$out/selftest.txt"
   ;;&
 changed|all)
   # 3 runs a form; one untimed verify run (VGPU_HOST_GPU_VERIFY=all) of each
-  $H --corpora "$CHANGED_CORPORA" --programs "$CHANGED" --runs 3 --long-secs 60 --long-runs 1 --forms sim,exact,exactn,turbo,turbon,verify --timeout 600 \
+  $H --corpora "$CHANGED_CORPORA" --programs "$CHANGED" --runs 3 --long-secs 20 --long-runs 1 --forms sim,exact,exactn,turbo,turbon,verify --timeout 600 \
      --json "$out/changed.json" --md "$out/changed.md" 2>&1 | tee "$out/changed.txt" | tail -40
   ;;&
 atomics|all)
