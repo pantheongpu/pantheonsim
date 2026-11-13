@@ -11,6 +11,7 @@
 //   tex      a texture object exists while `plain` runs (until Round sp66 that kept every launch off the card), then `fetch` reads through it (a
 //            texture instruction: it stays in the simulator).
 //   heap     `uses_heap` calls malloc and free: it stays in the simulator in both modes, and nothing reaches the driver.
+//   graph    `plain`, captured into a CUDA graph and launched from it four times (until Round sp66 every launch of a graph was refused).
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -150,6 +151,29 @@ int main(int argc, char** argv) {
       cudaDestroyTextureObject(t);
       cudaFree(e);
     }
+    cudaFree(d);
+  } else if (!std::strcmp(mode, "graph")) {
+    uint32_t* d = nullptr;
+    cudaMalloc(&d, n * 4);
+    cudaMemset(d, 5, n * 4);
+    cudaStream_t st;
+    cudaStreamCreate(&st);
+    cudaGraph_t g;
+    cudaGraphExec_t ge;
+    cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal);
+    plain<<<blocks, 256, 0, st>>>(d, n, 64);
+    cudaStreamEndCapture(st, &g);
+    if (cudaGraphInstantiate(&ge, g, 0) != cudaSuccess) { std::printf("no graph\n"); return 1; }
+    std::vector<uint32_t> back(n);
+    for (int launch = 0; launch < 4; ++launch) {
+      cudaGraphLaunch(ge, st);
+      cudaStreamSynchronize(st);
+      cudaMemcpy(back.data(), d, n * 4, cudaMemcpyDeviceToHost);
+      std::printf("graph %d: %016llx\n", launch, (unsigned long long)fnv(back.data(), n * 4));
+    }
+    cudaGraphExecDestroy(ge);
+    cudaGraphDestroy(g);
+    cudaStreamDestroy(st);
     cudaFree(d);
   } else {
     std::printf("unknown mode %s\n", mode);

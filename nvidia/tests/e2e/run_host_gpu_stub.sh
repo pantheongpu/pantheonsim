@@ -53,7 +53,8 @@
 #  27. a live texture object no longer keeps the device's launches off the card; the kernel that fetches through it stays (class never);
 #  28. a kernel that calls malloc, free and assert never reaches the driver, in either mode;
 #  29. a kernel that calls a device function of another section (host_gpu_rdc.cu, -rdc=true: an absolute call) reaches the card path in turbo mode,
-#      whose scan follows the call into the callee's code, and not in exact mode; the output is unchanged.
+#      whose scan follows the call into the callee's code, and not in exact mode; the output is unchanged;
+#  30. a kernel launched from a CUDA graph reaches the card path in both modes; the output is unchanged.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -327,7 +328,7 @@ read -r smp_n smp_sent <<< "$(sampled_of in_short)"
 [[ ! -s "$work/in_short.log" ]] || { echo "FAIL: a short launch sampled inside its blocks reached the driver: $(calls in_short)"; fails=1; }
 diff -q "$work/off_fewshort.out" "$work/in_short.out" > /dev/null || { echo "FAIL: sampling inside the blocks changes the output of fewshort"; fails=1; }
 # 24 to 28. what a module holds besides code (host_gpu_vars.cu).
-for arg in vars printf tex heap; do
+for arg in vars printf tex heap graph; do
   env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/vars" "$arg" > "$work/off_v$arg.out" 2> "$work/off_v$arg.err" || { echo "FAIL: the $arg run of host_gpu_vars with the mode off failed"; tail -5 "$work/off_v$arg.err"; exit 1; }
 done
 grep -q '^vars 5: ' "$work/off_vvars.out" || { echo "FAIL: host_gpu_vars vars printed: $(head -2 "$work/off_vvars.out")"; fails=1; }
@@ -358,6 +359,12 @@ for m in exact turbo; do
   diff -q "$work/off_vheap.out" "$work/vh_$m.out" > /dev/null || { echo "FAIL: $m changes the output of host_gpu_vars heap"; fails=1; }
 done
 grep -q '^host_gpu_refused: kernel=[^ ]*fetch[^ ]* class=never insn=T\(EX\|LD\)' "$work/vt_turbo.err" || { echo "FAIL: the texture fetch was not refused as class never: $(grep -m2 '^host_gpu_refused' "$work/vt_turbo.err")"; fails=1; }
+# 30. a graph's launches.
+for m in exact turbo; do
+  PROG=vars run "vg_$m" graph VGPU_HOST_GPU=$m "${reach[@]}" || { echo "FAIL: the $m graph run failed"; tail -5 "$work/vg_$m.err"; fails=1; }
+  grep -q '^cuModuleLoadData$' "$work/vg_$m.log" || { echo "FAIL: $m: a kernel launched from a graph did not reach the card path: $(calls "vg_$m")"; fails=1; }
+  diff -q "$work/off_vgraph.out" "$work/vg_$m.out" > /dev/null || { echo "FAIL: $m changes the output of host_gpu_vars graph"; fails=1; }
+done
 # 29. a call into another section.
 env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/rdc" > "$work/off_rdc.out" 2> "$work/off_rdc.err" || { echo "FAIL: host_gpu_rdc with the mode off failed"; tail -5 "$work/off_rdc.err"; exit 1; }
 PROG=rdc run rdc_turbo x VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 "${reach[@]}" || { echo "FAIL: the turbo rdc run failed"; tail -5 "$work/rdc_turbo.err"; fails=1; }

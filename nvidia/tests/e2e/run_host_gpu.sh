@@ -20,7 +20,8 @@
 #      launch) run on the card in both modes and the output is the mode-off output to the byte; exact mode's verify finds them identical;
 #   8. in turbo mode a kernel that prints runs on the card, and the lines (the card's and the host's, stdout a file) come in the mode-off order;
 #   9. with a live texture object a plain kernel runs on the card in both modes, and the output is the mode-off output;
-#  10. in turbo mode a kernel that calls a device function of another section (host_gpu_rdc.cu, -rdc=true) runs on the card, output the mode-off output.
+#  10. in turbo mode a kernel that calls a device function of another section (host_gpu_rdc.cu, -rdc=true) runs on the card, output the mode-off output;
+#  11. a kernel launched from a CUDA graph runs on the card in both modes, output the mode-off output.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -114,7 +115,7 @@ vrun() {   # <tag> <mode argument> [env...]
   env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$@" "$work/vars" "$arg" > "$work/$tag.out" 2> "$work/$tag.err"
 }
 send=(VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=0)
-for arg in vars printf tex; do
+for arg in vars printf tex graph; do
   vrun "voff_$arg" "$arg" || { echo "FAIL: host_gpu_vars $arg with the mode off failed"; tail -5 "$work/voff_$arg.err"; fails=1; }
 done
 for m in exact turbo; do
@@ -126,6 +127,9 @@ for m in exact turbo; do
   vrun "vt_$m" tex VGPU_HOST_GPU=$m "${send[@]}" || { echo "FAIL: host_gpu_vars tex, $m, failed"; tail -5 "$work/vt_$m.err"; fails=1; }
   cmp -s "$work/voff_tex.out" "$work/vt_$m.out" || { echo "FAIL: $m: a live texture object and a launch on the card change the output"; fails=1; }
   grep -q "plain[^ ]* on the card" "$work/vt_$m.err" || { echo "FAIL: $m: a plain kernel stayed off the card with a texture object alive: $(grep -m2 'plain' "$work/vt_$m.err")"; fails=1; }
+  vrun "vg_$m" graph VGPU_HOST_GPU=$m "${send[@]}" || { echo "FAIL: host_gpu_vars graph, $m, failed"; tail -5 "$work/vg_$m.err"; fails=1; }
+  cmp -s "$work/voff_graph.out" "$work/vg_$m.out" || { echo "FAIL: $m: a graph's launches on the card change the output"; fails=1; }
+  grep -q "plain[^ ]* on the card" "$work/vg_$m.err" || { echo "FAIL: $m: a kernel launched from a graph stayed off the card: $(grep -m2 'plain' "$work/vg_$m.err")"; fails=1; }
 done
 vrun vv_exact vars VGPU_HOST_GPU=exact VGPU_HOST_GPU_VERIFY=1 || { echo "FAIL: host_gpu_vars vars, exact verify, failed"; fails=1; }
 vl="$(grep '^host_gpu_verify:' "$work/vv_exact.err" | tail -1)"

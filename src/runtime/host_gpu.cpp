@@ -563,7 +563,7 @@ struct Runtime::Impl : CardGate {
   // no other card was run.
   bool div_idiom = false;
   // VGPU_HOST_GPU_WIDER=0: the safety rules before Round sp66, for A/B runs: any variable, external function or device-side launch in a module refuses all its
-  // kernels, a live texture object refuses every launch, and turbo mode's float atomics with a value, CAS and EXCH are an opt-in (VGPU_HOST_GPU_ATOMICS=1).
+  // kernels, a live texture object and a graph's launch refuse every launch, and turbo mode's float atomics with a value, CAS and EXCH are an opt-in (VGPU_HOST_GPU_ATOMICS=1).
   bool wider = true;
 
   static std::vector<CodeInsn> idiom_summary(const sass::Code& code) {
@@ -652,7 +652,10 @@ struct Runtime::Impl : CardGate {
     // (Texture objects: a kernel reads one only through a texture or surface instruction, which neither the exact set nor any turbo class admits,
     // so a launch is no longer refused because the device has one; until Round sp66 one live texture object kept every launch off the card.)
     if (!wider && cfg.textures) return unsafe("texture objects");
-    if (cfg.conditionals) return unsafe("inside a graph with conditionals");
+    // (A graph's launch: every kernel of a graph is given the graph's conditional handles, but a kernel reaches them only by calling
+    // cudaGraphSetConditional or launching a graph from the device, which keeps it in the simulator by what it calls (below); until Round sp66
+    // every launch of a graph was refused.)
+    if (!wider && cfg.conditionals) return unsafe("inside a graph with conditionals");
     if (cfg.warp_size && cfg.warp_size != 32) return unsafe("warp size");
     for (const auto& a : args)
       for (size_t i = 0; i + 8 <= a.size(); i += 8) {
@@ -699,7 +702,9 @@ struct Runtime::Impl : CardGate {
     } else {
       for (const std::string& f : sass::reachable(m, fn.name)) {
         const bool devrt = exec::devrt::lookup(f) != exec::devrt::Fn::None;
-        if (!devrt && std::find(m.cubin.externs.begin(), m.cubin.externs.end(), f) == m.cubin.externs.end()) continue;   // (a device function of the module)
+        bool builtin = false;   // (a function the simulator runs in place of the cubin's code, whether the cubin has code for it or not)
+        for (const auto& [addr, name] : m.builtins) builtin = builtin || name == f;
+        if (!devrt && !builtin && std::find(m.cubin.externs.begin(), m.cubin.externs.end(), f) == m.cubin.externs.end()) continue;   // (a device function of the module)
         const ExternKind k = extern_kind(f, devrt);
         if (extern_admitted(k, mode, sw.printf_off)) {
           v.printf = true;
