@@ -300,14 +300,84 @@ const char* const kRtcDefinitions = R"(#pragma once
 #endif
 )";
 
-// The stand-ins above, written under the program's scratch directory. Returns
+std::string real_path(const std::string& p);
+
+// Whether a name in an include directory is the CUDA toolkit's: its runtime,
+// device and math headers, the libraries' headers, and CCCL (cuda/, nv/, cub/,
+// thrust/). Nothing of glibc's or libstdc++'s matches.
+bool cuda_header_name(const std::string& n) {
+  static const char* const kPrefixes[] = {
+      "cuda", "cublas", "cufft", "curand", "cusolver", "cusparse", "cupti", "cuComplex.h", "cufile.h", "npp", "nvrtc.h",
+      "nvJitLink.h", "nvPTXCompiler.h", "nvToolsExt", "nvtx3", "nvfunctional", "nv_decode.h", "nvjpeg.h", "nvblas.h",
+      "nvml.h", "nvvm.h", "nvperf_", "generated_cuda", "generated_nvtx", "sm_", "crt", "cooperative_groups", "device_",
+      "driver_", "host_config.h", "host_defines.h", "builtin_types.h", "channel_descriptor.h", "common_functions.h",
+      "fatbinary_section.h", "library_types.h", "math_constants.h", "math_functions.h", "mma.h", "surface_",
+      "texture_", "vector_functions", "vector_types.h", "cub", "thrust"};
+  if (n == "nv") return true;   // CCCL's <nv/target>
+  for (const char* p : kPrefixes)
+    if (n.rfind(p, 0) == 0) return true;
+  return false;
+}
+
+// Where the toolkit's headers share a directory with the host's: Debian's and
+// Ubuntu's nvidia-cuda-toolkit put cuda_runtime.h, crt/ and the rest straight
+// into /usr/include, beside glibc, and nvcc (/usr/bin/nvcc) passes no -I for
+// them, the host compiler's own search finding them. With that search off,
+// the toolkit headers have to come from somewhere else; the directory is
+// returned, or "" for a toolkit with an include directory of its own
+// (/usr/local/cuda-X, NVIDIA's packages), which nvcc puts on the path itself.
+const std::string& shared_toolkit_include() {
+  static const std::string found = [] {
+    std::vector<std::string> dirs;
+    if (FILE* f = popen("command -v nvcc 2>/dev/null", "r")) {
+      char buf[PATH_MAX] = {0};
+      if (fgets(buf, sizeof buf, f)) {
+        const std::string nvcc = real_path(std::string(buf).substr(0, std::strcspn(buf, "\n")));
+        const size_t slash = nvcc.find_last_of('/');
+        if (slash != std::string::npos) {
+          const std::string bin = nvcc.substr(0, slash);
+          const std::string root = bin.substr(0, bin.find_last_of('/'));
+          for (const char* sub : {"/targets/x86_64-linux/include", "/targets/sbsa-linux/include", "/include"})
+            dirs.push_back(root + sub);
+        }
+      }
+      pclose(f);
+    }
+    dirs.push_back("/usr/include");
+    struct stat st;
+    for (const std::string& d : dirs) {
+      if (::stat((d + "/cuda_runtime.h").c_str(), &st) != 0) continue;
+      const bool shared = d == "/usr/include" || d == "/usr/local/include" || ::stat((d + "/stdio.h").c_str(), &st) == 0;
+      return shared ? d : std::string();
+    }
+    return std::string();
+  }();
+  return found;
+}
+
+// The stand-ins above, written under the program's scratch directory, and on a
+// shared layout a directory of links to the toolkit's own headers alone (the
+// set NVRTC compiles against), so that none of the host's is reachable. Returns
 // the directory, or "" when it cannot be written.
 std::string write_rtc_environment(const std::string& dir) {
   const std::string rtc = dir + "/" + kRtcDir;
   ::mkdir(rtc.c_str(), 0700);
-  const bool ok = write_file(rtc + "/vgpu_nvrtc_prelude.h", kRtcPrelude) && write_file(rtc + "/target", kRtcTarget) &&
-                  write_file(rtc + "/nvrtc_device_runtime.h", "#pragma once\n") &&
-                  write_file(rtc + "/vgpu_nvrtc_definitions.h", kRtcDefinitions);
+  bool ok = write_file(rtc + "/vgpu_nvrtc_prelude.h", kRtcPrelude) && write_file(rtc + "/target", kRtcTarget) &&
+            write_file(rtc + "/nvrtc_device_runtime.h", "#pragma once\n") &&
+            write_file(rtc + "/vgpu_nvrtc_definitions.h", kRtcDefinitions);
+  const std::string& shared = shared_toolkit_include();
+  if (ok && !shared.empty()) {
+    const std::string links = rtc + "/toolkit";
+    ok = ::mkdir(links.c_str(), 0700) == 0;
+    if (DIR* d = ok ? ::opendir(shared.c_str()) : nullptr) {
+      while (const dirent* e = ::readdir(d)) {
+        const std::string n = e->d_name;
+        if (n == "." || n == ".." || !cuda_header_name(n)) continue;
+        if (::symlink((shared + "/" + n).c_str(), (links + "/" + n).c_str()) != 0) ok = false;
+      }
+      ::closedir(d);
+    }
+  }
   return ok ? rtc : std::string();
 }
 
@@ -318,7 +388,8 @@ std::string write_rtc_environment(const std::string& dir) {
 std::string rtc_nvcc_options(const std::string& rtc) {
   return " -D__CUDACC_RTC__ -D__LP64__=1 -U__NVCC__ -D__FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__"
          " -D__FORCE_INCLUDE_CUDA_BF16_HPP_FROM_BF16_H__ -Xcompiler -nostdinc -Xcompiler -undef"
-         " -Xcompiler -include,vgpu_nvrtc_prelude.h -I " + shq(rtc);
+         " -Xcompiler -include,vgpu_nvrtc_prelude.h -I " + shq(rtc) +
+         (shared_toolkit_include().empty() ? std::string() : " -I " + shq(rtc + "/toolkit"));
 }
 
 bool have_nvcc() { return std::system("command -v nvcc >/dev/null 2>&1") == 0; }

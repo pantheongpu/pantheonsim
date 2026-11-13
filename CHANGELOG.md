@@ -11,7 +11,8 @@ release says what runs and what it produces, never how fast a real GPU would run
   directory, the toolkit headers in `__CUDACC_RTC__` mode, the headers given to `nvrtcCreateProgram` and the `-I`/`--include-path`
   directories. A program that brings its own `<cstdint>` (ThrustRTC 0.3.20) or defines `int64_t` itself (PyTorch's jiterator) compiles,
   where nvcc's host headers made it fail with "invalid redeclaration of type name int64_t"; `#include <stdint.h>` and the other host headers
-  fail to open, as with NVRTC. What NVRTC predefines (`size_t`, `ptrdiff_t`, `clock_t`, `NULL`, `std::move`, `std::forward`,
+  fail to open, as with NVRTC. Where the toolkit's headers share `/usr/include` with glibc's (Debian's and Ubuntu's
+  `nvidia-cuda-toolkit`), the compile sees links to the CUDA headers alone. What NVRTC predefines (`size_t`, `ptrdiff_t`, `clock_t`, `NULL`, `std::move`, `std::forward`,
   `std::initializer_list`, `printf`, `assert`) is there without an include, measured on CUDA 13.0's NVRTC; the PTX matches NVRTC's for the
   programs compared. ThrustRTC's fill and reduce run under `vgpu run` on `nvidia/a100` (ThrustRTC 0.3.20's own occupancy calculator does not
   know compute capability 9.x, so its kernels fail on an H100, real or simulated). The nvcc path also no longer leaves an empty
