@@ -213,9 +213,9 @@ python3 tools/bench/hostgpu/run.py --build build --corp /path/to/corp --gpu nvid
 
 | test | where it runs | what it pins |
 |---|---|---|
-| `test_host_gpu_logic` | every CI job | the mode names; exact's set against a frozen copy and every decoder mnemonic; each class; joined modifiers; calls; the switches and the off list; the sampling rule (how many blocks, what a process can afford, the estimate, what repays the card, when not to sample) |
+| `test_host_gpu_logic` | every CI job | the mode names; exact's set against a frozen copy and every decoder mnemonic; each class; joined modifiers; calls; the switches and the off list; the sampling rule (how many blocks, what a process can afford, the estimate, what repays the card, when not to sample); the rule for a launch while the card holds the memory (both sides by the formula, the margin and the floor found by bisection, the Costs it reads, when it does not act) |
 | `test_host_gpu_tol` | every CI job | the rule, the three readings, NaN, infinity, denormals, signed zero, range ends, the float-array hole, parsing of the tolerances |
-| `e2e_host_gpu_stub` | CI jobs with nvcc (a stand-in driver, no card) | turbo reaches the card path for expf, rcp and division beside expf; exact does not; the lines for scripts; the atomics opt-in and the off list; unreadable values; verify against a card that computes nothing; the timeout; a contended reduction under verify |
+| `e2e_host_gpu_stub` | CI jobs with nvcc (a stand-in driver, no card) | turbo reaches the card path for expf, rcp and division beside expf; exact does not; the lines for scripts; the atomics opt-in and the off list; unreadable values; verify against a card that computes nothing; the timeout; a contended reduction under verify; a short launch that follows a long one to a card that keeps memory and computes nothing while the card holds the memory, and stays with `VGPU_HOST_GPU_STREAK=0` or when the program read the memory back (steps 24 to 26) |
 | `hostgpu_bench_selftest` | every CI job | the harness: parsing, output classes, the table, a hang that is killed |
 | `e2e_host_gpu`, `tools/card-ci/run-card-ci.sh` | a machine with a card only (passed on an A10G, Round sp59) | section 5, item 1 |
 
@@ -335,7 +335,39 @@ for launches that turn out short; sampling the first blocks in the process itsel
 put back, was exact (every byte compared) and made a sampled block 14 to 26 times slower than a block of the launch, which is both the cost and
 the error of the estimate.
 
-## 9. What is next
+## 9. A launch while the card holds the memory (Round sp65; both modes)
+
+With residency (09, section 7), a launch on the card leaves every live 64 KiB chunk the card's alone, and a launch the simulator runs first pulls every such
+chunk back and leaves every chunk the simulator's, so the next card launch pushes them all again. The size rule weighed a launch's simulator time alone
+against the card path. A short launch between two card launches (PolyBench GRAMSCHM's two small kernels between its long one, LU's `lu_kernel1` between
+its `lu_kernel2`, Rodinia gaussian's `Fan1` between its `Fan2`) was therefore kept in the simulator, which then pulled the whole live memory back for it,
+and the card launch after it pushed the whole memory again: a streak of card launches broke into ping-pong, and the card path of the long kernel was
+mostly that push.
+
+**The rule** (`streak_offload`, vgpu/host_gpu.hpp). When the size rule keeps a launch of a kernel that has an estimate, the driver is up and the card
+holds chunks the simulator does not, the launch is priced with what each side really moves:
+
+* keeping it costs its simulator time and the pull of every chunk only the card holds, at the size rule's 10 GB/s;
+* sending it costs the launch (7 us), the kernel's time on the card (its last time there; 100 us before it has run there) and the push of the chunks
+  only the simulator holds; nothing else moves.
+
+It goes when keeping it costs over twice as much as sending it, and at least 200 us: the margin and the floor of the size rule, on both sides' real
+costs. The pushes that the next card launch would make after a simulator launch are not counted (no card launch may follow), so the rule errs towards
+the simulator. The bans are kept and weigh such a launch's card path against the same sum (its simulator time and the pull), since that is what the
+simulator would have cost; the traffic ban and the first-launch, sampling and start-cost rules are unchanged. `VGPU_HOST_GPU_STREAK=0` keeps the rule of
+Round sp61; the summary's `host_gpu_streak: sent=.. card_only_mib=.. rule=..` counts the launches it sent and the bytes only the card held at them.
+
+**Why it is sound.** It changes only which side runs a launch that either side could already run: the launch is admitted by the same checks (code,
+launch shape, memory), and the card path is the one every resident launch takes. In exact mode the card computes the simulator's bits for an admitted
+kernel, so outputs cannot change; in turbo mode the card's values are the mode's promise, as for any launch it sends. It never starts the driver (a
+program whose launches are all short never pays the start, as before) and never acts when the card holds nothing (the previous launch that touched the
+memory ran in the simulator, or the host has read everything back).
+
+What it can cost: a launch it sends whose kernel takes longer on the card than its simulator time plus the pull (the bans end that kernel after one such
+launch, as for any kernel); and a launch it sends whose pull happens anyway, because the launch after it is one the card cannot take (a refused kernel
+then pulls everything): the launch's card path against its simulator time, a few microseconds.
+
+## 10. What is next
 
 From Round sp59, less what section 8 does: a start-cost account that weighs the gain for programs of many short launches (they lose 0.1 to 0.2 s
 or gain nothing); the card's fixed-point `MUFU.SIN` / `MUFU.COS` in the simulator; `BMMA` in the tensor class and a tensor probe whose sums round;

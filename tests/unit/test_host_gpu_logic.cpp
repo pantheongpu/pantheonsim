@@ -1769,10 +1769,20 @@ VTEST(a_streak_launch_needs_the_driver_up_data_on_the_card_and_an_estimate) {
   VCHECK(!streak_offload(none, c, true));
   none.card_only_bytes = 1;
   VCHECK(streak_offload(none, c, true) == (streak_keep_seconds(none, c) >= c.min_sim_s && streak_keep_seconds(none, c) > c.margin * streak_card_seconds(none, c)));
+  // a long launch with nothing on the card is the size rule's to decide (should_offload says yes to it), not this rule's
+  StreakLaunch long_none;
+  long_none.sim_s = 0.001;
+  long_none.card_kernel_s = 20e-6;
+  Estimate le;
+  le.sim_s = long_none.sim_s;
+  le.card_kernel_s = long_none.card_kernel_s;
+  VCHECK(should_offload(le, c) && !streak_offload(long_none, c, true));
   StreakLaunch no_estimate = s;
   no_estimate.sim_s = 0;
   VCHECK(!streak_offload(no_estimate, c, true));
   no_estimate.sim_s = -1;
+  VCHECK(!streak_offload(no_estimate, c, true));
+  no_estimate.sim_s = -1e-6;   // (with the pull added this would pass both bars)
   VCHECK(!streak_offload(no_estimate, c, true));
   no_estimate.sim_s = std::numeric_limits<double>::quiet_NaN();
   VCHECK(!streak_offload(no_estimate, c, true));
@@ -1837,6 +1847,23 @@ VTEST(a_streak_launch_keeps_the_margin_and_the_floor) {
   VCHECK(streak_offload(s, c, true));
   s.sim_s = c.min_sim_s - pull - 1e-9;
   VCHECK(!streak_offload(s, c, true));
+  // exactly at the floor: goes (the floor is "at least"); 1e6 bytes at 10 GB/s and 100 us add up to 200 us exactly in binary
+  StreakLaunch at;
+  at.card_only_bytes = 1000000;
+  at.card_kernel_s = 5e-6;
+  at.sim_s = 1e-4;
+  VCHECK(streak_keep_seconds(at, c) == c.min_sim_s && streak_offload(at, c, true));
+  // exactly at the margin: stays (the margin is "more than"); every number here is exact in binary
+  Costs exact = c;
+  exact.launch_s = 0.25;
+  exact.pull_bytes_per_s = 2;
+  StreakLaunch edge;
+  edge.card_only_bytes = 1;     // 0.5 s to pull
+  edge.card_kernel_s = 0.25;
+  edge.sim_s = 0.5;
+  VCHECK(streak_keep_seconds(edge, exact) == 1.0 && exact.margin * streak_card_seconds(edge, exact) == 1.0 && !streak_offload(edge, exact, true));
+  edge.sim_s = 0.5 + 1e-9;
+  VCHECK(streak_offload(edge, exact, true));
   // the margin, found by bisection on the simulator's time against the formula: the launch goes just above margin x the card side, not at it
   StreakLaunch m;
   m.card_only_bytes = 1ull << 20;
