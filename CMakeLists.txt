@@ -2068,6 +2068,9 @@ target_compile_definitions(test_amd_gcn_cdna_gaps PRIVATE VGPU_SOURCE_DIR="${CMA
 # Three bugs other programs ran into (issues #578, #579, #580): a negative scratch offset, a scalar load into VCC, a packed constant zero.
 vgpu_unit_test(test_amd_gcn_issues_nov11 amd/tests/unit/test_gcn_issues_nov11.cpp)
 target_compile_definitions(test_amd_gcn_issues_nov11 PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# Issue #621: a whole-wave load into accumulation registers the wave had not used yet lost all but the last of them.
+vgpu_unit_test(test_amd_gcn_issue621 amd/tests/unit/test_gcn_issue621.cpp)
+target_compile_definitions(test_amd_gcn_issue621 PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # A kernel with a dynamic stack gets the device's stack size of scratch (issue #585): the code object and execute, then a HIP launch.
 vgpu_unit_test(test_amd_gcn_dyn_stack amd/tests/unit/test_gcn_dyn_stack.cpp)
 target_compile_definitions(test_amd_gcn_dyn_stack PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

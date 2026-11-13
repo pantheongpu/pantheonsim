@@ -7,6 +7,13 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- AMD: a load into accumulation registers that the wave had not used yet, made for the whole wave at once (`global_load_dwordx2 a[38:39], v2,
+  s[6:7] offset:200`, every lane at one address, as a Kokkos kernel loads a pointer out of a structure), fills every register it names. The
+  register file grows to the highest accumulation register named, and growing it for the second register moved the first one's row, which
+  then went to the freed copy: a38 kept what it held before, and the next load through the pointer stopped with "invalid-pointer ...
+  address is not inside any device allocation" at a small address (llnl/exadis on the simulated MI300X, pantheonsim #621). The file now grows
+  to the last register before any row is taken (the whole-wave loads of two, three and four dwords and the whole-wave store of three or
+  four). It surfaced with host-mapped memory taking the whole-wave path (#507): exadis's data is managed memory, which went lane by lane before.
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the
