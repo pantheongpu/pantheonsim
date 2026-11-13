@@ -431,6 +431,10 @@ void mma_frag_b(FragType t, unsigned K, const uint32_t* regs, float* f, int32_t*
   }
 }
 
+namespace {
+
+// internal like the other VGPU_COLD templates: an instantiation with external linkage is COMDAT,
+//  and GCC rejects COMDAT and local functions in the one named section ("section type conflict")
 template <unsigned Bits> VGPU_COLD void sparse_expand_t(unsigned K, unsigned sel, const uint32_t* meta, const uint32_t* stored_vals, uint32_t* out) {
   constexpr bool tf32 = Bits == 32;
   constexpr unsigned chunk_elems = tf32 ? 2 : 4, stored = chunk_elems / 2;
@@ -450,6 +454,8 @@ template <unsigned Bits> VGPU_COLD void sparse_expand_t(unsigned K, unsigned sel
     }
   }
 }
+
+}  // namespace
 
 void wgmma_sparse_expand(unsigned abits, unsigned K, unsigned sel, const uint32_t* meta, const uint32_t* stored_vals, uint32_t* out) {
   switch (abits) {
