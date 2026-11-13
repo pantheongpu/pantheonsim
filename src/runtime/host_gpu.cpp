@@ -663,11 +663,13 @@ struct Runtime::Impl : CardGate {
     // every launch of a graph was refused.)
     if (!wider && cfg.conditionals) return unsafe("inside a graph with conditionals");
     if (cfg.warp_size && cfg.warp_size != 32) return unsafe("warp size");
+    // (host_map_possible first: an inline range check, then the lookup. CUDA Samples LargeKernelParameter passes 32 KiB of parameters a launch,
+    // 2,002 launches: the out-of-line lookup of every word cost it 6 % with the mode on and no launch sent, on the A10G rig.)
     for (const auto& a : args)
       for (size_t i = 0; i + 8 <= a.size(); i += 8) {
         uint64_t v;
         std::memcpy(&v, &a[i], 8);
-        if (v && mem.is_host_mapped(v)) return unsafe("argument points into mapped host memory");
+        if (v && mem.host_map_possible(v) && mem.is_host_mapped(v)) return unsafe("argument points into mapped host memory");
       }
     // Device memory that is not in the allocation table (VMM mappings, IPC, the kernel heap) is not on the card: a pointer to it, from an argument or from
     // memory, would read what the card never got. Not cached: a mapping can appear between two launches of one kernel.
