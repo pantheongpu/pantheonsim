@@ -40,7 +40,12 @@ template <typename F>
 F entry(const char* name) {
   void* fn = nullptr;
   cudaDriverEntryPointQueryResult q = cudaDriverEntryPointSymbolNotFound;
+#if CUDART_VERSION >= 12050
   const cudaError_t e = cudaGetDriverEntryPointByVersion(name, &fn, CUDART_VERSION, cudaEnableDefault, &q);
+#else
+  // cudaGetDriverEntryPointByVersion is CUDA 12.5 and later; Ubuntu's apt toolkit is 12.0.
+  const cudaError_t e = cudaGetDriverEntryPoint(name, &fn, cudaEnableDefault, &q);
+#endif
   if (e != cudaSuccess || q != cudaDriverEntryPointSuccess || !fn) {
     std::printf("FAIL entry point %s: %d, found %d\n", name, static_cast<int>(e), static_cast<int>(q));
     ++failures;
