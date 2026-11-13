@@ -14,7 +14,8 @@ release says what runs and what it produces, never how fast a real GPU would run
   back, and the next card launch pushed it all again. Measured on one A10G (Round sp65): PolyBench LU 11.6 s to 1.5 s in turbo mode and with
   `VGPU_HOST_GPU_DIV=1`, Rodinia gaussian 0.99 s to 0.53 s, GRAMSCHM's traffic from 98 GB to 40 GB each way; outputs identical.
   `VGPU_HOST_GPU_STREAK=0` keeps the old rule; the summary's `host_gpu_streak:` line counts the launches sent this way
-  ([design](docs/perf-design/12-host-gpu-turbo.md), section 9).
+  ([design](docs/perf-design/12-host-gpu-turbo.md), section 9). A launch with a grid or block dimension of 0 now stays in the simulator, which
+  reports its own configuration error, instead of failing on the card (it ended the mode with an internal error when the card held memory).
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the

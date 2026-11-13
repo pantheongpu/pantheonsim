@@ -1,19 +1,29 @@
-Host-GPU benchmark: nvidia/a10g, 10 runs (median wall seconds), timeout 300 s, atol 1e-08, rtol 1e-05, threads default.
+Ten runs a form (twenty for sc_gpu) of every reading more than 3 % apart in the A/B; medians. Full rows: summary.py over repeat*.json on the rig.
+| program | mode | without the rule s | with it s | with / without | sent by the rule | card launches with / without | outputs with / without |
+|---|---|---:|---:|---:|---:|---:|---|
+| hecbench/atan2-cuda | exact | 0.030 | 0.030 | 1.007 | - | 0 / 0 | identical / identical |
+| hecbench/atan2-cuda | turbo | 0.029 | 0.029 | 1.000 | 0 | 0 / 0 | identical / identical |
+| hecbench/attention-cuda | exact | 0.036 | 0.036 | 0.997 | - | 0 / 0 | identical / identical |
+| hecbench/attention-cuda | turbo | 0.036 | 0.036 | 0.997 | 0 | 0 / 0 | identical / identical |
+| hecbench/bgmv-cuda | exact | 0.018 | 0.017 | 0.989 | - | 0 / 0 | identical / identical |
+| hecbench/bgmv-cuda | turbo | 0.017 | 0.017 | 1.000 | 0 | 0 / 0 | identical / identical |
+| polybench/3DCONV | exact | 0.778 | 0.778 | 1.000 | - | 0 / 0 | identical / identical |
+| polybench/3DCONV | turbo | 0.780 | 0.776 | 0.995 | 0 | 0 / 0 | identical / identical |
+| polybench/JACOBI2D | exact | 0.562 | 0.563 | 1.002 | - | 22 / 22 | identical / identical |
+| polybench/JACOBI2D | turbo | 0.564 | 0.562 | 0.998 | 0 | 22 / 22 | identical / identical |
+| polybench/MVT | exact | 1.224 | 1.228 | 1.004 | - | 0 / 0 | identical / identical |
+| polybench/MVT | turbo | 1.227 | 1.227 | 1.000 | 0 | 0 / 0 | identical / identical |
+| rodinia/backprop | exact | 0.616 | 0.616 | 1.001 | - | 0 / 0 | identical / identical |
+| rodinia/backprop | turbo | 0.722 | 0.723 | 1.002 | 0 | 1 / 1 | identical / identical |
+| rodinia/lud | exact | 3.001 | 3.004 | 1.001 | - | 50 / 50 | identical / identical |
+| rodinia/lud | turbo | 2.861 | 2.767 | 0.967 | 63 | 174 / 95 | identical / identical |
+| rodinia/needle | exact | 0.374 | 0.369 | 0.988 | - | 0 / 0 | identical / identical |
+| rodinia/needle | turbo | 0.371 | 0.369 | 0.994 | 0 | 0 / 0 | identical / identical |
+| rodinia/sc_gpu | exact | 0.793 | 0.797 | 1.005 | - | 1059 / 1063 | identical / identical |
+| rodinia/sc_gpu | turbo | 0.764 | 0.802 | 1.050 | 0 | 1065 / 1059 | identical / identical |
+| hecbench/black-scholes-cuda | exact | 25.194 | 25.174 | 0.999 | - | 0 / 0 | identical / identical |
+| rodinia/sc_gpu | turbo | 0.798 | 0.754 | 0.945 | 0 | 1063 / 1063 | identical / identical |
+| rodinia/gaussian | exact | 0.936 | 0.939 | 1.003 | - | 495 / 495 | identical / identical |
+| rodinia/lud | exactdiv | 2.882 | 2.844 | 0.987 | - | 95 / 95 | identical / identical |
 
-| program | sim s | exact s | x sim | exact card / all launches | exact card s / sim s | exact output | exactn s | x sim | exactn card / all launches | exactn card s / sim s | exactn output | turbo s | x sim | turbo card / all launches | turbo card s / sim s | turbo output | turbon s | x sim | turbon card / all launches | turbon card s / sim s | turbon output | turbo kept in sim: never/atomics/off/exact/safety/small |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| polybench/3DCONV | 0.77 | 0.78 | 0.99x | 0 / 254 | - | identical | 0.78 | 0.99x | 0 / 254 | - | identical | 0.78 | 0.99x | 0 / 254 | 0.00 / 0.50 | identical | 0.78 | 0.98x | 0 / 254 | 0.00 / 0.51 | identical | 0/0/0/0/0/252 |
-| polybench/JACOBI2D | 0.63 | 0.56 | 1.13x | 22 / 40 | - | identical | 0.56 | 1.13x | 22 / 40 | - | identical | 0.56 | 1.13x | 22 / 40 | 0.00 / 0.26 | identical | 0.56 | 1.12x | 22 / 40 | 0.00 / 0.26 | identical | 0/0/0/0/0/14 |
-| polybench/MVT | 1.23 | 1.23 | 1.00x | 0 / 2 | - | identical | 1.22 | 1.00x | 0 / 2 | - | identical | 1.23 | 1.00x | 0 / 2 | 0.00 / 0.99 | identical | 1.23 | 1.00x | 0 / 2 | 0.00 / 1.03 | identical | 0/0/0/0/0/0 |
-| rodinia/backprop | 0.62 | 0.62 | 1.00x | 0 / 2 | - | identical | 0.62 | 1.00x | 0 / 2 | - | identical | 0.72 | 0.85x | 1 / 2 | 0.02 / 0.27 | identical | 0.72 | 0.85x | 1 / 2 | 0.02 / 0.27 | identical | 0/0/0/0/0/0 |
-| rodinia/lud | 3.58 | 3.00 | 1.19x | 50 / 190 | - | identical | 3.00 | 1.19x | 50 / 190 | - | identical | 2.77 | 1.29x | 174 / 190 | 0.01 / 0.28 | identical | 2.86 | 1.25x | 95 / 190 | 0.04 / 0.30 | identical | 0/0/0/0/0/10 |
-| rodinia/needle | 0.36 | 0.37 | 0.98x | 0 / 255 | - | identical | 0.37 | 0.96x | 0 / 255 | - | identical | 0.37 | 0.98x | 0 / 255 | 0.00 / 0.32 | identical | 0.37 | 0.97x | 0 / 255 | 0.00 / 0.32 | identical | 0/0/0/0/0/251 |
-| rodinia/sc_gpu | 1.06 | 0.80 | 1.33x | 1059 / 1432 | - | identical | 0.79 | 1.34x | 1063 / 1432 | - | identical | 0.80 | 1.32x | 1065 / 1432 | 0.11 / 0.25 | identical | 0.76 | 1.39x | 1059 / 1432 | 0.10 / 0.25 | identical | 0/0/0/0/0/365 |
-| hecbench/atan2-cuda | 0.03 | 0.03 | 0.98x | 0 / 3 | - | identical | 0.03 | 0.98x | 0 / 3 | - | identical | 0.03 | 0.99x | 0 / 3 | 0.00 / 0.02 | identical | 0.03 | 0.99x | 0 / 3 | 0.00 / 0.02 | identical | 0/0/0/0/0/0 |
-| hecbench/attention-cuda | 0.04 | 0.04 | 1.00x | 0 / 3 | - | identical | 0.04 | 0.99x | 0 / 3 | - | identical | 0.04 | 1.00x | 0 / 3 | 0.00 / 0.01 | identical | 0.04 | 1.00x | 0 / 3 | 0.00 / 0.01 | identical | 0/0/0/0/3/0 |
-| hecbench/bgmv-cuda | 0.02 | 0.02 | 0.99x | 0 / 12 | - | identical | 0.02 | 0.98x | 0 / 12 | - | identical | 0.02 | 1.00x | 0 / 12 | 0.00 / 0.01 | identical | 0.02 | 1.00x | 0 / 12 | 0.00 / 0.01 | identical | 0/0/0/0/12/0 |
-
-exact: geometric mean speed-up over sim 1.05x (10 programs).
-exactn: geometric mean speed-up over sim 1.05x (10 programs).
-turbo: geometric mean speed-up over sim 1.05x (10 programs).
-turbon: geometric mean speed-up over sim 1.05x (10 programs).
+sc_gpu, 20 runs: two levels about 0.75 s and 0.80 s in every form (sp60b saw the same); turbo 14 of 20 runs low, turbon 7 of 20.

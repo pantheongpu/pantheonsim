@@ -20,3 +20,15 @@ reduced HeCBench list (`tools/bench/real/pack_corpora.sh`), with the arguments o
 | `card-run.sh`, `cardlog.py` | the card part, by stage (`build`, `ci`, `target`, `ab`, `log`, `repeat`), and the per-kernel summary of a `VGPU_HOST_GPU_LOG=1` run |
 | `mutants-pass1.txt` | the first pass: 19 of 23 killed; the four survivors (no card data needed, a negative estimate, the floor and the margin at their exact values) were killed by tests added at those edges (`mutants.txt`: 23 of 23) |
 | `offline/` | the tables of `analyze.sh` over the turbo traces (PolyBench, Rodinia): `replay-turbo` (today against the rule, per program), `q1-turbo` (question 1), `why-turbo` (what keeps the launches that stay for their size), `changes-turbo` (per kernel, the launches whose decision changes), `variants.txt` (the three variants decide alike), `replay-exact`, `changes-exact`, `why-exact` (exact mode, the programs traced in it), `q2-turbo` (question 2), `sim-scale.txt`; `stub-check.txt` (LU against the stand-in card) |
+
+## On the card (AWS g5.xlarge, us-east-1b, instance i-052e0df62d297f557: A10G, driver 595.112.07, 4 vCPU, nvcc 13.0; 2026-11-13)
+
+Simulator: `RelWithDebInfo`, no LTO (`tools/card-ci/run-card-ci.sh`), profile `nvidia/a10g`; the same corpus binaries, in `~/sp65-corp`.
+
+| file | what |
+|---|---|
+| `card/card-ci.txt` | the card CI's verdict lines (passed; `e2e_host_gpu_stub` with steps 24 to 26 passed in it and in the `ci` stage) |
+| `card/ab.md`, `card/ab.json` | `summary.py --short` over every pass: per program and mode the median with and without the rule, the launches it sent, the launches on the card, the outputs; the compact JSON has every row |
+| `card/target2.md`, `card/target3.md`, `card/gramschm.md`, `card/gramschm2.md` | the harness's tables of the target programs on the build with the change of the round's D (and of LU after the zero-grid fix), and GRAMSCHM before and after D |
+| `card/repeat.md` | ten runs a form (twenty for sc_gpu) of every reading more than 3 % apart |
+| `card/card-log.txt` | `cardlog.py` over `VGPU_HOST_GPU_LOG=1` runs of GRAMSCHM, LU, gaussian and lud in turbo mode with and without the rule (first build): per kernel the card's time against the estimate, the launches sent and kept, the bans |

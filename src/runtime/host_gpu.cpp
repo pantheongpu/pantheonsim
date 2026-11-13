@@ -1127,6 +1127,15 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   im.last = {};
   if (im.dead) return false;
   im.pending = {};
+  // A grid or block with a zero dimension is the simulator's to refuse, with its own error (cudaErrorInvalidConfiguration): on the card the launch fails,
+  // and with memory resident there that ended the mode with an internal error. PolyBench LU's last lu_kernel1 has such a grid; sp65's rule was the
+  // first to send it (as verify runs did before).
+  if (!cfg.grid[0] || !cfg.grid[1] || !cfg.grid[2] || !cfg.block[0] || !cfg.block[1] || !cfg.block[2]) {
+    ++im.stats.refused_launch;
+    ++im.stats.simulated;
+    if (logging()) std::fprintf(stderr, "host_gpu: %s stays in the simulator: a grid or block dimension is 0\n", fn.name.c_str());
+    return false;
+  }
   const Impl::Decision dec = im.kernel_eligible(fn, cfg, args, mem);
   const char* const why = dec.why;
   const uint64_t static_instrs = dec.instrs;

@@ -9,6 +9,7 @@ import argparse, json
 
 ap = argparse.ArgumentParser()
 ap.add_argument("files", nargs="+"); ap.add_argument("--md", action="store_true"); ap.add_argument("--json", default=""); ap.add_argument("--div0", default="")
+ap.add_argument("--short", action="store_true", help="only the rows where the rule sent a launch, or that are more than 3 % apart; a count of the others")
 a = ap.parse_args()
 progs = {}
 def norm(x):
@@ -40,8 +41,12 @@ for p in sorted(progs):
 sep = " | "
 print("| program | mode | without the rule s | with it s | with / without | sent by the rule | card launches with / without | outputs with / without |")
 print("|---|---|---:|---:|---:|---:|---:|---|")
+hidden = 0
 for p, m, o, n, ratio, st, cn, co, outs in rows:
+    if a.short and not st and 0.97 <= ratio <= 1.03 and outs[0] == "identical":
+        hidden += 1; continue
     print("| %s | %s | %.3f | %.3f | %.3f | %s | %s / %s | %s / %s |" % (p, m, o, n, ratio, "-" if st is None else st, cn, co, outs[0], outs[1]))
+if a.short: print("\n%d more rows: nothing sent by the rule, within 3 %%, outputs identical (all rows: --json)" % hidden)
 print()
 print("more than 3 %% slower with the rule: %s" % (", ".join("%s %s %.3f" % s for s in slow) or "none"))
 if a.json: json.dump(comp, open(a.json, "w"), separators=(",", ":"), sort_keys=True)

@@ -374,7 +374,8 @@ runs against `VGPU_HOST_GPU_STREAK=0`): PolyBench LU 11.6 s to 1.5 s in turbo mo
 to 16 MiB), Rodinia gaussian 0.99 s to 0.53 s, GRAMSCHM 271 s to 225 s in turbo (one run; its CPU reference is the rest), HeCBench axpby 1.11x and 1.14x.
 In exact mode without the division LU, gaussian and GRAMSCHM do not change: their short kernel is refused for its code, so the simulator runs it and
 the card holds nothing when the next launch comes. Outputs are the simulator's; no program was more than 3 % slower after ten runs of each reading
-over it. The card's own time for a short launch was 0.014 to 0.15 ms, and for a kernel on one block only twice under the simulator's estimate.
+over it. The run also found a launch with a grid of 0 blocks reaching the card (LU's last `lu_kernel1`): such a launch now stays in the simulator,
+which reports its own error. The card's own time for a short launch was 0.014 to 0.15 ms, and for a kernel on one block only twice under the simulator's estimate.
 
 ## 10. What is next
 

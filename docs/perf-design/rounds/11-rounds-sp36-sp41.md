@@ -2947,6 +2947,13 @@ of `atomicPerf` (8 in turbo, 9 ms in all, of 1.36 s).
   (`exec::g_sample_copy`), so not even a temporary file is left when it is ended.
 * *A program that reaps children it did not make* can see the copy: `VGPU_HOST_GPU_SAMPLE=0` is for it. Not tested.
 
+**A second finding of the card: a launch with a grid of zero reached it.** PolyBench LU's last `lu_kernel1` is launched on a grid of 0 blocks (a bug of
+the program, which the simulator answers with `cudaErrorInvalidConfiguration`). The mode's checks did not look at the grid's size, so once the rule
+sent LU's short launches this one went too, failed on the card while the card held memory, and ended the mode with an internal error (the summary's
+"1 failed on the card"; sp59's verify run of LU shows the same count). The output still matched, because the error came from the launch call before
+the kernel ran. A launch with a zero grid or block dimension now stays in the simulator, which reports its own error, in both modes and with or without
+the rule (`target3.md`: LU 1.51 s in turbo mode, 1.48 s with `VGPU_HOST_GPU_DIV=1`, no launch failed; it counts as an unsupported launch shape).
+
 ### E. Tests and mutants
 
 * `test_host_gpu_logic` (every CI job): 76 cases, 14 of them new: the constants the texts quote; how many blocks and which; how long a copy is
@@ -3324,7 +3331,7 @@ about 2 hours.
   `VGPU_HOST_GPU_DIV=1` the first two gain as in turbo mode. "Where admitted, in both modes" holds.
 * **Outputs**: the simulator's in every form of every program (`particlefilter_float` excepted, which does not repeat itself in the simulator).
 * **The bar** (no program more than 3 % slower than with sp61's rule in the same mode): see C; every reading over 3 % in one run was of a program
-  the rule sent nothing for, and ten runs each put them within REPEAT_RESULT.
+  the rule sent nothing for, and ten runs each (twenty for sc_gpu) put every one within 3 %.
 
 ### A. Question 1, offline: how many short launches sit between two card launches with every chunk resident
 
@@ -3371,10 +3378,14 @@ the pull dominates.
 
 ### C. The bar
 
-Target programs, 3 runs a form (`target.md`, `target2.md` after the change of D, `target-div0.md`), GRAMSCHM 1 run (`gramschm2.md`); the rest of
-PolyBench, Rodinia and the reduced HeCBench list, 1 run a form (`ab-rest.md`, `ab-hec.md`). Programs over 3 % in one run, none with a launch sent by
-the rule (`host_gpu_streak: sent=0` and the same launches on the card in both forms): REPEAT_LIST. Ten runs of each form (`repeat.md`,
-`repeat-bs.md`): REPEAT_RESULT. lud in turbo mode, the one program with launches sent that does not gain: 2.78 s against 2.82 (sent 63; its
+Target programs, 3 runs a form (the first pass and `target2.md` after the change of D, `target3.md` for LU after the zero-grid fix), GRAMSCHM 1 run
+(`gramschm.md` before D, `gramschm2.md` after); all compared in `card/ab.md` and `card/ab.json`; the rest of
+PolyBench, Rodinia and the reduced HeCBench list, 1 run a form. Programs over 3 % in one run, none with a launch sent by
+the rule (`host_gpu_streak: sent=0` and the same launches on the card in both forms): 3DCONV turbo +24 %, needle exact +14 %, JACOBI2D exact +8 %,
+backprop turbo +8 %, sc_gpu turbo +4 %, MVT turbo +4 %, needle turbo +3 %, and HeCBench atan2, attention, bgmv (runs of 20 to 40 ms) and black-scholes
+exact; on the changed build gaussian exact +6 % and lud with `VGPU_HOST_GPU_DIV=1` +3 %. Ten runs of each form (`card/repeat.md`): every one within
+1 % but sc_gpu in turbo mode, 0.802 s against 0.764 (+5 %) in ten runs; twenty more runs of it read 0.754 against 0.798 (-5 %): the program runs at
+two levels 50 ms apart in every form (sp60b saw the same), and the median of ten moves with how many runs land on each. lud in turbo mode, the one program with launches sent that does not gain: 2.78 s against 2.82 (sent 63; its
 launches on the card take 0.03 ms for 0.2 to 12 ms estimated, and the program's 2.8 s are its CPU part).
 
 A rig caveat: another round's build and runs shared the rig from about 13:55 to 14:20 UTC (during the first target pass and the A/B); the second target
@@ -3396,14 +3407,13 @@ change: 17 launches kept, 48 MiB moved, 225.0 s. LU, gaussian and lud were run a
   needed, a negative estimate, the floor and the margin taken strictly) were killed by tests added at those edges: 23 of 23.
 * `e2e_host_gpu_stub` steps 24 to 26 (a short launch follows a long one to a card that keeps memory and computes nothing, in both modes; not with
   `VGPU_HOST_GPU_STREAK=0`; not after the program read the memory back): first run on the rig, passed, as did the card CI (`card-ci.txt`).
-* Not covered by a test: the ban's new reference (D; runtime code, no stand-in can make a launch slow on purpose).
+* Not covered by a test: the ban's new reference (D; runtime code, no stand-in can make a launch slow on purpose), and the zero-grid refusal (the
+  stand-in program has no such launch; seen on the rig with LU).
 
 ### F. Caveats and what was not run
 
 * One rig, one card, one toolkit; 3 runs a form for the target programs, 1 for GRAMSCHM and the rest of the corpus (with ten runs of anything over 3 %).
 * The offline counts rest on a fitted factor between two machines' simulators; the card run is the measurement.
-* LU in turbo mode reports one launch "failed on the card" in every form that sends `lu_kernel1` (as sp59's verify run did); the launch falls back to
-  the simulator and the output is identical. Not investigated.
 * HeCBench programs that sp59 found with no launch on the card, and the long HeCBench programs (aligned-types, babelstream, base64e, binomial,
   atomicReduction: almost no launch kept for its size in sp59), were not traced; the A/B ran the reduced list without the five long ones.
 * Not compiled with the sanitizers or the CUDA 12 headers: the hosted CI jobs are their first run. `g++-12 -fsyntax-only` of the two changed C++ files is clean.
