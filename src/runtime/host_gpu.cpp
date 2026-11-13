@@ -277,6 +277,7 @@ struct Runtime::Impl : CardGate {
   uint32_t multiprocessors = 0;   // of the simulated profile (and the card: start() checks they agree)
   // The card copy outlives a launch (docs/perf-design/09-host-gpu-spike.md section 4) unless VGPU_HOST_GPU_WRITE_THROUGH=1.
   bool resident = true;
+  bool streak_rule = true;   // VGPU_HOST_GPU_STREAK=0: a launch in a card streak is judged like any other (the rule before Round sp65)
   MemoryManager* gate_mem = nullptr;
   using Res = Tracked;   // (vgpu/host_gpu_track.hpp)
   TrackedMap res;
@@ -287,6 +288,9 @@ struct Runtime::Impl : CardGate {
   struct Last {
     bool in_set = false;
     double card_s = -1;
+    uint32_t threads_per_block = 0;   // (for the trace's launch line: what the first-launch and sampling rules read)
+    uint64_t instrs = 0;
+    bool loop = false;
   } last;
   // The simulator time spent so far in launches of exact-set kernels that stayed in the simulator: the ski-rental account of should_offload_with_start (host_gpu.hpp).
   double eligible_sim_spent_s = 0;
@@ -322,6 +326,13 @@ struct Runtime::Impl : CardGate {
 
   // ---- the gate (vgpu::CardGate): called by the memory manager on the slow path of any access to an allocation with a valid card copy ----
   static uint64_t chunk_len(const Res& a, uint64_t c) { return std::min<uint64_t>(kChunkSize, a.size - c * kChunkSize); }
+  // The bytes of an allocation that only the card holds (its Where::Card chunks), in O(1): every chunk is whole but the last.
+  static uint64_t card_only_len(const Res& a) {
+    const uint64_t n = a.r.count(Where::Card);
+    if (!n) return 0;
+    const uint64_t last = a.r.chunks() - 1;
+    return n * kChunkSize - (a.r.at(last) == Where::Card ? kChunkSize - chunk_len(a, last) : 0);
+  }
 
   void update_slot(Res& a) {
     const uint32_t v = static_cast<uint32_t>(a.r.card_valid());
@@ -891,6 +902,7 @@ void print_summary(Runtime::Impl* im) {
                  ull(s.refused_never), ull(s.refused_atomics), ull(s.refused_off), ull(s.refused_exact), ull(s.refused_launch), ull(s.refused_size), ull(s.failed));
     std::fprintf(stderr, "host_gpu_sampled: sampled=%llu sent=%llu timeouts=%llu cost_s=%.6f after_driver=%llu copies_running_at_exit=%zu copies_left=%zu\n", ull(s.sampled),
                  ull(s.sample_sent), ull(s.sample_timeouts), s.sample_seconds, ull(s.sample_after_driver), im->copies_running_at_exit, sample_copies_reap(false));
+    std::fprintf(stderr, "host_gpu_streak: sent=%llu card_only_mib=%.1f rule=%d\n", ull(s.streak_sent), s.streak_card_only_bytes / 1048576.0, im->streak_rule ? 1 : 0);
     if (turbo && im->verify)
       for (const auto& [k, kt] : im->tol_by_kernel)
         if (kt.rep.outside)
@@ -956,6 +968,7 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
     r->impl_->configure_start(profile, kDeviceVaBase);
     if (const char* v = std::getenv("VGPU_HOST_GPU_VERIFY"); v && *v && *v != '0') r->impl_->verify = std::string(v) == "all" ? 2 : 1;
     if (const char* v = std::getenv("VGPU_HOST_GPU_WRITE_THROUGH"); v && *v && *v != '0') r->impl_->resident = false;
+    if (const char* v = std::getenv("VGPU_HOST_GPU_STREAK"); v && std::string(v) == "0") r->impl_->streak_rule = false;
     if (const char* v = std::getenv("VGPU_HOST_GPU_NO_FIRST_LAUNCH"); v && *v && *v != '0') r->impl_->first_launch_off = true;
     if (const char* v = std::getenv("VGPU_HOST_GPU_DIV"); v && *v && *v != '0') r->impl_->div_idiom = true;
     if (const char* v = std::getenv("VGPU_HOST_GPU_SAMPLE"); v && *v)   // 0: no launch is sampled (the rule before sp60b); log: see SampleMode
@@ -1022,8 +1035,10 @@ void Runtime::note_simulated(const ptx::EntryFn& fn, const exec::LaunchConfig& c
           }
         }
     std::lock_guard<std::mutex> tg(g_trace_mu);
-    std::fprintf(g_trace_file, "L %s %llu %.9f %d %.9f |%s\n", fn.name.c_str(), static_cast<unsigned long long>(uint64_t{cfg.grid[0]} * cfg.grid[1] * cfg.grid[2]),
-                 sim_seconds, impl_->last.in_set ? 1 : 0, impl_->last.card_s, bases.c_str());
+    // L kernel blocks sim_s in_set card_s threads_per_block static_instrs loop |argument-allocation-bases (the three fields before the bar since Round sp65)
+    std::fprintf(g_trace_file, "L %s %llu %.9f %d %.9f %u %llu %d |%s\n", fn.name.c_str(), static_cast<unsigned long long>(uint64_t{cfg.grid[0]} * cfg.grid[1] * cfg.grid[2]),
+                 sim_seconds, impl_->last.in_set ? 1 : 0, impl_->last.card_s, impl_->last.threads_per_block, static_cast<unsigned long long>(impl_->last.instrs),
+                 impl_->last.loop ? 1 : 0, bases.c_str());
   }
   Impl::Pending& p = impl_->pending;
   if (p.active && mem && p.kernel == fn.name) {
@@ -1112,12 +1127,24 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   im.last = {};
   if (im.dead) return false;
   im.pending = {};
+  // A grid or block with a zero dimension is the simulator's to refuse, with its own error (cudaErrorInvalidConfiguration): on the card the launch fails,
+  // and with memory resident there that ended the mode with an internal error. PolyBench LU's last lu_kernel1 has such a grid; sp65's rule was the
+  // first to send it (as verify runs did before).
+  if (launch_shape_empty(cfg.grid.data(), cfg.block.data())) {
+    ++im.stats.refused_launch;
+    ++im.stats.simulated;
+    if (logging()) std::fprintf(stderr, "host_gpu: %s stays in the simulator: a grid or block dimension is 0\n", fn.name.c_str());
+    return false;
+  }
   const Impl::Decision dec = im.kernel_eligible(fn, cfg, args, mem);
   const char* const why = dec.why;
   const uint64_t static_instrs = dec.instrs;
   const bool runnable = dec.runnable, back_edge = dec.back_edge;
   const bool in_exact_set = dec.ok;   // (in turbo mode: admitted by its classes)
   im.last.in_set = in_exact_set;
+  im.last.threads_per_block = cfg.block[0] * cfg.block[1] * cfg.block[2];
+  im.last.instrs = static_instrs;
+  im.last.loop = dec.loop;
   const uint64_t blocks = uint64_t{cfg.grid[0]} * cfg.grid[1] * cfg.grid[2];
   // (The driver is not started here, whatever the kernel: only a launch that has been decided to go to the card starts it, below, at await_start.)
   if (!in_exact_set && !(im.verify == 2 && runnable)) {
@@ -1157,12 +1184,14 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     total += r.second;
     hi = std::max(hi, r.first + r.second);
   }
-  uint64_t push_bytes = total;
+  uint64_t push_bytes = total, card_only_bytes = 0;
   if (im.resident) {   // only the chunks the simulator wrote since the card last had them; what the host reads later is paid when it reads
     im.sync_tracking(mem, ranges);
     push_bytes = 0;
-    for (const auto& [b, a] : im.res)
+    for (const auto& [b, a] : im.res) {
       for (uint64_t c : a.r.host_chunks()) push_bytes += Impl::chunk_len(a, c);
+      card_only_bytes += Impl::card_only_len(a);
+    }
   }
   Estimate e;
   e.sim_s = *sim_s;
@@ -1174,10 +1203,21 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     ++im.stats.simulated;
     return false;
   }
-  if (total > im.max_bytes || (!forced && !im.verify && !should_offload_with_start(e, im.costs, im.start_sh != nullptr, im.eligible_sim_spent_s))) {
+  const bool by_size = forced || im.verify || should_offload_with_start(e, im.costs, im.start_sh != nullptr, im.eligible_sim_spent_s);
+  // Round sp65: while the card holds chunks the simulator does not, keeping this launch would pull them back first, and sending it moves only what
+  // the simulator holds alone (streak_offload). `ref_s` is what the simulator side was expected to cost: the bans below weigh the card path against it.
+  bool streak = false;
+  if (!by_size && im.resident && im.streak_rule && total <= im.max_bytes) {
+    const StreakLaunch sl{e.sim_s, card_only_bytes, push_bytes, e.card_kernel_s};
+    streak = streak_offload(sl, im.costs, im.start_sh != nullptr);
+  }
+  // Whichever rule sends it, a launch while the card holds chunks the simulator does not is weighed by the bans against the pull it saves too
+  // (ban_reference_seconds, vgpu/host_gpu.hpp).
+  const double ref_s = ban_reference_seconds(StreakLaunch{e.sim_s, card_only_bytes, push_bytes, e.card_kernel_s}, im.costs, im.resident && im.streak_rule);
+  if (total > im.max_bytes || (!by_size && !streak)) {
     ++im.stats.refused_size;
     ++im.stats.simulated;
-    if (logging()) std::fprintf(stderr, "host_gpu: %s stays in the simulator (sim %.3f ms, card path %.3f ms%s, %.1f MiB)\n", fn.name.c_str(), e.sim_s * 1e3, card_path_seconds(e, im.costs) * 1e3, im.start_sh ? "" : " without the driver start", total / 1048576.0);
+    if (logging()) std::fprintf(stderr, "host_gpu: %s stays in the simulator (sim %.3f ms, card path %.3f ms%s, %.1f MiB, %.1f MiB only on the card)\n", fn.name.c_str(), e.sim_s * 1e3, card_path_seconds(e, im.costs) * 1e3, im.start_sh ? "" : " without the driver start", total / 1048576.0, card_only_bytes / 1048576.0);
     return false;
   }
 
@@ -1295,11 +1335,11 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   if (im.resident) {   // nothing comes back now: the simulator's memory is stale where the card wrote, and the gate pulls it when it is read
     const double total_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     const bool first_card_launch = im.card_kernel_s.count(fn.name) == 0;
-    if (!first_card_launch && !offload_paid_off(total_s, e.sim_s)) {
+    if (!first_card_launch && !offload_paid_off(total_s, ref_s)) {
       im.banned.insert(fn.name);
-      if (logging()) std::fprintf(stderr, "host_gpu: %s took %.3f ms on the card path against an estimate of %.3f ms in the simulator: offloading it ends\n", fn.name.c_str(), total_s * 1e3, e.sim_s * 1e3);
+      if (logging()) std::fprintf(stderr, "host_gpu: %s took %.3f ms on the card path against an estimate of %.3f ms in the simulator: offloading it ends\n", fn.name.c_str(), total_s * 1e3, ref_s * 1e3);
     }
-    if (im.traffic.record(fn.name, push_bytes, total, total_s, e.sim_s, !first_card_launch) && im.banned.insert(fn.name).second && logging())
+    if (im.traffic.record(fn.name, push_bytes, total, total_s, ref_s, !first_card_launch) && im.banned.insert(fn.name).second && logging())
       std::fprintf(stderr, "host_gpu: %s pushed %.1f MiB of %.1f MiB live on each of its last %u launches: offloading it ends (traffic)\n", fn.name.c_str(),
                    push_bytes / 1048576.0, total / 1048576.0, kTrafficLaunches);
     im.card_kernel_s[fn.name] = kernel_s;
@@ -1307,6 +1347,13 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     im.sim_times.note_offload(fn.name);
     if (first_launch_rule && logging()) std::fprintf(stderr, "host_gpu: %s: first launch decided by the static rule (loop, %llu blocks)\n", fn.name.c_str(), static_cast<unsigned long long>(blocks));
     if (forced && logging()) std::fprintf(stderr, "host_gpu: %s: sent by the time of its first blocks (%.3f s in the simulator, at least)\n", fn.name.c_str(), *forced_sim_s);
+    if (streak) {
+      ++im.stats.streak_sent;
+      im.stats.streak_card_only_bytes += card_only_bytes;
+      if (logging())
+        std::fprintf(stderr, "host_gpu: %s: sent because the card holds the memory (sim %.3f ms + %.2f MiB to pull back, against %.3f ms on the card path)\n", fn.name.c_str(),
+                     e.sim_s * 1e3, card_only_bytes / 1048576.0, total_s * 1e3);
+    }
     if (logging())
       std::fprintf(stderr, "host_gpu: %s on the card (resident): kernel %.3f ms, total %.3f ms (sim estimate %.3f ms), %.2f MiB pushed\n", fn.name.c_str(), kernel_s * 1e3,
                    total_s * 1e3, e.sim_s * 1e3, push_bytes / 1048576.0);

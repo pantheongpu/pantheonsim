@@ -1,0 +1,15 @@
+== build
+== unit tests
+== e2e (card present: a skip is a failure)
+== verify run, machine-readable summary
+== turbo verify run, machine-readable summary
+== SFU and division exhaustive checks (stride 257)
+== turbo mode's probes (reported; stride 257)
+VERDICT kind=imax repeats
+VERDICT kind=iadd varies
+VERDICT kind=fred varies
+VERDICT kind=fatom varies
+VERDICT kind=dadd varies
+VERDICT kind=cas varies
+VERDICT kind=exch varies
+PASS: card CI on NVIDIA A10G
