@@ -67,6 +67,7 @@
 #endif
 #include <strings.h>
 
+#include "driver_symbol.hpp"
 #include "nvshmem_abi.hpp"
 #include "vgpu/runtime/capture.hpp"
 #include "vgpu/runtime/shim_memory.hpp"
@@ -1345,10 +1346,11 @@ NVSHMEM_EXPORT int nvshmemx_set_attr_mpi_comm_args(void* mpi_comm, nvshmemx_init
   return 0;
 }
 
-// A module loaded with the driver API carries its own nvshmemi_device_state_d.
+// A module loaded with the driver API carries its own nvshmemi_device_state_d. The driver is found wherever it is, a private one
+// under `vgpu run --preload` too (driver_symbol.hpp).
 NVSHMEM_EXPORT int nvshmemx_cumodule_init(CUmodule module) {
   using GetGlobal = CUresult (*)(CUdeviceptr*, size_t*, CUmodule, const char*);
-  auto fn = reinterpret_cast<GetGlobal>(dlsym(RTLD_DEFAULT, "cuModuleGetGlobal_v2"));
+  auto fn = reinterpret_cast<GetGlobal>(vgpu_driver_symbol("cuModuleGetGlobal_v2"));
   State& s = st();
   if (!fn || !initialized(s)) return 1;
   CUdeviceptr p = 0;
@@ -1363,7 +1365,7 @@ NVSHMEM_EXPORT int nvshmemx_cumodule_finalize(CUmodule) { return 0; }
 // The same for a library loaded with the driver's cuLibrary calls.
 NVSHMEM_EXPORT int nvshmemx_culibrary_init(CUlibrary library) {
   using GetGlobal = CUresult (*)(CUdeviceptr*, size_t*, CUlibrary, const char*);
-  auto fn = reinterpret_cast<GetGlobal>(dlsym(RTLD_DEFAULT, "cuLibraryGetGlobal"));
+  auto fn = reinterpret_cast<GetGlobal>(vgpu_driver_symbol("cuLibraryGetGlobal"));
   State& s = st();
   if (!fn || !initialized(s)) return 1;
   CUdeviceptr p = 0;

@@ -1391,6 +1391,14 @@ cudaError_t symbol_address(State& s, const void* symbol, uint64_t* addr, size_t*
 }
 }  // namespace
 
+// The same lookup for the other shims (CUPTI's current context, nvshmemx_cumodule_init, ...: driver_symbol.hpp), which cannot see
+// the private handle.
+VGPU_EXPORT void* vgpu_driver_dlsym_v1(const char* name) { return driver_dlsym(name); }
+// cuDevicePrimaryCtxReset took the primary context out of the active state (driver_api.cpp). On an RTX 3060 the runtime's
+// next call that uses the device makes it active again (and cuProfilerStart, CUDA_ERROR_CONTEXT_IS_DESTROYED before that
+// call, succeeds after it): every thread hands the driver its context once more, as after a load of the driver.
+VGPU_EXPORT void vgpu_runtime_primary_reset_v1() { g_driver_loads.fetch_add(1, std::memory_order_release); }
+
 // The side of a symbol copy that is not the symbol: cudaMemcpyDeviceToDevice
 // says it is device memory and it must be; cudaMemcpyHostToDevice (or
 // ToHost) says host, but a device allocation there is still copied as one,
@@ -6579,15 +6587,22 @@ VGPU_EXPORT cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* cfg, const
   return traced_call("cudaLaunchKernelExC", cudaLaunchKernelExC_traced, cfg, func, args);
 }
 
-// Profiler control is a no-op: there is no external profiler attached, and a
-// framework toggling it must not fail.
-// Measured on an RTX 3060: both fail while a capture is going on (the unsafe calls' rule).
-static cudaError_t cudaProfilerStart_traced() { return capture_unsafe_gate("cudaProfilerStart"); }
+// Profiler control: there is no external profiler attached, but the calls are runtime calls like any other. Measured on an RTX
+// 3060 (CUDA 13.0): both fail while a capture is going on (the unsafe calls' rule); they start the runtime and make the device's
+// primary context current on the calling thread, a thread the runtime has not used and one whose driver context was destroyed
+// or cleared too (a later cuCtxGetCurrent finds it); a dead context's fault (700, 719) is what they answer, and is the last
+// error; with no device (CUDA_VISIBLE_DEVICES empty) they answer cudaErrorNoDevice; otherwise cudaSuccess, Start twice and
+// Stop with no Start too. They used to answer success always, touching nothing.
+static cudaError_t profiler_control(const char* api) {
+  if (const cudaError_t refused = capture_unsafe_gate(api)) return refused;
+  return guard(api, [](State&) { return cudaSuccess; });
+}
+static cudaError_t cudaProfilerStart_traced() { return profiler_control("cudaProfilerStart"); }
 
 VGPU_EXPORT cudaError_t cudaProfilerStart() {
   return traced_call("cudaProfilerStart", cudaProfilerStart_traced);
 }
-static cudaError_t cudaProfilerStop_traced() { return capture_unsafe_gate("cudaProfilerStop"); }
+static cudaError_t cudaProfilerStop_traced() { return profiler_control("cudaProfilerStop"); }
 
 VGPU_EXPORT cudaError_t cudaProfilerStop() {
   return traced_call("cudaProfilerStop", cudaProfilerStop_traced);
@@ -7070,7 +7085,7 @@ static bool async_defer(cudaStream_t stream, const std::function<bool(State&)>& 
   if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) return false;
   if (!async_would_wait(stream) || !async_defer_stream_ok(stream) || async_libraries_loaded()) return false;
   using Probe = int (*)();
-  const Probe driver_managed = reinterpret_cast<Probe>(dlsym(RTLD_DEFAULT, "vgpu_driver_has_managed_v1"));
+  const Probe driver_managed = reinterpret_cast<Probe>(driver_dlsym("vgpu_driver_has_managed_v1"));
   if (driver_managed && driver_managed()) return false;
   // Pending work behind a host function: queued once outstanding copies and kernels finish at exit, as the launch's are.
   static const bool registered = std::atexit([] { async_wait_device(); }) == 0;
@@ -7703,7 +7718,7 @@ GetProcAddressFn simulator_get_proc_address() {
     dir = dir.substr(0, dir.find_last_of('/') + 1);
     // Whether the runtime already sees the driver (the program links libcuda, or preloads it): then it has been
     // initialised and handed the runtime's contexts as usual, and there is nothing more to do here.
-    const bool seen = dlsym(RTLD_DEFAULT, "vgpu_driver_bind_primary_v1") != nullptr;
+    const bool seen = driver_dlsym("vgpu_driver_bind_primary_v1") != nullptr;   // (a private one returned above)
     void* h = dlopen((dir + "libcuda.so.1").c_str(), RTLD_NOW | RTLD_GLOBAL);
     if (!h) return nullptr;
     if (seen) return reinterpret_cast<GetProcAddressFn>(dlsym(h, "cuGetProcAddress_v2"));

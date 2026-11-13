@@ -1854,6 +1854,9 @@ static CUresult cuDevicePrimaryCtxReset_impl(CUdevice dev) {
     s.primary_active.erase(dev);
     if (const auto it = s.primary_ctx.find(dev); it != s.primary_ctx.end())
       s.ctx_state[it->second].flags = kCtxMapHost;
+    // The runtime's next call that uses the device makes the context active again, as on the card (runtime_api.cpp).
+    using Rebind = void (*)();
+    if (const auto rebind = reinterpret_cast<Rebind>(dlsym(RTLD_DEFAULT, "vgpu_runtime_primary_reset_v1"))) rebind();
     return CUDA_SUCCESS;
   });
 }
@@ -3393,18 +3396,35 @@ static CUresult cuProfilerInitialize_impl(const char* configFile, const char* ou
   return api("cuProfilerInitialize", true, false, [](ShimState&) { return CUDA_ERROR_NOT_SUPPORTED; });
 }
 
-// No profiler collects anything to start or stop; the card succeeds.
+// No profiler collects anything to start or stop, but the calls check the context as the card's do. An RTX 3060 (CUDA 13.0,
+// driver 610.88) answers both with CUDA_ERROR_NOT_INITIALIZED before cuInit, CUDA_ERROR_INVALID_CONTEXT with no current
+// context (a primary context retained but not made current, or a thread the runtime has not used, has none), and
+// CUDA_ERROR_CONTEXT_IS_DESTROYED when the current one is no longer alive: destroyed, or a primary context released to
+// nothing or reset (cuDevicePrimaryCtxReset, cudaDeviceReset); a dead context's fault (700, 719) as every call does; and
+// CUDA_SUCCESS otherwise, any number of times, a Stop with no Start too. The shim used to succeed always.
+static CUresult profiler_control(const char* name) {
+  return api(name, true, false, [](ShimState& s) {
+    if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
+    const uintptr_t h = ctx_stack().back();
+    const auto it = s.contexts.find(h);
+    if (it == s.contexts.end()) return CUDA_ERROR_CONTEXT_IS_DESTROYED;
+    const auto primary = s.primary_ctx.find(it->second);
+    if (primary != s.primary_ctx.end() && primary->second == h && !s.primary_active.count(it->second))
+      return CUDA_ERROR_CONTEXT_IS_DESTROYED;
+    return CUDA_SUCCESS;
+  });
+}
 static CUresult cuProfilerStart_impl(void);
 VGPU_EXPORT CUresult cuProfilerStart(void) { return traced("cuProfilerStart", cuProfilerStart_impl); }
 static CUresult cuProfilerStart_impl(void) {
   VGPU_CAPTURE_UNSAFE("cuProfilerStart");
-  return CUDA_SUCCESS;
+  return profiler_control("cuProfilerStart");
 }
 static CUresult cuProfilerStop_impl(void);
 VGPU_EXPORT CUresult cuProfilerStop(void) { return traced("cuProfilerStop", cuProfilerStop_impl); }
 static CUresult cuProfilerStop_impl(void) {
   VGPU_CAPTURE_UNSAFE("cuProfilerStop");
-  return CUDA_SUCCESS;
+  return profiler_control("cuProfilerStop");
 }
 
 /* ---- graphics interop ----

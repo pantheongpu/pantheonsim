@@ -2711,6 +2711,9 @@ set_tests_properties(config_cli PROPERTIES DEPENDS vgpu_cli
 add_test(NAME lint_makefile COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_makefile.sh)
 add_test(NAME lint_tracked_junk COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_tracked_junk.sh)
 set_tests_properties(lint_tracked_junk PROPERTIES TIMEOUT 60)
+# No shim but the driver looks a driver function up in the global scope only: under `vgpu run --preload` the driver is private.
+add_test(NAME lint_driver_lookups COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_driver_lookups.sh)
+set_tests_properties(lint_driver_lookups PROPERTIES TIMEOUT 60)
 set_tests_properties(lint_makefile PROPERTIES TIMEOUT 120)
 add_test(NAME lint_readme_commands COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_readme_commands.sh)
 set_tests_properties(lint_readme_commands PROPERTIES TIMEOUT 120)
@@ -2938,6 +2941,20 @@ if(TARGET vgpucuda)
     DRIVER_PROC_ADDRESS_TABLE="${CMAKE_SOURCE_DIR}/nvidia/tests/data/driver_proc_address.rtx3060.txt")
   add_test(NAME test_driver_proc_address COMMAND test_driver_proc_address)
   set_tests_properties(test_driver_proc_address PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/a100;VGPU_QUIET=1")
+endif()
+# cuProfilerStart/Stop and cudaProfilerStart/Stop answer as an RTX 3060 does: not initialised, no context, a dead context, no
+# device (they used to succeed always). One process per group: see the test's header. No toolkit header needed.
+if(TARGET vgpucuda AND TARGET vgpucudart)
+  add_executable(test_profiler_control nvidia/tests/unit/test_profiler_control.cpp)
+  target_link_libraries(test_profiler_control PRIVATE vgpucuda -Wl,--no-as-needed vgpucudart)
+  target_include_directories(test_profiler_control PRIVATE tests/framework)
+  foreach(_group driver runtime sticky no_device)
+    add_test(NAME test_profiler_control_${_group} COMMAND test_profiler_control ${_group}_)
+  endforeach()
+  set_tests_properties(test_profiler_control_driver test_profiler_control_runtime test_profiler_control_sticky PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1")
+  set_tests_properties(test_profiler_control_no_device PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;CUDA_VISIBLE_DEVICES=")
 endif()
 # Runtime entry points the toolkit exports and this one lacked (cudaMemset3D,
 # cudaChooseDevice, cudaDeviceGetByPCIBusId, the 2D array copies, the texture

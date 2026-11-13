@@ -55,6 +55,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "driver_symbol.hpp"
 #include "platform.hpp"
 #include "vgpu/profiling.hpp"
 
@@ -299,7 +300,7 @@ uint32_t context_id_of(uint64_t handle) {
 // on. A program that never touched the driver API has one all the same.
 CUcontext current_context() {
   using Get = CUresult (*)(CUcontext*);
-  static const Get get = reinterpret_cast<Get>(dlsym(RTLD_DEFAULT, "cuCtxGetCurrent"));
+  static const Get get = reinterpret_cast<Get>(vgpu_driver_symbol("cuCtxGetCurrent"));   // a private driver too (--preload)
   static int primary = 0;
   CUcontext c = nullptr;
   if (get) {
