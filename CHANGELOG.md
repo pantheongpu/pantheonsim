@@ -7,6 +7,12 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- cuRAND: `curandGeneratePoisson`, `curandCreatePoissonDistribution`, `curandDestroyDistribution`,
+  `curandGeneratePoissonMethod`, `curandGenerateSeeds` and `curandGetProperty` are exported. A program that called
+  one stopped with "undefined symbol" (RubixML/numpower's `NumPower::poisson`; pantheonsim #629). The methods are
+  the ones an RTX 3060's cuRAND uses for each generator and lambda: Marsaglia-Tsang-Wang's square histogram, built
+  with the card's aliases, so `curand_discrete` in a kernel and a Sobol' generator's Poisson integers are the card's;
+  the inversion and the rounded normal above the card's cut-offs ([libraries](nvidia/docs/libraries.md); `e2e_rand_poisson`).
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the
