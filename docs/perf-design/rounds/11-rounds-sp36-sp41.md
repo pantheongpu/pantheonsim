@@ -3971,4 +3971,19 @@ Tests: `test_host_gpu_logic` (the defaults; the bar at exactly 5 ms and 12.5 ms 
 saving; the share scales with the start; the four's launches refused and the protected programs' admitted, with the account alone as before for
 both; a first launch's share against a launch with a history's; `START_LAUNCHES=0` equal to the old rule over a grid of estimates, accounts and
 driver states): 105 of 105 pass. Mutants ([`data/sp64-sp68/mutants.py`](../data/sp64-sp68/mutants.py), `mutants.txt`): 16 of 16 killed; the one survivor of the first pass ("more than" for "at least") was killed by an exact-binary boundary check added for it.
-Not measured on a card: the four programs' times and the protected programs' under the new rule are for the rig run of this branch.
+### On the card (one A10G; [`data/sp64-sp68/card.md`](../data/sp64-sp68/card.md))
+
+* **Card CI.** The first pass failed one step: the stand-in test's step 27 (sp65's zero grid) expected `cudaErrorInvalidConfiguration` with the mode
+  off, but NVIDIA's runtime 13.0 on the card answers `cudaErrorInvalidValue`, as the simulator does; the step and the comments now say so. The
+  second pass, at 332606d8: e2e_host_gpu (card steps 1 to 12) and e2e_host_gpu_stub (steps 1 to 36) pass, verify 31 identical and 0 different.
+* **The four programs** (10 runs): exact and turbo at the simulator's time, none starts the driver: MC_EstimatePiInlineP 3.28 s (old rule, turbo:
+  3.52), dct8x8 1.08 (1.21 exact, 1.19 turbo), threadFenceReduction 0.38 (0.53 turbo), LargeKernelParameter 0.51 against 0.49 simulated (0.71 and
+  0.74). LargeKernelParameter's remaining 3 % is the mode's per-launch work with no launch sent; it was 6 % until an inline range check before the
+  host-map lookup of each argument word (332606d8: 32 KiB of parameters in each of 2,002 launches).
+* **The keep list** (3 runs, the outliers rerun with 3 or 10): no program more than 3 % slower than with `VGPU_HOST_GPU_START_LAUNCHES=0`
+  (largest FDTD-2D exact +2.2 %, COVAR turbo +2.0 %, one run each); exact-mode outputs identical but particlefilter_float's, which does not repeat
+  in the simulator either.
+* **The rounds' headlines** reproduce: LU turbo 1.29 s against 10.73 s with `STREAK=0` (sp65), gaussian 0.52 against 0.93, radixSortThrust 1.02
+  against 34.2 with `WIDER=0` (sp66), 3DCONV verify 8.53 s (sp67), hellinger 45.4 s to 6.75 s with `VGPU_HOST_GPU_SQRT=1` and GRAMSCHM 302.6 s to
+  125.2 s, its verify run 6,144 launches identical (sp68). sp64's JIT changes showed nothing on the rig's 4 vCPUs (GEMVER and JACOBI1D within 2 %);
+  that round measured at 1 and 16 threads on server3.
