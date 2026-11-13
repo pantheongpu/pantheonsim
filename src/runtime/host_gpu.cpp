@@ -14,6 +14,7 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -27,6 +28,7 @@
 #include <thread>
 
 #include "vgpu/error.hpp"
+#include "vgpu/exec/devrt.hpp"
 #include "vgpu/host_gpu_track.hpp"
 #include "vgpu/sass/exec.hpp"
 
@@ -211,7 +213,38 @@ struct Runtime::Impl : CardGate {
     Refused kind = Refused::No;
     TurboRefusal rr = TurboRefusal::None;   // Code: which class of instruction (in exact mode: what turbo mode would say with its defaults)
     const char* why = "";                       // the reason given on a later launch of the same kernel
+    std::string why_text;                       // ... when it is made for this kernel (`why` then points here)
   };
+  // VGPU_HOST_GPU_LOG: what kept each kernel's launches in the simulator, with the simulator's seconds (one host_gpu_kept line per kernel and
+  // reason at exit), for a census of what the mode still cannot send.
+  struct Kept {
+    uint64_t launches = 0;
+    double sim_s = 0;
+  };
+  std::map<std::pair<std::string, std::string>, Kept> kept;
+
+  // What a module holds besides code, for the reason a launch is refused: its variables by kind, its external functions, and which of them the
+  // kernel itself reaches (sass::reachable: the call graph and the kernel's CALL relocations).
+  static std::string module_detail(const sass::Module& m, const std::string& kernel) {
+    std::set<std::string> held, reached;
+    for (const sass::CubinSymbol& s : m.cubin.symbols) {
+      if (s.function || s.name.empty() || s.name[0] == '.' || !m.symbol_va.count(s.name)) continue;
+      const bool constant = s.section.rfind(".nv.constant", 0) == 0;
+      held.insert(s.managed ? "__managed__" : s.name[0] == '$' ? "string literals" : constant ? "__constant__" : "__device__");
+    }
+    for (const std::string& e : m.cubin.externs)
+      held.insert(extern_kind_name(extern_kind(e, exec::devrt::lookup(e) != exec::devrt::Fn::None)));
+    if (m.device_launches) held.insert("device-side launch");
+    for (const std::string& f : sass::reachable(m, kernel))
+      if (std::find(m.cubin.externs.begin(), m.cubin.externs.end(), f) != m.cubin.externs.end() || exec::devrt::lookup(f) != exec::devrt::Fn::None)
+        reached.insert(extern_kind_name(extern_kind(f, exec::devrt::lookup(f) != exec::devrt::Fn::None)));
+    const auto join = [](const std::set<std::string>& s) {
+      std::string o;
+      for (const std::string& x : s) o += (o.empty() ? "" : ", ") + x;
+      return o.empty() ? std::string("none") : o;
+    };
+    return "module holds " + join(held) + "; kernel reaches " + join(reached);
+  }
   Mode mode = Mode::Exact;
   TurboSwitches sw;      // turbo mode's switches; the defaults in exact mode (where they only class the refusals for the summary)
   Tolerance tol;           // turbo mode's verify (VGPU_HOST_GPU_ATOL, VGPU_HOST_GPU_RTOL)
@@ -287,6 +320,7 @@ struct Runtime::Impl : CardGate {
   struct Last {
     bool in_set = false;
     double card_s = -1;
+    std::string kept;   // why the launch stays in the simulator (the host_gpu_kept census, VGPU_HOST_GPU_LOG)
   } last;
   // The simulator time spent so far in launches of exact-set kernels that stayed in the simulator: the ski-rental account of should_offload_with_start (host_gpu.hpp).
   double eligible_sim_spent_s = 0;
@@ -596,7 +630,11 @@ struct Runtime::Impl : CardGate {
     bool ok = true;
     const char* why = "";
     std::vector<std::pair<uint64_t, uint64_t>> branches;
-    if (!m.symbol_va.empty() || !m.cubin.externs.empty() || m.device_launches) { ok = false; why = "module variables, device calls or device-side launches"; }
+    if (!m.symbol_va.empty() || !m.cubin.externs.empty() || m.device_launches) {
+      ok = false;
+      v.why_text = "module variables, device calls or device-side launches: " + module_detail(m, fn.name);
+      why = v.why_text.c_str();
+    }
     const auto ci = m.code_index.find(".text." + fn.name);
     if (ok && ci == m.code_index.end()) { ok = false; why = "no code section"; }
     const bool runnable_here = ok;
@@ -829,9 +867,12 @@ struct Runtime::Impl : CardGate {
           for (size_t i = 0; i < code.count; ++i) std::fprintf(stderr, "host_gpu:   %s: %04llx %s\n", fn.name.c_str(), static_cast<unsigned long long>(16 * i), sass::to_text(code.instr(i)).c_str());
       }
     }
-    eligible[key] = v;
-    decision_of(eligible[key]);   // (the table's copy: Decision::probe points into it)
-    d.why = why;   // the first launch says the reason in full
+    const bool why_is_text = !v.why_text.empty() && why == v.why_text.c_str();
+    const bool v_why_is_text = !v.why_text.empty() && v.why == v.why_text.c_str();
+    Verdict& stored = eligible[key] = v;
+    if (v_why_is_text) stored.why = stored.why_text.c_str();   // (the reason's text lives in the table's copy: a pointer into `v` would dangle)
+    decision_of(stored);   // (the table's copy: Decision::probe points into it)
+    d.why = why_is_text ? stored.why_text.c_str() : why;   // the first launch says the reason in full
     return d;
   }
 
@@ -891,6 +932,9 @@ void print_summary(Runtime::Impl* im) {
                  ull(s.refused_never), ull(s.refused_atomics), ull(s.refused_off), ull(s.refused_exact), ull(s.refused_launch), ull(s.refused_size), ull(s.failed));
     std::fprintf(stderr, "host_gpu_sampled: sampled=%llu sent=%llu timeouts=%llu cost_s=%.6f after_driver=%llu copies_running_at_exit=%zu copies_left=%zu\n", ull(s.sampled),
                  ull(s.sample_sent), ull(s.sample_timeouts), s.sample_seconds, ull(s.sample_after_driver), im->copies_running_at_exit, sample_copies_reap(false));
+    if (logging())
+      for (const auto& [kr, k] : im->kept)
+        std::fprintf(stderr, "host_gpu_kept: kernel=%s launches=%llu sim_s=%.6f reason=%s\n", kr.first.c_str(), ull(k.launches), k.sim_s, kr.second.c_str());
     if (turbo && im->verify)
       for (const auto& [k, kt] : im->tol_by_kernel)
         if (kt.rep.outside)
@@ -1082,6 +1126,11 @@ void Runtime::note_simulated(const ptx::EntryFn& fn, const exec::LaunchConfig& c
                    sim_seconds, inside_fields(l.hint, l.part).c_str());
     t_last_sample = {};
   }
+  if (logging()) {
+    Impl::Kept& k = impl_->kept[{fn.name, impl_->last.kept.empty() ? std::string("not asked") : impl_->last.kept}];
+    ++k.launches;
+    k.sim_s += sim_seconds;
+  }
   impl_->sim_times.record(fn.name, uint64_t{cfg.grid[0]} * cfg.grid[1] * cfg.grid[2], sim_seconds);
   if (impl_->last.in_set) impl_->eligible_sim_spent_s += sim_seconds;   // an exact-set kernel that the card could have run
 }
@@ -1092,7 +1141,12 @@ bool Runtime::try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, 
   std::lock_guard<GateLock> g(im.mu);   // one offloaded launch at a time: the card path shares the reserved window
   t_sample_hint = {};
   t_last_sample = {};
-  return im.launch(fn, cfg, args, mem, nullptr);
+  const bool was_dead = im.dead;
+  const uint64_t failed_before = im.stats.failed;
+  const bool sent = im.launch(fn, cfg, args, mem, nullptr);
+  if (!sent && logging() && im.last.kept.empty())   // (the census: refusals said their reason in launch(); what is left is the size rule's)
+    im.last.kept = was_dead ? "mode off" : im.stats.failed != failed_before ? "failed on the card" : im.verify_card_ran ? "verify" : "size rule";
+  return sent;
 }
 
 // The decision for a launch and, if it goes, the card path (mu held). `forced_sim_s`: a sampled launch that sample_decide sends to the card: nothing
@@ -1128,7 +1182,11 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
       ++im.stats.refused_launch;
     }
     ++im.stats.simulated;
-    if (logging()) std::fprintf(stderr, "host_gpu: %s stays in the simulator: %s\n", fn.name.c_str(), why);
+    if (logging()) {
+      static const char* const kClassName[] = {"exact", "never", "off", "atomics"};
+      im.last.kept = dec.kind == Impl::Refused::Code ? std::string("class ") + kClassName[static_cast<unsigned>(dec.rr)] : std::string("safety: ") + why;
+      std::fprintf(stderr, "host_gpu: %s stays in the simulator: %s\n", fn.name.c_str(), why);
+    }
     return false;
   }
   // What the simulator took before for this kernel, else a lower bound from the code and the grid.

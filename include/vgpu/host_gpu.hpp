@@ -299,6 +299,41 @@ inline bool call_stays_inside(bool relative, bool to_label, int64_t target, uint
   return relative && to_label && target >= 0 && static_cast<uint64_t>(target) >= lo && static_cast<uint64_t>(target) <= hi;
 }
 
+// ---- what a kernel reaches besides its code (Round sp66) ----------------------------------------------------------------------------
+// A function the module calls but does not define (Cubin::externs): the driver links it when it loads the module on the card, the simulator runs a
+// builtin in its place. What each kind needs on the card, and so whether a kernel that reaches one can go there:
+//   * vprintf: the card writes the arguments to its printf buffer and the driver prints them when the host synchronises with the kernel, which the
+//     card path does at once (cuCtxSynchronize), after flushing the process's stdout; the text is the card's formatting of the card's values. Turbo
+//     mode admits it (VGPU_HOST_GPU_TURBO_OFF=printf keeps it out); exact mode does not (its promise is about memory, not about a second printer);
+//   * __assertfail: a failed assert on the card ends the kernel with a sticky error, the context is lost, and data only the card holds with it;
+//   * malloc and free: the card's heap is the card's own, outside the simulator's window: a pointer from it, kept in memory, means nothing to the
+//     simulator, and the simulator's heap is not on the card;
+//   * the device runtime (device-side launches, cudaDeviceSynchronize in a kernel): the child grids would be the card's, with the card's addresses;
+//   * anything else: not known.
+enum class ExternKind : uint8_t { Printf, Assert, Heap, DeviceLaunch, Other };
+inline ExternKind extern_kind(const std::string& name, bool device_runtime) {
+  if (device_runtime) return ExternKind::DeviceLaunch;
+  if (name == "vprintf") return ExternKind::Printf;
+  if (name == "__assertfail" || name == "__assert_fail") return ExternKind::Assert;
+  if (name == "malloc" || name == "free") return ExternKind::Heap;
+  return ExternKind::Other;
+}
+inline const char* extern_kind_name(ExternKind k) {
+  static const char* const n[] = {"vprintf", "__assertfail", "malloc/free", "device-side launch", "an unknown external function"};
+  return n[static_cast<unsigned>(k)];
+}
+inline bool extern_admitted(ExternKind k, Mode mode, bool printf_off) { return k == ExternKind::Printf && mode == Mode::Turbo && !printf_off; }
+
+// The texture and surface instructions: they read the simulator's own tables (the handle in the instruction or a register is an index into
+// them), so a kernel that holds one cannot run on the card. Neither the exact set nor any turbo class names them; a kernel without one does
+// not read a texture object, whatever objects exist (until Round sp66 one live texture object kept every launch of the device off the card).
+inline bool texture_mnemonic(const std::string& m) {
+  static const char* const kTex[] = {"TEX", "TEXS", "TLD", "TLDS", "TLD4", "TLD4S", "TXD", "TXQ", "TMML", "SULD", "SUST", "SUATOM", "SURED", "SUQUERY"};
+  for (const char* t : kTex)
+    if (m == t) return true;
+  return false;
+}
+
 // The classes a kernel holds, as bits, and what the mode's switches make of them.
 using ClassMask = uint32_t;
 inline constexpr ClassMask class_bit(InsnClass c) { return ClassMask{1} << static_cast<unsigned>(c); }
