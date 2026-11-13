@@ -55,6 +55,7 @@
 
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -138,7 +139,8 @@ std::string tempdir() {
   ::mkdir(base.c_str(), 0700);
   static std::atomic_int seq{0};
   const std::string d = base + "/" + std::to_string(seq.fetch_add(1));
-  ::mkdir(d.c_str(), 0700);
+  // A program going away on another thread removes the process's directory when it is empty.
+  for (int tries = 0; tries < 8 && ::mkdir(d.c_str(), 0700) != 0 && errno == ENOENT; ++tries) ::mkdir(base.c_str(), 0700);
   return d;
 }
 
@@ -339,7 +341,11 @@ void remove_tree(const std::string& dir) {
 }
 
 Program::~Program() {
-  if (!scratch.empty() && !trace()) remove_tree(scratch);
+  if (scratch.empty() || trace()) return;
+  remove_tree(scratch);
+  // And the process's directory above it, once it holds no other program's.
+  const size_t slash = scratch.find_last_of('/');
+  if (slash != std::string::npos && slash > 0) ::rmdir(scratch.substr(0, slash).c_str());
 }
 
 // ---- the toolkit's NVRTC ----

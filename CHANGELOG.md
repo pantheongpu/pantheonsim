@@ -14,7 +14,8 @@ release says what runs and what it produces, never how fast a real GPU would run
   fail to open, as with NVRTC. What NVRTC predefines (`size_t`, `ptrdiff_t`, `clock_t`, `NULL`, `std::move`, `std::forward`,
   `std::initializer_list`, `printf`, `assert`) is there without an include, measured on CUDA 13.0's NVRTC; the PTX matches NVRTC's for the
   programs compared. ThrustRTC's fill and reduce run under `vgpu run` on `nvidia/a100` (ThrustRTC 0.3.20's own occupancy calculator does not
-  know compute capability 9.x, so its kernels fail on an H100, real or simulated). New test `e2e_nvrtc_paths_nvcc` (pantheonsim #619).
+  know compute capability 9.x, so its kernels fail on an H100, real or simulated). The nvcc path also no longer leaves an empty
+  `$TMPDIR/vgpu-nvrtc-<pid>` directory behind per process. New test `e2e_nvrtc_paths_nvcc` (pantheonsim #619).
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the
