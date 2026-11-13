@@ -390,7 +390,11 @@ prints them when the host synchronises with the kernel, which the card path does
 stdout just before such a launch, so the card's lines come after everything the program printed before the launch and before anything it prints
 after, which is the simulator's order. The text is the card's formatting of the card's values, as on real hardware; a kernel that prints more than
 the card's printf buffer (1 MiB unless the program sets `cudaLimitPrintfFifoSize`, which the simulator does not pass on) loses lines on the card,
-as it does natively. Exact mode does not admit `printf` (its promise is about memory), nor does a verify run (each launch would print twice, once on each side). `VGPU_HOST_GPU_TURBO_OFF=printf` keeps such kernels out.
+as it does natively. **What the card said (Round sp66): nvcc 13.0's sm_86 code calls `vprintf` through a register** (`MOV` of the address's two halves,
+which the loader patches, then `CALL.ABS.NOINC R2`), a call the scan does not follow, so on that toolkit a kernel that prints is still refused
+(class `never`); the admission covers the immediate form (`CALL.ABS.NOINC` with the address in the instruction, relocation 58 or 75), and no
+kernel of the corpus reached the card through it, so the output order above is argued, not measured. Following the register form needs the scan to
+tie the register to the `MOV` pair; not done. Exact mode does not admit `printf` (its promise is about memory), nor does a verify run (each launch would print twice, once on each side). `VGPU_HOST_GPU_TURBO_OFF=printf` keeps such kernels out.
 
 **Texture objects.** A kernel reads a texture or surface only through a texture or surface instruction (`TEX`, `TLD`, `TLD4`, `TXD`, `TXQ`, `TMML`,
 `SULD`, `SUST`, `SUATOM`, `SURED`: `texture_mnemonic`), which neither the exact set nor any turbo class admits; the handle itself is a number. So a

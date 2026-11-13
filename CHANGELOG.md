@@ -14,8 +14,9 @@ release says what runs and what it produces, never how fast a real GPU would run
   the simulator's before each launch. A kernel is judged by the external functions it calls itself, not by its module's: one that calls `malloc`,
   `free` or `assert`, or launches kernels, stays in the simulator; a module with `__managed__` variables still keeps all its kernels there. A live
   texture object no longer keeps every launch of the device off the card (texture and surface instructions are refused by the kernel's code, as
-  they always were), nor does a launch from a CUDA graph (a kernel that sets a conditional handle is kept by what it calls). Exact mode's results are still the simulator's bits. Turbo mode also admits kernels that call `printf` (the card's lines are
-  printed when the launch is waited for, after the program's earlier output; `VGPU_HOST_GPU_TURBO_OFF=printf` keeps them out) and, by default, float
+  they always were), nor does a launch from a CUDA graph (a kernel that sets a conditional handle is kept by what it calls). Exact mode's results are still the simulator's bits. Turbo mode also admits kernels that call `printf` with an immediate absolute call (the card's lines are
+  printed when the launch is waited for, after the program's earlier output; `VGPU_HOST_GPU_TURBO_OFF=printf` keeps them out; nvcc 13.0 calls
+  `vprintf` through a register, which is not followed yet, so on that toolkit such kernels still stay) and, by default, float
   atomics with a returned value, compare-and-swap and exchange (`VGPU_HOST_GPU_ATOMICS=0` keeps them out; an opt-in before).
   `VGPU_HOST_GPU_WIDER=0` restores the earlier rules for A/B runs, and with `VGPU_HOST_GPU_LOG` the exit summary lists per kernel the launches kept
   in the simulator and why, with their simulator seconds (`host_gpu_kept:`) ([design](docs/perf-design/12-host-gpu-turbo.md), section 10;
