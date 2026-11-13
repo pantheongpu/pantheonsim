@@ -37,6 +37,17 @@ release says what runs and what it produces, never how fast a real GPU would run
   the ones an RTX 3060's cuRAND uses for each generator and lambda: Marsaglia-Tsang-Wang's square histogram, built
   with the card's aliases, so `curand_discrete` in a kernel and a Sobol' generator's Poisson integers are the card's;
   the inversion and the rounded normal above the card's cut-offs ([libraries](nvidia/docs/libraries.md); `e2e_rand_poisson`).
+- AMD: loading a library's code objects takes 40 % less time. The 62 Tensile code objects of a small rocBLAS program (`amd/tests/rocblas/blas`,
+  sgemm, dgemm and the rest, ROCm 7.1 rocBLAS on a simulated MI300X) loaded in 0.44 s instead of 0.75 s and the program ran in 1.61 s
+  instead of 1.96 s (median of 8 alternating runs on an ubuntu-24.04 runner; best 1.53 s against 1.84 s). The time was page faults
+  and copies, not arithmetic: a kept bundle entry is inflated straight into its place instead of through a buffer that is then
+  copied, the zstd buffer is kept from one load to the next, the code object is read where it lies instead of from a copy, `.text`
+  and a linked image are written once instead of zeroed first, and the buffers of tens of megabytes are asked for in 2 MB pages
+  (`madvise(MADV_HUGEPAGE)`); the process took 190,000 page faults instead of 350,000. The bytes read are the same:
+  `test_amd_codeobject_same_bits` gives the recorded digests, and the 2,838 code objects ROCm 7.1 ships (rocBLAS's and hipBLASLt's
+  libraries) give the same digests before and after. `VGPU_LOAD_PLAIN=1` reads them as before (`test_amd_codeobject_same_bits_plain`);
+  `test_amd_bundle` adds bundles larger than the buffer, read both ways. AMD's `rocblas-test` gains nothing from it: its start-up
+  (57 s a process, reading `rocblas_gtest.data`, against 0.1 to 0.4 s of loading) is AMD's client, not the simulator (pantheonsim #565).
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the

@@ -2005,6 +2005,10 @@ target_compile_definitions(test_amd_gcn_packed_same_bits PRIVATE VGPU_SOURCE_DIR
 # The code object reader (codeobject.cpp) against digests of what it read before it was made faster.
 vgpu_unit_test(test_amd_codeobject_same_bits amd/tests/unit/test_codeobject_same_bits.cpp)
 target_compile_definitions(test_amd_codeobject_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# And with VGPU_LOAD_PLAIN=1, the reading from before pantheonsim #565 (bundles inflated through a buffer, images zeroed first, no
+# huge-page advice): the same digests both ways.
+add_test(NAME test_amd_codeobject_same_bits_plain COMMAND test_amd_codeobject_same_bits)
+set_tests_properties(test_amd_codeobject_same_bits_plain PROPERTIES ENVIRONMENT "VGPU_LOAD_PLAIN=1")
 # The digest tests again on the baseline x86-64 code of the AMD engine's SIMD paths (VGPU_SIMD=base keeps mfma_math.hpp and packed_math.hpp off
 # AVX2, FMA and F16C): the recorded bits are the same on every CPU the engine runs on, not only on one with those units.
 # (Not under ThreadSanitizer, where it would only repeat the same checks twenty times slower.)

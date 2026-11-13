@@ -17,6 +17,7 @@
 #include <vector>
 #include <mutex>
 
+#include "load_pages.hpp"
 #include "vgpu/error.hpp"
 
 namespace vgpu::amd {
@@ -181,8 +182,24 @@ void keep(const Plan& p, uint64_t pos, const uint8_t* bytes, uint64_t n, std::st
   }
 }
 
-// zstd's streaming calls, as its documentation gives them: the inflated bundle
-// passes through a buffer of a few megabytes, and what is kept is copied out.
+// Whether no two kept entries share a byte of the inflated bundle (each byte goes to at most one place).
+bool disjoint(const Plan& p) {
+  std::vector<std::pair<uint64_t, uint64_t>> kept_ranges;
+  for (size_t i = 0; i < p.entries.size(); ++i)
+    if (p.placed[i] != ~uint64_t{0} && p.entries[i].size) kept_ranges.push_back({p.entries[i].offset, p.entries[i].offset + p.entries[i].size});
+  std::sort(kept_ranges.begin(), kept_ranges.end());
+  for (size_t i = 1; i < kept_ranges.size(); ++i)
+    if (kept_ranges[i].first < kept_ranges[i - 1].second) return false;
+  return true;
+}
+
+// zstd's streaming calls, as its documentation gives them. Until the table of
+// contents is in, the inflated bundle passes through a buffer of a few
+// megabytes; after it, a kept entry's bytes are inflated straight into their
+// place in `into` (when no two kept entries share bytes) and only the rest goes
+// through the buffer, to be dropped. The bytes kept are the same either way,
+// with one pass fewer over a library's tens of megabytes (pantheonsim #565;
+// VGPU_LOAD_PLAIN=1 copies everything out of the buffer, as before).
 struct ZstdIn {
   const void* src;
   size_t size, pos;
@@ -206,11 +223,33 @@ void inflate_zstd(const Compressed& c, const std::string& device, Plan* p, std::
   if (!ds) throw Error::make(Err::Unsupported, "zstd could not make a decompression stream");
   std::string head;   // the start, until the table of contents is in it
   bool planned = false;
-  std::vector<uint8_t> buffer(size_t{4} << 20);
+  // The buffer is the thread's, kept from one load to the next: only what zstd writes into it is ever read, and a fresh
+  // one was 4 MB of zeroes and page faults a load. (VGPU_LOAD_PLAIN=1: a fresh one, as before.)
+  thread_local std::vector<uint8_t> kept_buffer;
+  std::vector<uint8_t> fresh_buffer;
+  std::vector<uint8_t>& buffer = plain_load() ? fresh_buffer : kept_buffer;
+  if (buffer.size() < (size_t{4} << 20)) buffer.resize(size_t{4} << 20);
   ZstdIn in{c.data, c.size, 0};
   uint64_t pos = 0;
+  bool direct = false;   // planned, and no two kept entries overlap: kept bytes are inflated in place
   for (;;) {
     ZstdOut out{buffer.data(), buffer.size(), 0};
+    bool into_place = false;
+    if (direct) {
+      // The kept entry `pos` is in, or the bytes up to the next one start.
+      uint64_t next = c.out_size;
+      for (size_t i = 0; i < p->entries.size(); ++i) {
+        if (p->placed[i] == ~uint64_t{0}) continue;
+        const Entry& e = p->entries[i];
+        if (pos >= e.offset && pos < e.offset + e.size) {
+          out = {into->data() + p->placed[i] + (pos - e.offset), static_cast<size_t>(e.offset + e.size - pos), 0};
+          into_place = true;
+          break;
+        }
+        if (e.offset > pos) next = std::min(next, e.offset);
+      }
+      if (!into_place && next > pos) out.size = static_cast<size_t>(std::min<uint64_t>(out.size, next - pos));
+    }
     const size_t r = stream(ds.get(), &out, &in);
     if (is_error(r)) throw Error::make(Err::InvalidValue, "the compressed device code does not inflate: ", error_name(r));
     if (pos + out.pos > c.out_size)
@@ -223,12 +262,15 @@ void inflate_zstd(const Compressed& c, const std::string& device, Plan* p, std::
         throw Error::make(Err::InvalidValue, "the compressed device code is not an offload bundle");
       if (read_entries(reinterpret_cast<const uint8_t*>(head.data()), head.size(), &entries)) {
         *p = plan(std::move(entries), device, c.out_size);
+        into->reserve(p->bytes);
+        prefer_huge_pages(into->data(), p->bytes);
         into->assign(p->bytes, '\0');
         keep(*p, 0, reinterpret_cast<const uint8_t*>(head.data()), head.size(), into);
         planned = true;
+        direct = disjoint(*p) && !plain_load();
         std::string().swap(head);
       }
-    } else {
+    } else if (!direct) {
       keep(*p, pos, buffer.data(), out.pos, into);
     }
     pos += out.pos;
@@ -247,7 +289,10 @@ void inflate_zstd(const Compressed& c, const std::string& device, Plan* p, std::
 void inflate_zlib(const Compressed& c, const std::string& device, Plan* p, std::string* into) {
   using Uncompress = int (*)(unsigned char*, unsigned long*, const unsigned char*, unsigned long);
   static const auto uncompress = library_function<Uncompress>("libz.so.1", "uncompress");
-  std::string all(c.out_size, '\0');
+  std::string all;
+  all.reserve(c.out_size);
+  prefer_huge_pages(all.data(), c.out_size);
+  all.assign(c.out_size, '\0');
   unsigned long n = c.out_size;
   if (const int e = uncompress(reinterpret_cast<unsigned char*>(all.data()), &n, c.data, c.size); e != 0)
     throw Error::make(Err::InvalidValue, "the compressed device code does not inflate (zlib says ", e, ")");
@@ -259,6 +304,8 @@ void inflate_zlib(const Compressed& c, const std::string& device, Plan* p, std::
   if (n < 24 || std::memcmp(b, kMagic, 24) != 0 || !read_entries(b, n, &entries))
     throw Error::make(Err::InvalidValue, "the compressed device code is not an offload bundle");
   *p = plan(std::move(entries), device, c.out_size);
+  into->reserve(p->bytes);
+  prefer_huge_pages(into->data(), p->bytes);
   into->assign(p->bytes, '\0');
   keep(*p, 0, b, n, into);
 }
