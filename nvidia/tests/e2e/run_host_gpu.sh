@@ -19,7 +19,8 @@
 #   7. kernels that use __device__ and __constant__ variables (by name, through a pointer from cudaGetSymbolAddress, with cudaMemcpyToSymbol before every
 #      launch) run on the card in both modes and the output is the mode-off output to the byte; exact mode's verify finds them identical;
 #   8. in turbo mode a kernel that prints runs on the card, and the lines (the card's and the host's, stdout a file) come in the mode-off order;
-#   9. with a live texture object a plain kernel runs on the card in both modes, and the output is the mode-off output.
+#   9. with a live texture object a plain kernel runs on the card in both modes, and the output is the mode-off output;
+#  10. in turbo mode a kernel that calls a device function of another section (host_gpu_rdc.cu, -rdc=true) runs on the card, output the mode-off output.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -45,6 +46,8 @@ trap 'rm -rf "$work"' EXIT
   || { echo "FAIL: does not compile"; exit 1; }
 "$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets "$root/nvidia/tests/e2e/host_gpu_vars.cu" -o "$work/vars" \
   || { echo "FAIL: host_gpu_vars.cu does not compile"; exit 1; }
+"$nvcc_bin" -std=c++17 -arch="sm_$cc" -rdc=true -cudart shared -w -Wno-deprecated-gpu-targets "$root/nvidia/tests/e2e/host_gpu_rdc.cu" "$root/nvidia/tests/e2e/host_gpu_rdc_fn.cu" -o "$work/rdc" \
+  || { echo "FAIL: host_gpu_rdc.cu does not compile"; exit 1; }
 if ! require_shim_libs "$shim" "$work/prog"; then exit 0; fi
 run() {   # <stdout file> <stderr file> [env...]
   local out=$1 err=$2
@@ -130,5 +133,9 @@ echo "$vl" | grep -Eq 'in_set_identical=[1-9][0-9]* in_set_different=0 ' || { ec
 vrun vp_turbo printf VGPU_HOST_GPU=turbo "${send[@]}" || { echo "FAIL: host_gpu_vars printf, turbo, failed"; tail -5 "$work/vp_turbo.err"; fails=1; }
 cmp -s "$work/voff_printf.out" "$work/vp_turbo.out" || { echo "FAIL: turbo: a kernel that prints on the card changes the output or its order:"; diff "$work/voff_printf.out" "$work/vp_turbo.out" | head -8; fails=1; }
 grep -q "prints[^ ]* on the card" "$work/vp_turbo.err" || { echo "FAIL: turbo: the kernel that prints did not run on the card: $(grep -m2 'prints' "$work/vp_turbo.err")"; fails=1; }
-(( fails == 0 )) && { echo "PASS: $sum; turbo: $rline; turbo verify: $vline; module variables, printf and textures on the card"; exit 0; }
+env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/rdc" > "$work/roff.out" 2> "$work/roff.err" || { echo "FAIL: host_gpu_rdc with the mode off failed"; fails=1; }
+env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" VGPU_HOST_GPU=turbo "${send[@]}" "$work/rdc" > "$work/rturbo.out" 2> "$work/rturbo.err" || { echo "FAIL: host_gpu_rdc, turbo, failed"; tail -5 "$work/rturbo.err"; fails=1; }
+cmp -s "$work/roff.out" "$work/rturbo.out" || { echo "FAIL: turbo: a kernel that calls into another section changes the output on the card"; fails=1; }
+grep -q "calls_out[^ ]* on the card" "$work/rturbo.err" || { echo "FAIL: turbo: the kernel that calls into another section did not run on the card: $(grep -m2 'calls_out' "$work/rturbo.err")"; fails=1; }
+(( fails == 0 )) && { echo "PASS: $sum; turbo: $rline; turbo verify: $vline; module variables, printf, textures and calls into another section on the card"; exit 0; }
 exit 1

@@ -725,25 +725,45 @@ struct Runtime::Impl : CardGate {
       const sass::Code& code = m.code[ci->second];
       v.instrs = code.count;
       // The classes of the code (vgpu/host_gpu.hpp turbo_class) and its branches. Nothing is printed here and exact mode decides nothing by it.
-      const uint64_t code_lo = code.count ? code.instr(0).pc : 0, code_hi = code.count ? code.instr(code.count - 1).pc : 0;
-      for (size_t i = 0; i < code.count; ++i) {
-        const sass::Instr& ins = code.instr(i);
-        if (ins.op == sass::Op::BRA)
-          for (const auto& o : ins.src)
-            if (o.kind == sass::Kind::Label) branches.emplace_back(ins.pc, static_cast<uint64_t>(o.imm));
-        InsnClass c = turbo_class(ins.mnemonic, ins.mods);
-        if (ins.op == sass::Op::CALL && c == InsnClass::Call) {
-          // The scan has seen this section only: a call that leaves it (another section, a register, an absolute address) runs code nobody classed.
-          // The one exception is the absolute call to vprintf, which the driver links when it loads the module (Round sp66; admitted above).
-          const bool label = !ins.src.empty() && ins.src[0].kind == sass::Kind::Label;
-          const auto b = label ? m.builtins.find(static_cast<uint64_t>(ins.src[0].imm)) : m.builtins.end();
-          const bool to_printf = v.printf && !mods_have(ins.mods, "REL") && b != m.builtins.end() && b->second == "vprintf";
-          if (!to_printf && !call_stays_inside(mods_have(ins.mods, "REL"), label, label ? ins.src[0].imm : -1, code_lo, code_hi)) c = InsnClass::Never;
+      // The code is the kernel's section and, since Round sp66, the sections of the device functions it calls (call_to_entry): each is classed the
+      // same way, once.
+      std::vector<const sass::Code*> todo{&code};
+      std::set<const sass::Code*> seen{&code};
+      while (!todo.empty()) {
+        const sass::Code& sec = *todo.back();
+        todo.pop_back();
+        const bool own = &sec == &code;
+        const uint64_t code_lo = sec.count ? sec.instr(0).pc : 0, code_hi = sec.count ? sec.instr(sec.count - 1).pc : 0;
+        for (size_t i = 0; i < sec.count; ++i) {
+          const sass::Instr& ins = sec.instr(i);
+          if (own && ins.op == sass::Op::BRA)
+            for (const auto& o : ins.src)
+              if (o.kind == sass::Kind::Label) branches.emplace_back(ins.pc, static_cast<uint64_t>(o.imm));
+          InsnClass c = turbo_class(ins.mnemonic, ins.mods);
+          if (ins.op == sass::Op::CALL && c == InsnClass::Call) {
+            // A call that leaves the section runs code this scan has to see. Three kinds are followed: a relative call inside the section; the absolute
+            // call to vprintf, which the driver links when it loads the module (admitted above); and an absolute call to the first instruction of
+            // another code section of the module, a device function kept out of line (a -rdc build), whose code is then classed too. A call through a
+            // register, or to anywhere else, runs code nobody classed: never.
+            const bool label = !ins.src.empty() && ins.src[0].kind == sass::Kind::Label;
+            const bool rel = mods_have(ins.mods, "REL");
+            const int64_t target = label ? ins.src[0].imm : -1;
+            const auto b = label ? m.builtins.find(static_cast<uint64_t>(target)) : m.builtins.end();
+            const bool to_printf = v.printf && !rel && b != m.builtins.end() && b->second == "vprintf";
+            if (!to_printf && !call_stays_inside(rel, label, target, code_lo, code_hi)) {
+              const sass::Code* callee = label && !rel && target >= 0 ? m.code_at(static_cast<uint64_t>(target)) : nullptr;
+              if (callee && call_to_entry(rel, label, target, callee->base, callee->count)) {
+                if (seen.insert(callee).second) todo.push_back(callee);
+              } else {
+                c = InsnClass::Never;
+              }
+            }
+          }
+          classes |= class_bit(c);
+          if (c == InsnClass::Never && first_never.empty()) first_never = sass::to_text(ins);
+          const ClassMask gated = sw.off | (sw.atomics ? 0 : class_bit(InsnClass::AtomFloat) | class_bit(InsnClass::AtomSwap));
+          if ((class_bit(c) & gated) && first_gated.empty()) first_gated = sass::to_text(ins);
         }
-        classes |= class_bit(c);
-        if (c == InsnClass::Never && first_never.empty()) first_never = sass::to_text(ins);
-        const ClassMask gated = sw.off | (sw.atomics ? 0 : class_bit(InsnClass::AtomFloat) | class_bit(InsnClass::AtomSwap));
-        if ((class_bit(c) & gated) && first_gated.empty()) first_gated = sass::to_text(ins);
       }
       // The exact set's scan, unchanged.
       bool idiom_checked = false, idiom_ok = false;

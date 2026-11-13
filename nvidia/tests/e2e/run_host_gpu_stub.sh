@@ -51,7 +51,9 @@
 #      (cuMemcpyDtoD) before the first launch, and the output is the simulator's;
 #  26. a kernel that prints reaches the card path in turbo mode, not in exact mode nor with VGPU_HOST_GPU_TURBO_OFF=printf; the output is unchanged;
 #  27. a live texture object no longer keeps the device's launches off the card; the kernel that fetches through it stays (class never);
-#  28. a kernel that calls malloc, free and assert never reaches the driver, in either mode.
+#  28. a kernel that calls malloc, free and assert never reaches the driver, in either mode;
+#  29. a kernel that calls a device function of another section (host_gpu_rdc.cu, -rdc=true: an absolute call) reaches the card path in turbo mode,
+#      whose scan follows the call into the callee's code, and not in exact mode; the output is unchanged.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -77,6 +79,7 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-host-gpu-stub.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 "$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_lazy.cu" "$root/nvidia/tests/e2e/host_gpu_lazy_heap.cu" -o "$work/prog" || { echo "FAIL: does not compile"; exit 1; }
 "$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_vars.cu" -o "$work/vars" || { echo "FAIL: host_gpu_vars.cu does not compile"; exit 1; }
+"$nvcc_bin" -std=c++17 -arch="sm_$cc" -rdc=true -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_rdc.cu" "$root/nvidia/tests/e2e/host_gpu_rdc_fn.cu" -o "$work/rdc" || { echo "FAIL: host_gpu_rdc.cu does not compile"; exit 1; }
 "$cc_bin" -shared -fPIC -O1 -o "$work/libstubcuda.so" "$root/nvidia/tests/e2e/host_gpu_stub_driver.c" || { echo "FAIL: the stand-in driver does not compile"; exit 1; }
 if ! require_shim_libs "$shim" "$work/prog"; then exit 0; fi
 init_ms=2000
@@ -355,5 +358,13 @@ for m in exact turbo; do
   diff -q "$work/off_vheap.out" "$work/vh_$m.out" > /dev/null || { echo "FAIL: $m changes the output of host_gpu_vars heap"; fails=1; }
 done
 grep -q '^host_gpu_refused: kernel=[^ ]*fetch[^ ]* class=never insn=T\(EX\|LD\)' "$work/vt_turbo.err" || { echo "FAIL: the texture fetch was not refused as class never: $(grep -m2 '^host_gpu_refused' "$work/vt_turbo.err")"; fails=1; }
+# 29. a call into another section.
+env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/rdc" > "$work/off_rdc.out" 2> "$work/off_rdc.err" || { echo "FAIL: host_gpu_rdc with the mode off failed"; tail -5 "$work/off_rdc.err"; exit 1; }
+PROG=rdc run rdc_turbo x VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 "${reach[@]}" || { echo "FAIL: the turbo rdc run failed"; tail -5 "$work/rdc_turbo.err"; fails=1; }
+grep -q '^cuModuleLoadData$' "$work/rdc_turbo.log" || { echo "FAIL: a kernel that calls a function of another section did not reach the card path in turbo mode: $(calls rdc_turbo); $(grep -m2 'calls_out' "$work/rdc_turbo.err")"; fails=1; }
+grep -q '^host_gpu_refused:' "$work/rdc_turbo.err" && { echo "FAIL: turbo refused a kernel of host_gpu_rdc: $(grep -m1 '^host_gpu_refused:' "$work/rdc_turbo.err")"; fails=1; }
+diff -q "$work/off_rdc.out" "$work/rdc_turbo.out" > /dev/null || { echo "FAIL: turbo mode changes the output of host_gpu_rdc"; fails=1; }
+PROG=rdc run rdc_exact x VGPU_HOST_GPU=exact "${reach[@]}" || { echo "FAIL: the exact rdc run failed"; fails=1; }
+[[ ! -s "$work/rdc_exact.log" ]] || { echo "FAIL: exact mode sent a kernel with a call to the card: $(calls rdc_exact)"; fails=1; }
 (( fails == 0 )) && { echo "PASS: first launch $first ms against a driver start of $init_ms ms; driver calls in the big run: $(calls on_big)"; exit 0; }
 exit 1

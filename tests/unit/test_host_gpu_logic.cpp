@@ -941,6 +941,13 @@ VTEST(a_call_must_stay_inside_the_kernel) {
   VCHECK(!call_stays_inside(true, true, -16, 0x0, 0x400));
   VCHECK(!call_stays_inside(false, true, 0x100, 0x0, 0x400));   // CALL.ABS
   VCHECK(!call_stays_inside(true, false, 0x100, 0x0, 0x400));   // through a register
+  // an absolute call to another section's first instruction is followed (Round sp66), and nothing else is
+  VCHECK(call_to_entry(false, true, 0x6ffb00000100, 0x6ffb00000100, 12));
+  VCHECK(!call_to_entry(false, true, 0x6ffb00000110, 0x6ffb00000100, 12));   // into the middle of a function
+  VCHECK(!call_to_entry(true, true, 0x6ffb00000100, 0x6ffb00000100, 12));    // a relative call is the section's own
+  VCHECK(!call_to_entry(false, false, 0x6ffb00000100, 0x6ffb00000100, 12));  // through a register
+  VCHECK(!call_to_entry(false, true, 0x6ffb00000100, 0x6ffb00000100, 0));    // a section with no code
+  VCHECK(!call_to_entry(false, true, -1, 0xffffffffffffffffull, 1));
 }
 
 VTEST(turbo_admits_by_class_and_switch) {

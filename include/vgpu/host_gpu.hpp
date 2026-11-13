@@ -334,6 +334,13 @@ inline bool texture_mnemonic(const std::string& m) {
   return false;
 }
 
+// An absolute call to the first instruction of a code section of the module (Round sp66): a device function the compiler kept out of line, in a
+// section of its own (a -rdc build). The driver links the call to its own copy of the same code, so the call is followed: the callee's section is
+// classed with the kernel's. `base`, `count`: the section the target lies in (its first address, its instructions; 0 is no code).
+inline bool call_to_entry(bool relative, bool to_label, int64_t target, uint64_t base, uint64_t count) {
+  return !relative && to_label && target >= 0 && count > 0 && static_cast<uint64_t>(target) == base;
+}
+
 // The classes a kernel holds, as bits, and what the mode's switches make of them.
 using ClassMask = uint32_t;
 inline constexpr ClassMask class_bit(InsnClass c) { return ClassMask{1} << static_cast<unsigned>(c); }

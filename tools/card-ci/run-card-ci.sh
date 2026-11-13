@@ -7,7 +7,8 @@
 #        CARD_CI_JOBS   (default 4)    compile processes
 #
 # What it checks, and what a failure means:
-#   1. e2e_host_gpu runs and does NOT skip (on a card machine a skip is a failure: the test must have run).
+#   1. e2e_host_gpu runs and does NOT skip (on a card machine a skip is a failure: the test must have run). Since Round sp66 it also runs
+#      host_gpu_vars.cu: kernels with module variables, a kernel that prints (turbo) and a live texture object, on the card, the output the mode-off output.
 #   2. unit tests host_gpu_logic, host_gpu_ref and card_gate pass.
 #   3. e2e_host_gpu_stub passes (the start-up logic, card or not).
 #   4. hostgpu_sfu_exhaustive div: the card's IEEE division equals the correctly rounded quotient (and so the simulator's) for every sampled divisor and eight
