@@ -2,6 +2,7 @@
 // protocol, and the size rule (include/vgpu/host_gpu.hpp). The part that drives the real GPU is run by
 // nvidia/tests/e2e/run_host_gpu.sh, on a machine with a card.
 #include <chrono>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <algorithm>
@@ -10,9 +11,11 @@
 #include <random>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "vgpu/host_gpu.hpp"
+#include "vgpu/host_gpu_image.hpp"
 #include "vtest.hpp"
 
 using namespace vgpu::hostgpu;
@@ -948,19 +951,21 @@ VTEST(turbo_admits_by_class_and_switch) {
     for (C c : cs) m |= class_bit(c);
     return m;
   };
-  // the defaults: everything but float atomics with a value, swaps and what has no class
+  // the defaults (Round sp66): everything but what has no class; float atomics with a value and swaps included
+  VCHECK(def.atomics && def.off == 0 && !def.printf_off);
   VCHECK(turbo_refusal(mask({C::Exact}), def) == TurboRefusal::None);
   VCHECK(turbo_refusal(0, def) == TurboRefusal::None);
-  for (C c : {C::Mufu, C::Half, C::FloatRed, C::Call, C::Extra, C::Tensor, C::AtomInt}) VCHECK(turbo_refusal(mask({C::Exact, c}), def) == TurboRefusal::None);
-  VCHECK(turbo_refusal(mask({C::Exact, C::Mufu, C::Half, C::FloatRed, C::Call, C::Extra, C::Tensor, C::AtomInt}), def) == TurboRefusal::None);
-  VCHECK(turbo_refusal(mask({C::Exact, C::AtomFloat}), def) == TurboRefusal::Atomics);
-  VCHECK(turbo_refusal(mask({C::Exact, C::AtomSwap}), def) == TurboRefusal::Atomics);
+  for (C c : {C::Mufu, C::Half, C::FloatRed, C::Call, C::Extra, C::Tensor, C::AtomInt, C::AtomFloat, C::AtomSwap})
+    VCHECK(turbo_refusal(mask({C::Exact, c}), def) == TurboRefusal::None);
+  VCHECK(turbo_refusal(mask({C::Exact, C::Mufu, C::Half, C::FloatRed, C::Call, C::Extra, C::Tensor, C::AtomInt, C::AtomFloat, C::AtomSwap}), def) == TurboRefusal::None);
   VCHECK(turbo_refusal(mask({C::Never}), def) == TurboRefusal::Never);
-  // the opt-in
-  TurboSwitches at;
-  at.atomics = true;
-  VCHECK(turbo_refusal(mask({C::Exact, C::AtomFloat, C::AtomSwap, C::AtomInt}), at) == TurboRefusal::None);
-  VCHECK(turbo_refusal(mask({C::AtomSwap, C::Never}), at) == TurboRefusal::Never);   // nothing opts into Never
+  VCHECK(turbo_refusal(mask({C::AtomSwap, C::Never}), def) == TurboRefusal::Never);   // nothing admits Never
+  // VGPU_HOST_GPU_ATOMICS=0: float atomics with a value and swaps stay; integer atomics are the off list's
+  TurboSwitches no;
+  no.atomics = false;
+  VCHECK(turbo_refusal(mask({C::Exact, C::AtomFloat}), no) == TurboRefusal::Atomics);
+  VCHECK(turbo_refusal(mask({C::Exact, C::AtomSwap}), no) == TurboRefusal::Atomics);
+  VCHECK(turbo_refusal(mask({C::Exact, C::AtomInt, C::Mufu}), no) == TurboRefusal::None);
   // the off list: each name switches its class off, and only its class
   const struct { const char* name; std::vector<C> off; } rows[] = {
       {"mufu", {C::Mufu}}, {"tensor", {C::Tensor}}, {"half", {C::Half}}, {"call", {C::Call}}, {"red", {C::FloatRed}}, {"extra", {C::Extra}},
@@ -976,8 +981,9 @@ VTEST(turbo_admits_by_class_and_switch) {
       VCHECK(turbo_refusal(class_bit(cls), sw) == want);
     }
   }
-  // the order: no class beats a switched-off class beats the opt-in
+  // the order: no class beats a switched-off class beats VGPU_HOST_GPU_ATOMICS=0
   TurboSwitches sw;
+  sw.atomics = false;
   VCHECK(parse_turbo_off("mufu", &sw.off));
   VCHECK(turbo_refusal(mask({C::Mufu, C::AtomSwap}), sw) == TurboRefusal::Off);
   VCHECK(turbo_refusal(mask({C::Mufu, C::AtomSwap, C::Never}), sw) == TurboRefusal::Never);
@@ -998,6 +1004,15 @@ VTEST(turbo_off_list_parses_names_and_refuses_the_rest) {
   VCHECK(!parse_turbo_off("MUFU", &off, &bad) && bad == "MUFU");
   VCHECK(!parse_turbo_off("mufu call", &off, &bad) && bad == "mufu call");
   VCHECK(!parse_turbo_off("exact", &off, &bad) && !parse_turbo_off("never", &off) && !parse_turbo_off("all", &off));
+  // printf (Round sp66) is not a class: it sets its own switch, and is a bad name where nobody asks for it
+  bool pf = true;
+  VCHECK(parse_turbo_off("mufu", &off, nullptr, &pf) && !pf && off == class_bit(InsnClass::Mufu));
+  VCHECK(parse_turbo_off("printf", &off, nullptr, &pf) && pf && off == 0);
+  pf = false;
+  VCHECK(parse_turbo_off("call,printf,red", &off, nullptr, &pf) && pf && off == (class_bit(InsnClass::Call) | class_bit(InsnClass::FloatRed)));
+  VCHECK(parse_turbo_off(nullptr, &off, nullptr, &pf) && !pf);
+  VCHECK(!parse_turbo_off("printf", &off, &bad) && bad == "printf");
+  VCHECK(!parse_turbo_off("print", &off, &bad, &pf) && bad == "print");
 }
 
 // The kernels of the spike again, as turbo mode sees them (the classes of exact_set_matches_the_measured_kernels above).
@@ -1007,22 +1022,22 @@ VTEST(turbo_takes_the_kernels_exact_refused_for_numerics) {
     for (const auto& [mn, mods] : code) m |= class_bit(turbo_class(mn, mods));
     return m;
   };
-  const TurboSwitches def;
+  const TurboSwitches def;   // (atomics admitted, Round sp66)
   TurboSwitches at;
-  at.atomics = true;
+  at.atomics = false;           // VGPU_HOST_GPU_ATOMICS=0
   // HeCBench silu forward (expf): refused in exact, admitted in turbo
   const ClassMask silu = classes({{"FFMA", {}}, {"MUFU", {"EX2"}}, {"MUFU", {"RCP"}}, {"FCHK", {}}, {"FADD", {"FTZ"}}});
   VCHECK(turbo_refusal(silu, def) == TurboRefusal::None);
   // HeCBench aop compute_partial_beta (double atomicAdd as a compare-and-swap loop): only with the opt-in
   const ClassMask aop = classes({{"DADD", {}}, {"ATOMS", {"CAST", "SPIN", "64"}}, {"DFMA", {}}});
-  VCHECK(turbo_refusal(aop, def) == TurboRefusal::Atomics && turbo_refusal(aop, at) == TurboRefusal::None);
+  VCHECK(turbo_refusal(aop, def) == TurboRefusal::None && turbo_refusal(aop, at) == TurboRefusal::Atomics);
   // HeCBench bh TreeBuildingKernel (ATOMG.E.CAS)
   const ClassMask bh = classes({{"FSETP", {"GEU", "AND"}}, {"ATOMG", {"E", "CAS", "STRONG", "GPU"}}});
-  VCHECK(turbo_refusal(bh, def) == TurboRefusal::Atomics && turbo_refusal(bh, at) == TurboRefusal::None);
+  VCHECK(turbo_refusal(bh, def) == TurboRefusal::None && turbo_refusal(bh, at) == TurboRefusal::Atomics);
   // a histogram (integer atomicAdd whose old value is used) and a float reduction: admitted
   VCHECK(turbo_refusal(classes({{"LDG", {"E"}}, {"ATOMG", {"E", "ADD", "STRONG", "GPU"}}, {"RED", {"E", "ADD", "F32.FTZ.RN", "STRONG", "GPU"}}}), def) == TurboRefusal::None);
   // a texture fetch: never, whatever is switched on
-  VCHECK(turbo_refusal(classes({{"TEX", {"SCR", "LL"}}, {"FMUL", {}}}), at) == TurboRefusal::Never);
+  VCHECK(turbo_refusal(classes({{"TEX", {"SCR", "LL"}}, {"FMUL", {}}}), def) == TurboRefusal::Never);
 }
 
 // ---- the first blocks of a launch, timed (Round sp60b) ----
@@ -1750,6 +1765,273 @@ VTEST(a_small_grid_s_floor_counts_the_followed_loop_s_bound) {
   g.blocks = 4096;
   g.bound_turns = 2048;
   VCHECK(sample_static_estimate(g) == g.static_s && !worth_sampling(g, c, 0.26));
+}
+
+// ---- what a kernel reaches besides its code (Round sp66) ----
+
+VTEST(externs_by_kind_and_what_each_mode_admits) {
+  using K = ExternKind;
+  VCHECK(extern_kind("vprintf", false) == K::Printf);
+  VCHECK(extern_kind("__assertfail", false) == K::Assert && extern_kind("__assert_fail", false) == K::Assert);
+  VCHECK(extern_kind("malloc", false) == K::Heap && extern_kind("free", false) == K::Heap);
+  VCHECK(extern_kind("cudaLaunchDeviceV2", true) == K::DeviceLaunch);
+  VCHECK(extern_kind("vprintf", true) == K::DeviceLaunch);   // (the device runtime's own name wins)
+  VCHECK(extern_kind("printf", false) == K::Other && extern_kind("vprintf_", false) == K::Other && extern_kind("", false) == K::Other);
+  VCHECK(extern_kind("Malloc", false) == K::Other && extern_kind("__nv_malloc", false) == K::Other);
+  // only vprintf, only in turbo mode, only when not switched off
+  VCHECK(extern_admitted(K::Printf, Mode::Turbo, false));
+  VCHECK(!extern_admitted(K::Printf, Mode::Turbo, true));
+  VCHECK(!extern_admitted(K::Printf, Mode::Exact, false));
+  VCHECK(!extern_admitted(K::Printf, Mode::Off, false));
+  for (K k : {K::Assert, K::Heap, K::DeviceLaunch, K::Other})
+    for (Mode m : {Mode::Exact, Mode::Turbo}) VCHECK(!extern_admitted(k, m, false));
+  const std::set<std::string> names = {extern_kind_name(K::Printf), extern_kind_name(K::Assert), extern_kind_name(K::Heap), extern_kind_name(K::DeviceLaunch),
+                                       extern_kind_name(K::Other)};
+  VCHECK(names.size() == 5 && names.count("vprintf") && names.count("__assertfail") && names.count("malloc/free"));
+}
+
+VTEST(texture_and_surface_instructions_are_named_and_never_admitted) {
+  for (const char* m : {"TEX", "TEXS", "TLD", "TLDS", "TLD4", "TLD4S", "TXD", "TXQ", "TMML", "SULD", "SUST", "SUATOM", "SURED", "SUQUERY"}) {
+    VCHECK(texture_mnemonic(m));
+    VCHECK(turbo_class(m, {}) == InsnClass::Never);   // what lets the device-wide refusal go: no class admits one
+    VCHECK(!exact_opcode_allowed(m, {}));
+  }
+  for (const char* m : {"LDG", "LDS", "LDC", "TEXDEPBAR", "ST", "SUB", "TLD5", "", "tex", "TE"}) VCHECK(!texture_mnemonic(m));
+}
+
+namespace {
+// A cubin-shaped ELF64 for the card image: sections by name, symbols, relocation tables (REL or RELA) against a section.
+struct ElfBuilder {
+  struct Sec { std::string name; uint32_t type; std::vector<uint8_t> bytes; uint64_t nobits = 0; uint32_t link = 0, info = 0; uint64_t entsize = 0; };
+  struct Sym { std::string name; uint16_t shndx; uint64_t value, size; uint8_t info; };
+  struct Rel { uint64_t offset; uint32_t sym, type; int64_t addend; };
+  std::vector<Sec> secs{{"", 0, {}}};
+  std::vector<Sym> syms{{"", 0, 0, 0, 0}};
+  uint16_t add(const std::string& name, uint32_t type, std::vector<uint8_t> bytes, uint64_t nobits = 0) {
+    secs.push_back({name, type, std::move(bytes), nobits});
+    return static_cast<uint16_t>(secs.size() - 1);
+  }
+  uint32_t sym(const std::string& name, uint16_t shndx, uint64_t value, uint64_t size = 4, uint8_t info = 0x11) {
+    syms.push_back({name, shndx, value, size, info});
+    return static_cast<uint32_t>(syms.size() - 1);
+  }
+  // Adds the relocation tables, the symbol and string tables and the section-name table, and lays the image out.
+  std::vector<uint8_t> build(const std::vector<std::tuple<uint16_t, bool, std::vector<Rel>>>& tables, std::vector<size_t>* table_index = nullptr) {
+    std::vector<uint8_t> strtab{0};
+    std::vector<uint8_t> symtab;
+    const auto put = [](std::vector<uint8_t>& v, uint64_t x, int n) { for (int k = 0; k < n; ++k) v.push_back(static_cast<uint8_t>(x >> (8 * k))); };
+    for (const Sym& y : syms) {
+      const uint32_t name_at = static_cast<uint32_t>(y.name.empty() ? 0 : strtab.size());
+      if (!y.name.empty()) strtab.insert(strtab.end(), y.name.begin(), y.name.end()), strtab.push_back(0);
+      put(symtab, name_at, 4);
+      put(symtab, y.info, 1);
+      put(symtab, 0, 1);
+      put(symtab, y.shndx, 2);
+      put(symtab, y.value, 8);
+      put(symtab, y.size, 8);
+    }
+    const uint16_t st = add(".symtab", 2, symtab);
+    const uint16_t ss = add(".strtab", 3, strtab);
+    secs[st].link = ss;
+    secs[st].entsize = 24;
+    for (const auto& [dst, rela, rels] : tables) {
+      std::vector<uint8_t> t;
+      for (const Rel& r : rels) {
+        put(t, r.offset, 8);
+        put(t, (uint64_t{r.sym} << 32) | r.type, 8);
+        if (rela) put(t, static_cast<uint64_t>(r.addend), 8);
+      }
+      const uint16_t i = add((rela ? ".rela" : ".rel") + secs[dst].name, rela ? 4 : 9, t);
+      secs[i].link = st;
+      secs[i].info = dst;
+      secs[i].entsize = rela ? 24 : 16;
+      if (table_index) table_index->push_back(i);
+    }
+    std::vector<uint8_t> shstr{0};
+    std::vector<uint32_t> name_at(secs.size() + 1, 0);
+    for (size_t i = 1; i < secs.size(); ++i) {
+      name_at[i] = static_cast<uint32_t>(shstr.size());
+      shstr.insert(shstr.end(), secs[i].name.begin(), secs[i].name.end());
+      shstr.push_back(0);
+    }
+    name_at[secs.size()] = static_cast<uint32_t>(shstr.size());
+    const std::string own = ".shstrtab";
+    shstr.insert(shstr.end(), own.begin(), own.end());
+    shstr.push_back(0);
+    secs.push_back({own, 3, shstr});
+    std::vector<uint8_t> img(64, 0);
+    std::vector<uint64_t> off(secs.size(), 0);
+    for (size_t i = 1; i < secs.size(); ++i) {
+      while (img.size() % 8) img.push_back(0);
+      off[i] = img.size();
+      img.insert(img.end(), secs[i].bytes.begin(), secs[i].bytes.end());
+    }
+    while (img.size() % 8) img.push_back(0);
+    const uint64_t shoff = img.size();
+    for (size_t i = 0; i < secs.size(); ++i) {
+      put(img, name_at[i], 4);
+      put(img, secs[i].type, 4);
+      put(img, 0, 8);
+      put(img, 0, 8);
+      put(img, off[i], 8);
+      put(img, secs[i].type == 8 ? secs[i].nobits : secs[i].bytes.size(), 8);
+      put(img, secs[i].link, 4);
+      put(img, secs[i].info, 4);
+      put(img, 8, 8);
+      put(img, secs[i].entsize, 8);
+    }
+    const uint8_t ident[16] = {0x7f, 'E', 'L', 'F', 2, 1, 1, 0x33, 7};
+    std::memcpy(img.data(), ident, 16);
+    const auto at = [&](size_t o, uint64_t x, int n) { for (int k = 0; k < n; ++k) img[o + k] = static_cast<uint8_t>(x >> (8 * k)); };
+    at(0x10, 2, 2);        // ET_EXEC
+    at(0x12, 190, 2);      // EM_CUDA
+    at(0x28, shoff, 8);
+    at(0x34, 64, 2);
+    at(0x3a, 64, 2);
+    at(0x3c, secs.size(), 2);
+    at(0x3e, secs.size() - 1, 2);
+    return img;
+  }
+};
+uint64_t rd64(const std::vector<uint8_t>& v, size_t o) { uint64_t x; std::memcpy(&x, &v[o], 8); return x; }
+// A section's header field in an image ElfBuilder made (sections in the order added).
+uint64_t sh_field(const std::vector<uint8_t>& img, size_t i, size_t field_off) { return rd64(img, rd64(img, 0x28) + 64 * i + field_off); }
+}  // namespace
+
+VTEST(the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables) {
+  ElfBuilder b;
+  std::vector<uint8_t> code(64);
+  for (size_t k = 0; k < code.size(); ++k) code[k] = static_cast<uint8_t>(0x40 + k);
+  const uint16_t text = b.add(".text.k", 1, code);
+  const uint16_t c4 = b.add(".nv.constant4", 1, std::vector<uint8_t>(24, 0xee));
+  const uint16_t glob = b.add(".nv.global", 8, {}, 256);
+  const uint16_t c3 = b.add(".nv.constant3", 1, std::vector<uint8_t>(32, 0));
+  const uint16_t init = b.add(".nv.global.init", 1, std::vector<uint8_t>(16, 0));
+  const uint32_t g = b.sym("g", glob, 8, 64);
+  const uint32_t c = b.sym("c", c3, 4, 16);
+  const uint32_t str = b.sym("$str", init, 0, 16, 0x01);
+  const uint32_t vp = b.sym("vprintf", 0, 0, 0, 0x12);
+  const uint32_t kf = b.sym("k", text, 0, 64, 0x12);
+  std::vector<size_t> tab;
+  const std::vector<uint8_t> img = b.build({{text, true, {{0, g, 56, 4}, {16, g, 57, 4}, {32, vp, 58, 0}, {48, str, 56, 0}}},
+                                            {c4, false, {{0, c, 2, 0}, {8, kf, 35, 0}, {16, g, 4, 0}}}}, &tab);
+  const uint64_t gva = 0x7f0000100000ull, cva = 0x7f0000200000ull, iva = 0x7f0000300000ull;
+  const auto vars = [&](const std::string& sec) -> std::optional<uint64_t> {
+    if (sec == ".nv.global") return gva;
+    if (sec == ".nv.constant3") return cva;
+    if (sec == ".nv.global.init") return iva;
+    return std::nullopt;
+  };
+  const CardImage ci = card_image_at_sim_addresses(img.data(), img.size(), vars);
+  VCHECK(ci.ok && ci.why.empty());
+  VCHECK(ci.applied == 5 && ci.bytes.size() == img.size());
+  const uint64_t text_off = sh_field(img, text, 24), c4_off = sh_field(img, c4, 24);
+  // the code: the low half of g + 8 + 4 at bits 32-63 of the first instruction, the high half in the second, the string's low half in the fourth
+  uint64_t lo0 = rd64(ci.bytes, text_off), lo1 = rd64(ci.bytes, text_off + 16), lo3 = rd64(ci.bytes, text_off + 48);
+  VCHECK((lo0 >> 32) == ((gva + 12) & 0xffffffffu) && (lo0 & 0xffffffffu) == (rd64(img, text_off) & 0xffffffffu));
+  VCHECK((lo1 >> 32) == ((gva + 12) >> 32));
+  VCHECK((lo3 >> 32) == (iva & 0xffffffffu));
+  VCHECK(rd64(ci.bytes, text_off + 8) == rd64(img, text_off + 8));   // (the high word of a MOV is not the relocation's)
+  VCHECK(rd64(ci.bytes, text_off + 32) == rd64(img, text_off + 32) && rd64(ci.bytes, text_off + 40) == rd64(img, text_off + 40));   // vprintf's call: the driver's
+  // the bank: c's address (cva + 4) and g's (G64); the function descriptor left alone
+  VCHECK(rd64(ci.bytes, c4_off) == cva + 4 && rd64(ci.bytes, c4_off + 16) == gva + 8 && rd64(ci.bytes, c4_off + 8) == 0xeeeeeeeeeeeeeeeeull);
+  // the tables: only what was left, in order, and their sizes say so
+  VCHECK(sh_field(ci.bytes, tab[0], 32) == 24 && sh_field(img, tab[0], 32) == 96);
+  const uint64_t t0 = sh_field(ci.bytes, tab[0], 24);
+  VCHECK(rd64(ci.bytes, t0) == 32 && rd64(ci.bytes, t0 + 8) == ((uint64_t{vp} << 32) | 58));
+  VCHECK(sh_field(ci.bytes, tab[1], 32) == 16);
+  const uint64_t t1 = sh_field(ci.bytes, tab[1], 24);
+  VCHECK(rd64(ci.bytes, t1) == 8 && rd64(ci.bytes, t1 + 8) == ((uint64_t{kf} << 32) | 35));
+  // nothing else of the image moved
+  size_t changed = 0;
+  for (size_t k = 0; k < img.size(); ++k) changed += img[k] != ci.bytes[k];
+  VCHECK(changed > 0 && changed <= 4 * 4 + 2 * 8 + 2 * 8 + 2 * 24 + 2);
+  // no variable section named: the image as it was
+  const CardImage same = card_image_at_sim_addresses(img.data(), img.size(), [](const std::string&) -> std::optional<uint64_t> { return std::nullopt; });
+  VCHECK(same.ok && same.applied == 0 && same.bytes == img);
+  // only the constant bank's variables: the code's references to g are the driver's
+  const CardImage only_c = card_image_at_sim_addresses(img.data(), img.size(), [&](const std::string& sec) -> std::optional<uint64_t> {
+    return sec == ".nv.constant3" ? std::optional<uint64_t>(cva) : std::nullopt;
+  });
+  VCHECK(only_c.ok && only_c.applied == 1 && rd64(only_c.bytes, c4_off) == cva + 4 && rd64(only_c.bytes, text_off) == rd64(img, text_off));
+  VCHECK(sh_field(only_c.bytes, tab[0], 32) == 96 && sh_field(only_c.bytes, tab[1], 32) == 32);
+}
+
+VTEST(the_card_image_refuses_what_it_cannot_apply) {
+  const auto vars = [](const std::string& sec) -> std::optional<uint64_t> {
+    return sec == ".nv.global" ? std::optional<uint64_t>(0x7f0000100000ull) : std::nullopt;
+  };
+  const auto one = [&](uint32_t type, bool into_code, bool into_nobits, uint64_t offset) {
+    ElfBuilder b;
+    const uint16_t text = b.add(".text.k", 1, std::vector<uint8_t>(32, 0));
+    const uint16_t c4 = b.add(".nv.constant4", 1, std::vector<uint8_t>(16, 0));
+    const uint16_t glob = b.add(".nv.global", 8, {}, 64);
+    const uint32_t g = b.sym("g", glob, 0);
+    const std::vector<uint8_t> img = b.build({{into_nobits ? glob : into_code ? text : c4, true, {{offset, g, type, 0}}}});
+    return card_image_at_sim_addresses(img.data(), img.size(), vars);
+  };
+  VCHECK(one(56, true, false, 0).ok && one(57, true, false, 16).ok && one(58, true, false, 0).ok && one(75, true, false, 16).ok);
+  VCHECK(one(62, true, false, 0).ok && one(63, true, false, 0).ok);
+  VCHECK(one(2, false, false, 0).ok && one(4, false, false, 8).ok);
+  VCHECK(!one(35, false, false, 0).ok);                      // a function descriptor of a variable
+  VCHECK(!one(2, true, false, 0).ok && !one(56, false, false, 0).ok);   // a data type in code, a code type in data
+  VCHECK(!one(1, true, false, 0).ok);                        // a type nobody named
+  VCHECK(!one(56, true, false, 17).ok && !one(56, true, false, 32).ok);   // past the end of the code
+  VCHECK(!one(2, false, false, 9).ok && !one(2, false, false, 16).ok);    // past the end of the bank
+  VCHECK(one(2, false, false, 8).ok);                        // the last 8 bytes
+  VCHECK(!one(2, false, true, 0).ok);                        // into a section with no bytes
+  const CardImage bad = one(35, false, false, 0);
+  VCHECK(bad.bytes.empty() && bad.why.find("35") != std::string::npos);
+  // not an image
+  const uint8_t junk[80] = {0x7f, 'E', 'L', 'F', 1};
+  VCHECK(!card_image_at_sim_addresses(junk, sizeof junk, vars).ok);
+  VCHECK(!card_image_at_sim_addresses(junk, 10, vars).ok);
+  std::vector<uint8_t> trunc;
+  {
+    ElfBuilder b;
+    b.add(".text.k", 1, std::vector<uint8_t>(32, 0));
+    trunc = b.build({});
+  }
+  VCHECK(card_image_at_sim_addresses(trunc.data(), trunc.size(), vars).ok);
+  VCHECK(!card_image_at_sim_addresses(trunc.data(), trunc.size() - 1, vars).ok);   // the section headers run past the end
+  std::vector<uint8_t> elf32 = trunc;
+  elf32[4] = 1;   // ELFCLASS32: the same bytes are not a 64-bit image
+  VCHECK(!card_image_at_sim_addresses(elf32.data(), elf32.size(), vars).ok);
+  std::vector<uint8_t> nomagic = trunc;
+  nomagic[1] = 'e';
+  VCHECK(!card_image_at_sim_addresses(nomagic.data(), nomagic.size(), vars).ok);
+}
+
+VTEST(code_relocations_write_the_bits_the_loader_writes) {
+  uint8_t w[16];
+  const auto fill = [&] { for (int k = 0; k < 16; ++k) w[k] = static_cast<uint8_t>(0xa0 + k); };
+  const auto lo = [&] { uint64_t x; std::memcpy(&x, w, 8); return x; };
+  const auto hi = [&] { uint64_t x; std::memcpy(&x, w + 8, 8); return x; };
+  fill();
+  const uint64_t lo0 = lo(), hi0 = hi();
+  const uint64_t v = 0x0001234589abcdefull;
+  vgpu::sass::patch_code_word(w, 56, v);
+  VCHECK(lo() == ((lo0 & 0xffffffffu) | (uint64_t{0x89abcdef} << 32)) && hi() == hi0);
+  fill();
+  vgpu::sass::patch_code_word(w, 62, v);
+  VCHECK(lo() == ((lo0 & 0xffffffffu) | (uint64_t{0x89abcdef} << 32)) && hi() == hi0);
+  fill();
+  vgpu::sass::patch_code_word(w, 57, v);
+  VCHECK(lo() == ((lo0 & 0xffffffffu) | (uint64_t{0x00012345} << 32)) && hi() == hi0);
+  fill();
+  vgpu::sass::patch_code_word(w, 63, v);
+  VCHECK(lo() == ((lo0 & 0xffffffffu) | (uint64_t{0x00012345} << 32)) && hi() == hi0);
+  fill();
+  vgpu::sass::patch_code_word(w, 58, v);   // 49 bits at 32
+  VCHECK(lo() == ((lo0 & 0xffffffffu) | (v << 32)) && hi() == ((hi0 & ~uint64_t{0x1ffff}) | ((v >> 32) & 0x1ffff)));
+  fill();
+  const uint64_t a = 0x0000123456789abcull & ~uint64_t{3};
+  vgpu::sass::patch_code_word(w, 75, a);   // words: 8 bits at 16, the rest at 34
+  const uint64_t words = a >> 2;
+  VCHECK(((lo() >> 16) & 0xff) == (words & 0xff) && (lo() >> 34) == ((words >> 8) & 0x3fffffff) && (hi() & 0x1ffff) == ((words >> 38) & 0x1ffff));
+  VCHECK((lo() & 0xffff) == (lo0 & 0xffff) && ((lo() >> 24) & 0x3ff) == ((lo0 >> 24) & 0x3ff) && (hi() >> 17) == (hi0 >> 17));
+  for (uint32_t t : {56u, 57u, 58u, 62u, 63u, 75u}) VCHECK(vgpu::sass::code_reloc_type(t));
+  for (uint32_t t : {0u, 1u, 2u, 4u, 35u, 55u, 59u, 64u, 74u, 76u}) VCHECK(!vgpu::sass::code_reloc_type(t));
 }
 
 VTEST_MAIN

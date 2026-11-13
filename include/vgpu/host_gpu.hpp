@@ -229,8 +229,8 @@ enum class InsnClass : uint8_t {
                // addresses as LDG and STG, so the card needs nothing that only the simulator holds
   Tensor,      // HMMA, IMMA, DMMA
   AtomInt,     // integer atomics that return the old value (ADD, MIN, MAX, AND, OR, XOR, INC, DEC): memory ends the same, the returned values depend on the order
-  AtomFloat,   // float atomics that return a value: opt-in (VGPU_HOST_GPU_ATOMICS=1)
-  AtomSwap,    // CAS, CAST.SPIN, EXCH: opt-in; the card does not agree with itself from run to run on programs built on these (09 doc, M2)
+  AtomFloat,   // float atomics that return a value: admitted unless VGPU_HOST_GPU_ATOMICS=0 (an opt-in until Round sp66)
+  AtomSwap,    // CAS, CAST.SPIN, EXCH: as AtomFloat; the card does not agree with itself from run to run on programs built on these (09 doc, M2)
   Never,       // textures, surfaces, anything not named
 };
 inline constexpr unsigned kInsnClasses = 11;
@@ -339,13 +339,19 @@ using ClassMask = uint32_t;
 inline constexpr ClassMask class_bit(InsnClass c) { return ClassMask{1} << static_cast<unsigned>(c); }
 
 struct TurboSwitches {
-  bool atomics = false;     // VGPU_HOST_GPU_ATOMICS=1: float atomics with a returned value, CAS, CAST.SPIN and EXCH
+  // Float atomics with a returned value, CAS, CAST.SPIN and EXCH: admitted unless VGPU_HOST_GPU_ATOMICS=0 (Round sp66; an opt-in before, see
+  // docs/perf-design/12-host-gpu-turbo.md section 2 for why the default changed).
+  bool atomics = true;
   ClassMask off = 0;        // VGPU_HOST_GPU_TURBO_OFF: classes switched off for an experiment
+  bool printf_off = false;  // VGPU_HOST_GPU_TURBO_OFF=printf: a kernel that calls vprintf stays in the simulator (Round sp66)
 };
 
-// VGPU_HOST_GPU_TURBO_OFF=mufu,tensor,half,call,atomics,red,extra (a comma list). False, with the bad name in *bad, for anything else.
-inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad = nullptr) {
+// VGPU_HOST_GPU_TURBO_OFF=mufu,tensor,half,call,atomics,red,extra,printf (a comma list). False, with the bad name in *bad, for anything else.
+// `printf` is not a class of instructions (a kernel's call to vprintf is, once admitted, of the call class): it sets *printf_off, and is a bad
+// name when printf_off is null.
+inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad = nullptr, bool* printf_off = nullptr) {
   *off = 0;
+  if (printf_off) *printf_off = false;
   if (!text) return true;
   const std::string t(text);
   for (size_t at = 0; at <= t.size();) {
@@ -360,6 +366,7 @@ inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad =
     else if (name == "atomics") *off |= class_bit(InsnClass::AtomInt) | class_bit(InsnClass::AtomFloat) | class_bit(InsnClass::AtomSwap);
     else if (name == "red") *off |= class_bit(InsnClass::FloatRed);
     else if (name == "extra") *off |= class_bit(InsnClass::Extra);
+    else if (name == "printf" && printf_off) *printf_off = true;
     else {
       if (bad) *bad = name;
       return false;
@@ -373,7 +380,7 @@ enum class TurboRefusal : uint8_t {
   None,      // admitted
   Never,     // an instruction outside every class
   Off,       // a class switched off with VGPU_HOST_GPU_TURBO_OFF
-  Atomics,   // a float atomic with a returned value, a CAS or an EXCH, without VGPU_HOST_GPU_ATOMICS=1
+  Atomics,   // a float atomic with a returned value, a CAS or an EXCH, with VGPU_HOST_GPU_ATOMICS=0
 };
 inline TurboRefusal turbo_refusal(ClassMask classes, const TurboSwitches& sw) {
   if (classes & class_bit(InsnClass::Never)) return TurboRefusal::Never;

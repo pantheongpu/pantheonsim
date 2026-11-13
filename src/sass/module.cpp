@@ -9,6 +9,7 @@
 #include "vgpu/exec/devrt.hpp"
 #include "ok_cache.hpp"
 #include "vgpu/sass/exec.hpp"
+#include "vgpu/sass/reloc_patch.hpp"
 
 namespace vgpu::sass {
 
@@ -164,28 +165,8 @@ bool is_bank(const std::string& name, unsigned* bank) {
 
 }  // namespace
 
-// Writes `value` into the instruction a code relocation names: the low (56,
-// 62) or high (57, 63) half of an address in a MOV's 32-bit immediate, a
-// CALL.ABS.NOINC's target, 49 bits at 32 (58), or from sm_90 in 4-byte units
-// at 16-23 and 34-80 (75).
-static void patch_code(CubinSection& s, const CubinReloc& r, uint64_t value) {
-  uint64_t hi, lo;
-  std::memcpy(&lo, &s.bytes[r.offset], 8);
-  std::memcpy(&hi, &s.bytes[r.offset + 8], 8);
-  if (r.type == 58) {          // bits 32-80
-    lo = (lo & 0xffffffffull) | (value << 32);
-    hi = (hi & ~uint64_t{0x1ffff}) | ((value >> 32) & 0x1ffff);
-  } else if (r.type == 75) {   // words: the low eight bits at 16-23, the rest at 34-80
-    const uint64_t words = value >> 2;
-    lo = (lo & ~(uint64_t{0xff} << 16) & 0x3ffffffffull) | ((words & 0xff) << 16) | ((words >> 8) << 34);
-    hi = (hi & ~uint64_t{0x1ffff}) | ((words >> 8 >> 30) & 0x1ffff);
-  } else {                     // bits 32-63: the low half (56, 62) or the high one (57, 63)
-    const uint64_t half = r.type == 56 || r.type == 62 ? (value & 0xffffffffull) : (value >> 32);
-    lo = (lo & 0xffffffffull) | (half << 32);
-  }
-  std::memcpy(&s.bytes[r.offset], &lo, 8);
-  std::memcpy(&s.bytes[r.offset + 8], &hi, 8);
-}
+// Writes `value` into the instruction a code relocation names (vgpu/sass/reloc_patch.hpp).
+static void patch_code(CubinSection& s, const CubinReloc& r, uint64_t value) { patch_code_word(&s.bytes[r.offset], r.type, value); }
 
 std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& mem, const DeviceProfile& profile) {
   auto m = std::make_shared<Module>();
@@ -337,9 +318,7 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
         // and so is R_CUDA_FUNC_DESC_64 (35), a function pointer in a table
         // (the device runtime -rdc builds link in has one), since a
         // function's descriptor here is its code address.
-        const bool known = code ? (r.type == 56 || r.type == 57 || r.type == 58 || r.type == 62 || r.type == 63 ||
-                                   r.type == 75)
-                                : (r.type == 2 || r.type == 4 || r.type == 35);
+        const bool known = code ? code_reloc_type(r.type) : (r.type == 2 || r.type == 4 || r.type == 35);
         if (!known)
           throw Error(Err::UnsupportedPtx,
                       "cubin: relocation type " + std::to_string(r.type) + " in " + s.name + " is not supported yet");

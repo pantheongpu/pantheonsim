@@ -2,7 +2,7 @@
 # Host-GPU mode (docs/perf-design/09-host-gpu-spike.md): VGPU_HOST_GPU=exact runs launches whose kernels are in the exact set on the machine's
 # real GPU, and the program has to print what it prints with the mode off. Needs a card of the model the simulator is told to be, so it
 # SKIPs without one (no hosted CI machine has one). host_gpu_exact.cu runs kernels of every kind: integer and FFMA kernels (on the card),
-# an expf kernel (MUFU: stays in the simulator), a tiny launch (too small), a kernel with a module variable (refused).
+# an expf kernel (MUFU: stays in the simulator), a tiny launch (too small), a kernel that calls assert (refused).
 #   1. mode off and mode exact print the same lines;
 #   2. the exact run reports launches on the card, and a kernel outside the set, a launch too small and a refused launch;
 #   3. the card copy outlives a launch (the default; VGPU_HOST_GPU_WRITE_THROUGH=1 is the older mode): the program touches memory between launches in every
@@ -15,6 +15,11 @@
 #      mode-off run prints, and exact mode's summary still counts the expf launches as outside its set (exact is unchanged);
 #   6. VGPU_HOST_GPU_VERIFY=1 in turbo mode compares by tolerance: the expf kernel ran on the card, no word is outside the default tolerance, and the
 #      program's output is the mode-off output to the byte (under verify the simulator's result is the program's).
+# What a module holds besides code (Round sp66, host_gpu_vars.cu):
+#   7. kernels that use __device__ and __constant__ variables (by name, through a pointer from cudaGetSymbolAddress, with cudaMemcpyToSymbol before every
+#      launch) run on the card in both modes and the output is the mode-off output to the byte; exact mode's verify finds them identical;
+#   8. in turbo mode a kernel that prints runs on the card, and the lines (the card's and the host's, stdout a file) come in the mode-off order;
+#   9. with a live texture object a plain kernel runs on the card in both modes, and the output is the mode-off output.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -38,6 +43,8 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-host-gpu.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 "$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets "$root/nvidia/tests/e2e/host_gpu_exact.cu" "$root/nvidia/tests/e2e/host_gpu_exact_mod.cu" -o "$work/prog" \
   || { echo "FAIL: does not compile"; exit 1; }
+"$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets "$root/nvidia/tests/e2e/host_gpu_vars.cu" -o "$work/vars" \
+  || { echo "FAIL: host_gpu_vars.cu does not compile"; exit 1; }
 if ! require_shim_libs "$shim" "$work/prog"; then exit 0; fi
 run() {   # <stdout file> <stderr file> [env...]
   local out=$1 err=$2
@@ -60,7 +67,7 @@ shape="$(echo "$sum" | sed -n 's/.*small, \([0-9]*\) unsupported.*/\1/p')"
 (( ${onc:-0} >= 8 )) || { echo "FAIL: fewer than 8 launches ran on the card: $sum"; fails=1; }
 (( ${notset:-0} >= 1 )) || { echo "FAIL: the expf kernel was not refused as outside the exact set: $sum"; fails=1; }
 (( ${small:-0} >= 1 )) || { echo "FAIL: the one-warp launch was not refused as too small: $sum"; fails=1; }
-(( ${shape:-0} >= 1 )) || { echo "FAIL: the module-variable kernel was not refused: $sum"; fails=1; }
+(( ${shape:-0} >= 1 )) || { echo "FAIL: the kernel that calls assert was not refused: $sum"; fails=1; }
 run "$work/wt.out" "$work/wt.err" VGPU_HOST_GPU=exact VGPU_HOST_GPU_WRITE_THROUGH=1 || { echo "FAIL: the write-through run failed"; tail -5 "$work/wt.err"; fails=1; }
 diff -u "$work/off.out" "$work/wt.out" > "$work/d.txt" || { echo "FAIL: write-through changes the program's output:"; head -20 "$work/d.txt"; fails=1; }
 moved() { sed -n 's/^host_gpu: \([0-9.]*\) MiB went to the card, \([0-9.]*\) MiB came back.*/\1 \2/p' "$1" | tail -1; }
@@ -97,5 +104,31 @@ vf() { echo "$vline" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
 [[ "$(vf words_outside)" == 0 && "$(vf kernels_outside)" == 0 ]] || { echo "FAIL: turbo verify found words outside the default tolerance: $vline"; grep '^host_gpu_outside:' "$work/rv.err" | head -5; fails=1; }
 grep -Eq '^host_gpu: verify [^ ]*use_expf[^ ]* \(admitted\): [0-9]+ words compared, [0-9]+ different, 0 outside tolerance' "$work/rv.err" \
   || { echo "FAIL: the expf kernel was not verified on the card: $(grep -m2 'verify.*use_expf' "$work/rv.err")"; fails=1; }
-(( fails == 0 )) && { echo "PASS: $sum; turbo: $rline; turbo verify: $vline"; exit 0; }
+# 7 to 9. host_gpu_vars.cu (the size rule is told to send what it can: the program's launches are short).
+vrun() {   # <tag> <mode argument> [env...]
+  local tag=$1 arg=$2
+  shift 2
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$@" "$work/vars" "$arg" > "$work/$tag.out" 2> "$work/$tag.err"
+}
+send=(VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=0)
+for arg in vars printf tex; do
+  vrun "voff_$arg" "$arg" || { echo "FAIL: host_gpu_vars $arg with the mode off failed"; tail -5 "$work/voff_$arg.err"; fails=1; }
+done
+for m in exact turbo; do
+  vrun "v_$m" vars VGPU_HOST_GPU=$m "${send[@]}" || { echo "FAIL: host_gpu_vars vars, $m, failed"; tail -5 "$work/v_$m.err"; fails=1; }
+  cmp -s "$work/voff_vars.out" "$work/v_$m.out" || { echo "FAIL: $m: kernels with module variables on the card change the output:"; diff "$work/voff_vars.out" "$work/v_$m.out" | head -6; fails=1; }
+  for k in with_vars through_pointer; do
+    grep -q "$k[^ ]* on the card" "$work/v_$m.err" || { echo "FAIL: $m: $k did not run on the card: $(grep -m2 "$k" "$work/v_$m.err")"; fails=1; }
+  done
+  vrun "vt_$m" tex VGPU_HOST_GPU=$m "${send[@]}" || { echo "FAIL: host_gpu_vars tex, $m, failed"; tail -5 "$work/vt_$m.err"; fails=1; }
+  cmp -s "$work/voff_tex.out" "$work/vt_$m.out" || { echo "FAIL: $m: a live texture object and a launch on the card change the output"; fails=1; }
+  grep -q "plain[^ ]* on the card" "$work/vt_$m.err" || { echo "FAIL: $m: a plain kernel stayed off the card with a texture object alive: $(grep -m2 'plain' "$work/vt_$m.err")"; fails=1; }
+done
+vrun vv_exact vars VGPU_HOST_GPU=exact VGPU_HOST_GPU_VERIFY=1 || { echo "FAIL: host_gpu_vars vars, exact verify, failed"; fails=1; }
+vl="$(grep '^host_gpu_verify:' "$work/vv_exact.err" | tail -1)"
+echo "$vl" | grep -Eq 'in_set_identical=[1-9][0-9]* in_set_different=0 ' || { echo "FAIL: exact verify of the kernels with module variables: $vl"; fails=1; }
+vrun vp_turbo printf VGPU_HOST_GPU=turbo "${send[@]}" || { echo "FAIL: host_gpu_vars printf, turbo, failed"; tail -5 "$work/vp_turbo.err"; fails=1; }
+cmp -s "$work/voff_printf.out" "$work/vp_turbo.out" || { echo "FAIL: turbo: a kernel that prints on the card changes the output or its order:"; diff "$work/voff_printf.out" "$work/vp_turbo.out" | head -8; fails=1; }
+grep -q "prints[^ ]* on the card" "$work/vp_turbo.err" || { echo "FAIL: turbo: the kernel that prints did not run on the card: $(grep -m2 'prints' "$work/vp_turbo.err")"; fails=1; }
+(( fails == 0 )) && { echo "PASS: $sum; turbo: $rline; turbo verify: $vline; module variables, printf and textures on the card"; exit 0; }
 exit 1

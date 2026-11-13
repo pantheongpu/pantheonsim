@@ -36,7 +36,7 @@ __global__ void use_expf(const float* a, float* b, int n) {   // MUFU.EX2: not i
 
 __global__ void tiny(int* p) { p[threadIdx.x] += 1; }   // one warp, a few instructions: too small to be worth the card
 
-// host_gpu_exact_mod.cu: a kernel whose module has a __device__ variable (its value lives in the simulator's module memory): refused.
+// host_gpu_exact_mod.cu: a kernel of a module with a __device__ variable that calls assert: refused (the assert, not the variable, since Round sp66).
 void launch_uses_global(int* p);
 
 static uint64_t fnv(const void* data, size_t bytes) {
