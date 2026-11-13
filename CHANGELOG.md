@@ -66,6 +66,12 @@ release says what runs and what it produces, never how fast a real GPU would run
   destroyed) return `cudaSuccess` and leave the last error alone, as an RTX 3060 does; they returned `cudaErrorInvalidValue`, which
   MaCh3's teardown left in the last error for CUDAProb3's next check to exit on. Unit test in `test_runtime_exports`
   (pantheonsim #618).
+- cuBLAS: a dot product (`?dot`, `?dotu`, `?dotc`, `DotEx`, `DotcEx`, their `_64` forms) in the default host pointer mode
+  with its result pointer in device memory stores the result there, as an RTX 3060 does; it died with SIGSEGV inside the
+  library, which stopped every device XC integration of GauXC (its `gdot` makes this call). The other reductions (`?nrm2`,
+  `?asum`, `i?amax`, `i?amin` and their Ex and `_64` forms), and a dot product with n <= 0, crash on the card with a device
+  result in host mode; they now return `CUBLAS_STATUS_INVALID_VALUE`, said once on stderr, instead of crashing. Measured per
+  routine on the card ([cuBLAS](nvidia/docs/cublas.md)). New unit test `test_cublas_host_mode_device_result` (pantheonsim #638).
 - NPP, CUDA 12 build: `nppGetStreamContext`, `nppGetStream` and `nppSetStream` (NPP 12's own stream, which CUDA 13's NPP removed)
   are exported from the shim, filling the context as NPP 12.3 does on an RTX 3060. New e2e test `e2e_npp_stream_context` (skips
   on CUDA 13). `nppiFilterGaussBorder_8u_C1R_Ctx` is still absent (pantheonsim #617).
