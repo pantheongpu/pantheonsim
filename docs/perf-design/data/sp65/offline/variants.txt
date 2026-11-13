@@ -1,0 +1,3 @@
+Variants of the rule replayed over the same traces (residency_replay.py --rule pullpush, --rule pullnf, --kdefault 10e-6) against --rule pull:
+launches on the card and launches sent by the rule are the same in every traced program for all three (columns compared with diff).
+The pull of the whole live memory dominates every case.

@@ -1,0 +1,11 @@
+Test project /home/ubuntu/sp65-build
+    Start   3: test_host_gpu_logic
+1/3 Test   #3: test_host_gpu_logic ..............   Passed    0.05 sec
+    Start 782: e2e_host_gpu_stub
+2/3 Test #782: e2e_host_gpu_stub ................   Passed   98.68 sec
+    Start 783: hostgpu_bench_selftest
+3/3 Test #783: hostgpu_bench_selftest ...........   Passed    1.09 sec
+
+100% tests passed, 0 tests failed out of 3
+
+Total Test time (real) =  99.84 sec

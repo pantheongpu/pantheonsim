@@ -1,0 +1,69 @@
+== polybench/bin/GRAMSCHM turbo
+kernel | card launches | kernel ms median (min-max) | card path ms median | sim estimate ms median | estimate / kernel median | MiB pushed median | sent by the streak rule | stayed for size
+_Z19gramschmidt_kernel1iiPfS_S_i | 2040 | 0.1490 (0.0960-0.2070) | 0.1520 | 0.2880 | 2 | 0.00 | 1215 | 6
+_Z19gramschmidt_kernel2iiPfS_S_i | 2040 | 0.0270 (0.0110-0.0580) | 0.0290 | 0.1540 | 6 | 0.00 | 2040 | 6
+_Z19gramschmidt_kernel3iiPfS_S_i | 2041 | 1.3340 (0.0140-1.5870) | 1.3360 | 38.7730 | 29 | 0.00 | 0 | 5
+host_gpu: 6121 launches ran on the card, 23 in the simulator (0 kernels not admitted by turbo mode, 17 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu: 48.0 MiB went to the card, 16.0 MiB came back
+host_gpu_refusals: refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=0 too_small=17 failed=0
+host_gpu_streak: sent=3255 card_only_mib=156240.0 rule=1
+== polybench/bin/GRAMSCHM turbon
+kernel | card launches | kernel ms median (min-max) | card path ms median | sim estimate ms median | estimate / kernel median | MiB pushed median | sent by the streak rule | stayed for size
+_Z19gramschmidt_kernel1iiPfS_S_i | 1 | 0.1710 (0.1710-0.1710) | 0.2120 | 0.2740 | 2 | 0.00 | 0 | 2045
+_Z19gramschmidt_kernel2iiPfS_S_i | 0 | - | - | - | - | - | 0 | 2046
+_Z19gramschmidt_kernel3iiPfS_S_i | 2041 | 1.5300 (0.0960-1.5940) | 11.1690 | 38.6880 | 25 | 48.00 | 0 | 5
+host_gpu: 2042 launches ran on the card, 4102 in the simulator (0 kernels not admitted by turbo mode, 4096 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu: 97968.0 MiB went to the card, 97936.0 MiB came back
+host_gpu_refusals: refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=0 too_small=4096 failed=0
+host_gpu_streak: sent=0 card_only_mib=0.0 rule=0
+== polybench/bin/LU turbo
+kernel | card launches | kernel ms median (min-max) | card path ms median | sim estimate ms median | estimate / kernel median | MiB pushed median | sent by the streak rule | stayed for size
+_Z10lu_kernel1iPfi | 2042 | 0.0140 (0.0080-0.0450) | 0.0150 | 0.0620 | 4 | 0.00 | 2042 | 3
+_Z10lu_kernel2iPfi | 2043 | 0.0190 (0.0090-0.1780) | 0.0200 | 15.9430 | 737 | 0.00 | 96 | 2
+host_gpu: 4085 launches ran on the card, 10 in the simulator (0 kernels not admitted by turbo mode, 5 too small, 0 unsupported launch shapes, 1 failed on the card)
+host_gpu: 16.0 MiB went to the card, 16.0 MiB came back
+host_gpu_refusals: refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=0 too_small=5 failed=1
+host_gpu_streak: sent=2138 card_only_mib=34208.0 rule=1
+== polybench/bin/LU turbon
+kernel | card launches | kernel ms median (min-max) | card path ms median | sim estimate ms median | estimate / kernel median | MiB pushed median | sent by the streak rule | stayed for size
+_Z10lu_kernel1iPfi | 0 | - | - | - | - | - | 0 | 2046
+_Z10lu_kernel2iPfi | 1393 | 0.1020 (0.0620-0.1980) | 3.3690 | 28.3170 | 279 | 16.00 | 0 | 2
+ban: _Z10lu_kernel2iPfi pushed 16.0 MiB of 16.0 MiB live on each of its last 2 launches: offloading it ends (traffic)
+host_gpu: 1393 launches ran on the card, 2703 in the simulator (0 kernels not admitted by turbo mode, 2699 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu: 22288.0 MiB went to the card, 22288.0 MiB came back
+host_gpu_refusals: refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=0 too_small=2699 failed=0
+host_gpu_streak: sent=0 card_only_mib=0.0 rule=0
+== rodinia/bin/gaussian turbo
+kernel | card launches | kernel ms median (min-max) | card path ms median | sim estimate ms median | estimate / kernel median | MiB pushed median | sent by the streak rule | stayed for size
+_Z4Fan1PfS_ii | 494 | 0.0150 (0.0130-0.0510) | 0.0160 | 0.0720 | 5 | 0.00 | 494 | 15
+_Z4Fan2PfS_S_iii | 495 | 0.0310 (0.0250-0.0920) | 0.0320 | 14.9940 | 484 | 0.00 | 0 | 14
+host_gpu: 989 launches ran on the card, 33 in the simulator (0 kernels not admitted by turbo mode, 29 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu: 2.0 MiB went to the card, 2.0 MiB came back
+host_gpu_refusals: refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=0 too_small=29 failed=0
+host_gpu_streak: sent=494 card_only_mib=989.0 rule=1
+== rodinia/bin/gaussian turbon
+kernel | card launches | kernel ms median (min-max) | card path ms median | sim estimate ms median | estimate / kernel median | MiB pushed median | sent by the streak rule | stayed for size
+_Z4Fan1PfS_ii | 0 | - | - | - | - | - | 0 | 509
+_Z4Fan2PfS_S_iii | 495 | 0.0400 (0.0300-0.1010) | 0.3820 | 15.0540 | 376 | 2.00 | 0 | 14
+host_gpu: 495 launches ran on the card, 527 in the simulator (0 kernels not admitted by turbo mode, 523 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu: 991.0 MiB went to the card, 991.0 MiB came back
+host_gpu_refusals: refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=0 too_small=523 failed=0
+host_gpu_streak: sent=0 card_only_mib=0.0 rule=0
+== rodinia/bin/lud turbo
+kernel | card launches | kernel ms median (min-max) | card path ms median | sim estimate ms median | estimate / kernel median | MiB pushed median | sent by the streak rule | stayed for size
+_Z12lud_diagonalPfii | 58 | 0.0350 (0.0250-0.0370) | 0.0360 | 0.1980 | 6 | 0.00 | 58 | 4
+_Z12lud_internalPfii | 58 | 0.0270 (0.0190-0.0510) | 0.0290 | 11.7855 | 393 | 0.00 | 3 | 3
+_Z13lud_perimeterPfii | 58 | 0.0370 (0.0300-0.1280) | 0.0380 | 2.0570 | 54 | 0.00 | 2 | 3
+host_gpu: 174 launches ran on the card, 16 in the simulator (0 kernels not admitted by turbo mode, 10 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu: 4.0 MiB went to the card, 4.0 MiB came back
+host_gpu_refusals: refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=0 too_small=10 failed=0
+host_gpu_streak: sent=63 card_only_mib=252.0 rule=1
+== rodinia/bin/lud turbon
+kernel | card launches | kernel ms median (min-max) | card path ms median | sim estimate ms median | estimate / kernel median | MiB pushed median | sent by the streak rule | stayed for size
+_Z12lud_diagonalPfii | 0 | - | - | - | - | - | 0 | 62
+_Z12lud_internalPfii | 50 | 0.0270 (0.0190-0.1230) | 0.0290 | 15.2470 | 635 | 0.00 | 0 | 11
+_Z13lud_perimeterPfii | 45 | 0.1290 (0.1130-0.1440) | 0.7690 | 2.5440 | 20 | 4.00 | 0 | 16
+host_gpu: 95 launches ran on the card, 95 in the simulator (0 kernels not admitted by turbo mode, 89 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu: 200.0 MiB went to the card, 200.0 MiB came back
+host_gpu_refusals: refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=0 too_small=89 failed=0
+host_gpu_streak: sent=0 card_only_mib=0.0 rule=0

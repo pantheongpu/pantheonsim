@@ -3296,3 +3296,114 @@ The 10 cold: asyncAllocation, bgmv (12 ms, one ms), JACOBI1D (noise, above), SYR
 * `VGPU_JIT_LINK=1` and `VGPU_JIT_FUSE=1` on the changed build.
 * The first pass's changed build also had `vfork`; its numbers for programs that start a compiler were re-measured on the final build (the recheck table), the others start none.
 * Rule deviations: the first ctest run held the machine lock for eleven minutes in one piece; the default-thread pass is three runs a side on 18 programs.
+
+## Round sp65 (host-GPU mode: a launch while the card holds the memory)
+
+Branch `sp65-resident-streaks`, on `hostgpu-relaxed` f55c8e65 (pantheonsim #587). With residency a launch on the card leaves every live 64 KiB chunk
+the card's alone, and a launch the simulator runs first pulls all of them back; the size rule weighed a short launch's simulator time alone against the
+card path, so a short kernel between two card launches was kept in the simulator, pulled the whole live memory back and made the next card launch
+push it all again. This round prices such a launch with what each side moves. Design and soundness: [12, section 9](../12-host-gpu-turbo.md).
+Data, scripts and commands: [`data/sp65/`](../data/sp65/README.md). Before the card everything ran on server3 (no driver; the machine's lock was shared
+with three other rounds, so the trace passes were cut to what can change); the card part is one A10G (g5.xlarge, 4 vCPU, driver 595.112.07, nvcc 13.0),
+about 2 hours.
+
+### Headline (one A10G; `exactn` and `turbon` are the same build with `VGPU_HOST_GPU_STREAK=0`, the rule of sp61; medians of 3 runs, 1 for GRAMSCHM)
+
+| program | mode | sp61's rule s | now s | | launches sent by the new rule | bytes moved each way, before and now |
+|---|---|---:|---:|---:|---:|---|
+| PolyBench LU | turbo | 11.64 | 1.53 | 7.6x | 2,138 (`lu_kernel1` every time, `lu_kernel2` 96 times) | 22,288 MiB to 16 MiB |
+| | exact with `VGPU_HOST_GPU_DIV=1` | 11.69 | 1.48 | 7.9x | (as turbo: the division admits `lu_kernel1`) | |
+| Rodinia gaussian | turbo | 0.99 | 0.53 | 1.88x | 493 (`Fan1`) | 991 MiB to 2 MiB |
+| | exact with `VGPU_HOST_GPU_DIV=1` | 0.95 | 0.57 | 1.67x | | |
+| PolyBench GRAMSCHM | turbo | 271.1 | 225.0 | 1.21x | 3,255 (kernel1 and kernel2); 6,121 of 6,144 launches on the card against 2,042 | 97,968 MiB to 48 MiB |
+| HeCBench axpby | exact and turbo | 0.65 | 0.57, 0.59 | 1.14x, 1.11x | 3 | |
+| Rodinia lud | turbo | 2.78 | 2.82 | 0.99x | 63 (`lud_diagonal`) | 200 MiB to 4 MiB |
+
+* In exact mode LU, gaussian and GRAMSCHM do not change: the short kernel between the long ones is refused for its code (`lu_kernel1` and `Fan1` for
+  the division, `gramschmidt_kernel1` for `MUFU.RSQ`), so the simulator runs it and the card holds nothing when the next one comes; with
+  `VGPU_HOST_GPU_DIV=1` the first two gain as in turbo mode. "Where admitted, in both modes" holds.
+* **Outputs**: the simulator's in every form of every program (`particlefilter_float` excepted, which does not repeat itself in the simulator).
+* **The bar** (no program more than 3 % slower than with sp61's rule in the same mode): see C; every reading over 3 % in one run was of a program
+  the rule sent nothing for, and ten runs each put them within REPEAT_RESULT.
+
+### A. Question 1, offline: how many short launches sit between two card launches with every chunk resident
+
+`data/sp65/trace_corpus.py` traced every launch on server3 with `VGPU_HOST_GPU_MAX_MIB=0` (nothing goes, no driver, no sample), and
+`residency_replay.py` replays the runtime's rules with the residency of every chunk. server3's simulator is 2 to 5 times faster than the rig's, and not
+by one factor (a 1-block launch runs on one thread, where the rig is about 1.5 times slower; a wide one on four, about 2.65); the replay takes, per
+program, the factor at which today's rule reproduces sp59's counts on the rig (exactly for gaussian, FDTD-2D, JACOBI1D and others, within 10 launches
+for GRAMSCHM; off by 832 for LU and 60 for lud). Over the traced programs 30,090 launches stay for their size (sp59 counted 30,812 over the whole corpus).
+
+* **3,772 of them are short launches right after a card launch, with the whole live memory on the card and a card launch after them**:
+  GRAMSCHM `kernel1` 2,037, LU `lu_kernel1` 1,210, gaussian `Fan1` 494, lud `lud_diagonal` 31. Each pulls the live memory back and makes the next
+  card launch push it again: 118,249 MiB each way. Counting the launches after them that then find the card holding the memory too (GRAMSCHM's
+  `kernel2`), the rule was predicted to send 6,798; on the card it sent 2,138 (LU, 2,168 predicted), 493 (gaussian, 494), 63 (lud, 62) and 3,255
+  (GRAMSCHM, where today's rule also sent about 830 `kernel1` launches itself once the card held the memory).
+* No other traced program changes its decisions, offline or on the card (C). In exact mode the replay changes only axpby (3 launches).
+* The rule runs in the runtime as in the replay: against the stand-in driver as a card that keeps memory and computes nothing, LU in turbo mode
+  sends 2,244 launches by the rule and pushes 16 MiB in all, against 772 on the card, 3,320 kept and 12,352 MiB with `VGPU_HOST_GPU_STREAK=0`
+  (`offline/stub-check.txt`).
+
+### B. Question 2: the card's kernel time, and what keeps short launches
+
+What the card took per launch (`VGPU_HOST_GPU_LOG=1`, `card-log.txt`; kernel and synchronisation, median) against the simulator's estimate:
+
+| kernel | grid | card | estimate | estimate / card |
+|---|---|---:|---:|---:|
+| GRAMSCHM `kernel1` | 1 block | 0.149 ms | 0.288 ms | 2 |
+| GRAMSCHM `kernel2` | 8 blocks | 0.027 ms | 0.154 ms | 6 |
+| GRAMSCHM `kernel3` | 8 blocks | 1.33 ms | 38.8 ms | 29 |
+| LU `lu_kernel1` | 8 blocks | 0.014 ms | 0.062 ms | 4 |
+| LU `lu_kernel2` | 16,384 blocks | 0.019 to 0.102 ms | 15.9 to 28.3 ms | 280 to 740 |
+| gaussian `Fan1` / `Fan2` | | 0.015 / 0.031 ms | 0.072 / 15.0 ms | 5 / 484 |
+| lud `diagonal` / `perimeter` / `internal` | | 0.035 / 0.037 / 0.027 ms | 0.20 / 2.1 / 11.8 ms | 6 / 54 / 393 |
+
+and from sp59's card paths with the replayed pushes taken off (`offline/q2-turbo.md`, 11 programs): 12 us (hotspot) to 32 ms (2MM), 25 to 808 times
+under the simulator. So the card's time is about 10 to 40 us for a short launch whatever the simulator takes, and 250 to 800 times under it for a wide
+grid; but on a grid of a few blocks it is only 2 to 30 times under (sp61's COVAR, 8 blocks: 15). The sampler's 1/8 is safe for wide grids and not far
+off for a 1-block kernel; nothing in this round changes it.
+
+**The 100 us assumed before a kernel has run on the card is not what keeps short launches**: of the 30,090, the replay finds none kept by it. 28,764 are
+under the 200 us floor (JACOBI1D 19,996 and ADI 2,041 among them, programs that never start the driver), 810 are kept while the driver is not up,
+516 by the push. The floor is what kept the streaks' short kernels, and the push of the whole memory after a simulator launch what kept the next one.
+The rule's decisions do not move on these programs with 10 us assumed, without the floor, or with the push back also charged (`offline/replay-turbo-*`):
+the pull dominates.
+
+### C. The bar
+
+Target programs, 3 runs a form (`target.md`, `target2.md` after the change of D, `target-div0.md`), GRAMSCHM 1 run (`gramschm2.md`); the rest of
+PolyBench, Rodinia and the reduced HeCBench list, 1 run a form (`ab-rest.md`, `ab-hec.md`). Programs over 3 % in one run, none with a launch sent by
+the rule (`host_gpu_streak: sent=0` and the same launches on the card in both forms): REPEAT_LIST. Ten runs of each form (`repeat.md`,
+`repeat-bs.md`): REPEAT_RESULT. lud in turbo mode, the one program with launches sent that does not gain: 2.78 s against 2.82 (sent 63; its
+launches on the card take 0.03 ms for 0.2 to 12 ms estimated, and the program's 2.8 s are its CPU part).
+
+A rig caveat: another round's build and runs shared the rig from about 13:55 to 14:20 UTC (during the first target pass and the A/B); the second target
+pass, the GRAMSCHM pass and the repeats ran alone.
+
+### D. What the card changed
+
+The first target pass sent GRAMSCHM's kernel1 by the rule only until a launch of it that **today's rule** had sent (its estimate, 0.29 ms, above twice
+a measured card path of 0.15 ms) took longer than that estimate on the card: the ban for a slow launch ended kernel1's offloading for good, and the
+streak broke for the rest of the run (1,658 launches kept, 39.6 GB moved, 260.7 s). Such a launch also saved the pull, so the bans now weigh
+**any** launch made while the card holds memory the simulator does not against its simulator time plus that pull, whichever rule sent it. After the
+change: 17 launches kept, 48 MiB moved, 225.0 s. LU, gaussian and lud were run again on the changed build (`target2.md`): the same launches sent.
+
+### E. Tests and mutants
+
+* `test_host_gpu_logic`: 92 cases, 3 new (when the rule acts; both sides by the formula; the floor and the margin, at exact binary edges and by bisection). Passed on
+  server3 and on the rig.
+* Mutants (`data/sp65/mutants.py`, a copy of the header outside the tree per mutant): 23; the first pass killed 19, the four survivors (no card data
+  needed, a negative estimate, the floor and the margin taken strictly) were killed by tests added at those edges: 23 of 23.
+* `e2e_host_gpu_stub` steps 24 to 26 (a short launch follows a long one to a card that keeps memory and computes nothing, in both modes; not with
+  `VGPU_HOST_GPU_STREAK=0`; not after the program read the memory back): first run on the rig, passed, as did the card CI (`card-ci.txt`).
+* Not covered by a test: the ban's new reference (D; runtime code, no stand-in can make a launch slow on purpose).
+
+### F. Caveats and what was not run
+
+* One rig, one card, one toolkit; 3 runs a form for the target programs, 1 for GRAMSCHM and the rest of the corpus (with ten runs of anything over 3 %).
+* The offline counts rest on a fitted factor between two machines' simulators; the card run is the measurement.
+* LU in turbo mode reports one launch "failed on the card" in every form that sends `lu_kernel1` (as sp59's verify run did); the launch falls back to
+  the simulator and the output is identical. Not investigated.
+* HeCBench programs that sp59 found with no launch on the card, and the long HeCBench programs (aligned-types, babelstream, base64e, binomial,
+  atomicReduction: almost no launch kept for its size in sp59), were not traced; the A/B ran the reduced list without the five long ones.
+* Not compiled with the sanitizers or the CUDA 12 headers: the hosted CI jobs are their first run. `g++-12 -fsyntax-only` of the two changed C++ files is clean.

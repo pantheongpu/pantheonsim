@@ -3,7 +3,7 @@
 Status: experimental, opt-in (`VGPU_HOST_GPU=turbo`). Measured on one A10G in *Round sp59*
 ([rounds/11-rounds-sp36-sp41.md](rounds/11-rounds-sp36-sp41.md#round-sp59-turbo-host-gpu-mode-on-an-a10g)): over 59 programs of PolyBench/GPU, Rodinia
 and HeCBench the geometric mean speed-up is 1.23x against 1.12x for exact mode (summed wall time 1.75x against 1.20x), every program's output is the
-simulator's, and no kernel was refused for an instruction of no class. Sections 5 and 8 say what the card confirmed and what it changed.
+simulator's, and no kernel was refused for an instruction of no class. Sections 5, 8 and 9 say what the card confirmed and what it changed.
 Tracking issue: pantheonsim #587. Read [09-host-gpu-spike.md](09-host-gpu-spike.md) first: this mode is the same machinery with a wider
 door.
 
@@ -353,8 +353,10 @@ holds chunks the simulator does not, the launch is priced with what each side re
 
 It goes when keeping it costs over twice as much as sending it, and at least 200 us: the margin and the floor of the size rule, on both sides' real
 costs. The pushes that the next card launch would make after a simulator launch are not counted (no card launch may follow), so the rule errs towards
-the simulator. The bans are kept and weigh such a launch's card path against the same sum (its simulator time and the pull), since that is what the
-simulator would have cost; the traffic ban and the first-launch, sampling and start-cost rules are unchanged. `VGPU_HOST_GPU_STREAK=0` keeps the rule of
+the simulator. The bans are kept, and weigh the card path of any launch made while the card holds such chunks, whichever rule sent it, against the
+same sum (its simulator time and the pull), since that is what the simulator would have cost: weighed against the simulator time alone, one slow
+launch of GRAMSCHM's 1-block kernel1 (0.15 ms on the card, 0.29 ms estimated, sent by the size rule itself) ended the kernel's offloading and broke
+the streak for the rest of the run (Round sp65, D). The traffic ban and the first-launch, sampling and start-cost rules are unchanged. `VGPU_HOST_GPU_STREAK=0` keeps the rule of
 Round sp61; the summary's `host_gpu_streak: sent=.. card_only_mib=.. rule=..` counts the launches it sent and the bytes only the card held at them.
 
 **Why it is sound.** It changes only which side runs a launch that either side could already run: the launch is admitted by the same checks (code,
@@ -366,6 +368,13 @@ memory ran in the simulator, or the host has read everything back).
 What it can cost: a launch it sends whose kernel takes longer on the card than its simulator time plus the pull (the bans end that kernel after one such
 launch, as for any kernel); and a launch it sends whose pull happens anyway, because the launch after it is one the card cannot take (a refused kernel
 then pulls everything): the launch's card path against its simulator time, a few microseconds.
+
+**What the card said** (one A10G, [Round sp65](rounds/11-rounds-sp36-sp41.md#round-sp65-host-gpu-mode-a-launch-while-the-card-holds-the-memory); medians of 3
+runs against `VGPU_HOST_GPU_STREAK=0`): PolyBench LU 11.6 s to 1.5 s in turbo mode and in exact mode with `VGPU_HOST_GPU_DIV=1` (22 GB moved each way
+to 16 MiB), Rodinia gaussian 0.99 s to 0.53 s, GRAMSCHM 271 s to 225 s in turbo (one run; its CPU reference is the rest), HeCBench axpby 1.11x and 1.14x.
+In exact mode without the division LU, gaussian and GRAMSCHM do not change: their short kernel is refused for its code, so the simulator runs it and
+the card holds nothing when the next launch comes. Outputs are the simulator's; no program was more than 3 % slower after ten runs of each reading
+over it. The card's own time for a short launch was 0.014 to 0.15 ms, and for a kernel on one block only twice under the simulator's estimate.
 
 ## 10. What is next
 
