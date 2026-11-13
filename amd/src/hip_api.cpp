@@ -2211,7 +2211,16 @@ hipError_t hipModuleGetFunction(hipFunction_t* function, hipModule_t module, con
   // A linked module's kernels are its members'.
   for (Module* member : m->members)
     if (!k && (k = vgpu::amd::find_kernel(member->object, name))) m = member;
-  if (!k) return record(s, fail(hipErrorNotFound, std::string("the code object has no kernel named ") + name));
+  if (!k) {
+    // Asking every loaded module for a kernel until one has it is how Tensile (rocBLAS, hipBLASLt) finds its
+    // GEMM kernels: hipErrorNotFound from the modules before the right one is expected, and it clears the error
+    // and asks the next. Said on stderr, each of those probes read as a failure (#636), so the miss is only said
+    // when no module loaded in the process has the kernel, which is a name the program got wrong.
+    const bool elsewhere = std::any_of(s.modules.begin(), s.modules.end(),
+                                       [&](const auto& other) { return vgpu::amd::find_kernel(other->object, name) != nullptr; });
+    const std::string what = std::string("the code object has no kernel named ") + name;
+    return record(s, elsewhere ? hipErrorNotFound : fail(hipErrorNotFound, what));
+  }
   auto f = std::make_unique<Function>();
   f->module = m;
   f->kernel = k;
