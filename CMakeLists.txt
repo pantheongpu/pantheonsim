@@ -1844,6 +1844,9 @@ target_include_directories(test_jit_wait PRIVATE src)
 # age rule, and the notices (once a day; none with VGPU_JIT=auto, none for a compile cancelled at exit: child processes of the test itself).
 vgpu_unit_test(test_jit_cold)
 target_include_directories(test_jit_cold PRIVATE src)
+# Tier 2, round sp64: a section whose compile is running is on the plain loop, and the compile log of VGPU_JIT_STATS (child processes of the test).
+vgpu_unit_test(test_jit_threads)
+target_include_directories(test_jit_threads PRIVATE src)
 # Register residence of the generated code against the register-file code, on random regions (VGPU_JIT_RANDOM_UNITS=<n> for more).
 vgpu_unit_test(test_jit_resid)
 target_include_directories(test_jit_resid PRIVATE src)

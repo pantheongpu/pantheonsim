@@ -231,6 +231,7 @@ struct Config {
   bool specialize = true;           // also generate the body for a whole warp (all 32 lanes) apart from the one for any group (from_env: off, VGPU_JIT_SPECIALIZE=1: on; off is only the general one: half the code, a faster compile)
   bool fuse = false;                // generate runs of register-only ops block by block of eight lanes (gen_fused_run; from_env: VGPU_JIT_FUSE=1 turns it on)
   unsigned timeout_s = 120;         // wall limit of one compile
+  bool pch = true;                  // GCC: the runtime header precompiled once in the runtime directory, read by every compile after (round sp64; from_env: VGPU_JIT_PCH=0 off)
   unsigned mem_mb = 4096;           // RLIMIT_AS of the compiler
   uint64_t max_bytes = uint64_t{256} << 20;   // the cache's size cap over its directories (Engine::trim; from_env: VGPU_JIT_CACHE_MAX_MB, 0: none)
   unsigned stale_days = 14;         // another build's directory none of whose files changed for this long is removed (0: never)
@@ -269,6 +270,8 @@ struct Result {
   bool pending = false;             // lookup_selected(): a miss of a section that has a selection on record (a compile of an earlier run that did not finish)
   bool cancelled = false;           // obtain(): the compile was cancelled (the process is ending)
   double compile_ms = 0, lookup_ms = 0;
+  uint64_t source_bytes = 0;        // obtain(): the size of the generated source it compiled (the compile log of VGPU_JIT_STATS, round sp64)
+  bool pch = false;                 // obtain(): the compile read the precompiled runtime header (round sp64)
   std::string key;
   std::string message;
 };
@@ -306,6 +309,8 @@ class Engine {
   std::string object_path(const std::string& key) const;
   std::string compiler_id(std::string* why = nullptr);
   std::string ensure_rt();                         // writes the embedded headers the generated code includes; "" or the error
+  // (Round sp64) Makes the precompiled runtime header that the last compile found missing, once an engine; true if it made one.
+  bool build_pch();
   void trim(const std::string& keep);              // the size cap and the age rule (round sp63; run after an install): `keep` is a key never removed
 
  private:
@@ -389,8 +394,13 @@ struct Unit : std::enable_shared_from_this<Unit> {
   std::vector<int32_t> fn_index;       // region -> its function in lib, -1 for a region that was not compiled (valid once Ready)
   bool ready() const { return state.load(std::memory_order_acquire) == static_cast<int>(State::Ready); }
   bool counting() const { return state.load(std::memory_order_relaxed) <= static_cast<int>(State::Counting); }
-  // Whether the run loop with the region hook is wanted: not once the section has failed or been declined (the plain loop is then used: step_warp asks).
-  bool hook() const { return state.load(std::memory_order_relaxed) <= static_cast<int>(State::Ready); }
+  // Whether the run loop with the region hook is wanted: not once the section has failed or been declined (the plain loop is then used: step_warp asks),
+  // and not while its compile runs (round sp64: Queued counts nothing, and its regions have no functions yet; the hook loop cost the section 3 to 8 % for
+  // as long as the compile took, a whole run when the compile started at the lookup and did not finish before the end).
+  bool hook() const {
+    const int s = state.load(std::memory_order_relaxed);
+    return s <= static_cast<int>(State::Counting) || s == static_cast<int>(State::Ready);
+  }
   // Waiting: the plain loop is used, and step_warp tells wait_note what each call of it ran.
   bool waiting() const { return state.load(std::memory_order_relaxed) == static_cast<int>(State::Waiting); }
   // The plain loop ran `instr` warp instructions of this section while it was Waiting. Each thread adds them up by itself and brings them to the shared
@@ -438,6 +448,7 @@ struct Stats {
   std::atomic<uint64_t> prewaits{0};                // sections that went to the plain loop on the way to the lookup (round sp63)
   std::atomic<uint64_t> history{0};                 // lookups that found a selection without its object and compiled it at once (round sp63)
   std::atomic<uint64_t> evicted{0};                 // objects and directories the cache's size cap and age rule removed (Engine::trim)
+  std::atomic<uint64_t> pch_used{0}, pch_built{0};  // compiles that read the precompiled runtime header, and headers made (round sp64)
   std::atomic<uint64_t> continued{0};   // branches and register-only ops the generated code went on past (the loop's chain steps it took over)
   // Why generated code was left (round sp52), per reason (ExitWhy): [0] the group was every runnable lane of the warp, [1] other runnable lanes stood elsewhere
   // (a diverged warp: the loop's chain conditions do not hold), [2] the calls of these that left at their entry with nothing run.
