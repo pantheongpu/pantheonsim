@@ -706,13 +706,14 @@ struct Runtime::Impl : CardGate {
         for (const auto& [addr, name] : m.builtins) builtin = builtin || name == f;
         if (!devrt && !builtin && std::find(m.cubin.externs.begin(), m.cubin.externs.end(), f) == m.cubin.externs.end()) continue;   // (a device function of the module)
         const ExternKind k = extern_kind(f, devrt);
-        if (extern_admitted(k, mode, sw.printf_off)) {
+        // (a verify run runs a launch on the card and then in the simulator: a kernel that prints would print twice, so it is not sent there)
+        if (extern_admitted(k, mode, sw.printf_off) && !verify) {
           v.printf = true;
           continue;
         }
         ok = false;
         v.why_text = std::string("the kernel calls ") + (k == ExternKind::Other ? f : extern_kind_name(k)) +
-                     (k == ExternKind::Printf ? (turbo ? " (VGPU_HOST_GPU_TURBO_OFF=printf)" : " (turbo mode only)") : "");
+                     (k == ExternKind::Printf ? (!turbo ? " (turbo mode only)" : verify ? " (not under VGPU_HOST_GPU_VERIFY: it would print twice)" : " (VGPU_HOST_GPU_TURBO_OFF=printf)") : "");
         why = v.why_text.c_str();
         break;
       }

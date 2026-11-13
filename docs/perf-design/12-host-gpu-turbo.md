@@ -390,7 +390,7 @@ prints them when the host synchronises with the kernel, which the card path does
 stdout just before such a launch, so the card's lines come after everything the program printed before the launch and before anything it prints
 after, which is the simulator's order. The text is the card's formatting of the card's values, as on real hardware; a kernel that prints more than
 the card's printf buffer (1 MiB unless the program sets `cudaLimitPrintfFifoSize`, which the simulator does not pass on) loses lines on the card,
-as it does natively. Exact mode does not admit `printf` (its promise is about memory). `VGPU_HOST_GPU_TURBO_OFF=printf` keeps such kernels out.
+as it does natively. Exact mode does not admit `printf` (its promise is about memory), nor does a verify run (each launch would print twice, once on each side). `VGPU_HOST_GPU_TURBO_OFF=printf` keeps such kernels out.
 
 **Texture objects.** A kernel reads a texture or surface only through a texture or surface instruction (`TEX`, `TLD`, `TLD4`, `TXD`, `TXQ`, `TMML`,
 `SULD`, `SUST`, `SUATOM`, `SURED`: `texture_mnemonic`), which neither the exact set nor any turbo class admits; the handle itself is a number. So a
