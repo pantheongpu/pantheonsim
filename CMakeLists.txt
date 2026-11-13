@@ -540,9 +540,19 @@ endfunction()
 # A version script naming the soname's own version node, which is how NVIDIA
 # tags these symbols. Getting it wrong makes the loader warn about missing
 # version information on every call.
+#
+# Except the profiling engine's functions (vgpu::profiling, src/core/profiling.cpp), which go in a version node every
+# shim shares (VGPU_PROFILING_MAP_NODE). Each shim carries its own copy of the engine, and the process must use one: a
+# library's Silence has to be the runtime's, or the runtime records the copies cuBLAS makes on the program's behalf as
+# the program's cudaMemcpy. The dynamic linker binds each library's references to the first definition in the global
+# scope whose version matches. Under the soname's own node no two shims' versions match, and only the unversioned
+# libcuda.so.1, when it was in the global scope, made them agree: `vgpu run --preload` now loads it privately (#597),
+# and PyTorch's profiler listed cuBLAS's copies. In one shared node they all agree on the first shim loaded, and an
+# unversioned libcuda still matches them all.
+set(VGPU_PROFILING_MAP_NODE "VGPU_PROFILING_1 {\n  global: extern \"C++\" { vgpu::profiling::*; };\n};\n")
 function(vgpu_version_script _libname _soversion _out)
   set(_path "${CMAKE_BINARY_DIR}/maps/lib${_libname}.so.${_soversion}.map")
-  file(WRITE "${_path}" "lib${_libname}.so.${_soversion} {\n  global: *;\n  local: ${VGPU_LOCAL_STD_TABLES};\n};\n")
+  file(WRITE "${_path}" "lib${_libname}.so.${_soversion} {\n  global: *;\n  local: ${VGPU_LOCAL_STD_TABLES};\n};\n${VGPU_PROFILING_MAP_NODE}")
   set(${_out} "${_path}" PARENT_SCOPE)
 endfunction()
 
@@ -4847,6 +4857,14 @@ set_tests_properties(e2e_vgpu_run PROPERTIES
 # vgpu run --preload and a library that keeps the driver's and NVRTC's functions in exported pointers named like them (ThrustRTC, #597).
 add_test(NAME e2e_preload_fnptr COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_preload_fnptr.sh)
 set_tests_properties(e2e_preload_fnptr PROPERTIES
+  DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 300)
+# vgpu run --preload and programs that use the shim as PyTorch does, without PyTorch: the driver reached through the runtime
+# with no cuInit of the program's own, and the profiling engine around a cuBLAS call (one engine for every shim).
+add_test(NAME e2e_preload_torch_like COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_preload_torch_like.sh)
+set_tests_properties(e2e_preload_torch_like PROPERTIES
   DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"

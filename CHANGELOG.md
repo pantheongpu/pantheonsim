@@ -77,6 +77,15 @@ release says what runs and what it produces, never how fast a real GPU would run
   after `cudaDeviceDisablePeerAccess`, the access still faults, as it does on two RTX 3060s (measured). Only an access that missed every
   allocation of the device looks at the peer; launch caching (`VGPU_MEMO=1`) and host-GPU mode stand aside while a peer link exists.
   New test `e2e_peer_kernel` (SASS and PTX paths).
+- `vgpu run --preload`: PyTorch starts again, and its profiler lists what it did before. Both broke when the driver became a private load
+  (pantheonsim #597, below). The runtime looked the driver up in the global scope only, so it never initialised it nor handed it its
+  primary context, and PyTorch 2.10's `torch.cuda` init, which asks `cuDevicePrimaryCtxGetState` with no `cuInit` of its own, failed with
+  "CUDA driver error: initialization error" on every check. The runtime now keeps the privately loaded driver's handle and asks it
+  first, and `cudaGetDriverEntryPoint` no longer reloads that driver with `RTLD_GLOBAL` (#604's late-load path), which put it in the
+  global scope after all. And each shim carries its own copy of the profiling engine: the unversioned driver in the global scope was
+  what made every shim use one, so without it cuBLAS's internal copies were reported as the program's `cudaMemcpy`. The engine's
+  functions now sit in a version node every shim shares (`VGPU_PROFILING_1`). New test `e2e_preload_torch_like`: programs that use
+  the shim as PyTorch does, with no PyTorch.
 - `vgpu run --preload`: `import ThrustRTC` (PyPI 0.3.20) no longer crashes with a segmentation fault (pantheonsim #597). ThrustRTC
   keeps the driver's and NVRTC's functions in exported pointers named like them (`cuInit`, `nvrtcVersion`, ...), and with the shim's
   `libcuda.so.1` preloaded its references to its own `cuInit` bound to the shim's function, whose code its `dlsym` result then

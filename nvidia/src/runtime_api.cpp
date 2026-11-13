@@ -120,6 +120,15 @@ bool trace() { return trace(std::getenv("VGPU_TRACE")); }
 // sonames, they are what every later request for one gets, as a preloaded library is; but their functions are not in the global scope,
 // where a library's own exported variable of the same name (ThrustRTC's function pointers `cuInit`, `nvrtcVersion`, ... that it fills
 // from dlsym) would bind to them, and the library would then write over their code (#597).
+//
+// The runtime still has to reach that driver: it initialises it (ensure_init), hands it each thread's primary context
+// (bind_driver_context) and forwards calls to it. Those lookups used dlsym(RTLD_DEFAULT), which cannot see a privately
+// loaded library, so under --preload the driver was never initialised, and a program that calls the driver without a cuInit
+// of its own, counting on the runtime to have done it as on the card -- PyTorch 2.10's _cuda_init asks
+// cuDevicePrimaryCtxGetState -- got CUDA_ERROR_NOT_INITIALIZED. The handle is kept here, and every lookup of a driver symbol
+// goes through driver_dlsym, which asks it first. (A constant-initialised atomic: nothing has to construct it before the
+// constructor below runs.)
+std::atomic<void*> g_private_driver{nullptr};
 __attribute__((constructor)) static void load_private_preloads() {
   const char* v = std::getenv("VGPU_PRELOAD_PRIVATE");
   if (!v || !*v) return;
@@ -129,9 +138,21 @@ __attribute__((constructor)) static void load_private_preloads() {
     const std::string path = list.substr(at, end - at);
     at = end + 1;
     if (path.empty()) continue;
-    if (!dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL) && !quiet())
-      std::fprintf(stderr, "[vgpu] --preload: cannot load %s: %s\n", path.c_str(), dlerror());
+    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+      if (!quiet()) std::fprintf(stderr, "[vgpu] --preload: cannot load %s: %s\n", path.c_str(), dlerror());
+      continue;
+    }
+    // The simulator's driver, whatever the file is called: the library that defines its hand-over entry point.
+    if (dlsym(h, "vgpu_driver_bind_primary_v1")) g_private_driver.store(h, std::memory_order_release);
   }
+}
+// A symbol of the driver shim: from the privately loaded driver when there is one, otherwise from the global scope (the
+// program links libcuda, preloads it, or a library loaded it with RTLD_GLOBAL), or null when no driver is loaded.
+void* driver_dlsym(const char* name) {
+  if (void* h = g_private_driver.load(std::memory_order_acquire))
+    if (void* p = dlsym(h, name)) return p;
+  return dlsym(RTLD_DEFAULT, name);
 }
 
 // A fatbin registered by the host boilerplate. PTX is parsed into a runtime
@@ -457,7 +478,7 @@ void unmap_host_everywhere(State& s, void* p) {
 // driver shim is not loaded, there is nothing to initialize and nothing to do.
 void init_driver_shim_if_loaded() {
   using CuInit = int (*)(unsigned int);
-  if (auto fn = reinterpret_cast<CuInit>(dlsym(RTLD_DEFAULT, "cuInit"))) fn(0);
+  if (auto fn = reinterpret_cast<CuInit>(driver_dlsym("cuInit"))) fn(0);
 }
 
 void ensure_init(State& s) {
@@ -989,7 +1010,7 @@ void bind_driver_context() {
   static Bind fn = nullptr;   // (callers hold the API lock)
   static unsigned fn_loads = ~0u;
   if (fn_loads != loads) {
-    fn = reinterpret_cast<Bind>(dlsym(RTLD_DEFAULT, "vgpu_driver_bind_primary_v1"));
+    fn = reinterpret_cast<Bind>(driver_dlsym("vgpu_driver_bind_primary_v1"));
     fn_loads = loads;
   }
   if (fn) fn(t_current_device);
@@ -1662,7 +1683,7 @@ static bool async_launch_eligible(State& s, const char* api, cudaStream_t stream
   if (!s.managed_allocs.empty() || !s.managed_vars.empty()) return false;
   using Probe = int (*)();
   // Looked up each time: the driver shim may be loaded after the first launch.
-  const Probe driver_managed = reinterpret_cast<Probe>(dlsym(RTLD_DEFAULT, "vgpu_driver_has_managed_v1"));
+  const Probe driver_managed = reinterpret_cast<Probe>(driver_dlsym("vgpu_driver_has_managed_v1"));
   if (driver_managed && driver_managed()) return false;
   if (!async_launch_stream_ok(stream)) return false;
   return !async_libraries_loaded();
@@ -7316,6 +7337,11 @@ int rt_tensor_map_encode_im2col(void* tensorMap, unsigned dataType, unsigned ran
 using GetProcAddressFn = int (*)(const char*, void**, int, unsigned long long, int*);
 GetProcAddressFn simulator_get_proc_address() {
   static GetProcAddressFn fn = []() -> GetProcAddressFn {
+    // The driver `vgpu run --preload` loaded privately (load_private_preloads): the runtime has initialised it and handed
+    // it its contexts as for a linked one. It stays private: loading it again with RTLD_GLOBAL, below, would put its
+    // functions in the global scope after all, where a library loaded later binds its own `cuInit` variable to them (#597).
+    if (void* h = g_private_driver.load(std::memory_order_acquire))
+      return reinterpret_cast<GetProcAddressFn>(dlsym(h, "cuGetProcAddress_v2"));
     Dl_info self{};
     if (!dladdr(reinterpret_cast<void*>(&simulator_get_proc_address), &self) || !self.dli_fname)
       return nullptr;
@@ -11904,7 +11930,7 @@ namespace {
 // The driver shim's entry point. Every framework has the driver loaded, and the
 // runtime hands it its context (bind_driver_context); with none loaded there is
 // nothing to forward to.
-void* driver_symbol(const char* name) { return dlsym(RTLD_DEFAULT, name); }
+void* driver_symbol(const char* name) { return driver_dlsym(name); }
 // CUresult and cudaError_t agree on every code these calls return.
 cudaError_t from_driver(int r) { return static_cast<cudaError_t>(r); }
 }  // namespace
