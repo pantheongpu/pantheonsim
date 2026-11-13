@@ -9,6 +9,8 @@
 // card that computes nothing leaves (step 18: a sampled launch sent to such a card must print exactly this).
 // `few` is `big` on 8 blocks with a long loop in every thread (Round sp61: a grid too small to sample by whole blocks, sampled inside its blocks),
 // `fewshort` the same with a short loop, and `fewnone` `few` with no launch (steps 21 to 23).
+// `sqrt`, `rsqrt`, `sqrtdiv` (Round sp68, step 28): an IEEE sqrtf on inputs that take both of its paths (tiny floats the slow path, negatives a NaN), a bare
+// rsqrtf, and sqrtf followed by a division (the square root idiom: in the set only with VGPU_HOST_GPU_SQRT=1; the last also needs VGPU_HOST_GPU_DIV=1).
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -64,6 +66,22 @@ __global__ void divexp(float* d, int n) {   // the division idiom and an EX2 in 
   if (i < n) d[i] = expf(d[i] * 0.001f) / (float(i % 977) + 1.25f);
 }
 
+__global__ void sqrtk(float* d, int n) {   // IEEE sqrtf: MUFU.RSQ, the range check, two FMULs and two FFMAs, a call to the slow path (the square root idiom)
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float v = (i & 1) ? d[i] : d[i] * 1.0001f + float(i);   // memset 1: the odd elements are 2.4e-38 at first, below 2^-101: the slow path
+  if (i % 97 == 0) v = -v;                                // a NaN
+  d[i] = sqrtf(v);
+}
+__global__ void rsqrtk(float* d, int n) {   // a bare rsqrtf: MUFU.RSQ with nothing that hides its last bits
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) d[i] = rsqrtf(fabsf(d[i]) + float(i) + 1.0f);
+}
+__global__ void sqrtdivk(float* d, int n) {   // the square root idiom and the division idiom in one kernel
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) d[i] = sqrtf(fabsf(d[i]) + float(i)) / (float(i % 977) + 1.25f);
+}
+
 __global__ void iatomk(unsigned* d, int n) {   // an integer atomic with a returned value: ATOMG.ADD
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
@@ -99,6 +117,7 @@ int main(int argc, char** argv) {
   const bool small = !std::strcmp(mode, "small"), mufu = !std::strcmp(mode, "mufu");
   const bool div = !std::strcmp(mode, "div"), rcp = !std::strcmp(mode, "rcp"), divexp_mode = !std::strcmp(mode, "divexp");
   const bool hist = !std::strcmp(mode, "hist");
+  const bool sqrt_mode = !std::strcmp(mode, "sqrt"), rsqrt_mode = !std::strcmp(mode, "rsqrt"), sqrtdiv_mode = !std::strcmp(mode, "sqrtdiv");
   const bool iatom = !std::strcmp(mode, "iatom"), fatom = !std::strcmp(mode, "fatom"), cas = !std::strcmp(mode, "cas");
   const bool fewnone = !std::strcmp(mode, "fewnone");
   const bool none = !std::strcmp(mode, "none") || fewnone;
@@ -126,6 +145,9 @@ int main(int argc, char** argv) {
     else if (div) divk<<<(n + 255) / 256, 256>>>(static_cast<float*>(d), n);
     else if (rcp) rcpk<<<(n + 255) / 256, 256>>>(static_cast<float*>(d), n);
     else if (divexp_mode) divexp<<<(n + 255) / 256, 256>>>(static_cast<float*>(d), n);
+    else if (sqrt_mode) sqrtk<<<(n + 255) / 256, 256>>>(static_cast<float*>(d), n);
+    else if (rsqrt_mode) rsqrtk<<<(n + 255) / 256, 256>>>(static_cast<float*>(d), n);
+    else if (sqrtdiv_mode) sqrtdivk<<<(n + 255) / 256, 256>>>(static_cast<float*>(d), n);
     else if (hist) histk<<<(n + 255) / 256, 256>>>(static_cast<unsigned*>(d), n);
     else if (iatom) iatomk<<<(n + 255) / 256, 256>>>(static_cast<unsigned*>(d), n);
     else if (fatom) fatomk<<<(n + 255) / 256, 256>>>(static_cast<float*>(d), n);

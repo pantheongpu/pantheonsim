@@ -44,6 +44,9 @@
 #  23. the same kernel with a short loop is sampled inside its blocks and stays, and the driver is never touched.
 #  27. (Round sp67) a verify run pushes again only the chunks whose card bytes differed from the simulator's after the last launch, and the chunks the host
 #      wrote since: an allocation no kernel touches goes to the card once, a host memset of part of it goes again, and the output is the mode-off output.
+#  28. (Round sp68) the square root idiom (include/vgpu/host_gpu_idiom.hpp, on the SASS nvcc emits for sqrtf): with VGPU_HOST_GPU_SQRT=1 a kernel that is a
+#      square root reaches the card path, and one with a square root and a division only with VGPU_HOST_GPU_DIV=1 as well; without the switch, or with a
+#      bare rsqrtf, the driver is never touched; the output is the mode-off output.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -330,5 +333,24 @@ done
 # (exact mode names the chunks: the 16 of the 1 MiB after every launch, never a 17th: the memset chunk reached the card before the third launch)
 n="$(grep -c '^host_gpu: verify [^ ]* (in the exact set): DIFFERENT, 64 KiB chunks: 16$' "$work/keep_exact.err")"
 (( n == 4 )) || { echo "FAIL: exact verify of keep: expected 4 launches with the 16 chunks of the 1 MiB different, got $n: $(grep '^host_gpu: verify' "$work/keep_exact.err" | head -4)"; fails=1; }
+# 28. (Round sp68) the square root idiom: `sqrt` (sqrtf on both of its paths), `rsqrt` (a bare rsqrtf), `sqrtdiv` (sqrtf, then a division).
+for arg in sqrt rsqrt sqrtdiv; do
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" "$arg" > "$work/off_$arg.out" 2> "$work/off_$arg.err" || { echo "FAIL: the $arg run with the mode off failed"; exit 1; }
+  run "sq0_$arg" "$arg" VGPU_HOST_GPU=exact VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=0 VGPU_HOST_GPU_DIV=1 || { echo "FAIL: the $arg run failed"; fails=1; }
+  [[ ! -s "$work/sq0_$arg.log" ]] || { echo "FAIL: $arg reached the driver without VGPU_HOST_GPU_SQRT: $(calls "sq0_$arg")"; fails=1; }
+  for both in 0 1; do
+    run "sq1_${arg}_$both" "$arg" VGPU_HOST_GPU=exact VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=0 VGPU_HOST_GPU_SQRT=1 VGPU_HOST_GPU_DIV=$both \
+      VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the $arg run with the square root idiom on failed"; fails=1; }
+    diff -q "$work/off_$arg.out" "$work/sq1_${arg}_$both.out" > /dev/null || { echo "FAIL: the square root idiom changes the output of $arg"; fails=1; }
+    want=no
+    [[ $arg == sqrt || ( $arg == sqrtdiv && $both == 1 ) ]] && want=yes
+    if [[ $want == yes ]]; then
+      grep -q '^cuModuleLoadData$' "$work/sq1_${arg}_$both.log" || { echo "FAIL: $arg did not reach the card path with VGPU_HOST_GPU_SQRT=1 DIV=$both: $(calls "sq1_${arg}_$both")"; fails=1; }
+      grep -q 'in the exact set by the square root idiom (1 site)' "$work/sq1_${arg}_$both.err" || { echo "FAIL: $arg: no log line for the idiom: $(grep 'host_gpu: ' "$work/sq1_${arg}_$both.err" | head -3)"; fails=1; }
+    else
+      [[ ! -s "$work/sq1_${arg}_$both.log" ]] || { echo "FAIL: $arg reached the driver with VGPU_HOST_GPU_SQRT=1 DIV=$both: $(calls "sq1_${arg}_$both")"; fails=1; }
+    fi
+  done
+done
 (( fails == 0 )) && { echo "PASS: first launch $first ms against a driver start of $init_ms ms; driver calls in the big run: $(calls on_big)"; exit 0; }
 exit 1

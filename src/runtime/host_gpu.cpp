@@ -27,6 +27,7 @@
 #include <thread>
 
 #include "vgpu/error.hpp"
+#include "vgpu/host_gpu_idiom.hpp"
 #include "vgpu/host_gpu_track.hpp"
 #include "vgpu/sass/exec.hpp"
 
@@ -533,25 +534,10 @@ struct Runtime::Impl : CardGate {
   // card's exhaustive division check (tools/probes/hostgpu_sfu_exhaustive.cu div) ran clean on an A10G (Round sp44); it stays a switch, off by default, because
   // no other card was run.
   bool div_idiom = false;
-
-  static std::vector<CodeInsn> idiom_summary(const sass::Code& code) {
-    std::vector<CodeInsn> out;
-    out.reserve(code.count);
-    for (size_t i = 0; i < code.count; ++i) {
-      const sass::Instr& ins = code.instr(i);
-      CodeInsn c;
-      const bool nan_const = ins.mnemonic == "MUFU" && !ins.src.empty() && ins.src[0].kind == sass::Kind::FImm && ins.src[0].fwidth == 32 &&
-                             (ins.src[0].fbits & 0x7f800000u) == 0x7f800000u && (ins.src[0].fbits & 0x7fffffu) != 0;
-      c.kind = classify_for_idiom(ins.mnemonic, ins.mods, nan_const);
-      c.pc = ins.pc;
-      const auto reg_of = [&](size_t k) { return ins.src.size() > k && ins.src[k].kind == sass::Kind::Reg && !ins.src[k].neg && !ins.src[k].abs ? static_cast<int>(ins.src[k].reg) : -1; };
-      if (c.kind == CodeInsn::Kind::Call && !ins.src.empty() && ins.src[0].kind == sass::Kind::Label) c.target = ins.src[0].imm;
-      if (c.kind == CodeInsn::Kind::MufuRcp) c.src0 = reg_of(0);
-      if (c.kind == CodeInsn::Kind::Fchk) { c.src0 = reg_of(0); c.src1 = reg_of(1); }
-      out.push_back(c);
-    }
-    return out;
-  }
+  // VGPU_HOST_GPU_SQRT=1: the same for the IEEE square root idiom (host_gpu_idiom.hpp; Round sp68), alone or with the division idiom. Off by default: the
+  // card's sqrt.rn check passed on an A10G only (Round sp44), and the refinement is not exact for every reciprocal square root one ulp off (a few hundred
+  // inputs in 2^31 fail, test_host_gpu_ref), so a card of another architecture has to pass the probe before it can be trusted with it.
+  bool sqrt_idiom = false;
 
   struct Decision {
     bool ok = false;
@@ -636,20 +622,29 @@ struct Runtime::Impl : CardGate {
         const ClassMask gated = sw.off | (sw.atomics ? 0 : class_bit(InsnClass::AtomFloat) | class_bit(InsnClass::AtomSwap));
         if ((class_bit(c) & gated) && first_gated.empty()) first_gated = sass::to_text(ins);
       }
-      // The exact set's scan, unchanged.
+      // The exact set's scan; the idioms (VGPU_HOST_GPU_DIV, VGPU_HOST_GPU_SQRT) are checked once, at the first instruction outside the set that one of them
+      // could explain.
       bool idiom_checked = false, idiom_ok = false;
       for (size_t i = 0; i < code.count && ok; ++i) {
         const sass::Instr& ins = code.instr(i);
         if (!exact_opcode_allowed(ins.mnemonic, ins.mods)) {
-          if (div_idiom && (ins.op == sass::Op::MUFU || ins.op == sass::Op::CALL || ins.op == sass::Op::RET)) {
+          if ((div_idiom || sqrt_idiom) && (ins.op == sass::Op::MUFU || ins.op == sass::Op::CALL || ins.op == sass::Op::RET)) {
             if (!idiom_checked) {
               idiom_checked = true;
-              const char* idiom_why = "";
-              idiom_ok = division_idiom_only(idiom_summary(code), &idiom_why);
+              std::vector<sass::Instr> all;
+              all.reserve(code.count);
+              for (size_t k = 0; k < code.count; ++k) all.push_back(code.instr(k));
+              const idiom::KernelVerdict kv = idiom::idioms_only(all, div_idiom, sqrt_idiom);
+              idiom_ok = kv.ok;
+              if (say && kv.ok && kv.sqrt_sites)
+                std::fprintf(stderr, "host_gpu: %s: in the exact set by the square root idiom (%u site%s)\n", fn.name.c_str(), kv.sqrt_sites,
+                             kv.sqrt_sites == 1 ? "" : "s");
               if (!idiom_ok && say) {
-                std::fprintf(stderr, "host_gpu: %s: not the division idiom: %s\n", fn.name.c_str(), idiom_why);
-                for (const CodeInsn& c : idiom_summary(code))
-                  if (c.kind != CodeInsn::Kind::Other) std::fprintf(stderr, "host_gpu:   pc 0x%llx kind %d src0 %d src1 %d target %lld\n", static_cast<unsigned long long>(c.pc), static_cast<int>(c.kind), c.src0, c.src1, static_cast<long long>(c.target));
+                std::fprintf(stderr, "host_gpu: %s: not the %s idiom: %s\n", fn.name.c_str(),
+                             div_idiom && sqrt_idiom ? "division or square root" : div_idiom ? "division" : "square root", kv.why);
+                if (div_idiom)
+                  for (const CodeInsn& c : idiom::division_summary(all, std::vector<char>(all.size(), 0)))
+                    if (c.kind != CodeInsn::Kind::Other) std::fprintf(stderr, "host_gpu:   pc 0x%llx kind %d src0 %d src1 %d target %lld\n", static_cast<unsigned long long>(c.pc), static_cast<int>(c.kind), c.src0, c.src1, static_cast<long long>(c.target));
               }
             }
             if (idiom_ok) continue;
@@ -967,6 +962,7 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
     if (const char* v = std::getenv("VGPU_HOST_GPU_WRITE_THROUGH"); v && *v && *v != '0') r->impl_->resident = false;
     if (const char* v = std::getenv("VGPU_HOST_GPU_NO_FIRST_LAUNCH"); v && *v && *v != '0') r->impl_->first_launch_off = true;
     if (const char* v = std::getenv("VGPU_HOST_GPU_DIV"); v && *v && *v != '0') r->impl_->div_idiom = true;
+    if (const char* v = std::getenv("VGPU_HOST_GPU_SQRT"); v && *v && *v != '0') r->impl_->sqrt_idiom = true;
     if (const char* v = std::getenv("VGPU_HOST_GPU_SAMPLE"); v && *v)   // 0: no launch is sampled (the rule before sp60b); log: see SampleMode
       r->impl_->sample_mode = std::string(v) == "0" ? Impl::SampleMode::Off : std::string(v) == "log" ? Impl::SampleMode::Log :
                               std::string(v) == "always" ? Impl::SampleMode::Always : std::string(v) == "whole" ? Impl::SampleMode::Whole : Impl::SampleMode::On;
