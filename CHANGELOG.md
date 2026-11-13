@@ -7,6 +7,81 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Runtime: a copy, fill or kernel launch issued on a stream behind a host function that has not finished returns at once and runs
+  after it, in stream order, as on an RTX 3060. It used to run inside the call after waiting for the host function, so a host function
+  that waits for something the program does after the call (Celeritas' `AsyncSnapshotTest.device_pending`) hung the program.
+  `cudaMemcpyAsync`, `cudaMemsetAsync`, the 2D and 3D copies and fills between pointers, the symbol copies, `cudaMemcpyPeerAsync`,
+  `cudaFreeAsync` and kernel launches on any stream the runtime made are queued on the stream's lane when the memory they touch is
+  device or page-locked memory; they see what the host function wrote, and events, stream queries and every synchronizing call wait for
+  them. Copies of pageable memory, managed memory and arrays still wait in the call. `cudaFree`, `cudaFreeHost`, `cudaHostUnregister`
+  and `cudaDeviceReset` wait for queued work first. The 2D, 3D and symbol copies on a stream also follow host functions on that stream
+  now (on a non-blocking stream they ran before them), and `cudaMemcpyPeer` and the synchronous symbol copies follow host functions on
+  the legacy default stream. New e2e test `e2e_async_host_copies`; [design](docs/perf-design/streams.md) (pantheonsim #634).
+- `nvidia-smi nvlink` takes the options of the real subcommand, not only `-s` and `-e`: `-c`/`--capabilities`, `-cBridge`/`--checkBridge`,
+  `-gt d|r`, `-i` and `-l` after `nvlink`, several displays at once, and `-h` or no option for nvidia-smi's own usage text. A GPU without NVLink
+  prints its name and exit 0 for every display, as the real tool does; on the SXM profiles `-c` prints each link's capabilities as
+  `nvmlDeviceGetNvLinkCapability` reports them, `-gt` zero traffic, and `-cBridge` no link lines (the links run through the baseboard, not a
+  bridge). The remote-end and setting displays (`-p`, `-R`, `-ec`, `-gLowPwrInfo`, `-gBwMode`, `-gLWidth`, `-info`) are refused on a GPU with
+  links, the changes (`-re`, `-sBwMode`, ...) everywhere, and an unknown option prints `Option "X" is not recognized.` and exits 2 as nvidia-smi
+  does. jpmorganchase/QOKit runs `nvidia-smi nvlink -cBridge` with `check=True` when its tests are collected (pantheonsim #640).
+- AMD: a load into accumulation registers that the wave had not used yet, made for the whole wave at once (`global_load_dwordx2 a[38:39], v2,
+  s[6:7] offset:200`, every lane at one address, as a Kokkos kernel loads a pointer out of a structure), fills every register it names. The
+  register file grows to the highest accumulation register named, and growing it for the second register moved the first one's row, which
+  then went to the freed copy: a38 kept what it held before, and the next load through the pointer stopped with "invalid-pointer ...
+  address is not inside any device allocation" at a small address (llnl/exadis on the simulated MI300X, pantheonsim #621). The file now grows
+  to the last register before any row is taken (the whole-wave loads of two, three and four dwords and the whole-wave store of three or
+  four). It surfaced with host-mapped memory taking the whole-wave path (#507): exadis's data is managed memory, which went lane by lane before.
+- cuRAND: `curandGeneratePoisson`, `curandCreatePoissonDistribution`, `curandDestroyDistribution`,
+  `curandGeneratePoissonMethod`, `curandGenerateSeeds` and `curandGetProperty` are exported. A program that called
+  one stopped with "undefined symbol" (RubixML/numpower's `NumPower::poisson`; pantheonsim #629). The methods are
+  the ones an RTX 3060's cuRAND uses for each generator and lambda: Marsaglia-Tsang-Wang's square histogram, built
+  with the card's aliases, so `curand_discrete` in a kernel and a Sobol' generator's Poisson integers are the card's;
+  the inversion and the rounded normal above the card's cut-offs ([libraries](nvidia/docs/libraries.md); `e2e_rand_poisson`).
+- AMD: loading a library's code objects takes 40 % less time. The 62 Tensile code objects of a small rocBLAS program (`amd/tests/rocblas/blas`,
+  sgemm, dgemm and the rest, ROCm 7.1 rocBLAS on a simulated MI300X) loaded in 0.44 s instead of 0.75 s and the program ran in 1.61 s
+  instead of 1.96 s (median of 8 alternating runs on an ubuntu-24.04 runner; best 1.53 s against 1.84 s). The time was page faults
+  and copies, not arithmetic: a kept bundle entry is inflated straight into its place instead of through a buffer that is then
+  copied, the zstd buffer is kept from one load to the next, the code object is read where it lies instead of from a copy, `.text`
+  and a linked image are written once instead of zeroed first, and the buffers of tens of megabytes are asked for in 2 MB pages
+  (`madvise(MADV_HUGEPAGE)`); the process took 190,000 page faults instead of 350,000. The bytes read are the same:
+  `test_amd_codeobject_same_bits` gives the recorded digests, and the 2,838 code objects ROCm 7.1 ships (rocBLAS's and hipBLASLt's
+  libraries) give the same digests before and after. `VGPU_LOAD_PLAIN=1` reads them as before (`test_amd_codeobject_same_bits_plain`);
+  `test_amd_bundle` adds bundles larger than the buffer, read both ways. AMD's `rocblas-test` gains nothing from it: its start-up
+  (57 s a process, reading `rocblas_gtest.data`, against 0.1 to 0.4 s of loading) is AMD's client, not the simulator (pantheonsim #565).
+- NVRTC without the toolkit's libnvrtc (the shim's nvcc path, or `VGPU_NVRTC=nvcc`) now searches includes as NVRTC does: no host
+  directory, the toolkit headers in `__CUDACC_RTC__` mode, the headers given to `nvrtcCreateProgram` and the `-I`/`--include-path`
+  directories. A program that brings its own `<cstdint>` (ThrustRTC 0.3.20) or defines `int64_t` itself (PyTorch's jiterator) compiles,
+  where nvcc's host headers made it fail with "invalid redeclaration of type name int64_t"; `#include <stdint.h>` and the other host headers
+  fail to open, as with NVRTC. Where the toolkit's headers share `/usr/include` with glibc's (Debian's and Ubuntu's
+  `nvidia-cuda-toolkit`), the compile sees links to the CUDA headers alone. What NVRTC predefines (`size_t`, `ptrdiff_t`, `clock_t`, `NULL`, `std::move`, `std::forward`,
+  `std::initializer_list`, `printf`, `assert`) is there without an include, measured on CUDA 13.0's NVRTC; the PTX matches NVRTC's for the
+  programs compared. ThrustRTC's fill and reduce run under `vgpu run` on `nvidia/a100` (ThrustRTC 0.3.20's own occupancy calculator does not
+  know compute capability 9.x, so its kernels fail on an H100, real or simulated). The nvcc path also no longer leaves an empty
+  `$TMPDIR/vgpu-nvrtc-<pid>` directory behind per process. New test `e2e_nvrtc_paths_nvcc` (pantheonsim #619).
+- AMD: `hipModuleGetFunction` no longer prints "the code object has no kernel named ..." when another loaded module has the
+  kernel. rocBLAS and hipBLASLt (Tensile) find a GEMM kernel by asking each loaded code object in turn and clear the
+  `hipErrorNotFound` of the misses, so every new GEMM kernel printed the message up to once per earlier module, which read as a
+  failed GEMM in runs whose GEMMs were right (double and complex-double GEMMs through rocBLAS 7.2 on `amd/mi300x` checked against a
+  host reference). The error code and `hipGetLastError` are unchanged, and a kernel that no loaded module has is still reported (#636).
+- Driver: `cuGetProcAddress` / `cuGetProcAddress_v2`, and with them `cudaGetDriverEntryPoint` and `...ByVersion`, resolve a
+  function's base name by the CUDA version asked for, as an RTX 3060 does: `cuGraphExecUpdate` at 12000 or later is
+  `cuGraphExecUpdate_v2` (it was not found, so cuda-core 1.3.0 refused the driver and every numba-cuda launch failed),
+  `cuCtxCreate` is `_v3` at 12000 and `_v4` at 13000, `cuStreamGetCaptureInfo` is `_v3` at 13000 (it was `_v2`), and so on for every
+  name. The table comes from NVIDIA's typedef headers (`PFN_<name>_v<version>`; `scripts/gen_driver_proc_versions.py`,
+  `nvidia/src/driver_proc_versions.inc`), with the per-thread-stream forms for `CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM`. As on
+  the card, a name asked for at a version older than the function is `CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT`, and a name that
+  is not found returns `CUDA_SUCCESS` with a null function and the status (it returned `CUDA_ERROR_NOT_FOUND`). The card maps
+  `cuGraphInstantiate` to `cuGraphInstantiate_v2` at every version from 11.0, not to `cuGraphInstantiateWithFlags`, and so does the
+  shim. New unit test `test_driver_proc_address` compares all 3,976 answers the card's driver gave (497 names at 11040, 12000,
+  12040 and 13000, both stream modes; `tools/probes/driver_proc_address_probe.cpp`) with the shim's; `lint_driver_proc_versions`
+  checks the table against the toolkit at hand (pantheonsim #626).
+- Driver: `cuProfilerInitialize` is exported (deprecated, still in the CUDA 13 driver; cudarc 0.19 binds it when it loads libcuda and
+  panicked without it). It answers `CUDA_ERROR_NOT_INITIALIZED` before `cuInit` and `CUDA_ERROR_NOT_SUPPORTED` after, whatever the
+  arguments and with or without a context, as an RTX 3060 does. Of the other names the CUDA 13.0 driver stub exports, the shim
+  now also exports the per-thread forms of the CUDA 11 stream memory-operation and capture calls (`cuStreamWaitValue32_ptsz`,
+  `cuStreamBatchMemOp_ptsz`, `cuStreamBeginCapture_ptsz`, `cuStreamGetCaptureInfo_ptsz` and the rest, which the card hands a CUDA
+  11 caller that asks for the per-thread default stream) and the unsuffixed `cuMemGetAddressRange`; only the debugger's `cudbg*`
+  entry points remain unexported (pantheonsim #627).
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch on fewer than 256 blocks, which the sample of whole blocks could not
   judge, is now sampled *inside* its blocks when its kernel has a counted loop: the forked copy runs each block until its warps stand in the
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the
@@ -66,9 +141,28 @@ release says what runs and what it produces, never how fast a real GPU would run
   destroyed) return `cudaSuccess` and leave the last error alone, as an RTX 3060 does; they returned `cudaErrorInvalidValue`, which
   MaCh3's teardown left in the last error for CUDAProb3's next check to exit on. Unit test in `test_runtime_exports`
   (pantheonsim #618).
+- cuBLAS: a dot product (`?dot`, `?dotu`, `?dotc`, `DotEx`, `DotcEx`, their `_64` forms) in the default host pointer mode
+  with its result pointer in device memory stores the result there, as an RTX 3060 does; it died with SIGSEGV inside the
+  library, which stopped every device XC integration of GauXC (its `gdot` makes this call). The other reductions (`?nrm2`,
+  `?asum`, `i?amax`, `i?amin` and their Ex and `_64` forms), and a dot product with n <= 0, crash on the card with a device
+  result in host mode; they now return `CUBLAS_STATUS_INVALID_VALUE`, said once on stderr, instead of crashing. Measured per
+  routine on the card ([cuBLAS](nvidia/docs/cublas.md)). New unit test `test_cublas_host_mode_device_result` (pantheonsim #638).
 - NPP, CUDA 12 build: `nppGetStreamContext`, `nppGetStream` and `nppSetStream` (NPP 12's own stream, which CUDA 13's NPP removed)
   are exported from the shim, filling the context as NPP 12.3 does on an RTX 3060. New e2e test `e2e_npp_stream_context` (skips
   on CUDA 13). `nppiFilterGaussBorder_8u_C1R_Ctx` is still absent (pantheonsim #617).
+- HIP: `hipGraphInstantiateWithParams` takes `hipGraphInstantiateFlagUpload` and `hipGraphInstantiateFlagDeviceLaunch`, as ROCm's
+  HIP does there (all four flags); it refused anything but AutoFreeOnLaunch and UseNodePriority with `hipErrorInvalidValue`, so
+  Colvars, which instantiates its graphs with Upload and an `uploadStream`, stopped on its first frame. With Upload the graph is
+  uploaded on `uploadStream` as `hipGraphUpload` does, which queues no work here (the executable graph is already the one a launch
+  runs); `result_out` and `errNode_out` are set as ROCm sets them. DeviceLaunch only shows in `hipGraphExecGetFlags`, as in ROCm.
+  `hipGraphInstantiateWithFlags` still refuses both, as ROCm does. New e2e test `amd_graph_instantiate_params` (pantheonsim #628).
+- HIP: a failed `hipModuleLoad` is the thread's last error, as in ROCm's HIP, where every API returns through `HIP_RETURN`: a missing
+  file (`hipErrorFileNotFound`) and an empty one (`hipErrorInvalidImage`) were returned but not recorded, so `hipGetLastError` then said
+  `hipSuccess`. OpenMM's HIP platform reads `hipGetLastError` after a miss in its kernel cache and stopped with "Detected HIP error: no
+  error" at the first kernel of every `TestHip*` program. `hipModuleGetFunction` and `hipModuleGetGlobal` now check their arguments in
+  ROCm's order and with its codes: a null module is `hipErrorInvalidResourceHandle` (`hipModuleGetFunction` said `hipErrorInvalidValue`)
+  and an empty kernel name is `hipErrorInvalidValue`. New e2e test `amd_module_last_error`, which also holds the other module and link
+  entry points to recording their errors (pantheonsim #635).
 
 - Peer access: after `cudaDeviceEnablePeerAccess` (or `cuCtxEnablePeerAccess`), a kernel on one simulated device reads, writes and
   atomically updates the peer device's allocations in place, as on a card (unified addressing). It stopped with `[invalid-pointer]
@@ -77,6 +171,15 @@ release says what runs and what it produces, never how fast a real GPU would run
   after `cudaDeviceDisablePeerAccess`, the access still faults, as it does on two RTX 3060s (measured). Only an access that missed every
   allocation of the device looks at the peer; launch caching (`VGPU_MEMO=1`) and host-GPU mode stand aside while a peer link exists.
   New test `e2e_peer_kernel` (SASS and PTX paths).
+- `vgpu run --preload`: PyTorch starts again, and its profiler lists what it did before. Both broke when the driver became a private load
+  (pantheonsim #597, below). The runtime looked the driver up in the global scope only, so it never initialised it nor handed it its
+  primary context, and PyTorch 2.10's `torch.cuda` init, which asks `cuDevicePrimaryCtxGetState` with no `cuInit` of its own, failed with
+  "CUDA driver error: initialization error" on every check. The runtime now keeps the privately loaded driver's handle and asks it
+  first, and `cudaGetDriverEntryPoint` no longer reloads that driver with `RTLD_GLOBAL` (#604's late-load path), which put it in the
+  global scope after all. And each shim carries its own copy of the profiling engine: the unversioned driver in the global scope was
+  what made every shim use one, so without it cuBLAS's internal copies were reported as the program's `cudaMemcpy`. The engine's
+  functions now sit in a version node every shim shares (`VGPU_PROFILING_1`). New test `e2e_preload_torch_like`: programs that use
+  the shim as PyTorch does, with no PyTorch.
 - `vgpu run --preload`: `import ThrustRTC` (PyPI 0.3.20) no longer crashes with a segmentation fault (pantheonsim #597). ThrustRTC
   keeps the driver's and NVRTC's functions in exported pointers named like them (`cuInit`, `nvrtcVersion`, ...), and with the shim's
   `libcuda.so.1` preloaded its references to its own `cuInit` bound to the shim's function, whose code its `dlsym` result then

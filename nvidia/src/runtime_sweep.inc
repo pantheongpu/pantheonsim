@@ -201,7 +201,7 @@ static cudaError_t cudaGetFuncBySymbol_traced(cudaFunction_t* functionPtr, const
     if (!registered_ptx(s, *ki.mod)) return cudaErrorNoKernelImageForDevice;   // built for other GPUs only
     if (!functionPtr) return cudaSuccess;
     using Bind = int (*)(int, uint64_t, const char*, void**, void**);
-    static const Bind fn = reinterpret_cast<Bind>(dlsym(RTLD_DEFAULT, "vgpu_driver_function_for_v1"));
+    static const Bind fn = reinterpret_cast<Bind>(driver_dlsym("vgpu_driver_function_for_v1"));
     if (!fn) return refuse("cudaGetFuncBySymbol", "the driver shim (libcuda) is not loaded, and a CUfunction is its handle");
     void* function = nullptr;
     void* module = nullptr;

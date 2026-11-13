@@ -694,10 +694,14 @@ cublasStatus_t cgetrs_batched(cublasHandle_t h, cublasOperation_t t, int n, int 
   });
 }
 
-// A reduction's result goes where the pointer mode says: host or device.
+// A reduction's result goes where the pointer mode says: host or device. A device
+// pointer in host mode is stored to as well, as the card does for the dot products
+// (device_result_in_host_mode in cublas_api.cpp).
 template <class T> void put_result(cublasHandle_t h, T* result, cd v) {
   if (!result) return;
-  if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE) store(result, std::vector<T>{from_cd<T>(v)});
+  if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE ||
+      vgpu::is_device_va(reinterpret_cast<uint64_t>(result)))
+    store(result, std::vector<T>{from_cd<T>(v)});
   else *result = from_cd<T>(v);
 }
 
@@ -878,6 +882,7 @@ template <class T> void put_result(cublasHandle_t h, T* result, cd v) {
                                                 int incy, T* result) {                                            \
     if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;                                                          \
     if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;                                         \
+    if (n <= 0 && device_result_in_host_mode(h, result)) return refuse_device_result("?dotu");                    \
     return run_c(h, nullptr, nullptr, 0, [=](const void*, const void*) {                                          \
       const auto xv = load_vec(x, n, incx), yv = load_vec(y, n, incy);                                            \
       cd s = 0;                                                                                                   \
@@ -890,6 +895,7 @@ template <class T> void put_result(cublasHandle_t h, T* result, cd v) {
                                                 int incy, T* result) {                                            \
     if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;                                                          \
     if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;                                         \
+    if (n <= 0 && device_result_in_host_mode(h, result)) return refuse_device_result("?dotc");                    \
     return run_c(h, nullptr, nullptr, 0, [=](const void*, const void*) {                                          \
       const auto xv = load_vec(x, n, incx), yv = load_vec(y, n, incy);                                            \
       cd s = 0;                                                                                                   \

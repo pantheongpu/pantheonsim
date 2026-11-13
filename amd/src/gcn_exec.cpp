@@ -1547,6 +1547,13 @@ struct Machine {
   static uint32_t* row_of(Wave& w, const Operand& o, uint32_t k) {
     return o.kind == OperandKind::Agpr ? acc(w, o.index + k).data() : &w.vgpr[o.index + k][0];
   }
+  // The rows of registers 0 .. n-1 of `o`, for a caller that holds them all at once. The accumulation registers are a vector that grows to the
+  // highest one named (acc), so it is grown to the last of them first: taking row 0 and then row 1 of a[38:39] the wave had not used yet moved
+  // the file, and row 0 pointed into the freed copy (a load of the pair left a38 as it was: issue #621).
+  static void rows_of(Wave& w, const Operand& o, uint32_t n, uint32_t** rows) {
+    if (o.kind == OperandKind::Agpr && n) acc(w, o.index + n - 1);
+    for (uint32_t k = 0; k < n; ++k) rows[k] = row_of(w, o, k);
+  }
   static void set_word(Wave& w, const Operand& o, uint32_t k, uint32_t lane, uint32_t v) {
     if (o.kind == OperandKind::Agpr) acc(w, o.index + k)[lane] = v;
     else w.vgpr[o.index + k][lane] = v;
@@ -10368,9 +10375,11 @@ struct Machine {
     }
     if (!n) return true;
     if ((bits & 3) || !mem.load_batch(a8, n, 8, v8) || !mem.load_batch(a4, n, 4, v4)) return false;
-    uint32_t* const r0 = row_of(w, dst, 0);
-    uint32_t* const r1 = row_of(w, dst, 1);
-    uint32_t* const r2 = row_of(w, dst, 2);
+    uint32_t* rows[3];
+    rows_of(w, dst, 3, rows);
+    uint32_t* const r0 = rows[0];
+    uint32_t* const r1 = rows[1];
+    uint32_t* const r2 = rows[2];
     uint32_t prev[3] = {};
     for (uint32_t i = 0; i < n; ++i) {
       uint32_t got[3];
@@ -10421,8 +10430,10 @@ struct Machine {
     if (live == whole >> from << from) {
       const uint32_t count = w.lanes - from;
       const uint64_t* const addrs = lane_addr + from;
-      uint32_t* const row0 = row_of(w, data, 0) + from;
-      uint32_t* const row1 = words == 2 ? row_of(w, data, 1) + from : row0;
+      uint32_t* rows[2];
+      rows_of(w, data, words == 2 ? 2 : 1, rows);
+      uint32_t* const row0 = rows[0] + from;
+      uint32_t* const row1 = words == 2 ? rows[1] + from : row0;
       if (store) {
         if (words == 2) {
           for (uint32_t i = 0; i < count; ++i) vals[i] = row0[i] | uint64_t{row1[i]} << 32;
@@ -10461,8 +10472,10 @@ struct Machine {
       addrs_buf[n] = lane_addr[lane], lanes[n++] = lane;
     }
     const uint64_t* const addrs = addrs_buf;
-    uint32_t* const row0 = row_of(w, data, 0);
-    uint32_t* const row1 = words == 2 ? row_of(w, data, 1) : row0;
+    uint32_t* rows[2];
+    rows_of(w, data, words == 2 ? 2 : 1, rows);
+    uint32_t* const row0 = rows[0];
+    uint32_t* const row1 = words == 2 ? rows[1] : row0;
     if (store) {
       if (words == 2) {
         for (uint32_t i = 0; i < n; ++i) vals[i] = row0[lanes[i]] | uint64_t{row1[lanes[i]]} << 32;
@@ -12988,8 +13001,8 @@ bool Machine::wave_store_words(Wave& w, uint32_t from, const uint64_t* lane_addr
   uint64_t a[4 * kLanes], v[4 * kLanes];
   uint32_t n = 0;
   uint64_t bits = 0;
-  const uint32_t* rows[4];
-  for (uint32_t k = 0; k < words; ++k) rows[k] = row_of(w, src, k);
+  uint32_t* rows[4];
+  rows_of(w, src, words, rows);
   for (uint64_t m = w.exec >> from << from; m; m &= m - 1) {
     const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(m));
     const uint64_t at = lane_addr[lane];
@@ -13024,10 +13037,12 @@ bool Machine::wave_load4(Wave& w, uint32_t from, const uint64_t* lane_addr, cons
     if (!mem.load_batch(a8 + c, std::min<uint32_t>(kLanes, n8 - c), 8, v8 + c)) return false;
   for (uint32_t c = 0; c < n4; c += kLanes)
     if (!mem.load_batch(a4 + c, std::min<uint32_t>(kLanes, n4 - c), 4, v4 + c)) return false;
-  uint32_t* const r0 = row_of(w, dst, 0);
-  uint32_t* const r1 = row_of(w, dst, 1);
-  uint32_t* const r2 = row_of(w, dst, 2);
-  uint32_t* const r3 = row_of(w, dst, 3);
+  uint32_t* rows[4];
+  rows_of(w, dst, 4, rows);
+  uint32_t* const r0 = rows[0];
+  uint32_t* const r1 = rows[1];
+  uint32_t* const r2 = rows[2];
+  uint32_t* const r3 = rows[3];
   uint32_t prev[4] = {};
   uint32_t i8 = 0, i4 = 0;
   for (uint32_t i = 0; i < n; ++i) {

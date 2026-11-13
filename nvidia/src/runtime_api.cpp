@@ -120,6 +120,15 @@ bool trace() { return trace(std::getenv("VGPU_TRACE")); }
 // sonames, they are what every later request for one gets, as a preloaded library is; but their functions are not in the global scope,
 // where a library's own exported variable of the same name (ThrustRTC's function pointers `cuInit`, `nvrtcVersion`, ... that it fills
 // from dlsym) would bind to them, and the library would then write over their code (#597).
+//
+// The runtime still has to reach that driver: it initialises it (ensure_init), hands it each thread's primary context
+// (bind_driver_context) and forwards calls to it. Those lookups used dlsym(RTLD_DEFAULT), which cannot see a privately
+// loaded library, so under --preload the driver was never initialised, and a program that calls the driver without a cuInit
+// of its own, counting on the runtime to have done it as on the card -- PyTorch 2.10's _cuda_init asks
+// cuDevicePrimaryCtxGetState -- got CUDA_ERROR_NOT_INITIALIZED. The handle is kept here, and every lookup of a driver symbol
+// goes through driver_dlsym, which asks it first. (A constant-initialised atomic: nothing has to construct it before the
+// constructor below runs.)
+std::atomic<void*> g_private_driver{nullptr};
 __attribute__((constructor)) static void load_private_preloads() {
   const char* v = std::getenv("VGPU_PRELOAD_PRIVATE");
   if (!v || !*v) return;
@@ -129,9 +138,21 @@ __attribute__((constructor)) static void load_private_preloads() {
     const std::string path = list.substr(at, end - at);
     at = end + 1;
     if (path.empty()) continue;
-    if (!dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL) && !quiet())
-      std::fprintf(stderr, "[vgpu] --preload: cannot load %s: %s\n", path.c_str(), dlerror());
+    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+      if (!quiet()) std::fprintf(stderr, "[vgpu] --preload: cannot load %s: %s\n", path.c_str(), dlerror());
+      continue;
+    }
+    // The simulator's driver, whatever the file is called: the library that defines its hand-over entry point.
+    if (dlsym(h, "vgpu_driver_bind_primary_v1")) g_private_driver.store(h, std::memory_order_release);
   }
+}
+// A symbol of the driver shim: from the privately loaded driver when there is one, otherwise from the global scope (the
+// program links libcuda, preloads it, or a library loaded it with RTLD_GLOBAL), or null when no driver is loaded.
+void* driver_dlsym(const char* name) {
+  if (void* h = g_private_driver.load(std::memory_order_acquire))
+    if (void* p = dlsym(h, name)) return p;
+  return dlsym(RTLD_DEFAULT, name);
 }
 
 // A fatbin registered by the host boilerplate. PTX is parsed into a runtime
@@ -457,7 +478,7 @@ void unmap_host_everywhere(State& s, void* p) {
 // driver shim is not loaded, there is nothing to initialize and nothing to do.
 void init_driver_shim_if_loaded() {
   using CuInit = int (*)(unsigned int);
-  if (auto fn = reinterpret_cast<CuInit>(dlsym(RTLD_DEFAULT, "cuInit"))) fn(0);
+  if (auto fn = reinterpret_cast<CuInit>(driver_dlsym("cuInit"))) fn(0);
 }
 
 void ensure_init(State& s) {
@@ -989,7 +1010,7 @@ void bind_driver_context() {
   static Bind fn = nullptr;   // (callers hold the API lock)
   static unsigned fn_loads = ~0u;
   if (fn_loads != loads) {
-    fn = reinterpret_cast<Bind>(dlsym(RTLD_DEFAULT, "vgpu_driver_bind_primary_v1"));
+    fn = reinterpret_cast<Bind>(driver_dlsym("vgpu_driver_bind_primary_v1"));
     fn_loads = loads;
   }
   if (fn) fn(t_current_device);
@@ -1071,6 +1092,16 @@ thread_local StreamContext t_stream_ctx;
 struct StreamContextScope {
   explicit StreamContextScope(cudaStream_t s) { t_stream_ctx = {true, s}; }
   ~StreamContextScope() { t_stream_ctx = {}; }
+};
+
+// Set while work that already has its place in a stream's order runs: a copy or fill the stream's lane worker runs
+// (see "Stream lanes"), or the plain calls a stream-ordered entry point makes after it has waited for its own stream.
+// The copies and fills underneath then do not wait again (async_order), on the lane they are running on, or on the
+// legacy default stream's order that the plain calls would otherwise follow.
+thread_local int t_ordered = 0;
+struct OrderedScope {
+  OrderedScope() { ++t_ordered; }
+  ~OrderedScope() { --t_ordered; }
 };
 
 // A wait that returned (vgpu/profiling.hpp), on the device this thread has
@@ -1180,6 +1211,48 @@ bool is_device_ptr(const void* p) {
 bool copyable_as_device(State& s, const void* p) {
   return is_device_ptr(p) || find_range(s.managed_allocs, p) != s.managed_allocs.end() ||
          find_range(pinned(s), p) != pinned(s).end();
+}
+
+// Whether [p, p + n) lies in one device allocation or in one page-locked host range (cudaMallocHost, cudaHostAlloc,
+// and with `registered` cudaHostRegister): memory a copy or fill can be left to its stream for (async_defer). Pageable
+// and managed memory cannot; nor can anything the call would refuse.
+bool stream_ordered_span(State& s, const void* p, size_t n, bool registered_too) {
+  if (!p) return false;
+  if (is_device_ptr(p)) {
+    uint64_t base = 0, size = 0;
+    const uint64_t a = reinterpret_cast<uint64_t>(p);
+    if (!owner_memory(s, p).find_allocation(a, &base, &size)) return false;
+    return a >= base && a - base <= size && n <= size - (a - base);
+  }
+  for (auto* ranges : {&pinned(s), &registered(s)}) {
+    if (ranges == &registered(s) && !registered_too) continue;
+    const auto it = find_range(*ranges, p);
+    if (it == ranges->end()) continue;
+    const size_t off = static_cast<size_t>(static_cast<const char*>(p) - static_cast<const char*>(it->first));
+    return off <= it->second.size && n <= it->second.size - off;
+  }
+  return false;
+}
+
+// The same for a copy of `n` bytes from the span at `src` to the span at `dst` (the spans may be longer than `n`, for
+// a 2D or 3D copy), with the kind checked as cudaMemcpy checks it: a copy it would refuse is not queued, so the refusal
+// is still the call's.
+bool stream_ordered_copy(State& s, void* dst, size_t dst_span, const void* src, size_t src_span, cudaMemcpyKind kind) {
+  switch (kind) {
+    case cudaMemcpyHostToDevice:
+    case cudaMemcpyDeviceToHost:
+    case cudaMemcpyDeviceToDevice:
+    case cudaMemcpyHostToHost:
+      if ((kind == cudaMemcpyHostToDevice || kind == cudaMemcpyDeviceToDevice) && !copyable_as_device(s, dst)) return false;
+      if ((kind == cudaMemcpyDeviceToHost || kind == cudaMemcpyDeviceToDevice) && !copyable_as_device(s, src)) return false;
+      break;
+    case cudaMemcpyDefault:
+      break;
+    default:
+      return false;
+  }
+  if (in_read_only_registration(s, dst, dst_span)) return false;
+  return stream_ordered_span(s, dst, dst_span, true) && stream_ordered_span(s, src, src_span, true);
 }
 
 // Pending chevron launch configuration, pushed by __cudaPushCallConfiguration
@@ -1334,8 +1407,10 @@ cudaError_t symbol_peer(State& s, cudaMemcpyKind kind, cudaMemcpyKind host_kind,
 }
 }  // namespace
 
+static void async_order(cudaStream_t stream);   // see "Stream lanes", with the events
 static cudaError_t cudaMemcpyToSymbol_body(const void* symbol, const void* src, size_t count,
                                            size_t offset, cudaMemcpyKind kind) {
+  async_order(t_stream_ctx.async ? t_stream_ctx.stream : nullptr);   // behind queued host functions, as cudaMemcpy
   return guard("cudaMemcpyToSymbol", [&](State& s) -> cudaError_t {
     uint64_t addr = 0;
     size_t size = 0;
@@ -1365,6 +1440,7 @@ VGPU_EXPORT cudaError_t cudaMemcpyToSymbol(const void* symbol, const void* src, 
 
 static cudaError_t cudaMemcpyFromSymbol_body(void* dst, const void* symbol, size_t count,
                                              size_t offset, cudaMemcpyKind kind) {
+  async_order(t_stream_ctx.async ? t_stream_ctx.stream : nullptr);   // behind queued host functions, as cudaMemcpy
   return guard("cudaMemcpyFromSymbol", [&](State& s) -> cudaError_t {
     uint64_t addr = 0;
     size_t size = 0;
@@ -1420,6 +1496,11 @@ cudaError_t symbol_span(const void* symbol, size_t count, size_t offset, char** 
 }
 }  // namespace
 
+// The stream lanes (defined with the events): see "Stream lanes" and async_defer.
+static bool async_would_wait(cudaStream_t stream);
+static bool async_defer(cudaStream_t stream, const std::function<bool(State&)>& memory_ok,
+                        std::function<cudaError_t()> run);
+
 static cudaError_t cudaMemcpyToSymbolAsync_body(const void* symbol, const void* src, size_t count,
                                                 size_t offset, cudaMemcpyKind kind,
                                                 cudaStream_t stream) {
@@ -1431,6 +1512,25 @@ static cudaError_t cudaMemcpyToSymbolAsync_body(const void* symbol, const void* 
     vgpu_record_copy_if_capturing(linear_copy(at, src, count, kind), stream, &rc);
     return rc;
   }
+  // Behind a host function that has not finished: queued after it (#634), once the symbol and the range are known
+  // to be good, so those refusals stay the call's.
+  if (count != 0 && (kind == cudaMemcpyHostToDevice || kind == cudaMemcpyDeviceToDevice || kind == cudaMemcpyDefault) &&
+      async_would_wait(stream)) {
+    char* at = nullptr;
+    if (const cudaError_t e = symbol_span(symbol, count, offset, &at); e != cudaSuccess) return e;
+    if (async_defer(
+            stream,
+            [&](State& s) {
+              return stream_ordered_span(s, src, count, true) && (kind != cudaMemcpyDeviceToDevice || copyable_as_device(s, src));
+            },
+            [=] {
+              StreamContextScope in_stream(stream);
+              return cudaMemcpyToSymbol(symbol, src, count, offset, kind);
+            }))
+      return cudaSuccess;
+  }
+  async_order(stream);   // the stream's own order, not the legacy default stream's that cudaMemcpyToSymbol follows
+  OrderedScope ordered;
   return cudaMemcpyToSymbol(symbol, src, count, offset, kind);
 }
 
@@ -1450,6 +1550,25 @@ static cudaError_t cudaMemcpyFromSymbolAsync_body(void* dst, const void* symbol,
     vgpu_record_copy_if_capturing(linear_copy(dst, at, count, kind), stream, &rc);
     return rc;
   }
+  // Behind a host function that has not finished: queued after it (#634), as cudaMemcpyToSymbolAsync.
+  if (count != 0 && (kind == cudaMemcpyDeviceToHost || kind == cudaMemcpyDeviceToDevice || kind == cudaMemcpyDefault) &&
+      async_would_wait(stream)) {
+    char* at = nullptr;
+    if (const cudaError_t e = symbol_span(symbol, count, offset, &at); e != cudaSuccess) return e;
+    if (async_defer(
+            stream,
+            [&](State& s) {
+              return stream_ordered_span(s, dst, count, true) && !in_read_only_registration(s, dst, count) &&
+                     (kind != cudaMemcpyDeviceToDevice || copyable_as_device(s, dst));
+            },
+            [=] {
+              StreamContextScope in_stream(stream);
+              return cudaMemcpyFromSymbol(dst, symbol, count, offset, kind);
+            }))
+      return cudaSuccess;
+  }
+  async_order(stream);   // the stream's own order, not the legacy default stream's that cudaMemcpyFromSymbol follows
+  OrderedScope ordered;
   return cudaMemcpyFromSymbol(dst, symbol, count, offset, kind);
 }
 
@@ -1646,13 +1765,18 @@ struct PendingKernel {
   int device = 0;              // the launching thread's current device
   std::thread::id launcher;
   bool started = false;        // the worker has the API lock (g_event_mu)
+  bool behind = false;         // queued behind pending lane work, and the launch did not wait for it to start (#634)
 };
 static bool async_launch_stream_ok(cudaStream_t stream);
 static bool async_libraries_loaded();
 static void async_enqueue_kernel(cudaStream_t stream, std::shared_ptr<PendingKernel> pk);
+static void async_enqueue_kernel_behind(cudaStream_t stream, std::shared_ptr<PendingKernel> pk);
+static bool async_would_wait(cudaStream_t stream);
+static bool async_runtime_stream(cudaStream_t stream);
+// `behind`: the stream has work pending behind a host function, and any stream the runtime made qualifies (#634).
 static bool async_launch_eligible(State& s, const char* api, cudaStream_t stream, bool cooperative,
                                   const std::array<uint32_t, 3>& cluster, const vgpu::ptx::EntryFn& fn,
-                                  const vgpu::exec::LaunchEnv& env, bool profiling) {
+                                  const vgpu::exec::LaunchEnv& env, bool profiling, bool behind = false) {
   if (std::strcmp(api, "cudaLaunchKernel") != 0 || cooperative) return false;
   if (cluster[0] || cluster[1] || cluster[2] || fn.req_cluster != std::array<uint32_t, 3>{0, 0, 0}) return false;
   if (t_api_depth != 1) return false;
@@ -1662,9 +1786,9 @@ static bool async_launch_eligible(State& s, const char* api, cudaStream_t stream
   if (!s.managed_allocs.empty() || !s.managed_vars.empty()) return false;
   using Probe = int (*)();
   // Looked up each time: the driver shim may be loaded after the first launch.
-  const Probe driver_managed = reinterpret_cast<Probe>(dlsym(RTLD_DEFAULT, "vgpu_driver_has_managed_v1"));
+  const Probe driver_managed = reinterpret_cast<Probe>(driver_dlsym("vgpu_driver_has_managed_v1"));
   if (driver_managed && driver_managed()) return false;
-  if (!async_launch_stream_ok(stream)) return false;
+  if (!(behind ? async_runtime_stream(stream) : async_launch_stream_ok(stream))) return false;
   return !async_libraries_loaded();
 }
 
@@ -1677,9 +1801,15 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
                                       std::array<uint32_t, 3> cluster = {0, 0, 0}) {
   // One pass over the environment for everything this launch reads (vgpu/exec/launch_env.hpp), handed on in the LaunchConfig.
   const vgpu::exec::LaunchEnv env = vgpu::exec::read_launch_env();
-  async_order(stream);   // behind any host function queued earlier on the stream
+  // Behind a host function queued earlier on the stream: the launch is queued after it when it can be (#634), else
+  // it waits for it here. `behind` is decided before the API lock is taken, since the wait cannot be made under it.
+  bool behind = t_api_depth == 0 && std::strcmp(api, "cudaLaunchKernel") == 0 && !cooperative && !cluster[0] &&
+                !cluster[1] && !cluster[2] && !vgpu::profiling::enabled() && !vgpu::profiling::hooked() &&
+                async_would_wait(stream) && async_runtime_stream(stream);
+  if (!behind) async_order(stream);
+  bool must_wait = false;   // `behind`, but the kernel cannot be left pending: wait, and launch again
   std::shared_ptr<PendingKernel> pending;   // the kernel, when this launch runs it later
-  const cudaError_t rc = guard(api, [&](State& s) -> cudaError_t {
+  const auto body = [&](State& s) -> cudaError_t {
     auto it = find_kernel(s, func);
     if (it == s.kernels.end()) {
       if (!quiet())
@@ -1706,6 +1836,10 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     uint64_t mid = module_on_current(s, *ki.mod);
     vgpu::runtime::Device& dev = current(s);
     const vgpu::ptx::EntryFn* fn = resolved_function(dev, ki, mid);
+    if (behind && !async_launch_eligible(s, api, stream, cooperative, cluster, *fn, env, profiling, true)) {
+      must_wait = true;   // before anything this launch does that a second pass would do again
+      return cudaSuccess;
+    }
     // The first launch of a kernel loads it (a lazily loaded function, on the card),
     // which a profiler is told as the cost of the launch that caused it.
     if (profiling && !ki.load_told) {
@@ -1862,7 +1996,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       cfg.graph_launcher = t_graph_env;
       cfg.current_graph_exec = t_graph_env ? reinterpret_cast<uint64_t>(t_graph_env->self) : 0;
     }
-    if (async_launch_eligible(s, api, stream, cooperative, cluster, *fn, env, profiling)) {
+    if (behind || async_launch_eligible(s, api, stream, cooperative, cluster, *fn, env, profiling)) {
       dev.check_launch(*fn, cfg);   // the configuration's refusals are the launch's, as ever
       auto pk = std::make_shared<PendingKernel>();
       pk->dev = &dev;
@@ -1900,8 +2034,17 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       vgpu::profiling::record(std::move(ev));
     }
     return cudaSuccess;
-  });
-  if (pending && rc == cudaSuccess) async_enqueue_kernel(stream, std::move(pending));
+  };
+  cudaError_t rc = guard(api, body);
+  if (must_wait) {
+    async_order(stream);
+    behind = false;
+    rc = guard(api, body);
+  }
+  if (pending && rc == cudaSuccess) {
+    if (behind) async_enqueue_kernel_behind(stream, std::move(pending));
+    else async_enqueue_kernel(stream, std::move(pending));
+  }
   // (A launch the device refuses for its configuration -- a block or grid past the limits, a zero dimension, too much shared memory, registers that
   // do not fit, a cluster the part cannot have -- is reported by the launch and by cudaGetLastError and by nothing after: an RTX 3060's
   // cudaDeviceSynchronize after each of those answers cudaSuccess, so they are not kept for the synchronize to report.)
@@ -2102,6 +2245,12 @@ static void async_wait_device();                       // device synchronize: ev
 static void async_wait_event(cudaEvent_t e);           // event synchronize: the event completes
 static void async_order(cudaStream_t stream);          // inline work on `stream`: earlier host work finished
 static bool async_stream_busy(cudaStream_t stream);    // stream query
+// A copy or fill issued on a stream that still has work queued behind a host function is queued too (see "Stream
+// lanes"): true when `run` was queued, false when the caller does the work now. `memory_ok` says, under the API lock,
+// whether every byte the work touches is memory that may be left to the stream (device or page-locked memory).
+static bool async_defer(cudaStream_t stream, const std::function<bool(State&)>& memory_ok,
+                        std::function<cudaError_t()> run);
+static void async_wait_deferred();   // the copies, fills and kernels queued behind host functions have run
 
 static cudaError_t cudaDeviceSynchronize_impl(void);
 static cudaError_t cudaDeviceSynchronize_body(void) {
@@ -2227,6 +2376,7 @@ static cudaError_t cudaDeviceReset_body(void) {
 }
 
 VGPU_EXPORT cudaError_t cudaDeviceReset(void) {
+  async_wait_deferred();   // copies and kernels queued behind a host function first, as the card synchronises
   return traced_call("cudaDeviceReset", cudaDeviceReset_body);
 }
 static cudaError_t cudaThreadSynchronize_traced() { return cudaDeviceSynchronize(); }
@@ -2870,6 +3020,7 @@ static void profile_cross_device_copy(State& s, size_t count, int src_dev, int d
 
 static cudaError_t cudaMemcpyPeer_body(void* dst, int dstDevice, const void* src, int srcDevice,
                                        size_t count) {
+  async_order(t_stream_ctx.async ? t_stream_ctx.stream : nullptr);   // behind queued host functions, as cudaMemcpy
   return guard("cudaMemcpyPeer", [&](State& s) {
     if (dstDevice < 0 || dstDevice >= s.rt->device_count() || srcDevice < 0 ||
         srcDevice >= s.rt->device_count())
@@ -3032,6 +3183,7 @@ static uint64_t device_allocation_size(State& s, const void* ptr) {
 }
 
 VGPU_EXPORT cudaError_t cudaFree(void* ptr) {
+  async_wait_deferred();   // copies and kernels queued behind a host function first, as the card synchronises
   return traced_call("cudaFree", cudaFree_body, ptr);
 }
 
@@ -3170,6 +3322,14 @@ VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cud
 static cudaError_t cudaMemcpyAsync_body(void* dst, const void* src, size_t count,
                                         cudaMemcpyKind kind, cudaStream_t stream) {
   if (vgpu_record_memcpy_if_capturing(dst, src, count, kind, stream)) return cudaSuccess;
+  // Behind a host function that has not finished: queued after it, and the call returns (#634).
+  if (async_defer(
+          stream, [&](State& s) { return count == 0 || stream_ordered_copy(s, dst, count, src, count, kind); },
+          [=] {
+            StreamContextScope in_stream(stream);
+            return cudaMemcpy(dst, src, count, kind);
+          }))
+    return cudaSuccess;
   StreamContextScope in_stream(stream);
   return cudaMemcpy(dst, src, count, kind);
 }
@@ -3262,6 +3422,21 @@ static cudaError_t cudaMemcpy2DAsync_body(void* dst, size_t dpitch, const void* 
     vgpu_record_copy_if_capturing(p, stream, &rc);
     return rc;
   }
+  if (width == 0 || height == 0) return cudaSuccess;
+  // Behind a host function that has not finished: queued after it (#634). Each row is a copy on this stream.
+  if (dst && src && width <= dpitch && width <= spitch &&
+      async_defer(
+          stream,
+          [&](State& s) {
+            return stream_ordered_copy(s, dst, (height - 1) * dpitch + width, src, (height - 1) * spitch + width, kind);
+          },
+          [=] {
+            StreamContextScope in_stream(stream);
+            return cudaMemcpy2D(dst, dpitch, src, spitch, width, height, kind);
+          }))
+    return cudaSuccess;
+  async_order(stream);   // the stream's own order, not the legacy default stream's that cudaMemcpy2D follows
+  OrderedScope ordered;
   return cudaMemcpy2D(dst, dpitch, src, spitch, width, height, kind);
 }
 
@@ -3324,6 +3499,14 @@ VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
 }
 static cudaError_t cudaMemsetAsync_body(void* dst, int value, size_t count, cudaStream_t stream) {
   if (vgpu_record_memset_if_capturing(dst, value, count, stream)) return cudaSuccess;
+  // Behind a host function that has not finished: queued after it (#634). Registered memory is refused by the fill.
+  if (async_defer(
+          stream, [&](State& s) { return count == 0 || stream_ordered_span(s, dst, count, false); },
+          [=] {
+            StreamContextScope in_stream(stream);
+            return cudaMemset(dst, value, count);
+          }))
+    return cudaSuccess;
   StreamContextScope in_stream(stream);
   return cudaMemset(dst, value, count);
 }
@@ -3361,6 +3544,18 @@ static cudaError_t cudaMemset2DAsync_body(void* dst, size_t pitch, int value, si
     vgpu_record_fill_if_capturing(p, stream, &rc);
     return rc;
   }
+  if (width == 0 || height == 0) return cudaSuccess;
+  // Behind a host function that has not finished: queued after it (#634).
+  if (dst && width <= pitch &&
+      async_defer(
+          stream, [&](State& s) { return stream_ordered_span(s, dst, (height - 1) * pitch + width, false); },
+          [=] {
+            StreamContextScope in_stream(stream);
+            return cudaMemset2D(dst, pitch, value, width, height);
+          }))
+    return cudaSuccess;
+  async_order(stream);   // the stream's own order, not the legacy default stream's that cudaMemset2D follows
+  OrderedScope ordered;
   return cudaMemset2D(dst, pitch, value, width, height);
 }
 
@@ -3478,6 +3673,7 @@ static cudaError_t cudaFreeHost_body(void* ptr) {
 }
 
 VGPU_EXPORT cudaError_t cudaFreeHost(void* ptr) {
+  async_wait_deferred();   // copies and kernels queued behind a host function first, as the card synchronises
   return traced_call("cudaFreeHost", cudaFreeHost_body, ptr);
 }
 static cudaError_t cudaMemcpyPeerAsync_body(void* dst, int dstDevice, const void* src,
@@ -3490,6 +3686,18 @@ static cudaError_t cudaMemcpyPeerAsync_body(void* dst, int dstDevice, const void
     vgpu_record_copy_if_capturing(linear_copy(dst, src, count, cudaMemcpyDefault), stream, &rc);
     return rc;
   }
+  // Behind a host function that has not finished: queued after it (#634).
+  if (async_defer(
+          stream,
+          [&](State& s) {
+            return count == 0 || (is_device_ptr(dst) && is_device_ptr(src) && stream_ordered_span(s, dst, count, false) &&
+                                  stream_ordered_span(s, src, count, false));
+          },
+          [=] {
+            StreamContextScope on_stream(stream);
+            return cudaMemcpyPeer(dst, dstDevice, src, srcDevice, count);
+          }))
+    return cudaSuccess;
   StreamContextScope on_stream(stream);   // the record of the copy names the stream it was issued on
   return cudaMemcpyPeer(dst, dstDevice, src, srcDevice, count);
 }
@@ -4167,6 +4375,18 @@ VGPU_EXPORT cudaError_t cudaMallocFromPoolAsync(void** ptr, size_t size, cudaMem
 }
 
 static cudaError_t cudaFreeAsync_body(void* ptr, cudaStream_t stream) {
+  // Behind a host function that has not finished, the free follows the copies and kernels queued after it, which may
+  // still use the memory (#634): it is queued too, when it names an allocation it can free.
+  if (ptr && async_defer(
+                 stream,
+                 [&](State& s) {
+                   const uint64_t a = reinterpret_cast<uint64_t>(ptr);
+                   uint64_t base = 0, size = 0;
+                   return is_device_ptr(ptr) && (pool_of(s, a) != nullptr ||
+                                                 (owner_memory(s, ptr).find_allocation(a, &base, &size) && base == a));
+                 },
+                 [=] { return cudaFreeAsync(ptr, stream); }))
+    return cudaSuccess;
   return guard("cudaFreeAsync", [&](State& s) -> cudaError_t {
     cudaError_t rc = cudaSuccess;
     if (ptr && capture_free(stream, ptr, &rc)) return rc;
@@ -4534,6 +4754,7 @@ static cudaError_t cudaHostUnregister_body(void* p) {
 }
 
 VGPU_EXPORT cudaError_t cudaHostUnregister(void* p) {
+  async_wait_deferred();   // copies and kernels queued behind a host function first, as the card synchronises
   return traced_call("cudaHostUnregister", cudaHostUnregister_body, p);
 }
 // Under unified addressing, memory CUDA pins or registers is reachable from
@@ -5463,6 +5684,33 @@ static cudaError_t cudaMemcpy3DAsync_traced(const cudaMemcpy3DParms* p, cudaStre
     vgpu_record_copy_if_capturing(*p, stream, &rc);
     return rc;
   }
+  // Behind a host function that has not finished: a copy between pitched pointers is queued after it (#634); one with
+  // an array at either end waits for it here.
+  if (p && !p->srcArray && !p->dstArray && p->srcPtr.ptr && p->dstPtr.ptr) {
+    const cudaMemcpy3DParms c = *p;
+    const uint64_t row = c.extent.width, rows = c.extent.height ? c.extent.height : 1,
+                   depth = c.extent.depth ? c.extent.depth : 1;
+    // The bytes from the box's first to its last, at the addresses cudaMemcpy3D copies.
+    auto span = [&](const cudaPitchedPtr& ptr, const cudaPos& pos, const void** lo) -> uint64_t {
+      const uint64_t ysize = ptr.ysize ? ptr.ysize : rows;
+      *lo = static_cast<const char*>(ptr.ptr) + (pos.z * ysize + pos.y) * ptr.pitch + pos.x;
+      return ((depth - 1) * ysize + (rows - 1)) * ptr.pitch + row;
+    };
+    const void* src_lo = nullptr;
+    const void* dst_lo = nullptr;
+    const uint64_t src_n = span(c.srcPtr, c.srcPos, &src_lo), dst_n = span(c.dstPtr, c.dstPos, &dst_lo);
+    if (row != 0 && c.srcPos.x + row <= c.srcPtr.pitch && c.dstPos.x + row <= c.dstPtr.pitch &&
+        async_defer(
+            stream,
+            [&](State& s) { return stream_ordered_copy(s, const_cast<void*>(dst_lo), dst_n, src_lo, src_n, c.kind); },
+            [=] {
+              StreamContextScope in_stream(stream);
+              return cudaMemcpy3D(&c);
+            }))
+      return cudaSuccess;
+  }
+  async_order(stream);   // the stream's own order, not the legacy default stream's that cudaMemcpy3D follows
+  OrderedScope ordered;
   return cudaMemcpy3D(p);
 }
 
@@ -6494,8 +6742,30 @@ RtEvent* find_event(cudaEvent_t e) {  // caller holds g_event_mu
 // keeps the order and loses only the overlap. The legacy default stream orders against every blocking stream and a
 // blocking stream against the default stream, as documented, through "barrier" items that wait for the other lane
 // to reach the position it had when the item was queued.
+//
+// Except where that wait could be for the calling thread itself (#634): a host function that waits for something the
+// program does after it has queued more work on the stream. A card returns from cudaMemcpyAsync at once there and runs
+// the copy after the host function; waiting in the call hangs. So a copy or fill on a stream with pending lane work
+// is queued on the lane as well (async_defer, an Op item) when everything it touches is device or page-locked memory
+// (pinned, registered), and a kernel launch is queued (a Kernel item) when it could be launched asynchronously at all
+// (async_launch_eligible), on any stream the runtime made. The worker runs either under the API lock, as the call would
+// have run it, in the lane's order, so it sees what the host function wrote and the host function does not see what it
+// writes. What still waits in the call: work on the per-thread default stream, copies of pageable memory (a card copies
+// those inside the call too: from device to pageable memory it returns once the copy is done), managed memory, arrays,
+// with a profiler listening or a CUDA library loaded, and calls made from inside another runtime call. A failure of
+// queued work reaches the issuing thread at its next call, as a failed asynchronous launch does. cudaFree,
+// cudaFreeHost, cudaHostUnregister and cudaDeviceReset wait for queued work first (async_wait_deferred), as the card
+// synchronises in them.
 namespace {
 struct LaneItem;
+// A copy or fill queued on a lane: the plain call that does it, the device that was current, and who issued it.
+struct DeferredOp {
+  std::function<cudaError_t()> run;
+  int device = 0;
+  std::thread::id issuer;
+};
+// Copies, fills and kernels queued behind a host function that have not finished (async_wait_deferred).
+std::atomic<int> g_deferred_pending{0};
 struct Lane {
   bool blocking = true;             // created without cudaStreamNonBlocking (the legacy default stream is one)
   bool legacy_default = false;      // the legacy default stream
@@ -6504,8 +6774,9 @@ struct Lane {
   std::deque<LaneItem> q;
 };
 struct LaneItem {
-  enum Kind { Host, Record, Wait, Barrier, Kernel } kind = Host;
+  enum Kind { Host, Record, Wait, Barrier, Kernel, Op } kind = Host;
   std::shared_ptr<PendingKernel> kernel;   // Kernel: see "An asynchronous kernel launch"
+  std::shared_ptr<DeferredOp> op;          // Op: a copy or fill queued behind a host function (async_defer)
   cudaHostFn_t fn = nullptr;
   void* user = nullptr;
   cudaEvent_t ev = nullptr;
@@ -6594,6 +6865,25 @@ void run_pending_kernel(PendingKernel& k, std::unique_lock<std::mutex>& event_lo
   event_lock.lock();
 }
 
+// Runs a queued copy or fill on the lane's worker thread: the plain call, which takes the API lock itself, with the
+// issuing thread's current device and without waiting again for the order it already has (t_ordered). A failure is
+// kept for the issuing thread, as a queued kernel's is.
+void run_deferred_op(DeferredOp& op, std::unique_lock<std::mutex>& event_lock) {
+  event_lock.unlock();
+  t_current_device = op.device;
+  cudaError_t rc = cudaSuccess;
+  {
+    OrderedScope ordered;
+    rc = op.run();
+  }
+  if (rc != cudaSuccess) {
+    std::lock_guard<std::mutex> lock(g_deferred_mu);
+    g_deferred_errors.emplace_back(op.issuer, rc);
+    g_deferred_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  event_lock.lock();
+}
+
 void lane_worker(Lane* l) {
   std::unique_lock<std::mutex> lk(g_event_mu);
   while (!l->q.empty()) {
@@ -6606,6 +6896,11 @@ void lane_worker(Lane* l) {
         break;
       case LaneItem::Kernel:
         run_pending_kernel(*it.kernel, lk);
+        if (it.kernel->behind) g_deferred_pending.fetch_sub(1);
+        break;
+      case LaneItem::Op:
+        run_deferred_op(*it.op, lk);
+        g_deferred_pending.fetch_sub(1);
         break;
       case LaneItem::Record:
         if (RtEvent* r = find_event(it.ev)) {
@@ -6725,6 +7020,86 @@ static void async_enqueue_kernel(cudaStream_t stream, std::shared_ptr<PendingKer
   g_async_cv.wait(lk, [&] { return pk->started; });
 }
 
+// A launch queued behind work still pending on its stream (#634): the call returns without waiting for the kernel to
+// start, which the worker does only once the host function before it has finished.
+static void async_enqueue_kernel_behind(cudaStream_t stream, std::shared_ptr<PendingKernel> pk) {
+  static const bool registered = std::atexit([] { async_wait_device(); }) == 0;
+  (void)registered;
+  const bool blocking = stream_is_blocking(stream);
+  pk->behind = true;
+  std::lock_guard<std::mutex> lock(g_event_mu);
+  g_deferred_pending.fetch_add(1);
+  LaneItem it;
+  it.kind = LaneItem::Kernel;
+  it.kernel = std::move(pk);
+  lane_push(stream, blocking, std::move(it));
+}
+
+// Whether work on `stream` may be queued behind its pending lane work rather than wait for it in the call: the legacy
+// default stream and the streams the runtime made. Not the per-thread default stream (the plain calls a program built
+// with per-thread default streams makes order against the legacy one here, see VGPU_PT_ALIAS), not a stream the driver
+// API made, and not one that is capturing (the callers record a capture before they get here).
+static bool async_defer_stream_ok(cudaStream_t stream) {
+  if (stream == cudaStreamPerThread) return false;
+  if (stream != nullptr && stream != cudaStreamLegacy) {
+    std::lock_guard<std::mutex> lock(g_stream_mu);
+    if (!stream_record(stream)) return false;
+  }
+  return !capture_active(stream);
+}
+
+// A stream the runtime made (not a default stream, not one the driver API made), not capturing.
+static bool async_runtime_stream(cudaStream_t stream) {
+  if (stream == nullptr || stream == cudaStreamLegacy || stream == cudaStreamPerThread) return false;
+  return async_defer_stream_ok(stream);
+}
+
+// True when work on `stream` would wait for pending lane work: the cheap test before the launch decides (no lock
+// held after it returns, so the answer can be stale, which only means the work is queued on a lane that has just
+// drained and runs at once).
+static bool async_would_wait(cudaStream_t stream) {
+  if (!g_async_used.load(std::memory_order_relaxed) || t_ordered) return false;
+  const bool blocking = stream_is_blocking(stream);
+  std::lock_guard<std::mutex> lock(g_event_mu);
+  return order_busy(stream, blocking);
+}
+
+static bool async_defer(cudaStream_t stream, const std::function<bool(State&)>& memory_ok,
+                        std::function<cudaError_t()> run) {
+  if (!g_async_used.load(std::memory_order_relaxed) || t_ordered || t_api_depth != 0) return false;
+  if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) return false;
+  if (!async_would_wait(stream) || !async_defer_stream_ok(stream) || async_libraries_loaded()) return false;
+  using Probe = int (*)();
+  const Probe driver_managed = reinterpret_cast<Probe>(dlsym(RTLD_DEFAULT, "vgpu_driver_has_managed_v1"));
+  if (driver_managed && driver_managed()) return false;
+  // Pending work behind a host function: queued once outstanding copies and kernels finish at exit, as the launch's are.
+  static const bool registered = std::atexit([] { async_wait_device(); }) == 0;
+  (void)registered;
+  const bool blocking = stream_is_blocking(stream);
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> api_lock(s.mu);   // the API lock, then the event lock, as everywhere
+  if (!s.initialized.load(std::memory_order_acquire)) return false;
+  if (!s.managed_allocs.empty() || !s.managed_vars.empty()) return false;
+  if (!memory_ok(s)) return false;
+  auto op = std::make_shared<DeferredOp>();
+  op->run = std::move(run);
+  op->device = t_current_device;
+  op->issuer = std::this_thread::get_id();
+  std::lock_guard<std::mutex> lock(g_event_mu);
+  g_deferred_pending.fetch_add(1);
+  LaneItem it;
+  it.kind = LaneItem::Op;
+  it.op = std::move(op);
+  lane_push(stream, blocking, std::move(it));
+  return true;
+}
+
+static void async_wait_deferred() {
+  if (g_deferred_pending.load() == 0 || t_ordered || t_api_depth != 0) return;
+  std::unique_lock<std::mutex> lk(g_event_mu);
+  g_async_cv.wait(lk, [] { return g_deferred_pending.load() == 0; });
+}
+
 // Which streams get asynchronous launches: the ones the runtime made, not capturing (the launch checks that), and
 // non-blocking unless VGPU_ASYNC_LAUNCH=all. VGPU_ASYNC_LAUNCH=0 turns it off.
 static bool async_launch_stream_ok(cudaStream_t stream) {
@@ -6824,7 +7199,7 @@ static void async_wait_event(cudaEvent_t e) {
   });
 }
 static void async_order(cudaStream_t stream) {
-  if (!g_async_used.load(std::memory_order_relaxed)) return;
+  if (!g_async_used.load(std::memory_order_relaxed) || t_ordered) return;
   const bool blocking = stream_is_blocking(stream);
   std::unique_lock<std::mutex> lk(g_event_mu);
   g_async_cv.wait(lk, [&] { return !order_busy(stream, blocking); });
@@ -7316,6 +7691,11 @@ int rt_tensor_map_encode_im2col(void* tensorMap, unsigned dataType, unsigned ran
 using GetProcAddressFn = int (*)(const char*, void**, int, unsigned long long, int*);
 GetProcAddressFn simulator_get_proc_address() {
   static GetProcAddressFn fn = []() -> GetProcAddressFn {
+    // The driver `vgpu run --preload` loaded privately (load_private_preloads): the runtime has initialised it and handed
+    // it its contexts as for a linked one. It stays private: loading it again with RTLD_GLOBAL, below, would put its
+    // functions in the global scope after all, where a library loaded later binds its own `cuInit` variable to them (#597).
+    if (void* h = g_private_driver.load(std::memory_order_acquire))
+      return reinterpret_cast<GetProcAddressFn>(dlsym(h, "cuGetProcAddress_v2"));
     Dl_info self{};
     if (!dladdr(reinterpret_cast<void*>(&simulator_get_proc_address), &self) || !self.dli_fname)
       return nullptr;
@@ -11904,7 +12284,7 @@ namespace {
 // The driver shim's entry point. Every framework has the driver loaded, and the
 // runtime hands it its context (bind_driver_context); with none loaded there is
 // nothing to forward to.
-void* driver_symbol(const char* name) { return dlsym(RTLD_DEFAULT, name); }
+void* driver_symbol(const char* name) { return driver_dlsym(name); }
 // CUresult and cudaError_t agree on every code these calls return.
 cudaError_t from_driver(int r) { return static_cast<cudaError_t>(r); }
 }  // namespace

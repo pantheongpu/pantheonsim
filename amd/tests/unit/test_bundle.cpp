@@ -7,9 +7,14 @@
 // The fixtures are built by amd/tests/data/build.sh: three bundles of the
 // same three objects, for gfx90a, gfx942 with XNACK on and gfx942 with it
 // off, and two hand-written kernels linked into one shared object.
+#include <dlfcn.h>
+
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <vector>
 
 #include "vgpu/amd_bundle.hpp"
 #include "vgpu/amd_codeobject.hpp"
@@ -147,6 +152,132 @@ VTEST(what_is_not_a_bundle_is_not_read_as_one) {
   const std::string elf = file("asm_vector.gfx942.o");
   VCHECK(!amd::is_bundle(bytes(elf)));
   VCHECK(amd::read_bundle(bytes(elf)) == nullptr);
+}
+
+// ---- A bundle larger than the inflating buffer ------------------------------------
+//
+// A library's bundle inflates to tens of megabytes, far past the few megabytes the
+// table of contents is read from, and the code kept for a device is inflated straight
+// into its place (pantheonsim #565). The bundles here are made at run time, compressed
+// with the system's zstd, with entries before, after and across the first 4 MB, and
+// what is kept must be byte for byte what was put in -- for one entry, several, all of
+// them, none, and for two entries that share bytes (which take the copying path) -- and the same with
+// VGPU_LOAD_PLAIN=1, the reading from before.
+namespace {
+
+struct Part {
+  std::string triple;
+  uint64_t offset = 0, size = 0;
+};
+
+// Bytes that compress somewhat (runs and repeats) but not to nothing.
+std::string pattern(uint64_t n, uint32_t seed) {
+  std::string s(n, '\0');
+  uint32_t x = seed * 2654435761u + 1;
+  for (uint64_t i = 0; i < n; ++i) {
+    x ^= x << 13, x ^= x >> 17, x ^= x << 5;
+    s[i] = static_cast<char>((i % 64) < 40 ? (x & 0xFF) : (i >> 7) & 0xFF);
+  }
+  return s;
+}
+
+// An uncompressed bundle of `parts` (whose offsets are set here unless `fixed`), and the payload each one names.
+std::string make_bundle(std::vector<Part>& parts, const std::vector<std::string>& payloads, bool fixed) {
+  std::string toc = "__CLANG_OFFLOAD_BUNDLE__";
+  const auto u64 = [](std::string& s, uint64_t v) { s.append(reinterpret_cast<const char*>(&v), 8); };
+  uint64_t header = 32;
+  for (const Part& p : parts) header += 24 + p.triple.size();
+  uint64_t at = (header + 4095) & ~uint64_t{4095};
+  for (size_t i = 0; i < parts.size() && !fixed; ++i) {
+    parts[i].offset = at;
+    parts[i].size = payloads[i].size();
+    at = (at + parts[i].size + 4095) & ~uint64_t{4095};
+  }
+  u64(toc, parts.size());
+  for (const Part& p : parts) u64(toc, p.offset), u64(toc, p.size), u64(toc, p.triple.size()), toc += p.triple;
+  uint64_t end = toc.size();
+  for (const Part& p : parts) end = std::max(end, p.offset + p.size);
+  std::string b(end, '\0');
+  std::memcpy(b.data(), toc.data(), toc.size());
+  for (size_t i = 0; i < parts.size(); ++i)
+    if (!payloads[i].empty()) std::memcpy(b.data() + parts[i].offset, payloads[i].data(), payloads[i].size());
+  return b;
+}
+
+// `plain` compressed as clang's offload bundler writes it: "CCOB", version 2 or 3, method 1 (zstd).
+std::string ccob(const std::string& plain, uint16_t version) {
+  using Bound = size_t (*)(size_t);
+  using Compress = size_t (*)(void*, size_t, const void*, size_t, int);
+  void* lib = dlopen("libzstd.so.1", RTLD_NOW | RTLD_LOCAL);
+  if (!lib) throw vtest::Failure("no libzstd.so.1 to compress with");
+  const auto bound = reinterpret_cast<Bound>(dlsym(lib, "ZSTD_compressBound"));
+  const auto compress = reinterpret_cast<Compress>(dlsym(lib, "ZSTD_compress"));
+  std::string z(bound(plain.size()), '\0');
+  z.resize(compress(z.data(), z.size(), plain.data(), plain.size(), 1));
+  std::string out = "CCOB";
+  const uint16_t method = 1;
+  out.append(reinterpret_cast<const char*>(&version), 2);
+  out.append(reinterpret_cast<const char*>(&method), 2);
+  const uint64_t header = version == 2 ? 24 : 32, total = header + z.size(), size = plain.size(), hash = 0;
+  if (version == 2) {
+    const uint32_t t = static_cast<uint32_t>(total), n = static_cast<uint32_t>(size);
+    out.append(reinterpret_cast<const char*>(&t), 4);
+    out.append(reinterpret_cast<const char*>(&n), 4);
+  } else {
+    out.append(reinterpret_cast<const char*>(&total), 8);
+    out.append(reinterpret_cast<const char*>(&size), 8);
+  }
+  out.append(reinterpret_cast<const char*>(&hash), 8);
+  return out + z;
+}
+
+}  // namespace
+
+VTEST(a_large_compressed_bundle_keeps_exactly_the_bytes_of_the_entries_a_device_runs) {
+  const std::string kHip = "hipv4-amdgcn-amd-amdhsa--";
+  std::vector<std::string> payloads = {pattern(3u << 20, 1), pattern((5u << 20) + 123, 2), pattern((2u << 20) + 7, 3),
+                                       pattern(4u << 20, 4), std::string()};
+  std::vector<Part> parts = {{kHip + "gfx90a"}, {kHip + "gfx942:xnack+"}, {kHip + "gfx1100"}, {kHip + "gfx942:xnack-"},
+                             {"host-x86_64-unknown-linux-gnu-"}};
+  const std::string plain = make_bundle(parts, payloads, false);
+  VCHECK(plain.size() > (8u << 20));   // entries before, across and past the first 4 MB
+  for (const char* old_reading : {"0", "1"}) {
+    ::setenv("VGPU_LOAD_PLAIN", old_reading, 1);
+    for (uint16_t version : {uint16_t{2}, uint16_t{3}}) {
+      const std::string packed = ccob(plain, version);
+      struct Case {
+        const char* device;
+        std::vector<size_t> kept;
+      };
+      for (const Case& c : {Case{"gfx942:sramecc+:xnack-", {1, 3}}, Case{"gfx90a:sramecc+:xnack-", {0}},
+                            Case{"gfx1100", {2}}, Case{"", {0, 1, 2, 3}}, Case{"gfx950:sramecc+:xnack-", {}}}) {
+        const std::unique_ptr<amd::Bundle> b = amd::read_bundle(bytes(packed), c.device);
+        VCHECK(b != nullptr);
+        VCHECK_EQ(b->targets.size(), c.kept.size());
+        uint64_t held = 0;
+        for (size_t i : c.kept) {
+          const std::string target = parts[i].triple.substr(kHip.size());
+          VCHECK(b->targets.count(target) == 1);
+          VCHECK(b->targets.at(target) == payloads[i]);
+          held += payloads[i].size();
+        }
+        VCHECK_EQ(b->inflated.size(), held);
+        VCHECK_EQ(amd::target_list(*b), std::string("gfx1100, gfx90a, gfx942:xnack+, gfx942:xnack-"));
+      }
+    }
+    // Two entries that share bytes: the second gfx942 entry starts inside the first.
+    std::vector<Part> shared = parts;
+    shared[3].offset = shared[1].offset + (1u << 20);
+    shared[3].size = 3u << 20;
+    std::vector<std::string> shared_payloads = payloads;
+    shared_payloads[3].clear();   // (its bytes are the first entry's)
+    const std::string overlapping = make_bundle(shared, shared_payloads, true);
+    const std::unique_ptr<amd::Bundle> b = amd::read_bundle(bytes(ccob(overlapping, 3)), "gfx942:sramecc+:xnack-");
+    VCHECK_EQ(b->targets.size(), size_t{2});
+    VCHECK(b->targets.at("gfx942:xnack+") == payloads[1]);
+    VCHECK(b->targets.at("gfx942:xnack-") == payloads[1].substr(1u << 20, 3u << 20));
+  }
+  ::unsetenv("VGPU_LOAD_PLAIN");
 }
 
 VTEST(a_linked_object_has_every_kernel_each_note_names) {

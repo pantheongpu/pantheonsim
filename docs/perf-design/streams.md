@@ -156,3 +156,33 @@ the call takes the API lock, once per call stack (a thread-local flag, so an asy
 stream and not for the legacy stream's dependencies), and not for the replay of a captured launch, which runs under the lock. A driver event
 is also recorded on its runtime shadow event once a host function exists; `cuEventQuery`, `cuEventSynchronize`, `cuEventElapsedTime`
 and `cuStreamWaitEvent` read the shadow's pending state and time (`vgpu_async_event_*_v1`).
+
+### Work queued behind a host function (pantheonsim #634)
+
+A copy, fill or launch on a stream whose lane still holds a host function used to wait for the lane in the call (`async_order`), which
+keeps the order but hangs a program whose host function waits for something the calling thread does after the call: Celeritas'
+`AsyncSnapshot` test queues a host function that spins on a flag, then a device-to-host `cudaMemcpyAsync` and an event, checks that the
+event is not ready, and only then sets the flag. On a card the copy call returns at once. Now such work is queued on the lane too, behind
+the host function, and the call returns:
+
+* `cudaMemcpyAsync`, `cudaMemsetAsync`, `cudaMemcpy2DAsync`, `cudaMemset2DAsync` (and `cudaMemset3DAsync`, slice by slice),
+  `cudaMemcpy3DAsync` between pitched pointers, `cudaMemcpyToSymbolAsync`, `cudaMemcpyFromSymbolAsync`, `cudaMemcpyPeerAsync` and
+  `cudaFreeAsync` become an `Op` item (`async_defer`): the plain call, run by the lane's worker under the API lock, in the lane's order,
+  so it sees what the host function wrote and the host function does not see what it writes. Only when every byte it touches is device
+  memory or page-locked host memory (`cudaMallocHost`, `cudaHostAlloc`, `cudaHostRegister`), and only when the call would not refuse it
+  (its kind and ranges are checked first), so the refusals stay the call's.
+* A kernel launch becomes a `Kernel` item that the launch does not wait to start, on any stream the runtime made, when it could be
+  launched asynchronously at all (`async_launch_eligible`); otherwise it waits as before.
+* Events, `cudaStreamWaitEvent`, `cudaStreamQuery` and the synchronizing calls need nothing new: an event recorded after the queued work
+  is queued behind it, and `cudaMemcpy`, `cudaStreamSynchronize`, `cudaDeviceSynchronize` and `cudaEventSynchronize` wait for lanes to
+  drain, the legacy default stream's barriers included. `cudaFree`, `cudaFreeHost`, `cudaHostUnregister` and `cudaDeviceReset` wait for
+  queued work first (`async_wait_deferred`), as the card synchronises in them. A queued copy that fails reports at the issuing thread's
+  next call, as an asynchronous launch's failure does.
+* The 2D, 3D and symbol copies now also wait for their own stream's lane rather than the legacy default stream's when they do run in the
+  call (they used to reach `cudaMemcpy` without the stream, so on a non-blocking stream they did not follow a host function on it), and
+  `cudaMemcpyPeer`, `cudaMemcpyToSymbol` and `cudaMemcpyFromSymbol` follow host functions as `cudaMemcpy` does.
+
+What still waits in the call: work on the per-thread default stream, copies to or from pageable memory (a card copies device to pageable
+memory inside the call too), managed memory, arrays, while a profiler listens or a CUDA library shim is loaded (their work does not take
+the API lock), calls made from inside another runtime call, and the driver API's copies and launches (its `StreamOrder`). Programs that
+never queue a host function are not changed: every hook returns after one relaxed load.

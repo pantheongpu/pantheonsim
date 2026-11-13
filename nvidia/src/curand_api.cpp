@@ -17,12 +17,14 @@
 // full, and the unscrambled ones produce NVIDIA's integers and uniforms bit
 // for bit (see "Sobol' sequences" below).
 #include <curand.h>
+#include <curand_discrete.h>
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -364,6 +366,127 @@ double normal_quantile(double p) {
   return x - u / (1 + x * u / 2);
 }
 
+// ---- Poisson ----
+//
+// What an RTX 3060's cuRAND 13 does, measured (pantheonsim #629; nvidia/docs/libraries.md, "cuRAND Poisson"):
+//  * curandCreatePoissonDistribution builds, for lambda below 2000, the Marsaglia-Tsang-Wang square histogram
+//    (method CURAND_M2) that curand_discrete in curand_poisson.h reads; from 2000 on it stores mean and standard
+//    deviation instead (CURAND_DISCRETE_GAUSS).
+//  * curandGeneratePoisson on a pseudorandom generator, below lambda 2000, is that histogram looked up with the
+//    generator's own 32-bit integers, one per value -- curandGenerate's at the same positions.
+//  * on a 32-bit Sobol' generator: the histogram below lambda 10, the inversion of curand_poisson.h
+//    (_curand_poisson_ITR_double, on a (0, 1] uniform) up to 8000, and above that lambda + sqrt(lambda) * (the float normal
+//    curandGenerateNormal gives at that point), rounded; on a 64-bit Sobol' generator the inversion below 2000
+//    and the rounded normal from there.
+// The histogram here is built the way the card's is (its range, its aliases, the same order of filling): the
+// aliases equal the card's for every lambda tried, and the cut-offs differ from its in the last bits only, which
+// no 32-bit integer's uniform falls between. So a Sobol' generator's Poisson integers are the card's, and device
+// code that calls curand_discrete with this histogram draws what it draws on the card.
+constexpr double kPoissonGaussFrom = 2000.0;   // curandCreatePoissonDistribution: a normal from here on
+
+bool poisson_lambda_ok(double lambda) { return lambda > 0 && lambda <= 400000.0; }   // NaN fails too
+
+struct PoissonHistogram {
+  unsigned shift = 0;
+  std::vector<double> V;     // cut-off of each column, on the uniform's own scale
+  std::vector<unsigned> K;   // the column's alias, from shift
+};
+
+// The values whose probability is not 0 in double precision (exp of the log of the pmf), and the square histogram
+// of them: each column holds 1/n of the mass; a column below that (scanning upwards, again until none is left)
+// is topped up from the highest-numbered column above it, which moves on once it falls below 1/n itself.
+PoissonHistogram poisson_histogram(double lambda) {
+  auto pmf = [lambda](unsigned k) { return std::exp(k * std::log(lambda) - lambda - std::lgamma(k + 1.0)); };
+  unsigned lo = 0;
+  while (pmf(lo) == 0) ++lo;
+  unsigned hi = lo;
+  while (pmf(hi + 1) > 0) ++hi;
+  PoissonHistogram h;
+  h.shift = lo;
+  const unsigned n = hi - lo + 1;
+  std::vector<double> p(n);
+  for (unsigned i = 0; i < n; ++i) p[i] = pmf(lo + i);
+  const double a = 1.0 / n;
+  h.V.resize(n);
+  h.K.resize(n);
+  for (unsigned i = 0; i < n; ++i) {
+    h.V[i] = (i + 1) * a;
+    h.K[i] = i;
+  }
+  std::vector<unsigned> large;
+  for (unsigned i = 0; i < n; ++i)
+    if (!(p[i] < a)) large.push_back(i);
+  std::vector<char> done(n, 0);
+  for (bool moved = true; moved && !large.empty();) {
+    moved = false;
+    for (unsigned i = 0; i < n && !large.empty(); ++i) {
+      if (done[i] || !(p[i] < a)) continue;
+      const unsigned g = large.back();
+      h.K[i] = g;
+      h.V[i] = i * a + p[i];
+      done[i] = 1;
+      moved = true;
+      p[g] = p[g] - (a - p[i]);
+      if (p[g] < a) large.pop_back();
+    }
+  }
+  for (unsigned g : large) h.V[g] = g * a + p[g];
+  return h;
+}
+
+// _curand_M2_double: column floor(n u) of the uniform (0, 1] the integer gives. The card's u can be exactly 1 (for
+// 0xffffffff), which reads one column past the table there; here it takes the last column.
+inline unsigned poisson_m2(const PoissonHistogram& h, uint32_t x) {
+  const double u = x * 2.3283064365386963e-10 + 2.3283064365386963e-10;
+  const unsigned n = static_cast<unsigned>(h.V.size());
+  unsigned j = static_cast<unsigned>(std::floor(n * u));
+  if (j >= n) j = n - 1;
+  return h.shift + (u < h.V[j] ? j : h.K[j]);
+}
+
+// _curand_poisson_ITR_double -- but on the uniform in (0, 1] of _curand_uniform_double, which is what the card's
+// library feeds it (measured: a million Sobol' points each, 32- and 64-bit, lambda 10 to 7999, all equal; the
+// header's (0, 1) form differs in the far tails). For a uniform of exactly 1, which q may never pass (not measured on
+// the card), the walk stops where p has run out; that changes nothing else.
+inline unsigned poisson_itr(double u, double lambda) {
+  double p = 1.0, q = 1.0;
+  unsigned k = 0;
+  int step = 0;
+  do {
+    const double L = lambda > step + 500.0 ? std::exp(-500.0) : std::exp(static_cast<double>(step) - lambda);
+    p *= L;
+    q *= L;
+    step += 500;
+    while (u > q) {
+      ++k;
+      p *= lambda / static_cast<double>(k);
+      q += p;
+      if (p == 0) break;
+    }
+  } while (static_cast<double>(step) < lambda);
+  return k;
+}
+inline double uniform_01(uint32_t x) { return x * 2.3283064365386963e-10 + 2.3283064365386963e-10; }
+inline double uniform_01(unsigned long long x) {
+  return static_cast<double>(x >> 11) * 1.1102230246251565e-16 + 1.1102230246251565e-16 / 2.0;
+}
+inline double excluding_one(uint32_t x) { return x * 2.3283064365386963e-10 + 2.3283064365386963e-10 / 2.0; }
+inline unsigned poisson_from_normal(double lambda, double z) {
+  return static_cast<unsigned>(std::sqrt(lambda) * z + lambda + 0.5);
+}
+
+// The device-memory image of a curandDiscreteDistribution_st and what it points to, as curand_discrete reads them,
+// with the host copies the host_* fields name.
+struct PoissonDistribution {
+  void* device = nullptr;
+  curandDiscreteDistribution_st host_dist{};
+  curandDistributionM2Shift_st host_m2{};
+  curandHistogramM2_st host_hist{};
+  std::vector<double> V;
+  std::vector<unsigned> K;
+};
+std::map<void*, std::unique_ptr<PoissonDistribution>> g_dists;   // under g_mu, by the device pointer the caller holds
+
 }  // namespace
 
 #define VGPU_EXPORT extern "C" __attribute__((visibility("default")))
@@ -674,4 +797,144 @@ VGPU_EXPORT curandStatus_t curandGenerateLogNormalDouble(curandGenerator_t gen, 
   });
   store(g, out, h);
   return CURAND_STATUS_SUCCESS;
+}
+
+// ---- Poisson (pantheonsim #629; see "Poisson" above) ----
+
+VGPU_EXPORT curandStatus_t curandCreatePoissonDistribution(double lambda, curandDiscreteDistribution_t* discrete_distribution) {
+  if (!discrete_distribution) return CURAND_STATUS_NOT_INITIALIZED;
+  if (!poisson_lambda_ok(lambda)) return CURAND_STATUS_OUT_OF_RANGE;
+  auto d = std::make_unique<PoissonDistribution>();
+  const bool m2 = lambda < kPoissonGaussFrom;
+  if (m2) {
+    PoissonHistogram h = poisson_histogram(lambda);
+    d->V = std::move(h.V);
+    d->K = std::move(h.K);
+    d->host_m2.shift = h.shift;
+    d->host_m2.length = static_cast<unsigned>(d->V.size());
+  }
+  // One allocation: the distribution, the M2 record, the histogram record, then K and V.
+  const size_t n = d->V.size();
+  const size_t o_m2 = 64, o_hist = 128, o_k = 192, o_v = o_k + ((n * sizeof(unsigned) + 63) / 64) * 64;
+  const size_t bytes = m2 ? o_v + n * sizeof(double) : o_m2;
+  if (cudaMalloc(&d->device, bytes) != cudaSuccess) return CURAND_STATUS_ALLOCATION_FAILED;
+  char* base = static_cast<char*>(d->device);
+  curandDiscreteDistribution_st dev{};
+  dev.self_host_ptr = &d->host_dist;
+  dev.method = m2 ? CURAND_M2 : CURAND_DISCRETE_GAUSS;
+  dev.mean = m2 ? 0.0 : lambda;
+  dev.stddev = m2 ? 0.0 : std::sqrt(lambda);
+  std::vector<char> image(bytes, 0);
+  if (m2) {
+    curandHistogramM2_st hist{};
+    hist.V = reinterpret_cast<curandHistogramM2V_t>(base + o_v);
+    hist.K = reinterpret_cast<curandHistogramM2K_t>(base + o_k);
+    hist.host_V = d->V.data();
+    hist.host_K = d->K.data();
+    d->host_hist = hist;   // the host copy points at the host arrays
+    d->host_hist.V = hist.host_V;
+    d->host_hist.K = hist.host_K;
+    curandDistributionM2Shift_st m{};
+    m.histogram = reinterpret_cast<curandHistogramM2_t>(base + o_hist);
+    m.host_histogram = &d->host_hist;
+    m.shift = d->host_m2.shift;
+    m.length = d->host_m2.length;
+    d->host_m2.histogram = &d->host_hist;
+    d->host_m2.host_histogram = &d->host_hist;
+    dev.M2 = reinterpret_cast<curandDistributionM2Shift_t>(base + o_m2);
+    dev.host_M2 = &d->host_m2;
+    std::memcpy(image.data() + o_m2, &m, sizeof m);
+    std::memcpy(image.data() + o_hist, &hist, sizeof hist);
+    std::memcpy(image.data() + o_k, d->K.data(), n * sizeof(unsigned));
+    std::memcpy(image.data() + o_v, d->V.data(), n * sizeof(double));
+  }
+  std::memcpy(image.data(), &dev, sizeof dev);
+  d->host_dist = dev;
+  d->host_dist.M2 = m2 ? &d->host_m2 : nullptr;
+  if (cudaMemcpy(d->device, image.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(d->device);
+    return CURAND_STATUS_INITIALIZATION_FAILED;
+  }
+  *discrete_distribution = static_cast<curandDiscreteDistribution_t>(d->device);
+  std::lock_guard<std::mutex> lock(g_mu);
+  void* key = d->device;
+  g_dists[key] = std::move(d);
+  return CURAND_STATUS_SUCCESS;
+}
+
+VGPU_EXPORT curandStatus_t curandDestroyDistribution(curandDiscreteDistribution_t discrete_distribution) {
+  std::unique_ptr<PoissonDistribution> d;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    auto it = g_dists.find(discrete_distribution);
+    if (it == g_dists.end()) return CURAND_STATUS_NOT_INITIALIZED;
+    d = std::move(it->second);
+    g_dists.erase(it);
+  }
+  cudaFree(d->device);
+  return CURAND_STATUS_SUCCESS;
+}
+
+// One unsigned int per value, from the generator's numbers at the positions curandGenerate would use (n of them,
+// or n / dimensions points of a quasirandom generator), by the rule the card follows for that generator and lambda.
+VGPU_EXPORT curandStatus_t curandGeneratePoisson(curandGenerator_t gen, unsigned int* out, size_t n, double lambda) {
+  if (!valid(gen)) return CURAND_STATUS_NOT_INITIALIZED;
+  if (!poisson_lambda_ok(lambda)) return CURAND_STATUS_OUT_OF_RANGE;
+  auto* g = reinterpret_cast<Generator*>(gen);
+  if (g->quasi() && n % g->dims) return CURAND_STATUS_LENGTH_NOT_MULTIPLE;
+  VGPU_RECORD_IF_CAPTURING(gen, n, curandGeneratePoisson(gen, out, n, lambda));
+  if (g->quasi()) {
+    const bool wide = g->quasi64();
+    const bool table = !wide && lambda < 10.0;
+    const bool normal = wide ? lambda >= kPoissonGaussFrom : lambda > 8000.0;
+    PoissonHistogram h;
+    if (table) h = poisson_histogram(lambda);
+    return quasi_fill(g, out, n, [&](auto x) -> unsigned int {
+      if (table) return poisson_m2(h, static_cast<uint32_t>(x));
+      if (normal) return poisson_from_normal(lambda, static_cast<float>(normal_quantile(quasi_float(x))));
+      return poisson_itr(uniform_01(x), lambda);
+    });
+  }
+  std::vector<unsigned int> h(n);
+  if (lambda < kPoissonGaussFrom) {
+    const PoissonHistogram t = poisson_histogram(lambda);
+    for_pieces(n, 6, [&](size_t b, size_t e) {
+      for (size_t i = b; i < e; ++i) h[i] = poisson_m2(t, draw32(g->seed, g->offset + g->counter + i));
+    });
+  } else {
+    // The card's own normal here is none of its normal generators' (measured); the generator's integer at the
+    // position, through the normal quantile, gives the same distribution.
+    for_pieces(n, 30, [&](size_t b, size_t e) {
+      for (size_t i = b; i < e; ++i)
+        h[i] = poisson_from_normal(lambda, normal_quantile(excluding_one(draw32(g->seed, g->offset + g->counter + i))));
+    });
+  }
+  g->counter += n;
+  store(g, out, h);
+  return CURAND_STATUS_SUCCESS;
+}
+
+// "Just for internal usage" in curand.h. The card takes only CURAND_DEVICE_API and CURAND_3RD and answers
+// CURAND_STATUS_INTERNAL_ERROR to every other method; both are curandGeneratePoisson here.
+VGPU_EXPORT curandStatus_t curandGeneratePoissonMethod(curandGenerator_t gen, unsigned int* out, size_t n, double lambda,
+                                                       curandMethod_t method) {
+  if (method != CURAND_DEVICE_API && method != CURAND_3RD) return CURAND_STATUS_INTERNAL_ERROR;
+  return curandGeneratePoisson(gen, out, n, lambda);
+}
+
+// The card's cuRAND sets up a device generator's states here; these generators have none to set up.
+VGPU_EXPORT curandStatus_t curandGenerateSeeds(curandGenerator_t gen) {
+  return valid(gen) ? CURAND_STATUS_SUCCESS : CURAND_STATUS_NOT_INITIALIZED;
+}
+
+// MAJOR_VERSION, MINOR_VERSION and PATCH_LEVEL of the headers built against (10, 4, 0 for CUDA 13.0), as the card's
+// library answers; anything else is OUT_OF_RANGE. (The card's crashes on a null value pointer.)
+VGPU_EXPORT curandStatus_t curandGetProperty(libraryPropertyType type, int* value) {
+  if (!value) return CURAND_STATUS_OUT_OF_RANGE;
+  switch (type) {
+    case MAJOR_VERSION: *value = CURAND_VER_MAJOR; return CURAND_STATUS_SUCCESS;
+    case MINOR_VERSION: *value = CURAND_VER_MINOR; return CURAND_STATUS_SUCCESS;
+    case PATCH_LEVEL: *value = CURAND_VER_PATCH; return CURAND_STATUS_SUCCESS;
+    default: return CURAND_STATUS_OUT_OF_RANGE;
+  }
 }

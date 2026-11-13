@@ -6,6 +6,7 @@
 #include <string_view>
 #include <unordered_map>
 
+#include "load_pages.hpp"
 #include "vgpu/error.hpp"
 
 namespace vgpu::amd {
@@ -17,7 +18,7 @@ namespace {
 // than reading whatever follows: a code object is a file, and files are
 // truncated.
 struct Reader {
-  const std::string& b;
+  std::string_view b;
   const std::string& origin;
 
   void need(uint64_t at, uint64_t n) const {
@@ -46,7 +47,7 @@ struct Reader {
   uint64_t u64(uint64_t at) const { return field<uint64_t>(at); }
   std::string str(uint64_t at, uint64_t n) const {
     need(at, n);
-    return b.substr(at, n);
+    return std::string(b.substr(at, n));
   }
   // A NUL-terminated string in a table, as a view of the file's own bytes.
   std::string_view cview(uint64_t at) const {
@@ -193,7 +194,7 @@ struct Descriptor {
 
 }  // namespace
 
-CodeObject load_code_object(const std::string& bytes, const std::string& origin) {
+CodeObject load_code_object(std::string_view bytes, const std::string& origin) {
   const Reader r{bytes, origin};
   if (bytes.size() < 64 || bytes.compare(0, 4, "\x7F" "ELF") != 0)
     throw Error::make(Err::ProfileParse, origin, ": not an ELF file");
@@ -234,8 +235,10 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
   CodeObject out;
   if (const Section* text = section(".text")) {
     r.need(text->offset, text->size);
-    out.text.resize(text->size);
-    if (text->size) std::memcpy(out.text.data(), bytes.data() + text->offset, text->size);
+    const auto* from = reinterpret_cast<const uint8_t*>(bytes.data()) + text->offset;
+    out.text.reserve(text->size);
+    prefer_huge_pages(out.text.data(), text->size);
+    out.text.assign(from, from + text->size);   // (one pass: no zeroes written first)
     out.text_addr = text->addr;
   } else {
     throw Error::make(Err::ProfileParse, origin, ": no .text section");
@@ -252,11 +255,33 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     uint64_t end = 0;
     for (const Section& sec : sections)
       if (sec.flags & 2 /* SHF_ALLOC */) end = std::max(end, sec.addr + sec.size);
-    out.image.assign(end, 0);
+    std::vector<const Section*> filled;   // the sections with bytes in the file, in the file's order
     for (const Section& sec : sections) {
       if (!(sec.flags & 2) || sec.type == 8 /* SHT_NOBITS */ || !sec.size) continue;
       r.need(sec.offset, sec.size);
-      std::memcpy(out.image.data() + sec.addr, bytes.data() + sec.offset, sec.size);
+      filled.push_back(&sec);
+    }
+    std::vector<const Section*> by_address = filled;
+    std::stable_sort(by_address.begin(), by_address.end(), [](const Section* a, const Section* b) { return a->addr < b->addr; });
+    bool apart = !plain_load();
+    for (size_t i = 1; i < by_address.size(); ++i)
+      if (by_address[i]->addr < by_address[i - 1]->addr + by_address[i - 1]->size) apart = false;
+    out.image.reserve(end);
+    prefer_huge_pages(out.image.data(), end);
+    if (apart) {
+      // Each section's bytes once, and zeroes only between them (a library's image is tens of megabytes: writing it
+      // all with zeroes first was one more pass over it, pantheonsim #565).
+      for (const Section* sec : by_address) {
+        out.image.resize(sec->addr);
+        const auto* from = reinterpret_cast<const uint8_t*>(bytes.data()) + sec->offset;
+        out.image.insert(out.image.end(), from, from + sec->size);
+      }
+      out.image.resize(end);
+    } else {
+      // Sections that overlap (or VGPU_LOAD_PLAIN=1): each written over the zeroed image in the file's order, the later
+      // one winning.
+      out.image.assign(end, 0);
+      for (const Section* sec : filled) std::memcpy(out.image.data() + sec->addr, bytes.data() + sec->offset, sec->size);
     }
   }
 

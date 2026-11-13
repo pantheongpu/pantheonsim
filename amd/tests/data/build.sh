@@ -104,6 +104,12 @@ for t in gfx90a gfx942; do
   echo "wrote $(pwd)/asm_issues_nov11.$t.o"
 done
 
+# A whole-wave load into accumulation registers not used yet (test_amd_gcn_issue621): the same scheme.
+for t in gfx90a gfx942; do
+  "$clang" -x assembler-with-cpp -D"$(echo "$t" | tr a-z A-Z)" -target amdgcn-amd-amdhsa -mcpu=$t -c asm_issue621.s -o asm_issue621.$t.o
+  echo "wrote $(pwd)/asm_issue621.$t.o"
+done
+
 # The clamp and output modifier of v_div_fmas and v_div_fixup (test_amd_gcn_div_clamp, issue #613): the same scheme, gfx90a and gfx942.
 for t in gfx90a gfx942; do
   "$clang" -x assembler-with-cpp -D"$(echo "$t" | tr a-z A-Z)" -target amdgcn-amd-amdhsa -mcpu=$t -c asm_div_clamp.s -o asm_div_clamp.$t.o
