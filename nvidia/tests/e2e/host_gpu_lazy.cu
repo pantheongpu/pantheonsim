@@ -105,11 +105,19 @@ int main(int argc, char** argv) {
   const bool few = !std::strcmp(mode, "few") || !std::strcmp(mode, "fewshort") || fewnone;
   const int rounds = !std::strcmp(mode, "acct") ? 2048 : !std::strcmp(mode, "few") ? 1 << 15 : 64;   // `acct`: `big` with 32 times the work per thread, a launch of a fraction of a second (run_host_gpu_stub.sh step 8)
   const bool heap = !std::strcmp(mode, "heap");   // `big`, after a kernel left a block of the device heap in use: no launch may go to the card
+  // `keep`: `big` with an 8 MiB allocation beside it that no kernel touches, and a host memset of its first 64 KiB after the second launch (run_host_gpu_stub.sh
+  // step 27: what a verify run pushes again)
+  const bool keep = !std::strcmp(mode, "keep");
   const int n = small ? 64 : few ? 8 * 256 : 1 << 18;
   void* d = nullptr;
   if (heap) leak_heap();
   cudaMalloc(&d, n * 4);
   cudaMemset(d, 1, n * 4);
+  void* side = nullptr;
+  if (keep) {
+    cudaMalloc(&side, 8 << 20);
+    cudaMemset(side, 2, 8 << 20);
+  }
   uint64_t h = 0xcbf29ce484222325ull;
   for (int launch = 0; launch < 4; ++launch) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -130,6 +138,14 @@ int main(int argc, char** argv) {
     cudaMemcpy(back.data(), d, n * 4, cudaMemcpyDeviceToHost);
     for (unsigned char c : back) h = (h ^ c) * 0x100000001b3ull;
     std::printf("launch %d: %016llx\n", launch, static_cast<unsigned long long>(h));
+    if (keep && launch == 1) cudaMemset(side, 3, 64 << 10);
+  }
+  if (keep) {
+    std::vector<unsigned char> s(8 << 20);
+    cudaMemcpy(s.data(), side, s.size(), cudaMemcpyDeviceToHost);
+    for (unsigned char c : s) h = (h ^ c) * 0x100000001b3ull;
+    std::printf("side: %016llx\n", static_cast<unsigned long long>(h));
+    cudaFree(side);
   }
   cudaFree(d);
   return 0;

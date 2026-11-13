@@ -422,4 +422,132 @@ VTEST(a_scalar_access_to_a_card_valid_allocation_asks_the_gate_every_time_and_re
   VCHECK(threw);
 }
 
+// ---- sp67: verify mode compares chunk by chunk and gives the card back the chunks that agree (compare_with_card, keep_verified_chunks) ----
+namespace {
+std::vector<uint8_t> pattern(uint64_t n, uint8_t seed) {
+  std::vector<uint8_t> v(n);
+  for (uint64_t i = 0; i < n; ++i) v[i] = static_cast<uint8_t>(seed + i * 131 + (i >> 9));
+  return v;
+}
+
+// The runtime's update_slot: the entry's count of card-valid chunks, and the memory manager's count of allocations that have one.
+void publish(Tracked& a, MemoryManager& mm) {
+  const uint32_t v = static_cast<uint32_t>(a.r.card_valid());
+  const uint32_t old = a.slot->exchange(v);
+  if (old == 0 && v > 0) mm.card_resident_count().fetch_add(1);
+  if (old > 0 && v == 0) mm.card_resident_count().fetch_sub(1);
+}
+
+// The runtime's gate, as far as accesses go: gate_access on the table, counting the accesses it is asked about.
+struct TrackGate : CardGate {
+  GateLock mu;
+  TrackedMap* res = nullptr;
+  MemoryManager* mm = nullptr;
+  std::atomic<uint64_t> asked{0}, pulled{0};
+  void before_access(uint64_t addr, uint64_t len, bool write) override {
+    ++asked;
+    gate_access(mu, *res, addr, len, write, [&](Tracked&, const std::vector<uint64_t>& idx) { pulled += idx.size(); }, [&](Tracked& a) { publish(a, *mm); });
+  }
+  void before_free(uint64_t base) override {
+    if (base == UINT64_MAX) res->clear();
+    else res->erase(base);
+  }
+};
+}  // namespace
+
+VTEST(compare_with_card_lists_the_chunks_that_agree_and_hands_over_the_others_with_their_bytes) {
+  MemoryManager mm(64 << 20);
+  const uint64_t sa = 3 * kChunkSize + 100, sb = kChunkSize;   // (a's last chunk is 100 bytes)
+  const uint64_t a = mm.alloc(sa), b = mm.alloc(sb);
+  const auto pa = pattern(sa, 7), pb = pattern(sb, 9);
+  mm.write(a, pa.data(), sa);
+  mm.write(b, pb.data(), sb);
+  const std::vector<std::pair<uint64_t, uint64_t>> ranges = {{a, sa}, {b, sb}};
+  std::vector<std::vector<uint8_t>> card = {pa, pb};
+  card[0][kChunkSize + 5] ^= 1;   // chunk 1 of a
+  card[0][sa - 1] ^= 0x80;        // the last byte of a's short last chunk
+  std::vector<uint8_t> scratch;
+  std::vector<std::vector<uint64_t>> equal;
+  std::vector<std::pair<uint64_t, uint64_t>> same, differ;
+  bool bytes_right = true;
+  compare_with_card(
+      mm, ranges, card, scratch, equal, [&](size_t, uint64_t addr, uint64_t n) { same.emplace_back(addr, n); },
+      [&](size_t i, uint64_t addr, const uint8_t* c, const uint8_t* s, uint64_t n) {
+        differ.emplace_back(addr, n);
+        const std::vector<uint8_t>& want = i == 0 ? pa : pb;
+        bytes_right = bytes_right && std::memcmp(s, want.data() + (addr - ranges[i].first), n) == 0 && c == card[i].data() + (addr - ranges[i].first);
+      });
+  VCHECK(equal.size() == 2);
+  VCHECK(equal[0] == (std::vector<uint64_t>{0, 2}));
+  VCHECK(equal[1] == (std::vector<uint64_t>{0}));
+  VCHECK(same == (std::vector<std::pair<uint64_t, uint64_t>>{{a, kChunkSize}, {a + 2 * kChunkSize, kChunkSize}, {b, kChunkSize}}));
+  VCHECK(differ == (std::vector<std::pair<uint64_t, uint64_t>>{{a + kChunkSize, kChunkSize}, {a + 3 * kChunkSize, 100}}));
+  VCHECK(bytes_right);   // the simulator's bytes of the chunk, and the card's own
+  // A second compare with the same scratch and lists starts clean.
+  card[0] = pa;
+  compare_with_card(mm, ranges, card, scratch, equal, [](size_t, uint64_t, uint64_t) {}, [](size_t, uint64_t, const uint8_t*, const uint8_t*, uint64_t) {});
+  VCHECK(equal[0] == (std::vector<uint64_t>{0, 1, 2, 3}));
+}
+
+VTEST(keep_verified_chunks_gives_the_card_only_the_simulators_chunks_that_agreed) {
+  MemoryManager mm(64 << 20);
+  TrackedMap res;
+  const uint64_t a = mm.alloc(8 * kChunkSize), b = mm.alloc(2 * kChunkSize);
+  sync_tracked(res, mm, mm.live_ranges());
+  res.at(a).r.set(5, Where::Card);   // (not the simulator's: the compare does not make it anything else)
+  publish(res.at(a), mm);
+  unsigned updates = 0;
+  const auto update = [&](Tracked& t) { ++updates; publish(t, mm); };
+  const std::vector<std::pair<uint64_t, uint64_t>> ranges = {{a, 8 * kChunkSize}, {b, 2 * kChunkSize}};
+  const std::vector<std::vector<uint64_t>> equal = {{0, 1, 5, 7}, {}};
+  VCHECK_EQ(keep_verified_chunks(res, mm, ranges, equal, update), uint64_t{3});
+  const Residency& r = res.at(a).r;
+  VCHECK(r.at(0) == Where::Both && r.at(1) == Where::Both && r.at(7) == Where::Both);
+  VCHECK(r.at(2) == Where::Host && r.at(3) == Where::Host && r.at(4) == Where::Host && r.at(6) == Where::Host);
+  VCHECK(r.at(5) == Where::Card);
+  VCHECK(r.host_chunks() == (std::vector<uint64_t>{2, 3, 4, 6}));   // what the next launch on the card pushes
+  VCHECK_EQ(updates, 1u);
+  VCHECK_EQ(res.at(a).slot->load(), uint32_t{4});
+  VCHECK_EQ(res.at(b).r.card_valid(), uint64_t{0});   // nothing agreed: untouched
+  VCHECK_EQ(keep_verified_chunks(res, mm, ranges, equal, update), uint64_t{0});   // already Both: nothing changes, nothing is published
+  VCHECK_EQ(updates, 1u);
+  // A range that is not the entry's allocation (another size at the address) is left alone.
+  const std::vector<std::pair<uint64_t, uint64_t>> other = {{b, 3 * kChunkSize}};
+  VCHECK_EQ(keep_verified_chunks(res, mm, other, std::vector<std::vector<uint64_t>>{{0, 1}}, update), uint64_t{0});
+  VCHECK_EQ(res.at(b).r.card_valid(), uint64_t{0});
+}
+
+VTEST(chunks_kept_after_a_verify_are_guarded_by_the_gate_like_any_card_copy) {
+  MemoryManager mm(64 << 20);
+  TrackedMap res;
+  TrackGate gate;
+  gate.res = &res;
+  gate.mm = &mm;
+  mm.set_card_gate(&gate);
+  const uint64_t a = mm.alloc(4 * kChunkSize);
+  for (uint64_t i = 0; i < 4 * kChunkSize; i += 4) mm.store_scalar(a + i, 4, i);
+  sync_tracked(res, mm, mm.live_ranges());
+  // This thread remembers the allocation (its lookup memory): the simulator's launch ran on it with no card copy, through the fast paths.
+  VCHECK_EQ(mm.load_scalar(a + 16, 4), uint64_t{16});
+  VCHECK_EQ(gate.asked.load(), uint64_t{0});
+  // The compare: every chunk agreed. The allocation has a card copy now, and what this thread remembered of it must not let an access past the gate.
+  {
+    std::lock_guard<GateLock> g(gate.mu);   // (the runtime holds the gate's lock exclusively in note_simulated)
+    VCHECK_EQ(keep_verified_chunks(res, mm, mm.live_ranges(), std::vector<std::vector<uint64_t>>{{0, 1, 2, 3}}, [&](Tracked& t) { publish(t, mm); }), uint64_t{4});
+  }
+  VCHECK_EQ(mm.card_resident_count().load(), 1);
+  VCHECK_EQ(mm.load_scalar(a + 16, 4), uint64_t{16});
+  VCHECK(gate.asked.load() >= 1);   // asked: the lookups were voided
+  VCHECK_EQ(gate.pulled.load(), uint64_t{0});   // a read of a chunk both sides hold pulls nothing
+  VCHECK(res.at(a).r.at(0) == Where::Both);
+  // A host write to chunk 2 makes it the simulator's again: the next launch on the card pushes it, and only it.
+  const uint32_t v = 0xdeadbeef;
+  mm.write(a + 2 * kChunkSize + 8, &v, 4);
+  VCHECK(res.at(a).r.host_chunks() == (std::vector<uint64_t>{2}));
+  VCHECK_EQ(res.at(a).slot->load(), uint32_t{3});
+  // A free drops the entry and the count.
+  mm.free(a);
+  VCHECK(res.count(a) == 0);
+}
+
 VTEST_MAIN

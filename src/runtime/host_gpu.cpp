@@ -316,8 +316,17 @@ struct Runtime::Impl : CardGate {
     bool active = false, in_exact_set = false;
     std::string kernel;
     std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    // The card's bytes of every range, copied back after the launch. Kept across launches by reset() (sp67): a fresh vector per range and launch was a zero
+    // fill and a page fault per page of all live memory every launch of a verify run.
     std::vector<std::vector<uint8_t>> card;
+    void reset() {
+      active = in_exact_set = false;
+      kernel.clear();
+      ranges.clear();
+    }
   } pending;
+  std::vector<uint8_t> verify_chunk;                 // compare_with_card's scratch (one chunk)
+  std::vector<std::vector<uint64_t>> verify_equal;   // ... and its chunks that agree, per range
 
 
   // ---- the gate (vgpu::CardGate): called by the memory manager on the slow path of any access to an allocation with a valid card copy ----
@@ -990,7 +999,8 @@ void Runtime::before_simulated(MemoryManager& mem) {
     // (nothing is pulled). Until Round sp59 it was kept valid, which was wrong twice over: the simulator then ran its launch through the gate's slow
     // path, where an atomic of one host thread could lose the update of another (HeCBench atomicAggregate printed FAIL under VERIFY with 4 host threads
     // and PASS with 1), and the next launch on the card started from the card's own earlier results instead of the simulator's, so in turbo mode the
-    // differences of one launch carried into the next. The price is that a verify run pushes all live memory before every launch.
+    // differences of one launch carried into the next. The price was that a verify run pushed all live memory before every launch; since sp67 the
+    // compare in note_simulated gives the card back the chunks whose bytes agree (keep_verified_chunks), and only the others are pushed again.
     impl_->verify_card_ran = false;
     for (auto& [b, a] : impl_->res) {
       if (a.slot->load(std::memory_order_relaxed) == 0) continue;
@@ -1031,21 +1041,20 @@ void Runtime::note_simulated(const ptx::EntryFn& fn, const exec::LaunchConfig& c
     bool same = true;
     uint64_t bad_chunks = 0;
     TolReport rep;   // turbo mode: the differing chunks word by word (vgpu/host_gpu_tol.hpp); equal chunks only add to the count of words
-    std::vector<uint8_t> sim_bytes;
-    for (size_t i = 0; i < p.ranges.size(); ++i) {
-      sim_bytes.resize(p.ranges[i].second);
-      mem->read(p.ranges[i].first, sim_bytes.data(), p.ranges[i].second);
-      for (uint64_t c = 0; c < sim_bytes.size(); c += kChunkSize) {
-        const uint64_t n = std::min<uint64_t>(kChunkSize, sim_bytes.size() - c);
-        if (std::memcmp(sim_bytes.data() + c, p.card[i].data() + c, n) != 0) {
+    compare_with_card(
+        *mem, p.ranges, p.card, impl_->verify_chunk, impl_->verify_equal,
+        [&](size_t, uint64_t addr, uint64_t n) {
+          if (turbo) rep.words += tol_word_count(addr, n);
+        },
+        [&](size_t, uint64_t addr, const uint8_t* card, const uint8_t* sim, uint64_t n) {
           same = false;
           ++bad_chunks;
-          if (turbo) compare_words(p.card[i].data() + c, sim_bytes.data() + c, p.ranges[i].first + c, n, impl_->tol, rep);
-        } else if (turbo) {
-          rep.words += tol_word_count(p.ranges[i].first + c, n);
-        }
-      }
-    }
+          if (turbo) compare_words(card, sim, addr, n, impl_->tol, rep);
+        });
+    // The chunks that agree are a valid card copy again: the next launch on the card pushes only the others (vgpu/host_gpu_track.hpp keep_verified_chunks,
+    // docs/perf-design/10-host-gpu-hooks.md section 8). This is an exclusive section of the gate's lock (held since the top of this function).
+    if (impl_->resident && impl_->gate_mem == mem)
+      keep_verified_chunks(impl_->res, *impl_->gate_mem, p.ranges, impl_->verify_equal, [&](Tracked& a) { impl_->update_slot(a); });
     Stats& st = impl_->stats;
     ++(p.in_exact_set ? (same ? st.same_exact_set : st.differ_exact_set) : (same ? st.same_other : st.differ_other));
     if (turbo) {
@@ -1069,7 +1078,7 @@ void Runtime::note_simulated(const ptx::EntryFn& fn, const exec::LaunchConfig& c
       std::fprintf(stderr, "host_gpu: verify %s (%s): %s%s\n", fn.name.c_str(), p.in_exact_set ? "in the exact set" : "outside the exact set",
                    same ? "identical" : "DIFFERENT, 64 KiB chunks: ", same ? "" : std::to_string(bad_chunks).c_str());
     }
-    p = {};
+    p.reset();
   }
   if (t_last_sample.set) {   // this launch was sampled and the simulator kept it: what the sample said against what the launch took
     const LastSample& l = t_last_sample;
@@ -1111,7 +1120,7 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   } keep_simulated{im.stats.simulated, im.stats.simulated, forced};
   im.last = {};
   if (im.dead) return false;
-  im.pending = {};
+  im.pending.reset();
   const Impl::Decision dec = im.kernel_eligible(fn, cfg, args, mem);
   const char* const why = dec.why;
   const uint64_t static_instrs = dec.instrs;
@@ -1278,15 +1287,18 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     mem.card_void_lookups(newly);
   }
   if (im.verify) {   // keep the card's bytes; the simulator runs the launch next and note_simulated compares
-    im.pending = {};
+    im.pending.reset();
     im.pending.active = true;
     im.pending.in_exact_set = in_exact_set;
     im.pending.kernel = fn.name;
     im.pending.ranges = ranges;
-    for (const auto& [rb, rs] : ranges) {
-      im.pending.card.emplace_back(rs);
+    im.pending.card.resize(ranges.size());
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      const auto [rb, rs] = ranges[i];
+      std::vector<uint8_t>& to = im.pending.card[i];
+      to.resize(rs);   // (the buffer of the last launch's range i: no new memory when the ranges did not grow)
       for (uint64_t at = 0; at < rs; at += (32ull << 20))
-        if (im.api.cuMemcpyDtoH(im.pending.card.back().data() + at, rb + at, std::min<uint64_t>(rs - at, 32ull << 20))) { im.pending = {}; return false; }
+        if (im.api.cuMemcpyDtoH(to.data() + at, rb + at, std::min<uint64_t>(rs - at, 32ull << 20))) { im.pending.reset(); return false; }
     }
     im.verify_card_ran = true;
     ++im.stats.simulated;

@@ -42,6 +42,8 @@
 #      sent; the stand-in refuses it and the output is the mode-off output;
 #  22. ... against a stand-in that keeps memory and computes nothing, the program prints what the program that launches nothing prints;
 #  23. the same kernel with a short loop is sampled inside its blocks and stays, and the driver is never touched.
+#  27. (Round sp67) a verify run pushes again only the chunks whose card bytes differed from the simulator's after the last launch, and the chunks the host
+#      wrote since: an allocation no kernel touches goes to the card once, a host memset of part of it goes again, and the output is the mode-off output.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -311,5 +313,22 @@ read -r smp_n smp_sent <<< "$(sampled_of in_short)"
 (( ${smp_n:-0} >= 1 && ${smp_sent:-1} == 0 && $(inside_of in_short) >= 1 )) || { echo "FAIL: fewshort: expected a launch sampled inside its blocks and none sent: $(grep -E 'host_gpu_sampled|host_gpu_sample:' "$work/in_short.err" | head -3)"; fails=1; }
 [[ ! -s "$work/in_short.log" ]] || { echo "FAIL: a short launch sampled inside its blocks reached the driver: $(calls in_short)"; fails=1; }
 diff -q "$work/off_fewshort.out" "$work/in_short.out" > /dev/null || { echo "FAIL: sampling inside the blocks changes the output of fewshort"; fails=1; }
+# 27. (Round sp67; 24 to 26 are Round sp65's) a verify run gives the card back the chunks whose bytes agreed after a launch, and pushes only the others
+# before the next one. `keep` is `big` (1 MiB, every chunk written by every launch) beside 8 MiB no kernel touches, with a host memset of the first 64 KiB of
+# those after the second launch. Against a card that keeps memory and computes nothing, every chunk of the 1 MiB differs after every launch (16 chunks) and every
+# chunk of the 8 MiB agrees: the 9 MiB go once, then the 1 MiB before each launch, and the memset chunk once more: 12.1 MiB in all (it was 36.0: every byte
+# before every launch). The memset chunk must reach the card before the third launch (else the compare finds a 17th chunk different), and the output is the
+# mode-off output.
+env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" keep > "$work/off_keep.out" 2> "$work/off_keep.err" || { echo "FAIL: the keep run with the mode off failed"; exit 1; }
+for m in exact turbo; do
+  run "keep_$m" keep VGPU_HOST_GPU=$m VGPU_HOST_GPU_VERIFY=1 VGPU_HOST_GPU_LOG=1 STUB_CARD_OK=1 STUB_KEEP_MEMORY=1 "${reach[@]}" || { echo "FAIL: the $m verify run of keep failed"; tail -5 "$work/keep_$m.err"; fails=1; }
+  diff -q "$work/off_keep.out" "$work/keep_$m.out" > /dev/null || { echo "FAIL: $m verify changes the output of keep"; fails=1; }
+  pushed="$(sed -n 's/^host_gpu: \([0-9.]*\) MiB went to the card.*/\1/p' "$work/keep_$m.err" | tail -1)"
+  [[ "$pushed" == 12.1 ]] || { echo "FAIL: $m verify of keep pushed ${pushed:-?} MiB, not 12.1 (9 once, 1 per later launch, the memset chunk once)"; fails=1; }
+  grep -q '^host_gpu_verify: in_set_identical=0 in_set_different=4 ' "$work/keep_$m.err" || { echo "FAIL: $m verify of keep: $(grep '^host_gpu_verify' "$work/keep_$m.err")"; fails=1; }
+done
+# (exact mode names the chunks: the 16 of the 1 MiB after every launch, never a 17th: the memset chunk reached the card before the third launch)
+n="$(grep -c '^host_gpu: verify [^ ]* (in the exact set): DIFFERENT, 64 KiB chunks: 16$' "$work/keep_exact.err")"
+(( n == 4 )) || { echo "FAIL: exact verify of keep: expected 4 launches with the 16 chunks of the 1 MiB different, got $n: $(grep '^host_gpu: verify' "$work/keep_exact.err" | head -4)"; fails=1; }
 (( fails == 0 )) && { echo "PASS: first launch $first ms against a driver start of $init_ms ms; driver calls in the big run: $(calls on_big)"; exit 0; }
 exit 1
