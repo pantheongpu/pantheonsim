@@ -73,6 +73,14 @@ release says what runs and what it produces, never how fast a real GPU would run
     (eigensolvers::steepest_descent 45 to 41 CPU-s).
   - A wave's three- and four-word loads and stores of managed or host memory (`hipMallocManaged`, `hipHostMalloc`) go to memory as one batch
     on one host thread, as its one- and two-word ones did (hamiltonian::ks_hamiltonian with `VGPU_THREADS=1`: 30.7 s to 27.4 s).
+- cuBLAS Ex routines, the type checks in the card's order: in `cublasGemmEx`, its batched and strided forms, A and B of two types
+  are `NOT_SUPPORTED` before a bad argument, and an unknown data type (outside 0..15) is `INVALID_VALUE` after it, as is an unknown
+  compute type in the batched forms; `cublasCsyrkEx`, `cublasCherkEx` and their 3m forms check their arguments first, take n = 0 whatever
+  the types, and answer an unknown type `INVALID_VALUE`. A CUDA 10 compute type (`CUDA_R_32F`, `CUDA_C_32F`, `CUDA_R_64F`, `CUDA_C_64F`,
+  `CUDA_R_16F`, `CUDA_R_32I`) is taken as the card takes it. `cublasGemmBatchedEx` with a negative batch count is
+  `CUBLAS_STATUS_EXECUTION_FAILED` once its other checks pass, success with an empty C, and `INVALID_VALUE` for a null C array;
+  `cublasGemmStridedBatchedEx` with no batch, or a negative count, succeeds once its checks pass. The simulator answered
+  `NOT_SUPPORTED` for every type problem before the arguments, and `INVALID_VALUE` for any negative count.
 - cuSPARSE: `cusparseSpMV` and `cusparseSpMV_bufferSize` take only the fifteen (A, x, y, compute) type combinations an RTX 3060's
   cuSPARSE 13.0 takes, measured over all 10,000 combinations of the ten types for CSR, CSC and COO and each operation; the others are
   `CUSPARSE_STATUS_NOT_SUPPORTED` with the card's "type combination ... is not supported" line. The simulator computed 1257 more (a
