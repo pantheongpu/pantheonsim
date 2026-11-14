@@ -2054,10 +2054,14 @@ VGPU_EXPORT cublasStatus_t cublasGemmBatchedEx(
   if (batchCount < 0) return CUBLAS_STATUS_INVALID_VALUE;
   if (batchCount == 0) return CUBLAS_STATUS_SUCCESS;
   if (!Aarray || !Barray || !Carray) return CUBLAS_STATUS_INVALID_VALUE;
+  // The operations travel as integers: the arguments are only checked by the per-matrix cublasGemmEx below, and a
+  // lambda copying an out-of-range enum is a load UBSan's enum check refuses.
+  const int ta_i = static_cast<int>(ta), tb_i = static_cast<int>(tb);
   if (deferred_to_graph(h, [=, al = hold(h, alpha, compute_scalar_bytes(computeType)),
                             be = hold(h, beta, compute_scalar_bytes(computeType))] {
-        cublasGemmBatchedEx(h, ta, tb, m, n, k, al.get(), Aarray, Atype, lda, Barray, Btype, ldb,
-                            be.get(), Carray, Ctype, ldc, batchCount, computeType, algo);
+        cublasGemmBatchedEx(h, static_cast<cublasOperation_t>(ta_i), static_cast<cublasOperation_t>(tb_i), m, n, k,
+                            al.get(), Aarray, Atype, lda, Barray, Btype, ldb, be.get(), Carray, Ctype, ldc,
+                            batchCount, computeType, algo);
       }))
     return CUBLAS_STATUS_SUCCESS;
   const auto a = fetch<const void*>(Aarray, static_cast<size_t>(batchCount));
