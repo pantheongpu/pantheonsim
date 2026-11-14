@@ -7,6 +7,10 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- AMD counters: the `VGPU_DISPATCH_STATS` line now ends with the bytes the active lanes ask for (`vmem_bytes_rd`, `vmem_bytes_wr`, `lds_bytes_rd`, `lds_bytes_wr`),
+  the vector instruction mix (`mix=`), the matrix work by type (`mops=`) and the kernel's name (`kernel=`). The mix and the matrix work were already counted
+  and are now printed; the bytes are new. A reader that splits the line on `=` and converts every value to a number must skip the text fields
+  (`tools/bench-amd/bench.py` does). Requested in [discussion 631](https://github.com/pantheongpu/pantheonsim/discussions/631), issues #648 and #649.
 - Host-GPU mode (experimental, opt-in), both modes: while the real driver is not started, a launch that would start it only because the program
   has already simulated as long as the start costs (the start-cost account) must now also save a share of the start by itself: 5 ms, or 12.5 ms
   for a kernel's first launch judged by its static estimate (`VGPU_HOST_GPU_START_LAUNCHES`, `0` for the rule before). Four short CUDA Samples

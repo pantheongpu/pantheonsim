@@ -153,6 +153,9 @@ struct InstructionCounts {
   uint64_t mix[static_cast<int>(gcn::Mix::Count)] = {};
   uint64_t mops[static_cast<int>(gcn::MopsType::Count)] = {};
   uint64_t vmem_rd = 0, vmem_wr = 0;
+  // The bytes the active lanes of vector memory instructions ask for, read and written (an atomic counts as written), and the
+  // same for LDS: active lanes times the bytes a lane moves (vgpu/amd_memtraffic.hpp says what is and is not counted).
+  uint64_t vmem_bytes_rd = 0, vmem_bytes_wr = 0, lds_bytes_rd = 0, lds_bytes_wr = 0;
 };
 
 // What a dispatch did, which is what a launch reports and what the tests
@@ -179,6 +182,8 @@ struct DispatchStats {
     for (size_t i = 0; i < std::size(c.mix); ++i) c.mix[i] += a.mix[i];
     for (size_t i = 0; i < std::size(c.mops); ++i) c.mops[i] += a.mops[i];
     c.vmem_rd += a.vmem_rd, c.vmem_wr += a.vmem_wr;
+    c.vmem_bytes_rd += a.vmem_bytes_rd, c.vmem_bytes_wr += a.vmem_bytes_wr;
+    c.lds_bytes_rd += a.lds_bytes_rd, c.lds_bytes_wr += a.lds_bytes_wr;
     waves_lt16 += o.waves_lt16, waves_lt32 += o.waves_lt32, waves_lt48 += o.waves_lt48;
     waves_lt64 += o.waves_lt64, waves_eq64 += o.waves_eq64;
   }
@@ -192,6 +197,7 @@ struct DispatchStats {
     for (uint64_t& v : c.mix) v *= n;
     for (uint64_t& v : c.mops) v *= n;
     c.vmem_rd *= n, c.vmem_wr *= n;
+    c.vmem_bytes_rd *= n, c.vmem_bytes_wr *= n, c.lds_bytes_rd *= n, c.lds_bytes_wr *= n;
     waves_lt16 *= n, waves_lt32 *= n, waves_lt48 *= n, waves_lt64 *= n, waves_eq64 *= n;
   }
 };

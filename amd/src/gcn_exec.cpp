@@ -36,6 +36,7 @@
 #include "vgpu/amd_decode_cache.hpp"
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/amd_hostcall.hpp"
+#include "vgpu/amd_memtraffic.hpp"
 #include "gcn_divide.hpp"
 #include "vgpu/exec/amd_run_scan.hpp"
 #include "vgpu/exec/lockstep.hpp"
@@ -7992,6 +7993,41 @@ struct Machine {
     return true;
   }
 
+  // The bytes each active lane of a vector memory instruction asks for, as the access functions below size them (global_access's
+  // access_bytes; a buffer access by its name). 0 for what is not counted: see vgpu/amd_memtraffic.hpp.
+  static uint32_t flat_lane_bytes(const Wave& w, const Inst& in, uint32_t fl) {
+    if (fl & (gcn::kInstLoadLds | gcn::kInstAsyncLds)) return 0;
+    gcn::MemFacts scratch;
+    const gcn::MemFacts& mf = gcn::mem_facts(in, scratch);
+    using Kind = gcn::MemKind;
+    switch (mf.kind) {
+      case Kind::Narrow: return mf.narrow_bytes;
+      case Kind::HalfReg: return mf.half_bytes;
+      case Kind::Load: return in.dst.empty() ? 0 : 4 * in.dst[0].width;
+      case Kind::Store: return in.src.size() < 2 ? 0 : 4 * in.src[1].width;
+      case Kind::StoreHi16: return 2;
+      case Kind::Atomic: return mf.atomic_bytes;
+      case Kind::AddTid: return 4;
+      case Kind::Block: return 4 * static_cast<uint32_t>(__builtin_popcount(static_cast<uint32_t>(w.m0)));
+      case Kind::Transpose: return transpose_bytes(mf.transpose_bits);
+      default: return 0;   // a prefetch moves nothing; an unknown one is refused when it runs
+    }
+  }
+  static uint32_t buffer_lane_bytes(const Inst& in) {
+    gcn::MemFacts scratch;
+    const gcn::MemFacts& mf = gcn::mem_facts(in, scratch);
+    if (mf.formatted || in.lds_dma || in.enc == gcn::Enc::Mtbuf) return 0;   // a format's size, and a copy to LDS, are not counted
+    if (mf.narrow_bytes) return mf.narrow_bytes;
+    if (mf.half_bytes) return mf.half_bytes;
+    if (mf.body_atomic) return in.name.find("_x2") != std::string::npos || in.name.find("_f64") != std::string::npos ? 8 : 4;
+    const Operand& data = in.dst.empty() ? (in.src.empty() ? in.dst.front() : in.src[0]) : in.dst[0];
+    return 4 * data.width;
+  }
+  static void count_bytes(InstructionCounts& n, uint64_t exec, uint32_t lane_bytes, bool writes, bool lds) {
+    const uint64_t b = uint64_t{static_cast<uint32_t>(__builtin_popcountll(exec))} * lane_bytes;
+    (lds ? (writes ? n.lds_bytes_wr : n.lds_bytes_rd) : (writes ? n.vmem_bytes_wr : n.vmem_bytes_rd)) += b;
+  }
+
   void lds_access(Wave& w, const Inst& in, Group& g) {
     const OpName op(in);
     // An LDS instruction the decoder gives no address register: ds_nop (which does nothing), and the append/consume counters
@@ -12827,6 +12863,11 @@ struct Machine {
       case gcn::Enc::Ds:
         ++n.lds;
         if (fl & gcn::kInstGws) return gws_barrier(w, in);
+        {
+          const gcn::LaneTraffic t = gcn::ds_lane_traffic(in.name);
+          if (t.read) count_bytes(n, w.exec, t.read, false, true);
+          if (t.written) count_bytes(n, w.exec, t.written, true, true);
+        }
         lds_access(w, in, g);
         return true;
       case gcn::Enc::Flat:
@@ -12843,6 +12884,7 @@ struct Machine {
         if (fl & gcn::kInstAtomic) ++n.flat_atomic, ++n.vmem_wr;
         else if (fl & gcn::kInstStore) ++n.flat_write, ++n.vmem_wr;
         else ++n.flat_read, ++n.vmem_rd, issued_load(w);
+        count_bytes(n, w.exec, flat_lane_bytes(w, in, fl), (fl & (gcn::kInstStore | gcn::kInstAtomic)) != 0, false);
         if (in.segment == Inst::Segment::Scratch) scratch_access(w, in, g);
         else if (in.segment == Inst::Segment::Flat) n.lds += flat_access(w, in, g);
         else if (fl & gcn::kInstLoadLds) global_load_lds(w, in, g), ++n.lds;
@@ -12866,6 +12908,7 @@ struct Machine {
         }
         if (fl & (gcn::kInstStore | gcn::kInstAtomic)) ++n.vmem_wr;
         else ++n.vmem_rd, issued_load(w);
+        count_bytes(n, w.exec, buffer_lane_bytes(in), (fl & (gcn::kInstStore | gcn::kInstAtomic)) != 0, false);
         buffer_access(w, in, g);
         if (in.lds_dma) ++n.lds;
         return true;

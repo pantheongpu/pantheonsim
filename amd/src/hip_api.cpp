@@ -987,22 +987,41 @@ void note_dispatch_stats(const Kernel& kernel, int ordinal, const vgpu::amd::Dis
   }();
   if (!target) return;
   const vgpu::amd::InstructionCounts& c = st.counts;
-  char line[640];
-  const int n = std::snprintf(
+  char line[2048];
+  const auto u = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+  int n = std::snprintf(
       line, sizeof line,
       "VGPU_DISPATCH device=%d wave=%d waves=%llu instructions=%llu barriers=%llu valu=%llu mfma=%llu salu=%llu smem=%llu "
       "vmem=%llu flat=%llu lds=%llu branch=%llu sendmsg=%llu gds=%llu flat_read=%llu flat_write=%llu flat_atomic=%llu "
-      "vmem_rd=%llu vmem_wr=%llu\n",
-      ordinal, kernel.wave32 ? 32 : 64, static_cast<unsigned long long>(st.waves),
-      static_cast<unsigned long long>(st.instructions), static_cast<unsigned long long>(st.barriers),
-      static_cast<unsigned long long>(c.valu), static_cast<unsigned long long>(c.mfma),
-      static_cast<unsigned long long>(c.salu), static_cast<unsigned long long>(c.smem),
-      static_cast<unsigned long long>(c.vmem), static_cast<unsigned long long>(c.flat),
-      static_cast<unsigned long long>(c.lds), static_cast<unsigned long long>(c.branch),
-      static_cast<unsigned long long>(c.sendmsg), static_cast<unsigned long long>(c.gds),
-      static_cast<unsigned long long>(c.flat_read), static_cast<unsigned long long>(c.flat_write),
-      static_cast<unsigned long long>(c.flat_atomic), static_cast<unsigned long long>(c.vmem_rd),
-      static_cast<unsigned long long>(c.vmem_wr));
+      "vmem_rd=%llu vmem_wr=%llu",
+      ordinal, kernel.wave32 ? 32 : 64, u(st.waves), u(st.instructions), u(st.barriers), u(c.valu), u(c.mfma), u(c.salu), u(c.smem),
+      u(c.vmem), u(c.flat), u(c.lds), u(c.branch), u(c.sendmsg), u(c.gds), u(c.flat_read), u(c.flat_write), u(c.flat_atomic),
+      u(c.vmem_rd), u(c.vmem_wr));
+  // After the fields a reader may already split on, in the order of the key=value pairs: the bytes the active lanes asked for, the
+  // vector instructions by operation and type (mix=add_f32:12,fma_f32:30, only the non-zero ones, "-" when none), the matrix work in
+  // 512-operation units by input type, and the kernel's name (last: it is the one field whose value is not a number or a list).
+  const auto append = [&](const char* fmt, auto... args) {
+    if (n < 0 || static_cast<size_t>(n) >= sizeof line) return;
+    const int m = std::snprintf(line + n, sizeof line - static_cast<size_t>(n), fmt, args...);
+    n = m < 0 ? m : n + m;
+  };
+  append(" vmem_bytes_rd=%llu vmem_bytes_wr=%llu lds_bytes_rd=%llu lds_bytes_wr=%llu", u(c.vmem_bytes_rd), u(c.vmem_bytes_wr),
+         u(c.lds_bytes_rd), u(c.lds_bytes_wr));
+  append("%s", " mix=");
+  bool any = false;
+  for (int i = 1; i < static_cast<int>(vgpu::amd::gcn::Mix::Count); ++i)
+    if (c.mix[i]) append("%s%s:%llu", any ? "," : "", vgpu::amd::gcn::mix_name(static_cast<vgpu::amd::gcn::Mix>(i)), u(c.mix[i])), any = true;
+  if (!any) append("%s", "-");
+  append("%s", " mops=");
+  any = false;
+  for (int i = 1; i < static_cast<int>(vgpu::amd::gcn::MopsType::Count); ++i)
+    if (c.mops[i]) append("%s%s:%llu", any ? "," : "", vgpu::amd::gcn::mops_name(static_cast<vgpu::amd::gcn::MopsType>(i)), u(c.mops[i])), any = true;
+  if (!any) append("%s", "-");
+  // (A kernel's name has no space or '=' in it for HIP's own kernels, which are mangled names; anything else is made safe to split on.)
+  std::string name = kernel.name;
+  for (char& ch : name) if (ch == ' ' || ch == '=' || ch == '\n' || ch == '\t') ch = '_';
+  append(" kernel=%s\n", name.c_str());
+  if (n >= static_cast<int>(sizeof line)) n = static_cast<int>(sizeof line) - 1, line[n - 1] = '\n';
   if (n <= 0) return;
   if (std::strcmp(target, "1") == 0) {
     (void)!::write(2, line, static_cast<size_t>(n));

@@ -101,6 +101,51 @@ VTEST(each_count_is_the_listing_times_the_waves) {
   VCHECK_EQ(s.counts.vmem_wr, e.vmem_wr * w);
 }
 
+VTEST(bytes_are_the_lanes_times_what_each_instruction_moves) {
+  const amd::CodeObject o = object();
+  const Expected e = from_listing(kData);
+  // The listing has a dword load, a dword atomic, a flat and a global dword store, and an LDS dword write and read: a non-zero
+  // number of each kind, so a count that ignored one would show.
+  VCHECK(e.vmem_lane_bytes_rd == 4 && e.vmem_lane_bytes_wr == 12 && e.lds_lane_bytes_rd == 4 && e.lds_lane_bytes_wr == 4);
+  const amd::DispatchStats s = run(o, "counted_mix", 3, 64, false);
+  const uint64_t lanes = 3 * 64;   // every lane of every wave is active
+  VCHECK_EQ(s.counts.vmem_bytes_rd, e.vmem_lane_bytes_rd * lanes);
+  VCHECK_EQ(s.counts.vmem_bytes_wr, e.vmem_lane_bytes_wr * lanes);
+  VCHECK_EQ(s.counts.lds_bytes_rd, e.lds_lane_bytes_rd * lanes);
+  VCHECK_EQ(s.counts.lds_bytes_wr, e.lds_lane_bytes_wr * lanes);
+  // The flat store reaching LDS is still a vector memory instruction, counted in full as vector memory bytes.
+  const amd::DispatchStats t = run(o, "counted_mix", 2, 64, true);
+  VCHECK_EQ(t.counts.vmem_bytes_rd, e.vmem_lane_bytes_rd * 2 * 64);
+  VCHECK_EQ(t.counts.vmem_bytes_wr, e.vmem_lane_bytes_wr * 2 * 64);
+  VCHECK_EQ(t.counts.lds_bytes_wr, e.lds_lane_bytes_wr * 2 * 64);
+}
+
+VTEST(bytes_count_only_the_lanes_a_wave_started_with) {
+  const amd::CodeObject o = object();
+  // counted_copy moves one dword in and one out a work-item. 2 groups of 100: 200 work-items, in waves of 64 and 36.
+  const amd::DispatchStats s = run(o, "counted_copy", 2, 100, false);
+  VCHECK_EQ(s.counts.vmem_bytes_rd, 4u * 200);
+  VCHECK_EQ(s.counts.vmem_bytes_wr, 4u * 200);
+  VCHECK_EQ(s.counts.lds_bytes_rd + s.counts.lds_bytes_wr, 0u);
+  // One wave of 20 lanes, and one of 8.
+  VCHECK_EQ(run(o, "counted_copy", 1, 20, false).counts.vmem_bytes_rd, 4u * 20);
+  VCHECK_EQ(run(o, "counted_copy", 1, 8, false).counts.vmem_bytes_wr, 4u * 8);
+}
+
+VTEST(bytes_add_up_and_scale_like_the_other_counts) {
+  amd::DispatchStats a, b;
+  a.counts.vmem_bytes_rd = 3, a.counts.vmem_bytes_wr = 5, a.counts.lds_bytes_rd = 7, a.counts.lds_bytes_wr = 11;
+  b.counts.vmem_bytes_rd = 100, b.counts.vmem_bytes_wr = 200, b.counts.lds_bytes_rd = 300, b.counts.lds_bytes_wr = 400;
+  a.add(b);
+  VCHECK_EQ(a.counts.vmem_bytes_rd, 103u);
+  VCHECK_EQ(a.counts.vmem_bytes_wr, 205u);
+  VCHECK_EQ(a.counts.lds_bytes_rd, 307u);
+  VCHECK_EQ(a.counts.lds_bytes_wr, 411u);
+  a.scale(2);
+  VCHECK_EQ(a.counts.vmem_bytes_rd, 206u);
+  VCHECK_EQ(a.counts.lds_bytes_wr, 822u);
+}
+
 VTEST(a_flat_access_that_reaches_lds_counts_as_lds_too) {
   const amd::CodeObject o = object();
   const Expected e = from_listing(kData);
