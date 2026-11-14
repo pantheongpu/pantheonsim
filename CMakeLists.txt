@@ -244,6 +244,7 @@ add_library(vgpu STATIC
   amd/src/gcn_exec.cpp
   amd/src/gcn_tier.cpp
   amd/src/gcn_tier_ds.cpp
+  amd/src/gcn_blocks.cpp
   amd/src/gcn_matrix_kernels.cpp
   amd/src/image.cpp
   amd/src/hostcall.cpp
@@ -1911,6 +1912,10 @@ set(VGPU_UNIT_TEST_NO_ADD_TEST OFF)
 target_compile_definitions(test_amd_gcn_tier_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_shard_tests(test_amd_gcn_tier_same_bits ENV_VAR VGPU_TIER_SHARD LIST_ENV VGPU_TIER_LIST SPECS ${VGPU_TIER_SHARD_SPECS}
                  COMMAND test_amd_gcn_tier_same_bits)
+# Blocks (VGPU_AMD_BLOCKS: runs of tier instructions called back to back, amd/src/gcn_exec.cpp Machine::run_block) against the tier's
+# one-instruction-at-a-time loop: programs of the corpora's shapes run both ways by the executor's loop over rounds, everything they leave compared.
+vgpu_unit_test(test_amd_gcn_blocks_same_bits amd/tests/unit/test_gcn_blocks_same_bits.cpp)
+target_compile_definitions(test_amd_gcn_blocks_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # The forms the AMD probe workloads found missing (RDNA2's VOP3 16-bit integer spellings), against the interpreter.
 vgpu_unit_test(test_amd_gcn_probe_forms amd/tests/unit/test_gcn_probe_forms.cpp)
 target_compile_definitions(test_amd_gcn_probe_forms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -2287,6 +2292,11 @@ set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
 add_test(NAME bench_amd_counters COMMAND ${CMAKE_SOURCE_DIR}/tools/bench-amd/run_bench_check.sh)
 set_tests_properties(bench_amd_counters PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "SKIP:" TIMEOUT 600)
+# The same with runs of tier instructions run as blocks (VGPU_AMD_BLOCKS=1): every workload still checks its own results, and the counts
+# are the ones of the expected file.
+add_test(NAME bench_amd_counters_blocks COMMAND ${CMAKE_SOURCE_DIR}/tools/bench-amd/run_bench_check.sh)
+set_tests_properties(bench_amd_counters_blocks PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_BENCH_AMD_ENV=VGPU_AMD_BLOCKS=1" SKIP_REGULAR_EXPRESSION "SKIP:" TIMEOUT 600)
 
 vgpu_unit_test(test_amd_hip_abi amd/tests/unit/test_hip_abi.cpp)
 # HIP's grid sizes for every AMD profile, one process each (the runtime takes

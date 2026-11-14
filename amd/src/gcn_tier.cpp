@@ -106,6 +106,9 @@ uint64_t bails() { return g_bails.load(std::memory_order_relaxed); }
 #ifndef VGPU_TIER_X86
 
 void tier_classify(Inst&) {}   // (the lane kernels are x86's: elsewhere the interpreter runs everything)
+namespace tier {
+bool gives_up_turn(const Op&) { return false; }
+}  // namespace tier
 
 #else
 
@@ -3479,6 +3482,11 @@ template <bool Max>
 [[gnu::target("avx2,fma,popcnt")]] void k_dmax_avx2(uint64_t* d, const uint64_t* ua, const uint64_t* ub, const uint64_t*, unsigned n) { k_dminmax_avx2<true>(d, ua, ub, n); }
 
 }  // namespace
+
+// (At the end of the unit, so that nothing above it moves: the handlers' code is laid out by this file alone.)
+namespace tier {
+bool gives_up_turn(const Op& o) { return o.run == b_waitcnt; }
+}  // namespace tier
 
 #endif  // VGPU_TIER_X86
 

@@ -647,7 +647,10 @@ struct Machine {
       : d(dispatch), mem(memory), decoded(&cache), sampler(dispatch.sampler && dispatch.sampler->interval ? dispatch.sampler : nullptr),
         prev_rows_sink_(gcn::set_vgpr_rows_sink(cache.vgpr_rows_cell())) {}
   // (What the instructions this machine decodes can write is noted in its decode cache: gcn::decode does it, told where.)
-  ~Machine() { gcn::set_vgpr_rows_sink(prev_rows_sink_); }
+  ~Machine() {
+    gcn::set_vgpr_rows_sink(prev_rows_sink_);
+    if (__builtin_expect(block_stats, 0)) flush_block_stats();
+  }
   Machine(const Machine&) = delete;
   Machine& operator=(const Machine&) = delete;
   const Dispatch& d;
@@ -702,6 +705,8 @@ struct Machine {
   uint64_t unit_none = 0;
   uint64_t* const unit_slot[5] = {&unit_none, &stats.counts.valu, &stats.counts.salu, &stats.counts.branch, &stats.counts.lds};
   const bool tier_on = gcn::tier::enabled() && !tracing() && !debug_on && !(d.sampler && d.sampler->interval);
+  // Runs of tier instructions as blocks (VGPU_AMD_BLOCKS; run_block below): only where the tier itself runs.
+  const bool blocks_on = tier_on && gcn::tier::blocks();
   // A vector load or store of device memory. ROCm runs CDNA with unaligned
   // access enabled (SH_MEM_CONFIG's unaligned mode), so a word may start at
   // any byte, and the compiler counts on it -- printf packs its string eight
@@ -12717,6 +12722,161 @@ struct Machine {
     }
     return step_interp(w, g, decoded);
   }
+  // ---- Blocks (VGPU_AMD_BLOCKS=1; docs/perf-design/13-amd-compiled-tier.md) ----
+  // A straight-line run of tier instructions run as one: what step() and tier_step() ask before each instruction is asked once for the run
+  // (the wave's state, which no handler can change), each handler is called as tier_step calls it, and what the run counts is added once.
+  // What is left when it returns -- registers, memory, the program counter, the counters -- is what that many steps leave.
+  //
+  // step() with the instruction already fetched (run_wave_blocks has it in hand; a second fetch_next would find it by the long way).
+  bool step_at(Wave& w, Group& g, const Inst& decoded) {
+    if (decoded.fast.run) {
+      if (const int t = tier_step(w, g, decoded)) return t == 1;
+    } else if (gcn::tier::stats()) {
+      gcn::tier::note_interp(decoded.name.c_str(), false);
+    }
+    return step_interp(w, g, decoded);
+  }
+  // Whether an instruction can be one of a block: the tier's, and not one the Machine runs for it.
+  static bool in_block(const Inst& in) { return in.fast.run && !in.fast.mach; }
+  // What tier_step asks of the wave before it calls a handler. No handler changes any of it (gcn::tier::Regs reaches none of these).
+  static bool block_state(const Wave& w) { return !(w.vgpr_msb || w.gpr_idx || w.vskip || !FloatMode::is_default(w.mode)); }
+  // (Two instructions are not worth a block: entering and leaving one costs about what the plain step of one instruction does.)
+  static constexpr size_t kMinBlock = 3, kMaxBlock = 256;
+  // The block that starts at `in` (an instruction of the decode cache's, at the wave's program counter), made the first time; null where
+  // fewer than kMinBlock instructions would be in it.
+  const gcn::TierBlock* block_at(const Inst& in) {
+    const gcn::TierBlock* b = __atomic_load_n(&in.block.p, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(!b, 0)) b = make_block(in);
+    return b == gcn::TierBlock::none() ? nullptr : b;
+  }
+  [[gnu::noinline]] const gcn::TierBlock* make_block(const Inst& in) {
+    if (&in == scratch_inst.get()) return gcn::TierBlock::none();   // (not the cache's: fetch() below would free it)
+    auto fresh = std::make_unique<gcn::TierBlock>();
+    uint32_t mix[static_cast<int>(gcn::Mix::Count)] = {}, mops[static_cast<int>(gcn::MopsType::Count)] = {}, unit[5] = {};
+    // (An instruction that can end the wave's turn -- a wait for loads, which ends it after it ran; a plain store, whose first of a round
+    // gives the group's other waves their turn before it runs -- may be inside a block, not at its start: the block would be entered
+    // and left with nothing or one instruction done, which costs more than the plain step.)
+    const bool head_ends_turn = gcn::tier::gives_up_turn(in.fast) || in.fast.store;
+    for (const Inst* cur = &in; !head_ends_turn && fresh->insts.size() < kMaxBlock && in_block(*cur);) {
+      fresh->insts.push_back(cur);
+      ++mix[static_cast<int>(cur->mix)];
+      mops[static_cast<int>(cur->mops_type)] += cur->mops;
+      ++unit[cur->fast.unit];
+      if (cur->fast.unit == gcn::tier::kUnitBranch) break;   // (the only handlers that write the program counter: a block ends with one)
+      // The instruction after it, which a wave that runs this one reaches next. (One that does not decode is the interpreter's to refuse,
+      // when a wave gets there.)
+      try {
+        const Inst& next = fetch(cur->pc + cur->size);
+        if (&next == scratch_inst.get()) break;
+        cur = &next;
+      } catch (const std::exception&) {
+        break;
+      }
+    }
+    const gcn::TierBlock* made = gcn::TierBlock::none();
+    if (fresh->insts.size() >= kMinBlock) {
+      // The counters tier_step raises, as places in this machine's `stats` (the same places in any machine's).
+      const auto add = [&](const uint64_t& counter, uint32_t n) {
+        if (n) fresh->adds.push_back({static_cast<uint32_t>(reinterpret_cast<const char*>(&counter) - reinterpret_cast<const char*>(&stats)), n});
+      };
+      add(stats.instructions, static_cast<uint32_t>(fresh->insts.size()));
+      for (int u = 1; u < 5; ++u) add(*unit_slot[u], unit[u]);
+      for (int i = 0; i < static_cast<int>(gcn::Mix::Count); ++i) add(stats.counts.mix[i], mix[i]);
+      for (int i = 0; i < static_cast<int>(gcn::MopsType::Count); ++i) add(stats.counts.mops[i], mops[i]);
+      made = fresh.release();
+    }
+    const gcn::TierBlock* seen = nullptr;
+    if (__atomic_compare_exchange_n(&in.block.p, &seen, made, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return made;
+    if (made != gcn::TierBlock::none()) delete made;   // (another thread's is the one)
+    return seen;
+  }
+  // What tier_step counts for the instructions [0, done) of a block.
+  [[gnu::noinline]] void count_block_part(const gcn::TierBlock& b, size_t done) {
+    InstructionCounts& c = stats.counts;
+    for (size_t i = 0; i < done; ++i) {
+      const Inst& in = *b.insts[i];
+      ++c.mix[static_cast<int>(in.mix)];
+      c.mops[static_cast<int>(in.mops_type)] += in.mops;
+      ++*unit_slot[in.fast.unit];
+    }
+    stats.instructions += done;
+    block_instructions += done;
+    if (__builtin_expect(block_stats, 0)) note_block_run(b, done);
+  }
+  // How many instructions ran inside blocks (for tests: that a block ran at all).
+  uint64_t block_instructions = 0;
+  // VGPU_AMD_BLOCKS_STATS: this machine's runs of each block (runs, instructions), handed to the tier's table when the machine ends.
+  const bool block_stats = blocks_on && gcn::tier::blocks_stats();
+  std::unordered_map<const gcn::TierBlock*, std::pair<uint64_t, uint64_t>> block_runs;
+  [[gnu::noinline]] void note_block_run(const gcn::TierBlock& b, uint64_t ran) {
+    auto& e = block_runs[&b];
+    ++e.first, e.second += ran;
+  }
+  static std::string block_listing(const void* block) {
+    std::string text;
+    for (const Inst* in : static_cast<const gcn::TierBlock*>(block)->insts) text += "\n             " + gcn::to_text(*in);
+    return text;
+  }
+  void flush_block_stats() {
+    const std::string kernel = d.kernel ? d.kernel->name : std::string("?");
+    for (const auto& [b, n] : block_runs)
+      gcn::tier::note_block(kernel.c_str(), b->insts[0]->pc - d.code_base, static_cast<uint32_t>(b->insts.size()), n.first, n.second, block_listing, b);
+    gcn::tier::note_block_totals(stats.instructions, block_instructions);
+  }
+  // How a block's run ended.
+  enum BlockEnd {
+    kBlockOn,        // at its last instruction, or at the last the turn had room for: the wave goes on
+    kBlockStop,      // an instruction gave up the wave's turn (step() false)
+    kBlockInterp,    // a handler handed its instruction back: the wave is at it, nothing of it done, and step_at runs it
+  };
+  // Runs the instructions of `b` in order, at most `room` of them. Returns how many ran as a step that returns true does (each of them
+  // counted); `end` says what follows. An instruction that gave up the wave's turn after it was done (a handler's 2) is counted but is not one of
+  // the number returned, as its step returned false. (No handler of a block's instructions throws: the tier's handlers hand an instruction
+  // back instead, and the instructions that reach device memory are the Machine's, which a block does not hold.)
+  uint64_t run_block(Wave& w, Group& g, const gcn::TierBlock& b, uint64_t room, BlockEnd* end) {
+    if (__builtin_expect(!w.tier.ok, 0)) make_tier_regs(w, g);
+    gcn::tier::Regs& r = w.tier.r;
+    const Inst* const* const insts = b.insts.data();
+    const size_t len = b.insts.size(), n = len < room ? len : static_cast<size_t>(room);
+    size_t i = 0;
+    int done = 1;
+    for (; i < n; ++i) {
+      const Inst& in = *insts[i];
+      r.target = in.target;
+      w.pc += in.size;
+      done = in.fast.run(in.fast, r);
+      if (__builtin_expect(done != 1, 0)) break;
+    }
+    if (__builtin_expect(i == len, 1)) {   // the whole block
+      char* const counters = reinterpret_cast<char*>(&stats);
+      for (const gcn::TierBlock::Add& a : b.adds) *reinterpret_cast<uint64_t*>(counters + a.at) += a.n;
+      block_instructions += len;
+      if (__builtin_expect(block_stats, 0)) note_block_run(b, len);
+      w.last = insts[len - 1];
+      *end = kBlockOn;
+      return len;
+    }
+    if (i == n) {   // the turn's room ended first
+      count_block_part(b, i);
+      w.last = insts[i - 1];
+      *end = kBlockOn;
+      return i;
+    }
+    const Inst& in = *insts[i];
+    if (done == 2) {   // done, and the wave gives up its turn
+      count_block_part(b, i + 1);
+      w.last = &in;
+      *end = kBlockStop;
+      return i;
+    }
+    // Not done: the program counter is back on the instruction. 3: a plain store's first of a round, the other waves go first. 0: the
+    // interpreter's (step_at calls the handler again, which hands it back again having changed nothing, and notes it once).
+    w.pc -= in.size;
+    if (i) count_block_part(b, i);
+    w.last = &in;
+    *end = done == 3 ? kBlockStop : kBlockInterp;
+    return i;
+  }
   [[gnu::noinline]] bool step_interp(Wave& w, Group& g, const Inst& decoded) {
     const uint64_t pc_here = w.pc;
     // gfx1250's vector register numbers past v255: the instruction as it names them with the wave's MSBs on.
@@ -13443,6 +13603,40 @@ std::atomic<bool> g_abandoned{false};
   throw Error::make(Err::DeviceLost, "the process is exiting, and the dispatch was abandoned");
 }
 
+// A wave's turn of a round with VGPU_AMD_BLOCKS on: run_round's loop over step(), in which a run of tier instructions that starts where the
+// wave is goes as one block (Machine::run_block). `n` counts as the loop's does -- an instruction for each step that returned true -- and a
+// block runs no further than the last instruction after which the loop would not yet have ended the turn (`slice`), so a turn ends on the
+// instruction it ends on without blocks. `pc` is run_round's: where the instruction a plain step threw at is.
+[[gnu::noinline]] void run_wave_blocks(Machine& m, Wave& w, Group& group, uint64_t slice, uint64_t& pc) {
+  uint64_t n = w.round_steps;
+  for (;;) {
+    const Inst* in = &m.fetch_next(w);
+    if (Machine::in_block(*in) && Machine::block_state(w)) {
+      // How many more steps can return true before the loop's `n + 1 >= slice` ends the turn (that one is a plain step's).
+      const uint64_t room = !slice ? ~uint64_t{0} : n + 1 < slice ? slice - 1 - n : 0;
+      const gcn::TierBlock* b = room ? m.block_at(*in) : nullptr;
+      if (b) {
+        Machine::BlockEnd end = Machine::kBlockOn;
+        const uint64_t ran = m.run_block(w, group, *b, room, &end);
+        if (ran) {
+          pc = w.pc;
+          if ((n >> 12) != ((n + ran) >> 12) && g_abandoned.load(std::memory_order_relaxed)) abandon();
+          n += ran;
+        }
+        if (end == Machine::kBlockOn) continue;
+        if (end == Machine::kBlockStop) break;
+        in = w.last;   // (the instruction the block handed back)
+      }
+    }
+    if (!m.step_at(w, group, *in)) break;
+    pc = w.pc;
+    if (slice && n + 1 >= slice) break;
+    if ((n & 4095) == 4095 && g_abandoned.load(std::memory_order_relaxed)) abandon();
+    ++n;
+  }
+  w.round_steps = n;
+}
+
 bool run_round(Machine& m, Group& group, uint64_t slice = 0) {
   if (g_abandoned.load(std::memory_order_relaxed)) abandon();
   bool runnable = false;
@@ -13458,13 +13652,17 @@ bool run_round(Machine& m, Group& group, uint64_t slice = 0) {
       runnable = true;
       uint64_t pc = w.pc;
       try {
-        uint64_t n = w.round_steps;
-        for (; m.step(w, group); ++n) {
-          pc = w.pc;
-          if (slice && n + 1 >= slice) break;
-          if ((n & 4095) == 4095 && g_abandoned.load(std::memory_order_relaxed)) abandon();
+        if (__builtin_expect(m.blocks_on, 0)) {
+          run_wave_blocks(m, w, group, slice, pc);
+        } else {
+          uint64_t n = w.round_steps;
+          for (; m.step(w, group); ++n) {
+            pc = w.pc;
+            if (slice && n + 1 >= slice) break;
+            if ((n & 4095) == 4095 && g_abandoned.load(std::memory_order_relaxed)) abandon();
+          }
+          w.round_steps = n;
         }
-        w.round_steps = n;
       } catch (const Error& e) {
         throw m.at_instruction(e, pc);
       }
@@ -14341,6 +14539,121 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
   return h.h;
 }
 
+
+// ---- a program's digest (amd_exec.hpp) --------------------------------------------------------------------------------
+
+uint64_t digest_program(const std::vector<gcn::Inst>& program, gcn::Target target, uint64_t seed, uint32_t flavour, uint32_t waves,
+                        uint64_t slice, ProgramRun* run, uint32_t wave_state) {
+  static constexpr uint32_t kMach[] = {0x4c, 0x3f, 0x4f, 0x41, 0x48, 0x36, 0x49};   // by gcn::Target's order
+  CodeObject co;
+  co.mach = kMach[static_cast<int>(target)];
+  uint64_t bytes_of_code = 0;
+  for (const gcn::Inst& in : program) bytes_of_code += in.size;
+  co.text.assign(bytes_of_code + 16, 0);
+  Kernel k;
+  k.name = "probe";
+  k.wave32 = gcn::is_rdna(target);
+  Dispatch d;
+  d.object = &co;
+  d.kernel = &k;
+  MemoryManager mem(4ull << 20);
+  const uint64_t region = mem.alloc(1 << 16);
+  DecodeCache cache(bytes_of_code + 16);
+  {
+    uint64_t at = 0;
+    for (const gcn::Inst& in : program) {
+      cache.get(at / 4, [&] {
+        gcn::Inst placed = in;
+        placed.pc = at;
+        return placed;
+      });
+      at += in.size;
+    }
+  }
+  d.decoded = &cache;
+  Machine m(d, mem, cache);
+  Rng r{seed * 0x2545F4914F6CDD1Dull + flavour};
+  Group g;
+  g.lds.assign(1 << 16, 0);
+  g.scratch_per_lane = 256;
+  g.scratch.assign(size_t{256} * kLanes * waves, 0);
+  for (uint8_t& b : g.scratch) b = static_cast<uint8_t>(draw(r, 0));
+  k.private_segment = 256;
+  g.waves.resize(waves);
+  for (uint8_t& b : g.lds) b = static_cast<uint8_t>(draw(r, 0));
+  {
+    std::vector<uint8_t> bytes(1 << 16);
+    for (uint8_t& b : bytes) b = static_cast<uint8_t>(draw(r, 0));
+    mem.write(region, bytes.data(), bytes.size());
+  }
+  uint32_t first_lane = 0;
+  for (Wave& w : g.waves) {
+    w.lanes = k.wave32 ? 32 : kLanes;
+    w.mode = k.mode;
+    w.first_lane = first_lane;
+    first_lane += w.lanes;
+    w.vgpr.grow(288);
+    w.agpr.resize(288);
+    for (uint32_t& s : w.sgpr) s = draw(r, flavour);
+    for (uint32_t& s : w.ttmp) s = draw(r, flavour);
+    for (auto& row : w.vgpr.r)
+      for (uint32_t& v : row) v = draw(r, flavour);
+    for (auto& row : w.agpr)
+      for (uint32_t& v : row) v = draw(r, flavour);
+    const uint64_t all = w.lanes == 64 ? ~uint64_t{0} : (uint64_t{1} << w.lanes) - 1;
+    w.exec = (flavour == 3 || flavour == 11 || flavour == 13 ? r.next() : ~uint64_t{0}) & all;
+    w.vcc = r.next() & all;
+    w.m0 = draw(r, flavour);
+    w.scc = r.next() & 1;
+    if (flavour == 12 || flavour == 13) w.loads_in_flight = 3 + static_cast<uint32_t>(r.next() & 7);   // (loads to wait for)
+    // The states the tier leaves to the interpreter (tier_step's first line), for a test that wants one from the first instruction on.
+    if (wave_state & kProgramVskip) w.vskip = true;
+    if (wave_state & kProgramGprIdx) w.gpr_idx = 0xF, w.gpr_idx_en = true, w.m0 = 1 + (w.m0 & 3);   // (every operand one to four registers further on)
+    if (wave_state & kProgramRoundToZero) w.mode = (w.mode & ~0xFu) | 0xF;   // (single and double precision both round toward zero)
+    w.pc = 0;
+  }
+  Mix64 h;
+  std::string error;
+  uint64_t rounds = 0;
+  bool ended = false;
+  try {
+    for (; rounds < 200 && !ended; ++rounds) {   // (a program that loops ends here)
+      ended = run_round(m, g, slice);
+      // Where the round left each wave and how many steps its turn counted (the next round starts the count again).
+      for (const Wave& w : g.waves) h.add(w.round_steps), h.add(w.pc), h.add(w.done), h.add(w.at_barrier), h.add(w.round_stopped);
+    }
+  } catch (const Error& e) {
+    error = std::string(e.what()) + "|" + std::to_string(static_cast<int>(e.code()));
+  } catch (const std::exception& e) {
+    error = std::string("std:") + e.what();
+  }
+  if (run) run->error = error, run->instructions = m.stats.instructions, run->in_blocks = m.block_instructions, run->ended = ended;
+  h.add(ended), h.add(rounds);
+  h.add_bytes(error.data(), error.size());
+  for (const Wave& w : g.waves) {
+    h.add(w.pc), h.add(w.exec), h.add(w.vcc), h.add(w.m0), h.add(w.scc), h.add(w.done), h.add(w.at_barrier);
+    h.add(w.loads_in_flight), h.add(w.soft_yield), h.add(w.vgpr_msb), h.add(w.mode), h.add(w.gpr_idx), h.add(w.round_steps);
+    h.add(w.round_stopped), h.add(w.store_gate), h.add(w.vskip);
+    h.add_bytes(w.sgpr, sizeof w.sgpr);
+    h.add_bytes(w.ttmp, sizeof w.ttmp);
+    for (const auto& row : w.vgpr.r) h.add_bytes(row.data(), sizeof row);
+    for (const auto& row : w.agpr) h.add_bytes(row.data(), sizeof row);
+  }
+  h.add_bytes(g.lds.data(), g.lds.size());
+  h.add_bytes(g.scratch.data(), g.scratch.size());
+  {
+    std::vector<uint8_t> bytes(1 << 16);
+    mem.read(region, bytes.data(), bytes.size());
+    h.add_bytes(bytes.data(), bytes.size());
+  }
+  const InstructionCounts& c = m.stats.counts;
+  h.add(m.stats.instructions), h.add(m.stats.barriers);
+  h.add(c.valu), h.add(c.mfma), h.add(c.salu), h.add(c.smem), h.add(c.vmem), h.add(c.flat), h.add(c.lds), h.add(c.branch);
+  h.add(c.sendmsg), h.add(c.flat_read), h.add(c.flat_write), h.add(c.flat_atomic), h.add(c.vmem_rd), h.add(c.vmem_wr);
+  for (uint64_t v : c.mix) h.add(v);
+  for (uint64_t v : c.mops) h.add(v);
+  return h.h;
+}
 
 // ---- the timing probe (amd_exec.hpp) ----------------------------------------------------------------------------------
 

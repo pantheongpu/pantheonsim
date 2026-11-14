@@ -214,6 +214,23 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem);
 uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t flavour,
                             std::string* error = nullptr);
 
+// For tests (amd/tests/unit/test_gcn_blocks_same_bits.cpp): a program -- the decoded instructions laid one after another from address 0
+// (each one's `pc` set to where it lands; a branch's `target` is the caller's to aim) -- run by the executor's own loop over rounds
+// (turns of `slice` instructions a wave; 0: no limit, for programs that end) on a work-group of `waves` waves whose registers, masks,
+// LDS and a memory region are drawn from `seed` as digest_instruction's flavours draw them. The digest holds everything the run left:
+// every wave's registers, masks and program counter, LDS, scratch, the region, the counters, how many rounds it took, the error's text if it
+// threw, and after each round where every wave was and how many steps its turn had counted. `run` says what happened, for a test to see that it tested something.
+struct ProgramRun {
+  std::string error;
+  uint64_t instructions = 0;   // DispatchStats::instructions
+  uint64_t in_blocks = 0;      // ... of which ran inside blocks (VGPU_AMD_BLOCKS)
+  bool ended = false;          // every wave reached the end of the program
+};
+// `wave_state`: bits that put every wave in a state the tier leaves to the interpreter before the first instruction runs.
+inline constexpr uint32_t kProgramVskip = 1, kProgramGprIdx = 2, kProgramRoundToZero = 4;
+uint64_t digest_program(const std::vector<gcn::Inst>& program, gcn::Target target, uint64_t seed, uint32_t flavour, uint32_t waves,
+                        uint64_t slice, ProgramRun* run = nullptr, uint32_t wave_state = 0);
+
 // For tools/benchmarks (amd/tools/matrix-bench.cpp): the nanoseconds one execution of the instruction takes on a wave
 // set up as digest_instruction's is (all lanes on), averaged over `iterations` runs of it. Throws what it throws.
 double time_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t flavour, uint32_t iterations);

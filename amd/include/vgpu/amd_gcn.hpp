@@ -165,6 +165,7 @@ inline bool is_gfx12(Target t) { return t == Target::Gfx1200 || t == Target::Gfx
 // gfx10.3 has a register per id.
 inline bool packs_work_item_ids(Target t) { return t != Target::Gfx1030; }
 
+struct TierBlock;
 struct Inst {
   Enc enc = Enc::Unknown;
   uint32_t opcode = 0;
@@ -322,7 +323,45 @@ struct Inst {
       return *this;
     }
   } next;
+  // The straight-line run of tier instructions that starts at this one (TierBlock, below; Machine::block_at makes it the first time a wave is
+  // here with VGPU_AMD_BLOCKS on): null until then, TierBlock::none() where no run worth one starts here. Set once, by whichever thread
+  // comes first, and read by any; a copy of an instruction starts without one.
+  struct Block {
+    mutable const TierBlock* p = nullptr;
+    Block() = default;
+    Block(const Block&) {}
+    Block& operator=(const Block&);
+    ~Block();
+  } block;
 };
+
+// A run of consecutive instructions the pre-decoded tier has handlers for, none of them the Machine's (Op::mach), ending with the first
+// branch (it is the run's last instruction) or before the first instruction that is not the tier's; and what running all of it adds to the
+// counters, added once. The instructions are the decode cache's, which outlives the run. (amd/src/gcn_exec.cpp: Machine::make_block and
+// run_block; docs/perf-design/13-amd-compiled-tier.md.)
+struct TierBlock {
+  std::vector<const Inst*> insts;
+  // What running the whole block counts: the 64-bit counter `at` bytes into the dispatch's DispatchStats goes up by n (the instruction
+  // total, each unit, each mix and matrix-operation slot the block's instructions count in; a handful of entries).
+  struct Add {
+    uint32_t at;
+    uint32_t n;
+  };
+  std::vector<Add> adds;
+  // What an instruction with no run to start points at (shared, never freed).
+  static const TierBlock* none() {
+    static const TierBlock kNone;
+    return &kNone;
+  }
+};
+inline Inst::Block& Inst::Block::operator=(const Block&) {
+  if (p != TierBlock::none()) delete p;
+  p = nullptr;
+  return *this;
+}
+inline Inst::Block::~Block() {
+  if (p != TierBlock::none()) delete p;
+}
 
 // The short form's name (Inst::short_name worked out), "" for an instruction that runs under its own.
 std::string short_name_of(const Inst& in);
