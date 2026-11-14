@@ -379,7 +379,10 @@ target_link_options(vgpuhip PRIVATE "-Wl,--version-script=${CMAKE_SOURCE_DIR}/am
 set_target_properties(vgpuhip PROPERTIES LINK_DEPENDS "${CMAKE_SOURCE_DIR}/amd/src/libamdhip64.map")
 # ROCm 7 renamed the library libamdhip64.so.7; a program built with it asks for
 # that name, and the loader goes by the file name, so both point here.
-add_custom_command(TARGET vgpuhip POST_BUILD
+# A target of their own that runs on every build of vgpuhip, not a POST_BUILD step,
+# which runs only when the library is relinked: build/shim removed under an
+# up-to-date library stayed empty (#647).
+add_custom_target(vgpuhip_shim
   COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.6"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.7"
@@ -388,7 +391,9 @@ add_custom_command(TARGET vgpuhip POST_BUILD
   # (as ROCm's libraries do) gets one copy of it, and one set of devices.
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so.1"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so"
-  COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7, libhsa-runtime64.so.1)")
+  COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7, libhsa-runtime64.so.1)"
+  VERBATIM)
+add_dependencies(vgpuhip vgpuhip_shim)
 # rocminfo for a machine without ROCm (amd/src/rocminfo.cpp): the HSA system
 # and its agents, from the HSA runtime above. A session runs it as rocminfo
 # where the host has no ROCm rocminfo of its own.
@@ -1356,6 +1361,9 @@ add_custom_command(TARGET vgpu_cli POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/amd/tools/amd-smi" "${CMAKE_BINARY_DIR}/bin/amd-smi"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/amd/tools/rocm_agent_enumerator" "${CMAKE_BINARY_DIR}/bin/rocm_agent_enumerator"
   COMMENT "Installing drop-in monitoring tools into build/bin")
+# `vgpu run --gpu amd/...` is how a HIP program is run, so building the HIP shim
+# alone (cmake --build build --target vgpuhip) builds the launcher too (#647).
+add_dependencies(vgpuhip vgpu_cli)
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -2689,6 +2697,10 @@ set_tests_properties(amd_hip_abi PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIM
 # The HIP version the runtime reports, by the library name a program was built to ask for.
 add_test(NAME amd_hip_version COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip_version.sh)
 set_tests_properties(amd_hip_version PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
+# `vgpu run --gpu amd/...` from a build with the HIP shim and no CUDA shim, and an NVIDIA run that still needs libcuda.so.1 (#647).
+add_test(NAME amd_vgpu_run COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_vgpu_run_amd.sh)
+set_tests_properties(amd_vgpu_run PROPERTIES DEPENDS "vgpu_cli;vgpuhip"
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
 # When a captured copy takes its host source: at launch for heap and live locals, at capture for a gone frame's.
 add_test(NAME amd_graph_host_source COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_graph_host_source.sh)

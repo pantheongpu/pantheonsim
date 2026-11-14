@@ -7,6 +7,12 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- `vgpu run --gpu amd/...` needs only the HIP shim ([#647](https://github.com/pantheongpu/pantheonsim/issues/647)): it no longer refuses
+  to start when `build/shim/libcuda.so.1` is missing, and says so when `libamdhip64.so.6` is, or when the program needs an AMD library the
+  build does not have (ROCm SMI, AMD SMI, rocprofiler-sdk), with the target that builds it. `cmake --build build --target vgpuhip` now
+  also builds `vgpu` and writes the HIP links in `build/shim` on every build, not only when the library is relinked, so a HIP-only build
+  runs. NVIDIA runs still require `libcuda.so.1`, with the same message.
+
 - Host-GPU mode (experimental, opt-in), both modes: while the real driver is not started, a launch that would start it only because the program
   has already simulated as long as the start costs (the start-cost account) must now also save a share of the start by itself: 5 ms, or 12.5 ms
   for a kernel's first launch judged by its static estimate (`VGPU_HOST_GPU_START_LAUNCHES`, `0` for the rule before). Four short CUDA Samples
