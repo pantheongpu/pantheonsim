@@ -1203,8 +1203,8 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   // The gfx9 instruction's number, which the executor reads a comparison's
   // condition and type from.
   if (const int op9 = gfx9_opcode(in.name); op9 >= 0) in.opcode = static_cast<uint32_t>(op9);
-  else if (const int e32 = gfx9_opcode(in.name.substr(0, in.name.rfind('_')) + "_e32"); e32 >= 0 && (in.dpp || in.dpp8))
-    in.opcode = static_cast<uint32_t>(e32);
+  else if (const int e32 = gfx9_opcode(in.name.substr(0, in.name.rfind('_')) + "_e32"); e32 >= 0 && (in.dpp || in.dpp8 || (in.sdwa && in.enc == Enc::Vopc)))
+    in.opcode = static_cast<uint32_t>(e32);   // (a DPP or SDWA comparison runs by the opcode of its short form)
   return in;
 }
 

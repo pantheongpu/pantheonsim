@@ -565,7 +565,18 @@ void set_sticky_error(State& s, cudaError_t code) { s.rt->set_context_fault(stat
 // RTX 3060, after a failed device assert, stream and event calls, allocation,
 // copies and launches all answer cudaErrorAssert; asking which device is
 // current, or what a device is, still succeeds.
+bool driver_binding_stale();
+void bind_driver_context();
 cudaError_t dead_context() {
+  // These are the calls that use the device without guard() (streams, events, synchronisation): like guard()'s calls
+  // they make the primary context current on the driver's side when the thread has none (bind_driver_context).
+  if (driver_binding_stale()) {
+    State& s = st();
+    if (s.initialized.load(std::memory_order_acquire) && !vgpu::profiling::silenced()) {
+      std::lock_guard<std::recursive_mutex> lock(s.mu);
+      bind_driver_context();
+    }
+  }
   const cudaError_t e = sticky_error();
   if (e != cudaSuccess) g_last_error = e;
   return e;
@@ -1001,22 +1012,35 @@ void announce_module_profiled(RegisteredModule& m, int dev) {
 // context as they do on the card.
 std::atomic<unsigned> g_driver_loads{0};
 thread_local int t_unbound_device = -1;
+thread_local int t_bound_device = -1;       // the device bind_driver_context last bound on this thread
+thread_local unsigned t_bound_loads = 0;    // and g_driver_loads then
+using DriverHasContext = int (*)();
+std::atomic<DriverHasContext> g_driver_has_context{nullptr};   // vgpu_driver_thread_has_context_v1, once looked up
+// Whether bind_driver_context has something to do on this thread, without the lock: a device it has not bound, a
+// driver loaded (or a primary context reset) since, or a thread the program has left with no context
+// (cuCtxSetCurrent(NULL), or destroying its own): an RTX 3060's next runtime call that uses the device makes the
+// primary context current again then. A context of the program's own that is current stays current.
+bool driver_binding_stale() {
+  if (t_bound_device != t_current_device || t_bound_loads != g_driver_loads.load(std::memory_order_acquire)) return true;
+  const DriverHasContext has = g_driver_has_context.load(std::memory_order_acquire);
+  return has && !has();
+}
 void bind_driver_context() {
-  thread_local int bound = -1;
-  thread_local unsigned bound_loads = 0;
   const unsigned loads = g_driver_loads.load(std::memory_order_acquire);
-  if (bound == t_current_device && bound_loads == loads) return;
   using Bind = int (*)(int);
   static Bind fn = nullptr;   // (callers hold the API lock)
   static unsigned fn_loads = ~0u;
   if (fn_loads != loads) {
     fn = reinterpret_cast<Bind>(driver_dlsym("vgpu_driver_bind_primary_v1"));
+    g_driver_has_context.store(reinterpret_cast<DriverHasContext>(driver_dlsym("vgpu_driver_thread_has_context_v1")),
+                               std::memory_order_release);
     fn_loads = loads;
   }
+  if (!driver_binding_stale()) return;
   if (fn) fn(t_current_device);
   t_unbound_device = fn ? -1 : t_current_device;
-  bound = t_current_device;
-  bound_loads = loads;
+  t_bound_device = t_current_device;
+  t_bound_loads = loads;
 }
 
 // The body of every API call: the lock, initialisation, the dead-context
@@ -1048,7 +1072,9 @@ cudaError_t guard_impl(const char* api, bool needs_context, F&& body) {
       // A profiler's own question (vgpu::profiling::Silence) is not the
       // program using the runtime: it binds no context and creates none.
       const bool silent = call.silenced();
-      if (!silent) bind_driver_context();
+      // Only a call that uses the device binds its context: an RTX 3060's cudaGetDeviceCount, cudaGetDevice and the
+      // other queries (guard_query) do not make the primary context current or active (cudaSetDevice binds itself).
+      if (!silent && needs_context) bind_driver_context();
       // cudaSetDevice makes the context of the device it selects, which is not
       // the one that was current when it was called (see its body).
       if (std::strcmp(api, "cudaSetDevice") != 0) announce_context(silent);
@@ -1183,6 +1209,11 @@ void note_kept(const vgpu_traced::KeptArgs<A...>& kept) {
 #define VGPU_CB_V2(plain) plain "_v2"
 #endif
 
+thread_local int t_traced_depth = 0;   // traced calls in progress on this thread
+static bool reads_last_error(const char* api) {
+  return std::strcmp(api, "cudaGetLastError") == 0 || std::strcmp(api, "cudaPeekAtLastError") == 0;
+}
+
 template <class Body, class... A>
 cudaError_t traced_call(const char* api, Body body, A... a) {
   // The arguments are kept in this frame for the whole call (the profiler reads them again at its exit), and
@@ -1193,7 +1224,19 @@ cudaError_t traced_call(const char* api, Body body, A... a) {
     note_kept(*kept);
   }
   vgpu::profiling::ApiCall call(api);
-  const cudaError_t rc = body(a...);
+  const cudaError_t rc = [&] {
+    struct Depth {
+      Depth() { ++t_traced_depth; }
+      ~Depth() { --t_traced_depth; }
+    } depth;
+    return body(a...);
+  }();
+  // Every call that fails makes its error the thread's last error, as on an RTX 3060: cudaEventElapsedTime on an
+  // event never recorded, cudaStreamEndCapture on a stream not capturing, cudaMemcpy2D with a pitch too small, and
+  // the rest that do not go through guard(). A query's not-ready is not an error. Only the program's own call counts:
+  // a call the simulator makes inside another (depth > 0) is not one the program made. cudaGetLastError and
+  // cudaPeekAtLastError return the last error, which is not a failure of their own.
+  if (rc != cudaSuccess && rc != cudaErrorNotReady && t_traced_depth == 0 && !reads_last_error(api)) g_last_error = rc;
   call.set_result(rc);
   return rc;
 }
@@ -1390,6 +1433,14 @@ cudaError_t symbol_address(State& s, const void* symbol, uint64_t* addr, size_t*
   return cudaSuccess;
 }
 }  // namespace
+
+// The same lookup for the other shims (CUPTI's current context, nvshmemx_cumodule_init, ...: driver_symbol.hpp), which cannot see
+// the private handle.
+VGPU_EXPORT void* vgpu_driver_dlsym_v1(const char* name) { return driver_dlsym(name); }
+// cuDevicePrimaryCtxReset took the primary context out of the active state (driver_api.cpp). On an RTX 3060 the runtime's
+// next call that uses the device makes it active again (and cuProfilerStart, CUDA_ERROR_CONTEXT_IS_DESTROYED before that
+// call, succeeds after it): every thread hands the driver its context once more, as after a load of the driver.
+VGPU_EXPORT void vgpu_runtime_primary_reset_v1() { g_driver_loads.fetch_add(1, std::memory_order_release); }
 
 // The side of a symbol copy that is not the symbol: cudaMemcpyDeviceToDevice
 // says it is device memory and it must be; cudaMemcpyHostToDevice (or
@@ -1661,6 +1712,10 @@ bool vgpu_record_memcpy_if_capturing(void* dst, const void* src, size_t bytes,
 bool vgpu_record_memset_if_capturing(void* dst, int value, size_t bytes, cudaStream_t stream);
 // Whether a stream is capturing right now.
 bool capture_active(cudaStream_t stream);
+// Whether a stream is taking part in a capture that something has invalidated. Measured on an RTX 3060: from then
+// on every launch, copy, fill, event record and wait on its streams fails with cudaErrorStreamCaptureInvalidated
+// until cudaStreamEndCapture ends it.
+bool capture_invalidated(cudaStream_t stream);
 // Stream-ordered allocation, host functions and refused operations on a
 // capturing stream; each returns false when the stream is not capturing.
 bool capture_malloc(State& s, cudaStream_t stream, size_t size, int device, void** ptr,
@@ -1889,6 +1944,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     }
     // Under stream capture the launch is recorded for later replay, not run. (The sizes are only for that.)
     if (capture_active(stream)) {
+      if (capture_invalidated(stream)) return cudaErrorStreamCaptureInvalidated;
       std::vector<uint32_t> param_sizes(fn->params.size());
       for (size_t i = 0; i < fn->params.size(); ++i) param_sizes[i] = fn->params[i].size;
       if (vgpu_record_launch_if_capturing(func, gridDim, blockDim, args, sharedMem, stream, param_sizes,
@@ -2372,6 +2428,12 @@ static cudaError_t cudaDeviceReset_body(void) {
   } catch (const std::exception& e) {
     if (!quiet()) std::fprintf(stderr, "[vgpu] cudaDeviceReset: %s\n", e.what());
   }
+  // The driver's primary context of the device is no longer active, as after cuDevicePrimaryCtxReset: its driver calls
+  // are CUDA_ERROR_CONTEXT_IS_DESTROYED until the runtime's next call that uses the device, which binds it again (an RTX
+  // 3060, CUDA 13.0).
+  using Deactivate = void (*)(int);
+  if (const auto off = reinterpret_cast<Deactivate>(driver_dlsym("vgpu_driver_primary_deactivate_v1"))) off(dev);
+  g_driver_loads.fetch_add(1, std::memory_order_release);
   return cudaSuccess;
 }
 
@@ -3215,6 +3277,10 @@ static cudaError_t cudaMemcpy_body(void* dst, const void* src, size_t count, cud
     // empty tensors (null pointers) as device-to-device when a
     // std::vector<HostTensor> reallocates.
     if (count == 0) return cudaSuccess;
+    // A kind that is none of the five is cudaErrorInvalidMemcpyDirection (an RTX 3060, for cudaMemcpy, the
+    // Async form, and the 2D and 3D copies that come here row by row), not an invalid value.
+    if (static_cast<unsigned>(enum_value(kind)) > static_cast<unsigned>(cudaMemcpyDefault))
+      return cudaErrorInvalidMemcpyDirection;
     auto _t0 = std::chrono::steady_clock::now();
     bool dd = is_device_ptr(dst), sd = is_device_ptr(src);
     // Under unified addressing a device pointer names its own device, so each
@@ -3321,6 +3387,7 @@ VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cud
 
 static cudaError_t cudaMemcpyAsync_body(void* dst, const void* src, size_t count,
                                         cudaMemcpyKind kind, cudaStream_t stream) {
+  if (count != 0 && capture_invalidated(stream)) return cudaErrorStreamCaptureInvalidated;
   if (vgpu_record_memcpy_if_capturing(dst, src, count, kind, stream)) return cudaSuccess;
   // Behind a host function that has not finished: queued after it, and the call returns (#634).
   if (async_defer(
@@ -3384,12 +3451,20 @@ VGPU_EXPORT cudaError_t cudaMalloc3D(cudaPitchedPtr* out, cudaExtent extent) {
   return traced_call("cudaMalloc3D", cudaMalloc3D_traced, out, extent);
 }
 
+// The pitches of a 2D copy, as an RTX 3060 checks them. A row wider than either pitch would overlap the next, and is
+// cudaErrorInvalidPitchValue. A single row has no next: there a pitch of 0 is accepted (the copy is one run), and only
+// a pitch that is set and narrower than the row is refused, as an invalid value.
+static cudaError_t copy2d_pitch_error(size_t dpitch, size_t spitch, size_t width, size_t height) {
+  if (height == 1)
+    return (dpitch != 0 && width > dpitch) || (spitch != 0 && width > spitch) ? cudaErrorInvalidValue : cudaSuccess;
+  return width > dpitch || width > spitch ? cudaErrorInvalidPitchValue : cudaSuccess;
+}
+
 static cudaError_t cudaMemcpy2D_body(void* dst, size_t dpitch, const void* src, size_t spitch,
                                      size_t width, size_t height, cudaMemcpyKind kind) {
   if (width == 0 || height == 0) return cudaSuccess;
   if (!dst || !src) return cudaErrorInvalidValue;
-  // A row wider than either pitch would overlap the next; CUDA refuses it.
-  if (width > dpitch || width > spitch) return cudaErrorInvalidPitchValue;
+  if (const cudaError_t e = copy2d_pitch_error(dpitch, spitch, width, height)) return e;
   // A rectangle is a run of rows; each row goes through the same path as a
   // linear copy, so the owning-device resolution applies to it too.
   for (size_t y = 0; y < height; ++y) {
@@ -3412,7 +3487,7 @@ static cudaError_t cudaMemcpy2DAsync_body(void* dst, size_t dpitch, const void* 
   // records it, rather than a copy done now and absent from every replay.
   if (width != 0 && height != 0 && capture_active(stream)) {
     if (!dst || !src) return cudaErrorInvalidValue;
-    if (width > dpitch || width > spitch) return cudaErrorInvalidPitchValue;
+    if (const cudaError_t e = copy2d_pitch_error(dpitch, spitch, width, height)) return e;
     cudaMemcpy3DParms p{};
     p.srcPtr = cudaPitchedPtr{const_cast<void*>(src), spitch, width, height};
     p.dstPtr = cudaPitchedPtr{dst, dpitch, width, height};
@@ -3424,7 +3499,7 @@ static cudaError_t cudaMemcpy2DAsync_body(void* dst, size_t dpitch, const void* 
   }
   if (width == 0 || height == 0) return cudaSuccess;
   // Behind a host function that has not finished: queued after it (#634). Each row is a copy on this stream.
-  if (dst && src && width <= dpitch && width <= spitch &&
+  if (dst && src && copy2d_pitch_error(dpitch, spitch, width, height) == cudaSuccess &&
       async_defer(
           stream,
           [&](State& s) {
@@ -3498,6 +3573,7 @@ VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
   return traced_call("cudaMemset", cudaMemset_body, dst, value, count);
 }
 static cudaError_t cudaMemsetAsync_body(void* dst, int value, size_t count, cudaStream_t stream) {
+  if (count != 0 && capture_invalidated(stream)) return cudaErrorStreamCaptureInvalidated;
   if (vgpu_record_memset_if_capturing(dst, value, count, stream)) return cudaSuccess;
   // Behind a host function that has not finished: queued after it (#634). Registered memory is refused by the fill.
   if (async_defer(
@@ -3518,6 +3594,9 @@ static cudaError_t cudaMemset2D_body(void* dst, size_t pitch, int value, size_t 
                                      size_t height) {
   if (width == 0 || height == 0) return cudaSuccess;
   if (!dst) return cudaErrorInvalidValue;
+  // Rows narrower than the pitch would overlap: an RTX 3060 refuses the fill (cudaErrorInvalidValue) and writes
+  // nothing. A single row is a fill of its own, whatever the pitch says.
+  if (height > 1 && width > pitch) return cudaErrorInvalidValue;
   for (size_t y = 0; y < height; ++y) {
     const cudaError_t e = cudaMemset(static_cast<char*>(dst) + y * pitch, value, width);
     if (e != cudaSuccess) return e;
@@ -3533,6 +3612,7 @@ static cudaError_t cudaMemset2DAsync_body(void* dst, size_t pitch, int value, si
                                           size_t height, cudaStream_t stream) {
   if (width != 0 && height != 0 && capture_active(stream)) {
     if (!dst) return cudaErrorInvalidValue;
+    if (height > 1 && width > pitch) return cudaErrorInvalidValue;
     cudaMemsetParams p{};
     p.dst = dst;
     p.pitch = pitch;
@@ -3546,7 +3626,7 @@ static cudaError_t cudaMemset2DAsync_body(void* dst, size_t pitch, int value, si
   }
   if (width == 0 || height == 0) return cudaSuccess;
   // Behind a host function that has not finished: queued after it (#634).
-  if (dst && width <= pitch &&
+  if (dst && (height == 1 || width <= pitch) &&
       async_defer(
           stream, [&](State& s) { return stream_ordered_span(s, dst, (height - 1) * pitch + width, false); },
           [=] {
@@ -3637,6 +3717,11 @@ VGPU_EXPORT cudaError_t cudaMallocHost(void** ptr, size_t size) {
 // portable here, whatever they say.
 static cudaError_t cudaHostAlloc_body(void** ptr, size_t size, unsigned int flags) {
   if (const cudaError_t unsafe_ = capture_unsafe_gate("cudaHostAlloc")) return unsafe_;
+  // Portable, Mapped and WriteCombined are the flags there are; any other bit is an invalid value and allocates
+  // nothing (an RTX 3060). A zero-byte request still succeeds first, whatever the flags.
+  if (ptr && size != 0 &&
+      (flags & ~static_cast<unsigned>(cudaHostAllocPortable | cudaHostAllocMapped | cudaHostAllocWriteCombined)))
+    return cudaErrorInvalidValue;
   const cudaError_t e = cudaMallocHost(ptr, size);
   if (e != cudaSuccess || !*ptr) return e;   // a zero-byte request has no pointer to flag
   return guard("cudaHostAlloc", [&](State& s) {
@@ -4832,21 +4917,24 @@ static cudaError_t cudaPointerGetAttributes_traced(cudaPointerAttributes* attr, 
       // is allocated there. This used to answer "device memory" for any address
       // past the base -- a freed pointer, a random one -- with a device ordinal
       // computed from it that no rack has, so an is-this-mine check accepted
-      // memory that was gone.
+      // memory that was gone. Any other address is memory CUDA does not know:
+      // an RTX 3060 answers success and "unregistered" for a freed pointer, and
+      // for one past the end of an allocation, as for any host address (it used
+      // to be cudaErrorInvalidValue here, which also became the last error).
       const uint64_t ord = (a - vgpu::kDeviceVaBase) / vgpu::kDeviceVaStride;
-      if (ord >= static_cast<uint64_t>(st.rt->device_count()) ||
-          !st.rt->device(static_cast<int>(ord)).memory().find_allocation(a, nullptr, nullptr)) {
-        if (!quiet())
-          std::fprintf(stderr,
-                       "[vgpu] cudaPointerGetAttributes: %p is in the device address range but "
-                       "not inside any live allocation (freed, or never allocated)\n",
-                       p);
-        return cudaErrorInvalidValue;
+      if (ord < static_cast<uint64_t>(st.rt->device_count()) &&
+          st.rt->device(static_cast<int>(ord)).memory().find_allocation(a, nullptr, nullptr)) {
+        attr->type = cudaMemoryTypeDevice;
+        attr->device = static_cast<int>(ord);
+        attr->devicePointer = const_cast<void*>(p);
+        return cudaSuccess;
       }
-      attr->type = cudaMemoryTypeDevice;
-      attr->device = static_cast<int>(ord);
-      attr->devicePointer = const_cast<void*>(p);
-      return cudaSuccess;
+      if (!quiet())
+        std::fprintf(stderr,
+                     "[vgpu] cudaPointerGetAttributes: %p is in the device address range but "
+                     "not inside any live allocation (freed, or never allocated); it is reported as "
+                     "unregistered host memory, as the card does\n",
+                     p);
     }
     // Plain host memory CUDA knows nothing about. It belongs to no device,
     // which CUDA says with cudaInvalidDeviceId (-2), not the current device:
@@ -5611,6 +5699,25 @@ VGPU_EXPORT cudaError_t cudaArrayGetInfo(cudaChannelFormatDesc* desc, cudaExtent
   return traced_call("cudaArrayGetInfo", cudaArrayGetInfo_traced, desc, extent, flags, array);
 }
 
+// The pitch and ysize of a pitched end of a 3D copy of `rows` rows of `row` bytes in each of `depth` slices, as an
+// RTX 3060 (CUDA 13.0) checks them, like copy2d_pitch_error for a 2D copy:
+//   - more than one slice needs a ysize of at least the rows (0 is not "unset" here): cudaErrorInvalidPitchValue;
+//   - more than one row or slice needs a pitch that holds the row from pos.x: cudaErrorInvalidPitchValue;
+//   - a single row of a single slice has no next one, so a pitch of 0 is accepted, and only a pitch that is set and too
+//     narrow is refused, as an invalid value (the 3D form of the one-row cudaMemcpy2D);
+//   - a ysize that is set must hold the rows from pos.y: cudaErrorInvalidValue.
+static cudaError_t copy3d_pitched_error(const cudaPitchedPtr& ptr, const cudaPos& pos, uint64_t row, uint64_t rows,
+                                        uint64_t depth) {
+  if (depth > 1 && ptr.ysize < rows) return cudaErrorInvalidPitchValue;
+  if (rows > 1 || depth > 1) {
+    if (pos.x + row > ptr.pitch) return cudaErrorInvalidPitchValue;
+  } else if (ptr.pitch != 0 && pos.x + row > ptr.pitch) {
+    return cudaErrorInvalidValue;
+  }
+  if (ptr.ysize != 0 && pos.y + rows > ptr.ysize) return cudaErrorInvalidValue;
+  return cudaSuccess;
+}
+
 // cudaMemcpy3D: a box of rows between arrays and pitched memory, in any
 // combination. With an array on either side the extent's width and that side's
 // x position count elements; for pitched memory they count bytes. Each row goes
@@ -5645,16 +5752,20 @@ static cudaError_t cudaMemcpy3D_traced(const cudaMemcpy3DParms* p) {
   if (sa && da && sa->texel_bytes != da->texel_bytes) return cudaErrorInvalidValue;
   const uint64_t elem = sa ? sa->texel_bytes : (da ? da->texel_bytes : 1);
   const uint64_t row = ext.width * elem;
-  const uint64_t rows = ext.height ? ext.height : 1;
-  const uint64_t depth = ext.depth ? ext.depth : 1;
-  if (row == 0) return cudaSuccess;
+  const uint64_t rows = ext.height;
+  const uint64_t depth = ext.depth;
+  // An extent with any side 0 copies nothing, arrays included, and its pitches are not checked (an RTX 3060's
+  // answer to 8 x 0 x 1 or 8 x 1 x 0 is success, with nothing written).
+  if (row == 0 || rows == 0 || depth == 0) return cudaSuccess;
   auto in_array = [](const ArrayRec& a, const cudaPos& pos, uint64_t w, uint64_t h, uint64_t d) {
     return pos.x + w <= a.width && pos.y + h <= (a.height ? a.height : 1) && pos.z + d <= a.slices();
   };
   if (sa && !in_array(*sa, spos, ext.width, rows, depth)) return cudaErrorInvalidValue;
   if (da && !in_array(*da, dpos, ext.width, rows, depth)) return cudaErrorInvalidValue;
-  if (!sa && (spos.x + row > p->srcPtr.pitch)) return cudaErrorInvalidPitchValue;
-  if (!da && (dpos.x + row > p->dstPtr.pitch)) return cudaErrorInvalidPitchValue;
+  if (!sa)
+    if (const cudaError_t e = copy3d_pitched_error(p->srcPtr, spos, row, rows, depth)) return e;
+  if (!da)
+    if (const cudaError_t e = copy3d_pitched_error(p->dstPtr, dpos, row, rows, depth)) return e;
   auto address = [&](const ArrayRec* a, const cudaPitchedPtr& ptr, const cudaPos& pos, uint64_t y,
                      uint64_t z) -> char* {
     if (a)
@@ -5688,8 +5799,7 @@ static cudaError_t cudaMemcpy3DAsync_traced(const cudaMemcpy3DParms* p, cudaStre
   // an array at either end waits for it here.
   if (p && !p->srcArray && !p->dstArray && p->srcPtr.ptr && p->dstPtr.ptr) {
     const cudaMemcpy3DParms c = *p;
-    const uint64_t row = c.extent.width, rows = c.extent.height ? c.extent.height : 1,
-                   depth = c.extent.depth ? c.extent.depth : 1;
+    const uint64_t row = c.extent.width, rows = c.extent.height, depth = c.extent.depth;
     // The bytes from the box's first to its last, at the addresses cudaMemcpy3D copies.
     auto span = [&](const cudaPitchedPtr& ptr, const cudaPos& pos, const void** lo) -> uint64_t {
       const uint64_t ysize = ptr.ysize ? ptr.ysize : rows;
@@ -5699,7 +5809,9 @@ static cudaError_t cudaMemcpy3DAsync_traced(const cudaMemcpy3DParms* p, cudaStre
     const void* src_lo = nullptr;
     const void* dst_lo = nullptr;
     const uint64_t src_n = span(c.srcPtr, c.srcPos, &src_lo), dst_n = span(c.dstPtr, c.dstPos, &dst_lo);
-    if (row != 0 && c.srcPos.x + row <= c.srcPtr.pitch && c.dstPos.x + row <= c.dstPtr.pitch &&
+    if (row != 0 && rows != 0 && depth != 0 &&
+        copy3d_pitched_error(c.srcPtr, c.srcPos, row, rows, depth) == cudaSuccess &&
+        copy3d_pitched_error(c.dstPtr, c.dstPos, row, rows, depth) == cudaSuccess &&
         async_defer(
             stream,
             [&](State& s) { return stream_ordered_copy(s, const_cast<void*>(dst_lo), dst_n, src_lo, src_n, c.kind); },
@@ -6234,7 +6346,7 @@ VGPU_EXPORT cudaError_t cudaGetSurfaceObjectResourceDesc(cudaResourceDesc* desc,
 // Managed memory is one allocation the CPU and GPU both address. Device memory
 // here lives in a separate virtual window that host code cannot dereference, so
 // handing back a device pointer would fault the moment the host touched it.
-static cudaError_t cudaMallocManaged_body(void** ptr, size_t size, unsigned int) {
+static cudaError_t cudaMallocManaged_body(void** ptr, size_t size, unsigned int flags) {
   if (const cudaError_t unsafe_ = capture_unsafe_gate("cudaMallocManaged")) return unsafe_;
   return guard("cudaMallocManaged", [&](State& s) -> cudaError_t {
     if (!ptr) return cudaErrorInvalidValue;
@@ -6242,6 +6354,8 @@ static cudaError_t cudaMallocManaged_body(void** ptr, size_t size, unsigned int)
       *ptr = nullptr;
       return cudaSuccess;
     }
+    // Exactly one of cudaMemAttachGlobal and cudaMemAttachHost: an RTX 3060 refuses 0, both, and any other bit.
+    if (flags != cudaMemAttachGlobal && flags != cudaMemAttachHost) return cudaErrorInvalidValue;
     if (vgpu::faults::should_fail(vgpu::faults::Op::Alloc)) return cudaErrorMemoryAllocation;
     const size_t n = size;
     void* p = std::aligned_alloc(4096, (n + 4095) / 4096 * 4096);
@@ -6579,15 +6693,22 @@ VGPU_EXPORT cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* cfg, const
   return traced_call("cudaLaunchKernelExC", cudaLaunchKernelExC_traced, cfg, func, args);
 }
 
-// Profiler control is a no-op: there is no external profiler attached, and a
-// framework toggling it must not fail.
-// Measured on an RTX 3060: both fail while a capture is going on (the unsafe calls' rule).
-static cudaError_t cudaProfilerStart_traced() { return capture_unsafe_gate("cudaProfilerStart"); }
+// Profiler control: there is no external profiler attached, but the calls are runtime calls like any other. Measured on an RTX
+// 3060 (CUDA 13.0): both fail while a capture is going on (the unsafe calls' rule); they start the runtime and make the device's
+// primary context current on the calling thread, a thread the runtime has not used and one whose driver context was destroyed
+// or cleared too (a later cuCtxGetCurrent finds it); a dead context's fault (700, 719) is what they answer, and is the last
+// error; with no device (CUDA_VISIBLE_DEVICES empty) they answer cudaErrorNoDevice; otherwise cudaSuccess, Start twice and
+// Stop with no Start too. They used to answer success always, touching nothing.
+static cudaError_t profiler_control(const char* api) {
+  if (const cudaError_t refused = capture_unsafe_gate(api)) return refused;
+  return guard(api, [](State&) { return cudaSuccess; });
+}
+static cudaError_t cudaProfilerStart_traced() { return profiler_control("cudaProfilerStart"); }
 
 VGPU_EXPORT cudaError_t cudaProfilerStart() {
   return traced_call("cudaProfilerStart", cudaProfilerStart_traced);
 }
-static cudaError_t cudaProfilerStop_traced() { return capture_unsafe_gate("cudaProfilerStop"); }
+static cudaError_t cudaProfilerStop_traced() { return profiler_control("cudaProfilerStop"); }
 
 VGPU_EXPORT cudaError_t cudaProfilerStop() {
   return traced_call("cudaProfilerStop", cudaProfilerStop_traced);
@@ -7070,7 +7191,7 @@ static bool async_defer(cudaStream_t stream, const std::function<bool(State&)>& 
   if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) return false;
   if (!async_would_wait(stream) || !async_defer_stream_ok(stream) || async_libraries_loaded()) return false;
   using Probe = int (*)();
-  const Probe driver_managed = reinterpret_cast<Probe>(dlsym(RTLD_DEFAULT, "vgpu_driver_has_managed_v1"));
+  const Probe driver_managed = reinterpret_cast<Probe>(driver_dlsym("vgpu_driver_has_managed_v1"));
   if (driver_managed && driver_managed()) return false;
   // Pending work behind a host function: queued once outstanding copies and kernels finish at exit, as the launch's are.
   static const bool registered = std::atexit([] { async_wait_device(); }) == 0;
@@ -7285,6 +7406,11 @@ extern "C" __attribute__((visibility("default"))) void vgpu_async_stream_flags_v
 static cudaError_t cudaEventCreateWithFlags_body(cudaEvent_t* e, unsigned int flags) {
   if (const cudaError_t dead = dead_context()) return dead;
   if (!e) return cudaErrorInvalidValue;
+  // Default, BlockingSync, DisableTiming and Interprocess are all there are, and an interprocess event cannot time:
+  // anything else is an invalid value on an RTX 3060, and no event is made.
+  if ((flags & ~static_cast<unsigned>(cudaEventBlockingSync | cudaEventDisableTiming | cudaEventInterprocess)) ||
+      ((flags & cudaEventInterprocess) && !(flags & cudaEventDisableTiming)))
+    return cudaErrorInvalidValue;
   auto rec = std::make_unique<RtEvent>();
   rec->timing = (flags & cudaEventDisableTiming) == 0;
   std::lock_guard<std::mutex> lock(g_event_mu);
@@ -7305,6 +7431,7 @@ VGPU_EXPORT cudaError_t cudaEventCreate(cudaEvent_t* e) {
 }
 static cudaError_t cudaEventRecord_body(cudaEvent_t e, cudaStream_t stream) {
   if (const cudaError_t dead = dead_context()) return dead;
+  if (capture_invalidated(stream)) return cudaErrorStreamCaptureInvalidated;
   const bool blocking = g_async_used.load(std::memory_order_relaxed) && stream_is_blocking(stream);
   std::lock_guard<std::mutex> lock(g_event_mu);
   RtEvent* r = find_event(e);
@@ -7400,6 +7527,7 @@ cudaError_t wait_event_now(cudaEvent_t e) {
 static cudaError_t cudaStreamWaitEvent_body(cudaStream_t stream, cudaEvent_t e, unsigned int flags) {
   if (const cudaError_t dead = dead_context()) return dead;
   if (flags & ~static_cast<unsigned>(cudaEventWaitExternal)) return cudaErrorInvalidValue;
+  if (capture_invalidated(stream)) return cudaErrorStreamCaptureInvalidated;
   SyncScope waited(vgpu::profiling::SyncKind::StreamWaitEvent, stream, e);
   bool captured = false;
   unsigned long long id = 0;
@@ -7478,12 +7606,34 @@ bool capture_id_alive(unsigned long long id);
 // capture goes on, cudaErrorCapturedEvent (which invalidates the capture, as any such call does); once
 // it has ended, the event is gone and the answer is cudaErrorInvalidValue until it is recorded again --
 // both measured on an RTX 3060 (driver 13.2), against the documented CapturedEvent alone.
-static cudaError_t captured_event_answer(unsigned long long capture_id) {
-  return capture_id_alive(capture_id) ? cudaErrorCapturedEvent : cudaErrorInvalidValue;
+// A wait for the event, or a query of it, also invalidates the capture in Relaxed mode, where the unsafe-call gate
+// lets it through (an RTX 3060: cudaStreamEndCapture then answers cudaErrorStreamCaptureInvalidated); a time does not.
+// Once the capture has been invalidated (by this kind of call or any other), the event is as good as gone: the
+// next wait or query answers cudaErrorInvalidValue (an RTX 3060, Relaxed mode: cudaEventQuery 907, then
+// cudaEventSynchronize 1). `was_invalidated` is the capture's state before this call's own unsafe-call gate ran.
+void invalidate_capture_id(unsigned long long id, const char* why);
+bool capture_id_invalidated(unsigned long long id);
+static cudaError_t captured_event_answer(unsigned long long capture_id, const char* invalidating = nullptr,
+                                         bool was_invalidated = false) {
+  if (!capture_id_alive(capture_id) || was_invalidated) return cudaErrorInvalidValue;
+  if (invalidating) invalidate_capture_id(capture_id, invalidating);
+  return cudaErrorCapturedEvent;
+}
+// Whether `e` was last recorded in a capture that something has already invalidated.
+static bool event_capture_invalidated(cudaEvent_t e) {
+  unsigned long long id = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_event_mu);
+    const RtEvent* r = find_event(e);
+    if (!r || !r->captured) return false;
+    id = r->capture_id;
+  }
+  return capture_id_invalidated(id);
 }
 
 static cudaError_t cudaEventSynchronize_body(cudaEvent_t e) {
   if (const cudaError_t dead = dead_context()) return dead;
+  const bool was_invalidated = event_capture_invalidated(e);
   const cudaError_t unsafe_ = capture_unsafe_gate("cudaEventSynchronize");
   SyncScope waited(vgpu::profiling::SyncKind::Event, nullptr, e);
   pool_waited_for(t_current_device, nullptr, true);
@@ -7495,7 +7645,7 @@ static cudaError_t cudaEventSynchronize_body(cudaEvent_t e) {
     if (!r) return unsafe_ ? unsafe_ : cudaErrorInvalidResourceHandle;
     captured = r->captured, id = r->capture_id;
   }
-  if (captured) return captured_event_answer(id);
+  if (captured) return captured_event_answer(id, "cudaEventSynchronize", was_invalidated);
   return unsafe_;
 }
 
@@ -7505,6 +7655,7 @@ VGPU_EXPORT cudaError_t cudaEventSynchronize(cudaEvent_t e) {
 }
 static cudaError_t cudaEventQuery_body(cudaEvent_t e) {
   if (const cudaError_t dead = dead_context()) return dead;
+  const bool was_invalidated = event_capture_invalidated(e);
   const cudaError_t unsafe_ = capture_unsafe_gate("cudaEventQuery");
   bool captured = false, pending = false;
   unsigned long long id = 0;
@@ -7515,7 +7666,7 @@ static cudaError_t cudaEventQuery_body(cudaEvent_t e) {
     captured = r->captured, id = r->capture_id;   // it stands for work not yet run
     pending = r->outstanding != 0;
   }
-  if (captured) return captured_event_answer(id);
+  if (captured) return captured_event_answer(id, "cudaEventQuery", was_invalidated);
   if (!unsafe_ && pending) return cudaErrorNotReady;   // recorded behind a host function that has not finished
   return unsafe_;
 }
@@ -7703,7 +7854,7 @@ GetProcAddressFn simulator_get_proc_address() {
     dir = dir.substr(0, dir.find_last_of('/') + 1);
     // Whether the runtime already sees the driver (the program links libcuda, or preloads it): then it has been
     // initialised and handed the runtime's contexts as usual, and there is nothing more to do here.
-    const bool seen = dlsym(RTLD_DEFAULT, "vgpu_driver_bind_primary_v1") != nullptr;
+    const bool seen = driver_dlsym("vgpu_driver_bind_primary_v1") != nullptr;   // (a private one returned above)
     void* h = dlopen((dir + "libcuda.so.1").c_str(), RTLD_NOW | RTLD_GLOBAL);
     if (!h) return nullptr;
     if (seen) return reinterpret_cast<GetProcAddressFn>(dlsym(h, "cuGetProcAddress_v2"));
@@ -8346,6 +8497,10 @@ void destroy_graph(void* graph);
 bool vgpu_record_copy_if_capturing(const cudaMemcpy3DParms& p, cudaStream_t stream,
                                    cudaError_t* rc) {
   if (!capture_active(stream)) return false;
+  if (capture_invalidated(stream)) {
+    *rc = cudaErrorStreamCaptureInvalidated;
+    return true;
+  }
   RecordedLaunch r;
   *rc = fill_memcpy_work(&r, &p);
   if (*rc == cudaSuccess) capture_record(stream, cudaGraphNodeTypeMemcpy, std::move(r));
@@ -8355,6 +8510,10 @@ bool vgpu_record_copy_if_capturing(const cudaMemcpy3DParms& p, cudaStream_t stre
 bool vgpu_record_fill_if_capturing(const cudaMemsetParams& p, cudaStream_t stream,
                                    cudaError_t* rc) {
   if (!capture_active(stream)) return false;
+  if (capture_invalidated(stream)) {
+    *rc = cudaErrorStreamCaptureInvalidated;
+    return true;
+  }
   RecordedLaunch r;
   *rc = fill_memset_work(&r, &p);
   if (*rc == cudaSuccess) capture_record(stream, cudaGraphNodeTypeMemset, std::move(r));
@@ -8362,6 +8521,13 @@ bool vgpu_record_fill_if_capturing(const cudaMemsetParams& p, cudaStream_t strea
 }
 
 bool capture_active(cudaStream_t stream) { return capture_target(stream) != nullptr; }
+
+bool capture_invalidated(cudaStream_t stream) {
+  if (!g_captures_active.load(std::memory_order_acquire)) return false;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  const StreamCapture* sc = stream_capture(stream);
+  return sc && sc->cap->graph->invalidated;
+}
 
 bool vgpu_record_memcpy_if_capturing(void* dst, const void* src, size_t bytes,
                                      cudaMemcpyKind kind, cudaStream_t stream) {
@@ -8592,7 +8758,15 @@ static cudaError_t cudaStreamEndCapture_body(cudaStream_t stream, cudaGraph_t* p
   StreamCapture* sc = stream_capture(stream);
   if (!sc) return cudaErrorIllegalState;   // not capturing
   // Only the stream that began a capture ends it; one that joined it cannot.
-  if (sc->cap->origin != reinterpret_cast<void*>(stream)) return cudaErrorStreamCaptureUnmatched;
+  // Measured on an RTX 3060: the attempt also invalidates the capture, so its origin's cudaStreamEndCapture then
+  // answers cudaErrorStreamCaptureInvalidated.
+  if (sc->cap->origin != reinterpret_cast<void*>(stream)) {
+    if (!sc->cap->graph->invalidated) {
+      sc->cap->graph->invalidated = true;
+      sc->cap->graph->invalidated_by = "cudaStreamEndCapture on a stream that joined the capture";
+    }
+    return cudaErrorStreamCaptureUnmatched;
+  }
   Capture* cap = sc->cap;
   // A capture begun in Global or ThreadLocal mode can only be ended by the thread that began it.
   // Measured on an RTX 3060: the call answers cudaErrorStreamCaptureWrongThread, the capture is
@@ -11472,6 +11646,22 @@ bool capture_id_alive(unsigned long long id) {
   for (auto& [origin, c] : g_captures)
     if (c->id == id) return true;
   return false;
+}
+
+bool capture_id_invalidated(unsigned long long id) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  for (auto& [origin, c] : g_captures)
+    if (c->id == id) return c->graph->invalidated;
+  return false;
+}
+
+void invalidate_capture_id(unsigned long long id, const char* why) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  for (auto& [origin, c] : g_captures)
+    if (c->id == id && !c->graph->invalidated) {
+      c->graph->invalidated = true;
+      c->graph->invalidated_by = why;
+    }
 }
 
 cudaError_t capture_wait(cudaStream_t stream, bool captured, unsigned long long id,

@@ -27,10 +27,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <complex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <mutex>
 #include <set>
 #include <vector>
@@ -95,6 +97,22 @@ void set_info(int* dev_info, int value) {
   if (dev_info) cudaMemcpy(dev_info, &value, sizeof(int), cudaMemcpyHostToDevice);
 }
 
+// LAPACK-style argument checking, as an RTX 3060's cuSOLVER does it for potrf, potrs, syevd and gesvd: the first
+// argument that is wrong is named in info as minus its position, and the call is an invalid value.
+struct BadArg {
+  bool bad;
+  int position;
+};
+cusolverStatus_t refuse(int* dev_info, std::initializer_list<BadArg> checks) {
+  for (const BadArg& c : checks)
+    if (c.bad) {
+      set_info(dev_info, c.position);
+      return CUSOLVER_STATUS_INVALID_VALUE;
+    }
+  return CUSOLVER_STATUS_SUCCESS;
+}
+bool known_uplo(cublasFillMode_t u) { return u == CUBLAS_FILL_MODE_LOWER || u == CUBLAS_FILL_MODE_UPPER; }
+
 /* ---- factorizations, all column-major and all in double ---- */
 
 // The factorizations and solves are host_dense.hpp's: the same chains of products and sums per element, in the same
@@ -102,6 +120,42 @@ void set_info(int* dev_info, int value) {
 
 // Cholesky. Returns 0, or the 1-based index of the leading minor that failed.
 int potrf(Mat& A, int n, bool lower) { return vgpu::hostdense::potrf(A.v.data(), A.ld, n, lower); }
+
+// potrf as an RTX 3060's cuSOLVER 13.0 (cusolverDn?potrf, cusolverDnXpotrf) leaves a matrix that is not positive
+// definite, failing at leading minor j: the columns before j factored, NaN at A(j,j), and then
+//   - from the lower triangle, the factorization goes on as if column j were 0 (its entries below the diagonal are
+//     set to 0, and a later failing column is the same);
+//   - from the upper triangle, every entry of rows j.. of the triangle is NaN.
+// Measured for n up to 32 (float and double); the card factors larger matrices in blocks, which changes what it
+// leaves after the failing column. The columns before it and info are the card's at every size measured.
+int potrf_as_card(Mat& A, int n, bool lower) {
+  const int rc = potrf(A, n, lower);
+  if (rc == 0) return 0;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  auto el = [&](int i, int j) -> double& { return lower ? A(i, j) : A(j, i); };   // the factor's (i, j), i >= j
+  for (int j = rc - 1; j < n; ++j) {
+    double d = el(j, j);
+    for (int k = 0; k < j; ++k) d -= el(j, k) * el(j, k);
+    if (!(d > 0.0)) {
+      if (!lower) {
+        for (int r = j; r < n; ++r)
+          for (int c = r; c < n; ++c) el(c, r) = nan;
+        break;
+      }
+      el(j, j) = nan;
+      for (int i = j + 1; i < n; ++i) el(i, j) = 0.0;
+      continue;
+    }
+    d = std::sqrt(d);
+    el(j, j) = d;
+    for (int i = j + 1; i < n; ++i) {
+      double t = el(i, j);
+      for (int k = 0; k < j; ++k) t -= el(i, k) * el(j, k);
+      el(i, j) = t / d;
+    }
+  }
+  return rc;
+}
 
 // LU with partial pivoting. ipiv is LAPACK's: 1-based row that row i was
 // swapped with. A null ipiv means the caller asked for no pivoting.
@@ -280,12 +334,14 @@ VGPU_EXPORT cusolverStatus_t cusolverGetVersion(int* v) {
                                                     int n, T* A, int lda, T* unused5, int unused6, int* info) { \
   VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##potrf, h, uplo, n, A, lda, unused5, unused6, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                     \
-    if (n < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                   \
+    if (const cusolverStatus_t bad = refuse(info, {{!known_uplo(uplo), -1}, {n < 0, -2},       \
+                                                   {lda < std::max(1, n), -4}}))               \
+      return uplo == CUBLAS_FILL_MODE_FULL ? CUSOLVER_STATUS_EXECUTION_FAILED : bad;            \
     Mat a;                                                                                     \
     if (!load<T>(A, (size_t)lda * n, &a, lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;        \
-    const int rc = potrf(a, n, uplo == CUBLAS_FILL_MODE_LOWER);                                \
+    const int rc = potrf_as_card(a, n, uplo == CUBLAS_FILL_MODE_LOWER);                        \
     set_info(info, rc);                                                                        \
-    if (rc == 0 && !save<T>(A, a.v)) return CUSOLVER_STATUS_EXECUTION_FAILED;                  \
+    if (!save<T>(A, a.v)) return CUSOLVER_STATUS_EXECUTION_FAILED;                             \
     return CUSOLVER_STATUS_SUCCESS;                                                            \
   }                                                                                            \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##potrs(cusolverDnHandle_t h, cublasFillMode_t uplo,\
@@ -293,6 +349,14 @@ VGPU_EXPORT cusolverStatus_t cusolverGetVersion(int* v) {
                                                     int ldb, int* info) { \
   VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##potrs, h, uplo, n, nrhs, A, lda, B, ldb, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                     \
+    if (const cusolverStatus_t bad = refuse(info, {{!known_uplo(uplo), -1}, {n < 0, -2}, {nrhs < 0, -3}, \
+                                                   {lda < std::max(1, n), -5},                 \
+                                                   {ldb < std::max(1, n), -7}}))               \
+      return bad;                                                                              \
+    if (n == 0 || nrhs == 0) {                                                                 \
+      set_info(info, 0);                                                                       \
+      return CUSOLVER_STATUS_SUCCESS;                                                          \
+    }                                                                                          \
     Mat a, b;                                                                                  \
     if (!load<T>(A, (size_t)lda * n, &a, lda) || !load<T>(B, (size_t)ldb * nrhs, &b, ldb))     \
       return CUSOLVER_STATUS_EXECUTION_FAILED;                                                 \
@@ -322,7 +386,12 @@ VGPU_POTRF(D, double)
                                                     int lda, T* unused5, int* devIpiv, int* info) { \
   VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##getrf, h, m, n, A, lda, unused5, devIpiv, info);     \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                      \
-    if (m < 0 || n < 0 || lda < std::max(1, m)) return CUSOLVER_STATUS_INVALID_VALUE;           \
+    if (m < 0 || n < 0) return CUSOLVER_STATUS_INVALID_VALUE;                                   \
+    /* A short lda is LAPACK's argument 4 in info, and the call succeeds (an RTX 3060). */     \
+    if (lda < std::max(1, m)) {                                                                 \
+      set_info(info, -4);                                                                       \
+      return CUSOLVER_STATUS_SUCCESS;                                                           \
+    }                                                                                           \
     Mat a;                                                                                      \
     if (!load<T>(A, (size_t)lda * n, &a, lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;         \
     std::vector<int> ipiv;                                                                      \
@@ -339,6 +408,11 @@ VGPU_POTRF(D, double)
       const int* devIpiv, T* B, int ldb, int* info) { \
   VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##getrs, h, trans, n, nrhs, A, lda, devIpiv, B, ldb, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                      \
+    /* Refused without touching info, as an RTX 3060's cuSOLVER does; nothing to solve is a success. */ \
+    if ((trans != CUBLAS_OP_N && trans != CUBLAS_OP_T && trans != CUBLAS_OP_C) || n < 0 ||      \
+        nrhs < 0 || lda < std::max(1, n) || ldb < std::max(1, n))                               \
+      return CUSOLVER_STATUS_INVALID_VALUE;                                                     \
+    if (n == 0 || nrhs == 0) return CUSOLVER_STATUS_SUCCESS;                                    \
     Mat a, b;                                                                                   \
     if (!load<T>(A, (size_t)lda * n, &a, lda) || !load<T>(B, (size_t)ldb * nrhs, &b, ldb))      \
       return CUSOLVER_STATUS_EXECUTION_FAILED;                                                  \
@@ -445,7 +519,11 @@ VGPU_GEQRF(D, double)
       T* W, T* unused7, int unused8, int* info) { \
   VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDn##P##syevd, h, jobz, uplo, n, A, lda, W, unused7, unused8, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                      \
-    if (n < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                    \
+    if (const cusolverStatus_t bad = refuse(info, {{jobz != CUSOLVER_EIG_MODE_NOVECTOR &&       \
+                                                        jobz != CUSOLVER_EIG_MODE_VECTOR, -1}, \
+                                                   {!known_uplo(uplo), -2}, {n < 0, -3},       \
+                                                   {lda < std::max(1, n), -5}}))               \
+      return bad;                                                                               \
     Mat a;                                                                                      \
     if (!load<T>(A, (size_t)lda * n, &a, lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;         \
     /* Only one triangle is meaningful; mirror it so the solver sees a full     \
@@ -484,19 +562,41 @@ VGPU_SYEVD(D, double)
       T* S, T* U, int ldu, T* VT, int ldvt, T* unused12, int unused13, T* unused14, int* info) { \
   VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDn##P##gesvd, h, jobu, jobvt, m, n, A, lda, S, U, ldu, VT, ldvt, unused12, unused13, unused14, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                      \
-    /* Hardware's gesvd requires m >= n; say so rather than inventing an answer. */             \
-    if (m < n) return CUSOLVER_STATUS_NOT_SUPPORTED;                                            \
-    if (jobu == 'O' || jobvt == 'O') return CUSOLVER_STATUS_NOT_SUPPORTED;                      \
+    /* LAPACK's jobs, upper case only, and not both 'O' (an RTX 3060: info -1 or -2). */        \
+    const auto job = [](signed char j) { return j == 'A' || j == 'S' || j == 'O' || j == 'N'; }; \
+    if (const cusolverStatus_t bad = refuse(info, {{!job(jobu), -1},                            \
+                                                   {!job(jobvt) || (jobu == 'O' && jobvt == 'O'), -2}})) \
+      return bad;                                                                               \
+    /* cuSOLVER's gesvd requires m >= n: an invalid value, with info 0, as on an RTX 3060. */   \
+    if (m < n) {                                                                                \
+      set_info(info, 0);                                                                        \
+      return CUSOLVER_STATUS_INVALID_VALUE;                                                     \
+    }                                                                                           \
+    if (const cusolverStatus_t bad = refuse(info, {{n < 0, -4}, {lda < std::max(1, m), -6}}))   \
+      return bad;                                                                               \
     Mat a;                                                                                      \
     if (!load<T>(A, (size_t)lda * n, &a, lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;         \
     std::vector<double> packed((size_t)m * n);                                                  \
     for (int c = 0; c < n; ++c)                                                                 \
       for (int r = 0; r < m; ++r) packed[(size_t)c * m + r] = a(r, c);                          \
     std::vector<double> s, v;                                                                   \
-    svd(packed, m, n, &s, &v, VT && jobvt != 'N');                                              \
+    svd(packed, m, n, &s, &v, jobvt == 'O' || (VT && jobvt != 'N'));                            \
     set_info(info, 0);                                                                          \
     if (!save<T>(S, s)) return CUSOLVER_STATUS_EXECUTION_FAILED;                                \
-    if (U && jobu != 'N') {                                                                     \
+    /* jobu 'O': the n left vectors overwrite A's columns; jobvt 'O': V^T overwrites A's first \
+       n rows. Nothing else of A is defined afterwards, as LAPACK says. */                      \
+    if (jobu == 'O' || jobvt == 'O') {                                                          \
+      Mat out;                                                                                  \
+      out.v.assign((size_t)lda * n, 0.0);                                                       \
+      for (int c = 0; c < n; ++c) {                                                             \
+        const double sc = s[c] > 0 ? 1.0 / s[c] : 0.0;                                          \
+        for (int r = 0; r < m; ++r)                                                             \
+          out.v[(size_t)c * lda + r] = jobu == 'O' ? packed[(size_t)c * m + r] * sc             \
+                                                   : r < n ? v[(size_t)r * n + c] : 0.0;        \
+      }                                                                                         \
+      if (!save<T>(A, out.v)) return CUSOLVER_STATUS_EXECUTION_FAILED;                          \
+    }                                                                                           \
+    if (U && jobu != 'N' && jobu != 'O') {                                                      \
       const int ucols = jobu == 'A' ? m : n;                                                    \
       std::vector<double> u((size_t)ldu * ucols, 0.0);                                          \
       for (int c = 0; c < std::min(n, ucols); ++c) {                                            \
@@ -505,7 +605,7 @@ VGPU_SYEVD(D, double)
       }                                                                                         \
       if (!save<T>(U, u)) return CUSOLVER_STATUS_EXECUTION_FAILED;                              \
     }                                                                                           \
-    if (VT && jobvt != 'N') {                                                                   \
+    if (VT && jobvt != 'N' && jobvt != 'O') {                                                   \
       const int vrows = jobvt == 'A' ? n : n;                                                   \
       std::vector<double> vt((size_t)ldvt * n, 0.0);                                            \
       for (int c = 0; c < n; ++c)                                                               \
@@ -706,9 +806,14 @@ VGPU_EXPORT cusolverStatus_t cusolverDnDestroyParams(cusolverDnParams_t p) {
   delete reinterpret_cast<Params*>(p);
   return CUSOLVER_STATUS_SUCCESS;
 }
-// One algorithm each here, so the choice has nothing to select.
-VGPU_EXPORT cusolverStatus_t cusolverDnSetAdvOptions(cusolverDnParams_t p, cusolverDnFunction_t, cusolverAlgMode_t) {
-  return known(p) ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INVALID_VALUE;
+// One algorithm each here, so the choice has nothing to select. The functions are GETRF and POTRF and the algorithms
+// ALG_0..ALG_2; anything else is an invalid value (an RTX 3060's cuSOLVER 13.0).
+VGPU_EXPORT cusolverStatus_t cusolverDnSetAdvOptions(cusolverDnParams_t p, cusolverDnFunction_t fn, cusolverAlgMode_t alg) {
+  if (!known(p)) return CUSOLVER_STATUS_INVALID_VALUE;
+  if ((fn != CUSOLVERDN_GETRF && fn != CUSOLVERDN_POTRF) ||
+      (alg != CUSOLVER_ALG_0 && alg != CUSOLVER_ALG_1 && alg != CUSOLVER_ALG_2))
+    return CUSOLVER_STATUS_INVALID_VALUE;
+  return CUSOLVER_STATUS_SUCCESS;
 }
 
 static size_t x_workspace(int64_t n) { return (size_t)std::max<int64_t>(1, n) * 64 * sizeof(double); }
@@ -735,9 +840,9 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXpotrf(cusolverDnHandle_t h, cusolverDnPa
     using T = decltype(t);
     Mat a;
     if (!load<T>(A, (size_t)lda * n, &a, (int)lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;
-    const int rc = potrf(a, (int)n, uplo == CUBLAS_FILL_MODE_LOWER);
+    const int rc = potrf_as_card(a, (int)n, uplo == CUBLAS_FILL_MODE_LOWER);
     set_info(info, rc);
-    if (rc == 0 && !save<T>(A, a.v)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+    if (!save<T>(A, a.v)) return CUSOLVER_STATUS_EXECUTION_FAILED;
     return CUSOLVER_STATUS_SUCCESS;
   });
 }

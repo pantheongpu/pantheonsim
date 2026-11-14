@@ -67,7 +67,6 @@ int run(const char* target, bool tier) {
   std::vector<uint64_t> g(128);
   mem.read(pout, f.data(), f.size() * 4);
   mem.read(pout + 1280, g.data(), g.size() * 8);
-  const bool cdna3 = std::string(target) == "gfx942";
   int wrong = 0;
   const auto want = [&](const char* what, int l, uint64_t got, uint64_t expected) {
     if (got == expected) return;
@@ -77,10 +76,10 @@ int run(const char* target, bool tier) {
     const float x = x32[l];
     want("v_div_fixup_f32 clamp", l, f[l], std::bit_cast<uint32_t>(clamp01(x)));
     want("v_div_fmas_f32 clamp", l, f[64 + l], std::bit_cast<uint32_t>(clamp01(x)));
-    // The output modifier: doubles the result on gfx90a; gfx942 ignores it with IEEE mode or output denormals on (CDNA3 guide 6.5),
-    // which a code object's defaults turn on -- whichever, the same as for v_mul_f32's.
+    // The output modifier: ignored with IEEE mode or output denormals on (CDNA2 and CDNA3 guides, 6.5; an RX 6800 too, test_amd_gcn_mods),
+    // which a code object's defaults turn on -- the same as for v_mul_f32's.
     want("v_div_fixup_f32 mul:2", l, f[128 + l], f[192 + l]);
-    if (!cdna3) want("v_mul_f32 mul:2", l, f[192 + l], std::bit_cast<uint32_t>(2.0f * x));
+    want("v_mul_f32 mul:2", l, f[192 + l], std::bit_cast<uint32_t>(x));
     want("v_div_fixup_f32", l, f[256 + l], std::bit_cast<uint32_t>(x));
     want("v_div_fixup_f64 clamp", l, g[l], std::bit_cast<uint64_t>(clamp01(x64[l])));
     want("v_div_fmas_f64 clamp", l, g[64 + l], std::bit_cast<uint64_t>(clamp01(x64[l])));

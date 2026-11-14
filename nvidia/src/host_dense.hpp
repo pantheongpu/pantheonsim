@@ -169,7 +169,9 @@ inline int potrf(double* a, int64_t ld, int n, bool lower) {
 }
 
 // Steps j = start .. min(m,n)-1 of LU, one column at a time over the whole matrix (the loops this file began with).
-// Returns the 1-based index of the first zero pivot (0 if none); a zero pivot skips its step.
+// Returns the 1-based index of the first zero pivot (0 if none). A zero pivot's column below the diagonal is multiplied
+// by 0 and the step goes on, as an RTX 3060's cuSOLVER 13.0 does without pivoting (with pivoting that column is all
+// zeros already).
 inline int getrf_steps(double* a, int64_t ld, int m, int n, int* ipiv, int start) {
   M A{a, ld};
   const int k = std::min(m, n);
@@ -185,9 +187,13 @@ inline int getrf_steps(double* a, int64_t ld, int m, int n, int* ipiv, int start
         for (int c = 0; c < n; ++c) std::swap(A(j, c), A(p, c));
     }
     const double piv = A(j, j);
-    if (piv == 0.0) { if (!info) info = j + 1; continue; }
     double* fj = A.col(j);
-    for (int i = j + 1; i < m; ++i) fj[i] /= piv;
+    if (piv == 0.0) {
+      if (!info) info = j + 1;
+      for (int i = j + 1; i < m; ++i) fj[i] *= 0.0;
+    } else {
+      for (int i = j + 1; i < m; ++i) fj[i] /= piv;
+    }
     // A(i,c) -= f_i * A(j,c): one column at a time, down the column.
     for (int c = j + 1; c < n; ++c) axpy_sub(A.col(c) + j + 1, fj + j + 1, A(j,c), m - j - 1);
   }
@@ -201,8 +207,8 @@ inline int getrf_steps(double* a, int64_t ld, int m, int n, int* ipiv, int start
 // as above; the rows of the panel's pivots are then exchanged in the other columns (which moves rows of values, and the
 // step that updates a row's content is the same wherever it sits); the panel's rows of U in the columns to the right are
 // L11's unit triangular solve (the chain of each element, with the columns along the vector lanes), and the rest of those
-// columns is a matrix product whose sums start from the old values (host_gemm.hpp). A zero pivot skips its step
-// in the loops above, which no update of this form can say, so the factorization then goes on, unblocked, from the start of
+// columns is a matrix product whose sums start from the old values (host_gemm.hpp). A zero pivot is a step of its own
+// in the loops above (see getrf_steps), which no update of this form can say, so the factorization then goes on, unblocked, from the start of
 // that panel (nothing to its right has been touched yet).
 inline int getrf(double* a, int64_t ld, int m, int n, int* ipiv) {
   const int k = std::min(m, n);

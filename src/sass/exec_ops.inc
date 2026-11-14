@@ -5570,6 +5570,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       // first.
       w.slice = 0;
       w.give_way = true;
+      w.forced = false;
       w.yield = true;
       ++w.idle_yields;
       w.yield_pc = w.pc[std::countr_zero(group)] + 16;   // where the lanes that yielded stand once the YIELD is done
@@ -5627,6 +5628,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
         if (++w.spins >= 64) {
           w.spins = 0;
           w.give_way = true;
+          w.forced = true;   // (not a YIELD: the group keeps its uniform registers, see Warp::UniformSave)
           w.yield_pc = w.pc[std::countr_zero(take)];   // the group that branched back, at the top of its loop
         }
       }

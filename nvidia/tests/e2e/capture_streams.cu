@@ -87,8 +87,9 @@ int main() {
     CK(capture_info(s1, &st1, &id1, nullptr, nullptr));
     CK(capture_info(s2, &st2, &id2, nullptr, nullptr));
     CHECK(st2 == cudaStreamCaptureStatusActive && id2 == id1);   // one capture, two streams
-    // The event stands for captured work nothing has run: it cannot be queried.
-    WANT(cudaEventQuery(fork), cudaErrorCapturedEvent);
+    // The event stands for captured work nothing has run: it cannot be queried. Querying it answers
+    // cudaErrorCapturedEvent and invalidates the capture, in Relaxed mode too (an RTX 3060), so that
+    // is checked in card_edges_capture.cu, not here.
     set<<<1, kN, 0, s2>>>(b, 100);                 // B, on the forked stream
     set<<<1, kN, 0, s1>>>(c, 1000);                // C, on the first
     const cudaGraphNode_t* pos = nullptr;
@@ -98,9 +99,8 @@ int main() {
     CK(cudaEventRecord(join, s2));
     CK(cudaStreamWaitEvent(s1, join, 0));          // the join
     add<<<1, kN, 0, s1>>>(b, c, out);              // D, after both branches
-    // A stream that joined cannot end the capture.
-    cudaGraph_t wrong = nullptr;
-    WANT(cudaStreamEndCapture(s2, &wrong), cudaErrorStreamCaptureUnmatched);
+    // A stream that joined cannot end the capture: cudaErrorStreamCaptureUnmatched, which also
+    // invalidates the capture (an RTX 3060), so that too is checked in card_edges_capture.cu.
     cudaGraph_t g = nullptr;
     CK(cudaStreamEndCapture(s1, &g));
     CK(cudaStreamIsCapturing(s2, &st2));

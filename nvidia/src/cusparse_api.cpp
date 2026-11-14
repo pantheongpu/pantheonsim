@@ -579,7 +579,9 @@ VGPU_EXPORT cusparseStatus_t cusparseCreate(cusparseHandle_t* h) {
     std::fprintf(stderr, "[vgpu] cuSPARSE handle created (host-computed)\n");
   return CUSPARSE_STATUS_SUCCESS;
 }
+// Destroying nothing (a null handle or descriptor) is a success, as on an RTX 3060's cuSPARSE 13.0.
 VGPU_EXPORT cusparseStatus_t cusparseDestroy(cusparseHandle_t h) {
+  if (!h) return CUSPARSE_STATUS_SUCCESS;
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   untrack(h); delete reinterpret_cast<Handle*>(h);
   return CUSPARSE_STATUS_SUCCESS;
@@ -609,16 +611,42 @@ VGPU_EXPORT cusparseStatus_t cusparseGetProperty(libraryPropertyType type, int* 
   }
   return CUSPARSE_STATUS_SUCCESS;
 }
-VGPU_EXPORT const char* cusparseGetErrorString(cusparseStatus_t s) {
+// Each status's name and sentence as an RTX 3060's cuSPARSE 13.0 gives them; a value that is no status is
+// "unrecognized error code" in both.
+VGPU_EXPORT const char* cusparseGetErrorName(cusparseStatus_t s) {
   switch (s) {
     case CUSPARSE_STATUS_SUCCESS: return "CUSPARSE_STATUS_SUCCESS";
     case CUSPARSE_STATUS_NOT_INITIALIZED: return "CUSPARSE_STATUS_NOT_INITIALIZED";
+    case CUSPARSE_STATUS_ALLOC_FAILED: return "CUSPARSE_STATUS_ALLOC_FAILED";
     case CUSPARSE_STATUS_INVALID_VALUE: return "CUSPARSE_STATUS_INVALID_VALUE";
+    case CUSPARSE_STATUS_ARCH_MISMATCH: return "CUSPARSE_STATUS_ARCH_MISMATCH";
+    case CUSPARSE_STATUS_MAPPING_ERROR: return "CUSPARSE_STATUS_MAPPING_ERROR";
+    case CUSPARSE_STATUS_EXECUTION_FAILED: return "CUSPARSE_STATUS_EXECUTION_FAILED";
+    case CUSPARSE_STATUS_INTERNAL_ERROR: return "CUSPARSE_STATUS_INTERNAL_ERROR";
+    case CUSPARSE_STATUS_MATRIX_TYPE_NOT_SUPPORTED: return "CUSPARSE_STATUS_MATRIX_TYPE_NOT_SUPPORTED";
+    case CUSPARSE_STATUS_ZERO_PIVOT: return "CUSPARSE_STATUS_ZERO_PIVOT";
     case CUSPARSE_STATUS_NOT_SUPPORTED: return "CUSPARSE_STATUS_NOT_SUPPORTED";
-    default: return "CUSPARSE_STATUS_INTERNAL_ERROR";
+    case CUSPARSE_STATUS_INSUFFICIENT_RESOURCES: return "CUSPARSE_STATUS_INSUFFICIENT_RESOURCES";
+    default: return "unrecognized error code";
   }
 }
-VGPU_EXPORT const char* cusparseGetErrorName(cusparseStatus_t s) { return cusparseGetErrorString(s); }
+VGPU_EXPORT const char* cusparseGetErrorString(cusparseStatus_t s) {
+  switch (s) {
+    case CUSPARSE_STATUS_SUCCESS: return "success";
+    case CUSPARSE_STATUS_NOT_INITIALIZED: return "initialization error";
+    case CUSPARSE_STATUS_ALLOC_FAILED: return "out of memory";
+    case CUSPARSE_STATUS_INVALID_VALUE: return "invalid value";
+    case CUSPARSE_STATUS_ARCH_MISMATCH: return "architecture mismatch";
+    case CUSPARSE_STATUS_MAPPING_ERROR: return "texture memory mapping error";
+    case CUSPARSE_STATUS_EXECUTION_FAILED: return "kernel launch failure";
+    case CUSPARSE_STATUS_INTERNAL_ERROR: return "internal error";
+    case CUSPARSE_STATUS_MATRIX_TYPE_NOT_SUPPORTED: return "matrix type not supported";
+    case CUSPARSE_STATUS_ZERO_PIVOT: return "zero pivot";
+    case CUSPARSE_STATUS_NOT_SUPPORTED: return "operation not supported";
+    case CUSPARSE_STATUS_INSUFFICIENT_RESOURCES: return "insufficient resources";
+    default: return "unrecognized error code";
+  }
+}
 
 /* ---- sparse matrix descriptors ---- */
 
@@ -628,6 +656,12 @@ static cusparseStatus_t make_sparse(cusparseSpMatDescr_t* out, cusparseFormat_t 
                                     cusparseIndexType_t idx_type, cusparseIndexBase_t base,
                                     cudaDataType vt) {
   if (!out || rows < 0 || cols < 0 || nnz < 0) return CUSPARSE_STATUS_INVALID_VALUE;
+  // An index base other than zero or one, and (CSR, CSC, COO) more entries than the matrix has places, are refused
+  // (an RTX 3060's cuSPARSE 13.0: "nnz (10) > matrix size (9)").
+  if (base != CUSPARSE_INDEX_BASE_ZERO && base != CUSPARSE_INDEX_BASE_ONE) return CUSPARSE_STATUS_INVALID_VALUE;
+  if ((fmt == CUSPARSE_FORMAT_CSR || fmt == CUSPARSE_FORMAT_CSC || fmt == CUSPARSE_FORMAT_COO) &&
+      static_cast<unsigned __int128>(nnz) > static_cast<unsigned __int128>(rows) * static_cast<unsigned __int128>(cols))
+    return CUSPARSE_STATUS_INVALID_VALUE;
   if (!type_bytes(vt) || !index_bytes(off_type) || !index_bytes(idx_type)) {
     std::fprintf(stderr, "[vgpu] cusparse: only half, bfloat16, float and double values, real or "
                          "complex, with 32- or 64-bit indices are implemented\n");
@@ -737,6 +771,7 @@ VGPU_EXPORT cusparseStatus_t cusparseCreateConstBsr(cusparseConstSpMatDescr_t* d
 }
 
 VGPU_EXPORT cusparseStatus_t cusparseDestroySpMat(cusparseConstSpMatDescr_t d) {
+  if (!d) return CUSPARSE_STATUS_SUCCESS;
   if (!known(d)) return CUSPARSE_STATUS_INVALID_VALUE;
   untrack(d); delete reinterpret_cast<const SpMat*>(d);
   return CUSPARSE_STATUS_SUCCESS;
@@ -837,6 +872,7 @@ VGPU_EXPORT cusparseStatus_t cusparseCreateConstDnVec(cusparseConstDnVecDescr_t*
   return rc;
 }
 VGPU_EXPORT cusparseStatus_t cusparseDestroyDnVec(cusparseConstDnVecDescr_t d) {
+  if (!d) return CUSPARSE_STATUS_SUCCESS;
   if (!known(d)) return CUSPARSE_STATUS_INVALID_VALUE;
   untrack(d); delete reinterpret_cast<const DnVec*>(d);
   return CUSPARSE_STATUS_SUCCESS;
@@ -865,6 +901,10 @@ VGPU_EXPORT cusparseStatus_t cusparseCreateDnMat(cusparseDnMatDescr_t* d, int64_
                                                  int64_t cols, int64_t ld, void* v, cudaDataType t,
                                                  cusparseOrder_t order) {
   if (!d || rows < 0 || cols < 0) return CUSPARSE_STATUS_INVALID_VALUE;
+  // The order is ROW or COL, and a row (ROW) or column (COL) fits in the leading dimension: an RTX 3060's
+  // cuSPARSE 13.0 refuses the rest ("ld (2) < rows (3) with order=COL").
+  if (order != CUSPARSE_ORDER_ROW && order != CUSPARSE_ORDER_COL) return CUSPARSE_STATUS_INVALID_VALUE;
+  if (ld < (order == CUSPARSE_ORDER_COL ? rows : cols)) return CUSPARSE_STATUS_INVALID_VALUE;
   if (!type_bytes(t)) return CUSPARSE_STATUS_NOT_SUPPORTED;
   auto* x = new DnMat{rows, cols, ld, v, t, order};
   *d = reinterpret_cast<cusparseDnMatDescr_t>(track(x));
@@ -880,6 +920,7 @@ VGPU_EXPORT cusparseStatus_t cusparseCreateConstDnMat(cusparseConstDnMatDescr_t*
   return rc;
 }
 VGPU_EXPORT cusparseStatus_t cusparseDestroyDnMat(cusparseConstDnMatDescr_t d) {
+  if (!d) return CUSPARSE_STATUS_SUCCESS;
   if (!known(d)) return CUSPARSE_STATUS_INVALID_VALUE;
   untrack(d); delete reinterpret_cast<const DnMat*>(d);
   return CUSPARSE_STATUS_SUCCESS;
@@ -1005,21 +1046,50 @@ cusparseStatus_t spmv_check(cusparseOperation_t op, const SpMat& A, const DnVec&
   if (!type_bytes(ct)) return CUSPARSE_STATUS_NOT_SUPPORTED;
   if (bad_conj(op, A.value_type)) return CUSPARSE_STATUS_INVALID_VALUE;
   if (!complex_combo_ok(A.value_type, X.type, Y.type, ct, true)) return CUSPARSE_STATUS_NOT_SUPPORTED;
+  // A, x and y of one real type compute in that type, half and bfloat16 in single (an RTX 3060's cuSPARSE 13.0
+  // refuses single data computed in double or half, and half computed in half).
+  if (!is_complex(A.value_type) && A.value_type == X.type && A.value_type == Y.type && !is_complex(ct)) {
+    const cudaDataType want =
+        A.value_type == CUDA_R_16F || A.value_type == CUDA_R_16BF ? CUDA_R_32F : A.value_type;
+    if (ct != want) return CUSPARSE_STATUS_NOT_SUPPORTED;
+  }
+  // CSR takes the default, CSR_ALG1 and CSR_ALG2 (0, 2, 3); the COO and sliced-ELL algorithms are invalid for it.
+  if (A.format == CUSPARSE_FORMAT_CSR && alg != CUSPARSE_SPMV_ALG_DEFAULT && alg != CUSPARSE_SPMV_CSR_ALG1 &&
+      alg != CUSPARSE_SPMV_CSR_ALG2)
+    return CUSPARSE_STATUS_INVALID_VALUE;
   // BSR: only A itself, as NVIDIA's (CUSPARSE_SPMV_BSR_ALG1) takes it.
   if (A.format == kFormatBsr && op != CUSPARSE_OPERATION_NON_TRANSPOSE) return CUSPARSE_STATUS_NOT_SUPPORTED;
   return CUSPARSE_STATUS_SUCCESS;
 }
+
+// The workspace cusparseSpMV asks for. The simulator's SpMV needs none, but an RTX 3060's cuSPARSE 13.0 asks for
+// some whenever A has entries, and its cusparseSpMV refuses a null buffer then; so the size is the card's, for CSR
+// with the default algorithm or CSR_ALG1: 7 + 4 bytes per started 1536 entries with 32-bit indices, 15 + 8 with
+// 64-bit (per 2048 entries for double A^T). Other formats and algorithms are given the same size; the card asks for
+// more there (CSR_ALG2 551 bytes and up for A itself, COO 540 and up), which the simulator does not use.
+size_t spmv_buffer_bytes(cusparseOperation_t op, const SpMat& A) {
+  if (A.nnz <= 0) return 0;
+  const int64_t per = op != CUSPARSE_OPERATION_NON_TRANSPOSE && A.value_type == CUDA_R_64F ? 2048 : 1536;
+  const auto chunks = static_cast<size_t>((A.nnz + per - 1) / per);
+  return A.row_type == CUSPARSE_INDEX_64I || A.col_type == CUSPARSE_INDEX_64I ? 15 + 8 * chunks : 7 + 4 * chunks;
+}
 }  // namespace
 
-VGPU_EXPORT cusparseStatus_t cusparseSpMV_bufferSize(cusparseHandle_t, cusparseOperation_t op,
+VGPU_EXPORT cusparseStatus_t cusparseSpMV_bufferSize(cusparseHandle_t h, cusparseOperation_t op,
                                                      const void*, cusparseConstSpMatDescr_t matA,
                                                      cusparseConstDnVecDescr_t vecX, const void*,
                                                      cusparseDnVecDescr_t vecY, cudaDataType ct,
                                                      cusparseSpMVAlg_t alg, size_t* bytes) {
-  if (bytes) *bytes = 0;   // host-computed: no device workspace to size
-  if (known(matA) && known(vecX) && known(vecY))
-    return spmv_check(op, *reinterpret_cast<const SpMat*>(matA), *reinterpret_cast<const DnVec*>(vecX),
-                      *reinterpret_cast<const DnVec*>(vecY), ct, alg);
+  // A null handle, descriptor or size is an invalid value on the card.
+  if (!h || !matA || !vecX || !vecY || !bytes) return CUSPARSE_STATUS_INVALID_VALUE;
+  *bytes = 0;
+  if (known(matA) && known(vecX) && known(vecY)) {
+    const auto& A = *reinterpret_cast<const SpMat*>(matA);
+    if (const cusparseStatus_t st = spmv_check(op, A, *reinterpret_cast<const DnVec*>(vecX),
+                                               *reinterpret_cast<const DnVec*>(vecY), ct, alg))
+      return st;
+    *bytes = spmv_buffer_bytes(op, A);
+  }
   return CUSPARSE_STATUS_SUCCESS;
 }
 
@@ -1028,8 +1098,14 @@ VGPU_EXPORT cusparseStatus_t cusparseSpMV(cusparseHandle_t h, cusparseOperation_
                                           cusparseConstDnVecDescr_t vecX, const void* beta,
                                           cusparseDnVecDescr_t vecY, cudaDataType ct,
                                           cusparseSpMVAlg_t alg, void* buffer) {
+  // A null handle or descriptor is an invalid value (an RTX 3060); one the library does not know is not initialized.
+  if (!h || !matA || !vecX || !vecY) return CUSPARSE_STATUS_INVALID_VALUE;
   if (!known(h) || !known(matA) || !known(vecX) || !known(vecY))
     return CUSPARSE_STATUS_NOT_INITIALIZED;
+  // An unknown operation and a null alpha or beta are invalid values (an RTX 3060), not read through.
+  if (!alpha || !beta || (op != CUSPARSE_OPERATION_NON_TRANSPOSE && op != CUSPARSE_OPERATION_TRANSPOSE &&
+                          op != CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE))
+    return CUSPARSE_STATUS_INVALID_VALUE;
   if (capturing(h)) {
     auto held = std::make_shared<Held>();
     const cusparseHandle_t hc = held->handle(h);
@@ -1044,6 +1120,8 @@ VGPU_EXPORT cusparseStatus_t cusparseSpMV(cusparseHandle_t h, cusparseOperation_
   const auto& X = *reinterpret_cast<const DnVec*>(vecX);
   auto& Y = *reinterpret_cast<DnVec*>(vecY);
   if (const cusparseStatus_t st = spmv_check(op, A, X, Y, ct, alg); st != CUSPARSE_STATUS_SUCCESS) return st;
+  // The card refuses a null buffer where cusparseSpMV_bufferSize asks for one (A has entries).
+  if (!buffer && spmv_buffer_bytes(op, A)) return CUSPARSE_STATUS_INVALID_VALUE;
   return any_complex({A.value_type, X.type, Y.type, ct}) ? spmv<cd>(h, op, alpha, A, X, beta, Y, ct)
                                                          : spmv<double>(h, op, alpha, A, X, beta, Y, ct);
 }
@@ -1489,14 +1567,21 @@ size_t element_bytes(cudaDataType t) {
 }  // namespace
 
 VGPU_EXPORT cusparseStatus_t cusparseCsr2cscEx2_bufferSize(
-    cusparseHandle_t h, int, int, int, const void*, const int*, const int*, void*, int*, int*,
+    cusparseHandle_t h, int, int n, int nnz, const void*, const int*, const int*, void*, int*, int*,
     cudaDataType valType, cusparseAction_t copyValues, cusparseIndexBase_t,
-    cusparseCsr2CscAlg_t, size_t* bufferSize) {
+    cusparseCsr2CscAlg_t alg, size_t* bufferSize) {
+  if (!h) return CUSPARSE_STATUS_INVALID_VALUE;   // as on an RTX 3060
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (!bufferSize) return CUSPARSE_STATUS_INVALID_VALUE;
   if (copyValues == CUSPARSE_ACTION_NUMERIC && !element_bytes(valType))
     return CUSPARSE_STATUS_NOT_SUPPORTED;
-  *bufferSize = 0;  // the work happens on the host
+  // CUSPARSE_CSR2CSC_ALG1 (also the default, 1) is the only algorithm the card's cuSPARSE 13.0 takes.
+  if (alg != CUSPARSE_CSR2CSC_ALG1) return CUSPARSE_STATUS_INVALID_VALUE;
+  // The work happens on the host, but the card always asks for a workspace and cusparseCsr2cscEx2 refuses a null
+  // one, so the size is the card's for small problems: 1431 bytes, 8 per column, 256 + 4 per entry when there are
+  // any, and 384 more for values (it grows faster for many entries, its sort's own workspace).
+  *bufferSize = 1431 + 8 * static_cast<size_t>(std::max(n, 0)) + (nnz > 0 ? 256 + 4 * static_cast<size_t>(nnz) : 0) +
+                (copyValues == CUSPARSE_ACTION_NUMERIC ? 384 : 0);
   return CUSPARSE_STATUS_SUCCESS;
 }
 
@@ -1504,6 +1589,7 @@ VGPU_EXPORT cusparseStatus_t cusparseCsr2cscEx2(
     cusparseHandle_t h, int m, int n, int nnz, const void* csrVal, const int* csrRowPtr,
     const int* csrColInd, void* cscVal, int* cscColPtr, int* cscRowInd, cudaDataType valType,
     cusparseAction_t copyValues, cusparseIndexBase_t idxBase, cusparseCsr2CscAlg_t alg, void* buffer) {
+  if (!h) return CUSPARSE_STATUS_INVALID_VALUE;   // as on an RTX 3060
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (capturing(h)) {
     auto held = std::make_shared<Held>();
@@ -1520,6 +1606,8 @@ VGPU_EXPORT cusparseStatus_t cusparseCsr2cscEx2(
   if (!numeric && copyValues != CUSPARSE_ACTION_SYMBOLIC) return CUSPARSE_STATUS_INVALID_VALUE;
   const size_t vb = element_bytes(valType);
   if (numeric && !vb) return CUSPARSE_STATUS_NOT_SUPPORTED;
+  // Only CUSPARSE_CSR2CSC_ALG1, and the workspace cusparseCsr2cscEx2_bufferSize always asks for (an RTX 3060).
+  if (alg != CUSPARSE_CSR2CSC_ALG1 || !buffer) return CUSPARSE_STATUS_INVALID_VALUE;
   if (n == 0) return CUSPARSE_STATUS_SUCCESS;
   if (!cscColPtr) return CUSPARSE_STATUS_INVALID_VALUE;
   const int base = idxBase == CUSPARSE_INDEX_BASE_ONE ? 1 : 0;
@@ -1682,24 +1770,28 @@ VGPU_EXPORT cusparseStatus_t cusparseCreateMatDescr(cusparseMatDescr_t* d) {
   return CUSPARSE_STATUS_SUCCESS;
 }
 VGPU_EXPORT cusparseStatus_t cusparseDestroyMatDescr(cusparseMatDescr_t d) {
+  if (!d) return CUSPARSE_STATUS_SUCCESS;
   if (!descr(d)) return CUSPARSE_STATUS_INVALID_VALUE;
   untrack(d);
   delete reinterpret_cast<MatDescr*>(d);
   return CUSPARSE_STATUS_SUCCESS;
 }
-#define VGPU_DESCR_FIELD(Name, Type, field)                                                    \
+// Each field takes only the values its enum has (an RTX 3060: matrix types 0..3, and 0 or 1 for the others); any
+// other is an invalid value and the field keeps what it had.
+#define VGPU_DESCR_FIELD(Name, Type, field, last)                                              \
   VGPU_EXPORT cusparseStatus_t cusparseSetMat##Name(cusparseMatDescr_t d, Type v) {            \
     if (!descr(d)) return CUSPARSE_STATUS_INVALID_VALUE;                                       \
+    if (static_cast<unsigned>(v) > static_cast<unsigned>(last)) return CUSPARSE_STATUS_INVALID_VALUE; \
     descr(d)->field = v;                                                                       \
     return CUSPARSE_STATUS_SUCCESS;                                                            \
   }                                                                                            \
   VGPU_EXPORT Type cusparseGetMat##Name(const cusparseMatDescr_t d) {                          \
     return descr(d) ? descr(d)->field : Type{};                                                \
   }
-VGPU_DESCR_FIELD(Type, cusparseMatrixType_t, type)
-VGPU_DESCR_FIELD(FillMode, cusparseFillMode_t, fill)
-VGPU_DESCR_FIELD(DiagType, cusparseDiagType_t, diag)
-VGPU_DESCR_FIELD(IndexBase, cusparseIndexBase_t, base)
+VGPU_DESCR_FIELD(Type, cusparseMatrixType_t, type, CUSPARSE_MATRIX_TYPE_TRIANGULAR)
+VGPU_DESCR_FIELD(FillMode, cusparseFillMode_t, fill, CUSPARSE_FILL_MODE_UPPER)
+VGPU_DESCR_FIELD(DiagType, cusparseDiagType_t, diag, CUSPARSE_DIAG_TYPE_UNIT)
+VGPU_DESCR_FIELD(IndexBase, cusparseIndexBase_t, base, CUSPARSE_INDEX_BASE_ONE)
 #undef VGPU_DESCR_FIELD
 
 /* ---- legacy index conversions and sorts (32-bit indices, as the API defines them) ---- */

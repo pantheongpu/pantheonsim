@@ -7,6 +7,136 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Under `vgpu run --preload`, where the driver is loaded privately (#597), CUPTI and NVSHMEM now find it: they looked driver
+  functions up in the global scope only, which a private library is not in. CUPTI's callbacks named a placeholder for the current
+  context instead of the one the program's driver calls find current, and `nvshmemx_cumodule_init` and `nvshmemx_culibrary_init`
+  failed, so a module loaded with the driver API never got its `nvshmemi_device_state_d`. They now ask the runtime's lookup, which
+  tries the private driver first (`nvidia/src/driver_symbol.hpp`). So does the runtime's own check for driver-API managed memory
+  before deferring an asynchronous copy, which still looked in the global scope only. `e2e_preload_torch_like` runs a third program
+  (`preload_torch_peers.cpp`), and `lint_driver_lookups` keeps any shim other than the driver from looking a driver function up in
+  the global scope alone.
+- `cuProfilerStart`, `cuProfilerStop`, `cudaProfilerStart` and `cudaProfilerStop` answer as an RTX 3060 does (CUDA 13.0); they
+  used to succeed always. The driver's return `CUDA_ERROR_NOT_INITIALIZED` before `cuInit`, `CUDA_ERROR_INVALID_CONTEXT` with no
+  current context, `CUDA_ERROR_CONTEXT_IS_DESTROYED` when the current context is dead (destroyed, or a primary context released
+  to nothing or reset), and a dead context's fault. The runtime's are runtime calls like any other: they start the runtime and make
+  the primary context current on the calling thread, and answer a dead context's fault or `cudaErrorNoDevice`. And after
+  `cuDevicePrimaryCtxReset`, the runtime's next call makes the primary context active again, as on the card
+  (`cuDevicePrimaryCtxGetState` kept reporting it inactive). New test `test_profiler_control`.
+- Runtime: every call that fails makes its error the thread's last error, as on an RTX 3060. Only the calls that went through the
+  runtime's guard did: `cudaEventElapsedTime` on an event never recorded, `cudaStreamWaitEvent` with an unknown flag,
+  `cudaStreamBeginCapture`/`cudaStreamEndCapture` refusals, `cudaMemcpy2D` with a pitch too small, `cudaMemcpy3D` and `cudaMemset3D`
+  with bad arguments, a captured event's `cudaErrorCapturedEvent` and others left `cudaGetLastError` at success. A query's not-ready
+  still sets nothing, and a call the simulator makes inside another does not count (found by differential testing against an RTX 3060;
+  `e2e_card_edges_last_error`).
+- Runtime: a copy kind that is none of the five is `cudaErrorInvalidMemcpyDirection` (21) from `cudaMemcpy`, `cudaMemcpyAsync`, the 2D
+  copies and `cudaMemcpy3D`, as on an RTX 3060, not `cudaErrorInvalidValue` (`e2e_card_edges_copy_kind`).
+- Runtime: 2D pitches are checked as an RTX 3060 checks them. `cudaMemset2D` of more than one row with a pitch narrower than the row is
+  `cudaErrorInvalidValue` and writes nothing; it used to fill the overlapping rows and succeed. `cudaMemcpy2D` of a single row accepts a
+  pitch of 0 (it was `cudaErrorInvalidPitchValue`), and a set pitch narrower than the row is `cudaErrorInvalidValue` there
+  (`e2e_card_edges_pitch`).
+- Runtime: `cudaEventCreateWithFlags`, `cudaHostAlloc` and `cudaMallocManaged` refuse flags the card refuses (an unknown bit;
+  Interprocess without DisableTiming; managed memory with 0 or both attach flags) with `cudaErrorInvalidValue` and create nothing.
+  They took any value (`e2e_card_edges_alloc_flags`).
+- Runtime: once a stream capture is invalidated, launches, `cudaMemcpyAsync`, `cudaMemsetAsync`, `cudaEventRecord` and
+  `cudaStreamWaitEvent` on its streams fail with `cudaErrorStreamCaptureInvalidated` until `cudaStreamEndCapture`, as on an RTX 3060;
+  they were recorded and succeeded. `cudaEventSynchronize` and `cudaEventQuery` of a captured event also invalidate a Relaxed-mode
+  capture, and answer `cudaErrorInvalidValue` once it is invalidated; `cudaStreamEndCapture` from a stream that joined the capture
+  invalidates it. `e2e_capture_streams` no longer continues a capture after those two calls (`e2e_card_edges_capture`).
+- Runtime: `cudaPointerGetAttributes` of an address in the device range that no live allocation covers (a freed pointer, one past
+  the end) answers success and `cudaMemoryTypeUnregistered` with device -2, as an RTX 3060 does for any address CUDA does not know. It
+  was `cudaErrorInvalidValue`, which also became the last error (`e2e_runtime_conformance`).
+- cuBLAS: `cublasSetPointerMode` refuses a mode other than HOST and DEVICE, and `cublasSetMathMode` a value above 31, keeping the old
+  setting; both were stored, and an unknown pointer mode made later calls read host scalars as device pointers.
+  `cublasGetStatusName`/`cublasGetStatusString` give the card's names and sentences (ARCH_MISMATCH, MAPPING_ERROR, EXECUTION_FAILED
+  and LICENSE_ERROR were all "CUBLAS_STATUS_INTERNAL_ERROR", and the string was the name). An empty `cublasSgemm` may pass a null C,
+  and `cublasSetMatrix`/`cublasGetMatrix` with a short leading dimension no longer leave a runtime last error
+  (`e2e_card_edges_cublas`).
+- cuSOLVER: `getrs` refuses an unknown operation, negative sizes and short leading dimensions; it solved with them, and `n = -1`
+  aborted the program with `std::length_error`. `potrf`, `potrs`, `syevd` and `gesvd` refuse unknown fill modes and jobs, negative
+  sizes and short leading dimensions with LAPACK's info (minus the argument's position), `getrf` with `lda < m` succeeds with info -4,
+  and `gesvd` with `m < n` is `CUSOLVER_STATUS_INVALID_VALUE` with info 0 (it was NOT_SUPPORTED). `gesvd` with `jobu = 'O'` or
+  `jobvt = 'O'` works, writing the vectors over A; it was refused. `cusolverDnSetAdvOptions` refuses unknown functions and algorithms
+  (`e2e_card_edges_cusolver`).
+- cuSPARSE: `cusparseCreateCsr/Csc/Coo` refuse an unknown index base and more entries than the matrix has places,
+  `cusparseCreateDnMat` an unknown order and a leading dimension below a column (COL) or row (ROW), and `cusparseSpMV` an unknown
+  operation, a null alpha or beta, a non-CSR algorithm for a CSR matrix, and a compute type the card does not offer for the data
+  (`CUSPARSE_STATUS_NOT_SUPPORTED`, also from `cusparseSpMV_bufferSize`). The `cusparseSetMat*` setters refuse values their enums do
+  not have, destroying a null handle or descriptor succeeds, and `cusparseGetErrorName`/`String` give the card's texts
+  (`e2e_card_edges_cusparse`).
+- cuBLAS: `?gemv` takes what an RTX 3060's cuBLAS 13.0 takes. A negative `m` or `n` is an empty product and a zero
+  increment is a stride of zero (`incx = 0` reads `x[0]` for every element; with `incy = 0`, `y[0]` keeps row 0's result):
+  the simulator refused them with `CUBLAS_STATUS_INVALID_VALUE`, leaving `y` as it was where the card computes it. An
+  operation other than N is a transpose (`CUBLAS_OP_CONJG` is `conj(A)` for `cgemv`/`zgemv` and `A` for the real types; it
+  was taken as `A^H`), and `cgemv`/`zgemv` refuse an `lda` below `m`, which they read past. The other level-2 routines
+  and the GEMMs (`?gemm`, `cublasHgemm`, `?gemm3m`) print reference BLAS's line for the first bad argument on stdout, as
+  the card does (" ** On entry to SGER   parameter number 5 had an illegal value"); `?symv`/`?hemv` refuse silently, and
+  `?gemv` prints nothing (found by differential testing; `e2e_card_edges_blas2`).
+- Runtime: `cudaMemcpy3D` and `cudaMemcpy3DAsync` between pitched pointers check pitches and `ysize` as an RTX 3060 does. One
+  row of one slice accepts a pitch of 0 (it was `cudaErrorInvalidPitchValue`) and refuses a set pitch narrower than the
+  row with `cudaErrorInvalidValue`, the 3D form of the one-row `cudaMemcpy2D` fix; more than one slice needs a `ysize` of
+  at least the rows (0 included: the simulator took 0 for the rows and copied); a set `ysize` that does not hold the rows
+  from `pos.y` is `cudaErrorInvalidValue` (it copied overlapping slices). An extent with a side of 0 copies nothing; the
+  simulator copied one row or one slice for a height or depth of 0 (`e2e_card_edges_pitch`).
+- cuSOLVER: `potrf` (`cusolverDn?potrf`, `cusolverDnXpotrf`) of a matrix that is not positive definite leaves A as an
+  RTX 3060 does: the columns before the failing one factored, NaN on the failing diagonal, and then, from the lower
+  triangle, the rest factored with that column taken as 0; from the upper, NaN in every row from the failing one. The
+  simulator left A untouched (measured up to n = 32; the card factors larger matrices in blocks, which changes the part
+  after the failing column). `getrf` without pivoting multiplies the column below a zero pivot by 0 and goes on, as
+  the card does; it skipped the column, leaving it as it was (`e2e_card_edges_cusolver`, `test_host_dense`).
+- cuSPARSE: `cusparseSpMV_bufferSize` asks for the workspace the card asks for (11 bytes and up for a CSR matrix with
+  entries) and `cusparseSpMV` refuses a null buffer then; it asked for 0 and took null. A null handle, matrix or vector
+  is `CUSPARSE_STATUS_INVALID_VALUE` from both (it was NOT_INITIALIZED, or success for the size).
+  `cusparseCsr2cscEx2`/`_bufferSize` take `CUSPARSE_CSR2CSC_ALG1` only and refuse a null handle, the size is never 0,
+  and a null buffer is refused (`e2e_card_edges_cusparse`).
+- Driver: `cuCtxSetCurrent` takes a destroyed context, as an RTX 3060 does (it was `CUDA_ERROR_INVALID_CONTEXT`), and every
+  call that needs a context answers `CUDA_ERROR_CONTEXT_IS_DESTROYED` while the current one is dead: destroyed, a primary
+  context released to nothing, or reset. `cudaDeviceReset` now resets the driver's primary context as
+  `cuDevicePrimaryCtxReset` does, so the driver's calls are `CUDA_ERROR_CONTEXT_IS_DESTROYED` until the runtime's next
+  call that uses the device; they succeeded. That call, after `cuCtxSetCurrent(NULL)` or destroying the program's own
+  context, makes the primary context current again, as on the card (the thread was left with none). The runtime's
+  queries (`cudaGetDeviceCount`, `cudaGetDevice`, `cudaGetDeviceProperties`, `cudaDeviceGetAttribute`,
+  `cudaPointerGetAttributes`) no longer make the primary context current or active, as on the card
+  (`e2e_card_edges_context`).
+- AMD: the SDWA, DPP and VOP3P modifiers and the denormal and IEEE modes around them, audited against the guides and an RX 6800
+  (follow-up to pantheonsim #613). The output modifier (`mul:2`, `mul:4`, `div:2`) did nothing on gfx942 and gfx950 only with IEEE mode
+  or output denormals on; it now does nothing then on gfx90a, gfx1030 and gfx1100 too (CDNA2 to CDNA4 guides, 6.5, the RDNA3 guide,
+  7.2.3.1, and the card, which
+  a code object's defaults always hit), and applied, a result it makes denormal is flushed keeping its sign while a zero becomes +0;
+  the tier leaves an output modifier to the interpreter there. `v_div_scale_f32` and `v_div_scale_f64` wrote their result unclamped
+  and unscaled: the card clamps it (a NaN to 0) and scales it like any VOP3 float result (every target, gfx1250's too). neg_lo and neg_hi on the packed integer
+  instructions (`v_pk_add_u16` and the rest) were ignored by the interpreter and the tier; they flip the half's top bit, as the card
+  does. gfx90a and gfx1030 take the guides' rule for `v_min`/`v_max` (f16, f32, f64, packed): -0 is below +0, and with IEEE mode a
+  signalling NaN gives a NaN, without it the other operand (the CDNA2 guide's pseudocode, and the card); they took the host's fmin and
+  fmax; there a denormal operand is a zero where MODE flushes input
+  denormals (the result is an operand, which the host's DAZ left as it was). A half's denormals are flushed where `float_denorm_mode_16_64`
+  says (the card does; they were always kept). gfx1030's SDWA comparisons (`v_cmp_*_sdwa`) were refused as not implemented. gfx11's
+  VOP3 DPP with op_sel read the first source from its own lane, not the shuffled one. On gfx1030 `v_dot2_f32_f16` flushes a denormal
+  addend whatever MODE says and keeps denormal halves, as the card does. New test `test_amd_gcn_mods`
+  (`amd/tests/data/asm_mods.s`: 50 SDWA and DPP, 36 VOP3P and VOP3 and 24 gfx11 VOP3 DPP instructions over 1024 edge inputs, in three modes,
+  gfx90a, gfx942, gfx1030 and gfx1100, tier off and on; the gfx1030 kernels run on the card gave exactly what the test expects).
+  test_amd_gcn_same_bits: 96 lines re-recorded, the ones these change (its header lists them). Not fixed: gfx1030's VOP2 16-bit
+  results keep the destination's high half on the card (`v_min_f16_e32`), where the executor zeroes it as gfx9 does.
+  `amd/tests/hipcc/rdna3.cpp` expected `v_add_f32_e64 ... div:2` to halve in a default-mode (IEEE on) hipcc kernel; it now expects the
+  modifier ignored (`rdna3.gfx1100` and `rdna3.w64.gfx1100` rebuilt: host code only, the device code is the same).
+- AMD: the clamp bit of the integer instructions saturates their result on every target, as the CDNA3 and CDNA4 guides say (6.5, and
+  "Supports saturation" on each add and subtract) and as an RX 6800 does. The VOP3b adds and subtracts with a carry out (`v_add_co_u32`,
+  `v_sub_co_u32`, `v_subrev_co_u32`, `v_addc_co_u32`, `v_subb_co_u32`, `v_subbrev_co_u32`, RDNA's `_co_ci_` forms) and `v_mad_u64_u32` /
+  `v_mad_i64_i32` ignored it (gfx9's decoder did not read the bit, and neither the interpreter nor the tier applied it), so
+  `v_add_co_u32_e64 ... clamp`, LLVM's unsigned saturating add on gfx8, wrapped; clamped, a sum past the type's range is its maximum, a
+  difference below zero is zero, and the carry out stays the unclamped one's. `v_mad_u32_u24`, `v_mad_i32_i24`, `v_mul_u32_u24`,
+  `v_mul_i32_i24`, `v_sad_u8`, `v_sad_hi_u8`, `v_sad_u16`, `v_msad_u8`, `v_mul_lo_u16` and `v_mad_legacy_u16` ignored it too, and
+  `v_subrev_u32`, `v_subrev_u16`, `v_mad_u16`, `v_mad_i16`, `v_mad_u32_u16` and `v_mad_i32_i16` applied it on gfx942 and gfx950 only.
+  `v_mad_i64_i32`'s scalar bit is bit 64 of the 65-bit result (the guides' pseudocode, and the card's): the sign of the exact result, not
+  whether it overflowed int64, which it was. New test `test_amd_gcn_int_clamp` (gfx90a, gfx942 and gfx1030, tier off and on; its gfx1030
+  kernel run on the card gave what the test expects) (follow-up to pantheonsim #613).
+- SASS: a lane group the simulator lets another group of its warp past in the middle of a loop (the turn a group gives after many
+  backward branches while other lanes wait, which is the simulator's own fairness and not a YIELD) gets its uniform registers and
+  predicates back as it left them when it runs again. ptxas keeps a counted loop's index on one side of a divergent branch in a uniform
+  register that the other side reuses, because the hardware runs one side to its BSYNC or EXIT unless it meets a YIELD; the other side's
+  write landed in the loop. pravirkr/loki's sm_90 EP scorer (`kernel_ep_shift_add_score_c2c`) walked UR4 through a row of shared memory
+  while the lanes of invalid leaves loaded a pointer into UR4, and after the 64th trip stopped with "a shared address (0x8ded482c) naming
+  block 141 of a cluster of 1"; the PTX path and the card were right. `SR_CgaCtaId` was not involved: it reads 0 in a launch without
+  clusters. New unit test `test_sass_uniform_switch`, SASS and PTX (pantheonsim #642).
 - Runtime: a copy, fill or kernel launch issued on a stream behind a host function that has not finished returns at once and runs
   after it, in stream order, as on an RTX 3060. It used to run inside the call after waiting for the host function, so a host function
   that waits for something the program does after the call (Celeritas' `AsyncSnapshotTest.device_pending`) hung the program.
