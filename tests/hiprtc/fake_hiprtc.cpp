@@ -100,18 +100,6 @@ API int hiprtcAddNameExpression(void* prog, const char* e) {
   p->exprs.push_back(e);
   return 0;
 }
-// A library by name, as the real libhiprtc loads its compiler: through this library's own RUNPATH ($ORIGIN). Under ThreadSanitizer the
-// dlopen is its interceptor's call, so the lookup runs against the interceptor's caller and the RUNPATH is not this library's; then the
-// library beside this one is the same file.
-static void* open_dependency(const char* name) {
-  if (void* h = dlopen(name, RTLD_NOW | RTLD_LOCAL)) return h;
-  Dl_info info;
-  if (!dladdr(reinterpret_cast<void*>(&open_dependency), &info) || !info.dli_fname) return nullptr;
-  std::string path = info.dli_fname;
-  path.resize(path.rfind('/') == std::string::npos ? 0 : path.rfind('/') + 1);
-  return dlopen((path + name).c_str(), RTLD_NOW | RTLD_LOCAL);
-}
-
 API int hiprtcCompileProgram(void* prog, int n, const char** options) {
   auto* p = static_cast<Program*>(prog);
   if (!p) return 4;
