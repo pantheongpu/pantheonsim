@@ -73,6 +73,10 @@ release says what runs and what it produces, never how fast a real GPU would run
     (eigensolvers::steepest_descent 45 to 41 CPU-s).
   - A wave's three- and four-word loads and stores of managed or host memory (`hipMallocManaged`, `hipHostMalloc`) go to memory as one batch
     on one host thread, as its one- and two-word ones did (hamiltonian::ks_hamiltonian with `VGPU_THREADS=1`: 30.7 s to 27.4 s).
+- cuSPARSE: `cusparseSpMV` and `cusparseSpMV_bufferSize` take only the fifteen (A, x, y, compute) type combinations an RTX 3060's
+  cuSPARSE 13.0 takes, measured over all 10,000 combinations of the ten types for CSR, CSC and COO and each operation; the others are
+  `CUSPARSE_STATUS_NOT_SUPPORTED` with the card's "type combination ... is not supported" line. The simulator computed 1257 more (a
+  single A with half or double vectors of mixed kinds, int8 into double, ...).
 - NVIDIA runtime: `cudaGetDeviceFlags` answers the current context's flags, or the device's primary context's with
   `cudaDeviceMapHost` when no context is current, as an RTX 3060 (CUDA 13.0) does (after `cudaSetDeviceFlags`, `cudaInitDevice` with
   `cudaInitDeviceFlagsAreValid`, or `cuDevicePrimaryCtxSetFlags`); it answered 0, and success for a null pointer. `cudaSetDeviceFlags`
