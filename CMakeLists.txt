@@ -4468,6 +4468,15 @@ if(TARGET vgpucudart)
       TIMEOUT 300)
   endforeach()
 endif()
+foreach(_edge cublas)
+  if(TARGET vgpucudart AND TARGET vgpu${_edge})
+    add_test(NAME e2e_card_edges_${_edge} COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh ${_edge} -l${_edge})
+    set_tests_properties(e2e_card_edges_${_edge} PROPERTIES
+      DEPENDS "vgpucudart;vgpu${_edge}"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      TIMEOUT 300)
+  endif()
+endforeach()
 
 # The session's ncu: Nsight Compute's command line answered from the simulator's
 # counters, checked against kernels whose metrics follow from their addresses.

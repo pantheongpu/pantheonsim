@@ -30,6 +30,12 @@ release says what runs and what it produces, never how fast a real GPU would run
 - Runtime: `cudaPointerGetAttributes` of an address in the device range that no live allocation covers (a freed pointer, one past
   the end) answers success and `cudaMemoryTypeUnregistered` with device -2, as an RTX 3060 does for any address CUDA does not know. It
   was `cudaErrorInvalidValue`, which also became the last error (`e2e_runtime_conformance`).
+- cuBLAS: `cublasSetPointerMode` refuses a mode other than HOST and DEVICE, and `cublasSetMathMode` a value above 31, keeping the old
+  setting; both were stored, and an unknown pointer mode made later calls read host scalars as device pointers.
+  `cublasGetStatusName`/`cublasGetStatusString` give the card's names and sentences (ARCH_MISMATCH, MAPPING_ERROR, EXECUTION_FAILED
+  and LICENSE_ERROR were all "CUBLAS_STATUS_INTERNAL_ERROR", and the string was the name). An empty `cublasSgemm` may pass a null C,
+  and `cublasSetMatrix`/`cublasGetMatrix` with a short leading dimension no longer leave a runtime last error
+  (`e2e_card_edges_cublas`).
 - Runtime: a copy, fill or kernel launch issued on a stream behind a host function that has not finished returns at once and runs
   after it, in stream order, as on an RTX 3060. It used to run inside the call after waiting for the host function, so a host function
   that waits for something the program does after the call (Celeritas' `AsyncSnapshotTest.device_pending`) hung the program.
