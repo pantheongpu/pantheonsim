@@ -5037,8 +5037,9 @@ struct Machine {
         "v_pk_fmac_f16", "v_sat_pk_u8_i16", "v_mac_f16", "v_mad_legacy_f16"};
     return kDefined.count(name) != 0;
   }
-  // The 16-bit instructions of gfx1030 that gfx9_added_alu runs, which the RDNA2 code did not have: an RX 6800 and an RX 6700 XT give what
-  // those bodies give, bit for bit, on the inputs of test_amd_gcn_hi16 (ones, halves, twos, denormals, infinities, a NaN, zeros of both signs).
+  // The 16-bit instructions of gfx1030 and gfx1100 that gfx9_added_alu runs, which the RDNA code did not have: an RX 6800 and an RX 6700 XT
+  // give what those bodies give, bit for bit, on the inputs of test_amd_gcn_hi16 (ones, halves, twos, denormals, infinities, a NaN, zeros of
+  // both signs). gfx1100: no card; AMD's machine-readable RDNA3 ISA describes each of them in the same words as its RDNA2 one.
   static bool rdna2_shares(const std::string& full) {
     std::string name = full;
     for (const char* suffix : {"_e32", "_e64", "_dpp"})
@@ -6042,7 +6043,7 @@ struct Machine {
          (in.arch == gcn::Target::Gfx950 && (op == "v_minimum3_f32"_op || op == "v_maximum3_f32"_op ||
                                              op == "v_pk_minimum3_f16"_op || op == "v_pk_maximum3_f16"_op))) &&
         cdna5_alu(w, in, op)) {return;} else if (gcn::is_rdna(in.arch) && rdna_alu(w, in, op)) {return;} else if (carry_alu(w, in)) {return;} else if (more_alu(w, in, op)) {return;} else if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950 || (in.arch == gcn::Target::Gfx90a && cdna2_defines(in.name)) ||
-         (in.arch == gcn::Target::Gfx1030 && rdna2_shares(in.name))) &&
+         ((in.arch == gcn::Target::Gfx1030 || in.arch == gcn::Target::Gfx1100) && rdna2_shares(in.name))) &&
         gfx9_added_alu(w, in)) {return;} else {
   switch (op.hash()) {
     case "v_mov_b16_e32"_op.hash: case "v_mov_b16_e64"_op.hash: case "v_mov_b16"_op.hash:

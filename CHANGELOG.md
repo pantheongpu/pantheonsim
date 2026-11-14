@@ -134,6 +134,11 @@ release says what runs and what it produces, never how fast a real GPU would run
   card does. The tier hands gfx1030's NaN results, its `v_div_fixup_f32` and its `v_sin_f32` to the interpreter. New test
   `test_amd_gcn_nan` (`amd/tests/data/asm_nan.s`: 65 f16 and f32 instructions over pairs of 11 special values, IEEE mode on and off,
   every dword against the cards'). test_amd_gcn_same_bits: 31 lines re-recorded (its header lists them).
+- AMD: gfx1100 refused eleven instructions as "decoded but not implemented": `v_frexp_mant_f16`, `v_frexp_exp_i16_f16`, `v_sin_f16`,
+  `v_cos_f16`, `v_ldexp_f16`, `v_sat_pk_u8_i16`, `v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16`, and the VOP3 `v_ashrrev_i16`, `v_max_i16`
+  and `v_min_i16`. They run now, through the code gfx1030 uses (AMD's machine-readable RDNA3 ISA describes each in the same words as its
+  RDNA2 one; no RDNA3 card was run). `test_amd_gcn_hi16` runs them on gfx1100 against the gfx1030 cards' low halves and checks that
+  every gfx1100 16-bit result keeps the other half of its register. test_amd_gcn_same_bits: 7 gfx1100 lines re-recorded.
   `amd/tests/hipcc/rdna3.cpp` expected `v_add_f32_e64 ... div:2` to halve in a default-mode (IEEE on) hipcc kernel; it now expects the
   modifier ignored (`rdna3.gfx1100` and `rdna3.w64.gfx1100` rebuilt: host code only, the device code is the same).
 - AMD: the clamp bit of the integer instructions saturates their result on every target, as the CDNA3 and CDNA4 guides say (6.5, and

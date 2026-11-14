@@ -32,6 +32,8 @@
 // NaN (v_sub_f16/f32, v_div_fixup_f16/f32, v_fma_f32, v_min_f32, v_floor_f32, v_ceil_f32, v_frexp_mant_f32: now the cards' NaN) or a sine of a
 // whole number of turns (v_sin_f32, now +0), and v_div_fixup_f16 on the other targets (11 lines: 1098, 3046-3047, 4930-4931, 6842-6844, 8653,
 // 12637-12638), whose 0/y case now gives the guides' signed zero where the baseline gave the quotient's magnitude.
+// Seven more after gfx1100 ran its VOP3 v_ashrrev_i16, v_max_i16 and v_min_i16 as gfx1030 does (lines 6229, 7083-7085, 7116-7118), whose
+// baseline digest was the text of "decoded but not implemented".
 // Every other digest is the baseline's.
 #include <cstdint>
 #include <cstdio>

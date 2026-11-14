@@ -39,7 +39,18 @@ uint32_t old_of(int t) { return uint32_t(0x5a00 | t) << 16 | kH[(t * 3 + 2) & 15
 //                        012345678901234567890123456789012345678901234567890123456789012345678901234
 constexpr char kGfx9[] = "ZZZXXZZZZZZZZZZZZZZZXXZZZZZZZXXXZZZZZZZXXZZZZZZZZPPPPXXXXXXXXXHHHXXFFPZZZXX";
 constexpr char kGfx10[] = "PPPPPPPPPPPPPPPPPPPZPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPHHHPPFFPNNNNN";
-static_assert(sizeof kGfx9 == kOps + 1 && sizeof kGfx10 == kOps + 1);
+// gfx1100 (no card): its 16-bit results are register halves (true16), the other half kept (LLVM's zeroesHigh16BitsOfDest: only gfx9 and
+// before zero it); v_sat_pk_u8_i16's other half is not established there (X).
+constexpr char kGfx11[] = "PPPPPPPPPPPPPPPPPPPXPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPHHHPPFFPNNNNN";
+static_assert(sizeof kGfx9 == kOps + 1 && sizeof kGfx10 == kOps + 1 && sizeof kGfx11 == kOps + 1);
+// The slots of the instructions gfx1100 runs through the gfx1030 code (frexp_mant, frexp_exp, sin, cos, sat_pk_u8_i16, cvt_norm_i16/u16,
+// ldexp, and VOP3 ashrrev_i16, max_i16, min_i16): their low halves are compared with the gfx1030 cards' (a NaN's bits are not).
+constexpr int kShared11[] = {10, 11, 17, 18, 19, 20, 21, 28, 44, 46, 48};
+bool shared11(int op) {
+  for (int s : kShared11)
+    if (s == op) return true;
+  return false;
+}
 
 amd::CodeObject object(const char* target) {
   const std::string path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/asm_hi16." + target + ".o";
@@ -58,7 +69,8 @@ std::vector<uint32_t> card(const char* target) {
 }
 
 int run(const char* target, const char* rules, bool wave32, bool tier) {
-  const std::vector<uint32_t> want = card(target);
+  const bool gfx11 = std::string(target) == "gfx1100";
+  const std::vector<uint32_t> want = card(gfx11 ? "gfx1030" : target);
   if (!want.empty() && want.size() != size_t{kOps} * kItems) throw vtest::Failure(std::string("a short card file for ") + target);
   const amd::CodeObject o = object(target);
   MemoryManager mem(4ull << 20);
@@ -101,7 +113,12 @@ int run(const char* target, const char* rules, bool wave32, bool tier) {
         case 'N': ok = g == old; break;
         default: break;
       }
-      if (ok && !want.empty()) ok = g == want[op * kItems + t];
+      if (ok && !want.empty() && !gfx11) ok = g == want[op * kItems + t];
+      if (ok && gfx11 && shared11(op)) {
+        const uint32_t c = want[op * kItems + t] & 0xFFFFu, l = g & 0xFFFFu;
+        const auto nan16 = [](uint32_t v) { return (v & 0x7FFFu) > 0x7C00u; };
+        ok = nan16(c) ? nan16(l) : l == c;
+      }
       if (ok) continue;
       ++wrong;
       if (shown++ < 2)
@@ -132,6 +149,12 @@ VTEST(gfx9_16_bit_results_zero_the_high_half_but_the_vop3_multiply_adds) {
 
 VTEST(gfx10_16_bit_results_keep_the_high_half) {
   VCHECK_EQ(run_both("gfx1030", kGfx10, true), 0);
+}
+
+// gfx1100 runs the eleven instructions it refused, as gfx1030 does them (AMD's machine-readable RDNA3 ISA describes each in the same words
+// as its RDNA2 one; no card), and keeps the high half of every 16-bit result.
+VTEST(gfx11_16_bit_results_keep_the_high_half_and_run_the_rdna2_instructions) {
+  VCHECK_EQ(run_both("gfx1100", kGfx11, true), 0);
 }
 
 VTEST_MAIN
