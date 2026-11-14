@@ -71,6 +71,15 @@ release says what runs and what it produces, never how fast a real GPU would run
   and the GEMMs (`?gemm`, `cublasHgemm`, `?gemm3m`) print reference BLAS's line for the first bad argument on stdout, as
   the card does (" ** On entry to SGER   parameter number 5 had an illegal value"); `?symv`/`?hemv` refuse silently, and
   `?gemv` prints nothing (found by differential testing; `e2e_card_edges_blas2`).
+- cuBLAS: the level-3 routines and the extensions print the card's line for their first bad argument on stdout too:
+  `?symm`, `?hemm`, `?syrk`, `?herk`, `?syr2k`, `?her2k`, `?syrkx`, `?herkx`, `?trsm`, `?trmm`, `?geam` (and `_64`),
+  `?dgmm`, `?gemmBatched`, `?gemmStridedBatched`, `?trsmBatched`, `cublasHgemm(Strided)Batched`,
+  `cublasCgemm3m(Strided)Batched`, `cublasGemmEx`, `cublasGemmBatchedEx`, `cublasGemmStridedBatchedEx` (and `_64`),
+  `cublasSgemmEx`, `cublasCgemmEx`, `cublasCgemm3mEx` and the Ex herk/syrk forms, each with the field and position an
+  RTX 3060's cuBLAS 13.0 prints (" ** On entry to SSYMM  parameter number 7 had an illegal value", "SBATCHED TRSM ",
+  "GEMM_EX " with GemmEx's own positions). `cublasCgemm3mBatched` printed `CgemmBatched`'s field. `cublasGemmEx` and its
+  batched forms refuse an algorithm outside `CUBLAS_GEMM_DEFAULT`..`ALGO23` and `DEFAULT_TENSOR_OP`..`ALGO15_TENSOR_OP`,
+  as the card does; they ran it (found by differential testing; `e2e_card_edges_blas3`).
 - Runtime: `cudaMemcpy3D` and `cudaMemcpy3DAsync` between pitched pointers check pitches and `ysize` as an RTX 3060 does. One
   row of one slice accepts a pitch of 0 (it was `cudaErrorInvalidPitchValue`) and refuses a set pitch narrower than the
   row with `cudaErrorInvalidValue`, the 3D form of the one-row `cudaMemcpy2D` fix; more than one slice needs a `ysize` of
