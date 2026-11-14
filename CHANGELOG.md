@@ -99,7 +99,8 @@ release says what runs and what it produces, never how fast a real GPU would run
   (`e2e_card_edges_context`).
 - AMD: the SDWA, DPP and VOP3P modifiers and the denormal and IEEE modes around them, audited against the guides and an RX 6800
   (follow-up to pantheonsim #613). The output modifier (`mul:2`, `mul:4`, `div:2`) did nothing on gfx942 and gfx950 only with IEEE mode
-  or output denormals on; it now does nothing then on gfx90a, gfx1030 and gfx1100 too (CDNA2 to CDNA4 guides, 6.5, and the card, which
+  or output denormals on; it now does nothing then on gfx90a, gfx1030 and gfx1100 too (CDNA2 to CDNA4 guides, 6.5, the RDNA3 guide,
+  7.2.3.1, and the card, which
   a code object's defaults always hit), and applied, a result it makes denormal is flushed keeping its sign while a zero becomes +0;
   the tier leaves an output modifier to the interpreter there. `v_div_scale_f32` and `v_div_scale_f64` wrote their result unclamped
   and unscaled: the card clamps it (a NaN to 0) and scales it like any VOP3 float result (every target, gfx1250's too). neg_lo and neg_hi on the packed integer
@@ -115,6 +116,8 @@ release says what runs and what it produces, never how fast a real GPU would run
   gfx90a, gfx942, gfx1030 and gfx1100, tier off and on; the gfx1030 kernels run on the card gave exactly what the test expects).
   test_amd_gcn_same_bits: 96 lines re-recorded, the ones these change (its header lists them). Not fixed: gfx1030's VOP2 16-bit
   results keep the destination's high half on the card (`v_min_f16_e32`), where the executor zeroes it as gfx9 does.
+  `amd/tests/hipcc/rdna3.cpp` expected `v_add_f32_e64 ... div:2` to halve in a default-mode (IEEE on) hipcc kernel; it now expects the
+  modifier ignored (`rdna3.gfx1100` and `rdna3.w64.gfx1100` rebuilt: host code only, the device code is the same).
 - AMD: the clamp bit of the integer instructions saturates their result on every target, as the CDNA3 and CDNA4 guides say (6.5, and
   "Supports saturation" on each add and subtract) and as an RX 6800 does. The VOP3b adds and subtracts with a carry out (`v_add_co_u32`,
   `v_sub_co_u32`, `v_subrev_co_u32`, `v_addc_co_u32`, `v_subb_co_u32`, `v_subbrev_co_u32`, RDNA's `_co_ci_` forms) and `v_mad_u64_u32` /

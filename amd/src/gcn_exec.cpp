@@ -1478,7 +1478,8 @@ struct Machine {
   // CDNA2, CDNA3 and CDNA4 (guides, 6.5): "Output modifiers are not compatible with output denormals: if output denormals are enabled, then
   // output modifiers are ignored ... Output modifiers are ignored if the IEEE mode bit is set to 1." Applied, "-0 is flushed to +0" and a
   // result the multiplier makes denormal is flushed to zero, keeping its sign (an RX 6800: -2^-126 div:2 is -0; it ignores the output
-  // modifier with IEEE mode or output denormals on, as the guides say). The rules of every target with an IEEE mode bit (gfx9, gfx10, gfx11);
+  // modifier with IEEE mode or output denormals on, as the guides say; the RDNA3 guide, 7.2.3.1, has the same text). The rules of every target
+  // with an IEEE mode bit (gfx9, gfx10, gfx11);
   // gfx12 and gfx1250 apply the multiplier as they did. `denorm_bit` is the FP_DENORM bit that allows output denormals for the type: 5 for
   // single precision, 7 for double and half.
   static bool omod_rules(const Inst& in) { return in.arch != gcn::Target::Gfx1200 && in.arch != gcn::Target::Gfx1250; }
