@@ -10386,9 +10386,14 @@ struct Machine {
     return mem.host_map_possible(addrs[0]) ? mem.host_store_batch(addrs, n, bytes, vals) || mem.store_batch(addrs, n, bytes, vals)
                                            : mem.store_batch(addrs, n, bytes, vals);
   }
+  // One batch of loads, wherever the first address is: a host mapping's (managed and host memory, which load_batch declines after a
+  // table lookup under a lock) is asked first.
+  bool load_any(const uint64_t* addrs, uint32_t n, uint32_t bytes, uint64_t* vals) const {
+    return mem.host_map_possible(addrs[0]) ? mem.host_load_batch(addrs, n, bytes, vals) || mem.load_batch(addrs, n, bytes, vals)
+                                           : mem.load_batch(addrs, n, bytes, vals);
+  }
   bool load_wave(const uint64_t* addrs, uint32_t n, uint32_t bytes, uint64_t* vals) const {
-    // (An address in a host mapping is the host batch's, asked first: load_batch declines it, after a table lookup under a lock.)
-    if (mem.host_map_possible(addrs[0]) ? mem.host_load_batch(addrs, n, bytes, vals) || mem.load_batch(addrs, n, bytes, vals) : mem.load_batch(addrs, n, bytes, vals)) return true;
+    if (load_any(addrs, n, bytes, vals)) return true;
     if (bytes != 8) return false;
     uint64_t bits = 0, odd = 0;
     for (uint32_t i = 0; i < n; ++i) bits |= addrs[i], odd |= addrs[i] & 4;
@@ -10475,7 +10480,8 @@ struct Machine {
       a4[n - 1] = pair_first ? a + 8 : a;
     }
     if (!n) return true;
-    if ((bits & 3) || !mem.load_batch(a8, n, 8, v8) || !mem.load_batch(a4, n, 4, v4)) return false;
+    // (load_any: three words a lane of managed memory were declined here and read a lane at a time, Round sp70)
+    if ((bits & 3) || !load_any(a8, n, 8, v8) || !load_any(a4, n, 4, v4)) return false;
     uint32_t* rows[3];
     rows_of(w, dst, 3, rows);
     uint32_t* const r0 = rows[0];
@@ -13112,7 +13118,7 @@ bool Machine::wave_store_words(Wave& w, uint32_t from, const uint64_t* lane_addr
   }
   if (!n) return true;
   if (bits & 3) return false;
-  return mem.store_batch(a, n, 4, v);
+  return store_wave(a, n, 4, v);   // (a host mapping's batch first, as the loads': Round sp70)
 }
 
 bool Machine::wave_load4(Wave& w, uint32_t from, const uint64_t* lane_addr, const Operand& dst) {
@@ -13134,10 +13140,11 @@ bool Machine::wave_load4(Wave& w, uint32_t from, const uint64_t* lane_addr, cons
   }
   if (!n) return true;
   if (bits & 3) return false;
+  // (load_any: a quad of managed memory -- a complex double of inq's -- was declined here and read a lane at a time, Round sp70)
   for (uint32_t c = 0; c < n8; c += kLanes)
-    if (!mem.load_batch(a8 + c, std::min<uint32_t>(kLanes, n8 - c), 8, v8 + c)) return false;
+    if (!load_any(a8 + c, std::min<uint32_t>(kLanes, n8 - c), 8, v8 + c)) return false;
   for (uint32_t c = 0; c < n4; c += kLanes)
-    if (!mem.load_batch(a4 + c, std::min<uint32_t>(kLanes, n4 - c), 4, v4 + c)) return false;
+    if (!load_any(a4 + c, std::min<uint32_t>(kLanes, n4 - c), 4, v4 + c)) return false;
   uint32_t* rows[4];
   rows_of(w, dst, 4, rows);
   uint32_t* const r0 = rows[0];
