@@ -78,6 +78,10 @@ count: 1
 # a whole number of at least 0; default: 0
 # scheduler_seed: 1
 
+# What is kept of hiprtc's compile results (AMD run-time compilation, done by ROCm's own compiler): disk keeps them in memory and in files for later processes, mem for the process only, off compiles every time.
+# one of: disk, mem, off; default: disk
+# hiprtc_cache: disk
+
 # Refuse undefined behaviour (integer division by zero, storing an unwritten register).
 # true or false; default: false
 # strict: false

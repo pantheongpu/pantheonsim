@@ -1,0 +1,55 @@
+control: the unchanged file built this way passes
+ 0 killed by 7 check(s), first: "a new compile for another source, kept in its turn": key: without the source
+ 1 killed by 1 check(s), first: "a new compile for another program name, kept in its turn": key: without the program's name
+ 2 killed by 2 check(s), first: "a new compile for another option, kept in its turn": key: without the options
+ 3 killed by 1 check(s), first: "a new compile for another header text, kept in its turn": key: without the headers' text
+ 4 killed by 1 check(s), first: "a new compile for another header name, kept in its turn": key: without the headers' names
+ 5 killed by 2 check(s), first: "a new compile for another name expression, kept in its turn": key: without the name expressions
+ 6 killed by 1 check(s), first: "a new compile for another device architecture, kept in its turn": key: without the device's architecture
+ 7 killed by 1 check(s), first: "a new compile for a compiler variable in the environment, kept in its turn": key: without the environment
+ 8 killed by 4 check(s), first: "a new compile for another device bitcode library, kept in its turn": key: without the toolchain
+ 9 killed by 1 check(s), first: "<hip/hip_runtime.h> changed and still guarded (a new compile, then kept): compiled once": key: without the hip_runtime.h files
+10 killed by 2 check(s), first: "a new compile for another device bitcode library, kept in its turn": toolchain: without the device bitcode and configuration files
+11 killed by 1 check(s), first: "a new compile for another compiler library, kept in its turn": toolchain: without the compiler library
+12 killed by 1 check(s), first: "a new compile for another built-in header library, kept in its turn": toolchain: the built-in header library by name only
+13 killed by 1 check(s), first: "a new compile for a compiler variable in the environment, kept in its turn": environment: only the HIPRTC_ variables
+14 killed by 2 check(s), first: "an entry that is another program's is not used": entry: used on its name alone (the key not compared) (second pass: it survived the first, where the foreign entry's program had no name expression and the base's had one)
+15 killed by 2 check(s), first: "an entry with one bit of its code changed is not used": entry: the body's check not made
+16 killed by 2 check(s), first: "an entry with bytes after its end is not used": entry: its length not held to its head
+17 killed by 2 check(s), first: "an entry of another format is not used": entry: any format
+18 killed by 2 check(s), first: "an entry that is not an entry is not used": entry: any magic
+19 killed by 1 check(s), first: "an entry others may write is not used": entry: a file others may write is read
+20 killed by 1 check(s), first: "a cache directory others may write is not used: compiled every time, nothing written": directory: one others may write is used
+21 killed by 1 check(s), first: "the cache stays under VGPU_HIPRTC_CACHE_MAX_MB once a process has written to it": cap: never trimmed
+22 killed by 1 check(s), first: "... and is not emptied": cap: trimmed to nothing
+23 killed by 1 check(s), first: "VGPU_HIPRTC_CACHE_MAX_MB=0 keeps everything": cap: 0 is a cap of nothing
+24 killed by 2 check(s), first: "VGPU_HIPRTC_CACHE=mem writes no file": mode: mem writes files
+25 killed by 1 check(s), first: "... nor kept in memory: a program compiled twice in a process is compiled twice": mode: 0 still answers from the cache (third pass: it survived the second, the test had no program compiled twice with the cache off)
+26 killed by 2 check(s), first: "a compile that fails gives the real library's code and log": cacheable: a failed compile is kept
+27 killed by 6 check(s), first: "the option -g: compiled every time": cacheable: any option
+28 killed by 1 check(s), first: "a reserved macro: compiled every time": cacheable: a reserved macro
+29 killed by 1 check(s), first: "an option handed to the preprocessor: compiled every time": cacheable: options handed to another tool
+30 killed by 2 check(s), first: "an #include of a file that was not given: compiled every time": cacheable: an include that was not given
+31 killed by 1 check(s), first: "an #include through a macro: compiled every time": cacheable: an include that is not a file name
+32 killed by 1 check(s), first: "an #include on a continued line: compiled every time": cacheable: continued lines not joined
+33 killed by 2 check(s), first: "__DATE__: compiled every time": cacheable: __DATE__ and __FILE__
+34 killed by 1 check(s), first: ""#include" in a comment: compiled once": cacheable: comments are read as code
+35 killed by 2 check(s), first: "<hip/hip_runtime.h> with an include path: compiled every time": runtime header: with an include path
+36 killed by 1 check(s), first: "<hip/hip_runtime.h> with CPATH set: compiled every time": runtime header: with CPATH
+37 killed by 4 check(s), first: "<hip/hip_runtime.h> with something after its guard: compiled every time": runtime header: any file
+38 killed by 1 check(s), first: "<hip/hip_runtime.h> with something after its guard: compiled every time": runtime header: something after the guard
+39 killed by 1 check(s), first: "<hip/hip_runtime.h> with a declaration before its guard: compiled every time": runtime header: something before the guard (second pass: it survived the first, where the only thing before the guard was a directive)
+40 killed by 1 check(s), first: "<hip/hip_runtime.h> under another guard: compiled every time": runtime header: any guard
+41 killed by 1 check(s), first: "<hip/hip_runtime.h> that is nowhere: compiled every time": runtime header: nowhere is fine
+42 killed by 1 check(s), first: "<hip/hip_runtime.h> under a built-in header without the guard: compiled every time": runtime header: the built-in header's guard not looked for
+43 killed by 1 check(s), first: "hiprtc_runtime.h in the working directory: compiled every time": cacheable: hiprtc_runtime.h in the working directory
+44 killed by 1 check(s), first: "no device to ask for the architecture: compiled every time": cacheable: no device to ask
+45 killed by 2 check(s), first: "the calls of "late-expr" give the real library's answers, cold and from the cache": answers: a name expression after a cached compile is taken
+46 killed by 2 check(s), first: "a later process gets the same bytes from the files": answers: the lowered names in another order
+47 killed by 2 check(s), first: "the calls of "unknown-name" give the real library's answers, cold and from the cache": answers: an unknown name gets the first one's
+48 killed by 2 check(s), first: "a later process gets the same bytes from the files": answers: the log's size is the log's length
+49 killed by 26 check(s), first: "a later process gets the same bytes from the files": answers: one byte of code short
+50 killed by 1 check(s), first: "(a destroyed program's handle is left as it was, as ROCm's library leaves it: the comparis": answers: a destroy clears the caller's handle (ROCm's library leaves it)
+51 killed by 1 check(s), first: "the real library is found on the library path, past the simulator's own": search: the simulator's own library is taken for the real one
+52 killed by 1 check(s), first: "... and nothing is printed unasked": statistics: printed unasked
+53 of 53 killed (50 in the first pass, 52 in the second after the test gained two cases, the last after a third)

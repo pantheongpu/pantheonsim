@@ -18,6 +18,18 @@ release says what runs and what it produces, never how fast a real GPU would run
   `VGPU_AMD_BLOCKS_STATS=1` lists the blocks that ran most. Measured first: the dispatch loop is 18 to 35 % of an arithmetic-bound kernel on
   this engine and operand decode 17 to 32 %, and the same arithmetic written as one host loop over a wave's lanes costs 13 to 22 times less
   than the tier, which is what the design's later layers are for.
+- AMD run-time compilation (hiprtc) is cached ([round sp71](docs/perf-design/rounds/11-rounds-sp36-sp41.md)). A program that compiles kernels at
+  run time (VkFFT's plans, CuPy's and PyTorch's kernels) calls ROCm's own `libhiprtc`, about 150 ms a kernel on any GPU; `build/shim` now has a
+  `libhiprtc` (`.so.6` and `.so.7`) that loads ROCm's, forwards every entry point, and keeps what a compile returned -- the code, the log, the
+  lowered names -- in memory and in a file under `~/.cache/pantheonsim/hiprtc-v1`, keyed by everything the compile reads (source, name, headers,
+  options, name expressions, the device's architecture, the compiler's environment, and the toolchain's libraries and files). The same compile, in
+  the process or a later one, gets the bytes ROCm's library returned. Whatever the key cannot name completely is compiled by ROCm every time, as
+  before: includes that were not given (except the guarded `<hip/hip_runtime.h>`), `__DATE__`/`__FILE__`, options such as `-g` and `-include`,
+  failures, the bitcode and the link API. Six of inq's unit tests on the simulated MI300X: 217 s with the cache off, 172 s cold, 64 s warm (410, 345
+  and 237 CPU-s), the same outputs. On by default; `VGPU_HIPRTC_CACHE=0` or `mem` (settings key `hiprtc_cache`), `VGPU_HIPRTC_CACHE_DIR`,
+  `VGPU_HIPRTC_CACHE_MAX_MB` (256), `VGPU_HIPRTC_CACHE_STATS=1`, `VGPU_HIPRTC_REAL` ([cli.md](docs/cli.md)). Run-time compilation still needs
+  ROCm's compiler installed, as it did.
+
 - Host-GPU mode (experimental, opt-in), both modes: the share of the driver start that a launch must save by itself (the entry below) kept the
   start from programs of many short launches that repay it many times over: Rodinia hotspot, 1,000 launches of about 1 ms, was 2.27x faster in
   turbo mode before the share and 1.00x with it. A kernel the simulator has already run 200 times is now taken to be launched as many times

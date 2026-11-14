@@ -4305,6 +4305,164 @@ killed):
 * The user's CI runs 6 to 11 times slower than server3 on the same tests, and why was not found.
 * Real hardware: nothing here was compared with a card (the outputs are compared between builds of the simulator).
 
+## Round sp71 (hiprtc: ROCm's run-time compiler behind a cache of its results, `VGPU_HIPRTC_CACHE`)
+
+Branch `sp71-hiprtc-cache`, base `origin/sp69-hotspot-start` 77a8b8c8 (which holds Round sp70). Data, scripts and commands:
+[`data/sp71/`](../data/sp71/README.md). server3 (Ryzen 7 PRO 8840U, GCC 13.3, `Release`), which another round was building and measuring on
+at the same time: the wall times below move by a third from run to run, the CPU-seconds by less, the counts of compiles not at all. ROCm 6.4.4
+(debs extracted without root) for the real library; inq f939e63 as in Round sp70.
+
+### Why
+
+Round sp70's profile: inq's FFT is VkFFT, which makes a kernel for every plan and compiles it at run time through hiprtc. hiprtc is not the
+simulator's: it is ROCm's `libhiprtc.so` over `libamd_comgr.so` (clang and LLVM), native code that costs about 150 ms a kernel on a real card
+and on a simulated one, and 77 to 93% of the wall time of inq's short FFT tests. The kernels repeat: in one process (`operations::transform`
+compiles 224 and 130 are distinct) and from process to process (a suite is hundreds of processes that plan the same sizes).
+
+ROCm's compiler library has a cache of its own (`AMD_COMGR_CACHE=1`, off by default in 6.4.4). It keeps LLVM's back-end work, not the parse:
+`transform` went from 72.6 to 62.3 CPU-seconds with it warm, of some 34 s of compiling.
+
+### What was built
+
+`amd/src/hiprtc_cache.cpp`, a `libhiprtc` of the simulator's (`build/shim/libhiprtc.so.6`, `.so.7` and `.so`, target `vgpuhiprtc`; no simulator
+code is linked into it). It is first on the library path of a program run on the simulator, loads ROCm's `libhiprtc` (the next one on the
+program's search path that is not itself, then `ROCM_PATH/lib`, `HIP_PATH/lib`, `/opt/rocm/lib`; `VGPU_HIPRTC_REAL` names it) and defines the 18
+entry points ROCm 6.4.4's and 7.1.1's libraries export (the same 18, by `nm`). Every one is forwarded; a compile is also remembered.
+
+* **A program is the simulator's object until it has to be ROCm's.** `hiprtcCreateProgram` and `hiprtcAddNameExpression` record their arguments.
+  `hiprtcCompileProgram` builds the key and looks it up, in memory and then in a file. A hit makes no real program at all: the code, the log (its
+  size as ROCm's library reported it, and exactly the bytes it wrote) and the lowered names come from the entry. A miss makes the real program,
+  compiles it, and from then on every call on that program is ROCm's; what it returned is read back through its own calls and kept.
+* **The key is everything the compile reads**, found by tracing a real compile's file opens (`strace`) and the libraries' strings:
+  * the source, the program's name (the compiler uses it as the file's name), each header given with it and its name, the options in order, the
+    name expressions in order;
+  * the architecture of the current device, asked of the HIP runtime in the process as ROCm's library asks (`hipGetDevice`,
+    `hipGetDevicePropertiesR0600`; the runtime is loaded by the name `libamdhip64.so` where the program has not loaded it);
+  * the environment variables the compiler's two libraries read: `HIPRTC_*`, `HIP_*`, `AMD_*`, `ROCM_*`, `LLVM_*`, `CLANG_*`, `CCC_*`, `GPU_*`, the
+    include-path ones and `SOURCE_DATE_EPOCH`;
+  * the toolchain: ROCm's `libhiprtc` by content (the header every program is compiled with is inside it, in 6.4.4 and 7.1.1), `libamd_comgr` by
+    build id, size and time (it is 150 MB), and the files a compile reads from the installation: `llvm/bin/*.cfg` (clang's configuration),
+    `llvm/lib/clang/*/lib/amdgcn/bitcode/*.bc` (the device libraries) and the version files, by name, size and time.
+  An entry holds its whole key; the file's name is a hash of it, and a hit is an equal key.
+* **Which compiler library** the key names is the one the loader will load: the one already loaded, else the first on ROCm's `libhiprtc`'s own
+  search path (`dlinfo`) outside the system directories. After a real compile the loaded one is held against it, and a result is written to a file
+  only if they agree; a toolchain whose device bitcode is not where 6.4.4 keeps it, or whose compiler library is found only through the
+  loader's cache, is known only for the process (memory, no files).
+* **What cannot be named completely is compiled by ROCm every time**, with a reason in the statistics:
+  * an `#include` of a file the caller did not give, an `#include` that is not a file name, `#include_next`, `#import`, `#embed`, `__has_include`;
+  * `__DATE__`, `__TIME__`, `__TIMESTAMP__`, `__FILE__`, `__BASE_FILE__` (the compile's temporary directory, `/tmp/comgr-<random>`, is in `__FILE__`);
+  * any option outside a list of options that only change the code: `-O*`, `-std=`, `-W*` and `-w`, `-D`/`-U` of a name that is not reserved (not
+    `_X`, `__x`, `HIP*`, `CUDA*`: those steer the built-in header), `-ffp-contract=` and the fast-math family, `--offload-arch=`, `-mcpu=`, `-I` and
+    `-isystem` with nothing to find through them. So not `-g` (the temporary directory goes into the debug information: two real compiles differ),
+    `-include`, `-Wp,`, `@file`;
+  * a file named `hiprtc_runtime.h` in the working directory (the built-in header is included by that name, and the compile looks there first);
+  * no HIP runtime to ask for the architecture; a program created with arguments ROCm's library may have its own answer for (a null name).
+* **`#include <hip/hip_runtime.h>` is the exception**, because VkFFT's kernels begin with it and because it reads nothing: the built-in header
+  defines the file's include guard (`HIP_INCLUDE_HIP_HIP_RUNTIME_H`), and a traced compile opens the file and nothing it includes. It is
+  cacheable when ROCm's `libhiprtc` contains that `#define`, when every `hip/hip_runtime.h` the compile could find (the installation's
+  `include`, `ROCM_PATH`'s, `HIP_PATH`'s, `/usr/include`, `/usr/local/include`) has everything inside `#ifndef HIP_INCLUDE_HIP_HIP_RUNTIME_H` (those files go
+  into the key by name, size, time and content), when there is at least one, and when no option or variable gives an include path.
+* **What the cache has no answer for is ROCm's.** `hiprtcGetBitcode` and its size, a second compile, a name expression after the compile, a
+  lowered name that was not added, a null argument: the real program is made (and compiled, where the cache had answered) and the call is
+  forwarded. The link API (`hiprtcLink*`) works on bitcode the caller holds, not on programs: forwarded, never cached. A compile that fails is
+  never kept. With `VGPU_HIPRTC_CACHE=0` the real program is made at `hiprtcCreateProgram` and everything is forwarded.
+* **Files.** `VGPU_HIPRTC_CACHE_DIR`, else `$XDG_CACHE_HOME/pantheonsim/hiprtc-v1`, else `~/.cache/pantheonsim/hiprtc-v1` (beside the SASS and JIT
+  caches; a relative home is ignored, as theirs). The directory and every entry must be the user's alone, as the SASS cache's (a code object from
+  a directory others can write would be run). One file an entry: a head (magic, format, the two lengths, a check of each part), the key, the
+  rest. A writer writes a file of its own name and renames it, so a reader sees a whole entry or none and eight writers need no lock; a reader
+  takes an entry only if its length is its head's, both checks hold and the key is equal. `VGPU_HIPRTC_CACHE_MAX_MB` (256, as the JIT's cache;
+  0: none): at a process's first write and every 32nd after, the least recently used entries go until the directory is under nine tenths of the
+  cap (a hit renews an entry's time).
+
+### On by default, files included
+
+In memory there is nothing to weigh: within a process the toolchain is what is loaded. For the files the question is whether a later process
+can get bytes ROCm's library would not have returned to it. It cannot through the key (equal keys are equal inputs, and the entry carries the
+key), so what is left is an input the key does not have: a file of the toolchain replaced by one of the same size and time, or something
+the compiler reads that the trace and the strings did not show. Against that: a suite's compiles are the same from process to process, which is
+the whole gain, and a cache that has to be asked for is not there in the CI jobs that need it. So the default is `disk`; `mem` and `0` are one
+variable away (`hiprtc_cache` in the settings file), and the entry of `docs/cli.md` says what the key is.
+
+One thing a user should know: ROCm's own output is not always the same twice. A program with two name expressions came out with one size and
+two different contents in runs of the real library alone (the order it instantiates them in), and a non-empty log names the temporary
+directory. The cache hands back the bytes of one real compile, the first; it does not make the output more or less than what that compile
+returned.
+
+### inq: cold and warm
+
+`all_unit_tests "[dir][test]"` on the simulated MI300X, the cache off, then cold (one cache for the six tests, empty before the first) and
+warm. Wall seconds / CPU-seconds (user plus system), the median of three passes (`data/sp71/inq.md` has each pass; the machine was shared):
+
+| test | cache off | cold cache | warm cache | compiles | cold: real / memory / files | warm: files / memory |
+|---|---|---|---|---|---|---|
+| operations::laplacian | 6.7 s / 6 | 8.8 s / 8 | 2.0 s / 2 | 24 | 24 / 0 / 0 | 24 / 0 |
+| operations::gradient | 11.8 s / 10 | 8.0 s / 7 | 1.7 s / 1 | 48 | 24 / 0 / 24 | 48 / 0 |
+| operations::transform | 46.2 s / 61 | 46.4 s / 56 | 6.6 s / 22 | 224 | 130 / 94 / 0 | 130 / 94 |
+| hamiltonian::ks_hamiltonian | 24.9 s / 49 | 21.8 s / 48 | 12.4 s / 41 | 68 | 44 / 24 / 0 | 44 / 24 |
+| ground_state::initial_guess | 54.4 s / 177 | 40.8 s / 151 | 25.4 s / 121 | 98 | 71 / 27 / 0 | 71 / 27 |
+| systems::electrons | 73.6 s / 107 | 46.0 s / 74 | 16.0 s / 49 | 200 | 126 / 74 / 0 | 126 / 74 |
+| all six | 217.4 s / 410 | 171.8 s / 345 | 64.2 s / 237 | 662 | 419 / 219 / 24 | 443 / 219 |
+
+Warm, the six tests take 30% of the wall time and 58% of the CPU time of the cache off; cold, memory answers a third of the compiles (219 of
+662) and the files 24 more (`gradient`'s plans that `laplacian` had made). The quietest pass, the first: off 5.8, 11.8, 46.2, 23.6, 38.0 and
+51.2 s; warm 1.9, 1.7, 5.6, 11.1, 21.7 and 14.7 s. No compile of the six tests was refused by the cache (0 not cacheable). The output of every
+test (its text without the timestamps) is the same with the cache off, cold and warm, in all three passes. (The passes ran the library before two
+small changes of the last commit, the destroy call that no longer clears the handle among them; that commit's library was run once more, cold
+and warm: the same outputs and counts.)
+
+Four tests at once (`laplacian`, `gradient`, `transform`, `ks_hamiltonian`, started together, as `ctest -j4` does), seconds until all four are
+done, two runs each: cache off 70.0 and 63.5 s (166 and 167 CPU-s, 364 real compiles); cold, the four filling one empty cache at once, 39.3 and
+42.7 s (137 and 125 CPU-s; 231 and 230 real compiles, 118 answered from memory and 15 and 16 from files another of the four had just
+written); warm 29.5 and 16.6 s (73 and 75 CPU-s, no real compile). All four pass in every run with the same outputs.
+
+### Tests
+
+* **`hiprtc_cache`** (`tests/hiprtc/test_hiprtc_cache.cpp`, framework-free, no ROCm): against a stand-in for ROCm's library
+  (`tests/hiprtc/fake_hiprtc.cpp`) whose "code" is a function of everything a real compile depends on and which counts its compiles in a file,
+  in an installation the test makes in a temporary directory (the library, a compiler library and a built-in header library beside it, the
+  configuration file, a bitcode file, `include/hip/hip_runtime.h`). Each session of calls is a child process whose output is every result code,
+  size and byte it got (as hashes). 102 checks: the same output with the cache off, cold, from memory and from a file; one real compile for the
+  same inputs and a new one for each of fourteen changes (source, name, option, one option more, header text, header name, name expression, none,
+  architecture, a compiler variable, the bitcode file, the configuration file, the compiler library, the built-in header library); the
+  eleven kinds of program that are compiled every time and three that look like them and are not; `<hip/hip_runtime.h>` in ten situations; a failed
+  compile; six orders of calls the cache has no answer for; the link API; nine kinds of damaged or foreign entry, each not used and each
+  replaced; a directory and an entry others may write; eight processes on a cold cache; the size cap; `mem` and `0`; the statistics; the search
+  for the real library; a missing real library; the 18 entry points.
+* **`amd_hiprtc_cache`** (`amd/tests/e2e/run_hiprtc_cache.sh`, skips without ROCm): ROCm's own `libhiprtc`, alone (a directory with only
+  ROCm's library under the name the program asks for, first on the path) and behind the cache, four programs (a plain kernel; VkFFT's shape; a
+  template with a header and two name expressions; one that warns). Alone, the cache off, cold, warm and twice in one process: the same
+  result codes, code bytes, log and lowered names (the template's code by size against the runs of the real library alone, for the reason
+  above, and exactly between cold, warm and the second compile of a process); no real compile when warm; another simulated GPU compiled for
+  again; five orders of calls the cache has no answer for, each compared with ROCm alone; every `hiprtc*` symbol of ROCm's library defined by
+  the simulator's. 20 checks on server3.
+* Twelve single calls were also compared by hand between ROCm's library alone and the cache off, cold and warm (a destroy, a null name, null
+  handles, a size and a lowered name before any compile, a null name expression, one after the compile, an unknown name, a null size, a second
+  compile). Eleven agreed, a crash in ROCm's library on a null program included (the cache forwards it). One did not: ROCm's
+  `hiprtcDestroyProgram` leaves the caller's handle as it was and the first form of the cache cleared it. It leaves it now, and both tests hold
+  that.
+* `data/sp71/mutants.py`: 53 single edits of `hiprtc_cache.cpp`, each built into a library of its own and expected to fail `hiprtc_cache`
+  (`mutants.txt`; the unchanged file built the same way passes). All 53 are killed: each part of the key and of the toolchain's text left
+  out, an entry used on its name alone or with a check, its length, its format or its magic not looked at, files and directories others may
+  write, the cap (never, to nothing, 0 as a cap), `mem` writing files, `0` still caching, a failed compile kept, each rule of what is cacheable
+  dropped (any option, a reserved macro, `-Wp,`, an include that was not given or is not a file name, continued lines, `__DATE__`, comments read
+  as code, each condition on `<hip/hip_runtime.h>`, the working directory's `hiprtc_runtime.h`, no device), and the answers (a late name
+  expression taken, lowered names in another order, an unknown name answered, the log's size, a byte of code short, the handle cleared, the
+  simulator's own library taken for the real one, statistics printed unasked). Three survived the first pass and showed what the test did not
+  hold: an entry of another program was refused only because its number of name expressions differed (the test's foreign program has as
+  many now); text before the header's guard was only tried as a directive (a declaration now); and nothing compiled a program twice with the
+  cache off (one check more; the off switch was also tested in two places in the code, of which one is gone).
+
+### What was not verified
+
+* ROCm 7.x at run time: its `libhiprtc` was only read (`nm`: the same 18 exports; `strings`: the same libraries loaded by name, the header
+  inside it). Whether a 7.x installation keeps the device bitcode where the toolchain's rule looks decides between files and memory only.
+* A distribution's ROCm (Ubuntu's `libamd-comgr2` in `/usr/lib`): there the compiler library is in a system directory, so results are kept in
+  files only after the first real compile of a process has loaded it.
+* The real library calling its own entry points through the simulator's names (the guard for it has no test: neither ROCm's library nor the
+  stand-in does it).
+* `vgpu shell`'s isolated root, the Docker images and the GitHub Action: whatever copies `build/shim` gets the library; none was run.
+* inq's whole suite and the user's CI; the six tests are the ones with FFTs among Round sp70's eight.
+* Quiet-machine timings: another round shared server3. The counts, the outputs and the CPU-seconds are the firm part.
 ## Round sp72 (a compiled tier for AMD kernels, phase 1: the ceiling measured, the design, and blocks: `VGPU_AMD_BLOCKS`)
 
 Branch `sp72-amd-tier`, base `origin/sp69-hotspot-start` 77a8b8c8 (rounds sp69 and sp70). Design: [study 13](../13-amd-compiled-tier.md). Data,
