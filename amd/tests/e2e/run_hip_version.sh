@@ -21,7 +21,10 @@ expect() {  # expect <name> <expected> <actual>
 }
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-echo 'void hip_stand_in(void) {}' > "$tmp/stand_in.c"
+# Link-time stand-ins only: the two functions the program calls, answering an error, so a run that
+# reached a stand-in instead of the simulator's library could not print the expected versions.
+printf '%s\n' 'int hipRuntimeGetVersion(int* v) { *v = -1; return 1; }' \
+  'int hipDriverGetVersion(int* v) { *v = -1; return 1; }' > "$tmp/stand_in.c"
 for n in 6 7; do
   mkdir -p "$tmp/lib$n"
   gcc -shared -fPIC -Wl,-soname,libamdhip64.so.$n -o "$tmp/lib$n/libamdhip64.so.$n" "$tmp/stand_in.c"
