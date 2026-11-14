@@ -7,6 +7,14 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- SASS: a lane group the simulator lets another group of its warp past in the middle of a loop (the turn a group gives after many
+  backward branches while other lanes wait, which is the simulator's own fairness and not a YIELD) gets its uniform registers and
+  predicates back as it left them when it runs again. ptxas keeps a counted loop's index on one side of a divergent branch in a uniform
+  register that the other side reuses, because the hardware runs one side to its BSYNC or EXIT unless it meets a YIELD; the other side's
+  write landed in the loop. pravirkr/loki's sm_90 EP scorer (`kernel_ep_shift_add_score_c2c`) walked UR4 through a row of shared memory
+  while the lanes of invalid leaves loaded a pointer into UR4, and after the 64th trip stopped with "a shared address (0x8ded482c) naming
+  block 141 of a cluster of 1"; the PTX path and the card were right. `SR_CgaCtaId` was not involved: it reads 0 in a launch without
+  clusters. New unit test `test_sass_uniform_switch`, SASS and PTX (pantheonsim #642).
 - Runtime: a copy, fill or kernel launch issued on a stream behind a host function that has not finished returns at once and runs
   after it, in stream order, as on an RTX 3060. It used to run inside the call after waiting for the host function, so a host function
   that waits for something the program does after the call (Celeritas' `AsyncSnapshotTest.device_pending`) hung the program.
