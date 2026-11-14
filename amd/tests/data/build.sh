@@ -137,6 +137,9 @@ done
 # Which NaN a float instruction gives (test_amd_gcn_nan): gfx1030 (wave32), the object the cards ran.
 "$clang" -nogpulib -x assembler-with-cpp -target amdgcn-amd-amdhsa -mcpu=gfx1030 -c asm_nan.s -o asm_nan.gfx1030.o
 echo "wrote $(pwd)/asm_nan.gfx1030.o"
+# The same for the forms asm_nan.s leaves out (test_amd_gcn_nan2): SDWA, DPP, fmamk/fmaak, packed, doubles, dot products.
+"$clang" -nogpulib -x assembler-with-cpp -target amdgcn-amd-amdhsa -mcpu=gfx1030 -c asm_nan2.s -o asm_nan2.gfx1030.o
+echo "wrote $(pwd)/asm_nan2.gfx1030.o"
 
 # gfx1250's: the same for what the CDNA 5 document defines and the executor refused (test_amd_gcn_cdna_gaps).
 for src in asm_cdna5_gaps; do

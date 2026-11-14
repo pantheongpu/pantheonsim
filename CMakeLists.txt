@@ -2184,6 +2184,9 @@ target_compile_definitions(test_amd_gcn_hi16 PRIVATE VGPU_SOURCE_DIR="${CMAKE_SO
 # Which NaN a gfx1030 float instruction gives (sign, payload, quieting, the invalid-operation NaN), against an RX 6800.
 vgpu_unit_test(test_amd_gcn_nan amd/tests/unit/test_gcn_nan.cpp)
 target_compile_definitions(test_amd_gcn_nan PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# gfx1030 NaNs in the SDWA, DPP, fmamk/fmaak, packed, double and dot-product forms, against an RX 6800 and an RX 6700 XT.
+vgpu_unit_test(test_amd_gcn_nan2 amd/tests/unit/test_gcn_nan2.cpp)
+target_compile_definitions(test_amd_gcn_nan2 PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn_abandon amd/tests/unit/test_gcn_abandon.cpp)
 target_compile_definitions(test_amd_gcn_abandon PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_hostcall amd/tests/unit/test_hostcall.cpp)

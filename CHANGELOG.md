@@ -308,6 +308,21 @@ release says what runs and what it produces, never how fast a real GPU would run
   card does. The tier hands gfx1030's NaN results, its `v_div_fixup_f32` and its `v_sin_f32` to the interpreter. New test
   `test_amd_gcn_nan` (`amd/tests/data/asm_nan.s`: 65 f16 and f32 instructions over pairs of 11 special values, IEEE mode on and off,
   every dword against the cards'). test_amd_gcn_same_bits: 31 lines re-recorded (its header lists them).
+- AMD: gfx1030's NaN rule now covers the forms the first measurement left out (an RX 6800 and an RX 6700 XT, which agree; follow-up to
+  pantheonsim #613): the SDWA, DPP and DPP8 forms, `v_fmamk`/`v_fmaak` (f16, f32), the legacy `v_fma_legacy_f32`/`v_fmac_legacy_f32`,
+  the packed `v_pk_add/mul/fma/min/max_f16` (per half), the doubles (`v_add/mul/fma/min/max/div_fixup/ldexp/frexp_mant_f64`, the
+  rounding and reciprocal instructions, `v_cvt_f32_f64`, `v_cvt_f64_f32`) and `v_dot2_f32_f16`/`v_dot2c_f32_f16` (the first NaN of
+  a.lo, b.lo, a.hi, b.hi, c). A narrowing conversion quiets a signalling NaN with IEEE mode off too. `v_med3`/`v_min3`/`v_max3` with
+  a denormal source where MODE flushes input denormals take it as the zero of its sign (the executor kept the denormal). gfx1030's
+  `v_dot2_f32_f16` adds the two products before the addend, as its `v_dot2c_f32_f16` already did (1 * d + 1 * -d + c is c on the
+  card; adding c first lost it). gfx1030 refused `v_mul_legacy_f32_sdwa` (its executor name came out as "v_mul_legac_e32"),
+  `v_fma_legacy_f32` and `v_fmac_legacy_f32`; they run now (a zero factor makes the product +0, the cards' 0 * NaN + -0 is +0).
+  `v_cvt_f32_f64_e64` ignored its source's abs and neg on every target; it applies them (the card does; the guides' VOP3 NEG and ABS
+  fields act on every float source). The tier hands gfx1030's double NaNs back to the interpreter and leaves its float 64-bit
+  conversions, `v_div_fixup_f64` and its packed f16 arithmetic to it. Not modelled: gfx1030's `v_sqrt_f64` of a positive number is
+  an approximation on the card (sqrt(1) is 0x3ff0000004000000). New test `test_amd_gcn_nan2` (`amd/tests/data/asm_nan2.s`: 117
+  slots over pairs of 12 special values, IEEE mode on, off, and on with denormals flushed; every result, the high half of the 16-bit
+  ones included, against the cards'). test_amd_gcn_same_bits: 19 lines re-recorded (its header lists them).
 - AMD: gfx1100 refused eleven instructions as "decoded but not implemented": `v_frexp_mant_f16`, `v_frexp_exp_i16_f16`, `v_sin_f16`,
   `v_cos_f16`, `v_ldexp_f16`, `v_sat_pk_u8_i16`, `v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16`, and the VOP3 `v_ashrrev_i16`, `v_max_i16`
   and `v_min_i16`. They run now, through the code gfx1030 uses (AMD's machine-readable RDNA3 ISA describes each in the same words as its
