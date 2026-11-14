@@ -4502,6 +4502,14 @@ foreach(_edge cublas cusolver cusparse)
       TIMEOUT 300)
   endif()
 endforeach()
+# cusparseSpMV's workspace sizes and the lines it prints for its refusals (card_edges_spmv.cu).
+if(TARGET vgpucudart AND TARGET vgpucusparse)
+  add_test(NAME e2e_card_edges_spmv COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh spmv -lcusparse)
+  set_tests_properties(e2e_card_edges_spmv PROPERTIES
+    DEPENDS "vgpucudart;vgpucusparse"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+endif()
 # cuBLAS's level-2 and GEMM argument checks and the lines it prints for them (card_edges_blas2.cu), and the driver's
 # current context against the runtime's calls (card_edges_context.cu).
 if(TARGET vgpucudart AND TARGET vgpucublas)

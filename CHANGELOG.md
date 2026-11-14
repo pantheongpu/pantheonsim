@@ -97,6 +97,17 @@ release says what runs and what it produces, never how fast a real GPU would run
   is `CUSPARSE_STATUS_INVALID_VALUE` from both (it was NOT_INITIALIZED, or success for the size).
   `cusparseCsr2cscEx2`/`_bufferSize` take `CUSPARSE_CSR2CSC_ALG1` only and refuse a null handle, the size is never 0,
   and a null buffer is refused (`e2e_card_edges_cusparse`).
+- cuSPARSE: `cusparseSpMV_bufferSize` asks for the workspace an RTX 3060's cuSPARSE 13.0 asks for with every format,
+  algorithm, operation and index type for single, double and complex values (and half and bfloat16 with `CSR_ALG2`
+  and `COO_ALG2`); every one was given the single-precision CSR size, where the card asks 515 bytes and up for
+  `CSR_ALG2` (CSC's for A^T), 524 and up for COO and nothing for COO's A^T, and steps at other entry counts for double
+  (2048) and complex values. With COO and A^T, `cusparseSpMV` takes a null buffer. `cusparseSpMV` and its
+  `_bufferSize` print the card's line on stderr for a refused argument (" ** On entry to cusparseSpMV() parameter
+  number 10 (externalBuffer) had an illegal value: NULL pointer", dimension mismatches, a conjugate transpose of
+  real data, an unsupported type combination, an algorithm of another format), unless `VGPU_QUIET=1`; the size
+  refuses a null alpha or beta, an unknown operation, x or y of the wrong size and an algorithm of another format
+  (CSR's for COO, COO's for CSC), which it took, and an unknown compute type is `CUSPARSE_STATUS_INVALID_VALUE` from
+  both, as on the card (it was NOT_SUPPORTED) (found by differential testing; `e2e_card_edges_spmv`).
 - Driver: `cuCtxSetCurrent` takes a destroyed context, as an RTX 3060 does (it was `CUDA_ERROR_INVALID_CONTEXT`), and every
   call that needs a context answers `CUDA_ERROR_CONTEXT_IS_DESTROYED` while the current one is dead: destroyed, a primary
   context released to nothing, or reset. `cudaDeviceReset` now resets the driver's primary context as
