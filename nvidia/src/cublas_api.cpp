@@ -491,9 +491,38 @@ void gemm_int8(cublasOperation_t transa, cublasOperation_t transb, int m, int n,
 // operation, a negative size, or a leading dimension shorter than its
 // matrix's rows (and never below 1, even for an empty matrix).
 bool known_op(cublasOperation_t t) { return t == CUBLAS_OP_N || t == CUBLAS_OP_T || t == CUBLAS_OP_C; }
+// The first refused argument, by its position in reference BLAS's ?GEMM (transa 1, transb 2, m 3, n 4, k 5,
+// lda 8, ldb 10, ldc 13), or 0 when there is none.
+int gemm_bad_arg(cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, int lda, int ldb, int ldc) {
+  if (!known_op(ta)) return 1;
+  if (!known_op(tb)) return 2;
+  if (m < 0) return 3;
+  if (n < 0) return 4;
+  if (k < 0) return 5;
+  if (lda < std::max(1, ta == CUBLAS_OP_N ? m : k)) return 8;
+  if (ldb < std::max(1, tb == CUBLAS_OP_N ? k : n)) return 10;
+  if (ldc < std::max(1, m)) return 13;
+  return 0;
+}
 bool gemm_args_ok(cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, int lda, int ldb, int ldc) {
-  return known_op(ta) && known_op(tb) && m >= 0 && n >= 0 && k >= 0 && lda >= std::max(1, ta == CUBLAS_OP_N ? m : k) &&
-         ldb >= std::max(1, tb == CUBLAS_OP_N ? k : n) && ldc >= std::max(1, m);
+  return gemm_bad_arg(ta, tb, m, n, k, lda, ldb, ldc) == 0;
+}
+
+// What cuBLAS prints when it refuses an argument, as reference BLAS's XERBLA words it, on stdout: an RTX 3060
+// (cuBLAS 13.0) prints " ** On entry to SGER   parameter number 5 had an illegal value" for cublasSger with
+// incx = 0, every time, and returns INVALID_VALUE. The routine's field is the card's, padding included ("SGER  ",
+// "SGEMM ", "SSYR2  ", "ZGEMM3M "): the type's letter, then `rest`. The level-2 routines do this (but ?gemv,
+// ?symv and ?hemv, which print nothing), and so do the GEMMs.
+template <class T> constexpr char blas_letter() {
+  if constexpr (std::is_same_v<T, float>) return 'S';
+  else if constexpr (std::is_same_v<T, double>) return 'D';
+  else if constexpr (std::is_same_v<T, cuComplex>) return 'C';
+  else if constexpr (std::is_same_v<T, cuDoubleComplex>) return 'Z';
+  else return 'H';
+}
+cublasStatus_t illegal_arg(char letter, const char* rest, int param) {
+  std::printf(" ** On entry to %c%s parameter number %d had an illegal value\n", letter, rest, param);
+  return CUBLAS_STATUS_INVALID_VALUE;
 }
 
 // A matrix whose pointer is not aligned to its element is refused by the
@@ -1028,6 +1057,8 @@ VGPU_EXPORT cublasStatus_t cublasSgemm_v2(cublasHandle_t h, cublasOperation_t ta
                                           const float* alpha, const float* A, int lda,
                                           const float* B, int ldb, const float* beta, float* C,
                                           int ldc) {
+  if (valid(h))
+    if (const int bad = gemm_bad_arg(ta, tb, m, n, k, lda, ldb, ldc)) return illegal_arg('S', "GEMM ", bad);
   if (deferred_to_graph(h, [=, a = hold(h, alpha, sizeof(float)),
                             b = hold(h, beta, sizeof(float))] {
         cublasSgemm_v2(h, ta, tb, m, n, k, static_cast<const float*>(a.get()), A, lda, B, ldb,
@@ -1042,6 +1073,8 @@ VGPU_EXPORT cublasStatus_t cublasDgemm_v2(cublasHandle_t h, cublasOperation_t ta
                                           const double* alpha, const double* A, int lda,
                                           const double* B, int ldb, const double* beta, double* C,
                                           int ldc) {
+  if (valid(h))
+    if (const int bad = gemm_bad_arg(ta, tb, m, n, k, lda, ldb, ldc)) return illegal_arg('D', "GEMM ", bad);
   if (deferred_to_graph(h, [=, a = hold(h, alpha, sizeof(double)),
                             b = hold(h, beta, sizeof(double))] {
         cublasDgemm_v2(h, ta, tb, m, n, k, static_cast<const double*>(a.get()), A, lda, B, ldb,
@@ -1374,8 +1407,12 @@ template <class T>
 cublasStatus_t gemv(cublasHandle_t h, cublasOperation_t trans, int m, int n, const T* alpha,
                     const T* A, int lda, const T* x, int incx, const T* beta, T* y, int incy) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (m < 0 || n < 0 || lda < std::max(1, m) || incx == 0 || incy == 0) return CUBLAS_STATUS_INVALID_VALUE;
-  if (trans == CUBLAS_OP_C) trans = CUBLAS_OP_T;  // real types
+  // As an RTX 3060's cuBLAS 13.0: a negative size is an empty product, and only then is a short lda refused (no
+  // message is printed). A zero increment is a stride of zero, and an operation other than N (or CONJG, which is
+  // N for a real matrix) is a transpose.
+  if (m <= 0 || n <= 0) return CUBLAS_STATUS_SUCCESS;
+  if (lda < m) return CUBLAS_STATUS_INVALID_VALUE;
+  trans = trans == CUBLAS_OP_N || static_cast<int>(trans) == 3 ? CUBLAS_OP_N : CUBLAS_OP_T;
   if (deferred_to_graph(h, [=, al = hold(h, alpha, sizeof(T)), be = hold(h, beta, sizeof(T))] {
         gemv<T>(h, trans, m, n, static_cast<const T*>(al.get()), A, lda, x, incx,
                 static_cast<const T*>(be.get()), y, incy);
@@ -1384,7 +1421,6 @@ cublasStatus_t gemv(cublasHandle_t h, cublasOperation_t trans, int m, int n, con
   const T a = scalar(h, alpha), b = scalar(h, beta);
   const int xlen = trans == CUBLAS_OP_N ? n : m;
   const int ylen = trans == CUBLAS_OP_N ? m : n;
-  if (!m || !n) return CUBLAS_STATUS_SUCCESS;
   auto hA = fetch_raw<T>(A, extent(lda, n, m));
   auto hx = fetch<T>(x, span(xlen, incx));
   auto hy = fetch<T>(y, span(ylen, incy));
@@ -1394,7 +1430,8 @@ cublasStatus_t gemv(cublasHandle_t h, cublasOperation_t trans, int m, int n, con
   for (int j = 0; j < xlen; ++j) xd[static_cast<size_t>(j)] = hx[elem(j, xlen, incx)];
   vgpu::hostgemm::gemm<T, T>(trans != CUBLAS_OP_N, false, ylen, 1, xlen, hA.data(), lda, xd.data(), xlen,
                              [&](int64_t i, int64_t, T acc) { accv[static_cast<size_t>(i)] = acc; });
-  for (int i = 0; i < ylen; ++i) {
+  // With incy = 0 every row lands on y[0]; the card's y[0] is row 0's (from y[0] as it was).
+  for (int i = 0; i < (incy == 0 ? 1 : ylen); ++i) {
     T& yi = hy[elem(i, ylen, incy)];
     const T acc = accv[static_cast<size_t>(i)];
     yi = b == T(0) ? a * acc : a * acc + b * yi;
@@ -1904,6 +1941,8 @@ VGPU_EXPORT cublasStatus_t cublasHgemm(cublasHandle_t h, cublasOperation_t ta,
                                        const __half* alpha, const __half* A, int lda,
                                        const __half* B, int ldb, const __half* beta, __half* C,
                                        int ldc) {
+  if (valid(h))
+    if (const int bad = gemm_bad_arg(ta, tb, m, n, k, lda, ldb, ldc)) return illegal_arg('H', "GEMM ", bad);
   return cublasGemmEx(h, ta, tb, m, n, k, alpha, A, CUDA_R_16F, lda, B, CUDA_R_16F, ldb, beta, C,
                       CUDA_R_16F, ldc, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT);
 }

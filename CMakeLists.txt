@@ -4499,6 +4499,22 @@ foreach(_edge cublas cusolver cusparse)
       TIMEOUT 300)
   endif()
 endforeach()
+# cuBLAS's level-2 and GEMM argument checks and the lines it prints for them (card_edges_blas2.cu), and the driver's
+# current context against the runtime's calls (card_edges_context.cu).
+if(TARGET vgpucudart AND TARGET vgpucublas)
+  add_test(NAME e2e_card_edges_blas2 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh blas2 -lcublas)
+  set_tests_properties(e2e_card_edges_blas2 PROPERTIES
+    DEPENDS "vgpucudart;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+endif()
+if(TARGET vgpucudart AND TARGET vgpucuda)
+  add_test(NAME e2e_card_edges_context COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh context -lcuda)
+  set_tests_properties(e2e_card_edges_context PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+endif()
 
 # The session's ncu: Nsight Compute's command line answered from the simulator's
 # counters, checked against kernels whose metrics follow from their addresses.

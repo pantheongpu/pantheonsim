@@ -279,20 +279,28 @@ cublasStatus_t cgemm(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t t
 template <class T>
 cublasStatus_t cgemv(cublasHandle_t h, cublasOperation_t t, int m, int n, const T* alpha, const T* A, int lda,
                      const T* x, int incx, const T* beta, T* y, int incy) {
-  if (m < 0 || n < 0 || incx == 0 || incy == 0) return CUBLAS_STATUS_INVALID_VALUE;
+  // As an RTX 3060's cuBLAS 13.0 (and the real gemv): a negative size is an empty product, then a short lda is
+  // refused, silently; a zero increment is a stride of zero (with incy = 0, y[0] keeps row 0's result). OP_CONJG
+  // is conj(A), not transposed, and an operation the card does not know is a transpose.
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (m <= 0 || n <= 0) return CUBLAS_STATUS_SUCCESS;
+  if (lda < m) return CUBLAS_STATUS_INVALID_VALUE;
+  const bool conj_only = static_cast<int>(t) == 3;
+  if (t != CUBLAS_OP_N && t != CUBLAS_OP_C && !conj_only) t = CUBLAS_OP_T;
   return run_c(h, alpha, beta, sizeof(T), [=](const void* al, const void* be) {
     const cd a_ = cscalar(h, static_cast<const T*>(al)), b_ = cscalar(h, static_cast<const T*>(be));
-    const auto op = to_op(t);
+    const auto op = conj_only ? vgpu_la::Op::N : to_op(t);
     const int rows = op == vgpu_la::Op::N ? m : n, cols = op == vgpu_la::Op::N ? n : m;
     const CMat a = load_mat(A, lda, n, m);
     const auto xv = load_vec(x, cols, incx);
     auto yv = b_ == cd(0) ? std::vector<cd>(rows, 0) : load_vec(y, rows, incy);
-    for (int i = 0; i < rows; ++i) {
+    for (int i = 0; i < (incy == 0 ? 1 : rows); ++i) {
       cd s = 0;
-      for (int j = 0; j < cols; ++j) s += opel(a, op, i, j) * xv[j];
+      for (int j = 0; j < cols; ++j) s += (conj_only ? std::conj(a(i, j)) : opel(a, op, i, j)) * xv[j];
       yv[i] = b_ == cd(0) ? a_ * s : a_ * s + b_ * yv[i];
     }
-    store_vec(y, rows, incy, yv);
+    if (incy == 0) store_vec(y, 1, 1, std::vector<cd>{yv[0]});
+    else store_vec(y, rows, incy, yv);
     return CUBLAS_STATUS_SUCCESS;
   });
 }
@@ -302,7 +310,10 @@ template <class T>
 cublasStatus_t cger(cublasHandle_t h, bool conj, int m, int n, const T* alpha, const T* x, int incx, const T* y,
                     int incy, T* A, int lda) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (m < 0 || n < 0 || incx == 0 || incy == 0 || lda < std::max(1, m)) return CUBLAS_STATUS_INVALID_VALUE;
+  {
+    const int bad = m < 0 ? 1 : n < 0 ? 2 : incx == 0 ? 5 : incy == 0 ? 7 : lda < std::max(1, m) ? 9 : 0;
+    if (bad) return illegal_arg(blas_letter<T>(), kRealType<T> ? "GER  " : conj ? "GERC " : "GERU ", bad);
+  }
   return run_c(h, alpha, nullptr, sizeof(T), [=](const void* al, const void*) {
     const cd a_ = cscalar(h, static_cast<const T*>(al));
     const auto xv = load_vec(x, m, incx), yv = load_vec(y, n, incy);
@@ -454,8 +465,11 @@ template <class T, class S>
 cublasStatus_t csyr(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, int n, const S* alpha, const T* x,
                     int incx, const T* y, int incy, T* A, int lda) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (!known_fill(uplo) || n < 0 || incx == 0 || (y && incy == 0) || lda < std::max(1, n))
-    return CUBLAS_STATUS_INVALID_VALUE;
+  {
+    const int bad = !known_fill(uplo) ? 1 : n < 0 ? 2 : incx == 0 ? 5 : y && incy == 0 ? 7
+                  : lda < std::max(1, n) ? (y ? 9 : 7) : 0;
+    if (bad) return illegal_arg(blas_letter<T>(), y ? (hermitian ? "HER2  " : "SYR2  ") : (hermitian ? "HER  " : "SYR  "), bad);
+  }
   if (n == 0) return CUBLAS_STATUS_SUCCESS;
   return run_c(h, alpha, nullptr, sizeof(S), [=](const void* al, const void*) {
     cd a_;
@@ -628,8 +642,11 @@ template <class T>
 cublasStatus_t ctrmv(cublasHandle_t h, bool solve, cublasFillMode_t uplo, cublasOperation_t t, cublasDiagType_t diag,
                      int n, const T* A, int lda, T* x, int incx) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (!known_fill(uplo) || !known_op(t) || !known_diag(diag) || n < 0 || lda < std::max(1, n) || incx == 0)
-    return CUBLAS_STATUS_INVALID_VALUE;
+  {
+    const int bad = !known_fill(uplo) ? 1 : !known_op(t) ? 2 : !known_diag(diag) ? 3 : n < 0 ? 4
+                  : lda < std::max(1, n) ? 6 : incx == 0 ? 8 : 0;
+    if (bad) return illegal_arg(blas_letter<T>(), solve ? "TRSV " : "TRMV ", bad);
+  }
   if (n == 0) return CUBLAS_STATUS_SUCCESS;
   return run_c(h, nullptr, nullptr, 0, [=](const void*, const void*) {
     const CMat a = load_mat(A, lda, n, n);
@@ -711,6 +728,8 @@ template <class T> void put_result(cublasHandle_t h, T* result, cd v) {
   VGPU_EXPORT cublasStatus_t cublas##P##gemm_v2(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb,     \
                                                 int m, int n, int k, const T* alpha, const T* A, int lda,         \
                                                 const T* B, int ldb, const T* beta, T* C, int ldc) {              \
+    if (valid(h))                                                                                                 \
+      if (const int bad = gemm_bad_arg(ta, tb, m, n, k, lda, ldb, ldc)) return illegal_arg(#P[0], "GEMM ", bad);  \
     return cgemm<T>(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);                                     \
   }                                                                                                               \
   VGPU_EXPORT cublasStatus_t cublas##P##gemmStridedBatched(                                                       \

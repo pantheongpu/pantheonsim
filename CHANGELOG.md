@@ -63,6 +63,14 @@ release says what runs and what it produces, never how fast a real GPU would run
   (`CUSPARSE_STATUS_NOT_SUPPORTED`, also from `cusparseSpMV_bufferSize`). The `cusparseSetMat*` setters refuse values their enums do
   not have, destroying a null handle or descriptor succeeds, and `cusparseGetErrorName`/`String` give the card's texts
   (`e2e_card_edges_cusparse`).
+- cuBLAS: `?gemv` takes what an RTX 3060's cuBLAS 13.0 takes. A negative `m` or `n` is an empty product and a zero
+  increment is a stride of zero (`incx = 0` reads `x[0]` for every element; with `incy = 0`, `y[0]` keeps row 0's result):
+  the simulator refused them with `CUBLAS_STATUS_INVALID_VALUE`, leaving `y` as it was where the card computes it. An
+  operation other than N is a transpose (`CUBLAS_OP_CONJG` is `conj(A)` for `cgemv`/`zgemv` and `A` for the real types; it
+  was taken as `A^H`), and `cgemv`/`zgemv` refuse an `lda` below `m`, which they read past. The other level-2 routines
+  and the GEMMs (`?gemm`, `cublasHgemm`, `?gemm3m`) print reference BLAS's line for the first bad argument on stdout, as
+  the card does (" ** On entry to SGER   parameter number 5 had an illegal value"); `?symv`/`?hemv` refuse silently, and
+  `?gemv` prints nothing (found by differential testing; `e2e_card_edges_blas2`).
 - AMD: the clamp bit of the integer instructions saturates their result on every target, as the CDNA3 and CDNA4 guides say (6.5, and
   "Supports saturation" on each add and subtract) and as an RX 6800 does. The VOP3b adds and subtracts with a carry out (`v_add_co_u32`,
   `v_sub_co_u32`, `v_subrev_co_u32`, `v_addc_co_u32`, `v_subb_co_u32`, `v_subbrev_co_u32`, RDNA's `_co_ci_` forms) and `v_mad_u64_u32` /
