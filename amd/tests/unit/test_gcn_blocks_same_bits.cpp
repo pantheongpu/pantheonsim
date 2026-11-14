@@ -487,4 +487,57 @@ VTEST(memory_instructions_inside_blocks) {
   VCHECK(threw * 10 > runs && ended * 10 > runs);
 }
 
+// Bound integer operations: runs of 32-bit integer instructions on vector registers and constants, whose lane kernels a block calls straight
+// on the rows when every lane of the wave is on. Programs of such instructions (and now and then another, which ends a run), with every lane
+// on, with half of them off (the handlers run then), with turns that end inside a run (the wave goes on in the run one instruction at a
+// time): one instruction at a time, blocks without binding, and blocks with it must agree.
+VTEST(bound_integer_runs_give_the_handlers_bits) {
+  const bool tier_was = amd::gcn::tier::enabled(), blocks_were = amd::gcn::tier::blocks(), bound_was = amd::gcn::tier::bound();
+  amd::gcn::tier::set_enabled(true);
+  uint64_t runs = 0, wrong = 0, instructions = 0, bound = 0;
+  for (const Target& t : {kTargets[0], kTargets[1]}) {
+    const Pools pool = pools_of(t);
+    // The shapes that bind, found by running three of each: the integer instructions whose sources are vector registers and constants.
+    std::vector<amd::gcn::Inst> ints;
+    amd::gcn::tier::set_blocks(true);
+    amd::gcn::tier::set_bound(true);
+    for (const amd::gcn::Inst& in : pool.blockable) {
+      if (in.enc != amd::gcn::Enc::Vop2 && in.enc != amd::gcn::Enc::Vop3 && in.enc != amd::gcn::Enc::Vop1) continue;
+      amd::ProgramRun run;
+      amd::digest_program({in, in, in, pool.endpgm[0]}, t.target, 1, 1, 1, 0, &run);
+      if (run.bound_in_blocks) ints.push_back(in);
+    }
+    VCHECK(ints.size() > 40);
+    Rng r{0xb0d + static_cast<uint64_t>(t.target)};
+    for (uint64_t pn = 0; pn < 150; ++pn) {
+      std::vector<amd::gcn::Inst> program;
+      const size_t len = 10 + r.below(24);
+      for (size_t i = 0; i < len; ++i) program.push_back(r.below(8) ? ints[r.below(ints.size())] : pool.blockable[r.below(pool.blockable.size())]);
+      program.push_back(pool.endpgm[0]);
+      for (const uint32_t flavour : {1u, 0u, 20u, 3u}) {
+        const uint64_t slice = r.below(2) ? 0 : 1 + r.below(7);
+        const uint32_t waves = 1 + static_cast<uint32_t>(r.below(2));
+        amd::ProgramRun on_run;
+        amd::gcn::tier::set_blocks(false);
+        const uint64_t plain = amd::digest_program(program, t.target, pn, flavour, waves, slice);
+        amd::gcn::tier::set_blocks(true);
+        amd::gcn::tier::set_bound(false);
+        const uint64_t unbound = amd::digest_program(program, t.target, pn, flavour, waves, slice);
+        amd::gcn::tier::set_bound(true);
+        const uint64_t on = amd::digest_program(program, t.target, pn, flavour, waves, slice, &on_run);
+        ++runs, instructions += on_run.instructions, bound += on_run.bound_in_blocks;
+        wrong += plain != on || unbound != on;
+        if (flavour == 3) VCHECK(on_run.bound_in_blocks * 4 <= on_run.instructions);   // (half the lanes off: the handlers, but for a wave whose lanes all came on)
+      }
+    }
+  }
+  amd::gcn::tier::set_bound(bound_was);
+  amd::gcn::tier::set_blocks(blocks_were);
+  amd::gcn::tier::set_enabled(tier_was);
+  std::fprintf(stderr, "bound integer runs: %llu runs each way, %llu instructions, %llu as bound operations\n", static_cast<unsigned long long>(runs),
+               static_cast<unsigned long long>(instructions), static_cast<unsigned long long>(bound));
+  if (wrong) throw vtest::Failure(std::to_string(wrong) + " of " + std::to_string(runs) + " runs differ with bound integer operations");
+  VCHECK(bound * 6 > instructions);
+}
+
 VTEST_MAIN

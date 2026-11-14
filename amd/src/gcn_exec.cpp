@@ -12745,6 +12745,8 @@ struct Machine {
   static bool block_state(const Wave& w) { return !(w.vgpr_msb || w.gpr_idx || w.vskip || !FloatMode::is_default(w.mode)); }
   // (Two instructions are not worth a block: entering and leaving one costs about what the plain step of one instruction does.)
   static constexpr size_t kMinBlock = 3, kMaxBlock = 256;
+  // (A run of bound integer operations: three or more. Two save about what entering the run costs.)
+  static constexpr uint32_t kMinBound = 3;
   // The block that starts at `in` (an instruction of the decode cache's, at the wave's program counter), made the first time; null where
   // fewer than kMinBlock instructions would be in it.
   const gcn::TierBlock* block_at(const Inst& in) {
@@ -12804,6 +12806,37 @@ struct Machine {
         for (int i = 0; i < static_cast<int>(gcn::MopsType::Count); ++i) add(stats.counts.mops[i], mops[i]);
         return static_cast<uint32_t>(fresh->adds.size()) - first_add;
       };
+      // The runs of bound integer operations among the plain instructions (two or more in a row).
+      fresh->bound_of.assign(len, 0);
+      if (bound_on) {
+        const auto constant = [](void* block, uint32_t value) -> int32_t {
+          auto& rows = static_cast<gcn::TierBlock*>(block)->constants;
+          for (size_t i = 0; i < rows.size(); ++i)
+            if (rows[i][0] == value) return ~static_cast<int32_t>(i);
+          rows.emplace_back();
+          rows.back().fill(value);
+          return ~static_cast<int32_t>(rows.size() - 1);
+        };
+        for (uint32_t i = 0; i < len;) {
+          uint32_t end = i;
+          std::vector<gcn::tier::BoundInt> ops;
+          for (gcn::tier::BoundInt op; end < len && fresh->kind[end] == gcn::TierBlock::kPlain && gcn::tier::bind_int(fresh->insts[end]->fast, &op, constant, fresh.get()); ++end)
+            ops.push_back(op);
+          if (end - i < kMinBound) {
+            i = end + 1;
+            continue;
+          }
+          const uint32_t first_add = static_cast<uint32_t>(fresh->adds.size()), n_adds = counts_of(i, end);
+          const uint32_t bytes = static_cast<uint32_t>(fresh->insts[end - 1]->pc + fresh->insts[end - 1]->size - fresh->insts[i]->pc);
+          for (uint32_t k = i; k < end; ++k) {
+            fresh->kind[k] = k == i ? gcn::TierBlock::kBound : gcn::TierBlock::kBoundIn;
+            fresh->bound_of[k] = static_cast<uint32_t>(fresh->bound.size());
+          }
+          fresh->bound.push_back({i, end, static_cast<uint32_t>(fresh->bound_ops.size()), bytes, first_add, n_adds});
+          fresh->bound_ops.insert(fresh->bound_ops.end(), ops.begin(), ops.end());
+          i = end;
+        }
+      }
       // The stretches.
       fresh->stretch_of.resize(len);
       for (uint32_t begin = 0;;) {
@@ -12813,8 +12846,9 @@ struct Machine {
         const uint32_t first_add = static_cast<uint32_t>(fresh->adds.size()), n_adds = counts_of(begin, end);
         fresh->stretches.push_back({begin, end, first_add, n_adds});
         if (end == len) break;
-        fresh->stretch_of[end] = index;
-        begin = end + 1;
+        const uint32_t next = fresh->kind[end] == gcn::TierBlock::kBound ? fresh->bound[fresh->bound_of[end]].end : end + 1;
+        for (uint32_t k = end; k < next; ++k) fresh->stretch_of[k] = index;
+        begin = next;
       }
       made = fresh.release();
     }
@@ -12908,6 +12942,41 @@ struct Machine {
       }
       if (i == limit) return leave_block(w, b, from, i, i - from, kBlockOn, end);   // the turn's room ended first
       const Inst& in = *insts[i];
+      if (b.kind[i] >= gcn::TierBlock::kBound) {
+        // A run of bound integer operations, from its instruction i on (its first, or one further on where the wave left the block inside
+        // it). Every lane on and room for the rest of it: the lane kernels on the rows. Otherwise the handlers, one at a time.
+        const gcn::TierBlock::BoundRun& run = b.bound[b.bound_of[i]];
+        const uint64_t ex = w.exec;
+        const unsigned lanes = (ex >> 32) ? 64 : 32;
+        if (run.end <= limit && (lanes == 64 ? ex == ~uint64_t{0} : static_cast<uint32_t>(ex) == 0xFFFFFFFFu)) {
+          gcn::tier::run_bound_ints(b.bound_ops.data() + run.first_op + (i - run.begin), run.end - i,
+                                    reinterpret_cast<const uint32_t (*)[64]>(b.constants.data()), r.vgpr, lanes);
+          w.pc = insts[run.end - 1]->pc + insts[run.end - 1]->size;
+          if (i == run.begin) {
+            char* const counters = reinterpret_cast<char*>(&stats);
+            for (const gcn::TierBlock::Add *a = b.adds.data() + run.first_add, *e = a + run.n_adds; a != e; ++a) *reinterpret_cast<uint64_t*>(counters + a->at) += a->n;
+          } else {
+            count_range(b, i, run.end);
+          }
+          block_bound += run.end - i;
+          i = run.end;
+        } else {
+          const uint32_t begin = i, to = run.end < limit ? run.end : limit;
+          for (; i < to; ++i) {
+            const Inst& x = *insts[i];
+            r.target = x.target;
+            w.pc += x.size;
+            if (__builtin_expect(x.fast.run(x.fast, r) != 1, 0)) {
+              w.pc -= x.size;
+              count_range(b, begin, i);
+              return leave_block(w, b, from, i, i - from, kBlockInterp, end);
+            }
+          }
+          count_range(b, begin, i);
+          if (i != run.end) return leave_block(w, b, from, i, i - from, kBlockOn, end);
+        }
+        continue;
+      }
       if (b.kind[i] == gcn::TierBlock::kMach) {
         block_pc = w.pc;
         const int t = tier_mach(w, g, in);
@@ -13327,8 +13396,9 @@ struct Machine {
   bool blocks_live = blocks_on;
   uint32_t block_turns = 0;
   uint64_t block_turn_steps = 0;
+  const bool bound_on = gcn::tier::bound();
   // How many instructions ran inside blocks, and how many of them were the Machine's (for tests: that a block ran at all, and with what in it).
-  uint64_t block_instructions = 0, block_machine = 0;
+  uint64_t block_instructions = 0, block_machine = 0, block_bound = 0;
   // With blocks on: the address of the instruction the wave is at, for the error of one that throws (run_round's `pc`, which stays a
   // register of its loop when blocks are off: as a variable both loops shared it was written to the stack after every instruction).
   uint64_t block_pc = 0;
@@ -14803,7 +14873,7 @@ uint64_t digest_program(const std::vector<gcn::Inst>& program, gcn::Target targe
     error = std::string("std:") + e.what();
   }
   if (run)
-    run->error = error, run->instructions = m.stats.instructions, run->in_blocks = m.block_instructions, run->machine_in_blocks = m.block_machine,
+    run->error = error, run->instructions = m.stats.instructions, run->in_blocks = m.block_instructions, run->machine_in_blocks = m.block_machine, run->bound_in_blocks = m.block_bound,
     run->ended = ended;
   h.add(ended), h.add(rounds);
   h.add_bytes(error.data(), error.size());

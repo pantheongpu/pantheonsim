@@ -105,6 +105,20 @@ void set_blocks(bool on);
 // Whether an instruction's handler can end its wave's turn although it ran (answer 2: a wait for loads in flight). A block does not start with
 // such an instruction: the turn would end before the block had run anything.
 bool gives_up_turn(const Op& o);
+// A bound integer operation (blocks): a 32-bit integer instruction whose sources are vector registers and constants, with what its handler
+// works out on every call worked out once: the lane kernel, the destination row, and for each source the register row (0 or more) or the
+// row of a constant the block keeps (~index, negative). bind_int says whether the instruction is one and fills it in (`constant` is asked for
+// the row of a value: the block's, the same row for the same value). run_bound_ints runs `count` of them on a wave whose lanes are all on
+// (the first `lanes` of every row): each is its lane kernel straight on the rows, which is what the handlers do then.
+// bound(): whether blocks bind them (VGPU_AMD_BLOCKS_BOUND=0 turns it off; set_bound for tests).
+bool bound();
+void set_bound(bool on);
+struct BoundInt {
+  AnyFn kern;
+  int32_t dst, src[3];
+};
+bool bind_int(const Op& o, BoundInt* out, int32_t (*constant)(void* block, uint32_t value), void* block);
+void run_bound_ints(const BoundInt* ops, uint32_t count, const uint32_t (*constants)[64], uint32_t (*vgpr)[64], unsigned lanes);
 // VGPU_AMD_BLOCKS_STATS=1 (with blocks on): at exit, how many instructions ran inside blocks and the blocks that ran the most, each with its
 // listing. note_block adds one machine's runs of one block (`listing` makes the text, the first time the block is seen).
 bool blocks_stats();

@@ -12,6 +12,7 @@
 // answer.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -344,7 +345,8 @@ struct TierBlock {
   // What each instruction is to the runner. kPlain: a handler that does the instruction or hands it back. kTurn: a handler that can also
   // end the wave's turn (a plain store, whose first of a round waits for the group's other waves; a wait for loads). kMach: the Machine's
   // (it counts itself, moves the program counter itself, and can throw).
-  enum Kind : uint8_t { kPlain, kTurn, kMach };
+  // kBound: the first instruction of a run of bound integer operations (below); kBoundIn: the others of the run (one at a time they are plain).
+  enum Kind : uint8_t { kPlain, kTurn, kMach, kBound, kBoundIn };
   std::vector<uint8_t> kind;
   // A counter raised: the 64-bit counter `at` bytes into the dispatch's DispatchStats goes up by n.
   struct Add {
@@ -360,6 +362,17 @@ struct TierBlock {
   std::vector<Stretch> stretches;
   std::vector<uint32_t> stretch_of;   // by instruction: its stretch (an instruction that is not plain belongs to the stretch it ends)
   std::vector<Add> adds;
+  // Runs of three or more integer instructions on vector registers and constants (tier::BoundInt): with every lane of the wave on, a run is
+  // its lane kernels called on the rows, one after the other, with no handler between. The instructions [begin, end), `bytes` of code,
+  // are bound_ops[first_op, ...) in order; adds[first_add, first_add + n_adds) is what they count. A run ends the stretch before it as an
+  // instruction that is not plain does (the next stretch begins at `end`).
+  struct BoundRun {
+    uint32_t begin, end, first_op, bytes, first_add, n_adds;
+  };
+  std::vector<BoundRun> bound;
+  std::vector<uint32_t> bound_of;            // by instruction, for kBound and kBoundIn: its run
+  std::vector<tier::BoundInt> bound_ops;
+  std::vector<std::array<uint32_t, 64>> constants;   // the rows of the constants the bound operations read
   // Whether the block pays, found out over its first runs (Machine::judge_block): a block whose waves give up their turn every two or
   // three instructions (waits for loads and first stores of a round, in a work-group of several waves) is entered and left more than it
   // runs, and its instructions go one at a time again (`off`). Counted without locks by whichever threads run it first (a lost count

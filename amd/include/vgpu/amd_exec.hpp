@@ -225,6 +225,7 @@ struct ProgramRun {
   uint64_t instructions = 0;   // DispatchStats::instructions
   uint64_t in_blocks = 0;      // ... of which ran inside blocks (VGPU_AMD_BLOCKS)
   uint64_t machine_in_blocks = 0;   // ... and of those, the Machine's instructions (memory accesses and the like)
+  uint64_t bound_in_blocks = 0;     // ... and the integer instructions that ran as bound operations
   bool ended = false;          // every wave reached the end of the program
 };
 // `wave_state`: bits that put every wave in a state the tier leaves to the interpreter before the first instruction runs.

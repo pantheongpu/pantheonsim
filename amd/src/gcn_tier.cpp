@@ -108,6 +108,8 @@ uint64_t bails() { return g_bails.load(std::memory_order_relaxed); }
 void tier_classify(Inst&) {}   // (the lane kernels are x86's: elsewhere the interpreter runs everything)
 namespace tier {
 bool gives_up_turn(const Op&) { return false; }
+bool bind_int(const Op&, BoundInt*, int32_t (*)(void*, uint32_t), void*) { return false; }
+void run_bound_ints(const BoundInt*, uint32_t, const uint32_t (*)[64], uint32_t (*)[64], unsigned) {}
 }  // namespace tier
 
 #else
@@ -3486,6 +3488,34 @@ template <bool Max>
 // (At the end of the unit, so that nothing above it moves: the handlers' code is laid out by this file alone.)
 namespace tier {
 bool gives_up_turn(const Op& o) { return o.run == b_waitcnt; }
+// (h_int and h_intv with every lane on: the kernel on the sources' rows, into the destination's. A source that is not there is the first one.)
+bool bind_int(const Op& o, BoundInt* out, int32_t (*constant)(void*, uint32_t), void* block) {
+  if (o.run != h_int_avx2 && o.run != h_int_base && o.run != h_intv_avx2 && o.run != h_intv_base) return false;
+  if (o.dst.kind != kVgpr || o.dst.index >= kVgprs) return false;
+  for (int k = 0; k < 3; ++k) {
+    const Src& s = o.src[k];
+    if (!s.kind) {
+      if (k == 0) return false;
+      continue;
+    }
+    if (s.neg || s.abs || (s.kind != kVgpr && s.kind != kConst) || (s.kind == kVgpr && s.index >= kVgprs)) return false;
+  }
+  out->kern = o.kern;
+  out->dst = static_cast<int32_t>(o.dst.index);
+  for (int k = 0; k < 3; ++k) {
+    const Src& s = o.src[k];
+    out->src[k] = !s.kind ? out->src[0] : s.kind == kVgpr ? static_cast<int32_t>(s.index) : constant(block, s.value);
+  }
+  return true;
+}
+void run_bound_ints(const BoundInt* ops, uint32_t count, const uint32_t (*constants)[64], uint32_t (*vgpr)[64], unsigned lanes) {
+  for (const BoundInt* o = ops, *e = ops + count; o != e; ++o) {
+    const uint32_t* const a = o->src[0] >= 0 ? vgpr[o->src[0]] : constants[~o->src[0]];
+    const uint32_t* const b = o->src[1] >= 0 ? vgpr[o->src[1]] : constants[~o->src[1]];
+    const uint32_t* const c = o->src[2] >= 0 ? vgpr[o->src[2]] : constants[~o->src[2]];
+    reinterpret_cast<K3>(o->kern)(vgpr[o->dst], a, b, c, lanes);
+  }
+}
 }  // namespace tier
 
 #endif  // VGPU_TIER_X86

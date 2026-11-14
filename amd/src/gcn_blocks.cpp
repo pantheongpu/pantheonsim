@@ -31,6 +31,20 @@ bool blocks() {
 }
 void set_blocks(bool on) { g_blocks.store(on ? 1 : 0, std::memory_order_relaxed); }
 namespace {
+// -1: not looked at yet. On unless VGPU_AMD_BLOCKS_BOUND=0.
+std::atomic<int> g_bound{-1};
+}  // namespace
+bool bound() {
+  int s = g_bound.load(std::memory_order_relaxed);
+  if (s < 0) {
+    const char* e = std::getenv("VGPU_AMD_BLOCKS_BOUND");
+    s = e && *e == '0' ? 0 : 1;
+    g_bound.store(s, std::memory_order_relaxed);
+  }
+  return s != 0;
+}
+void set_bound(bool on) { g_bound.store(on ? 1 : 0, std::memory_order_relaxed); }
+namespace {
 struct BlockStats {
   struct Row {
     std::string text;
