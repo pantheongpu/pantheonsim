@@ -15,6 +15,13 @@
 //     left vectors overwrite A's columns, or V^T A's first n rows. The
 //     simulator refused both with NOT_SUPPORTED.
 //   - cusolverDnSetAdvOptions takes GETRF and POTRF with ALG_0..ALG_2 only.
+//   - potrf of a matrix that is not positive definite (info = j, the failing leading minor) leaves the columns before
+//     j factored and NaN at A(j,j). From the lower triangle the factorization goes on with column j taken as 0 (the
+//     entries below the diagonal are 0); from the upper, rows j.. of the triangle are all NaN. The simulator left A
+//     as it was. (Measured for n up to 32; larger matrices are factored in blocks on the card, which changes the
+//     part after the failing column.)
+//   - getrf without pivoting (devIpiv null) multiplies the column below a zero pivot by 0 and goes on; info is the
+//     first zero pivot. The simulator skipped the column, leaving it as it was.
 #include <cuda_runtime.h>
 #include <cusolverDn.h>
 
@@ -135,6 +142,118 @@ int main() {
     WANT(close(get(A, 6), vt, 2, 3, 2, 2), true);
     WANT(close(get(s, 2), sv, 2, 2, 2, 1), true);
   }
+  // potrf of a matrix that is not positive definite: A(i,i) = n + 1 and 1 elsewhere, with A(f,f) = -5; the other
+  // triangle holds 77, which potrf does not touch.
+  {
+    const double nan = std::nan("");
+    auto same = [](double got, double want) {
+      if (std::isnan(want)) return std::isnan(got);
+      return std::fabs(got - want) <= 1e-5 * std::fabs(want) + 1e-6;
+    };
+    for (int x = 0; x < 2; ++x)   // cusolverDnDpotrf, cusolverDnXpotrf
+      for (int n : {4, 8, 32})
+        for (int f : {0, 1, n / 2, n - 1})
+          for (int lower = 0; lower < 2; ++lower) {
+            std::vector<double> a((size_t)n * n);
+            for (int j = 0; j < n; ++j)
+              for (int i = 0; i < n; ++i)
+                a[i + (size_t)j * n] = (lower ? i < j : i > j) ? 77 : i == j ? n + 1 : 1;
+            a[f + (size_t)f * n] = -5;
+            // The expected factor: left-looking Cholesky, a failing column taken as 0 (lower) or NaN from there (upper).
+            std::vector<double> w = a;
+            auto el = [&](int i, int j) -> double& { return lower ? w[i + (size_t)j * n] : w[j + (size_t)i * n]; };
+            for (int j = 0; j < n; ++j) {
+              double d = el(j, j);
+              for (int k = 0; k < j; ++k) d -= el(j, k) * el(j, k);
+              if (!(d > 0)) {
+                if (!lower) {
+                  for (int r = j; r < n; ++r)
+                    for (int c = r; c < n; ++c) el(c, r) = nan;
+                  break;
+                }
+                el(j, j) = nan;
+                for (int i = j + 1; i < n; ++i) el(i, j) = 0;
+                continue;
+              }
+              d = std::sqrt(d);
+              el(j, j) = d;
+              for (int i = j + 1; i < n; ++i) {
+                double t = el(i, j);
+                for (int k = 0; k < j; ++k) t -= el(i, k) * el(j, k);
+                el(i, j) = t / d;
+              }
+            }
+            double* dA = nullptr;
+            WANT(cudaMalloc(&dA, a.size() * sizeof(double)), cudaSuccess);
+            WANT(cudaMemcpy(dA, a.data(), a.size() * sizeof(double), cudaMemcpyHostToDevice), cudaSuccess);
+            const auto uplo = lower ? L : CUBLAS_FILL_MODE_UPPER;
+            seti(-77);
+            if (x == 0) {
+              int dlw = 0;
+              WANT(cusolverDnDpotrf_bufferSize(h, uplo, n, dA, n, &dlw), ok);
+              double* dws = nullptr;
+              WANT(cudaMalloc(&dws, (dlw + 1) * sizeof(double)), cudaSuccess);
+              WANT(cusolverDnDpotrf(h, uplo, n, dA, n, dws, dlw, info), ok);
+              WANT(cudaFree(dws), cudaSuccess);
+            } else {
+              cusolverDnParams_t xp;
+              WANT(cusolverDnCreateParams(&xp), ok);
+              size_t dsz = 0, hsz = 0;
+              WANT(cusolverDnXpotrf_bufferSize(h, xp, uplo, n, CUDA_R_64F, dA, n, CUDA_R_64F, &dsz, &hsz), ok);
+              void* dws = nullptr;
+              WANT(cudaMalloc(&dws, dsz + 8), cudaSuccess);
+              std::vector<char> hws(hsz + 8);
+              WANT(cusolverDnXpotrf(h, xp, uplo, n, CUDA_R_64F, dA, n, CUDA_R_64F, dws, dsz, hws.data(), hsz, info), ok);
+              WANT(cudaFree(dws), cudaSuccess);
+              WANT(cusolverDnDestroyParams(xp), ok);
+            }
+            WANT(geti(), f + 1);
+            std::vector<double> got(a.size());
+            WANT(cudaMemcpy(got.data(), dA, got.size() * sizeof(double), cudaMemcpyDeviceToHost), cudaSuccess);
+            int wrong = 0;
+            for (size_t i = 0; i < got.size(); ++i) wrong += !same(got[i], w[i]);
+            if (wrong) {
+              std::printf("FAIL %s n=%d failing at %d %s: %d entries differ from the card's\n", x ? "Xpotrf" : "Dpotrf",
+                          n, f + 1, lower ? "lower" : "upper", wrong);
+              ++fails;
+            }
+            WANT(cudaFree(dA), cudaSuccess);
+          }
+    // Float, a small case exactly: 4 x 4, failing at 3.
+    for (int lower = 0; lower < 2; ++lower) {
+      std::vector<float> a(16);
+      for (int j = 0; j < 4; ++j)
+        for (int i = 0; i < 4; ++i) a[i + j * 4] = (lower ? i < j : i > j) ? 77 : i == j ? 5 : 1;
+      a[10] = -5;
+      cudaMemcpy(A, a.data(), 16 * sizeof(float), cudaMemcpyHostToDevice);
+      CALL(cusolverDnSpotrf(h, lower ? L : CUBLAS_FILL_MODE_UPPER, 4, A, 4, ws, lw, info), ok, 3);
+      const std::vector<float> g = get(A, 16);
+      const bool col_or_row_ok = lower ? std::isnan(g[10]) && g[11] == 0 && std::fabs(g[15] - 2.1602468f) < 1e-5f
+                                       : std::isnan(g[10]) && std::isnan(g[14]) && std::isnan(g[15]);
+      WANT(col_or_row_ok && std::fabs(g[0] - 2.2360680f) < 1e-5f && g[1 + (lower ? 0 : 3)] != 77, true);
+    }
+  }
+
+  // getrf without pivoting, on zero pivots.
+  {
+    auto run = [&](int n, const std::vector<float>& a, int want_info, const std::vector<float>& want) {
+      cudaMemcpy(A, a.data(), a.size() * sizeof(float), cudaMemcpyHostToDevice);
+      CALL(cusolverDnSgetrf(h, n, n, A, n, ws, nullptr, info), ok, want_info);
+      const std::vector<float> g = get(A, n * n);
+      for (int i = 0; i < n * n; ++i)
+        if (g[i] != want[i] || std::signbit(g[i]) != std::signbit(want[i])) {
+          std::printf("FAIL getrf without pivoting, zero pivot: A[%d] = %g, expected %g\n", i, g[i], want[i]);
+          ++fails;
+        }
+    };
+    run(3, {0, 1, 2, 1, 1, 1, 2, 1, 3}, 1, {0, 0, 0, 1, 1, 1, 2, 1, 2});
+    run(3, {1, 2, 3, 2, 4, 5, 3, 7, 9}, 2, {1, 2, 3, 2, 0, -0.0f, 3, 1, 0});
+    run(2, {0, 1, 1, 1}, 1, {0, 0, 1, 1});
+    // Pivoted, a zero column: the same as before.
+    cudaMemcpy(A, std::vector<float>{1, 2, 2, 4}.data(), 4 * sizeof(float), cudaMemcpyHostToDevice);
+    CALL(cusolverDnSgetrf(h, 2, 2, A, 2, ws, piv, info), ok, 2);
+  }
+
   // SetAdvOptions
   cusolverDnParams_t prm;
   WANT(cusolverDnCreateParams(&prm), ok);

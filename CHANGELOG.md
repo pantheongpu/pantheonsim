@@ -77,6 +77,12 @@ release says what runs and what it produces, never how fast a real GPU would run
   at least the rows (0 included: the simulator took 0 for the rows and copied); a set `ysize` that does not hold the rows
   from `pos.y` is `cudaErrorInvalidValue` (it copied overlapping slices). An extent with a side of 0 copies nothing; the
   simulator copied one row or one slice for a height or depth of 0 (`e2e_card_edges_pitch`).
+- cuSOLVER: `potrf` (`cusolverDn?potrf`, `cusolverDnXpotrf`) of a matrix that is not positive definite leaves A as an
+  RTX 3060 does: the columns before the failing one factored, NaN on the failing diagonal, and then, from the lower
+  triangle, the rest factored with that column taken as 0; from the upper, NaN in every row from the failing one. The
+  simulator left A untouched (measured up to n = 32; the card factors larger matrices in blocks, which changes the part
+  after the failing column). `getrf` without pivoting multiplies the column below a zero pivot by 0 and goes on, as
+  the card does; it skipped the column, leaving it as it was (`e2e_card_edges_cusolver`, `test_host_dense`).
 - AMD: the clamp bit of the integer instructions saturates their result on every target, as the CDNA3 and CDNA4 guides say (6.5, and
   "Supports saturation" on each add and subtract) and as an RX 6800 does. The VOP3b adds and subtracts with a carry out (`v_add_co_u32`,
   `v_sub_co_u32`, `v_subrev_co_u32`, `v_addc_co_u32`, `v_subb_co_u32`, `v_subbrev_co_u32`, RDNA's `_co_ci_` forms) and `v_mad_u64_u32` /
