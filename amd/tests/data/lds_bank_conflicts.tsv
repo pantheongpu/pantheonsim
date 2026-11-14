@@ -1,5 +1,5 @@
 # SQC_LDS_BANK_CONFLICT read from real cards: how many bank-conflict passes ONE LDS instruction took.
-# Cards: AMD Radeon RX 6800 (gfx1030) and RX 6700 XT (gfx1031), ROCm 7.2.0, rocprofv2 (rocprofv3 --pmc aborts on that machine, see
+# Card: AMD Radeon RX 6800 (gfx1030), ROCm 7.2.0 (no RX 6700 XT, gfx1031, rows have been recorded), rocprofv2 (rocprofv3 --pmc aborts on that machine, see
 # amd/docs/rocprofiler.md), one wave of `lanes` lanes alone on the GPU, the instruction issued 1000 times, counter / 1000.
 # Lane L addresses LDS byte (L * stride) % 65536 (plus the instruction's offsets, in the name: "ds_read2_b32 0 32" is offset0:0
 # offset1:32). `wave` is 32, or 64 for a program built with -mwavefrontsize64 (lanes 20, 32 and 64 were run).

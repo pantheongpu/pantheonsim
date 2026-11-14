@@ -1,6 +1,6 @@
 // LDS bank conflicts (SQC_LDS_BANK_CONFLICT), against what real cards counted.
 //
-// amd/tests/data/lds_bank_conflicts.tsv holds 906 measurements from an RX 6800 and an RX 6700 XT: one wave of 1 to 64 lanes issuing
+// amd/tests/data/lds_bank_conflicts.tsv holds 906 measurements from an RX 6800: one wave of 1 to 64 lanes issuing
 // one LDS instruction 1000 times at a stride, the counter divided by 1000 (amd/tools/lds-bank-probe says how). The model in
 // vgpu/amd_memtraffic.hpp is checked against every row; and the executor, running a kernel of six LDS instructions at a stride, against
 // the same rows (a wave64 is two wave32 halves). Nothing here is derived from the model.
@@ -108,7 +108,7 @@ VTEST(the_model_reproduces_every_conflict_a_real_card_counted) {
 }
 
 VTEST(the_rows_cover_what_the_model_claims) {
-  // Both cards, both wave sizes, partial waves, reads, writes, atomics and the two-address forms: a regeneration that lost one fails.
+  // The RX 6800 (the only card measured so far), both wave sizes, partial waves, reads, writes, atomics and the two-address forms: a regeneration that lost one fails.
   std::map<std::string, size_t> seen;
   for (const Row& r : rows()) {
     ++seen["card " + r.card];
@@ -116,7 +116,7 @@ VTEST(the_rows_cover_what_the_model_claims) {
     ++seen["lanes " + std::to_string(r.lanes)];
     ++seen[r.instruction.substr(0, r.instruction.find(' '))];
   }
-  for (const char* want : {"card rx6800", "card rx6700xt", "wave 32", "wave 64", "lanes 8", "lanes 16", "lanes 20", "lanes 32", "lanes 64",
+  for (const char* want : {"card rx6800", "wave 32", "wave 64", "lanes 8", "lanes 16", "lanes 20", "lanes 32", "lanes 64",
                            "ds_read_b32", "ds_read_b64", "ds_read_b96", "ds_read_b128", "ds_write_b32", "ds_write_b96", "ds_read_u8",
                            "ds_add_u32", "ds_add_rtn_u32", "ds_add_u64", "ds_read2_b32", "ds_read2_b64", "ds_read2st64_b32", "ds_write2_b32"})
     if (!seen.count(want)) throw vtest::Failure(std::string("no row for ") + want);

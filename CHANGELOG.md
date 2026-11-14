@@ -12,7 +12,7 @@ release says what runs and what it produces, never how fast a real GPU would run
   and are now printed; the bytes are new. A reader that splits the line on `=` and converts every value to a number must skip the text fields
   (`tools/bench-amd/bench.py` does). Requested in [discussion 631](https://github.com/pantheongpu/pantheonsim/discussions/631), issues #648 and #649.
 - AMD counters: LDS bank conflicts. `VGPU_DISPATCH_STATS` also prints `lds_bank_conflicts`, the passes through LDS's 32 banks beyond the first.
-  The rule was measured on an RX 6800 and an RX 6700 XT (`SQC_LDS_BANK_CONFLICT`, 906 combinations of instruction, stride and active lanes,
+  The rule was measured on an RX 6800 (`SQC_LDS_BANK_CONFLICT`, 906 combinations of instruction, stride and active lanes,
   all reproduced; data in `amd/tests/data/lds_bank_conflicts.tsv`, probe in `amd/tools/lds-bank-probe`) and is applied unchecked to the other targets.
   It is counted only when `VGPU_DISPATCH_STATS` is set. Sectors and cache lines are not counted yet (issue #650).
 - Host-GPU mode (experimental, opt-in), both modes: while the real driver is not started, a launch that would start it only because the program
