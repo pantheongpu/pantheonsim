@@ -71,6 +71,12 @@ release says what runs and what it produces, never how fast a real GPU would run
   and the GEMMs (`?gemm`, `cublasHgemm`, `?gemm3m`) print reference BLAS's line for the first bad argument on stdout, as
   the card does (" ** On entry to SGER   parameter number 5 had an illegal value"); `?symv`/`?hemv` refuse silently, and
   `?gemv` prints nothing (found by differential testing; `e2e_card_edges_blas2`).
+- Runtime: `cudaMemcpy3D` and `cudaMemcpy3DAsync` between pitched pointers check pitches and `ysize` as an RTX 3060 does. One
+  row of one slice accepts a pitch of 0 (it was `cudaErrorInvalidPitchValue`) and refuses a set pitch narrower than the
+  row with `cudaErrorInvalidValue`, the 3D form of the one-row `cudaMemcpy2D` fix; more than one slice needs a `ysize` of
+  at least the rows (0 included: the simulator took 0 for the rows and copied); a set `ysize` that does not hold the rows
+  from `pos.y` is `cudaErrorInvalidValue` (it copied overlapping slices). An extent with a side of 0 copies nothing; the
+  simulator copied one row or one slice for a height or depth of 0 (`e2e_card_edges_pitch`).
 - AMD: the clamp bit of the integer instructions saturates their result on every target, as the CDNA3 and CDNA4 guides say (6.5, and
   "Supports saturation" on each add and subtract) and as an RX 6800 does. The VOP3b adds and subtracts with a carry out (`v_add_co_u32`,
   `v_sub_co_u32`, `v_subrev_co_u32`, `v_addc_co_u32`, `v_subb_co_u32`, `v_subbrev_co_u32`, RDNA's `_co_ci_` forms) and `v_mad_u64_u32` /

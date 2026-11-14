@@ -5667,6 +5667,25 @@ VGPU_EXPORT cudaError_t cudaArrayGetInfo(cudaChannelFormatDesc* desc, cudaExtent
   return traced_call("cudaArrayGetInfo", cudaArrayGetInfo_traced, desc, extent, flags, array);
 }
 
+// The pitch and ysize of a pitched end of a 3D copy of `rows` rows of `row` bytes in each of `depth` slices, as an
+// RTX 3060 (CUDA 13.0) checks them, like copy2d_pitch_error for a 2D copy:
+//   - more than one slice needs a ysize of at least the rows (0 is not "unset" here): cudaErrorInvalidPitchValue;
+//   - more than one row or slice needs a pitch that holds the row from pos.x: cudaErrorInvalidPitchValue;
+//   - a single row of a single slice has no next one, so a pitch of 0 is accepted, and only a pitch that is set and too
+//     narrow is refused, as an invalid value (the 3D form of the one-row cudaMemcpy2D);
+//   - a ysize that is set must hold the rows from pos.y: cudaErrorInvalidValue.
+static cudaError_t copy3d_pitched_error(const cudaPitchedPtr& ptr, const cudaPos& pos, uint64_t row, uint64_t rows,
+                                        uint64_t depth) {
+  if (depth > 1 && ptr.ysize < rows) return cudaErrorInvalidPitchValue;
+  if (rows > 1 || depth > 1) {
+    if (pos.x + row > ptr.pitch) return cudaErrorInvalidPitchValue;
+  } else if (ptr.pitch != 0 && pos.x + row > ptr.pitch) {
+    return cudaErrorInvalidValue;
+  }
+  if (ptr.ysize != 0 && pos.y + rows > ptr.ysize) return cudaErrorInvalidValue;
+  return cudaSuccess;
+}
+
 // cudaMemcpy3D: a box of rows between arrays and pitched memory, in any
 // combination. With an array on either side the extent's width and that side's
 // x position count elements; for pitched memory they count bytes. Each row goes
@@ -5701,16 +5720,20 @@ static cudaError_t cudaMemcpy3D_traced(const cudaMemcpy3DParms* p) {
   if (sa && da && sa->texel_bytes != da->texel_bytes) return cudaErrorInvalidValue;
   const uint64_t elem = sa ? sa->texel_bytes : (da ? da->texel_bytes : 1);
   const uint64_t row = ext.width * elem;
-  const uint64_t rows = ext.height ? ext.height : 1;
-  const uint64_t depth = ext.depth ? ext.depth : 1;
-  if (row == 0) return cudaSuccess;
+  const uint64_t rows = ext.height;
+  const uint64_t depth = ext.depth;
+  // An extent with any side 0 copies nothing, arrays included, and its pitches are not checked (an RTX 3060's
+  // answer to 8 x 0 x 1 or 8 x 1 x 0 is success, with nothing written).
+  if (row == 0 || rows == 0 || depth == 0) return cudaSuccess;
   auto in_array = [](const ArrayRec& a, const cudaPos& pos, uint64_t w, uint64_t h, uint64_t d) {
     return pos.x + w <= a.width && pos.y + h <= (a.height ? a.height : 1) && pos.z + d <= a.slices();
   };
   if (sa && !in_array(*sa, spos, ext.width, rows, depth)) return cudaErrorInvalidValue;
   if (da && !in_array(*da, dpos, ext.width, rows, depth)) return cudaErrorInvalidValue;
-  if (!sa && (spos.x + row > p->srcPtr.pitch)) return cudaErrorInvalidPitchValue;
-  if (!da && (dpos.x + row > p->dstPtr.pitch)) return cudaErrorInvalidPitchValue;
+  if (!sa)
+    if (const cudaError_t e = copy3d_pitched_error(p->srcPtr, spos, row, rows, depth)) return e;
+  if (!da)
+    if (const cudaError_t e = copy3d_pitched_error(p->dstPtr, dpos, row, rows, depth)) return e;
   auto address = [&](const ArrayRec* a, const cudaPitchedPtr& ptr, const cudaPos& pos, uint64_t y,
                      uint64_t z) -> char* {
     if (a)
@@ -5744,8 +5767,7 @@ static cudaError_t cudaMemcpy3DAsync_traced(const cudaMemcpy3DParms* p, cudaStre
   // an array at either end waits for it here.
   if (p && !p->srcArray && !p->dstArray && p->srcPtr.ptr && p->dstPtr.ptr) {
     const cudaMemcpy3DParms c = *p;
-    const uint64_t row = c.extent.width, rows = c.extent.height ? c.extent.height : 1,
-                   depth = c.extent.depth ? c.extent.depth : 1;
+    const uint64_t row = c.extent.width, rows = c.extent.height, depth = c.extent.depth;
     // The bytes from the box's first to its last, at the addresses cudaMemcpy3D copies.
     auto span = [&](const cudaPitchedPtr& ptr, const cudaPos& pos, const void** lo) -> uint64_t {
       const uint64_t ysize = ptr.ysize ? ptr.ysize : rows;
@@ -5755,7 +5777,9 @@ static cudaError_t cudaMemcpy3DAsync_traced(const cudaMemcpy3DParms* p, cudaStre
     const void* src_lo = nullptr;
     const void* dst_lo = nullptr;
     const uint64_t src_n = span(c.srcPtr, c.srcPos, &src_lo), dst_n = span(c.dstPtr, c.dstPos, &dst_lo);
-    if (row != 0 && c.srcPos.x + row <= c.srcPtr.pitch && c.dstPos.x + row <= c.dstPtr.pitch &&
+    if (row != 0 && rows != 0 && depth != 0 &&
+        copy3d_pitched_error(c.srcPtr, c.srcPos, row, rows, depth) == cudaSuccess &&
+        copy3d_pitched_error(c.dstPtr, c.dstPos, row, rows, depth) == cudaSuccess &&
         async_defer(
             stream,
             [&](State& s) { return stream_ordered_copy(s, const_cast<void*>(dst_lo), dst_n, src_lo, src_n, c.kind); },
