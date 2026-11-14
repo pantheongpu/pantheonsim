@@ -251,5 +251,8 @@ uint64_t matrix_tile_count();
 // How many vector register files (64 KB each) the process has made new -- allocated and zeroed whole -- rather than taken from a
 // host thread's pool of the files earlier waves gave back. For the test that holds the pool to what a thread keeps resident.
 uint64_t vgpr_files_made();
+// How many host threads a dispatch with more work-groups than threads is spread over: VGPU_THREADS, or without it one a physical
+// core the process may use (vgpu/host_cores.hpp), not one a hardware thread. Read from the environment at each call, as a dispatch does.
+unsigned default_workers();
 
 }  // namespace vgpu::amd

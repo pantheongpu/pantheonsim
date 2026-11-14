@@ -40,6 +40,7 @@
 #include "vgpu/exec/amd_run_scan.hpp"
 #include "vgpu/exec/lockstep.hpp"
 #include "vgpu/error.hpp"
+#include "vgpu/host_cores.hpp"
 #include "vgpu/host_cpus.hpp"
 #include "mfma_math.hpp"
 #include "gcn_matrix_kernels.hpp"
@@ -13268,7 +13269,10 @@ unsigned worker_count(uint64_t groups) {
     const int v = std::atoi(t);
     want = v > 0 ? static_cast<unsigned>(v) : 1;
   } else {
-    want = vgpu::host_cpus();  // the CPUs this process may use, quota included
+    // The cores this process may use, quota included: one host thread a core, not one a hardware thread. A second thread on a
+    // core gave no wall time and doubled the CPU time on an 8-core, 16-thread host (vgpu/host_cores.hpp; Round sp70).
+    // VGPU_THREADS says otherwise, as before.
+    want = vgpu::host_cores();
   }
   if (want == 0) want = 1;
   if (want > groups) want = static_cast<unsigned>(groups);
@@ -13726,6 +13730,7 @@ std::atomic<bool> g_matrix_fast{true};
 bool matrix_fast_path() { return g_matrix_fast.load(std::memory_order_relaxed); }
 uint64_t matrix_tile_count() { return g_matrix_tiles; }
 uint64_t vgpr_files_made() { return g_vgpr_files_made.load(std::memory_order_relaxed); }
+unsigned default_workers() { return worker_count(~uint64_t{0}); }
 void set_matrix_fast_path(bool on) { g_matrix_fast.store(on); }
 
 void abandon_dispatches() { g_abandoned.store(true); }

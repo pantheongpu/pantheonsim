@@ -23,6 +23,8 @@
 #include "../../src/gcn_pool.hpp"
 #include "vgpu/amd_codeobject.hpp"
 #include "vgpu/amd_exec.hpp"
+#include "vgpu/host_cores.hpp"
+#include "vgpu/host_cpus.hpp"
 #include "vtest.hpp"
 
 using namespace vgpu;
@@ -111,6 +113,24 @@ bool same(const Result& x, const Result& y) {
 
 // The tasks of one launch run at once, one to a thread, and each exactly once: n tasks that wait for each other
 // (every one spins until all have started) finish only if they really are n threads.
+// Without VGPU_THREADS a dispatch is spread over one host thread a physical core the process may use, not one a hardware thread
+// (two threads of a core gave no wall time and twice the CPU time: Round sp70); VGPU_THREADS says otherwise, as it always has.
+VTEST(a_dispatch_is_spread_over_the_cores_unless_vgpu_threads_says_otherwise) {
+  const char* was = std::getenv("VGPU_THREADS");
+  const std::string saved = was ? was : "";
+  ::unsetenv("VGPU_THREADS");
+  VCHECK_EQ(amd::default_workers(), vgpu::host_cores());
+  VCHECK(amd::default_workers() <= vgpu::host_cpus());
+  ::setenv("VGPU_THREADS", "5", 1);
+  VCHECK_EQ(amd::default_workers(), 5u);
+  ::setenv("VGPU_THREADS", "64", 1);   // (more than the host has: the number asked for, as before)
+  VCHECK_EQ(amd::default_workers(), 64u);
+  ::setenv("VGPU_THREADS", "0", 1);
+  VCHECK_EQ(amd::default_workers(), 1u);
+  if (was) ::setenv("VGPU_THREADS", saved.c_str(), 1);
+  else ::unsetenv("VGPU_THREADS");
+}
+
 VTEST(a_launch_runs_every_task_once_and_all_at_the_same_time) {
   for (unsigned round = 0; round < 300; ++round) {
     const unsigned n = 1 + round % 40;
