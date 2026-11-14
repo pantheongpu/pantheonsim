@@ -2317,8 +2317,7 @@ VGPU_EXPORT cudaError_t cudaChooseDevice(int* device, const struct cudaDevicePro
 // an RTX 3060 (CUDA 13.0): the primary context is active afterwards and current on no thread; deviceFlags are applied
 // (the primary context's flags, as cuDevicePrimaryCtxSetFlags's but MAP_HOST taken and not kept) only when `flags` has
 // cudaInitDeviceFlagsAreValid, its other bits ignored, and then a value above 0xff or two scheduling modes are
-// cudaErrorInvalidValue -- with the context active all the same, and current on the calling thread. (The runtime keeps
-// no flags of its own: cudaGetDeviceFlags is still 0.)
+// cudaErrorInvalidValue -- with the context active all the same, and current on the calling thread.
 static cudaError_t cudaInitDevice_traced(int device, unsigned int deviceFlags, unsigned int flags) {
   return guard_query("cudaInitDevice", [&](State& s) {
     if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
@@ -2342,14 +2341,39 @@ VGPU_EXPORT cudaError_t cudaInitDevice(int device, unsigned int deviceFlags, uns
   return traced_call("cudaInitDevice", cudaInitDevice_traced, device, deviceFlags, flags);
 }
 
-static cudaError_t cudaSetDeviceFlags_traced(unsigned int /*p0*/) { return cudaSuccess; }
+// cudaSetDeviceFlags: the flags of the current device's primary context, as an RTX 3060 (CUDA 13.0) takes them -- the
+// values cuDevicePrimaryCtxSetFlags takes, MAP_HOST allowed and not kept (a primary context always has it), on an
+// active context too; the call then makes the primary context active and current, as cudaFree(0) does. A value above
+// 0xff or two scheduling modes are cudaErrorInvalidValue, and then nothing is started.
+static cudaError_t cudaSetDeviceFlags_traced(unsigned int flags) {
+  return guard_query("cudaSetDeviceFlags", [&](State&) {
+    const unsigned sched = flags & 7u;
+    if (flags > 0xffu || !(sched == 0 || sched == 1 || sched == 2 || sched == 4)) return cudaErrorInvalidValue;
+    using Activate = int (*)(int, int);
+    if (const auto on = reinterpret_cast<Activate>(driver_dlsym("vgpu_driver_primary_activate_v1")))
+      on(t_current_device, static_cast<int>(flags));
+    return bind_driver_context();
+  });
+}
 
 VGPU_EXPORT cudaError_t cudaSetDeviceFlags(unsigned int p0) {
   return traced_call("cudaSetDeviceFlags", cudaSetDeviceFlags_traced, p0);
 }
+// cudaGetDeviceFlags: the current context's flags, or the current device's primary context's with MAP_HOST when the
+// thread has no live context (vgpu_driver_device_flags_v1), as an RTX 3060 (CUDA 13.0) answers; a null pointer is
+// cudaErrorInvalidValue. Without the driver shim there are no flags to keep: MAP_HOST alone, as for a fresh device.
 static cudaError_t cudaGetDeviceFlags_traced(unsigned int* flags) {
-  if (flags) *flags = 0;
-  return cudaSuccess;
+  return guard_query("cudaGetDeviceFlags", [&](State&) {
+    if (!flags) return cudaErrorInvalidValue;
+    unsigned f = 0x8u;   // cudaDeviceMapHost
+    using Flags = int (*)(int, unsigned*);
+    if (const auto get = reinterpret_cast<Flags>(driver_dlsym("vgpu_driver_device_flags_v1"))) {
+      unsigned got = 0;
+      if (get(t_current_device, &got) == 0) f = got;
+    }
+    *flags = f;
+    return cudaSuccess;
+  });
 }
 
 VGPU_EXPORT cudaError_t cudaGetDeviceFlags(unsigned int* flags) {

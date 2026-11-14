@@ -1116,6 +1116,24 @@ VGPU_EXPORT int vgpu_driver_primary_activate_v1(int dev, int flags) {
   });
 }
 
+// cudaGetDeviceFlags, as an RTX 3060 (CUDA 13.0) answers it: the flags of the thread's current context when it has a
+// live one (cuCtxGetFlags), otherwise those set for the device's primary context (cudaSetDeviceFlags, cudaInitDevice,
+// cuDevicePrimaryCtxSetFlags) with MAP_HOST, which a primary context always has. It makes no context current or active.
+VGPU_EXPORT int vgpu_driver_device_flags_v1(int dev, unsigned* out) {
+  if (cuInit_impl(0) != CUDA_SUCCESS) return CUDA_ERROR_NOT_INITIALIZED;
+  return api("vgpu_driver_device_flags", true, false, [&](ShimState& s) {
+    check_device(s, dev);
+    const auto& stack = ctx_stack();
+    if (!stack.empty() && s.contexts.count(stack.back()) && !context_dead(s, stack.back())) {
+      *out = s.ctx_state[stack.back()].flags;
+    } else {
+      const auto it = s.primary_flags.find(dev);
+      *out = ((it == s.primary_flags.end() ? 0u : it->second) & kCtxSettableMask) | kCtxMapHost;
+    }
+    return CUDA_SUCCESS;
+  });
+}
+
 VGPU_EXPORT int vgpu_driver_bind_primary_v1(int dev) {
   if (cuInit_impl(0) != CUDA_SUCCESS) return CUDA_ERROR_NOT_INITIALIZED;
   return api("vgpu_driver_bind_primary", true, false, [&](ShimState& s) {

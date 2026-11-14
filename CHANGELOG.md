@@ -73,6 +73,11 @@ release says what runs and what it produces, never how fast a real GPU would run
     (eigensolvers::steepest_descent 45 to 41 CPU-s).
   - A wave's three- and four-word loads and stores of managed or host memory (`hipMallocManaged`, `hipHostMalloc`) go to memory as one batch
     on one host thread, as its one- and two-word ones did (hamiltonian::ks_hamiltonian with `VGPU_THREADS=1`: 30.7 s to 27.4 s).
+- NVIDIA runtime: `cudaGetDeviceFlags` answers the current context's flags, or the device's primary context's with
+  `cudaDeviceMapHost` when no context is current, as an RTX 3060 (CUDA 13.0) does (after `cudaSetDeviceFlags`, `cudaInitDevice` with
+  `cudaInitDeviceFlagsAreValid`, or `cuDevicePrimaryCtxSetFlags`); it answered 0, and success for a null pointer. `cudaSetDeviceFlags`
+  now sets the primary context's flags (on an active context too) and makes the context active and current, and refuses a value above
+  0xff or two scheduling modes with `cudaErrorInvalidValue`; it took any value and did nothing.
 - NVIDIA runtime, stream capture: anything a program does on the legacy stream while a blocking stream takes part in a capture is
   now `cudaErrorStreamCaptureImplicit` (906), is not done, and invalidates every capture a blocking stream takes part in, in every
   capture mode, as an RTX 3060 (CUDA 13.0) answers: a launch, a copy or fill (the synchronous `cudaMemcpy` and `cudaMemset` too), an
