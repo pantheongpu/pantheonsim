@@ -210,7 +210,8 @@ layout, arguments and scratch directories) as sim, exact and turbo, `--runs` tim
 on the card and in the simulator, launches kept in the simulator by reason, verify's counts, and the program's output against the sim
 run's: identical, numeric (the same words, every number with a fraction or exponent within `atol + rtol * |sim|`; integers and hashes
 must be equal), or different, with the largest numeric difference. A run past `--timeout` is killed (its own process group) and recorded.
-The form `exactdiv` is exact with `VGPU_HOST_GPU_DIV=1`; a program slower than `--long-secs` in the simulator gets `--long-runs` runs of each form.
+The form `exactdiv` is exact with `VGPU_HOST_GPU_DIV=1`; `exactr0` and `turbor0` are exact and turbo with `VGPU_HOST_GPU_START_REPEATS=0`
+(section 11), `exactl0` and `turbol0` with `VGPU_HOST_GPU_START_LAUNCHES=0`; a program slower than `--long-secs` in the simulator gets `--long-runs` runs of each form.
 `--dry-run` is a self-test that needs no card; it is the ctest `hostgpu_bench_selftest`.
 
 ```
@@ -224,7 +225,7 @@ python3 tools/bench/hostgpu/run.py --build build --corp /path/to/corp --gpu nvid
 |---|---|---|
 | `test_host_gpu_logic` | every CI job | the mode names; exact's set against a frozen copy and every decoder mnemonic; each class; joined modifiers; calls; the switches and the off list; the sampling rule (how many blocks, what a process can afford, the estimate, what repays the card, when not to sample); the rule for a launch while the card holds the memory (both sides by the formula, the margin and the floor found by bisection, the Costs it reads, when it does not act); the bans' reference while the card holds memory; the zero-grid check; the kinds of external functions and what each mode admits, the texture instructions, the `printf` switch and the atomics default, the card image (each relocation kind applied, the tables shortened, what it refuses) and the code relocation writer (Round sp66) |
 | `test_host_gpu_tol` | every CI job | the rule, the three readings, NaN, infinity, denormals, signed zero, range ends, the float-array hole, parsing of the tolerances |
-| `e2e_host_gpu_stub` | CI jobs with nvcc (a stand-in driver, no card) | turbo reaches the card path for expf, rcp and division beside expf; exact does not; the lines for scripts; the atomics default, `VGPU_HOST_GPU_ATOMICS=0` and the off list; unreadable values; verify against a card that computes nothing; the timeout; a contended reduction under verify; kernels with module variables in both modes, the image the card gets (no relocation of a variable left), the constant bank looked up and filled before the launch, `printf` in turbo only, a live texture object, a kernel that calls `malloc` (Round sp66, `host_gpu_vars.cu`, steps 30 to 36); a short launch that follows a long one to a card that keeps memory and computes nothing while the card holds the memory, and stays with `VGPU_HOST_GPU_STREAK=0` or when the program read the memory back (steps 24 to 26); a zero grid while the card holds the memory gets the simulator's error (step 27); a verify run pushes again only the chunks that differed (Round sp67, step 28); the square root idiom only with `VGPU_HOST_GPU_SQRT=1` (Round sp68, step 29) |
+| `e2e_host_gpu_stub` | CI jobs with nvcc (a stand-in driver, no card) | turbo reaches the card path for expf, rcp and division beside expf; exact does not; the lines for scripts; the atomics default, `VGPU_HOST_GPU_ATOMICS=0` and the off list; unreadable values; verify against a card that computes nothing; the timeout; a contended reduction under verify; kernels with module variables in both modes, the image the card gets (no relocation of a variable left), the constant bank looked up and filled before the launch, `printf` in turbo only, a live texture object, a kernel that calls `malloc` (Round sp66, `host_gpu_vars.cu`, steps 30 to 36); a short launch that follows a long one to a card that keeps memory and computes nothing while the card holds the memory, and stays with `VGPU_HOST_GPU_STREAK=0` or when the program read the memory back (steps 24 to 26); a zero grid while the card holds the memory gets the simulator's error (step 27); a verify run pushes again only the chunks that differed (Round sp67, step 28); the square root idiom only with `VGPU_HOST_GPU_SQRT=1` (Round sp68, step 29); 400 launches of one kernel, each a hundredth of the start cost, start the driver after the 200th, and not with `VGPU_HOST_GPU_START_REPEATS=0` nor when there are 150 (Round sp69, step 37) |
 | `hostgpu_bench_selftest` | every CI job | the harness: parsing, output classes, the table, a hang that is killed |
 | `e2e_host_gpu`, `tools/card-ci/run-card-ci.sh` | a machine with a card only (passed on an A10G, Round sp59) | section 5, item 1; module variables, `printf` (the order of the lines, stdout a file) and a live texture object on the card, the output the mode-off output to the byte (Round sp66) |
 
@@ -448,8 +449,38 @@ memory through `cuMemHostRegister` at the same address where the device says so,
 the mode would have to register every such range before a launch and the residency protocol does not cover memory the card reads over the bus; in
 the census 3.4 s are behind it, nearly all of them HeCBench `zerocopy`, a program written to time zero-copy access); cooperative and cluster launches and warp size (launch shapes the card path does not build). `VGPU_HOST_GPU_WIDER=0` restores the safety rules and the atomics opt-in of before the round, for A/B runs (the benchmark's forms `exactn` and `turbon`); the class scan's additions (calls into another section, `B2R`, `NANOSLEEP`, `LEPC`) are not switched by it.
 
-## 11. What is next
+## 11. The driver start of a program of many short launches (Round sp69; both modes)
+
+The driver start (0.15 to 0.25 s) is bought by a launch that repays it alone, or, once the program has simulated as long as the start costs
+(the account of sp43), by a launch that saves a share of it by itself: the start over 50 launches, 5 ms (the integration of sp64 to sp68, for
+four short CUDA Samples that paid a start they did not repay). That share kept the start from Rodinia hotspot, whose 1,000 launches of about
+1 ms save four times the start between them: 2.27x in turbo mode in Round sp66, 1.00x with the share.
+
+The rule (`start_share_launches`, `include/vgpu/host_gpu.hpp`): **the launch must repay the start within 50 launches like it, or, once the
+simulator has run its kernel 200 times, within as many launches as it has run it, at most 500. A kernel launched that often is taken to be
+launched as many times again, so the start is bought when the launches already made would have repaid it.**
+
+* *Why a count of the kernel's launches.* The four Samples' launches save more each than hotspot's (3.5 ms against 0.9 ms), so no bar on a
+  launch tells them apart; what does is that their kernels are launched about 100 times and hotspot's 1,000. Under 200 launches nothing
+  changes.
+* *Why at most 500.* The launch must then save 0.5 ms at the least. The card path's estimate has a fixed part of 0.107 ms that nothing has
+  measured for the kernel before its first card launch, and LargeKernelParameter (two kernels, 1,001 launches each of 0.2 to 0.3 ms) saved
+  0.1 to 0.2 ms a launch by it and repaid none of the start on the card.
+* *What it does not touch.* The account is asked first, as before; a first launch judged by its static estimate keeps its share of 12.5 ms; a
+  launch that repays the start alone, a sampled launch and every launch with the driver up are decided as before. The rule only adds
+  launches to those the share of 50 sends, and none that the account alone (`VGPU_HOST_GPU_START_LAUNCHES=0`) would not send.
+* *Exact mode.* The rule is the same in both modes and decides only when the driver starts: which kernels may run on the card, and so the
+  bits of an exact run, are not its business.
+
+On an A10G hotspot's turbo run goes from 1.06 s (1.00x) to 0.57 s (1.85x; 2.05x under the account alone, which buys the start 48 launches
+sooner); the four Samples send nothing and stay at the simulator's time; Rodinia sc_gpu (launches of 0.6 ms, under the floor) is not helped;
+no program of the integration's keep list is more than 3 % slower, and every output is the one it was.
+
+`VGPU_HOST_GPU_START_REPEATS=0` is the rule before. Numbers, the per-kernel table and the tests:
+[Round sp69](rounds/11-rounds-sp36-sp41.md#round-sp69-host-gpu-the-driver-start-of-a-program-of-many-short-launches).
+
+## 12. What is next
 
 From Round sp59, less what section 8 does: a start-cost account that weighs the gain for programs of many short launches (they lose 0.1 to 0.2 s
-or gain nothing); the card's fixed-point `MUFU.SIN` / `MUFU.COS` in the simulator; `BMMA` in the tensor class and a tensor probe whose sums round;
+or gain nothing; section 11 is a first step: it counts the launches a kernel has had, not yet what the card saved on them); the card's fixed-point `MUFU.SIN` / `MUFU.COS` in the simulator; `BMMA` in the tensor class and a tensor probe whose sums round;
 other cards and toolkits.

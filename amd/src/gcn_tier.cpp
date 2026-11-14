@@ -2689,6 +2689,8 @@ int h_ldexp_base(const Op& o, Regs& R) { return h_ldexp_body(o, R, h_f32_base); 
 
 int h_div64_rows_base(const Op& o, Regs& R);
 [[gnu::target("avx2,fma,popcnt")]] int h_div64_rows_avx2(const Op& o, Regs& R);   // (v_div_*_f64 rows: defined at the end of the file)
+[[gnu::target("avx2,fma,popcnt")]] void k_dmin_avx2(uint64_t* d, const uint64_t* ua, const uint64_t* ub, const uint64_t*, unsigned n);
+[[gnu::target("avx2,fma,popcnt")]] void k_dmax_avx2(uint64_t* d, const uint64_t* ua, const uint64_t* ub, const uint64_t*, unsigned n);   // (v_min_f64, v_max_f64: the same)
 
 bool cdna(const Inst& in) { return in.arch == gcn::Target::Gfx90a || in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950; }
 
@@ -2975,6 +2977,8 @@ void tier_classify(Inst& in) {
       } else {
         if (e.k == DMIN || e.k == DMAX) f.sub = 1;   // (opposite zeros go to the interpreter)
         f.kern = reinterpret_cast<AnyFn>(T.f64[e.k]);
+        // (fmin and fmax four lanes at a time where the host has AVX2, with the C library's bits: the end of the file)
+        if (T.avx2 && (e.k == DMIN || e.k == DMAX)) f.kern = reinterpret_cast<AnyFn>(e.k == DMIN ? k_dmin_avx2 : k_dmax_avx2);
         f.run = TIER_RUN(h_f64);
       }
       f.unit = kUnitValu;
@@ -3447,6 +3451,32 @@ namespace {
 }
 int h_div64_rows_base(const Op& o, Regs& R) { return h_div64_rows_body(o, R); }
 [[gnu::target("avx2,fma,popcnt")]] int h_div64_rows_avx2(const Op& o, Regs& R) { return h_div64_rows_body(o, R); }
+
+// ---- Round sp70: after everything else, so that it moves none of it.
+// fmin and fmax of doubles four lanes at a time, with the bits the C library's give (glibc's s_fmax_template.c, which the lane kernels
+// k_dmin and k_dmax call a lane at a time: 1.6 to 4.4% of the time of inq's reductions, Round sp70). The vector instruction returns its
+// second operand when either is a NaN, so: where b is a NaN the answer is a (the other operand, or a itself when both are NaNs), and
+// where either is a signaling NaN it is a + b, the quiet NaN the library's `x + y` makes. The two zeros of opposite sign never get here
+// (h_f64 sends them to the interpreter, Op::sub); a NaN result is handed back too (kNanHandBack), so what must be exact is which lanes
+// come out a NaN and every result that is not one. test_gcn_tier_same_bits holds both to the interpreter.
+template <bool Max>
+[[gnu::target("avx2,fma,popcnt"), gnu::always_inline]] inline void k_dminmax_avx2(uint64_t* d, const uint64_t* ua, const uint64_t* ub, unsigned n) {
+  const __m256i quiet = _mm256_set1_epi64x(0x0008000000000000ll);
+  for (unsigned i = 0; i < n; i += 4) {
+    const __m256d a = _mm256_loadu_pd(reinterpret_cast<const double*>(ua + i)), b = _mm256_loadu_pd(reinterpret_cast<const double*>(ub + i));
+    const __m256d anan = _mm256_cmp_pd(a, a, _CMP_UNORD_Q), bnan = _mm256_cmp_pd(b, b, _CMP_UNORD_Q);
+    __m256d r = Max ? _mm256_max_pd(a, b) : _mm256_min_pd(a, b);
+    r = _mm256_blendv_pd(r, a, bnan);
+    // (signaling: a NaN whose quiet bit is clear)
+    const __m256d aq = _mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(_mm256_castpd_si256(a), quiet), _mm256_setzero_si256()));
+    const __m256d bq = _mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(_mm256_castpd_si256(b), quiet), _mm256_setzero_si256()));
+    const __m256d snan = _mm256_or_pd(_mm256_and_pd(anan, aq), _mm256_and_pd(bnan, bq));
+    r = _mm256_blendv_pd(r, _mm256_add_pd(a, b), snan);
+    _mm256_storeu_pd(reinterpret_cast<double*>(d + i), r);
+  }
+}
+[[gnu::target("avx2,fma,popcnt")]] void k_dmin_avx2(uint64_t* d, const uint64_t* ua, const uint64_t* ub, const uint64_t*, unsigned n) { k_dminmax_avx2<false>(d, ua, ub, n); }
+[[gnu::target("avx2,fma,popcnt")]] void k_dmax_avx2(uint64_t* d, const uint64_t* ua, const uint64_t* ub, const uint64_t*, unsigned n) { k_dminmax_avx2<true>(d, ua, ub, n); }
 
 }  // namespace
 

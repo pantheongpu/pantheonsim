@@ -1,0 +1,16 @@
+ 0 killed by test_amd_gcn_register_pool: pool: room for 32 files, as before
+ 1 killed by test_amd_gcn_register_pool (second pass, after the test's kernel went from 6 barriers to 24 and its first launch was held above 128 files): pool: room for 128 files
+ 2 killed by test_amd_gcn_register_pool: pool: nothing is given back
+ 3 killed by test_amd_gcn_threads, test_amd_gcn_threads_gfx1100, test_amd_gcn_threads_gfx1030: threads: the hardware threads, as before
+ 4 killed by test_amd_gcn_threads, test_amd_gcn_threads_gfx1100, test_amd_gcn_threads_gfx1030: threads: VGPU_THREADS capped by the cores
+ 5 killed by host_cores: cores: every CPU its own core
+ 6 killed by host_cores: cores: the package not looked at
+ 7 killed by host_cores: cores: a CPU without a topology is skipped
+ 8 survived, and cannot be killed by a result: fmax: b a NaN gives b (the lane comes out a NaN where the answer is a, a NaN result is handed back, and the interpreter runs the instruction: the right bits, more slowly)
+ 9 killed by test_amd_gcn_tier_same_bits_shard_0of8, test_amd_gcn_tier_same_bits_shard_1of8, test_amd_gcn_tier_same_bits_shard_2of8, test_amd_gcn_tier_same_bits_shard_3of8 ...: fmax: a signaling NaN is not answered with a NaN
+10 survived, and cannot be killed by a result: fmax: the operands the other way round (the same: where a is a quiet NaN the lane comes out a NaN and is handed back; everything else is as it was, the two zeros never get here)
+11 killed by test_amd_gcn_tier_same_bits_shard_0of8, test_amd_gcn_tier_same_bits_shard_1of8, test_amd_gcn_tier_same_bits_shard_2of8, test_amd_gcn_tier_same_bits_shard_3of8 ...: fmax: minimum for maximum
+12 killed by test_amd_gcn_tier_same_bits_shard_0of8, test_amd_gcn_tier_same_bits_shard_1of8, test_amd_gcn_tier_same_bits_shard_2of8, test_amd_gcn_tier_same_bits_shard_3of8 ...: fmax: only a's signaling NaN
+13 killed by test_amd_gcn_memruns, test_amd_gcn_memruns_gfx1100, test_amd_gcn_memruns_gfx1201, test_amd_gcn_memruns_gfx1030 ...: host batch: a quad's loads not made
+14 killed by test_amd_gcn_memruns, test_amd_gcn_memruns_gfx1100, test_amd_gcn_memruns_gfx1201, test_amd_gcn_memruns_gfx1030: host batch: a quad's stores not made
+13 of 15 killed (12 in the first pass); the two that survive change which instructions are handed back to the interpreter, not a result
