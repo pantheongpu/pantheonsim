@@ -1,0 +1,43 @@
+# hiprtc_cache (the stand-in for ROCm, twice)
+102 ok, 0 FAIL, all passed
+102 ok, 0 FAIL, all passed
+# amd_hiprtc_cache (ROCm 6.4.4)
+exit 0: 20 ok, 0 FAIL
+ok    with the cache off a program sees what it sees with ROCm's library alone: every result code, size and byte
+ok    ROCm's libhiprtc compiles the four programs (cache off)
+ok    ... and lowers the template's two names
+ok    ... and leaves a warning in the fourth program's log
+ok    the cache off is ROCm's library alone: 4 real compiles, nothing kept
+ok    a cold cache hands back what ROCm's library does: results, code, log, lowered names
+ok    ... having compiled each program once and kept it
+ok    a later process gets the bytes ROCm's library returned to the first, every one
+ok    ... from the files, with no real compile
+ok    in one process the second compile of each program gets the bytes of the first, which ROCm's library made
+ok    ... and they are what the library returns with the cache off
+ok    ... from memory
+ok    another simulated GPU is compiled for again, with ROCm's results for it
+ok    ... which are not the MI300X's
+ok    "bitcode": ROCm's answers with the cache off, cold and warm
+ok    "twice": ROCm's answers with the cache off, cold and warm
+ok    "late-expr": ROCm's answers with the cache off, cold and warm
+ok    "unknown-name": ROCm's answers with the cache off, cold and warm
+ok    "early": ROCm's answers with the cache off, cold and warm
+ok    the simulator's libhiprtc defines every hiprtc entry point of libhiprtc.so.6
+# ctest
+ 1/15 Test  #11: test_config ......................   Passed    0.01 sec
+ 2/15 Test #163: host_cpus ........................ (its program was not built in this tree)
+ 3/15 Test #164: hiprtc_cache .....................   Passed    5.40 sec
+ 4/15 Test #165: amd_hiprtc_cache .................   Passed   17.17 sec
+ 5/15 Test #166: host_cores ....................... (its program was not built in this tree)
+ 6/15 Test #527: config_cli .......................   Passed    0.43 sec
+ 7/15 Test #531: lint_readme_commands .............   Passed    0.43 sec
+ 8/15 Test #535: lint_example_yaml ................   Passed    0.02 sec
+ 9/15 Test #587: lint_doc_links ...................   Passed    0.23 sec
+10/15 Test #597: lint_header_exports ..............***Skipped   0.04 sec
+11/15 Test #598: lint_odr_globals .................***Skipped   0.04 sec
+12/15 Test #599: lint_odr_globals_selftest ........   Passed    1.03 sec
+13/15 Test #600: lint_shim_symbols ................   Passed    0.13 sec
+14/15 Test #601: lint_shim_dynsyms ................   Passed    0.13 sec
+15/15 Test #602: lint_static_tls ..................   Passed    0.20 sec
+13 of the 13 whose programs were built pass or skip
+Total Test time (real) =  25.27 sec
