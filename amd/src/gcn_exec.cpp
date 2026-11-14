@@ -1238,6 +1238,8 @@ struct Machine {
   // A half result, which fills the low half of the register and zeroes the
   // high half, as every 16-bit instruction here does.
   void write_half(Wave& w, const Inst& in, uint32_t lane, _Float16 v) {
+    if (in.arch == gcn::Target::Gfx1030 && v != v)
+      v = std::bit_cast<_Float16>(static_cast<uint16_t>(rdna2_nan(w, in, lane, true, std::bit_cast<uint16_t>(v))));
     // FP16_OVFL: an infinity that no infinite operand explains is an overflow, and becomes the largest finite half.
     if (fp16_ovfl(w, in) && std::isinf(static_cast<float>(v)) && overflow_only_op(in.name)) {
       bool finite_in = true;
@@ -1486,7 +1488,118 @@ struct Machine {
   static bool omod_ignored(const Wave& w, const Inst& in, uint32_t denorm_bit) {
     return omod_rules(in) && (((w.mode >> 9) & 1) || ((w.mode >> denorm_bit) & 1));
   }
+  // gfx1030's NaN (an RX 6800 and an RX 6700 XT, test_amd_gcn_nan): where a float result of the e32 or e64 form of an instruction below
+  // is a NaN, it is the first NaN source in operand order, after the source's abs and neg (v_sub negates its second source, v_subrev its
+  // first: their NaN comes out with the sign flipped), quieted with IEEE mode on and as it is with IEEE mode off (a signalling NaN goes
+  // through); with no NaN source (inf - inf, 0 * inf, sqrt(-1), fract(inf), sin(inf)) it is the negative default NaN, 0xfe00 or 0xffc00000.
+  // Conversions carry the payload's top bits across (quieted where none is left). v_fma and v_fmac: a product of 0 and an infinity is
+  // the default NaN even beside a NaN addend. v_min and v_max with IEEE mode on: a signalling NaN before a quiet one. v_div_fixup: S2,
+  // then S1; a NaN quotient (S0) where the pseudocode's last case would keep it is an infinity of the result's sign. Not established, left
+  // as they were: v_med3, v_min3 and v_max3, v_fmamk/v_fmaak, the SDWA and DPP forms, doubles. Returns the result's bits, out16 a half.
+  uint32_t rdna2_nan(const Wave& w, const Inst& in, uint32_t lane, bool out16, uint32_t bits) const {
+    if (in.sdwa || in.dpp || in.dpp8) return bits;
+    std::string_view name = in.name;
+    for (std::string_view suffix : {"_e32", "_e64"})
+      if (name.ends_with(suffix)) name.remove_suffix(suffix.size());
+    static const std::set<std::string_view> kRule = {
+        "v_add_f16", "v_sub_f16", "v_subrev_f16", "v_mul_f16", "v_max_f16", "v_min_f16", "v_fmac_f16", "v_fma_f16", "v_div_fixup_f16",
+        "v_fract_f16", "v_floor_f16", "v_ceil_f16", "v_trunc_f16", "v_rndne_f16", "v_sqrt_f16", "v_rcp_f16", "v_rsq_f16", "v_log_f16",
+        "v_exp_f16", "v_sin_f16", "v_cos_f16", "v_frexp_mant_f16", "v_ldexp_f16", "v_cvt_f16_f32", "v_cvt_f32_f16",
+        "v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_mul_legacy_f32", "v_max_f32", "v_min_f32", "v_fmac_f32", "v_fma_f32",
+        "v_div_fixup_f32", "v_fract_f32", "v_floor_f32", "v_ceil_f32", "v_trunc_f32", "v_rndne_f32", "v_sqrt_f32", "v_rcp_f32",
+        "v_rsq_f32", "v_log_f32", "v_exp_f32", "v_sin_f32", "v_cos_f32", "v_frexp_mant_f32", "v_ldexp_f32"};
+    if (!kRule.count(name)) return bits;
+    const bool ieee = (w.mode >> 9) & 1;
+    const bool in16 = name == "v_cvt_f32_f16" || (out16 && name != "v_cvt_f16_f32");
+    const uint32_t sign = in16 ? 0x8000u : 0x80000000u, mag = ~sign & (in16 ? 0xFFFFu : ~0u), inf = in16 ? 0x7C00u : 0x7F800000u;
+    const auto nan_of = [&](uint32_t v) { return (v & mag) > inf; };
+    const auto signalling = [&](uint32_t v) { return nan_of(v) && !(v & (in16 ? 0x200u : 0x400000u)); };
+    // The float sources as the instruction sees them (v_fmac's addend is its destination; v_ldexp's second source is an integer).
+    const bool fmac = name.starts_with("v_fmac");
+    const size_t n = name.starts_with("v_ldexp") ? 1 : fmac ? 3 : std::min<size_t>(in.src.size(), 3);
+    uint32_t s[3] = {0, 0, 0};
+    for (size_t k = 0; k < n; ++k) {
+      const Operand& o = fmac && k == 2 ? in.dst[0] : in.src[k];
+      uint32_t v = lane_src(w, o, lane);
+      if (in16) v &= 0xFFFFu;
+      if (o.abs) v &= ~sign;
+      if (o.neg) v ^= sign;
+      s[k] = v;
+    }
+    if (name.starts_with("v_sub_")) s[1] ^= sign;
+    if (name.starts_with("v_subrev_")) s[0] ^= sign;
+    const uint32_t out_quiet = out16 ? 0x200u : 0x400000u, out_mant = out16 ? 0x3FFu : 0x7FFFFFu;
+    const uint32_t out_sign = out16 ? 0x8000u : 0x80000000u, out_inf = out16 ? 0x7C00u : 0x7F800000u;
+    const auto pass = [&](uint32_t v) {   // a NaN source as the result: converted, then quieted where IEEE mode says
+      if (in16 && !out16) v = (v & 0x8000u) << 16 | 0x7F800000u | (v & 0x3FFu) << 13;
+      if (!in16 && out16) v = (v >> 16 & 0x8000u) | 0x7C00u | (v & 0x7FFFFFu) >> 13;
+      if (ieee || !(v & out_mant)) v |= out_quiet;
+      return v;
+    };
+    const uint32_t dflt = out16 ? 0xFE00u : 0xFFC00000u;
+    if (name.starts_with("v_div_fixup")) {
+      if (nan_of(s[2])) return pass(s[2]);
+      if (nan_of(s[1])) return pass(s[1]);
+      const bool z1 = !(s[1] & mag), z2 = !(s[2] & mag), i1 = (s[1] & mag) == inf, i2 = (s[2] & mag) == inf;
+      if (nan_of(s[0]) && !z1 && !z2 && !i1 && !i2) return ((s[1] ^ s[2]) & sign ? out_sign : 0u) | out_inf;
+      return dflt;
+    }
+    if (name.starts_with("v_fma") && !nan_of(s[0]) && !nan_of(s[1]) &&
+        ((!(s[0] & mag) && (s[1] & mag) == inf) || ((s[0] & mag) == inf && !(s[1] & mag))))
+      return dflt;
+    if (ieee && (name.starts_with("v_max_") || name.starts_with("v_min_")))
+      for (size_t k = 0; k < n; ++k)
+        if (signalling(s[k])) return pass(s[k]);
+    for (size_t k = 0; k < n; ++k)
+      if (nan_of(s[k])) return pass(s[k]);
+    return dflt;
+  }
+  // gfx1030's v_min3, v_max3 and v_med3 (f16, f32), as the RX 6800 gives them (test_amd_gcn_nan): the guides'
+  // pseudocode (V_MED3: with a NaN source, V_MIN3) over the card's two-input min and max, which order -0 below +0 and, with IEEE mode on,
+  // let a signalling NaN win, quieted, a quiet NaN lose to a number and two quiet NaNs give the first, quieted; with IEEE mode off a NaN
+  // loses to a number and two NaNs give the first as it is. Every lane where no source is a denormal (whose flushing MODE decides, and the
+  // instruction's own arithmetic does); false, and that arithmetic, for the others.
+  bool rdna2_minmax3_nan(const Wave& w, const Inst& in, uint32_t lane, bool h, uint32_t* out) const {
+    if (in.sdwa || in.dpp || in.dpp8) return false;
+    const uint32_t sign = h ? 0x8000u : 0x80000000u, mag = sign - 1, inf = h ? 0x7C00u : 0x7F800000u, quiet = h ? 0x200u : 0x400000u;
+    uint32_t s[3];
+    bool denormal = false;
+    for (int k = 0; k < 3; ++k) {
+      const Operand& o = in.src[k];
+      uint32_t v = lane_src(w, o, lane);
+      if (h) v &= 0xFFFFu;
+      if (o.abs) v &= ~sign;
+      if (o.neg) v ^= sign;
+      s[k] = v;
+      denormal = denormal || ((v & mag) != 0 && (v & mag) < (h ? 0x400u : 0x800000u));
+    }
+    if (denormal) return false;
+    const bool ieee = (w.mode >> 9) & 1;
+    const auto nan = [&](uint32_t v) { return (v & mag) > inf; };
+    const auto value = [&](uint32_t v) { return h ? static_cast<double>(std::bit_cast<_Float16>(static_cast<uint16_t>(v))) : static_cast<double>(as_float(v)); };
+    const auto below = [&](uint32_t a, uint32_t b) {   // a < b, -0 below +0
+      const double x = value(a), y = value(b);
+      return x == y ? (a & sign) && !(b & sign) : x < y;
+    };
+    const auto two = [&](uint32_t a, uint32_t b, bool is_min) {
+      if (ieee && nan(a) && !(a & quiet)) return a | quiet;
+      if (ieee && nan(b) && !(b & quiet)) return b | quiet;
+      if (nan(a) && nan(b)) return ieee ? a | quiet : a;
+      if (nan(a)) return b;
+      if (nan(b)) return a;
+      return is_min ? (below(b, a) ? b : a) : (below(a, b) ? b : a);
+    };
+    const bool is_max = in.name.starts_with("v_max3");
+    if (in.name.starts_with("v_med3") && !nan(s[0]) && !nan(s[1]) && !nan(s[2])) {
+      const uint32_t top = two(two(s[0], s[1], false), s[2], false);
+      *out = top == s[0] ? two(s[1], s[2], false) : top == s[1] ? two(s[0], s[2], false) : two(s[0], s[1], false);
+      return true;
+    }
+    *out = two(two(s[0], s[1], !is_max), s[2], !is_max);   // (v_med3 with a NaN: v_min3)
+    return true;
+  }
   void write_float(Wave& w, const Inst& in, uint32_t lane, float v) {
+    if (in.arch == gcn::Target::Gfx1030 && v != v) v = as_float(rdna2_nan(w, in, lane, false, as_bits(v)));
     // The output multiplier, then the clamp, as the ISA orders them.
     if (in.omod && !omod_ignored(w, in, 5)) {
       if (omod_rules(in) && v == 0) v = 0.0f;
@@ -5427,6 +5540,11 @@ struct Machine {
     if (!(op == "v_min3_f16"_op || op == "v_max3_f16"_op || op == "v_med3_f16"_op || op == "v_mad_f16"_op)) goto L_ladder_11;
     {
       each([&](uint32_t lane) {
+        uint32_t bits = 0;
+        if (in.arch == gcn::Target::Gfx1030 && op != "v_mad_f16"_op && rdna2_minmax3_nan(w, in, lane, true, &bits)) {
+          write_half(w, in, lane, std::bit_cast<_Float16>(static_cast<uint16_t>(bits)));
+          return;
+        }
         const float x = half(0, lane), y = half(1, lane), z = half(2, lane);
         float r;
         if (op == "v_min3_f16"_op) r = std::fmin(std::fmin(x, y), z);
@@ -5637,8 +5755,8 @@ struct Machine {
               if (std::isnan(num) || std::isnan(den)) out = std::numeric_limits<float>::quiet_NaN();
               else if (den == 0) out = num == 0 ? std::numeric_limits<float>::quiet_NaN()
                                                 : std::copysign(inf, num) * std::copysign(1.0f, den);
-              else if (std::isinf(den)) out = std::isinf(num) ? std::numeric_limits<float>::quiet_NaN()
-                                                             : std::copysign(0.0f, num) * std::copysign(1.0f, den);
+              else if (std::isinf(den) || num == 0)   // (x/inf and 0/y: the guides' pseudocode, and an RX 6800, give the zero for 0/y too)
+                out = std::isinf(num) ? std::numeric_limits<float>::quiet_NaN() : std::copysign(0.0f, num) * std::copysign(1.0f, den);
               else if (std::isinf(num)) out = std::copysign(inf, num) * std::copysign(1.0f, den);
               else out = std::signbit(den) != std::signbit(num) ? -std::fabs(q) : std::fabs(q);   // the quotient's sign is the operands' (CDNA3 ISA)
               write_half(w, in, lane, static_cast<_Float16>(out));
@@ -6356,7 +6474,11 @@ struct Machine {
           return;
         }
         // The argument is in turns: a whole turn is 1.0, not 2pi.
-        const double radians = static_cast<double>(lane_float(w, in.src[0], lane)) * 6.283185307179586476925286766559;
+        const float turns = lane_float(w, in.src[0], lane);
+        // gfx1030 (an RX 6800, test_amd_gcn_nan): the sine of a nonzero whole number of turns is +0, not the rounding error of 2pi.
+        if (in.arch == gcn::Target::Gfx1030 && op == "v_sin_f32_e32"_op && turns != 0 && std::isfinite(turns) && turns == std::trunc(turns))
+          return write_float(w, in, lane, 0.0f);
+        const double radians = static_cast<double>(turns) * 6.283185307179586476925286766559;
         write_float(w, in, lane, static_cast<float>(op == "v_sin_f32_e32"_op ? std::sin(radians) : std::cos(radians)));
       });
     }
@@ -6375,6 +6497,8 @@ struct Machine {
     if (!(op == "v_min3_f32"_op || op == "v_max3_f32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
+        uint32_t bits = 0;
+        if (in.arch == gcn::Target::Gfx1030 && rdna2_minmax3_nan(w, in, lane, false, &bits)) return write_float(w, in, lane, as_float(bits));
         const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane),
                     z = lane_float(w, in.src[2], lane);
         write_float(w, in, lane, op == "v_min3_f32"_op ? nan_fmin<0>(nan_fmin<0>(x, y), z)
@@ -6388,6 +6512,8 @@ struct Machine {
       each([&](uint32_t lane) {
         // The middle one of three; with a NaN among them, the least, as
         // min3 gives it (a NaN losing to any number).
+        uint32_t bits = 0;
+        if (in.arch == gcn::Target::Gfx1030 && rdna2_minmax3_nan(w, in, lane, false, &bits)) return write_float(w, in, lane, as_float(bits));
         const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane),
                     z = lane_float(w, in.src[2], lane);
         write_float(w, in, lane,
@@ -6922,7 +7048,8 @@ struct Machine {
         int e = 0;
         const float m = std::isfinite(x) ? std::frexp(x, &e) : x;
         if (!std::isfinite(x)) e = 0;
-        write_lane(w, in.dst[0], lane, op == "v_frexp_mant_f32_e32"_op ? as_bits(m) : static_cast<uint32_t>(e));
+        const uint32_t mb = in.arch == gcn::Target::Gfx1030 && m != m ? rdna2_nan(w, in, lane, false, as_bits(m)) : as_bits(m);
+        write_lane(w, in.dst[0], lane, op == "v_frexp_mant_f32_e32"_op ? mb : static_cast<uint32_t>(e));
       });
     }
     break;

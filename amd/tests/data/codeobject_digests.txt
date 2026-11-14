@@ -69,6 +69,7 @@ data/asm_mods.gfx1100.o	e3f64aa5e4f0165d
 data/asm_mods.gfx90a.o	4699c994e9b729f1
 data/asm_mods.gfx942.o	e907be3cabedda36
 data/asm_mulhi.gfx942.o	43ad510470faf4ad
+data/asm_nan.gfx1030.o	d69615257b221843
 data/asm_permlane.gfx1100.o	6768595450bd87c
 data/asm_permute_exec.gfx942.o	6ebd1555fdb9b13c
 data/asm_quad.gfx942.o	b7ea0876449944cd

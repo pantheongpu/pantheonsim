@@ -7,9 +7,7 @@
 //
 // The kernel is amd/tests/data/asm_hi16.s; SDWA (dst_sel and dst_unused say what happens) and the packed instructions are not in it.
 // gfx9: only the bits a rule names are compared. gfx1030: every dword is also compared with what the cards wrote
-// (amd/tests/data/asm_hi16.gfx1030.card.txt), but for two differences this does not fix: v_fract_f16 of an infinity and v_sub_f16 and
-// v_subrev_f16 with a NaN are 0xfe00 on the card, 0x7e00 here (slots 16, 23, 24: those NaNs need only be NaNs), and v_div_fixup_f16
-// (slot 52) makes -inf of a NaN quotient (S0 0x7e00, S1 -1, S2 100) on the card, where the guide's pseudocode keeps the NaN.
+// (amd/tests/data/asm_hi16.gfx1030.card.txt), NaNs and all (test_amd_gcn_nan has the NaN rules).
 // Run with the tier off and on.
 #include <cstdint>
 #include <cstdio>
@@ -58,9 +56,6 @@ std::vector<uint32_t> card(const char* target) {
     for (std::string w; t < kItems && in >> w; ++t) v.push_back(static_cast<uint32_t>(std::stoul(w, nullptr, 16)));
   return v;
 }
-bool is_nan16(uint32_t v) { return (v & 0x7C00) == 0x7C00 && (v & 0x3FF); }
-constexpr int kCardNotCompared = 52;
-bool any_nan(int op) { return op == 16 || op == 23 || op == 24; }
 
 int run(const char* target, const char* rules, bool wave32, bool tier) {
   const std::vector<uint32_t> want = card(target);
@@ -106,10 +101,7 @@ int run(const char* target, const char* rules, bool wave32, bool tier) {
         case 'N': ok = g == old; break;
         default: break;
       }
-      if (ok && !want.empty() && op != kCardNotCompared) {
-        const uint32_t c = want[op * kItems + t];
-        ok = any_nan(op) && is_nan16(c & 0xFFFFu) ? (g >> 16) == (c >> 16) && is_nan16(g & 0xFFFFu) : g == c;
-      }
+      if (ok && !want.empty()) ok = g == want[op * kItems + t];
       if (ok) continue;
       ++wrong;
       if (shown++ < 2)

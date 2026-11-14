@@ -2115,6 +2115,9 @@ target_compile_definitions(test_amd_gcn_mods PRIVATE VGPU_SOURCE_DIR="${CMAKE_SO
 # What a 16-bit vector result leaves in the destination's high half (gfx9: zeroed, but the VOP3 multiply-adds; gfx10: kept), against an RX 6800.
 vgpu_unit_test(test_amd_gcn_hi16 amd/tests/unit/test_gcn_hi16.cpp)
 target_compile_definitions(test_amd_gcn_hi16 PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# Which NaN a gfx1030 float instruction gives (sign, payload, quieting, the invalid-operation NaN), against an RX 6800.
+vgpu_unit_test(test_amd_gcn_nan amd/tests/unit/test_gcn_nan.cpp)
+target_compile_definitions(test_amd_gcn_nan PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn_abandon amd/tests/unit/test_gcn_abandon.cpp)
 target_compile_definitions(test_amd_gcn_abandon PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_hostcall amd/tests/unit/test_hostcall.cpp)

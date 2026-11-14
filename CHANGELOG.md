@@ -123,6 +123,17 @@ release says what runs and what it produces, never how fast a real GPU would run
   `v_ldexp_f16`, `v_sat_pk_u8_i16`, `v_cvt_norm_i16_f16` and `v_cvt_norm_u16_f16` ("decoded but not implemented"); they run now, and
   give the cards' bits (the sine and cosine of an infinity are 0xfe00 there). New test `test_amd_gcn_hi16` (`amd/tests/data/asm_hi16.s`,
   75 instruction slots, gfx90a, gfx942 and gfx1030, tier off and on; the gfx1030 one against the cards' dwords).
+- AMD: gfx1030's NaNs are now the card's (an RX 6800 and an RX 6700 XT; follow-up to pantheonsim #613). A NaN result is the first NaN
+  source in operand order after its abs/neg (so `v_sub` and `v_subrev` flip the sign of the NaN they pass on), quieted with IEEE mode
+  on and passed through as it is (a signalling NaN too) with IEEE mode off; with no NaN source (inf - inf, 0 * inf, sqrt(-1),
+  fract(inf)) it is the negative default NaN, 0xfe00 or 0xffc00000; conversions carry the payload over; `v_fma`'s 0 * inf beats a NaN
+  addend; `v_min`/`v_max` with IEEE mode let a signalling NaN win; `v_min3`, `v_max3` and `v_med3` follow the guides' pseudocode over
+  those (with -0 below +0). The executor took NaNs from the host's arithmetic, in whichever order kept the old digests. `v_div_fixup`
+  takes S2's NaN, then S1's, and makes an infinity of a NaN quotient, as the card does. `v_sin_f32` of a whole number of turns is +0.
+  `v_div_fixup_f16` gave the quotient's magnitude for 0/y on every target; it gives the signed zero of the guides' pseudocode, as the
+  card does. The tier hands gfx1030's NaN results, its `v_div_fixup_f32` and its `v_sin_f32` to the interpreter. New test
+  `test_amd_gcn_nan` (`amd/tests/data/asm_nan.s`: 65 f16 and f32 instructions over pairs of 11 special values, IEEE mode on and off,
+  every dword against the cards'). test_amd_gcn_same_bits: 31 lines re-recorded (its header lists them).
   `amd/tests/hipcc/rdna3.cpp` expected `v_add_f32_e64 ... div:2` to halve in a default-mode (IEEE on) hipcc kernel; it now expects the
   modifier ignored (`rdna3.gfx1100` and `rdna3.w64.gfx1100` rebuilt: host code only, the device code is the same).
 - AMD: the clamp bit of the integer instructions saturates their result on every target, as the CDNA3 and CDNA4 guides say (6.5, and

@@ -28,6 +28,10 @@
 // Sixty-four more were recorded after the high-half fix (test_amd_gcn_hi16), from the tree that has it: gfx1030's 16-bit VOP1, VOP2 and VOP3
 // results (57 lines in 14869-16049: v_add_f16, v_fma_f16, v_add_nc_u16, v_cvt_f16_f32 and the rest), which keep the destination's high half as an RX
 // 6800 does where the baseline zeroed it, and gfx90a's v_fma_f16 and v_div_fixup_f16 (7 lines in 4930-4971), which keep it as the CDNA2 guide says.
+// Thirty-one more after the gfx1030 NaN rules (test_amd_gcn_nan), from the tree that has them: 20 gfx1030 lines in 14954-16019 whose result is a
+// NaN (v_sub_f16/f32, v_div_fixup_f16/f32, v_fma_f32, v_min_f32, v_floor_f32, v_ceil_f32, v_frexp_mant_f32: now the cards' NaN) or a sine of a
+// whole number of turns (v_sin_f32, now +0), and v_div_fixup_f16 on the other targets (11 lines: 1098, 3046-3047, 4930-4931, 6842-6844, 8653,
+// 12637-12638), whose 0/y case now gives the guides' signed zero where the baseline gave the quotient's magnitude.
 // Every other digest is the baseline's.
 #include <cstdint>
 #include <cstdio>
