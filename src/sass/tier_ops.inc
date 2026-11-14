@@ -2854,6 +2854,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
         if (++w.spins >= 64) {
           w.spins = 0;
           w.give_way = true;
+          w.forced = true;   // (not a YIELD: the group keeps its uniform registers, see Warp::UniformSave)
           w.yield_pc = target;   // the group that branched back, at the top of its loop (exec_control's BRA)
         }
       }
@@ -2896,6 +2897,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       st.inst_by_class[last.cls] += lanes;
       w.slice = 0;
       w.give_way = true;
+      w.forced = false;
       w.yield = true;
       ++w.idle_yields;
       w.yield_pc = here + 16;   // where the lanes that yielded stand once the YIELD is done (exec_control's YIELD)
@@ -3001,7 +3003,8 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
     fault(w, *cur->ins, static_cast<unsigned>(std::countr_zero(group ? group : 1u)), e.message(), e.code());
   }
   // The chain (see above).
-  if (!tier_chain_ || w.budget == 0 || w.yield || w.slice || w.give_way || w.ws_held || w.mactive_force) return true;
+  // (A group switched away from on a backward branch gets its uniform registers back in step_warp: the chain stops while one waits.)
+  if (!tier_chain_ || w.budget == 0 || w.yield || w.slice || w.give_way || w.ws_held || w.mactive_force || !w.ur_saved.empty()) return true;
   const Mask run = w.runnable();
   if (!run) return true;
   uint64_t lo;

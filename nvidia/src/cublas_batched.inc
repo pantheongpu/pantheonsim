@@ -281,6 +281,8 @@ VGPU_EXPORT cublasStatus_t cublasZgemm3m(cublasHandle_t h, cublasOperation_t ta,
                                          int k, const cuDoubleComplex* alpha, const cuDoubleComplex* A, int lda,
                                          const cuDoubleComplex* B, int ldb, const cuDoubleComplex* beta,
                                          cuDoubleComplex* C, int ldc) {
+  if (valid(h))
+    if (const int bad = gemm_bad_arg(ta, tb, m, n, k, lda, ldb, ldc)) return illegal_arg('Z', "GEMM3M ", bad);
   return cublasZgemm_v2(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 VGPU_EXPORT cublasStatus_t cublasCgemm3mBatched(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m,

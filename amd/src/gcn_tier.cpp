@@ -2894,10 +2894,12 @@ void tier_classify(Inst& in) {
       if ((e.flags & kCdnaOnly) && in.arch != gcn::Target::Gfx90a && in.arch != gcn::Target::Gfx942 && in.arch != gcn::Target::Gfx950) return fail();
       if ((e.flags & (kNoOmod | kFloatOut)) && in.omod) return fail();
       if ((e.flags & kFloatOut) && in.clamp) return fail();
-      // (CDNA3 and CDNA4 apply the clamp bit to the integer instructions that have one and to the conversions to float: the interpreter's.)
-      if (in.clamp && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && (!is_f || (e.flags & kIgnoreMods))) return fail();
-      // (gfx942 and gfx950 apply or ignore an output modifier by MODE and flush what it makes denormal, CDNA3 and CDNA4 guides, 6.5: the interpreter's.)
-      if (in.omod && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && !(e.flags & kIgnoreMods)) return fail();
+      // (The clamp bit of an integer instruction saturates its result, on every target -- CDNA3 and CDNA4 guides, 6.5, and an RX 6800 --
+      // and CDNA3 and CDNA4 apply it to the conversions to float too: the interpreter's.)
+      if (in.clamp && (!is_f || ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && (e.flags & kIgnoreMods)))) return fail();
+      // (gfx9, gfx10 and gfx11 apply or ignore an output modifier by MODE and flush what it makes denormal, CDNA2 to CDNA4 guides, 6.5, the
+      // RDNA3 guide, 7.2.3.1, and an RX 6800: the interpreter's.)
+      if (in.omod && in.arch != gcn::Target::Gfx1200 && in.arch != gcn::Target::Gfx1250 && !(e.flags & kIgnoreMods)) return fail();
       for (int k = 0; k < e.arity; ++k) {
         if ((e.k == ALIGNBIT || e.k == ALIGNBYTE) && !is_f && k == 2 && in.src[2].bits16 && !in.src[2].hi && !in.src[2].sext && (in.src[2].sel == 6 || in.src[2].sel == 4)) {
           // (RDNA3 and RDNA4 name the shift count a 16-bit operand; the low half of a register, whose low bits are all the kernel reads of it)
@@ -2953,7 +2955,7 @@ void tier_classify(Inst& in) {
     case Cat::F64: {
       if (!vector_enc || in.dst.size() != 1 || in.src.size() < static_cast<size_t>(e.arity)) return;
       if (!vgpr_dst(in.dst[0], f.dst, 2)) return fail();
-      if (in.omod && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950)) return fail();
+      if (in.omod && in.arch != gcn::Target::Gfx1200 && in.arch != gcn::Target::Gfx1250) return fail();   // (the interpreter's, as for F32)
       for (int k = 0; k < e.arity; ++k)
         if (!lane_src64(in.src[k], f.src[k], true)) return fail();
       if (e.flags & kFmac) f.src[2] = Src(), f.src[2].kind = kVgpr, f.src[2].index = f.dst.index, f.src[2].wide = true;
@@ -2998,6 +3000,7 @@ void tier_classify(Inst& in) {
       const std::string& nm = in.name;
       const bool takes = nm.find("_addc_") != std::string::npos || nm.find("_subb") != std::string::npos;
       if (takes && in.src.size() < 3) return;
+      if (in.clamp) return fail();   // (clamped, the result saturates: the interpreter's carry_alu)
       if (!vgpr_dst(in.dst[0], f.dst, 1) || !scalar_dst(in.dst[1], f.dst2)) return fail();
       if (!lane_src32(in.src[0], f.src[0], false) || !lane_src32(in.src[1], f.src[1], false)) return fail();
       if (takes && !scalar_src(in.src[2], f.src[2])) return fail();
@@ -3157,6 +3160,7 @@ void tier_classify(Inst& in) {
     case Cat::Pk16: {
       if (in.enc != Enc::Vop3p || in.dst.size() != 1 || in.src.size() < static_cast<size_t>(e.arity)) return;
       if (!vgpr_dst(in.dst[0], f.dst, 1)) return fail();
+      if (in.neg_lo || in.neg_hi) return fail();   // (neg_lo and neg_hi flip an integer half's top bit: the interpreter's)
       const bool clamps = in.clamp && e.sub;
       uint32_t sub = 0;
       for (int k = 0; k < e.arity; ++k) {
@@ -3203,6 +3207,7 @@ void tier_classify(Inst& in) {
     }
     case Cat::Mad64: {
       if (!vector_enc || in.dst.empty() || in.dst.size() > 2 || in.src.size() < 3) return;
+      if (in.clamp) return fail();   // (clamped, the result saturates: the interpreter's)
       if (!vgpr_dst(in.dst[0], f.dst, 2)) return fail();
       if (!lane_src32(in.src[0], f.src[0], false) || !lane_src32(in.src[1], f.src[1], false) || !lane_src64(in.src[2], f.src[2], false)) return fail();
       if (in.dst.size() == 2 && !scalar_dst(in.dst[1], f.dst2)) return fail();
@@ -3305,7 +3310,7 @@ void tier_classify(Inst& in) {
       const bool dbl = e.k >= 4, scale = (e.k & 3) == 0;
       if (!vgpr_dst(in.dst.empty() ? Operand() : in.dst[0], f.dst, dbl ? 2 : 1)) return fail();
       if (scale ? (in.dst.size() != 2 || !scalar_dst(in.dst[1], f.dst2)) : in.dst.size() != 1) return fail();
-      if (!scale && (in.clamp || in.omod)) return fail();   // (the interpreter's write_float / write_double, issue #613)
+      if (in.clamp || in.omod) return fail();   // (the interpreter's write_float / write_double: issue #613, and v_div_scale's on an RX 6800)
       for (int k = 0; k < 3; ++k)
         if (!(dbl ? lane_src64(in.src[k], f.src[k], true) : lane_src32(in.src[k], f.src[k], true))) return fail();
       f.sub = static_cast<uint32_t>(e.k);

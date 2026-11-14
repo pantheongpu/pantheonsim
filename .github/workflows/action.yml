@@ -204,8 +204,13 @@ jobs:
             cusparseCreateCsr(&A, 2, 2, 2, dr, dc, dv, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
                               CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F);
             cusparseCreateDnVec(&X, 2, dx, CUDA_R_64F); cusparseCreateDnVec(&Y, 2, dy, CUDA_R_64F);
+            // The buffer SpMV asks for, as on a real card (it refuses a null one when the size is not 0).
+            size_t bytes = 0; void* buf = nullptr;
+            if (cusparseSpMV_bufferSize(h, CUSPARSE_OPERATION_NON_TRANSPOSE, &one, A, X, &zero, Y, CUDA_R_64F,
+                                        CUSPARSE_SPMV_ALG_DEFAULT, &bytes)) return 1;
+            if (bytes) cudaMalloc(&buf, bytes);
             if (cusparseSpMV(h, CUSPARSE_OPERATION_NON_TRANSPOSE, &one, A, X, &zero, Y, CUDA_R_64F,
-                             CUSPARSE_SPMV_ALG_DEFAULT, nullptr)) return 1;
+                             CUSPARSE_SPMV_ALG_DEFAULT, buf)) return 1;
             cublasHandle_t b; cublasCreate(&b);
             cublasDnrm2(b, 2, dy, 1, &norm);
             cudaMemcpy(y, dy, sizeof y, cudaMemcpyDeviceToHost);
