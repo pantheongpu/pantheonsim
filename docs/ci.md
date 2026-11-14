@@ -77,8 +77,9 @@ fixed temporary name or shared state between two of them would have shown. The
 tests that fetch CUTLASS serialise the fetch (`cutlass_fetch.sh`) and each makes
 its own `mktemp` directory; the fixed names the tests do use are one per test
 (`/tmp/vgpu-graph-build.dot`, `/tmp/vgpu-graph-nodes.dot`) or carry the pid; no
-test binds a fixed port. Not proven: peak memory of a sanitized test (nothing in
-the logs says), and CUTLASS's 10 GB compile beside another test on the 16 GB
+test binds a fixed port. Not proven: peak memory of a sanitized test (the ASan and TSan jobs now
+print the job's peak in a "Report the peak memory" step; read it before
+lowering `-g 6`), and CUTLASS's 10 GB compile beside another test on the 16 GB
 hosted runner (the test sizes its compiles from the memory free when it starts,
 so it takes one compile at a time there). If a sanitizer job is killed with exit
 137 in its test step, or the build job in a CUTLASS compile, revert the commit.
