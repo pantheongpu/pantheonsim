@@ -2270,9 +2270,11 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     const uint32_t w1 = word(code, at + 4);
     // The modifiers: a source's absolute value and negation, and a clamp of
     // the result. An output multiplier is refused rather than dropped, since
-    // dropping one gives a wrong answer with nothing to show for it.
+    // dropping one gives a wrong answer with nothing to show for it. VOP3b
+    // keeps its clamp bit where VOP3a does (bit 15, above the scalar
+    // destination): v_add_co_u32 ... clamp saturates.
     const uint32_t abs = s.sdst ? 0 : (w0 >> 8) & 0x7;
-    in.clamp = s.sdst ? false : ((w0 >> 15) & 1) != 0;
+    in.clamp = ((w0 >> 15) & 1) != 0;
     in.omod = static_cast<uint8_t>((w1 >> 27) & 0x3);
     if (s.scalar_dst) in.dst.push_back(sgpr(w0 & 0xFF, s.dst_width));
     else in.dst.push_back(vgpr(w0 & 0xFF, s.dst_width));

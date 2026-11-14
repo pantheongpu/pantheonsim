@@ -63,6 +63,17 @@ release says what runs and what it produces, never how fast a real GPU would run
   (`CUSPARSE_STATUS_NOT_SUPPORTED`, also from `cusparseSpMV_bufferSize`). The `cusparseSetMat*` setters refuse values their enums do
   not have, destroying a null handle or descriptor succeeds, and `cusparseGetErrorName`/`String` give the card's texts
   (`e2e_card_edges_cusparse`).
+- AMD: the clamp bit of the integer instructions saturates their result on every target, as the CDNA3 and CDNA4 guides say (6.5, and
+  "Supports saturation" on each add and subtract) and as an RX 6800 does. The VOP3b adds and subtracts with a carry out (`v_add_co_u32`,
+  `v_sub_co_u32`, `v_subrev_co_u32`, `v_addc_co_u32`, `v_subb_co_u32`, `v_subbrev_co_u32`, RDNA's `_co_ci_` forms) and `v_mad_u64_u32` /
+  `v_mad_i64_i32` ignored it (gfx9's decoder did not read the bit, and neither the interpreter nor the tier applied it), so
+  `v_add_co_u32_e64 ... clamp`, LLVM's unsigned saturating add on gfx8, wrapped; clamped, a sum past the type's range is its maximum, a
+  difference below zero is zero, and the carry out stays the unclamped one's. `v_mad_u32_u24`, `v_mad_i32_i24`, `v_mul_u32_u24`,
+  `v_mul_i32_i24`, `v_sad_u8`, `v_sad_hi_u8`, `v_sad_u16`, `v_msad_u8`, `v_mul_lo_u16` and `v_mad_legacy_u16` ignored it too, and
+  `v_subrev_u32`, `v_subrev_u16`, `v_mad_u16`, `v_mad_i16`, `v_mad_u32_u16` and `v_mad_i32_i16` applied it on gfx942 and gfx950 only.
+  `v_mad_i64_i32`'s scalar bit is bit 64 of the 65-bit result (the guides' pseudocode, and the card's): the sign of the exact result, not
+  whether it overflowed int64, which it was. New test `test_amd_gcn_int_clamp` (gfx90a, gfx942 and gfx1030, tier off and on; its gfx1030
+  kernel run on the card gave what the test expects) (follow-up to pantheonsim #613).
 - Runtime: a copy, fill or kernel launch issued on a stream behind a host function that has not finished returns at once and runs
   after it, in stream order, as on an RTX 3060. It used to run inside the call after waiting for the host function, so a host function
   that waits for something the program does after the call (Celeritas' `AsyncSnapshotTest.device_pending`) hung the program.

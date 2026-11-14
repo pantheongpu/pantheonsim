@@ -2104,6 +2104,9 @@ set_tests_properties(test_amd_hip_module_probe PROPERTIES ENVIRONMENT "VGPU_GPU=
 # v_div_fmas / v_div_fixup with the clamp bit or an output modifier (issue #613).
 vgpu_unit_test(test_amd_gcn_div_clamp amd/tests/unit/test_gcn_div_clamp.cpp)
 target_compile_definitions(test_amd_gcn_div_clamp PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The clamp bit of the integer instructions: VOP3b adds and subtracts with a carry out, the 64-bit multiply-adds, and the rest.
+vgpu_unit_test(test_amd_gcn_int_clamp amd/tests/unit/test_gcn_int_clamp.cpp)
+target_compile_definitions(test_amd_gcn_int_clamp PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn_abandon amd/tests/unit/test_gcn_abandon.cpp)
 target_compile_definitions(test_amd_gcn_abandon PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_hostcall amd/tests/unit/test_hostcall.cpp)

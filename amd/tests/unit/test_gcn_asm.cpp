@@ -1273,7 +1273,7 @@ VTEST(vector_comparisons_packed_math_and_mixed_precision_give_what_the_isa_says)
   const __int128 sum = static_cast<__int128>(x) * y + 0x7ffffffffffffff0ll;
   VCHECK_EQ(r[4], u(static_cast<int64_t>(sum)));
   VCHECK_EQ(r[5], u(static_cast<int64_t>(sum) >> 32));
-  VCHECK_EQ(r[6], 1u);     // and it overflowed
+  VCHECK_EQ(r[6], 0u);     // it overflowed int64, but the scalar bit is bit 64 of the 65-bit sum (CDNA3 guide), here 0
   VCHECK_EQ(r[21], 0u);
   VCHECK_EQ(r[7], halves(-(-2.0f) + 0.25f, 1.5f + 3.0f));   // (-hi(v6) + lo(v7), lo(v6) + hi(v7))
   VCHECK_EQ(r[8], halves(1.5f, -2.0f));                      // max(1.5, 0.25), max(-2, -3)
