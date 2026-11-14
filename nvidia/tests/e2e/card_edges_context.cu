@@ -19,6 +19,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+// cuCtxCreate gained a CUctxCreateParams argument in CUDA 13 (cuCtxCreate_v4); CUDA 12 headers have the 3-argument form.
+#if CUDA_VERSION >= 13000
+#define CTX_CREATE(pctx, dev) cuCtxCreate((pctx), nullptr, 0, (dev))
+#else
+#define CTX_CREATE(pctx, dev) cuCtxCreate((pctx), 0, (dev))
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 
@@ -47,7 +54,7 @@ static void destroyed() {
   WANT(cuInit(0), CUDA_SUCCESS);
   WANT(cuDeviceGet(&dev, 0), CUDA_SUCCESS);
   CUcontext c = nullptr;
-  WANT(cuCtxCreate(&c, nullptr, 0, dev), CUDA_SUCCESS);
+  WANT(CTX_CREATE(&c, dev), CUDA_SUCCESS);
   WANT(cuCtxDestroy(c), CUDA_SUCCESS);
   WANT(current() == nullptr, true);
   WANT(cuCtxSetCurrent(c), CUDA_SUCCESS);
@@ -127,7 +134,7 @@ static void unset() {
   WANT(cuDeviceGet(&dev, 0), CUDA_SUCCESS);
   CUcontext own = nullptr;
   WANT(cuCtxSetCurrent(nullptr), CUDA_SUCCESS);   // so that destroying it leaves nothing below
-  WANT(cuCtxCreate(&own, nullptr, 0, dev), CUDA_SUCCESS);
+  WANT(CTX_CREATE(&own, dev), CUDA_SUCCESS);
   WANT(cudaMalloc(&q, 16), cudaSuccess);
   WANT(current() == own, true);
   WANT(cudaFree(q), cudaSuccess);
