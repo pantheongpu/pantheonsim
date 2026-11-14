@@ -224,10 +224,12 @@ struct ProgramRun {
   std::string error;
   uint64_t instructions = 0;   // DispatchStats::instructions
   uint64_t in_blocks = 0;      // ... of which ran inside blocks (VGPU_AMD_BLOCKS)
+  uint64_t machine_in_blocks = 0;   // ... and of those, the Machine's instructions (memory accesses and the like)
   bool ended = false;          // every wave reached the end of the program
 };
 // `wave_state`: bits that put every wave in a state the tier leaves to the interpreter before the first instruction runs.
-inline constexpr uint32_t kProgramVskip = 1, kProgramGprIdx = 2, kProgramRoundToZero = 4;
+// kProgramAddresses is not such a state: it aims the address registers of the program's flat and global accesses at the memory region.
+inline constexpr uint32_t kProgramVskip = 1, kProgramGprIdx = 2, kProgramRoundToZero = 4, kProgramAddresses = 8;
 uint64_t digest_program(const std::vector<gcn::Inst>& program, gcn::Target target, uint64_t seed, uint32_t flavour, uint32_t waves,
                         uint64_t slice, ProgramRun* run = nullptr, uint32_t wave_state = 0);
 

@@ -401,4 +401,90 @@ VTEST(a_barrier_ends_a_block) {
   if (wrong) throw vtest::Failure(std::to_string(wrong) + " of " + std::to_string(runs) + " runs with barriers differ with blocks on");
 }
 
+// Memory instructions inside blocks: global loads and stores whose addresses are on a memory region (until an instruction before them writes
+// the address register: then the access faults, in the middle of a block, and the error says where), scalar memory (s_memtime among it, which
+// reads the instruction count: everything before it has to be counted when it runs), LDS reads and writes at small addresses, between plain
+// instructions; one to three waves, so that a wave's first store of a round waits for the others inside a block and the wave goes on in the block.
+VTEST(memory_instructions_inside_blocks) {
+  const bool tier_was = amd::gcn::tier::enabled(), blocks_were = amd::gcn::tier::blocks();
+  amd::gcn::tier::set_enabled(true);
+  uint64_t runs = 0, wrong = 0, in_blocks = 0, machine = 0, instructions = 0, threw = 0, ended = 0;
+  std::string report;
+  for (const Target& t : {kTargets[0], kTargets[1]}) {
+    const Pools pool = pools_of(t);
+    std::vector<amd::gcn::Inst> global, scalar, lds, plain;
+    for (const amd::gcn::Inst& in : pool.any) {
+      if (!in.fast.run) continue;
+      if (in.enc == amd::gcn::Enc::Flat && in.fast.mach && (starts(in.name, "global_load") || starts(in.name, "global_store"))) global.push_back(in);
+      else if (in.enc == amd::gcn::Enc::Smem && in.fast.mach) scalar.push_back(in);
+      else if (in.enc == amd::gcn::Enc::Ds && !in.fast.mach) lds.push_back(in);
+    }
+    for (const amd::gcn::Inst& in : pool.blockable)
+      if ((in.enc == amd::gcn::Enc::Vop2 || in.enc == amd::gcn::Enc::Sop2) && plain.size() < 80) plain.push_back(in);
+    VCHECK(global.size() >= 4);
+    VCHECK(!scalar.empty());
+    VCHECK(lds.size() >= 4);
+    Rng r{0x3e3021 + static_cast<uint64_t>(t.target)};
+    for (uint64_t pn = 0; pn < 150; ++pn) {
+      // The memory accesses first, so that the other instructions can be chosen among those that leave their address registers alone (a
+      // program whose first access faults tests one fault and nothing after it; one access in five may still be aimed elsewhere by a load before it).
+      const size_t len = 8 + r.below(24);
+      std::vector<amd::gcn::Inst> program(len);
+      std::vector<bool> taken(len, false), vreg(260, false), sreg(110, false);
+      for (size_t i = 0; i < len; ++i) {
+        const uint64_t pick = r.below(100);
+        if (pick >= 45) continue;
+        program[i] = pick < 25 ? global[r.below(global.size())] : pick < 38 ? lds[r.below(lds.size())] : scalar[r.below(scalar.size())];
+        taken[i] = true;
+        const amd::gcn::Inst& in = program[i];
+        if (in.enc == amd::gcn::Enc::Flat && !in.src.empty() && in.src[0].kind == amd::gcn::OperandKind::Vgpr && in.src[0].index < 256)
+          vreg[in.src[0].index] = vreg[in.src[0].index + 1] = true;
+        if (in.enc == amd::gcn::Enc::Flat && in.has_saddr && in.saddr < 105) sreg[in.saddr] = sreg[in.saddr + 1] = true;
+        if (in.enc == amd::gcn::Enc::Smem && !in.src.empty() && in.src[0].kind == amd::gcn::OperandKind::Sgpr && in.src[0].index < 105)
+          sreg[in.src[0].index] = sreg[in.src[0].index + 1] = true;
+      }
+      const auto leaves_addresses = [&](const amd::gcn::Inst& in) {
+        for (const amd::gcn::Operand& o : in.dst)
+          for (uint32_t k = 0; k < o.width + 1; ++k) {
+            if (o.kind == amd::gcn::OperandKind::Vgpr && o.index + k < 260 && vreg[o.index + k]) return false;
+            if (o.kind == amd::gcn::OperandKind::Sgpr && o.index + k < 110 && sreg[o.index + k]) return false;
+          }
+        return true;
+      };
+      for (size_t i = 0; i < len; ++i) {
+        if (taken[i]) continue;
+        do program[i] = plain[r.below(plain.size())];
+        while (!leaves_addresses(program[i]));
+      }
+      program.push_back(pool.endpgm[0]);
+      for (const uint32_t waves : {1u, 2u, 3u}) {
+        const uint64_t slice = r.below(3) == 0 ? 0 : 1 + r.below(9);
+        amd::ProgramRun off_run, on_run;
+        amd::gcn::tier::set_blocks(false);
+        const uint64_t off = amd::digest_program(program, t.target, pn, 1, waves, slice, &off_run, amd::kProgramAddresses);
+        amd::gcn::tier::set_blocks(true);
+        const uint64_t on = amd::digest_program(program, t.target, pn, 1, waves, slice, &on_run, amd::kProgramAddresses);
+        ++runs, in_blocks += on_run.in_blocks, machine += on_run.machine_in_blocks, instructions += on_run.instructions;
+        threw += !on_run.error.empty(), ended += on_run.ended;
+        if (off != on || off_run.error != on_run.error) {
+          if (++wrong <= 3) {
+            report += "\n  target " + std::to_string(static_cast<int>(t.target)) + " program " + std::to_string(pn) + " waves " + std::to_string(waves) + " slice " +
+                      std::to_string(slice) + ": [" + off_run.error + "] one at a time, [" + on_run.error + "] in blocks";
+            if (wrong == 1 && std::getenv("VGPU_BLOCKS_DUMP")) report += listing(program);
+          }
+        }
+      }
+    }
+  }
+  amd::gcn::tier::set_blocks(blocks_were);
+  amd::gcn::tier::set_enabled(tier_was);
+  std::fprintf(stderr, "memory in blocks: %llu runs each way, %llu instructions, %llu in blocks, %llu of them the Machine's, %llu threw, %llu ended\n",
+               static_cast<unsigned long long>(runs), static_cast<unsigned long long>(instructions), static_cast<unsigned long long>(in_blocks),
+               static_cast<unsigned long long>(machine), static_cast<unsigned long long>(threw), static_cast<unsigned long long>(ended));
+  if (wrong) throw vtest::Failure(std::to_string(wrong) + " of " + std::to_string(runs) + " runs with memory instructions differ with blocks on:" + report);
+  VCHECK(in_blocks * 2 > instructions);
+  VCHECK(machine * 20 > instructions);
+  VCHECK(threw * 10 > runs && ended * 10 > runs);
+}
+
 VTEST_MAIN

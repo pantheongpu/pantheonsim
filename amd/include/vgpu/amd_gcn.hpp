@@ -335,19 +335,37 @@ struct Inst {
   } block;
 };
 
-// A run of consecutive instructions the pre-decoded tier has handlers for, none of them the Machine's (Op::mach), ending with the first
-// branch (it is the run's last instruction) or before the first instruction that is not the tier's; and what running all of it adds to the
-// counters, added once. The instructions are the decode cache's, which outlives the run. (amd/src/gcn_exec.cpp: Machine::make_block and
-// run_block; docs/perf-design/13-amd-compiled-tier.md.)
+// A run of consecutive instructions the pre-decoded tier has handlers for or hands to the Machine (Op::mach: memory instructions and the
+// like; not a barrier and not s_endpgm, which stop the wave), ending with the first branch (it is the run's last instruction) or before
+// the first instruction that is neither; and what running it adds to the counters. The instructions are the decode cache's, which
+// outlives the run. (amd/src/gcn_exec.cpp: Machine::make_block and run_block; docs/perf-design/13-amd-compiled-tier.md.)
 struct TierBlock {
   std::vector<const Inst*> insts;
-  // What running the whole block counts: the 64-bit counter `at` bytes into the dispatch's DispatchStats goes up by n (the instruction
-  // total, each unit, each mix and matrix-operation slot the block's instructions count in; a handful of entries).
+  // What each instruction is to the runner. kPlain: a handler that does the instruction or hands it back. kTurn: a handler that can also
+  // end the wave's turn (a plain store, whose first of a round waits for the group's other waves; a wait for loads). kMach: the Machine's
+  // (it counts itself, moves the program counter itself, and can throw).
+  enum Kind : uint8_t { kPlain, kTurn, kMach };
+  std::vector<uint8_t> kind;
+  // A counter raised: the 64-bit counter `at` bytes into the dispatch's DispatchStats goes up by n.
   struct Add {
     uint32_t at;
     uint32_t n;
   };
+  // A stretch: the plain instructions [begin, end) and the one that is not plain at `end` (none where `end` is the block's length; the
+  // last stretch of a block that ends with one that is not plain is empty). adds[first_add, first_add + n_adds) is what running all of
+  // the plain ones counts (the instruction total, each unit, each mix and matrix-operation slot: a handful of entries), added once.
+  struct Stretch {
+    uint32_t begin, end, first_add, n_adds;
+  };
+  std::vector<Stretch> stretches;
+  std::vector<uint32_t> stretch_of;   // by instruction: its stretch (an instruction that is not plain belongs to the stretch it ends)
   std::vector<Add> adds;
+  // Whether the block pays, found out over its first runs (Machine::judge_block): a block whose waves give up their turn every two or
+  // three instructions (waits for loads and first stores of a round, in a work-group of several waves) is entered and left more than it
+  // runs, and its instructions go one at a time again (`off`). Counted without locks by whichever threads run it first (a lost count
+  // changes when the answer comes, not what any instruction does), then read only.
+  mutable std::atomic<uint32_t> trial_runs{0}, trial_steps{0}, trial_stops{0};
+  mutable std::atomic<bool> judged{false}, off{false};
   // What an instruction with no run to start points at (shared, never freed).
   static const TierBlock* none() {
     static const TierBlock kNone;
