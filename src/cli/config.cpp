@@ -131,6 +131,9 @@ std::vector<Key> build_keys() {
                          "Warp scheduling order. random and adversarial find order bugs (PTX engine only: set sass: off)."));
   t.push_back(integer("scheduler_seed", "VGPU_SCHEDULER_SEED", 0, LLONG_MAX, "0", "1",
                       "Seed for random and adversarial scheduling; the same seed replays the same run."));
+  // AMD run-time compilation (amd/src/hiprtc_cache.cpp)
+  t.push_back(enumerated("hiprtc_cache", "VGPU_HIPRTC_CACHE", {{"disk", ""}, {"mem", "mem"}, {"off", "0"}}, "disk", "disk",
+                         "What is kept of hiprtc's compile results (AMD run-time compilation, done by ROCm's own compiler): disk keeps them in memory and in files for later processes, mem for the process only, off compiles every time."));
   // Checks and output
   t.push_back(boolean("strict", "VGPU_STRICT", "1", "", "false", "false",
                       "Refuse undefined behaviour (integer division by zero, storing an unwritten register)."));

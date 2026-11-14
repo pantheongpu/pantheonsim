@@ -126,6 +126,7 @@ story of each one.
 | `simd` | `auto`, `base`, `avx2`, `avx512` or `off` | `VGPU_SIMD` | `auto` | The vector instruction set the engines use: `auto` is the best the CPU has (the AVX-512 tile kernels and binary64 lane kernel where it has AVX-512 F/BW/DQ/VL and VNNI); `base` and `avx2` cap it; `off` uses scalar code. For ruling them out when a result looks wrong. |
 | `scheduler` | `deterministic`, `random` or `adversarial` | `VGPU_SCHEDULER` | `deterministic` | The warp scheduling order. `random` and `adversarial` find bugs that depend on which warp runs first. PTX engine only, so set `sass: off` with them. |
 | `scheduler_seed` | whole number, 0 or more | `VGPU_SCHEDULER_SEED` | 0 | Seed for `random` and `adversarial`; the same seed replays the same run. |
+| `hiprtc_cache` | `disk`, `mem` or `off` | `VGPU_HIPRTC_CACHE` | `disk` | AMD run-time compilation (hiprtc: VkFFT, CuPy, PyTorch kernels), which ROCm's own compiler does at about 150 ms a kernel. `disk` keeps each result in memory and in a file, so the same kernel is compiled once across processes; `mem` keeps it for the process only; `off` compiles every time. The bytes a program gets are always the ones ROCm's library returned ([cli.md](cli.md), `VGPU_HIPRTC_CACHE`). |
 
 **Checks and output** (see [diagnostics](diagnostics.md))
 
@@ -148,6 +149,12 @@ file. The one key that sets a variable to switch something off is
 Variables that are not in this list (`VGPU_SASS_LOG`, `VGPU_PTX_CONTRACT`, the
 trace selectors and so on) are for diagnosing the simulator itself. Set them in
 the environment as before.
+
+The hiprtc cache's other settings are environment variables only, read by the simulator's `libhiprtc` in the program
+itself: `VGPU_HIPRTC_CACHE_DIR` (where the files go; default `$XDG_CACHE_HOME/pantheonsim/hiprtc-v1`, else
+`~/.cache/pantheonsim/hiprtc-v1`), `VGPU_HIPRTC_CACHE_MAX_MB` (the size cap, 256; 0 for none), `VGPU_HIPRTC_CACHE_STATS=1`
+(a line of what the cache did when the program ends) and `VGPU_HIPRTC_REAL` (ROCm's `libhiprtc`, where the search does
+not find it). [cli.md](cli.md) has what each does.
 
 ## Commands
 
