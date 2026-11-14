@@ -73,6 +73,11 @@ release says what runs and what it produces, never how fast a real GPU would run
     (eigensolvers::steepest_descent 45 to 41 CPU-s).
   - A wave's three- and four-word loads and stores of managed or host memory (`hipMallocManaged`, `hipHostMalloc`) go to memory as one batch
     on one host thread, as its one- and two-word ones did (hamiltonian::ks_hamiltonian with `VGPU_THREADS=1`: 30.7 s to 27.4 s).
+- NVIDIA driver: `cuModuleLoadData`, `cuModuleLoadDataEx`, `cuModuleLoadFatBinary` and `cuModuleLoad` of a fatbin with nothing the
+  GPU runs (SASS only for other architectures, PTX only for newer ones) answer `CUDA_ERROR_NO_BINARY_FOR_GPU` (209), as an RTX 3060
+  does for sm_90-, sm_89- and sm_75-only fatbins and a compute_90 PTX-only one; the simulator answered `CUDA_ERROR_NOT_SUPPORTED` with
+  "fatbin contains no PTX image" (or `CUDA_ERROR_INVALID_PTX`). NVHPC's first load of its SASS-only fatbin (before it links the code
+  with `cuLink*`) now fails as on a real GPU, silently.
 - cuBLAS Ex routines, the type checks in the card's order: in `cublasGemmEx`, its batched and strided forms, A and B of two types
   are `NOT_SUPPORTED` before a bad argument, and an unknown data type (outside 0..15) is `INVALID_VALUE` after it, as is an unknown
   compute type in the batched forms; `cublasCsyrkEx`, `cublasCherkEx` and their 3m forms check their arguments first, take n = 0 whatever

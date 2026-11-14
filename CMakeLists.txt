@@ -4624,11 +4624,14 @@ if(TARGET vgpucudart AND TARGET vgpucublas)
   endforeach()
 endif()
 if(TARGET vgpucudart AND TARGET vgpucuda)
-  add_test(NAME e2e_card_edges_context COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh context -lcuda)
-  set_tests_properties(e2e_card_edges_context PROPERTIES
-    DEPENDS "vgpucudart;vgpucuda"
-    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-    TIMEOUT 300)
+  # (card_edges_module_arch.cu: the module loaders handed code for another GPU.)
+  foreach(_drv context module_arch)
+    add_test(NAME e2e_card_edges_${_drv} COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh ${_drv} -lcuda)
+    set_tests_properties(e2e_card_edges_${_drv} PROPERTIES
+      DEPENDS "vgpucudart;vgpucuda"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      TIMEOUT 300)
+  endforeach()
 endif()
 
 # The session's ncu: Nsight Compute's command line answered from the simulator's

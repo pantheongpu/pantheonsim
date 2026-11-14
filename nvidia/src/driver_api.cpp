@@ -760,6 +760,25 @@ std::string ptx_for_unsupported_cubin(const uint8_t* b, size_t size) {
   return aside;
 }
 
+// Whether a fatbin holds nothing a device of compute capability `cc` can run: no PTX image for its architecture or an
+// older one, and no cubin it runs (cuModuleLoadData's CUDA_ERROR_NO_BINARY_FOR_GPU).
+bool fatbin_runs_nothing(const void* image, uint32_t cc) {
+  for (const vgpu::cuda::FatbinPtx& p : vgpu::cuda::extract_ptx(image))
+    if (vgpu::cuda::ptx_runs_on(p, cc)) return false;
+  try {
+    for (const vgpu::cuda::FatbinPtx& e : vgpu::cuda::extract_elf_for(image, cc)) {
+      const auto* b = reinterpret_cast<const uint8_t*>(e.text.data());
+      if (e.text.size() < 64 || b[0] != 0x7f ||
+          vgpu::sass::runs_on(static_cast<int>(e.arch), vgpu::sass::cubin_arch_specific(b, e.text.size()),
+                              static_cast<int>(cc)))
+        return false;
+    }
+  } catch (const vgpu::Error&) {
+    return false;   // (a fatbin that does not parse is refused as before)
+  }
+  return true;
+}
+
 std::string best_ptx(const void* image) {
   auto ptxs = vgpu::cuda::extract_ptx(image);
   if (ptxs.empty())
@@ -1877,6 +1896,17 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
         mid = s.rt->device(dev).load_cubin(reinterpret_cast<const uint8_t*>(cubin.data()), cubin.size());
         loaded_cubin.assign(cubin.begin(), cubin.end());
       } else {
+        // Nothing this GPU runs -- no SASS for its architecture and no PTX it can JIT (none, or only for newer
+        // ones): CUDA_ERROR_NO_BINARY_FOR_GPU, as an RTX 3060 (CUDA 13.0) answers an sm_90-, sm_89- or sm_75-only
+        // fatbin and a compute_90 PTX-only one (the simulator said NOT_SUPPORTED, "no PTX image", or INVALID_PTX).
+        // NVHPC tries that first and links (cuLink*) on the refusal. SASS that would run but is set aside (VGPU_SASS=0,
+        // a relocatable cubin) still takes the PTX path below, and its error.
+        if (fatbin_runs_nothing(image, cc)) {
+          if (trace_calls())
+            std::fprintf(stderr, "[vgpu] cuModuleLoadData: the fatbin has no SASS sm_%u runs and no PTX it can JIT\n",
+                         cc);
+          return CUDA_ERROR_NO_BINARY_FOR_GPU;
+        }
         extracted = best_ptx(image);
         text = extracted.c_str();
         mid = s.rt->device(dev).load_module(text);
