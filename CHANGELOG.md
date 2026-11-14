@@ -336,7 +336,23 @@ release says what runs and what it produces, never how fast a real GPU would run
   routine on the card ([cuBLAS](nvidia/docs/cublas.md)). New unit test `test_cublas_host_mode_device_result` (pantheonsim #638).
 - NPP, CUDA 12 build: `nppGetStreamContext`, `nppGetStream` and `nppSetStream` (NPP 12's own stream, which CUDA 13's NPP removed)
   are exported from the shim, filling the context as NPP 12.3 does on an RTX 3060. New e2e test `e2e_npp_stream_context` (skips
-  on CUDA 13). `nppiFilterGaussBorder_8u_C1R_Ctx` is still absent (pantheonsim #617).
+  on CUDA 13) (pantheonsim #617).
+- NPP: `nppiFilterBoxBorder_8u_C1R`, `nppiGradientVectorPrewittBorder_8u16s_C1R` and `nppiFilterCannyBorder_8u_C1R` (and
+  their `_Ctx` forms) read the right pixels with a nonzero `oSrcOffset`. They took `pSrc` for the image's origin, but it points at
+  the pixel `oSrcOffset` names, as an RTX 3060 (NPP 13.0) shows; so a ROI inside the image read pixels `oSrcOffset` too far on,
+  past the image's end. A zero offset is unchanged. The `npp_imgproc` golden (`e2e_library_goldens`) has the box filter and the
+  gradients on ROIs at an offset reaching the source's right and bottom edge, measured on the card. Canny is not pinned there:
+  at a nonzero offset the card's result depends on what its scratch buffer held before the call; the simulator gives the
+  full image's result for the ROI, which is what the card gives at offset zero.
+- NPP: `nppiFilterGaussBorder_8u_C1R_Ctx` and its plain CUDA 12 form, with every mask NPP gives it (3x3 to 15x15), bit for bit
+  as NPP 13.0 and NPP 12.3 on an RTX 3060 on random, constant and impulse images. Measured: a separable single-precision filter,
+  vertical then horizontal, each an fma chain over the taps in the order 1, 0, 2, ..., n-1, truncated to 8 bits (so a constant
+  image can come out a count low, 3 to 2 with 3x3, which is what an earlier attempt could not explain); the taps are the card's
+  (the 32f form's impulse response is exactly their products), with sigma 0.6 + 0.4 * (n/2) rather than the header's formula.
+  Replicate is the only border, the source image's edge replicates (pSrc is the pixel at `oSrcOffset`), and the argument checks
+  and their order are the card's: null pointer, size, offset out of range, border mode, mask size, then an empty ROI succeeds and
+  a destination step below the ROI width is `NPP_STEP_ERROR`. The card's output is pinned in the `npp_imgproc` golden
+  (`e2e_library_goldens`) (pantheonsim #617).
 - HIP: `hipGraphInstantiateWithParams` takes `hipGraphInstantiateFlagUpload` and `hipGraphInstantiateFlagDeviceLaunch`, as ROCm's
   HIP does there (all four flags); it refused anything but AutoFreeOnLaunch and UseNodePriority with `hipErrorInvalidValue`, so
   Colvars, which instantiates its graphs with Upload and an `uploadStream`, stopped on its first frame. With Upload the graph is

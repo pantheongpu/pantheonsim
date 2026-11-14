@@ -1729,8 +1729,10 @@ NppStatus bordered(const Npp8u* s, int ss, NppiSize ssz, NppiPoint off, NppiSize
   if (!s) return NPP_NULL_POINTER_ERROR;
   if (bad(ssz) || bad(roi)) return NPP_SIZE_ERROR;
   if (type != NPP_BORDER_REPLICATE) return NPP_NOT_SUPPORTED_MODE_ERROR;
-  auto img = fetch<Npp8u>(s, ss, ssz.width, ssz.height);
-  // Coordinates relative to the ROI's first pixel, which sits at `off` in the image.
+  // pSrc is the ROI's first pixel, which sits at `off` in the image (measured on an RTX 3060 for the box filter, the
+  // Prewitt gradients and Canny): the image starts `off` before it.
+  auto img = fetch<Npp8u>(offset(s, ss, -off.x, -off.y, 1), ss, ssz.width, ssz.height);
+  // Coordinates relative to the ROI's first pixel.
   out->b = border;
   out->w = roi.width + 2 * border;
   out->h = roi.height + 2 * border;
@@ -1770,6 +1772,104 @@ VGPU_PLAIN(nppiFilterBoxBorder_8u_C1R,
            (const Npp8u* s, Npp32s ss, NppiSize ssz, NppiPoint off, Npp8u* d, Npp32s ds, NppiSize roi, NppiSize m,
             NppiPoint a, NppiBorderType bt),
            (s, ss, ssz, off, d, ds, roi, m, a, bt, NppStreamContext{}))
+
+/* ---- FilterGaussBorder ----
+   Measured on an RTX 3060 with NPP 13.0 and NPP 12.3, which agree bit for bit (#617). The filter is separable and
+   in single precision: a vertical pass, then a horizontal pass over its float results, each an fma chain over the
+   taps in the order 1, 0, 2, 3, ..., n-1 (tap t weighs the pixel t - n/2 away: the compiler's contraction of
+   p1*g1 + p0*g0 + p2*g2 + ...), and the 8-bit result is the float truncated. The 32f form's impulse response is
+   exactly g[i]*g[j] in float, which pins the taps below; their sigma is 0.6 + 0.4 * (n/2) (the header's
+   "0.4F + (mask width / 2) * 0.6F" does not fit 5x5 and wider), but no float or double evaluation of the
+   Gaussian tried rounds to them, so they are the card's values. A constant image comes out a count low wherever
+   the chain's sum falls below the integer (3 gives 2 with 3x3), which is what truncating it gives.
+   Border pixels replicate the source image's edge (not the ROI's); pSrc points at oSrcOffset. Checks, in order:
+   a null pointer, a negative ROI or an empty source (NPP_SIZE_ERROR), an offset outside the source
+   (NPP_OUT_OFF_RANGE_ERROR), any border but replicate, a mask other than 3x3, 5x5, ..., 15x15; then an empty ROI
+   succeeds doing nothing, and a destination step below the ROI width is NPP_STEP_ERROR (compared unsigned: a
+   negative step passes on the card, which then writes who knows where; the simulator writes nothing). The source
+   step is not checked. */
+namespace {
+const float kGaussTaps[7][8] = {
+    {0x1.18a572p-2f, 0x1.ceb51cp-2f},
+    {0x1.c36b04p-4f, 0x1.e5322p-3f, 0x1.39186p-2f},
+    {0x1.dbfc08p-5f, 0x1.016aa4p-3f, 0x1.98fa14p-3f, 0x1.dd389p-3f},
+    {0x1.280a7ep-5f, 0x1.310e02p-4f, 0x1.ff552p-4f, 0x1.5c8d9p-3f, 0x1.827c74p-3f},
+    {0x1.99436cp-6f, 0x1.8e2cdcp-5f, 0x1.4e1e6ap-4f, 0x1.e3a124p-4f, 0x1.2de40cp-3f, 0x1.451108p-3f},
+    {0x1.2fd348p-6f, 0x1.17e548p-5f, 0x1.cd7848p-5f, 0x1.5469ap-4f, 0x1.c16906p-4f, 0x1.09752ep-3f, 0x1.189f6cp-3f},
+    {0x1.da8744p-7f, 0x1.a05258p-6f, 0x1.4efc76p-5f, 0x1.ee68a4p-5f, 0x1.4e9db4p-4f, 0x1.9f66e6p-4f, 0x1.d8f4fap-4f,
+     0x1.eddcc8p-4f},
+};
+// The mask's width, or 0 for one the Gauss filters refuse.
+int gauss_width(NppiMaskSize m) {
+  switch (m) {
+    case NPP_MASK_SIZE_3_X_3: return 3;
+    case NPP_MASK_SIZE_5_X_5: return 5;
+    case NPP_MASK_SIZE_7_X_7: return 7;
+    case NPP_MASK_SIZE_9_X_9: return 9;
+    case NPP_MASK_SIZE_11_X_11: return 11;
+    case NPP_MASK_SIZE_13_X_13: return 13;
+    case NPP_MASK_SIZE_15_X_15: return 15;
+    default: return 0;
+  }
+}
+}  // namespace
+
+VGPU_EXPORT NppStatus nppiFilterGaussBorder_8u_C1R_Ctx(const Npp8u* s, Npp32s ss, NppiSize ssz, NppiPoint off,
+                                                       Npp8u* d, Npp32s ds, NppiSize roi, NppiMaskSize msz,
+                                                       NppiBorderType bt, NppStreamContext unused10) {
+  VGPU_DEFER_CALL(g_reg, unused10.hStream, nppiFilterGaussBorder_8u_C1R_Ctx, s, ss, ssz, off, d, ds, roi, msz, bt, unused10);
+  if (!s || !d) return NPP_NULL_POINTER_ERROR;
+  if (roi.width < 0 || roi.height < 0 || bad(ssz)) return NPP_SIZE_ERROR;
+  if (off.x < 0 || off.y < 0 || off.x >= ssz.width || off.y >= ssz.height) return NPP_OUT_OFF_RANGE_ERROR;
+  if (bt != NPP_BORDER_REPLICATE) return NPP_NOT_SUPPORTED_MODE_ERROR;
+  const int n = gauss_width(msz);
+  if (!n) return NPP_MASK_SIZE_ERROR;
+  if (roi.width == 0 || roi.height == 0) return NPP_SUCCESS;
+  if (static_cast<unsigned>(ds) < static_cast<unsigned>(roi.width)) return NPP_STEP_ERROR;
+  if (ds < 0) return NPP_SUCCESS;
+  const int r = n / 2;
+  float g[15];
+  int order[15];
+  for (int t = 0; t < n; ++t) {
+    g[t] = kGaussTaps[r - 1][t <= r ? t : n - 1 - t];
+    order[t] = t < 2 ? 1 - t : t;
+  }
+  // The source rows and columns the ROI and its halo reach, clamped to the image.
+  const int x0 = std::max(off.x - r, 0), x1 = std::min(off.x + roi.width + r, ssz.width);
+  const int y0 = std::max(off.y - r, 0), y1 = std::min(off.y + roi.height + r, ssz.height);
+  const int fw = std::max(x1 - x0, 1), fh = std::max(y1 - y0, 1);
+  const Npp8u* origin = offset(s, ss, -off.x, -off.y, 1);
+  const auto img = fetch<Npp8u>(offset(origin, ss, x0, y0, 1), ss, fw, fh);
+  auto px = [&](int ix, int iy) {
+    ix = std::min(std::max(ix, x0), x0 + fw - 1) - x0;
+    iy = std::min(std::max(iy, y0), y0 + fh - 1) - y0;
+    return static_cast<float>(img[static_cast<size_t>(iy) * fw + ix]);
+  };
+  // The vertical pass over the ROI's rows, for its columns and the halo's.
+  const int vw = roi.width + 2 * r;
+  std::vector<float> v(static_cast<size_t>(vw) * roi.height);
+  for (int y = 0; y < roi.height; ++y)
+    for (int x = 0; x < vw; ++x) {
+      float acc = 0.0f;
+      for (int k = 0; k < n; ++k)
+        acc = std::fma(g[order[k]], px(off.x + x - r, off.y + y + order[k] - r), acc);
+      v[static_cast<size_t>(y) * vw + x] = acc;
+    }
+  std::vector<Npp8u> o(static_cast<size_t>(roi.width) * roi.height);
+  for (int y = 0; y < roi.height; ++y)
+    for (int x = 0; x < roi.width; ++x) {
+      const float* row = &v[static_cast<size_t>(y) * vw + x];
+      float acc = 0.0f;
+      for (int k = 0; k < n; ++k) acc = std::fma(g[order[k]], row[order[k]], acc);
+      o[static_cast<size_t>(y) * roi.width + x] = static_cast<Npp8u>(std::min(static_cast<int>(acc), 255));
+    }
+  store<Npp8u>(d, ds, roi.width, roi.height, o);
+  return NPP_SUCCESS;
+}
+VGPU_PLAIN(nppiFilterGaussBorder_8u_C1R,
+           (const Npp8u* s, Npp32s ss, NppiSize ssz, NppiPoint off, Npp8u* d, Npp32s ds, NppiSize roi,
+            NppiMaskSize msz, NppiBorderType bt),
+           (s, ss, ssz, off, d, ds, roi, msz, bt, NppStreamContext{}))
 
 // Prewitt gradients, measured with an impulse: x is the left column minus the
 // right one and y the bottom row minus the top one, each summed over the 3x3
