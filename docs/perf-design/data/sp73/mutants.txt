@@ -1,0 +1,54 @@
+scripts/mutants.py on the block runner of round sp73 (amd/src/gcn_exec.cpp; the last three in amd/src/gcn_tier.cpp), a tree without LTO,
+test_amd_gcn_blocks_same_bits (seven cases) rebuilt and run for each. The tree is the final sources but for the frame pointers of
+run_round_blocks and run_round_live, which came after.
+
+ 0 killed: a whole stretch counts nothing  [6632 of 14400 runs differ]
+ 1 killed: a whole stretch does not count its instructions  [6632 of 14400 runs differ]
+ 2 killed: a whole stretch does not count by unit  [6632 of 14400 runs differ]
+ 3 killed: a whole stretch does not count the mix  [6632 of 14400 runs differ]
+ 4 killed: a whole stretch does not count the matrix operations  [1599 of 14400 runs differ]
+ 5 killed: a whole stretch counts each unit one too many  [6632 of 14400 runs differ]
+ 6 killed: a stretch that ran in part counts nothing  [8201 of 14400 runs differ]
+ 7 killed: a block runs past the turn's room  [7925 of 14400 runs differ]
+ 8 killed: the room is one instruction too long  [9773 of 14400 runs differ]
+ 9 killed: a handed-back instruction leaves the program counter past it  [749 of 14400 runs differ]
+10 killed: a handed-back instruction is counted  [751 of 14400 runs differ]
+11 killed: the instructions before a handed-back one are not counted  [523 of 14400 runs differ]
+12 killed: a wait that ends the turn after it ran is a step  [28 of 14400 runs differ]
+13 killed: a wait that ends the turn after it ran does not end it  [13 of 14400 runs differ]
+14 killed: a wait that ends the turn is not counted  [28 of 14400 runs differ]
+15 killed: a gated store goes to the interpreter instead of ending the turn  [153 of 14400 runs differ]
+16 killed: a handed-back store or wait ends the turn  [288 of 14400 runs differ]
+17 killed: a store or a wait that ran inside a block is not counted  [297 of 14400 runs differ]
+18 killed: a gated store leaves the program counter past it  [337 of 14400 runs differ]
+19 killed: a Machine instruction that gives up the turn or hands back always ends the turn  [6 of 14400 runs differ]
+20 killed: a Machine instruction that gives up the turn goes to the interpreter  [21 of 14400 runs differ]
+21 killed: an error of a Machine instruction is not told where it was  [113 of 14400 runs differ]
+22 killed: a block goes on past a branch  [5560 of 14400 runs differ]
+23 killed: the wave's state is not asked  [a_wave_the_tier_leaves_to_the_interpreter_runs_no_block: VCHECK(on_run.in_blocks == 0)]
+24 killed: the steps of a block are not counted in the turn  [the test does not end: stopped after 300 s]
+25 killed: the branch target is not handed to the handler  [the test does not end: stopped after 300 s]
+26 killed: a wave goes on in the block it left without asking where it is  [the test does not end: stopped after 300 s]
+27 killed: a wave that ran the instruction after the one it left at goes on one instruction early  [7781 of 14400 runs differ]
+28 killed: a store is never taken for one that can end the turn  [153 of 14400 runs differ]
+29 killed: a wait is never taken for one that can end the turn  [13 of 14400 runs differ]
+30 killed: an error in a wave's turn is told the address the turn began at  [686 of 14400 runs differ]
+31 killed: a bound run is used with lanes off  [14 of 14400 runs differ]
+32 killed: a bound run of a wave of 64 lanes asks only the first 32  [1 of 14400 runs differ]
+33 killed: a bound run runs past the turn's room  [8 of 14400 runs differ]
+34 killed: a bound run leaves the program counter where it was  [the test does not end: stopped after 300 s]
+35 killed: a whole bound run counts nothing  [8 of 14400 runs differ]
+36 killed: a bound run entered in its middle counts nothing  [5 of 14400 runs differ]
+37 killed: a bound run entered in its middle starts at its first operation  [3 of 14400 runs differ]
+38 SURVIVED: an instruction handed back inside a bound run leaves the program counter past it
+39 killed: the instructions of a bound run that ran one at a time are not counted  [24 of 14400 runs differ]
+40 killed: every constant of a block reads the first constant's row  [8 of 14400 runs differ]
+41 SURVIVED: a bound operation's missing source is register 0, not its first source
+42 killed: a bound operation with a modifier on a source is bound  [2 of 1200 runs differ with bound integer operations]
+43 killed: a scalar register source is bound as a vector register  [11 of 14400 runs differ]
+42 of 44 killed
+
+The two that survive change no result:
+38: the integer handlers that bind (h_int, h_intv) never hand an instruction back, so the branch that puts the program counter back is
+    not reached; it is kept for a handler that would.
+41: a bound operation with fewer than three sources has a lane kernel that does not read the others, whichever row it is given.

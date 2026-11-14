@@ -1,9 +1,11 @@
 # Study 13: a compiled tier for AMD kernels
 
-Status: design, 2026-11-14, with its first slice built: **blocks** (`VGPU_AMD_BLOCKS=1`, off by default; section 9). Measurements, tests and
-mutants are in *Round sp72* ([rounds/11-rounds-sp36-sp41.md](rounds/11-rounds-sp36-sp41.md)); scripts and data in `data/sp72/`. Everything was
-measured on server3 (Ryzen 7 PRO 8840U, 8 cores / 16 threads, g++ 13.3, Release with LTO), one host thread unless a line says otherwise, on a
-machine shared with other sessions.
+Status: design, 2026-11-14, with its closure layers partly built behind `VGPU_AMD_BLOCKS=1` (off by default): **blocks** (section 9,
+round sp72), then **memory instructions and waits inside blocks** and **bound integer runs** (section 12, round sp73). Measurements, tests and
+mutants are in *Round sp72* and *Round sp73* ([rounds/11-rounds-sp36-sp41.md](rounds/11-rounds-sp36-sp41.md)); scripts and data in
+`data/sp72/` and `data/sp73/`. Everything was measured on server3 (Ryzen 7 PRO 8840U, 8 cores / 16 threads, g++ 13.3, Release with LTO), one
+host thread unless a line says otherwise. Sections 1 to 11 are the design as written in round sp72, on a host shared with other sessions;
+section 12 says what round sp73 built, measured on a quiet host, and where the design's estimates were wrong.
 
 **What "compiled tier" means here.** The AMD engine has two levels today: the interpreter (`amd/src/gcn_exec.cpp`) and the pre-decoded tier
 (`amd/src/gcn_tier.cpp`, on by default: each instruction's handler and operand classes are worked out when it is decoded, and a handler works on
@@ -246,7 +248,8 @@ words and a load compares them. What it does not reuse: the SASS generator (`jit
 
 `Machine::run_block`, `block_at`, `make_block`, `step_at` and `run_wave_blocks` in `amd/src/gcn_exec.cpp` (about 170 lines), `gcn::TierBlock`
 and `Inst::block` in `amd/include/vgpu/amd_gcn.hpp`, the knob in `amd/src/gcn_tier.cpp`. With the knob off the only code that runs differently
-is one test of `m.blocks_on` per wave turn in `run_round`.
+is one test of `m.blocks_on` per wave turn in `run_round`. (**Corrected in round sp73**: that was the intent, not the result. The plain loop
+was slower with the knob off, valu_f64 by 13 and 23 %; section 12.)
 
 What a block run is: the wave's state is asked once; for each instruction the branch target is put where the handler reads it, the program
 counter is advanced and the handler is called, as `tier_step` does; a result other than "done" ends the run as section 5 says; at the end the
@@ -283,6 +286,8 @@ the host was shared, and the rows that run no kernel range from 0.89 to 1.07, wh
   blocks, 8 to 15 instructions a run. The outputs have the same checksum.
 * With the knob off the bench's geometric mean against the base is 0.993 to 0.996 over two passes, and a control (the base with one function
   nothing calls added) is 0.993 to 1.003: the same within what this host could resolve (single rows scatter from 0.77 to 1.31 in both).
+  (**Corrected in round sp73**: on a quiet host the scatter is 2 %, not 20 %, and valu_f64 was 13 and 23 % slower with the knob off in this
+  slice. The 0.77 above was that row, read as noise.)
 
 What changed inside the slice, by argument and not by measurement (four passes over 12 rows could not tell the forms apart on this host): a
 block of two instructions was allowed at first (entering and leaving a block costs about one plain step, so the minimum is three); a block
@@ -299,9 +304,9 @@ bench's valu, probe and control rows, "inq" the eight tests of round sp70.
 
 | # | what | removes | expected gain | gate |
 |---|---|---|---|---|
-| 1 | **blocks** (built) | loop, inside straight-line runs | measured: section 9 | done: same-bits test, mutants, bench counters |
-| 2 | **bound operations**: a block holds an array of `{kernel, row offsets, constant rows}` beside the instruction list; EXEC looked at once per EXEC-stable stretch; the all-lanes forms call the lane kernel on the destination row | decode: 17 to 32 % of today's time on ALU rows, most of it reachable for the handler families `h_int`, `h_intv`, `h_f32`, `h_f64r`, the compares and `v_cndmask` | 1.15x to 1.35x on ALU rows; inq 1.05x to 1.10x | same-bits test with every operand kind in every stretch shape; a handler family is bound only when its shapes pass |
-| 3 | **longer blocks**: a taken branch goes on into the block at its target inside the runner (chains); global loads and stores, scalar memory and `s_waitcnt` are members called through `tier_mach` | the loop between blocks: inq's blocks are 8 instructions long, so the per-block entry (fetch, block lookup, the counter flush) is paid every 8 instructions; and the whole loop share of memory-bound kernels | 1.05x to 1.15x on inq and on the memory rows; little on the valu rows, which are one block already | faults in the middle of a block (address, counters, lane order), the store gate inside a block, lockstep and Stream-K tests with the knob on |
+| 1 | **blocks** (built, round sp72) | loop, inside straight-line runs | measured: 1.06 to 1.36 on arithmetic rows (section 12's table, column *blocks*) | done: same-bits test, mutants, bench counters |
+| 2 | **bound operations**: a block holds an array of `{kernel, row offsets, constant rows}` beside the instruction list; EXEC looked at once per run; the all-lanes forms call the lane kernel on the destination row | decode | **built for the 32-bit integer family (round sp73)**: valu_int 1.14 and 1.11 over blocks alone, p_sdwa 1.09 and 1.10, p_i64 1.07 and 1.04; nothing on inq. Estimated here at 1.15x to 1.35x on arithmetic rows and 1.05x to 1.10x on inq for all families; the float, double, compare and select families are not bound, and section 12 says why binding is the wrong tool for them | same-bits test with every operand kind; a handler family is bound only when its shapes pass |
+| 3 | **longer blocks**: global loads and stores, scalar memory, waits and plain stores as members; a wave goes on in the block it left | the loop around memory instructions | **built (round sp73)**: the `lds` and `mem` rows no longer lose with the knob on (0.99 to 1.02 against the base), smem and p_smem_wide 1.18 to 1.32; inq 1 to 4 % less CPU with the knob on (estimated 1.05x to 1.15x). A taken branch going on into the next block inside the runner was not built: the hint `Inst::next` already makes that step a load and a compare | faults in the middle of a block, the store gate inside a block, turns that end inside a block |
 | 2b | **fused pairs** written by hand for the hottest adjacent pairs that `VGPU_AMD_BLOCKS_STATS` shows (compare + select, 64-bit shift + or, multiply + add of doubles): lanes outermost for two instructions | one row store and load and one call per pair | 1.05x to 1.15x where the pairs are; only if layer 4 is not started | per pair, against the two handlers |
 | 4 | **generated fused runs** (`VGPU_AMD_JIT`, opt-in): C++ per fused run, lanes outermost, EXEC as a blend, NaN staging, compiled by the host compiler with the NVIDIA JIT's compile, cache and promotion machinery; the closure tier runs until the object is there | rows and most of lanes inside fused runs | 3x to 8x on ALU rows warm (ceiling 13x to 22x); inq warm 1.2x to 1.5x, cold a loss | a generated run against the same digest as the handlers; mutants per generated form; cold and warm timings at 1 and 8 threads; never on by default |
 | 5 | the default flip of layers 1 to 3 | | | the test plan's last line |
@@ -318,3 +323,71 @@ for the ALU rows. Layer 4 is worth starting only after 2 and 3, because its entr
   instructions. The first thing layer 4 must measure is one real block (inq's 84-instruction block of section 9) generated by hand.
 * Thread scaling with blocks on (a block is shared read-only, so no new sharing is expected; measured at 1 and 8 threads only on the rows of section 9).
 * gfx1250 (named barriers, clusters, VGPR MSBs) runs through the fallbacks; its kernels were not timed.
+
+## 12. Phase 2 as built (round sp73), and what it corrects
+
+**The knob off.** Round sp72's slice made the interpreter slower with the knob off, and its measurement (on a loaded host) could not see
+it: valu_f64 ran 13 % (MI300X) and 23 % (RX 6800) slower, because `run_round`'s `pc` was passed to the blocks loop by reference and the
+plain loop therefore wrote it to the stack after every instruction. Three smaller costs of the same kind followed in round sp73 and were
+removed one at a time against a no-op control: `tier_mach` out of line once it had a second caller, the machine's hot members moved by
+the members blocks added among them, and the plain loop re-laid by a flag test and a second loop inside `run_round`. The rule that came out
+of it: **with the knob off the plain path is the text it was** (`run_round` untouched and always in line, `run_groups<false>` the old
+function, blocks in a twin `run_round_blocks` and their own instantiation `run_groups<true>`), and what blocks keep in the machine comes
+after every other member. With that the knob-off build is at 1.001 of the base (geometric mean of 62 rows; the control 1.001), every row
+within 3.5 %, as the control's rows are. (That is the build before the frame pointers. The committed library, with them, is at 0.993
+with three rows 4 to 5 % low, smem on the RX 6800 the lowest at 0.946; a variant with the blocks' loop in its own text section moved the
+loss to mem and narrow. A link of this library places two to eight rows 3 to 5 % below the base's, different ones each time: round sp73,
+section 1.)
+
+**Longer blocks (milestone 3).** The instructions the tier hands to the Machine are block members, called through `tier_mach` with the
+stretch before them counted and the error's address on them. A block is *stretches* of plain instructions, each counted once, separated by
+the instructions that are the Machine's or can end the wave's turn. A wave that leaves a block before its end goes on in it at the
+instruction it stopped at (`Wave::blk`), so a gated store or a wait costs one exit and one entry and no second block. Two trials keep
+blocks from running where they do not pay, neither of which changes what any instruction does: a block whose runs are left for a turn's
+end more often than every 8 instructions over its first 64 runs is turned off; a machine whose turns average under 16 instructions over
+256 turns goes back to the plain loop for the rest of the dispatch. Without the second, `lds` (a wait or a first store every two
+instructions in work-groups of several waves) still lost 7 to 10 % with the knob on: what it paid was not the blocks but coming into
+the blocks' loop for a turn of two instructions.
+
+**Bound integer runs (milestone 2, in part).** Three or more consecutive 32-bit integer instructions whose sources are vector registers and
+constants are a *bound run*: with every lane of the wave on, the runner calls their lane kernels on the rows one after the other
+(`gcn::tier::run_bound_ints`), with no handler, no EXEC test and no constant spread between them (a constant's row is made once, when the
+block is). Lanes off, or a turn that ends inside the run: the handlers, one at a time. `VGPU_AMD_BLOCKS_BOUND=0` turns binding off.
+
+Measured (round sp73; CPU seconds of the device phase, the base's over each build's, best of 7 alternating runs pinned to one core on a
+quiet host; *control* is the base plus a function nothing calls; full table in `data/sp73/steps.md`):
+
+| row | MI300X: control | knob off | blocks | blocks + bound | RX 6800: control | knob off | blocks | blocks + bound |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| valu_int | 0.995 | 0.997 | 1.161 | 1.326 | 0.997 | 0.998 | 1.206 | 1.341 |
+| valu_f32 | 0.979 | 0.980 | 1.119 | 1.087 | 0.997 | 1.004 | 1.202 | 1.204 |
+| valu_f64 | 0.996 | 1.000 | 1.115 | 1.101 | 0.994 | 0.987 | 1.085 | 1.088 |
+| p_i64 | 0.980 | 0.974 | 1.162 | 1.242 | 1.005 | 1.003 | 1.268 | 1.323 |
+| p_sdwa | 0.996 | 0.994 | 1.099 | 1.199 | 0.998 | 0.989 | 1.180 | 1.296 |
+| p_cmp | 1.007 | 0.998 | 1.193 | 1.203 | 0.992 | 0.965 | 1.263 | 1.282 |
+| divergent | 1.007 | 1.016 | 1.156 | 1.158 | 1.021 | 1.018 | 1.240 | 1.243 |
+| wave | 0.996 | 1.002 | 1.224 | 1.233 | 1.004 | 0.990 | 1.281 | 1.289 |
+| smem | 1.023 | 0.988 | 1.324 | 1.323 | 1.016 | 0.990 | 1.303 | 1.306 |
+| mem | 0.984 | 1.002 | 1.006 | 1.016 | 1.003 | 1.012 | 1.018 | 1.014 |
+| lds | 1.001 | 1.010 | 1.011 | 1.007 | 0.997 | 0.995 | 1.005 | 0.990 |
+| narrow | 1.003 | 1.004 | 1.006 | 1.000 | 1.005 | 1.036 | 1.024 | 1.031 |
+| buf | 0.998 | 0.982 | 0.984 | 0.982 | 1.001 | 0.984 | 0.984 | 0.986 |
+| flat | 1.013 | 1.001 | 1.010 | 1.014 | 0.990 | 0.993 | 1.010 | 1.005 |
+
+Geometric mean of the 62 kernel rows: control 1.001, knob off 1.001, blocks 1.099, blocks with bound runs 1.107; no row below 0.97 of the
+base with the knob on. The committed library (frame pointers in the blocks' loop): control 0.999, knob off 0.993, knob on 1.103, again no
+row below 0.97 of the base with the knob on.
+
+**Where the design's estimates were wrong.**
+
+* *Bound operations on inq* (estimated 1.05x to 1.10x): nothing. inq's decode share (18 to 29 % of its time in the library) is not the
+  operand `switch` binding removes. It is the general binary64 handler (`h_f64`: `v_max_f64` with `|x|` modifiers and the other forms that
+  have no row kernel go through 64-bit arrays packed from and unpacked into the register pairs; 13 to 15 % of the library's samples in
+  steepest_descent and initial_guess), the SDWA and 64-bit compare and shift handlers, and LDS. The lever there is row kernels for those
+  forms in the tier itself (as `f64_rows` has for add, multiply and fused multiply-add), not a block mechanism.
+* *Bound operations for the float families*: their handlers scan the result for NaNs, apply the rule or hand back, and merge; binding
+  cannot drop any of that, only the operand reads, which are a small part. Not built.
+* *Chains* (a taken branch continuing inside the runner): the step between two blocks is `fetch_next`'s hint (a load and a compare) and the
+  block lookup (a load); a chain would save the lookup. Not built.
+* *The trials* were not in the design: it assumed a block always pays once entered. A block entered for one or two instructions costs
+  more than the plain steps; the turn-length trial is what makes the knob safe on barrier- and store-heavy kernels.

@@ -4724,3 +4724,218 @@ Study 13's milestones 2 and 3, in that order of evidence:
 * **Design numbers that are estimates**: every "expected" gain of study 13's milestones 2 to 4 is derived from the class shares and the
   native loops, not from a prototype of that layer.
 * Cleanup: this round's directory on server3 (`/tmp/sp72-amd-tier`: six trees and builds, the bench cache, logs) was removed by exact path; round sp70's inq directory was read and not changed.
+
+## Round sp73 (blocks for AMD kernels, phase 2: the knob off as it was, memory instructions and waits inside blocks, bound integer runs; the case for the default)
+
+Branch `sp72-amd-tier` after the merge of round sp71 (base `origin/sp69-hotspot-start` 3e4c7f3f). Design: [study 13](../13-amd-compiled-tier.md),
+section 12. Data, scripts and commands: [`data/sp73/`](../data/sp73/README.md). server3 as in round sp72 (Release, LTO), now **quiet**: nothing
+but this round's own jobs, and those one at a time while a table was taken.
+
+It continues round sp72 and corrects it. Round sp72 measured on a loaded host, took the best of 9 runs of `bench.py`, and read rows that
+scattered by 20 % as noise. Two of its statements were wrong: "the knob off cannot be told from the control" (valu_f64 was 13 and 23 % slower
+with the knob off), and inq's gain at one thread (0.84 to 1.00 of the knob-off CPU time there; 0.96 to 0.99 here).
+
+### How rows are read now
+
+`scripts/quick.sh` runs one bench workload once per build, in turn, 7 times (9 or more where a row was in doubt), pinned to one physical
+core, and keeps each build's best device CPU time; `scripts/qall.sh` does that for the bench's 62 kernel rows (27 workloads on two targets,
+the matrix rows and permlane on one). With nothing else running the same build measured twice agrees within 1 to 2 % on nearly every row;
+the *control* (the base plus one function nothing calls in `gcn_exec.cpp`) is in every table and shows what a row does when only placement
+changes: 0.98 to 1.04. A table taken while a build of this round ran beside it (the mutants) had control rows at 0.95 and 1.10 and was
+thrown away. The API rows (no kernel) are from `bench.py`, 15 runs, pinned. Counters: `bench.py`'s counting runs of both sides.
+
+### 1. The knob off: four costs, found one at a time, each removed
+
+Each line is a build with the knob off against the base, rows that the control did not move:
+
+| what the build had | what it cost with the knob off | how it was found | what removed it |
+|---|---|---|---|
+| round sp72 as committed: `run_round`'s `pc` passed by reference to the blocks loop | valu_f64 13 % slower (MI300X), 23 % (RX 6800); other rows within 2 % | a pinned A/B on the quiet host; the dispatch loop's disassembly: `pc` in a stack slot, written after every instruction (a register in the base); moving every thread's stack by 0 to 3,856 bytes changed nothing, so not the stack's place | the blocks loop has its own (`Machine::block_pc`) |
+| the Machine's instructions as block members: `tier_mach` had two callers | buf 2 to 5 %, ldsx 2 %, mem 1 to 2 % | `tier_mach` had become a function of its own (it was in line in the base) | `tier_mach` always in line |
+| blocks' members among the Machine's others | part of the same rows | the comment on the Machine's last member says it: where its hot members sit moves the interpreter's speed | blocks' members after every other member |
+| a test of a flag and the call of the blocks loop inside `run_round` | buf 2 to 3 %, p_cmp, p_i64, p_dpp_arch 2 to 3 %, p_lane on the RX 6800 3 to 5 %, flat 4 % in one build | the loop's disassembly: its blocks laid out apart, a jump on the hot path; growing `Wave` and `Inst` alone (a build of the base with both larger) cost nothing | `run_round` is the base's text and always in line; blocks have `run_round_blocks` and their own instantiation of `run_groups` |
+
+The build with all of that (commit e20f35d6, one before the last), knob off, against the base (`data/sp73/steps.md`, first table, column *knob off*): geometric mean of the 62 kernel rows **1.001**
+(control 1.001). Lowest rows: p_cmp on the RX 6800 0.965 (0.971 to 0.994 in the three builds before it, which differ from it in nothing that row runs), p_i64 on the MI300X
+0.974 (control 0.980), valu_f32 on the MI300X 0.980 (control 0.979), p_lane on the RX 6800 0.980, buf 0.982 and 0.984. Highest: smfmac
+1.071, p_sbuf 1.048, narrow on the RX 6800 1.036. **No row is 3 % slower in two passes**; buf is the one row that is lower in every pass
+(1.5 to 2 %), and nothing was found that it runs differently. The API rows (no kernel; `bench.py`, 15 runs, pinned): 0.971 to 1.048 against the base, geometric mean 0.992; the control 0.903 to 1.090, geometric mean 0.997 (apicheap alone moves by 10 % either way).
+
+**The last commit's library does not keep that to the row.** The frame pointers of section 2 are in three functions the knob-off path
+never runs, and the 62 rows taken again on that library (`steps.md`, second table) have a geometric mean of 0.993 knob off (control 0.999)
+with three rows below 0.97: smem on the RX 6800 **0.946** (0.947 and 0.930 in two more passes: it is that library, not the pass), atomics on the RX 6800 0.959,
+p_i64 on the MI300X 0.964 (0.956, 0.966). They were 0.990, 0.997 and 0.974 one commit earlier, and the row that was lowest there (p_cmp on
+the RX 6800) is 1.00. One attempt to have them back, the blocks' loop in a text section of its own so that it moves nothing else, gave smem
+back (1.01) and took mem (0.957, 0.953) and narrow on the RX 6800 (0.947) instead; it was not kept (`steps.md`, last section). So: **the
+four costs that had a cause are gone and the geometric mean is the control's within 1 %, and each link of this library still puts two to
+eight rows 3 to 5 % below the base's, different rows each time**, with nothing changed that they run. The control (one unused function
+added to the base) moves single rows by up to 4 to 6 % as well (0.967 to 1.059 in the last table). The bar "no row 3 % slower with the knob off" was met by the build
+before the frame pointers and is not met, on three rows, by the committed one; if that bar is to hold to the row, drop the last commit
+(1aef82fb) and keep the hazard as a documented one, though the next edit of `gcn_exec.cpp` on any branch re-rolls the same dice.
+
+### 2. The profiler hazard: frame pointers in the three functions of the blocks' loop
+
+Round sp72 found that a profiler which walks the stack in its signal handler (round sp69's `sprof.c`) crashed one run in four of
+steepest_descent with blocks on: the sample falls on the last instructions of a function with a realigned stack, where GCC's unwind rules
+still find the callee-saved registers through `%rbp` although it has been popped, so the unwinder takes the *caller's* saved `%rbp` for
+the callee's.
+
+* **A frame pointer in `run_wave_blocks` alone made it worse: 12 of 12 runs crashed**, within seconds, on the `ret` of any tier handler
+  with a realigned stack (`h_ds`). The unwinder then takes `run_round_blocks`' `%rbp` for `run_wave_blocks`' frame, and that was a
+  general register (the fault address was `0x400000005`). The reasoning of round sp72's caveat ("give the caller a frame pointer") was
+  one frame short.
+* **With frame pointers in `run_wave_blocks`, `run_round_blocks` and `run_round_live`** (`__builtin_frame_address(0)` used in each, which
+  makes GCC keep one), as `run_groups` has: **12 of 12 runs pass** with the sampler and the knob on, and the knob-off and base runs with
+  the sampler pass as before. What the unwinder skips in that window is a frame, not the stack.
+* Cost: nothing in the blocks' loop itself. The rows that run it most, knob on against the base, before and after the frame pointers
+  (MI300X, RX 6800): valu_int 1.326 and 1.341 before, 1.329 and 1.343 after; wave 1.218 and 1.278 after (1.21 and 1.27 before); p_i64
+  1.242 and 1.323, then 1.255 and 1.322; smem 1.323 and 1.306, then 1.321 and 1.311; the 62 rows 1.107, then 1.103. Under 1 %, so they
+  are in. What they did cost is placement, with the knob off: section 1's last paragraph.
+* It is a guard for that one kind of tool. The unwind rules of those epilogues are still wrong for one or two instructions, with the
+  knob on or off; what the simulator can do is keep frames where its own functions sit above them.
+
+### 3a. Longer blocks
+
+What was built is in study 13, section 12: the Machine's instructions as members (global loads and stores, scalar memory, packed halves,
+VOPD pairs, accumulation moves, fences), stretches counted once, a wave that goes on in the block it left, and two trials that turn blocks
+off where they do not pay (a block left for a turn's end more often than every 8 instructions; a machine whose turns average under 16
+instructions). Steps on the way, each a build measured with the knob on against the same build with it off (MI300X, RX 6800; the first
+three rows are `bench.py` passes with other passes beside them and are good to a few percent, the last two are `qall.sh` alone):
+
+| build | lds | mem | buf | flat | arithmetic rows |
+|---|---|---|---|---|---|
+| round sp72 (blocks end before memory instructions) | 0.92 to 0.96 | 0.87 to 1.05 | 0.98 to 1.04 | 0.94 to 1.01 | 1.06 to 1.49 (loaded host) |
+| members and resume | 0.93, 0.91 | 1.02, 0.97 | 0.99, 0.98 | 0.94, 0.99 | as before |
+| ... and blocks left too often turned off (every 4 instructions) | 0.94, 0.96 | 1.03, 1.02 | 0.94, 0.96 | 1.05, 1.08 | as before |
+| ... and the plain loop where turns are short (8 instructions), `tier_mach` in line | 1.00, 0.99 | 1.00, 1.02 | 1.00, 0.99 | 0.96, 1.04 | 1.09 to 1.40 |
+| final, without bound runs (8 and 16 instructions; `run_round` restored) | 1.00, 1.01 | 1.00, 1.01 | 1.00, 1.00 | 1.01, 1.02 | 1.10 to 1.38 |
+
+* **`lds` and `mem` no longer lose** (final column of `data/sp73/steps.md`: 0.99 to 1.02 of the base with the knob on). What `lds` lost
+  was never the blocks: its waves wait for a load or make a first store every two instructions, and a turn of two instructions does not
+  repay coming into the blocks' loop. Its machines go back to the plain loop after 256 turns.
+* Rows that gained from memory instructions as members: smem 1.32 and 1.30 (1.25 to 1.59 on the loaded host before), p_smem_wide 1.20
+  and 1.19, p_sbuf 1.09 and 1.10, atomics 1.03 to 1.06.
+* Counters: identical in all 62 counted rows, knob off against on (`bench.py`'s counting runs of the final build, both sides).
+
+### 3b. Bound integer runs
+
+Three or more consecutive 32-bit integer instructions on vector registers and constants, every lane on: their lane kernels called on the
+rows, no handler between (`gcn::tier::bind_int`, `run_bound_ints`; a constant's row is made once a block). The same binary with
+`VGPU_AMD_BLOCKS_BOUND=0` and without:
+
+| row | MI300X: blocks | blocks + bound | gain | RX 6800: blocks | blocks + bound | gain |
+|---|---:|---:|---:|---:|---:|---:|
+| valu_int | 1.161 | 1.326 | 1.14 | 1.206 | 1.341 | 1.11 |
+| p_sdwa | 1.099 | 1.199 | 1.09 | 1.180 | 1.296 | 1.10 |
+| p_i64 | 1.162 | 1.242 | 1.07 | 1.268 | 1.323 | 1.04 |
+| p_f64x | 1.043 | 1.040 | 1.00 | 1.050 | 1.077 | 1.03 |
+| valu_f32 | 1.119 | 1.087 | 0.97 | 1.202 | 1.204 | 1.00 |
+| p_dpp_arch | 1.090 | 1.051 | 0.96 | 1.059 | 1.051 | 0.99 |
+| atomics | 1.059 | 1.025 | 0.97 | 1.032 | 1.052 | 1.02 |
+
+* **Kept**: four rows at 1.09 or more (valu_int and p_sdwa on both targets) and p_i64 on the MI300X at 1.07; geometric mean of the 62 rows
+  1.099 to 1.107. A first form bound runs of two: p_cmp on the MI300X lost 3.4 % with it (runs of two between compares cost their entry),
+  so a run is three or more.
+* The three rows below 1.00 are within what one pass shows for an unchanged build (valu_f32 on the MI300X was 1.132 against 1.141 in the
+  pass before, p_dpp_arch 1.072 against 1.062): not read as losses, not ruled out either.
+* **Not bound, and why** (study 13, section 12): the float and double families (their handlers' work is the NaN scan, the rule and the
+  merge, which binding does not remove), compares and selects (they read and write masks), anything with a scalar register source (it can
+  change inside the run). On inq nothing is bound that matters: its integer runs are short and its time is in the binary64 handlers.
+
+### inq
+
+`data/sp73/inq.md`. CPU seconds of the whole process, the best run of each side; single runs of one side agree within 0.5 % this time:
+
+| test | one host thread: off | on | on / off | default threads (8): off, wall s / CPU s | on | CPU on / off |
+|---|---:|---:|---:|---:|---:|---:|
+| eigensolvers::steepest_descent | 25.8 | 25.0 | 0.967 | 15.1 / 40.4 | 14.8 / 39.3 | 0.973 |
+| hamiltonian::ks_hamiltonian | 26.2 | 25.9 | 0.988 | 21.1 / 42.0 | 21.0 / 41.1 | 0.978 |
+| ground_state::initial_guess | 65.2 | 62.8 | 0.964 | 35.9 / 126.3 | 35.5 / 125.7 | 0.995 |
+| solvers::poisson | 114.1 | 111.0 | 0.972 | 64.0 / 188.3 | 63.2 / 182.5 | 0.969 |
+| operations::laplacian | | | | 5.8 / 5.6 | 5.9 / 5.5 | 0.977 |
+| operations::gradient | | | | 10.0 / 9.0 | 10.3 / 8.9 | 0.998 |
+| operations::transform | | | | 42.9 / 56.8 | 42.7 / 56.5 | 0.994 |
+| systems::electrons | | | | 48.6 / 79.3 | 48.1 / 77.7 | 0.980 |
+
+* **inq gains 1 to 4 % of its CPU time with the knob on, one thread or eight, and no test is slower.** Wall time at the default: within
+  1 % but gradient (10.0 and 10.3 s, which is run-time compile).
+* **Round sp72's inq numbers were the loaded host's**: it reported 0.84 for steepest_descent from runs of 39.3 and 33.1 CPU-s; the same
+  test is 25.8 s on the quiet host and the gain is 3 %.
+* Why so little, when the dispatch loop is 16 to 25 % of inq's time in the library: `VGPU_AMD_BLOCKS_STATS` on the final build
+  (`data/sp73/blocks-stats.txt`): 76 % of steepest_descent's instructions run in blocks, 80 % of ks_hamiltonian's, 72 % of poisson's,
+  19 % of initial_guess's (its reduction runs work-groups of 16 waves with barriers, and its machines go back to the plain loop), and a
+  block run is 9 to 23 instructions. What a run of 9 saves is the loop of 9 instructions less one entry; and the instructions themselves
+  are the expensive ones here (the binary64 handler through 64-bit arrays is 13 to 15 % of the library's time by itself), so the loop is a
+  smaller part of them than of the bench's integer and float rows. The bench's arithmetic rows are one block of 8 to 53 instructions, run
+  whole, 100 % in blocks.
+
+### Tests and mutants
+
+* `test_amd_gcn_blocks_same_bits` has seven cases (five in round sp72): the two new ones are **memory instructions inside blocks** (global
+  loads and stores with addresses on a memory region, until an instruction before them moves the address and the access faults in the
+  middle of a block; scalar memory with `s_memtime`, which reads the instruction count; LDS at small addresses; one to three waves, so that
+  a first store of a round and the waits end turns inside blocks and waves go on in them; 900 runs each way, 3,295 of the Machine's
+  instructions inside blocks, 649 runs that throw) and **bound integer runs** (the shapes that bind, found by running them; every lane
+  on, half of them off, turns that end inside a run; blocks off, blocks without binding and blocks with it must agree; 1,200 runs each way,
+  13,468 instructions as bound operations). It passes in the LTO build and the build without LTO; the state of the tree before bound runs
+  (its own commit) was built and passes its six cases.
+* **Mutants** (`data/sp73/scripts/mutants.py`, `mutants.txt`): 44 edits, one at a time, of the runner's second form and of the binding:
+  stretch counters left out or doubled, the room, handed-back instructions, waits and gated stores taken for the wrong kind or given the
+  wrong end, the Machine's instructions' answers, the error's address, a wave going on in a block without asking where it is or one
+  instruction off, a bound run with lanes off, past the room, entered in its middle, with the wrong constant row, a modifier or a scalar
+  source bound. **42 of 44 are killed.** The two that survive change no result (a branch for a hand-back that the integer handlers
+  never make; an unused source's row).
+* **The AMD ctest set** (`data/sp73/ctest.txt`), knob off and `VGPU_AMD_BLOCKS=1` in every test's environment: 325 tests, 237 pass, 88 skip, none fails, both ways.
+* inq: every run of every test passes with the same output checksum off and on.
+
+### Should `VGPU_AMD_BLOCKS` be the default?
+
+The bar: no AMD bench row and no inq test more than 3 % slower with the knob on, with the control beside it, and every AMD test
+identical. **The default was not changed in this branch.** The evidence:
+
+| | measured | bar |
+|---|---|---|
+| bench, 62 kernel rows, one thread, knob on against the base | geometric mean 1.107 (build before the frame pointers) and 1.103 (final library); lowest row 0.982 and 0.983 (the matrix rows, buf); control 1.001 and 0.999 | met: no row below 0.97 in either table |
+| the same, knob on against knob off of the same library | 1.105 and 1.111; lowest 0.986 (mfma_i8; smfmac) | met |
+| 8 simulator threads (26 rows, on one core), on against off | 1.113; lowest 0.986 (mfma), 0.987 (flat on the MI300X) | met; not a rate on eight cores |
+| `bench.py` at all host threads, knob on | every workload's own check passes, no failed run | results only, no rates read |
+| inq, four tests at one thread, eight at the default | CPU 0.964 to 0.998 of knob off, wall within 1 % (gradient +3 %, 10.0 to 10.3 s, run-time compile), same checksums | met: none slower |
+| counters | identical in all 62 counted rows | met |
+| AMD ctest set, knob off and on | 325 tests, 237 pass, 88 skip, none fails, both ways | met for what runs here |
+| same-bits test, mutants | 7 cases; 42 of 44 mutants killed, 2 equivalent | |
+| a profiler that walks the stack in its handler | 12 of 12 runs pass with the knob on | |
+
+Against: (1) the 88 skipped tests are the ones that need ROCm's full install (rocBLAS, PyTorch, hipBLASLt, vLLM, hipcc 7.2's expected
+counters in `bench_amd_counters_blocks`), and ASan, TSan and gfx1250 kernels were not run with the knob on anywhere; only CI has them.
+(2) Placement: a link of this library moves single rows by 3 to 5 % (section 1), so "no row more than 3 % slower" holds for the two
+libraries measured, with a margin of 1.3 % on the lowest row, not for every future link. (3) What the default buys the workload that
+asked for it is 1 to 4 % of inq's CPU; the 1.1x to 1.4x is on the bench's arithmetic and scalar-memory rows.
+
+**Recommendation: yes, after one CI run with the knob on.** Run the AMD jobs (the e2e set, `bench_amd_counters_blocks`, ASan and TSan,
+the gfx1250 tests) once with `VGPU_AMD_BLOCKS=1` in the environment; if they are identical, flip the default and keep
+`VGPU_AMD_BLOCKS=0` as the way out for a release. Nothing measured here speaks against it, and the two trials mean a kernel that blocks
+do not suit runs the plain loop after 64 runs or 256 turns. The variant of the section-placement experiment (on: narrow on the RX 6800
+0.957, mfma 0.961) is the warning that the 3 % bar is one unlucky link away for a row or two, on or off.
+
+### What was not built, and what the numbers say to build next
+
+* **Row kernels for the binary64 forms that go through 64-bit arrays** (`v_max_f64` and `v_min_f64`, the forms with `|x|` and `-x`
+  modifiers, 64-bit shifts and compares): `h_f64` alone is 13 to 15 % of inq's time in the library. This is tier work, not block work, and
+  it is where inq's next 5 to 10 % is.
+* Generated fused runs (study 13, milestone 4): unchanged; the ceiling is 13x to 22x on arithmetic loops and nothing built here comes near.
+* Bound runs for other families: not until a profile shows the operand reads, and not the handler's own work, in them.
+
+### Caveats and what is not solid
+
+* One host. Quiet this time, but the rows still move by 1 to 3 % from pass to pass and by up to 4 % from build to build with nothing
+  changed that they run (the control). A claim of less than 3 % on one row is not made.
+* The knob-off costs were found by what they did to rows, one at a time; a fifth of the same kind and size (1 to 2 % on some rows, like
+  buf's) could be in the final build. The geometric mean says there is no general cost.
+* The two trials' thresholds (8 instructions a stop, 16 a turn, 64 runs, 256 turns) were set from the `lds`, `mem`, `buf` and `flat` rows.
+  A kernel between them (turns of 16 to 30 instructions with waits) was not looked for.
+* Timing is one host thread except where a table says otherwise. The eight-thread table ran eight simulator threads on one core.
+* The mutants, the ctest set, the inq tables and the block statistics were taken on the library one commit before the last (the frame
+  pointers); the last library ran the same-bits test, the sampler check, the 62-row table and the eight-thread table.
+* Not run here: `bench_amd_counters_blocks` (hipcc 6.4.4 has no expected file), the e2e tests that need ROCm's full install, ASan and
+  TSan, gfx1250 kernels. The knob stays off by default in this branch.
+* Cleanup: this round's directory on server3 (`/tmp/sp72-amd-tier`: ten trees and builds, the bench cache, logs) was removed by exact path; round sp70's inq directory was read and not changed.
