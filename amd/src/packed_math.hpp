@@ -86,7 +86,7 @@ struct HalfSource {
 struct WaveArgs {
   Op op = Op::Fma;
   bool clamp = false;
-  bool guide = false;   // (Min and Max) gfx942 and gfx950's rule, on the halves' bits (minmax_half_bits); else RDNA's and gfx90a's, on floats (pk_fminf)
+  bool guide = false;   // (Min and Max) the guides' rule (gfx90a, gfx942, gfx950, gfx1030), on the halves' bits (minmax_half_bits); else gfx11's and gfx12's, on floats (pk_fminf)
   bool ieee = false;    // (Min and Max, guide) MODE.IEEE: a signaling NaN operand gives that NaN, quieted
   uint64_t exec = 0;
   HalfSource src[3][2];   // source k, low result then high

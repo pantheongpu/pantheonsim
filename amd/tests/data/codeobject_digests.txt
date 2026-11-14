@@ -60,6 +60,10 @@ data/asm_logic.gfx942.o	80a2d3d0d776ee92
 data/asm_memory.gfx942.o	ff7da61417a8bd95
 data/asm_mfma_order.gfx942.o	38bc839399a58a5c
 data/asm_minmax3.gfx950.o	f3b585ab2b81f18b
+data/asm_mods.gfx1030.o	f2c4714ca36a8b07
+data/asm_mods.gfx1100.o	e3f64aa5e4f0165d
+data/asm_mods.gfx90a.o	4699c994e9b729f1
+data/asm_mods.gfx942.o	e907be3cabedda36
 data/asm_mulhi.gfx942.o	43ad510470faf4ad
 data/asm_permlane.gfx1100.o	6768595450bd87c
 data/asm_permute_exec.gfx942.o	6ebd1555fdb9b13c

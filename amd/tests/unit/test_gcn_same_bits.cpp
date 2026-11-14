@@ -20,6 +20,11 @@
 // gfx1250's v_mad_co_i64_i32, whose scalar bit is bit 64 of the 65-bit result (the CDNA3 guide and an RX 6800) where the baseline wrote whether the
 // sum overflowed, and integer instructions with the clamp bit (v_add_co_u32, v_sub_co_u32, v_subrev_nc_u32, v_mul_i32_i24, v_mad_i32_i24, v_mad_u16)
 // that the baseline left unsaturated (lines 1230-1232, 3193-3195, 5072-5074, 7305, 9109, 12041, 12412, 12593, 12766-12768, 12770, 12775, 16046).
+// Ninety-six more were recorded after the modifier audit (test_amd_gcn_mods), from the tree that has it: gfx90a's and gfx1030's v_min/v_max (f16,
+// f32, packed, SDWA), which now take the guides' rule for -0 against +0 and for a NaN (the CDNA2 guide's pseudocode, and an RX 6800) where the
+// baseline took the host's fmin and fmax (9 gfx90a lines in 5094-5304, 6 gfx1030 lines); gfx1250's v_div_scale_f32/f64 with a clamp
+// or an output modifier, which the baseline wrote unmodified (lines 12755, 12757, 12761, 12762); and gfx1030's SDWA comparisons (v_cmp_*_sdwa,
+// 77 lines; with the 6 above, the gfx1030 lines in 14958-15958), whose baseline digest was the text of "decoded but not implemented".
 // Every other digest is the baseline's.
 #include <cstdint>
 #include <cstdio>
