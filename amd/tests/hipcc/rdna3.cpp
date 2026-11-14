@@ -264,8 +264,10 @@ int main() {
       const int bank = (l >> 2) & 3;
       bad += o[l] != ((0xc >> bank) & 1 ? d[l] + a[(l & ~3) + qa[l & 3]] * b[l] : d[l]);
       bad += o[64 + l] != a[(l & ~3) + qb[l & 3]] + b[l];
-      bad += o[128 + l] != (a[l] + b[l]) / 2;
-      bad += o[192 + l] != (b[l] - a[l]) / 2;
+      // div:2 does nothing here: a hipcc kernel runs with IEEE mode and output denormals on, and with either the output modifier is
+      // ignored (RDNA3 ISA guide, 7.2.3.1; an RX 6800 does the same, test_amd_gcn_mods).
+      bad += o[128 + l] != a[l] + b[l];
+      bad += o[192 + l] != b[l] - a[l];
       bad += o[256 + l] != a[(l & ~15) + 15 - (l & 15)];
       bad += o[320 + l] != a[(l & ~7) + 7 - (l & 7)];
     }

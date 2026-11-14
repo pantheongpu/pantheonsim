@@ -58,9 +58,12 @@ int ref_getrf(Mat& A, int m, int n, std::vector<int>* ipiv) {
         for (int c = 0; c < n; ++c) std::swap(A(j, c), A(p, c));
     }
     const double piv = A(j, j);
-    if (piv == 0.0) { if (!info) info = j + 1; continue; }
+    // A zero pivot's column is multiplied by 0 and the step goes on, as an RTX 3060's cuSOLVER does (it used to be
+    // skipped; card_edges_cusolver.cu).
+    if (piv == 0.0 && !info) info = j + 1;
     for (int i = j + 1; i < m; ++i) {
-      A(i, j) /= piv;
+      if (piv == 0.0) A(i, j) *= 0.0;
+      else A(i, j) /= piv;
       const double f = A(i, j);
       for (int c = j + 1; c < n; ++c) A(i, c) -= f * A(j, c);
     }

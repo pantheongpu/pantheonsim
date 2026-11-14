@@ -5,7 +5,9 @@
 #                               cuInit of its own: the runtime neither initialised that driver nor handed it its primary
 #                               context ("CUDA driver error: initialization error" on every PyTorch check);
 #   preload_torch_profiler.cpp  the profiling engine switched on around a cuBLAS call: the shims no longer shared one engine,
-#                               and the copies cuBLAS makes on the program's behalf were recorded as the program's cudaMemcpy.
+#                               and the copies cuBLAS makes on the program's behalf were recorded as the program's cudaMemcpy;
+#   preload_torch_peers.cpp     CUPTI and NVSHMEM, which call the driver by name, could not find the private one either: CUPTI's
+#                               callbacks named a placeholder context, and nvshmemx_cumodule_init / culibrary_init failed.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 build="${VGPU_BUILD_DIR:-$root/build}"
@@ -20,7 +22,7 @@ soname() {
     basename "$f"
   done | awk '{ print length, $0 }' | sort -n | head -n1 | cut -d' ' -f2
 }
-cart=$(soname libcudart) blas=$(soname libcublas)
+cart=$(soname libcudart) blas=$(soname libcublas) cupti=$(soname libcupti) shmem=$(soname libnvshmem_host)
 [[ -e $shim/libcuda.so.1 && -n $cart && -n $blas ]] || { echo "SKIP: the driver, runtime or cuBLAS shim is not built"; exit 0; }
 . "$root/tests/shim_guard.sh"
 if [[ -n "$(shim_sanitizer "$shim")" ]]; then
@@ -31,7 +33,7 @@ cxx="${CXX:-c++}"
 command -v "$cxx" >/dev/null 2>&1 || { echo "SKIP: no C++ compiler"; exit 0; }
 work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-preload-torch-like.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
-for p in driver profiler; do
+for p in driver profiler peers; do
   "$cxx" -std=c++17 -O1 -I"$root/include" "$root/nvidia/tests/e2e/preload_torch_$p.cpp" -o "$work/$p" -ldl -pthread ||
     { echo "FAIL: preload_torch_$p.cpp does not compile"; exit 1; }
 done
@@ -50,5 +52,10 @@ for gpu in nvidia/t4 nvidia/rtx5090; do
   run "the driver, initialised by the runtime" "$gpu" ./driver "$cart"
 done
 run "one profiling engine for every shim" nvidia/rtx5090 ./profiler "$cart" "$blas"
+if [[ -n $cupti || -n $shmem ]]; then
+  run "CUPTI and NVSHMEM reach the private driver" nvidia/rtx3060 ./peers "$cart" "${cupti:--}" "${shmem:--}"
+else
+  echo "skip CUPTI and NVSHMEM: neither shim is built"
+fi
 (( fails == 0 )) || exit 1
 echo "PASS"

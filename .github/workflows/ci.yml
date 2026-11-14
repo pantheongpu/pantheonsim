@@ -822,11 +822,14 @@ jobs:
         #                        on a toolchain whose link clones them.
         #   e2e_host_gpu         it runs kernels on a real NVIDIA card (VGPU_HOST_GPU=exact) and skips
         #                        where there is none, as on this runner.
+        #   e2e_npp_stream_context  it checks nppGetStreamContext and the other stream-context
+        #                        functions of the CUDA 12 NPP build; CUDA 13 removed them, and this
+        #                        image has CUDA 13.0, so it skips by design (the CUDA 12 legs run it).
         # The last four above, and these three, are the image's or the branch's to fix; drop
         # them here when they are.
         if: inputs.ml_tests == ''
         env:
-          RUNNER_SKIPS_OK: '^(e2e_sass_jit_full|bench_amd_counters|e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_packed_int_forms|e2e_runtime_132|e2e_rdc_clones|e2e_host_gpu|amd_rocprofiler_pcsampling|amd_rvs)$'
+          RUNNER_SKIPS_OK: '^(e2e_sass_jit_full|bench_amd_counters|e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_packed_int_forms|e2e_runtime_132|e2e_rdc_clones|e2e_host_gpu|e2e_npp_stream_context|amd_rocprofiler_pcsampling|amd_rvs)$'
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 4 -m 4)" \

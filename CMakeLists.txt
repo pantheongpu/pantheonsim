@@ -1628,6 +1628,8 @@ vgpu_unit_test(test_lockstep_look)
 vgpu_unit_test(test_sass_lea)
 # ULDC c[bank][URa + offset]: the offset is signed and the address wraps in the 64 KiB bank (pantheonsim #499).
 vgpu_unit_test(test_sass_uldc_indexed)
+# A lane group switched away from on a backward branch keeps its uniform registers; the PTX of the same kernel agrees (pantheonsim #642).
+vgpu_unit_test(test_sass_uniform_switch)
 # Kernels launched while the host has floating-point traps enabled (#605): no SIGFPE, the host environment as it was.
 vgpu_unit_test(test_launch_fp_traps)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
@@ -2109,6 +2111,12 @@ set_tests_properties(test_amd_hip_module_probe PROPERTIES ENVIRONMENT "VGPU_GPU=
 # v_div_fmas / v_div_fixup with the clamp bit or an output modifier (issue #613).
 vgpu_unit_test(test_amd_gcn_div_clamp amd/tests/unit/test_gcn_div_clamp.cpp)
 target_compile_definitions(test_amd_gcn_div_clamp PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The clamp bit of the integer instructions: VOP3b adds and subtracts with a carry out, the 64-bit multiply-adds, and the rest.
+vgpu_unit_test(test_amd_gcn_int_clamp amd/tests/unit/test_gcn_int_clamp.cpp)
+target_compile_definitions(test_amd_gcn_int_clamp PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# SDWA, DPP and VOP3P modifiers (clamp, output modifier, selects, op_sel, neg) and v_div_scale's clamp, against an RX 6800's results.
+vgpu_unit_test(test_amd_gcn_mods amd/tests/unit/test_gcn_mods.cpp)
+target_compile_definitions(test_amd_gcn_mods PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn_abandon amd/tests/unit/test_gcn_abandon.cpp)
 target_compile_definitions(test_amd_gcn_abandon PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_hostcall amd/tests/unit/test_hostcall.cpp)
@@ -2716,6 +2724,9 @@ set_tests_properties(config_cli PROPERTIES DEPENDS vgpu_cli
 add_test(NAME lint_makefile COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_makefile.sh)
 add_test(NAME lint_tracked_junk COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_tracked_junk.sh)
 set_tests_properties(lint_tracked_junk PROPERTIES TIMEOUT 60)
+# No shim but the driver looks a driver function up in the global scope only: under `vgpu run --preload` the driver is private.
+add_test(NAME lint_driver_lookups COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_driver_lookups.sh)
+set_tests_properties(lint_driver_lookups PROPERTIES TIMEOUT 60)
 set_tests_properties(lint_makefile PROPERTIES TIMEOUT 120)
 add_test(NAME lint_readme_commands COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_readme_commands.sh)
 set_tests_properties(lint_readme_commands PROPERTIES TIMEOUT 120)
@@ -2943,6 +2954,20 @@ if(TARGET vgpucuda)
     DRIVER_PROC_ADDRESS_TABLE="${CMAKE_SOURCE_DIR}/nvidia/tests/data/driver_proc_address.rtx3060.txt")
   add_test(NAME test_driver_proc_address COMMAND test_driver_proc_address)
   set_tests_properties(test_driver_proc_address PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/a100;VGPU_QUIET=1")
+endif()
+# cuProfilerStart/Stop and cudaProfilerStart/Stop answer as an RTX 3060 does: not initialised, no context, a dead context, no
+# device (they used to succeed always). One process per group: see the test's header. No toolkit header needed.
+if(TARGET vgpucuda AND TARGET vgpucudart)
+  add_executable(test_profiler_control nvidia/tests/unit/test_profiler_control.cpp)
+  target_link_libraries(test_profiler_control PRIVATE vgpucuda -Wl,--no-as-needed vgpucudart)
+  target_include_directories(test_profiler_control PRIVATE tests/framework)
+  foreach(_group driver runtime sticky no_device)
+    add_test(NAME test_profiler_control_${_group} COMMAND test_profiler_control ${_group}_)
+  endforeach()
+  set_tests_properties(test_profiler_control_driver test_profiler_control_runtime test_profiler_control_sticky PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1")
+  set_tests_properties(test_profiler_control_no_device PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;CUDA_VISIBLE_DEVICES=")
 endif()
 # Runtime entry points the toolkit exports and this one lacked (cudaMemset3D,
 # cudaChooseDevice, cudaDeviceGetByPCIBusId, the 2D array copies, the texture
@@ -4459,6 +4484,44 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
+endif()
+
+# Edge cases of the runtime and the math libraries against an RTX 3060 (CUDA 13.0): the last error of every failed
+# call, copy kinds, 2D pitches, allocation flags, invalidated captures, and the cuBLAS, cuSOLVER and cuSPARSE
+# argument checks and status texts (nvidia/tests/e2e/card_edges_*.cu).
+if(TARGET vgpucudart)
+  foreach(_edge last_error copy_kind pitch alloc_flags capture)
+    add_test(NAME e2e_card_edges_${_edge} COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh ${_edge})
+    set_tests_properties(e2e_card_edges_${_edge} PROPERTIES
+      DEPENDS vgpucudart
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      TIMEOUT 300)
+  endforeach()
+endif()
+foreach(_edge cublas cusolver cusparse)
+  if(TARGET vgpucudart AND TARGET vgpu${_edge})
+    add_test(NAME e2e_card_edges_${_edge} COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh ${_edge} -l${_edge})
+    set_tests_properties(e2e_card_edges_${_edge} PROPERTIES
+      DEPENDS "vgpucudart;vgpu${_edge}"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      TIMEOUT 300)
+  endif()
+endforeach()
+# cuBLAS's level-2 and GEMM argument checks and the lines it prints for them (card_edges_blas2.cu), and the driver's
+# current context against the runtime's calls (card_edges_context.cu).
+if(TARGET vgpucudart AND TARGET vgpucublas)
+  add_test(NAME e2e_card_edges_blas2 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh blas2 -lcublas)
+  set_tests_properties(e2e_card_edges_blas2 PROPERTIES
+    DEPENDS "vgpucudart;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+endif()
+if(TARGET vgpucudart AND TARGET vgpucuda)
+  add_test(NAME e2e_card_edges_context COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh context -lcuda)
+  set_tests_properties(e2e_card_edges_context PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
 endif()
 
 # The session's ncu: Nsight Compute's command line answered from the simulator's

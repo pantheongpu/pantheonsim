@@ -94,6 +94,7 @@ VGPU_EXPORT cusparseStatus_t cusparseCreateConstSpVec(cusparseConstSpVecDescr_t*
   return rc;
 }
 VGPU_EXPORT cusparseStatus_t cusparseDestroySpVec(cusparseConstSpVecDescr_t d) {
+  if (!d) return CUSPARSE_STATUS_SUCCESS;
   if (!spvec(d)) return CUSPARSE_STATUS_INVALID_VALUE;
   untrack(d);
   delete static_cast<const SpVec*>(static_cast<const void*>(d));

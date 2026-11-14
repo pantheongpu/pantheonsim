@@ -260,12 +260,16 @@ int main() {
         "%s / %s", cudaGetErrorName(cudaErrorNoDevice), cudaGetErrorString((cudaError_t)12345));
 
   // A freed device pointer is not a device pointer. It used to report one,
-  // with a device ordinal computed from the address.
+  // with a device ordinal computed from the address. An RTX 3060 answers
+  // success and "unregistered" (no device, -2), as for any address CUDA does
+  // not know, and the last error stays clear.
   int* gone = nullptr;
   cudaMalloc(&gone, 64);
   cudaFree(gone);
+  cudaGetLastError();
   e = cudaPointerGetAttributes(&a, gone);
-  CHECK("attributes of a freed device pointer -> invalid value", e == cudaErrorInvalidValue, "got %d type %d", e, (int)a.type);
+  CHECK("attributes of a freed device pointer -> unregistered", e == cudaSuccess && a.type == cudaMemoryTypeUnregistered &&
+        a.device == cudaInvalidDeviceId && cudaGetLastError() == cudaSuccess, "got %d type %d device %d", e, (int)a.type, a.device);
   cudaGetLastError();
 
   // Last: a kernel's illegal address corrupts the context, and it stays

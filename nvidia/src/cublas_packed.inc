@@ -136,8 +136,11 @@ template <class T>
 cublasStatus_t gbmv(cublasHandle_t h, cublasOperation_t t, int m, int n, int kl, int ku, const T* alpha, const T* A,
                     int lda, const T* x, int incx, const T* beta, T* y, int incy) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (!known_op(t) || m < 0 || n < 0 || kl < 0 || ku < 0 || lda < kl + ku + 1 || incx == 0 || incy == 0)
-    return CUBLAS_STATUS_INVALID_VALUE;
+  {
+    const int bad = !known_op(t) ? 1 : m < 0 ? 2 : n < 0 ? 3 : kl < 0 ? 4 : ku < 0 ? 5 : lda < kl + ku + 1 ? 8
+                  : incx == 0 ? 10 : incy == 0 ? 13 : 0;
+    if (bad) return illegal_arg(blas_letter<T>(), "GBMV ", bad);
+  }
   if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
   if (!alpha || !beta) return CUBLAS_STATUS_INVALID_VALUE;
   return run_c(h, alpha, beta, sizeof(T), [=](const void* al, const void* be) {
@@ -162,7 +165,10 @@ template <class T>
 cublasStatus_t sbmv(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, int n, int k, const T* alpha, const T* A,
                     int lda, const T* x, int incx, const T* beta, T* y, int incy) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (!known_fill(uplo) || n < 0 || k < 0 || lda < k + 1 || incx == 0 || incy == 0) return CUBLAS_STATUS_INVALID_VALUE;
+  {
+    const int bad = !known_fill(uplo) ? 1 : n < 0 ? 2 : k < 0 ? 3 : lda < k + 1 ? 6 : incx == 0 ? 8 : incy == 0 ? 11 : 0;
+    if (bad) return illegal_arg(blas_letter<T>(), hermitian ? "HBMV " : "SBMV ", bad);
+  }
   if (n == 0) return CUBLAS_STATUS_SUCCESS;
   if (!alpha || !beta) return CUBLAS_STATUS_INVALID_VALUE;
   return run_c(h, alpha, beta, sizeof(T), [=](const void* al, const void* be) {
@@ -180,7 +186,10 @@ template <class T>
 cublasStatus_t spmv(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, int n, const T* alpha, const T* AP,
                     const T* x, int incx, const T* beta, T* y, int incy) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (!known_fill(uplo) || n < 0 || incx == 0 || incy == 0) return CUBLAS_STATUS_INVALID_VALUE;
+  {
+    const int bad = !known_fill(uplo) ? 1 : n < 0 ? 2 : incx == 0 ? 6 : incy == 0 ? 9 : 0;
+    if (bad) return illegal_arg(blas_letter<T>(), hermitian ? "HPMV " : "SPMV ", bad);
+  }
   if (n == 0) return CUBLAS_STATUS_SUCCESS;
   if (!alpha || !beta) return CUBLAS_STATUS_INVALID_VALUE;
   return run_c(h, alpha, beta, sizeof(T), [=](const void* al, const void* be) {
@@ -200,7 +209,10 @@ template <class T, class S>
 cublasStatus_t spr(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, int n, const S* alpha, const T* x,
                    int incx, const T* y, int incy, T* AP) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (!known_fill(uplo) || n < 0 || incx == 0 || (y && incy == 0)) return CUBLAS_STATUS_INVALID_VALUE;
+  {
+    const int bad = !known_fill(uplo) ? 1 : n < 0 ? 2 : incx == 0 ? 5 : y && incy == 0 ? 7 : 0;
+    if (bad) return illegal_arg(blas_letter<T>(), y ? (hermitian ? "HPR2  " : "SPR2  ") : (hermitian ? "HPR  " : "SPR  "), bad);
+  }
   if (n == 0) return CUBLAS_STATUS_SUCCESS;
   if (!alpha) return CUBLAS_STATUS_INVALID_VALUE;
   return run_c(h, alpha, nullptr, sizeof(S), [=](const void* al, const void*) {
@@ -226,13 +238,17 @@ cublasStatus_t spr(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, int 
 // x = op(A) x (multiply) or op(A) x = b, x over b (solve), A triangular:
 // banded with k off-diagonals (tbmv, tbsv) or packed (tpmv, tpsv, k < 0).
 template <class T>
-cublasStatus_t tri_band(cublasHandle_t h, bool solve, cublasFillMode_t uplo, cublasOperation_t t,
+cublasStatus_t tri_band(cublasHandle_t h, bool solve, bool packed, cublasFillMode_t uplo, cublasOperation_t t,
                         cublasDiagType_t diag, int n, int k, const T* A, int lda, T* x, int incx) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  const bool packed = k < 0;
-  if (!known_fill(uplo) || !known_op(t) || !known_diag(diag) || n < 0 || incx == 0 ||
-      (!packed && lda < k + 1))
-    return CUBLAS_STATUS_INVALID_VALUE;
+  {
+    // Reference BLAS's positions: uplo 1, trans 2, diag 3, n 4, then k 5, lda 7, incx 9 (band) or incx 7 (packed).
+    const int bad = !known_fill(uplo) ? 1 : !known_op(t) ? 2 : !known_diag(diag) ? 3 : n < 0 ? 4
+                  : packed ? (incx == 0 ? 7 : 0)
+                  : k < 0 ? 5 : lda < k + 1 ? 7 : incx == 0 ? 9 : 0;
+    if (bad) return illegal_arg(blas_letter<T>(), packed ? (solve ? "TPSV " : "TPMV ") : (solve ? "TBSV " : "TBMV "), bad);
+  }
+  if (packed) k = -1;
   if (n == 0) return CUBLAS_STATUS_SUCCESS;
   return run_c(h, nullptr, nullptr, 0, [=](const void*, const void*) {
     const bool lower = uplo == CUBLAS_FILL_MODE_LOWER, unit = diag == CUBLAS_DIAG_UNIT;
@@ -297,22 +313,20 @@ cublasStatus_t tpttr(cublasHandle_t h, bool to_full, cublasFillMode_t uplo, int 
   VGPU_EXPORT cublasStatus_t cublas##P##tbmv_v2(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t,        \
                                                 cublasDiagType_t d, int n, int k, const T* A, int lda, T* x,      \
                                                 int incx) {                                                       \
-    if (k < 0 && valid(h)) return CUBLAS_STATUS_INVALID_VALUE;                                                    \
-    return tri_band<T>(h, false, u, t, d, n, k, A, lda, x, incx);                                                 \
+    return tri_band<T>(h, false, false, u, t, d, n, k, A, lda, x, incx);                                          \
   }                                                                                                               \
   VGPU_EXPORT cublasStatus_t cublas##P##tbsv_v2(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t,        \
                                                 cublasDiagType_t d, int n, int k, const T* A, int lda, T* x,      \
                                                 int incx) {                                                       \
-    if (k < 0 && valid(h)) return CUBLAS_STATUS_INVALID_VALUE;                                                    \
-    return tri_band<T>(h, true, u, t, d, n, k, A, lda, x, incx);                                                  \
+    return tri_band<T>(h, true, false, u, t, d, n, k, A, lda, x, incx);                                           \
   }                                                                                                               \
   VGPU_EXPORT cublasStatus_t cublas##P##tpmv_v2(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t,        \
                                                 cublasDiagType_t d, int n, const T* AP, T* x, int incx) {         \
-    return tri_band<T>(h, false, u, t, d, n, -1, AP, 0, x, incx);                                                 \
+    return tri_band<T>(h, false, true, u, t, d, n, -1, AP, 0, x, incx);                                           \
   }                                                                                                               \
   VGPU_EXPORT cublasStatus_t cublas##P##tpsv_v2(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t,        \
                                                 cublasDiagType_t d, int n, const T* AP, T* x, int incx) {         \
-    return tri_band<T>(h, true, u, t, d, n, -1, AP, 0, x, incx);                                                  \
+    return tri_band<T>(h, true, true, u, t, d, n, -1, AP, 0, x, incx);                                            \
   }                                                                                                               \
   VGPU_EXPORT cublasStatus_t cublas##P##tpttr(cublasHandle_t h, cublasFillMode_t u, int n, const T* AP, T* A,     \
                                               int lda) {                                                          \
