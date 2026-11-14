@@ -22,6 +22,47 @@ release says what runs and what it produces, never how fast a real GPU would run
   the primary context current on the calling thread, and answer a dead context's fault or `cudaErrorNoDevice`. And after
   `cuDevicePrimaryCtxReset`, the runtime's next call makes the primary context active again, as on the card
   (`cuDevicePrimaryCtxGetState` kept reporting it inactive). New test `test_profiler_control`.
+- Runtime: every call that fails makes its error the thread's last error, as on an RTX 3060. Only the calls that went through the
+  runtime's guard did: `cudaEventElapsedTime` on an event never recorded, `cudaStreamWaitEvent` with an unknown flag,
+  `cudaStreamBeginCapture`/`cudaStreamEndCapture` refusals, `cudaMemcpy2D` with a pitch too small, `cudaMemcpy3D` and `cudaMemset3D`
+  with bad arguments, a captured event's `cudaErrorCapturedEvent` and others left `cudaGetLastError` at success. A query's not-ready
+  still sets nothing, and a call the simulator makes inside another does not count (found by differential testing against an RTX 3060;
+  `e2e_card_edges_last_error`).
+- Runtime: a copy kind that is none of the five is `cudaErrorInvalidMemcpyDirection` (21) from `cudaMemcpy`, `cudaMemcpyAsync`, the 2D
+  copies and `cudaMemcpy3D`, as on an RTX 3060, not `cudaErrorInvalidValue` (`e2e_card_edges_copy_kind`).
+- Runtime: 2D pitches are checked as an RTX 3060 checks them. `cudaMemset2D` of more than one row with a pitch narrower than the row is
+  `cudaErrorInvalidValue` and writes nothing; it used to fill the overlapping rows and succeed. `cudaMemcpy2D` of a single row accepts a
+  pitch of 0 (it was `cudaErrorInvalidPitchValue`), and a set pitch narrower than the row is `cudaErrorInvalidValue` there
+  (`e2e_card_edges_pitch`).
+- Runtime: `cudaEventCreateWithFlags`, `cudaHostAlloc` and `cudaMallocManaged` refuse flags the card refuses (an unknown bit;
+  Interprocess without DisableTiming; managed memory with 0 or both attach flags) with `cudaErrorInvalidValue` and create nothing.
+  They took any value (`e2e_card_edges_alloc_flags`).
+- Runtime: once a stream capture is invalidated, launches, `cudaMemcpyAsync`, `cudaMemsetAsync`, `cudaEventRecord` and
+  `cudaStreamWaitEvent` on its streams fail with `cudaErrorStreamCaptureInvalidated` until `cudaStreamEndCapture`, as on an RTX 3060;
+  they were recorded and succeeded. `cudaEventSynchronize` and `cudaEventQuery` of a captured event also invalidate a Relaxed-mode
+  capture, and answer `cudaErrorInvalidValue` once it is invalidated; `cudaStreamEndCapture` from a stream that joined the capture
+  invalidates it. `e2e_capture_streams` no longer continues a capture after those two calls (`e2e_card_edges_capture`).
+- Runtime: `cudaPointerGetAttributes` of an address in the device range that no live allocation covers (a freed pointer, one past
+  the end) answers success and `cudaMemoryTypeUnregistered` with device -2, as an RTX 3060 does for any address CUDA does not know. It
+  was `cudaErrorInvalidValue`, which also became the last error (`e2e_runtime_conformance`).
+- cuBLAS: `cublasSetPointerMode` refuses a mode other than HOST and DEVICE, and `cublasSetMathMode` a value above 31, keeping the old
+  setting; both were stored, and an unknown pointer mode made later calls read host scalars as device pointers.
+  `cublasGetStatusName`/`cublasGetStatusString` give the card's names and sentences (ARCH_MISMATCH, MAPPING_ERROR, EXECUTION_FAILED
+  and LICENSE_ERROR were all "CUBLAS_STATUS_INTERNAL_ERROR", and the string was the name). An empty `cublasSgemm` may pass a null C,
+  and `cublasSetMatrix`/`cublasGetMatrix` with a short leading dimension no longer leave a runtime last error
+  (`e2e_card_edges_cublas`).
+- cuSOLVER: `getrs` refuses an unknown operation, negative sizes and short leading dimensions; it solved with them, and `n = -1`
+  aborted the program with `std::length_error`. `potrf`, `potrs`, `syevd` and `gesvd` refuse unknown fill modes and jobs, negative
+  sizes and short leading dimensions with LAPACK's info (minus the argument's position), `getrf` with `lda < m` succeeds with info -4,
+  and `gesvd` with `m < n` is `CUSOLVER_STATUS_INVALID_VALUE` with info 0 (it was NOT_SUPPORTED). `gesvd` with `jobu = 'O'` or
+  `jobvt = 'O'` works, writing the vectors over A; it was refused. `cusolverDnSetAdvOptions` refuses unknown functions and algorithms
+  (`e2e_card_edges_cusolver`).
+- cuSPARSE: `cusparseCreateCsr/Csc/Coo` refuse an unknown index base and more entries than the matrix has places,
+  `cusparseCreateDnMat` an unknown order and a leading dimension below a column (COL) or row (ROW), and `cusparseSpMV` an unknown
+  operation, a null alpha or beta, a non-CSR algorithm for a CSR matrix, and a compute type the card does not offer for the data
+  (`CUSPARSE_STATUS_NOT_SUPPORTED`, also from `cusparseSpMV_bufferSize`). The `cusparseSetMat*` setters refuse values their enums do
+  not have, destroying a null handle or descriptor succeeds, and `cusparseGetErrorName`/`String` give the card's texts
+  (`e2e_card_edges_cusparse`).
 - Runtime: a copy, fill or kernel launch issued on a stream behind a host function that has not finished returns at once and runs
   after it, in stream order, as on an RTX 3060. It used to run inside the call after waiting for the host function, so a host function
   that waits for something the program does after the call (Celeritas' `AsyncSnapshotTest.device_pending`) hung the program.
