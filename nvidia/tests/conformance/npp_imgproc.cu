@@ -855,6 +855,45 @@ static void gauss_border() {
   report("FilterGaussBorder roi past the source", 0, d);
 }
 
+/* ---------------- border filters at a source offset ---------------- */
+
+// pSrc points at the pixel oSrcOffset names, not at the image's origin: the
+// box filter and the Prewitt gradients on a ROI inside the image, its left
+// and top halo real pixels and its right and bottom edge the image's.
+static void border_offsets() {
+  char name[96];
+  Img<Npp8u> s(29, 17, 1);
+  const struct { NppiPoint off; NppiSize roi; } rois[] = {{{6, 4}, {23, 13}}, {{20, 9}, {9, 8}}};
+  for (const auto& r : rois) {
+    Img<Npp8u> d(r.roi.width, r.roi.height, 1, false);
+    std::snprintf(name, sizeof name, "FilterBoxBorder offset %d,%d", r.off.x, r.off.y);
+    report(name,
+           nppiFilterBoxBorder_8u_C1R_Ctx(s.at(r.off.x, r.off.y), s.step(), {29, 17}, r.off, d.dev, d.step(), r.roi,
+                                          {5, 3}, {2, 1}, NPP_BORDER_REPLICATE, ctx()),
+           d);
+    for (NppiNorm norm : {nppiNormL1, nppiNormL2}) {
+      Img<Npp16s> gx(r.roi.width, r.roi.height, 1, false), gy(r.roi.width, r.roi.height, 1, false),
+          gm(r.roi.width, r.roi.height, 1, false);
+      Img<Npp32f> ga(r.roi.width, r.roi.height, 1, false);
+      const int st = nppiGradientVectorPrewittBorder_8u16s_C1R_Ctx(
+          s.at(r.off.x, r.off.y), s.step(), {29, 17}, r.off, gx.dev, gx.step(), gy.dev, gy.step(), gm.dev, gm.step(),
+          ga.dev, ga.step(), r.roi, NPP_MASK_SIZE_3_X_3, norm, NPP_BORDER_REPLICATE, ctx());
+      const char* part[] = {"x", "y", "mag", "angle"};
+      for (int i = 0; i < 4; ++i) {
+        std::snprintf(name, sizeof name, "GradientVectorPrewitt offset %d,%d %s norm %d", r.off.x, r.off.y, part[i],
+                      int(norm));
+        if (i == 0) report(name, st, gx);
+        if (i == 1) report(name, st, gy);
+        if (i == 2) report(name, st, gm);
+        if (i == 3) report(name, st, ga);
+      }
+    }
+  }
+  // Not Canny: on an RTX 3060 (NPP 13.0) its result at a nonzero offset depends on what the scratch buffer held
+  // before the call (81, 80 or 17 pixels unlike the full image's, after a full-image call, an offset call or a
+  // zeroed buffer), so there is no one answer to pin.
+}
+
 int main() {
   if (cudaFree(0) != cudaSuccess) {
     std::printf("no CUDA device\n");
@@ -868,5 +907,6 @@ int main() {
   misc();
   resize_modes();
   gauss_border();
+  border_offsets();
   return g_lines > 0 ? 0 : 1;
 }

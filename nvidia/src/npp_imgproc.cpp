@@ -1729,8 +1729,10 @@ NppStatus bordered(const Npp8u* s, int ss, NppiSize ssz, NppiPoint off, NppiSize
   if (!s) return NPP_NULL_POINTER_ERROR;
   if (bad(ssz) || bad(roi)) return NPP_SIZE_ERROR;
   if (type != NPP_BORDER_REPLICATE) return NPP_NOT_SUPPORTED_MODE_ERROR;
-  auto img = fetch<Npp8u>(s, ss, ssz.width, ssz.height);
-  // Coordinates relative to the ROI's first pixel, which sits at `off` in the image.
+  // pSrc is the ROI's first pixel, which sits at `off` in the image (measured on an RTX 3060 for the box filter, the
+  // Prewitt gradients and Canny): the image starts `off` before it.
+  auto img = fetch<Npp8u>(offset(s, ss, -off.x, -off.y, 1), ss, ssz.width, ssz.height);
+  // Coordinates relative to the ROI's first pixel.
   out->b = border;
   out->w = roi.width + 2 * border;
   out->h = roi.height + 2 * border;

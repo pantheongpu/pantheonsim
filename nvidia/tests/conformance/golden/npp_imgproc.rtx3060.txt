@@ -409,3 +409,21 @@ FilterGaussBorder zero step, bad border      st=-9999
 FilterGaussBorder step below roi width       st=-14
 FilterGaussBorder roi past the source        st=0
 FilterGaussBorder roi past the source        st=0 n=304 sum=21569 wsum=1032356
+FilterBoxBorder offset 6,4                   st=0 n=338 sum=38141 wsum=1711025
+GradientVectorPrewitt offset 6,4 x norm 1    st=0 n=338 sum=-1018 wsum=-38495
+GradientVectorPrewitt offset 6,4 y norm 1    st=0 n=338 sum=3188 wsum=232369
+GradientVectorPrewitt offset 6,4 mag norm 1  st=0 n=338 sum=85575 wsum=3845297
+GradientVectorPrewitt offset 6,4 angle norm 1 st=0 n=338 sum=3.339941e+02 wsum=1.557564e+04
+GradientVectorPrewitt offset 6,4 x norm 2    st=0 n=338 sum=-1018 wsum=-38495
+GradientVectorPrewitt offset 6,4 y norm 2    st=0 n=338 sum=3188 wsum=232369
+GradientVectorPrewitt offset 6,4 mag norm 2  st=0 n=338 sum=67432 wsum=3022147
+GradientVectorPrewitt offset 6,4 angle norm 2 st=0 n=338 sum=3.339941e+02 wsum=1.557564e+04
+FilterBoxBorder offset 20,9                  st=0 n=96 sum=9477 wsum=444861
+GradientVectorPrewitt offset 20,9 x norm 1   st=0 n=96 sum=-286 wsum=9623
+GradientVectorPrewitt offset 20,9 y norm 1   st=0 n=96 sum=1503 wsum=5377
+GradientVectorPrewitt offset 20,9 mag norm 1 st=0 n=96 sum=22775 wsum=1068930
+GradientVectorPrewitt offset 20,9 angle norm 1 st=0 n=96 sum=1.774082e+02 wsum=8.921941e+03
+GradientVectorPrewitt offset 20,9 x norm 2   st=0 n=96 sum=-286 wsum=9623
+GradientVectorPrewitt offset 20,9 y norm 2   st=0 n=96 sum=1503 wsum=5377
+GradientVectorPrewitt offset 20,9 mag norm 2 st=0 n=96 sum=18155 wsum=865169
+GradientVectorPrewitt offset 20,9 angle norm 2 st=0 n=96 sum=1.774082e+02 wsum=8.921941e+03
