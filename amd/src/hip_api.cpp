@@ -980,11 +980,16 @@ hipError_t prepare_launch(State& s, int ordinal, const Module& module, const Ker
 // counted (vgpu::amd::DispatchStats: the numbers the profiler's SQ_* counters are made of, and the interpreter's own
 // instruction total). "1" writes the lines to stderr. It needs no profiler, so tools/bench-amd can count instructions
 // where rocprofv3 does not run. One line, one write, so launches on different streams do not interleave.
-void note_dispatch_stats(const Kernel& kernel, int ordinal, const vgpu::amd::DispatchStats& st) {
+const char* dispatch_stats_target() {
   static const char* const target = [] {
     const char* t = std::getenv("VGPU_DISPATCH_STATS");
     return t && *t && std::strcmp(t, "0") != 0 ? t : nullptr;
   }();
+  return target;
+}
+
+void note_dispatch_stats(const Kernel& kernel, int ordinal, const vgpu::amd::DispatchStats& st) {
+  const char* const target = dispatch_stats_target();
   if (!target) return;
   const vgpu::amd::InstructionCounts& c = st.counts;
   char line[2048];
@@ -1005,8 +1010,8 @@ void note_dispatch_stats(const Kernel& kernel, int ordinal, const vgpu::amd::Dis
     const int m = std::snprintf(line + n, sizeof line - static_cast<size_t>(n), fmt, args...);
     n = m < 0 ? m : n + m;
   };
-  append(" vmem_bytes_rd=%llu vmem_bytes_wr=%llu lds_bytes_rd=%llu lds_bytes_wr=%llu", u(c.vmem_bytes_rd), u(c.vmem_bytes_wr),
-         u(c.lds_bytes_rd), u(c.lds_bytes_wr));
+  append(" vmem_bytes_rd=%llu vmem_bytes_wr=%llu lds_bytes_rd=%llu lds_bytes_wr=%llu lds_bank_conflicts=%llu", u(c.vmem_bytes_rd),
+         u(c.vmem_bytes_wr), u(c.lds_bytes_rd), u(c.lds_bytes_wr), u(c.lds_bank_conflicts));
   append("%s", " mix=");
   bool any = false;
   for (int i = 1; i < static_cast<int>(vgpu::amd::gcn::Mix::Count); ++i)
@@ -1127,6 +1132,7 @@ hipError_t run_launch(const LaunchJob& job) {
       dispatch.layout = {dies, std::max(c.engines / dies, 1u), std::max(c.arrays, 1u),
                          std::max(static_cast<uint32_t>(d.profile().limits.multiprocessors) / dies, 1u)};
     }
+    dispatch.count_lds_banks = dispatch_stats_target() != nullptr;   // (a profiler's counters do not offer it yet)
     if (prof) {
       launch.device = ordinal;
       launch.kernel_id = kernel_id(module, kernel);

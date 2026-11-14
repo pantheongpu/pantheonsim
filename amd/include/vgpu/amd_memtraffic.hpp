@@ -72,4 +72,105 @@ inline LaneTraffic ds_lane_traffic(std::string_view name) {
   return {0, bytes};                                              // an atomic: counted as written, whether or not it returns
 }
 
+// ---- LDS bank conflicts ----------------------------------------------------------------------------------------------
+//
+// LDS has 32 banks of 4 bytes (bank = dword address mod 32). A wave's access takes one pass through the banks when its lanes
+// land on different banks, or on the same dword (a read is served to every lane that asks for it); lanes on one bank with
+// different dwords take a pass each. SQC_LDS_BANK_CONFLICT counts the passes beyond the first.
+//
+// This is MEASURED, not read from a document: a wave of one to 64 lanes issuing one LDS instruction 1000 times at strides from
+// 0 to 4096 bytes, read on an RX 6800 and an RX 6700 XT (gfx1030, gfx1031; rocprofv2, SQC_LDS_BANK_CONFLICT), 906 combinations of
+// instruction, stride and lanes, all of which this reproduces. What the measurements show:
+//  * A wave64 is two wave32 halves, counted one after the other.
+//  * A lane that moves more than one dword is served in groups of lanes, 32 banks at a time: 16 lanes for a 64-bit access,
+//    8 for 96 and 128 bits. Conflicts are counted per group, and groups do not share a pass (so two lanes on one dword
+//    conflict if they are in different groups).
+//  * 8-bit and 16-bit accesses are dword accesses (the dword they touch).
+//  * An atomic is not served from one fetch: lanes on the same dword take a pass each.
+//  * ds_read2 / ds_write2 (and the st64 forms) are two accesses, one per offset, counted separately.
+//  * An access whose address is not a multiple of its width (64 bits and wider) is served one lane at a time and counts no
+//    conflicts. (96 bits is taken to need 16: the card showed 8-aligned 96-bit accesses behave so; 12 was not measured.)
+//  * A partly filled wave of 96- or 128-bit READS pays at least min(4, ceil(lanes/4)) passes, so a few lanes at one dword
+//    count fewer conflicts than the same writes do (the writes count the groups' own excess).
+// Verified on RDNA2 only. The same rule is applied to the other targets (CDNA's LDS also has 32 banks); there it is modelled,
+// not checked against a card.
+struct LdsBankAccess {
+  bool counted = false;   // false: no model for this instruction (it counts no conflicts)
+  uint32_t words = 1;     // dwords a lane moves in one access
+  bool atomic = false;
+  bool write = false;     // a store, or an atomic
+  bool pair = false;      // two accesses, at offset0 and offset1 (in units of `unit` bytes)
+  uint32_t unit = 4;      // bytes in one unit of those offsets
+};
+
+inline LdsBankAccess ds_bank_access(std::string_view name) {
+  using detail::begins;
+  using detail::has;
+  LdsBankAccess a;
+  if (detail::begins(name, "ds_")) name.remove_prefix(3);
+  const LaneTraffic t = ds_lane_traffic(name);
+  if (!t.read && !t.written) return a;                    // moves nothing through the banks
+  if (has(name, "addtid") || has(name, "_tr") || has(name, "tr4") || has(name, "tr6") || has(name, "tr8")) return a;   // not measured
+  const bool reads = begins(name, "read") || begins(name, "load");
+  const bool stores = (begins(name, "write") || begins(name, "store")) && !begins(name, "storexchg");
+  const bool pair = has(name, "2addr") || has(name, "read2") || has(name, "write2");
+  if (!reads && !stores && (has(name, "2addr") || has(name, "wrxchg2"))) return a;   // an atomic exchange of two addresses: not measured
+  const uint32_t bits = detail::widest_type_bits(name);
+  a.words = bits >= 128 ? 4 : bits >= 96 ? 3 : bits >= 64 ? 2 : 1;
+  a.atomic = !reads && !stores;
+  a.write = !reads;
+  a.pair = pair;
+  a.unit = a.words == 2 ? 8 : 4;
+  if (has(name, "st64") || has(name, "stride64")) a.unit *= 64;
+  a.counted = true;
+  return a;
+}
+
+// The conflicts of ONE access by a wave, from each lane's byte address (`addr[lane]`, 64 lanes) and the lanes that are active.
+inline uint32_t lds_bank_conflicts(const uint32_t* addr, uint64_t exec, const LdsBankAccess& a) {
+  if (!exec) return 0;
+  const uint32_t align = a.words == 2 ? 8 : a.words >= 3 ? 16 : 1;
+  for (uint64_t live = exec; live; live &= live - 1)
+    if (align > 1 && addr[__builtin_ctzll(live)] % align) return 0;   // served a lane at a time
+  const uint32_t group = a.words == 1 ? 32 : a.words == 2 ? 16 : 8;     // lanes served together
+  const bool wide_read = a.words >= 3 && !a.write;
+  uint32_t total = 0;
+  for (uint32_t half = 0; half < 64; half += 32) {
+    const uint32_t mask = static_cast<uint32_t>(exec >> half);
+    if (!mask) continue;
+    const uint32_t active = static_cast<uint32_t>(__builtin_popcount(mask));
+    uint32_t passes = 0, excess = 0;
+    for (uint32_t g = 0; g < 32; g += group) {
+      const uint32_t gm = group == 32 ? mask : (mask >> g) & ((1u << group) - 1);
+      if (!gm) continue;
+      uint32_t seen[32];                 // the dwords asked for in this group (at most 32)
+      uint8_t per_bank[32] = {};
+      uint32_t n = 0, worst = 0;
+      for (uint32_t m = gm; m; m &= m - 1) {
+        const uint32_t base = addr[half + g + static_cast<uint32_t>(__builtin_ctz(m))] / 4;
+        for (uint32_t k = 0; k < a.words; ++k) {
+          const uint32_t dword = base + k;
+          bool dup = false;
+          if (!a.atomic)
+            for (uint32_t i = 0; i < n; ++i)
+              if (seen[i] == dword) { dup = true; break; }
+          if (dup) continue;
+          seen[n++] = dword;
+          const uint32_t c = ++per_bank[dword % 32];
+          worst = c > worst ? c : worst;
+        }
+      }
+      passes += worst;
+      excess += worst - 1;
+    }
+    if (wide_read) {
+      const uint32_t least = active >= 16 ? 4 : (active + 3) / 4;   // min(4, ceil(active / 4))
+      total += passes > least ? passes - least : 0;
+    } else {
+      total += excess;
+    }
+  }
+  return total;
+}
+
 }  // namespace vgpu::amd::gcn

@@ -1,0 +1,913 @@
+# SQC_LDS_BANK_CONFLICT read from real cards: how many bank-conflict passes ONE LDS instruction took.
+# Cards: AMD Radeon RX 6800 (gfx1030) and RX 6700 XT (gfx1031), ROCm 7.2.0, rocprofv2 (rocprofv3 --pmc aborts on that machine, see
+# amd/docs/rocprofiler.md), one wave of `lanes` lanes alone on the GPU, the instruction issued 1000 times, counter / 1000.
+# Lane L addresses LDS byte (L * stride) % 65536 (plus the instruction's offsets, in the name: "ds_read2_b32 0 32" is offset0:0
+# offset1:32). `wave` is 32, or 64 for a program built with -mwavefrontsize64 (lanes 20, 32 and 64 were run).
+# Recorded 2026-11-14 with amd/tools/lds-bank-probe (probe.cpp, probe2.cpp, sweep.sh, sweep2.sh). Checked by test_amd_gcn_lds_banks.
+# Columns: card, wave, instruction, stride (bytes), lanes, conflicts
+rx6800	32	ds_read_b32	0	32	0
+rx6800	32	ds_read_b32	4	32	0
+rx6800	32	ds_read_b32	8	32	1
+rx6800	32	ds_read_b32	12	32	0
+rx6800	32	ds_read_b32	16	32	3
+rx6800	32	ds_read_b32	20	32	0
+rx6800	32	ds_read_b32	24	32	1
+rx6800	32	ds_read_b32	28	32	0
+rx6800	32	ds_read_b32	32	32	7
+rx6800	32	ds_read_b32	36	32	0
+rx6800	32	ds_read_b32	48	32	3
+rx6800	32	ds_read_b32	64	32	15
+rx6800	32	ds_read_b32	128	32	31
+rx6800	32	ds_read_b32	256	32	31
+rx6800	32	ds_read_b32	512	32	31
+rx6800	32	ds_read_b32	1024	32	31
+rx6800	32	ds_read_b32	2048	32	31
+rx6800	32	ds_read_b32	4096	32	15
+rx6800	32	ds_read_b64	0	32	0
+rx6800	32	ds_read_b64	4	32	0
+rx6800	32	ds_read_b64	8	32	0
+rx6800	32	ds_read_b64	12	32	0
+rx6800	32	ds_read_b64	16	32	2
+rx6800	32	ds_read_b64	20	32	0
+rx6800	32	ds_read_b64	24	32	0
+rx6800	32	ds_read_b64	28	32	0
+rx6800	32	ds_read_b64	32	32	6
+rx6800	32	ds_read_b64	36	32	0
+rx6800	32	ds_read_b64	48	32	2
+rx6800	32	ds_read_b64	64	32	14
+rx6800	32	ds_read_b64	128	32	30
+rx6800	32	ds_read_b64	256	32	30
+rx6800	32	ds_read_b64	512	32	30
+rx6800	32	ds_read_b64	1024	32	30
+rx6800	32	ds_read_b64	2048	32	30
+rx6800	32	ds_read_b64	4096	32	30
+rx6800	32	ds_read_b128	0	32	0
+rx6800	32	ds_read_b128	4	32	0
+rx6800	32	ds_read_b128	8	32	0
+rx6800	32	ds_read_b128	12	32	0
+rx6800	32	ds_read_b128	16	32	0
+rx6800	32	ds_read_b128	20	32	0
+rx6800	32	ds_read_b128	24	32	0
+rx6800	32	ds_read_b128	28	32	0
+rx6800	32	ds_read_b128	32	32	4
+rx6800	32	ds_read_b128	36	32	0
+rx6800	32	ds_read_b128	48	32	0
+rx6800	32	ds_read_b128	64	32	12
+rx6800	32	ds_read_b128	128	32	28
+rx6800	32	ds_read_b128	256	32	28
+rx6800	32	ds_read_b128	512	32	28
+rx6800	32	ds_read_b128	1024	32	28
+rx6800	32	ds_read_b128	2048	32	28
+rx6800	32	ds_read_b128	4096	32	28
+rx6800	32	ds_write_b32	0	32	0
+rx6800	32	ds_write_b32	4	32	0
+rx6800	32	ds_write_b32	8	32	1
+rx6800	32	ds_write_b32	12	32	0
+rx6800	32	ds_write_b32	16	32	3
+rx6800	32	ds_write_b32	20	32	0
+rx6800	32	ds_write_b32	24	32	1
+rx6800	32	ds_write_b32	28	32	0
+rx6800	32	ds_write_b32	32	32	7
+rx6800	32	ds_write_b32	36	32	0
+rx6800	32	ds_write_b32	48	32	3
+rx6800	32	ds_write_b32	64	32	15
+rx6800	32	ds_write_b32	128	32	31
+rx6800	32	ds_write_b32	256	32	31
+rx6800	32	ds_write_b32	512	32	31
+rx6800	32	ds_write_b32	1024	32	31
+rx6800	32	ds_write_b32	2048	32	31
+rx6800	32	ds_write_b32	4096	32	15
+rx6800	32	ds_write_b64	0	32	0
+rx6800	32	ds_write_b64	4	32	0
+rx6800	32	ds_write_b64	8	32	0
+rx6800	32	ds_write_b64	12	32	0
+rx6800	32	ds_write_b64	16	32	2
+rx6800	32	ds_write_b64	20	32	0
+rx6800	32	ds_write_b64	24	32	0
+rx6800	32	ds_write_b64	28	32	0
+rx6800	32	ds_write_b64	32	32	6
+rx6800	32	ds_write_b64	36	32	0
+rx6800	32	ds_write_b64	48	32	2
+rx6800	32	ds_write_b64	64	32	14
+rx6800	32	ds_write_b64	128	32	30
+rx6800	32	ds_write_b64	256	32	30
+rx6800	32	ds_write_b64	512	32	30
+rx6800	32	ds_write_b64	1024	32	30
+rx6800	32	ds_write_b64	2048	32	30
+rx6800	32	ds_write_b64	4096	32	30
+rx6800	32	ds_write_b128	0	32	0
+rx6800	32	ds_write_b128	4	32	0
+rx6800	32	ds_write_b128	8	32	0
+rx6800	32	ds_write_b128	12	32	0
+rx6800	32	ds_write_b128	16	32	0
+rx6800	32	ds_write_b128	20	32	0
+rx6800	32	ds_write_b128	24	32	0
+rx6800	32	ds_write_b128	28	32	0
+rx6800	32	ds_write_b128	32	32	4
+rx6800	32	ds_write_b128	36	32	0
+rx6800	32	ds_write_b128	48	32	0
+rx6800	32	ds_write_b128	64	32	12
+rx6800	32	ds_write_b128	128	32	28
+rx6800	32	ds_write_b128	256	32	28
+rx6800	32	ds_write_b128	512	32	28
+rx6800	32	ds_write_b128	1024	32	28
+rx6800	32	ds_write_b128	2048	32	28
+rx6800	32	ds_write_b128	4096	32	28
+rx6800	32	ds_read_b32	0	16	0
+rx6800	32	ds_read_b32	4	16	0
+rx6800	32	ds_read_b32	8	16	0
+rx6800	32	ds_read_b32	12	16	0
+rx6800	32	ds_read_b32	16	16	1
+rx6800	32	ds_read_b32	20	16	0
+rx6800	32	ds_read_b32	24	16	0
+rx6800	32	ds_read_b32	28	16	0
+rx6800	32	ds_read_b32	32	16	3
+rx6800	32	ds_read_b32	36	16	0
+rx6800	32	ds_read_b32	48	16	1
+rx6800	32	ds_read_b32	64	16	7
+rx6800	32	ds_read_b32	128	16	15
+rx6800	32	ds_read_b32	256	16	15
+rx6800	32	ds_read_b32	512	16	15
+rx6800	32	ds_read_b32	1024	16	15
+rx6800	32	ds_read_b32	2048	16	15
+rx6800	32	ds_read_b32	4096	16	15
+rx6800	32	ds_read_b64	0	16	0
+rx6800	32	ds_read_b64	4	16	0
+rx6800	32	ds_read_b64	8	16	0
+rx6800	32	ds_read_b64	12	16	0
+rx6800	32	ds_read_b64	16	16	1
+rx6800	32	ds_read_b64	20	16	0
+rx6800	32	ds_read_b64	24	16	0
+rx6800	32	ds_read_b64	28	16	0
+rx6800	32	ds_read_b64	32	16	3
+rx6800	32	ds_read_b64	36	16	0
+rx6800	32	ds_read_b64	48	16	1
+rx6800	32	ds_read_b64	64	16	7
+rx6800	32	ds_read_b64	128	16	15
+rx6800	32	ds_read_b64	256	16	15
+rx6800	32	ds_read_b64	512	16	15
+rx6800	32	ds_read_b64	1024	16	15
+rx6800	32	ds_read_b64	2048	16	15
+rx6800	32	ds_read_b64	4096	16	15
+rx6800	32	ds_read_b128	0	16	0
+rx6800	32	ds_read_b128	4	16	0
+rx6800	32	ds_read_b128	8	16	0
+rx6800	32	ds_read_b128	12	16	0
+rx6800	32	ds_read_b128	16	16	0
+rx6800	32	ds_read_b128	20	16	0
+rx6800	32	ds_read_b128	24	16	0
+rx6800	32	ds_read_b128	28	16	0
+rx6800	32	ds_read_b128	32	16	0
+rx6800	32	ds_read_b128	36	16	0
+rx6800	32	ds_read_b128	48	16	0
+rx6800	32	ds_read_b128	64	16	4
+rx6800	32	ds_read_b128	128	16	12
+rx6800	32	ds_read_b128	256	16	12
+rx6800	32	ds_read_b128	512	16	12
+rx6800	32	ds_read_b128	1024	16	12
+rx6800	32	ds_read_b128	2048	16	12
+rx6800	32	ds_read_b128	4096	16	12
+rx6800	32	ds_write_b32	0	16	0
+rx6800	32	ds_write_b32	4	16	0
+rx6800	32	ds_write_b32	8	16	0
+rx6800	32	ds_write_b32	12	16	0
+rx6800	32	ds_write_b32	16	16	1
+rx6800	32	ds_write_b32	20	16	0
+rx6800	32	ds_write_b32	24	16	0
+rx6800	32	ds_write_b32	28	16	0
+rx6800	32	ds_write_b32	32	16	3
+rx6800	32	ds_write_b32	36	16	0
+rx6800	32	ds_write_b32	48	16	1
+rx6800	32	ds_write_b32	64	16	7
+rx6800	32	ds_write_b32	128	16	15
+rx6800	32	ds_write_b32	256	16	15
+rx6800	32	ds_write_b32	512	16	15
+rx6800	32	ds_write_b32	1024	16	15
+rx6800	32	ds_write_b32	2048	16	15
+rx6800	32	ds_write_b32	4096	16	15
+rx6800	32	ds_write_b64	0	16	0
+rx6800	32	ds_write_b64	4	16	0
+rx6800	32	ds_write_b64	8	16	0
+rx6800	32	ds_write_b64	12	16	0
+rx6800	32	ds_write_b64	16	16	1
+rx6800	32	ds_write_b64	20	16	0
+rx6800	32	ds_write_b64	24	16	0
+rx6800	32	ds_write_b64	28	16	0
+rx6800	32	ds_write_b64	32	16	3
+rx6800	32	ds_write_b64	36	16	0
+rx6800	32	ds_write_b64	48	16	1
+rx6800	32	ds_write_b64	64	16	7
+rx6800	32	ds_write_b64	128	16	15
+rx6800	32	ds_write_b64	256	16	15
+rx6800	32	ds_write_b64	512	16	15
+rx6800	32	ds_write_b64	1024	16	15
+rx6800	32	ds_write_b64	2048	16	15
+rx6800	32	ds_write_b64	4096	16	15
+rx6800	32	ds_write_b128	0	16	0
+rx6800	32	ds_write_b128	4	16	0
+rx6800	32	ds_write_b128	8	16	0
+rx6800	32	ds_write_b128	12	16	0
+rx6800	32	ds_write_b128	16	16	0
+rx6800	32	ds_write_b128	20	16	0
+rx6800	32	ds_write_b128	24	16	0
+rx6800	32	ds_write_b128	28	16	0
+rx6800	32	ds_write_b128	32	16	2
+rx6800	32	ds_write_b128	36	16	0
+rx6800	32	ds_write_b128	48	16	0
+rx6800	32	ds_write_b128	64	16	6
+rx6800	32	ds_write_b128	128	16	14
+rx6800	32	ds_write_b128	256	16	14
+rx6800	32	ds_write_b128	512	16	14
+rx6800	32	ds_write_b128	1024	16	14
+rx6800	32	ds_write_b128	2048	16	14
+rx6800	32	ds_write_b128	4096	16	14
+rx6800	32	ds_read_b32	0	8	0
+rx6800	32	ds_read_b32	4	8	0
+rx6800	32	ds_read_b32	8	8	0
+rx6800	32	ds_read_b32	12	8	0
+rx6800	32	ds_read_b32	16	8	0
+rx6800	32	ds_read_b32	20	8	0
+rx6800	32	ds_read_b32	24	8	0
+rx6800	32	ds_read_b32	28	8	0
+rx6800	32	ds_read_b32	32	8	1
+rx6800	32	ds_read_b32	36	8	0
+rx6800	32	ds_read_b32	48	8	0
+rx6800	32	ds_read_b32	64	8	3
+rx6800	32	ds_read_b32	128	8	7
+rx6800	32	ds_read_b32	256	8	7
+rx6800	32	ds_read_b32	512	8	7
+rx6800	32	ds_read_b32	1024	8	7
+rx6800	32	ds_read_b32	2048	8	7
+rx6800	32	ds_read_b32	4096	8	7
+rx6800	32	ds_read_b64	0	8	0
+rx6800	32	ds_read_b64	4	8	0
+rx6800	32	ds_read_b64	8	8	0
+rx6800	32	ds_read_b64	12	8	0
+rx6800	32	ds_read_b64	16	8	0
+rx6800	32	ds_read_b64	20	8	0
+rx6800	32	ds_read_b64	24	8	0
+rx6800	32	ds_read_b64	28	8	0
+rx6800	32	ds_read_b64	32	8	1
+rx6800	32	ds_read_b64	36	8	0
+rx6800	32	ds_read_b64	48	8	0
+rx6800	32	ds_read_b64	64	8	3
+rx6800	32	ds_read_b64	128	8	7
+rx6800	32	ds_read_b64	256	8	7
+rx6800	32	ds_read_b64	512	8	7
+rx6800	32	ds_read_b64	1024	8	7
+rx6800	32	ds_read_b64	2048	8	7
+rx6800	32	ds_read_b64	4096	8	7
+rx6800	32	ds_read_b128	0	8	0
+rx6800	32	ds_read_b128	4	8	0
+rx6800	32	ds_read_b128	8	8	0
+rx6800	32	ds_read_b128	12	8	0
+rx6800	32	ds_read_b128	16	8	0
+rx6800	32	ds_read_b128	20	8	0
+rx6800	32	ds_read_b128	24	8	0
+rx6800	32	ds_read_b128	28	8	0
+rx6800	32	ds_read_b128	32	8	0
+rx6800	32	ds_read_b128	36	8	0
+rx6800	32	ds_read_b128	48	8	0
+rx6800	32	ds_read_b128	64	8	2
+rx6800	32	ds_read_b128	128	8	6
+rx6800	32	ds_read_b128	256	8	6
+rx6800	32	ds_read_b128	512	8	6
+rx6800	32	ds_read_b128	1024	8	6
+rx6800	32	ds_read_b128	2048	8	6
+rx6800	32	ds_read_b128	4096	8	6
+rx6800	32	ds_write_b32	0	8	0
+rx6800	32	ds_write_b32	4	8	0
+rx6800	32	ds_write_b32	8	8	0
+rx6800	32	ds_write_b32	12	8	0
+rx6800	32	ds_write_b32	16	8	0
+rx6800	32	ds_write_b32	20	8	0
+rx6800	32	ds_write_b32	24	8	0
+rx6800	32	ds_write_b32	28	8	0
+rx6800	32	ds_write_b32	32	8	1
+rx6800	32	ds_write_b32	36	8	0
+rx6800	32	ds_write_b32	48	8	0
+rx6800	32	ds_write_b32	64	8	3
+rx6800	32	ds_write_b32	128	8	7
+rx6800	32	ds_write_b32	256	8	7
+rx6800	32	ds_write_b32	512	8	7
+rx6800	32	ds_write_b32	1024	8	7
+rx6800	32	ds_write_b32	2048	8	7
+rx6800	32	ds_write_b32	4096	8	7
+rx6800	32	ds_write_b64	0	8	0
+rx6800	32	ds_write_b64	4	8	0
+rx6800	32	ds_write_b64	8	8	0
+rx6800	32	ds_write_b64	12	8	0
+rx6800	32	ds_write_b64	16	8	0
+rx6800	32	ds_write_b64	20	8	0
+rx6800	32	ds_write_b64	24	8	0
+rx6800	32	ds_write_b64	28	8	0
+rx6800	32	ds_write_b64	32	8	1
+rx6800	32	ds_write_b64	36	8	0
+rx6800	32	ds_write_b64	48	8	0
+rx6800	32	ds_write_b64	64	8	3
+rx6800	32	ds_write_b64	128	8	7
+rx6800	32	ds_write_b64	256	8	7
+rx6800	32	ds_write_b64	512	8	7
+rx6800	32	ds_write_b64	1024	8	7
+rx6800	32	ds_write_b64	2048	8	7
+rx6800	32	ds_write_b64	4096	8	7
+rx6800	32	ds_write_b128	0	8	0
+rx6800	32	ds_write_b128	4	8	0
+rx6800	32	ds_write_b128	8	8	0
+rx6800	32	ds_write_b128	12	8	0
+rx6800	32	ds_write_b128	16	8	0
+rx6800	32	ds_write_b128	20	8	0
+rx6800	32	ds_write_b128	24	8	0
+rx6800	32	ds_write_b128	28	8	0
+rx6800	32	ds_write_b128	32	8	1
+rx6800	32	ds_write_b128	36	8	0
+rx6800	32	ds_write_b128	48	8	0
+rx6800	32	ds_write_b128	64	8	3
+rx6800	32	ds_write_b128	128	8	7
+rx6800	32	ds_write_b128	256	8	7
+rx6800	32	ds_write_b128	512	8	7
+rx6800	32	ds_write_b128	1024	8	7
+rx6800	32	ds_write_b128	2048	8	7
+rx6800	32	ds_write_b128	4096	8	7
+rx6800	64	ds_read_b32	0	64	0
+rx6800	64	ds_read_b32	4	64	0
+rx6800	64	ds_read_b32	8	64	2
+rx6800	64	ds_read_b32	12	64	0
+rx6800	64	ds_read_b32	16	64	6
+rx6800	64	ds_read_b32	20	64	0
+rx6800	64	ds_read_b32	24	64	2
+rx6800	64	ds_read_b32	28	64	0
+rx6800	64	ds_read_b32	32	64	14
+rx6800	64	ds_read_b32	36	64	0
+rx6800	64	ds_read_b32	48	64	6
+rx6800	64	ds_read_b32	64	64	30
+rx6800	64	ds_read_b32	128	64	62
+rx6800	64	ds_read_b32	256	64	62
+rx6800	64	ds_read_b32	512	64	62
+rx6800	64	ds_read_b32	1024	64	62
+rx6800	64	ds_read_b32	2048	64	62
+rx6800	64	ds_read_b32	4096	64	30
+rx6800	64	ds_read_b64	0	64	0
+rx6800	64	ds_read_b64	4	64	0
+rx6800	64	ds_read_b64	8	64	0
+rx6800	64	ds_read_b64	12	64	0
+rx6800	64	ds_read_b64	16	64	4
+rx6800	64	ds_read_b64	20	64	0
+rx6800	64	ds_read_b64	24	64	0
+rx6800	64	ds_read_b64	28	64	0
+rx6800	64	ds_read_b64	32	64	12
+rx6800	64	ds_read_b64	36	64	0
+rx6800	64	ds_read_b64	48	64	4
+rx6800	64	ds_read_b64	64	64	28
+rx6800	64	ds_read_b64	128	64	60
+rx6800	64	ds_read_b64	256	64	60
+rx6800	64	ds_read_b64	512	64	60
+rx6800	64	ds_read_b64	1024	64	60
+rx6800	64	ds_read_b64	2048	64	60
+rx6800	64	ds_read_b64	4096	64	60
+rx6800	64	ds_read_b128	0	64	0
+rx6800	64	ds_read_b128	4	64	0
+rx6800	64	ds_read_b128	8	64	0
+rx6800	64	ds_read_b128	12	64	0
+rx6800	64	ds_read_b128	16	64	0
+rx6800	64	ds_read_b128	20	64	0
+rx6800	64	ds_read_b128	24	64	0
+rx6800	64	ds_read_b128	28	64	0
+rx6800	64	ds_read_b128	32	64	8
+rx6800	64	ds_read_b128	36	64	0
+rx6800	64	ds_read_b128	48	64	0
+rx6800	64	ds_read_b128	64	64	24
+rx6800	64	ds_read_b128	128	64	56
+rx6800	64	ds_read_b128	256	64	56
+rx6800	64	ds_read_b128	512	64	56
+rx6800	64	ds_read_b128	1024	64	56
+rx6800	64	ds_read_b128	2048	64	56
+rx6800	64	ds_read_b128	4096	64	56
+rx6800	64	ds_write_b32	0	64	0
+rx6800	64	ds_write_b32	4	64	0
+rx6800	64	ds_write_b32	8	64	2
+rx6800	64	ds_write_b32	12	64	0
+rx6800	64	ds_write_b32	16	64	6
+rx6800	64	ds_write_b32	20	64	0
+rx6800	64	ds_write_b32	24	64	2
+rx6800	64	ds_write_b32	28	64	0
+rx6800	64	ds_write_b32	32	64	14
+rx6800	64	ds_write_b32	36	64	0
+rx6800	64	ds_write_b32	48	64	6
+rx6800	64	ds_write_b32	64	64	30
+rx6800	64	ds_write_b32	128	64	62
+rx6800	64	ds_write_b32	256	64	62
+rx6800	64	ds_write_b32	512	64	62
+rx6800	64	ds_write_b32	1024	64	62
+rx6800	64	ds_write_b32	2048	64	62
+rx6800	64	ds_write_b32	4096	64	30
+rx6800	64	ds_write_b64	0	64	0
+rx6800	64	ds_write_b64	4	64	0
+rx6800	64	ds_write_b64	8	64	0
+rx6800	64	ds_write_b64	12	64	0
+rx6800	64	ds_write_b64	16	64	4
+rx6800	64	ds_write_b64	20	64	0
+rx6800	64	ds_write_b64	24	64	0
+rx6800	64	ds_write_b64	28	64	0
+rx6800	64	ds_write_b64	32	64	12
+rx6800	64	ds_write_b64	36	64	0
+rx6800	64	ds_write_b64	48	64	4
+rx6800	64	ds_write_b64	64	64	28
+rx6800	64	ds_write_b64	128	64	60
+rx6800	64	ds_write_b64	256	64	60
+rx6800	64	ds_write_b64	512	64	60
+rx6800	64	ds_write_b64	1024	64	60
+rx6800	64	ds_write_b64	2048	64	60
+rx6800	64	ds_write_b64	4096	64	60
+rx6800	64	ds_write_b128	0	64	0
+rx6800	64	ds_write_b128	4	64	0
+rx6800	64	ds_write_b128	8	64	0
+rx6800	64	ds_write_b128	12	64	0
+rx6800	64	ds_write_b128	16	64	0
+rx6800	64	ds_write_b128	20	64	0
+rx6800	64	ds_write_b128	24	64	0
+rx6800	64	ds_write_b128	28	64	0
+rx6800	64	ds_write_b128	32	64	8
+rx6800	64	ds_write_b128	36	64	0
+rx6800	64	ds_write_b128	48	64	0
+rx6800	64	ds_write_b128	64	64	24
+rx6800	64	ds_write_b128	128	64	56
+rx6800	64	ds_write_b128	256	64	56
+rx6800	64	ds_write_b128	512	64	56
+rx6800	64	ds_write_b128	1024	64	56
+rx6800	64	ds_write_b128	2048	64	56
+rx6800	64	ds_write_b128	4096	64	56
+rx6800	64	ds_read_b32	0	32	0
+rx6800	64	ds_read_b32	4	32	0
+rx6800	64	ds_read_b32	8	32	1
+rx6800	64	ds_read_b32	12	32	0
+rx6800	64	ds_read_b32	16	32	3
+rx6800	64	ds_read_b32	20	32	0
+rx6800	64	ds_read_b32	24	32	1
+rx6800	64	ds_read_b32	28	32	0
+rx6800	64	ds_read_b32	32	32	7
+rx6800	64	ds_read_b32	36	32	0
+rx6800	64	ds_read_b32	48	32	3
+rx6800	64	ds_read_b32	64	32	15
+rx6800	64	ds_read_b32	128	32	31
+rx6800	64	ds_read_b32	256	32	31
+rx6800	64	ds_read_b32	512	32	31
+rx6800	64	ds_read_b32	1024	32	31
+rx6800	64	ds_read_b32	2048	32	31
+rx6800	64	ds_read_b32	4096	32	15
+rx6800	64	ds_read_b64	0	32	0
+rx6800	64	ds_read_b64	4	32	0
+rx6800	64	ds_read_b64	8	32	0
+rx6800	64	ds_read_b64	12	32	0
+rx6800	64	ds_read_b64	16	32	2
+rx6800	64	ds_read_b64	20	32	0
+rx6800	64	ds_read_b64	24	32	0
+rx6800	64	ds_read_b64	28	32	0
+rx6800	64	ds_read_b64	32	32	6
+rx6800	64	ds_read_b64	36	32	0
+rx6800	64	ds_read_b64	48	32	2
+rx6800	64	ds_read_b64	64	32	14
+rx6800	64	ds_read_b64	128	32	30
+rx6800	64	ds_read_b64	256	32	30
+rx6800	64	ds_read_b64	512	32	30
+rx6800	64	ds_read_b64	1024	32	30
+rx6800	64	ds_read_b64	2048	32	30
+rx6800	64	ds_read_b64	4096	32	30
+rx6800	64	ds_read_b128	0	32	0
+rx6800	64	ds_read_b128	4	32	0
+rx6800	64	ds_read_b128	8	32	0
+rx6800	64	ds_read_b128	12	32	0
+rx6800	64	ds_read_b128	16	32	0
+rx6800	64	ds_read_b128	20	32	0
+rx6800	64	ds_read_b128	24	32	0
+rx6800	64	ds_read_b128	28	32	0
+rx6800	64	ds_read_b128	32	32	4
+rx6800	64	ds_read_b128	36	32	0
+rx6800	64	ds_read_b128	48	32	0
+rx6800	64	ds_read_b128	64	32	12
+rx6800	64	ds_read_b128	128	32	28
+rx6800	64	ds_read_b128	256	32	28
+rx6800	64	ds_read_b128	512	32	28
+rx6800	64	ds_read_b128	1024	32	28
+rx6800	64	ds_read_b128	2048	32	28
+rx6800	64	ds_read_b128	4096	32	28
+rx6800	64	ds_write_b32	0	32	0
+rx6800	64	ds_write_b32	4	32	0
+rx6800	64	ds_write_b32	8	32	1
+rx6800	64	ds_write_b32	12	32	0
+rx6800	64	ds_write_b32	16	32	3
+rx6800	64	ds_write_b32	20	32	0
+rx6800	64	ds_write_b32	24	32	1
+rx6800	64	ds_write_b32	28	32	0
+rx6800	64	ds_write_b32	32	32	7
+rx6800	64	ds_write_b32	36	32	0
+rx6800	64	ds_write_b32	48	32	3
+rx6800	64	ds_write_b32	64	32	15
+rx6800	64	ds_write_b32	128	32	31
+rx6800	64	ds_write_b32	256	32	31
+rx6800	64	ds_write_b32	512	32	31
+rx6800	64	ds_write_b32	1024	32	31
+rx6800	64	ds_write_b32	2048	32	31
+rx6800	64	ds_write_b32	4096	32	15
+rx6800	64	ds_write_b64	0	32	0
+rx6800	64	ds_write_b64	4	32	0
+rx6800	64	ds_write_b64	8	32	0
+rx6800	64	ds_write_b64	12	32	0
+rx6800	64	ds_write_b64	16	32	2
+rx6800	64	ds_write_b64	20	32	0
+rx6800	64	ds_write_b64	24	32	0
+rx6800	64	ds_write_b64	28	32	0
+rx6800	64	ds_write_b64	32	32	6
+rx6800	64	ds_write_b64	36	32	0
+rx6800	64	ds_write_b64	48	32	2
+rx6800	64	ds_write_b64	64	32	14
+rx6800	64	ds_write_b64	128	32	30
+rx6800	64	ds_write_b64	256	32	30
+rx6800	64	ds_write_b64	512	32	30
+rx6800	64	ds_write_b64	1024	32	30
+rx6800	64	ds_write_b64	2048	32	30
+rx6800	64	ds_write_b64	4096	32	30
+rx6800	64	ds_write_b128	0	32	0
+rx6800	64	ds_write_b128	4	32	0
+rx6800	64	ds_write_b128	8	32	0
+rx6800	64	ds_write_b128	12	32	0
+rx6800	64	ds_write_b128	16	32	0
+rx6800	64	ds_write_b128	20	32	0
+rx6800	64	ds_write_b128	24	32	0
+rx6800	64	ds_write_b128	28	32	0
+rx6800	64	ds_write_b128	32	32	4
+rx6800	64	ds_write_b128	36	32	0
+rx6800	64	ds_write_b128	48	32	0
+rx6800	64	ds_write_b128	64	32	12
+rx6800	64	ds_write_b128	128	32	28
+rx6800	64	ds_write_b128	256	32	28
+rx6800	64	ds_write_b128	512	32	28
+rx6800	64	ds_write_b128	1024	32	28
+rx6800	64	ds_write_b128	2048	32	28
+rx6800	64	ds_write_b128	4096	32	28
+rx6800	64	ds_read_b32	0	20	0
+rx6800	64	ds_read_b32	4	20	0
+rx6800	64	ds_read_b32	8	20	1
+rx6800	64	ds_read_b32	12	20	0
+rx6800	64	ds_read_b32	16	20	2
+rx6800	64	ds_read_b32	20	20	0
+rx6800	64	ds_read_b32	24	20	1
+rx6800	64	ds_read_b32	28	20	0
+rx6800	64	ds_read_b32	32	20	4
+rx6800	64	ds_read_b32	36	20	0
+rx6800	64	ds_read_b32	48	20	2
+rx6800	64	ds_read_b32	64	20	9
+rx6800	64	ds_read_b32	128	20	19
+rx6800	64	ds_read_b32	256	20	19
+rx6800	64	ds_read_b32	512	20	19
+rx6800	64	ds_read_b32	1024	20	19
+rx6800	64	ds_read_b32	2048	20	19
+rx6800	64	ds_read_b32	4096	20	15
+rx6800	64	ds_read_b64	0	20	0
+rx6800	64	ds_read_b64	4	20	0
+rx6800	64	ds_read_b64	8	20	0
+rx6800	64	ds_read_b64	12	20	0
+rx6800	64	ds_read_b64	16	20	1
+rx6800	64	ds_read_b64	20	20	0
+rx6800	64	ds_read_b64	24	20	0
+rx6800	64	ds_read_b64	28	20	0
+rx6800	64	ds_read_b64	32	20	3
+rx6800	64	ds_read_b64	36	20	0
+rx6800	64	ds_read_b64	48	20	1
+rx6800	64	ds_read_b64	64	20	8
+rx6800	64	ds_read_b64	128	20	18
+rx6800	64	ds_read_b64	256	20	18
+rx6800	64	ds_read_b64	512	20	18
+rx6800	64	ds_read_b64	1024	20	18
+rx6800	64	ds_read_b64	2048	20	18
+rx6800	64	ds_read_b64	4096	20	18
+rx6800	64	ds_read_b128	0	20	0
+rx6800	64	ds_read_b128	4	20	0
+rx6800	64	ds_read_b128	8	20	0
+rx6800	64	ds_read_b128	12	20	0
+rx6800	64	ds_read_b128	16	20	0
+rx6800	64	ds_read_b128	20	20	0
+rx6800	64	ds_read_b128	24	20	0
+rx6800	64	ds_read_b128	28	20	0
+rx6800	64	ds_read_b128	32	20	1
+rx6800	64	ds_read_b128	36	20	0
+rx6800	64	ds_read_b128	48	20	0
+rx6800	64	ds_read_b128	64	20	6
+rx6800	64	ds_read_b128	128	20	16
+rx6800	64	ds_read_b128	256	20	16
+rx6800	64	ds_read_b128	512	20	16
+rx6800	64	ds_read_b128	1024	20	16
+rx6800	64	ds_read_b128	2048	20	16
+rx6800	64	ds_read_b128	4096	20	16
+rx6800	64	ds_write_b32	0	20	0
+rx6800	64	ds_write_b32	4	20	0
+rx6800	64	ds_write_b32	8	20	1
+rx6800	64	ds_write_b32	12	20	0
+rx6800	64	ds_write_b32	16	20	2
+rx6800	64	ds_write_b32	20	20	0
+rx6800	64	ds_write_b32	24	20	1
+rx6800	64	ds_write_b32	28	20	0
+rx6800	64	ds_write_b32	32	20	4
+rx6800	64	ds_write_b32	36	20	0
+rx6800	64	ds_write_b32	48	20	2
+rx6800	64	ds_write_b32	64	20	9
+rx6800	64	ds_write_b32	128	20	19
+rx6800	64	ds_write_b32	256	20	19
+rx6800	64	ds_write_b32	512	20	19
+rx6800	64	ds_write_b32	1024	20	19
+rx6800	64	ds_write_b32	2048	20	19
+rx6800	64	ds_write_b32	4096	20	15
+rx6800	64	ds_write_b64	0	20	0
+rx6800	64	ds_write_b64	4	20	0
+rx6800	64	ds_write_b64	8	20	0
+rx6800	64	ds_write_b64	12	20	0
+rx6800	64	ds_write_b64	16	20	1
+rx6800	64	ds_write_b64	20	20	0
+rx6800	64	ds_write_b64	24	20	0
+rx6800	64	ds_write_b64	28	20	0
+rx6800	64	ds_write_b64	32	20	3
+rx6800	64	ds_write_b64	36	20	0
+rx6800	64	ds_write_b64	48	20	1
+rx6800	64	ds_write_b64	64	20	8
+rx6800	64	ds_write_b64	128	20	18
+rx6800	64	ds_write_b64	256	20	18
+rx6800	64	ds_write_b64	512	20	18
+rx6800	64	ds_write_b64	1024	20	18
+rx6800	64	ds_write_b64	2048	20	18
+rx6800	64	ds_write_b64	4096	20	18
+rx6800	64	ds_write_b128	0	20	0
+rx6800	64	ds_write_b128	4	20	0
+rx6800	64	ds_write_b128	8	20	0
+rx6800	64	ds_write_b128	12	20	0
+rx6800	64	ds_write_b128	16	20	0
+rx6800	64	ds_write_b128	20	20	0
+rx6800	64	ds_write_b128	24	20	0
+rx6800	64	ds_write_b128	28	20	0
+rx6800	64	ds_write_b128	32	20	2
+rx6800	64	ds_write_b128	36	20	0
+rx6800	64	ds_write_b128	48	20	0
+rx6800	64	ds_write_b128	64	20	7
+rx6800	64	ds_write_b128	128	20	17
+rx6800	64	ds_write_b128	256	20	17
+rx6800	64	ds_write_b128	512	20	17
+rx6800	64	ds_write_b128	1024	20	17
+rx6800	64	ds_write_b128	2048	20	17
+rx6800	64	ds_write_b128	4096	20	17
+rx6800	32	ds_read_u8	0	32	0
+rx6800	32	ds_read_u8	4	32	0
+rx6800	32	ds_read_u8	8	32	1
+rx6800	32	ds_read_u8	16	32	3
+rx6800	32	ds_read_u8	24	32	1
+rx6800	32	ds_read_u8	32	32	7
+rx6800	32	ds_read_u8	48	32	3
+rx6800	32	ds_read_u8	64	32	15
+rx6800	32	ds_read_u8	128	32	31
+rx6800	32	ds_read_u8	4096	32	15
+rx6800	32	ds_read_u16	0	32	0
+rx6800	32	ds_read_u16	4	32	0
+rx6800	32	ds_read_u16	8	32	1
+rx6800	32	ds_read_u16	16	32	3
+rx6800	32	ds_read_u16	24	32	1
+rx6800	32	ds_read_u16	32	32	7
+rx6800	32	ds_read_u16	48	32	3
+rx6800	32	ds_read_u16	64	32	15
+rx6800	32	ds_read_u16	128	32	31
+rx6800	32	ds_read_u16	4096	32	15
+rx6800	32	ds_write_b8	0	32	0
+rx6800	32	ds_write_b8	4	32	0
+rx6800	32	ds_write_b8	8	32	1
+rx6800	32	ds_write_b8	16	32	3
+rx6800	32	ds_write_b8	24	32	1
+rx6800	32	ds_write_b8	32	32	7
+rx6800	32	ds_write_b8	48	32	3
+rx6800	32	ds_write_b8	64	32	15
+rx6800	32	ds_write_b8	128	32	31
+rx6800	32	ds_write_b8	4096	32	15
+rx6800	32	ds_read_b96	0	32	0
+rx6800	32	ds_read_b96	4	32	0
+rx6800	32	ds_read_b96	8	32	0
+rx6800	32	ds_read_b96	16	32	0
+rx6800	32	ds_read_b96	24	32	0
+rx6800	32	ds_read_b96	32	32	4
+rx6800	32	ds_read_b96	48	32	0
+rx6800	32	ds_read_b96	64	32	12
+rx6800	32	ds_read_b96	128	32	28
+rx6800	32	ds_read_b96	4096	32	28
+rx6800	32	ds_write_b96	0	32	0
+rx6800	32	ds_write_b96	4	32	0
+rx6800	32	ds_write_b96	8	32	0
+rx6800	32	ds_write_b96	16	32	0
+rx6800	32	ds_write_b96	24	32	0
+rx6800	32	ds_write_b96	32	32	4
+rx6800	32	ds_write_b96	48	32	0
+rx6800	32	ds_write_b96	64	32	12
+rx6800	32	ds_write_b96	128	32	28
+rx6800	32	ds_write_b96	4096	32	28
+rx6800	32	ds_add_u32	0	32	31
+rx6800	32	ds_add_u32	4	32	0
+rx6800	32	ds_add_u32	8	32	1
+rx6800	32	ds_add_u32	16	32	3
+rx6800	32	ds_add_u32	24	32	1
+rx6800	32	ds_add_u32	32	32	7
+rx6800	32	ds_add_u32	48	32	3
+rx6800	32	ds_add_u32	64	32	15
+rx6800	32	ds_add_u32	128	32	31
+rx6800	32	ds_add_u32	4096	32	31
+rx6800	32	ds_add_rtn_u32	0	32	31
+rx6800	32	ds_add_rtn_u32	4	32	0
+rx6800	32	ds_add_rtn_u32	8	32	1
+rx6800	32	ds_add_rtn_u32	16	32	3
+rx6800	32	ds_add_rtn_u32	24	32	1
+rx6800	32	ds_add_rtn_u32	32	32	7
+rx6800	32	ds_add_rtn_u32	48	32	3
+rx6800	32	ds_add_rtn_u32	64	32	15
+rx6800	32	ds_add_rtn_u32	128	32	31
+rx6800	32	ds_add_rtn_u32	4096	32	31
+rx6800	32	ds_add_u64	0	32	30
+rx6800	32	ds_add_u64	8	32	0
+rx6800	32	ds_add_u64	16	32	2
+rx6800	32	ds_add_u64	24	32	0
+rx6800	32	ds_add_u64	32	32	6
+rx6800	32	ds_add_u64	48	32	2
+rx6800	32	ds_add_u64	64	32	14
+rx6800	32	ds_add_u64	128	32	30
+rx6800	32	ds_add_u64	4096	32	30
+rx6800	32	ds_read2_b32 0 1	0	32	0
+rx6800	32	ds_read2_b32 0 1	4	32	0
+rx6800	32	ds_read2_b32 0 1	8	32	2
+rx6800	32	ds_read2_b32 0 1	16	32	6
+rx6800	32	ds_read2_b32 0 1	24	32	2
+rx6800	32	ds_read2_b32 0 1	32	32	14
+rx6800	32	ds_read2_b32 0 1	48	32	6
+rx6800	32	ds_read2_b32 0 1	64	32	30
+rx6800	32	ds_read2_b32 0 1	128	32	62
+rx6800	32	ds_read2_b32 0 1	4096	32	30
+rx6800	32	ds_read2_b32 0 32	0	32	0
+rx6800	32	ds_read2_b32 0 32	4	32	0
+rx6800	32	ds_read2_b32 0 32	8	32	2
+rx6800	32	ds_read2_b32 0 32	16	32	6
+rx6800	32	ds_read2_b32 0 32	24	32	2
+rx6800	32	ds_read2_b32 0 32	32	32	14
+rx6800	32	ds_read2_b32 0 32	48	32	6
+rx6800	32	ds_read2_b32 0 32	64	32	30
+rx6800	32	ds_read2_b32 0 32	128	32	62
+rx6800	32	ds_read2_b32 0 32	4096	32	30
+rx6800	32	ds_read2_b64 0 1	0	32	0
+rx6800	32	ds_read2_b64 0 1	4	32	0
+rx6800	32	ds_read2_b64 0 1	8	32	0
+rx6800	32	ds_read2_b64 0 1	16	32	4
+rx6800	32	ds_read2_b64 0 1	24	32	0
+rx6800	32	ds_read2_b64 0 1	32	32	12
+rx6800	32	ds_read2_b64 0 1	48	32	4
+rx6800	32	ds_read2_b64 0 1	64	32	28
+rx6800	32	ds_read2_b64 0 1	128	32	60
+rx6800	32	ds_read2_b64 0 1	4096	32	60
+rx6800	32	ds_read2st64_b32 0 1	0	32	0
+rx6800	32	ds_read2st64_b32 0 1	4	32	0
+rx6800	32	ds_read2st64_b32 0 1	8	32	2
+rx6800	32	ds_read2st64_b32 0 1	16	32	6
+rx6800	32	ds_read2st64_b32 0 1	24	32	2
+rx6800	32	ds_read2st64_b32 0 1	32	32	14
+rx6800	32	ds_read2st64_b32 0 1	48	32	6
+rx6800	32	ds_read2st64_b32 0 1	64	32	30
+rx6800	32	ds_read2st64_b32 0 1	128	32	62
+rx6800	32	ds_read2st64_b32 0 1	4096	32	30
+rx6800	32	ds_write2_b32 0 1	0	32	0
+rx6800	32	ds_write2_b32 0 1	4	32	0
+rx6800	32	ds_write2_b32 0 1	8	32	2
+rx6800	32	ds_write2_b32 0 1	16	32	6
+rx6800	32	ds_write2_b32 0 1	24	32	2
+rx6800	32	ds_write2_b32 0 1	32	32	14
+rx6800	32	ds_write2_b32 0 1	48	32	6
+rx6800	32	ds_write2_b32 0 1	64	32	30
+rx6800	32	ds_write2_b32 0 1	128	32	62
+rx6800	32	ds_write2_b32 0 1	4096	32	30
+rx6800	32	ds_read_u8	0	16	0
+rx6800	32	ds_read_u8	4	16	0
+rx6800	32	ds_read_u8	8	16	0
+rx6800	32	ds_read_u8	16	16	1
+rx6800	32	ds_read_u8	24	16	0
+rx6800	32	ds_read_u8	32	16	3
+rx6800	32	ds_read_u8	48	16	1
+rx6800	32	ds_read_u8	64	16	7
+rx6800	32	ds_read_u8	128	16	15
+rx6800	32	ds_read_u8	4096	16	15
+rx6800	32	ds_read_u16	0	16	0
+rx6800	32	ds_read_u16	4	16	0
+rx6800	32	ds_read_u16	8	16	0
+rx6800	32	ds_read_u16	16	16	1
+rx6800	32	ds_read_u16	24	16	0
+rx6800	32	ds_read_u16	32	16	3
+rx6800	32	ds_read_u16	48	16	1
+rx6800	32	ds_read_u16	64	16	7
+rx6800	32	ds_read_u16	128	16	15
+rx6800	32	ds_read_u16	4096	16	15
+rx6800	32	ds_write_b8	0	16	0
+rx6800	32	ds_write_b8	4	16	0
+rx6800	32	ds_write_b8	8	16	0
+rx6800	32	ds_write_b8	16	16	1
+rx6800	32	ds_write_b8	24	16	0
+rx6800	32	ds_write_b8	32	16	3
+rx6800	32	ds_write_b8	48	16	1
+rx6800	32	ds_write_b8	64	16	7
+rx6800	32	ds_write_b8	128	16	15
+rx6800	32	ds_write_b8	4096	16	15
+rx6800	32	ds_read_b96	0	16	0
+rx6800	32	ds_read_b96	4	16	0
+rx6800	32	ds_read_b96	8	16	0
+rx6800	32	ds_read_b96	16	16	0
+rx6800	32	ds_read_b96	24	16	0
+rx6800	32	ds_read_b96	32	16	0
+rx6800	32	ds_read_b96	48	16	0
+rx6800	32	ds_read_b96	64	16	4
+rx6800	32	ds_read_b96	128	16	12
+rx6800	32	ds_read_b96	4096	16	12
+rx6800	32	ds_write_b96	0	16	0
+rx6800	32	ds_write_b96	4	16	0
+rx6800	32	ds_write_b96	8	16	0
+rx6800	32	ds_write_b96	16	16	0
+rx6800	32	ds_write_b96	24	16	0
+rx6800	32	ds_write_b96	32	16	2
+rx6800	32	ds_write_b96	48	16	0
+rx6800	32	ds_write_b96	64	16	6
+rx6800	32	ds_write_b96	128	16	14
+rx6800	32	ds_write_b96	4096	16	14
+rx6800	32	ds_add_u32	0	16	15
+rx6800	32	ds_add_u32	4	16	0
+rx6800	32	ds_add_u32	8	16	0
+rx6800	32	ds_add_u32	16	16	1
+rx6800	32	ds_add_u32	24	16	0
+rx6800	32	ds_add_u32	32	16	3
+rx6800	32	ds_add_u32	48	16	1
+rx6800	32	ds_add_u32	64	16	7
+rx6800	32	ds_add_u32	128	16	15
+rx6800	32	ds_add_u32	4096	16	15
+rx6800	32	ds_add_rtn_u32	0	16	15
+rx6800	32	ds_add_rtn_u32	4	16	0
+rx6800	32	ds_add_rtn_u32	8	16	0
+rx6800	32	ds_add_rtn_u32	16	16	1
+rx6800	32	ds_add_rtn_u32	24	16	0
+rx6800	32	ds_add_rtn_u32	32	16	3
+rx6800	32	ds_add_rtn_u32	48	16	1
+rx6800	32	ds_add_rtn_u32	64	16	7
+rx6800	32	ds_add_rtn_u32	128	16	15
+rx6800	32	ds_add_rtn_u32	4096	16	15
+rx6800	32	ds_add_u64	0	16	15
+rx6800	32	ds_add_u64	8	16	0
+rx6800	32	ds_add_u64	16	16	1
+rx6800	32	ds_add_u64	24	16	0
+rx6800	32	ds_add_u64	32	16	3
+rx6800	32	ds_add_u64	48	16	1
+rx6800	32	ds_add_u64	64	16	7
+rx6800	32	ds_add_u64	128	16	15
+rx6800	32	ds_add_u64	4096	16	15
+rx6800	32	ds_read2_b32 0 1	0	16	0
+rx6800	32	ds_read2_b32 0 1	4	16	0
+rx6800	32	ds_read2_b32 0 1	8	16	0
+rx6800	32	ds_read2_b32 0 1	16	16	2
+rx6800	32	ds_read2_b32 0 1	24	16	0
+rx6800	32	ds_read2_b32 0 1	32	16	6
+rx6800	32	ds_read2_b32 0 1	48	16	2
+rx6800	32	ds_read2_b32 0 1	64	16	14
+rx6800	32	ds_read2_b32 0 1	128	16	30
+rx6800	32	ds_read2_b32 0 1	4096	16	30
+rx6800	32	ds_read2_b32 0 32	0	16	0
+rx6800	32	ds_read2_b32 0 32	4	16	0
+rx6800	32	ds_read2_b32 0 32	8	16	0
+rx6800	32	ds_read2_b32 0 32	16	16	2
+rx6800	32	ds_read2_b32 0 32	24	16	0
+rx6800	32	ds_read2_b32 0 32	32	16	6
+rx6800	32	ds_read2_b32 0 32	48	16	2
+rx6800	32	ds_read2_b32 0 32	64	16	14
+rx6800	32	ds_read2_b32 0 32	128	16	30
+rx6800	32	ds_read2_b32 0 32	4096	16	30
+rx6800	32	ds_read2_b64 0 1	0	16	0
+rx6800	32	ds_read2_b64 0 1	4	16	0
+rx6800	32	ds_read2_b64 0 1	8	16	0
+rx6800	32	ds_read2_b64 0 1	16	16	2
+rx6800	32	ds_read2_b64 0 1	24	16	0
+rx6800	32	ds_read2_b64 0 1	32	16	6
+rx6800	32	ds_read2_b64 0 1	48	16	2
+rx6800	32	ds_read2_b64 0 1	64	16	14
+rx6800	32	ds_read2_b64 0 1	128	16	30
+rx6800	32	ds_read2_b64 0 1	4096	16	30
+rx6800	32	ds_read2st64_b32 0 1	0	16	0
+rx6800	32	ds_read2st64_b32 0 1	4	16	0
+rx6800	32	ds_read2st64_b32 0 1	8	16	0
+rx6800	32	ds_read2st64_b32 0 1	16	16	2
+rx6800	32	ds_read2st64_b32 0 1	24	16	0
+rx6800	32	ds_read2st64_b32 0 1	32	16	6
+rx6800	32	ds_read2st64_b32 0 1	48	16	2
+rx6800	32	ds_read2st64_b32 0 1	64	16	14
+rx6800	32	ds_read2st64_b32 0 1	128	16	30
+rx6800	32	ds_read2st64_b32 0 1	4096	16	30
+rx6800	32	ds_write2_b32 0 1	0	16	0
+rx6800	32	ds_write2_b32 0 1	4	16	0
+rx6800	32	ds_write2_b32 0 1	8	16	0
+rx6800	32	ds_write2_b32 0 1	16	16	2
+rx6800	32	ds_write2_b32 0 1	24	16	0
+rx6800	32	ds_write2_b32 0 1	32	16	6
+rx6800	32	ds_write2_b32 0 1	48	16	2
+rx6800	32	ds_write2_b32 0 1	64	16	14
+rx6800	32	ds_write2_b32 0 1	128	16	30
+rx6800	32	ds_write2_b32 0 1	4096	16	30

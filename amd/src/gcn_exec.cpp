@@ -8023,6 +8023,22 @@ struct Machine {
     const Operand& data = in.dst.empty() ? (in.src.empty() ? in.dst.front() : in.src[0]) : in.dst[0];
     return 4 * data.width;
   }
+  // The bank conflicts of one LDS instruction (vgpu/amd_memtraffic.hpp), from each active lane's address.
+  void count_lds_banks(const Wave& w, const Inst& in, InstructionCounts& n) const {
+    if (!w.exec || in.src.empty() || in.gds) return;
+    const gcn::LdsBankAccess a = gcn::ds_bank_access(in.name);
+    if (!a.counted) return;
+    uint32_t addr[64] = {};
+    const uint32_t subs = a.pair ? 2 : 1;
+    for (uint32_t s = 0; s < subs; ++s) {
+      const uint32_t off = a.pair ? static_cast<uint32_t>(s == 0 ? in.offset : in.offset1) * a.unit : static_cast<uint32_t>(in.offset);
+      for (uint64_t live = w.exec; live; live &= live - 1) {
+        const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(live));
+        addr[lane] = static_cast<uint32_t>(lane_src(w, in.src[0], lane)) + off;
+      }
+      n.lds_bank_conflicts += gcn::lds_bank_conflicts(addr, w.exec, a);
+    }
+  }
   static void count_bytes(InstructionCounts& n, uint64_t exec, uint32_t lane_bytes, bool writes, bool lds) {
     const uint64_t b = uint64_t{static_cast<uint32_t>(__builtin_popcountll(exec))} * lane_bytes;
     (lds ? (writes ? n.lds_bytes_wr : n.lds_bytes_rd) : (writes ? n.vmem_bytes_wr : n.vmem_bytes_rd)) += b;
@@ -12867,6 +12883,7 @@ struct Machine {
           const gcn::LaneTraffic t = gcn::ds_lane_traffic(in.name);
           if (t.read) count_bytes(n, w.exec, t.read, false, true);
           if (t.written) count_bytes(n, w.exec, t.written, true, true);
+          if (d.count_lds_banks) count_lds_banks(w, in, n);
         }
         lds_access(w, in, g);
         return true;
