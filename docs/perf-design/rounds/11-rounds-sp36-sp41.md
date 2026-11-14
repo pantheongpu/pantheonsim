@@ -4304,3 +4304,265 @@ killed):
 * The eight-test table is one run a cell.
 * The user's CI runs 6 to 11 times slower than server3 on the same tests, and why was not found.
 * Real hardware: nothing here was compared with a card (the outputs are compared between builds of the simulator).
+
+## Round sp72 (a compiled tier for AMD kernels, phase 1: the ceiling measured, the design, and blocks: `VGPU_AMD_BLOCKS`)
+
+Branch `sp72-amd-tier`, base `origin/sp69-hotspot-start` 77a8b8c8 (rounds sp69 and sp70). Design: [study 13](../13-amd-compiled-tier.md). Data,
+scripts and commands: [`data/sp72/`](../data/sp72/README.md). server3 (Ryzen 7 PRO 8840U, 8 cores and 16 hardware threads, GCC 13.3, `Release`,
+the default link-time optimization) for every build, test and measurement; no card; no `perf` (`perf_event_paranoid` 4). The host was shared
+with other sessions for the whole round (1-minute load 4 to 16), which decides how the timings below were taken and how far they can be read.
+
+Question: round sp69's profile of inq put 51 to 88 % of the process's CPU in the AMD engine executing waves, 14 to 28 % of that in the
+dispatch loop. The engine has a pre-decoded tier but no compiled one (`VGPU_JIT` is the NVIDIA engines'). What would a compiled tier be worth,
+which kind, and what is the first piece that pays? Three stages, as round sp48 did for the NVIDIA side: (1) measure the share of dispatch,
+operand decode, register traffic and counting against the arithmetic; (2) design; (3) build the smallest slice with a real number, behind a
+knob, and keep it only at 5 % or more on three compute-bound rows with no row more than 3 % slower with the knob off.
+
+### Stage 1: where the executed work goes
+
+Method (no hardware counters): the nanoseconds a wave-instruction takes, from the bench's device CPU time and its exact instruction counts;
+the share of each kind of host work, from samples of the instruction pointer (`tools/bench-amd/profile/sigprof.c` at 10 kHz over 30 runs of a
+bench row; round sp69's sampler at 1 kHz for inq, because inq's process starts helpers that overwrite the first one's output file),
+classified by function and, inside the tier's handlers and lane kernels, by the host instruction at the address
+(`scripts/classify.py`: *loop*, *decode*, *rows*, *lanes*, *mem*, *interp*, *other*; the classes are defined in study 13, section 1); and the
+three ALU kernels of the bench written as host loops over a wave's 64 lanes (`scripts/native_ceiling.cpp`, `g++ -O3 -mavx2 -mfma
+-ffp-contract=off`, the integer one with the compiler's vector type because g++ leaves the scalar form unvectorized).
+
+Bench rows on the simulated MI300X, base build, one host thread (percent of the samples inside the simulator's library; 2,500 to 7,500 samples
+a row):
+
+| row | ns per wave-instruction | loop | decode | rows | lanes | mem | other |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| valu_int | 14.3 | 32.7 | 18.7 | 14.3 | 34.2 | 0.1 | 0.2 |
+| valu_f32 | 15.8 | 18.0 | 29.3 | 14.7 | 37.6 | 0.1 | 0.3 |
+| valu_f64 | 16.7 | 19.6 | 23.1 | 10.1 | 47.1 | 0.0 | 0.1 |
+| p_i64 | 18.8 | 22.7 | 16.6 | 18.8 | 41.7 | 0.0 | 0.1 |
+| divergent | 11.7 | 29.9 | 29.6 | 15.0 | 25.1 | 0.1 | 0.2 |
+| lds | 31.9 | 34.9 | 31.9 | 1.9 | 6.9 | 18.2 | 6.2 |
+
+inq (f939e63, the build of round sp70), one host thread, base build (18,000 to 95,000 samples in the library a test):
+
+| test | loop | decode | rows | lanes | mem | interp | other | samples outside the library |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| eigensolvers::steepest_descent | 25.4 | 29.1 | 8.9 | 21.2 | 6.2 | 3.8 | 5.2 | 8 % |
+| ground_state::initial_guess | 23.6 | 27.8 | 9.1 | 20.5 | 10.4 | 6.5 | 2.3 | 34 % |
+| solvers::poisson | 22.8 | 22.8 | 5.6 | 17.3 | 16.4 | 6.0 | 9.2 | 42 % |
+| hamiltonian::ks_hamiltonian | 16.1 | 18.1 | 6.0 | 17.3 | 26.2 | 7.0 | 9.3 | 59 % |
+
+The same kernels as host code, lanes outermost (best of 9, three passes agree within 12 %):
+
+| kernel | wave-instructions a loop iteration | simulator today, ns an iteration | native, ns an iteration | native ns per wave-instruction | today / native |
+|---|---:|---:|---:|---:|---:|
+| valu_int | 16 | 229 | 17.2 | 1.08 | 13x |
+| valu_f32 | 11 | 174 | 7.9 | 0.72 | 22x |
+| valu_f64 | 8 | 134 | 7.6 | 0.95 | 18x |
+
+What it says:
+
+* **The dispatch loop is 18 to 35 % of an ALU-bound bench row and 16 to 25 % of inq's time in the library; operand decode is as much again**
+  (17 to 32 %). Those two are what a tier that still calls one handler per instruction can remove: at most 1.8x to 2.5x on an ALU-bound loop.
+* **The arithmetic (*lanes*) is 25 to 47 % of an ALU row**, against 3 to 13 % on the NVIDIA engine (round sp48): a wave is 64 lanes, eight
+  vector operations an instruction.
+* **Written as one loop with the lanes outermost the same arithmetic costs 0.7 to 1.1 ns per wave-instruction: 13 to 22 times less than
+  today and 4 to 7 times less than the *lanes* share alone.** What the lane kernels cost is a call, a loop, three row loads and a row store per
+  guest instruction, not the arithmetic. Only code made for the run removes that; it is a ceiling (no EXEC test, no NaN staging, no scalar
+  instructions), not a forecast.
+* On inq *mem* (6 to 26 %) and what is outside the library (8 to 59 %: the host program, the run-time compile of VkFFT's kernels) bound
+  everything said here.
+
+### Stage 2: the design
+
+[Study 13](../13-amd-compiled-tier.md). In short: two routes were compared, a closure tier (pre-decoded straight-line runs, handlers called
+back to back, operands bound when the run is built, counters once; nothing but the simulator's own code) and generated host code (the NVIDIA
+JIT's way: a compiler in a forked process, a cache on disk). They are layers, not alternatives. The closure tier comes first: it needs nothing,
+it helps a suite of many short processes from the first block (inq's CI job is 244 processes of 3 to 60 s, with kernels VkFFT makes at run
+time), it can become the default, and its blocks are the unit and the entry conditions generated code needs. Generated code comes after it,
+opt-in, for the fusable runs inside a block (lane-local, register-only instructions between two writes of EXEC), lanes outermost with compares,
+selects and masks covered from the start, which is the lesson of rounds sp48 and sp52. The study has the unit, the wave's layout, how EXEC, NaN
+hand-back, barriers, LDS, atomics, faults, counters, traces, turns, lockstep and `run_groups` stay what they are, the fallbacks, the cache key
+of the generated layer, the test plan and five milestones with an expected gain each.
+
+### Stage 3: the slice that was built: blocks (`VGPU_AMD_BLOCKS=1`, off by default)
+
+A *block* is a run of consecutive instructions the tier has handlers for and that are not the Machine's (memory instructions, barriers,
+`s_endpgm`), ending with the first branch or before the first instruction that is not the tier's; found the first time a wave is at its first
+instruction, at least 3 and at most 256 instructions, never starting with a wait for loads or a plain store (which can end the wave's turn
+before the block has run anything). `Machine::run_block` asks the wave's state once, then for each instruction does what `tier_step` does
+around the handler call (the branch target, the program counter) and nothing else; the block's counters are added once at the end, or for the
+instructions that ran when it stops early. It stops early where a handler hands the instruction back (the plain step then runs it and notes
+it once, as before), where an instruction gives up the wave's turn (a gated store before it runs, a wait after), or where the turn has no
+room left (the instruction that completes a turn is always a plain step, so turns end where they did). No instruction of a block throws: the
+tier's handlers hand an instruction back instead, and the instructions that reach device memory are not in blocks. The code: `amd/src/gcn_exec.cpp` (`run_block`, `make_block`, `block_at`,
+`step_at`, `run_wave_blocks`), `gcn::TierBlock` and `Inst::block` in `amd/include/vgpu/amd_gcn.hpp`, the switch and the statistics table in
+`amd/src/gcn_blocks.cpp` (a unit of its own: the tier's unit is built outside link-time optimization so that its layout depends on its source
+only, and gains one function at its end). With the knob off, `run_round` tests one flag a wave's turn and runs the loop it had.
+
+`VGPU_AMD_BLOCKS_STATS=1` prints, at exit, how many instructions ran in blocks, the mean run and the blocks that ran most with their listings.
+
+### Tests and mutants
+
+* **`test_amd_gcn_blocks_same_bits`** (new, CI-wired, framework-free, about 15 s): programs of 6 to 40 instructions made of the ISA corpora's
+  shapes for four targets (gfx942, gfx1030, gfx1100, gfx1200), with the seven branches encoded by the test and aimed at the program's own
+  instructions (one in six backward), one instruction in sixteen any shape at all (memory, no handler, a mode change), and matrix-operation
+  counts planted on one instruction in thirty. Each program runs through `run_round` (`digest_program`, new in `amd_exec.hpp`) with blocks
+  off and on, on nine kinds of state and one of eight turn lengths, one or two waves. The digest holds every wave's registers, masks, flags
+  and program counter, LDS, scratch, a memory region, every counter, the number of rounds, the error's text, and after each round where every
+  wave was and how many steps its turn had counted. 14,400 runs each way by default (10.2 M instructions, 6.9 M of them in blocks, 710
+  runs that throw, 11,831 that end); `VGPU_BLOCKS_PROGRAMS=3000` (108,000 runs each way, 80.6 M instructions): no run differs. Four more
+  cases: a handed-back instruction is noted once either way; a wait inside a block ends the turn there (two waves with loads in flight); a
+  wave in a state the tier leaves to the interpreter (VSKIP, VGPR indexing, a round mode) runs no block; a barrier ends a block and the waves
+  meet at it.
+  * The first form of the test compared the digest only at the end. Two mutants of the turn's count survived it, because a round that
+    finishes a program starts the count again; the digest now takes the count after every round.
+  * It found nothing wrong in the block runner. Its first failure was the test's own: `s_memrealtime` reads the host's clock, which two runs
+    do not share (clock-reading shapes are left out).
+* **`bench_amd_counters_blocks`** (new, CI-wired): `tools/bench-amd/run_bench_check.sh` with `VGPU_BENCH_AMD_ENV=VGPU_AMD_BLOCKS=1`: every
+  workload's own check of its results and the expected instruction counts, with blocks on. It skips on server3 (the expected file is hipcc
+  7.2's, the host has 6.4.4); here the A/B's counting runs stand in for it: all 62 counted rows have the same counters off and on, in every pass.
+* **Mutants** (`data/sp72/scripts/mutants.py`, `mutants.txt`; a tree without LTO): 21 edits of the block runner, one at a time: counters
+  left out or doubled, a block run past the turn's room or one instruction into it, a handed-back instruction counted or left with the
+  program counter past it, a wait or a gated store that does not end the turn, a block that goes on past a branch, the wave's state not
+  asked, the turn's count not advanced, the branch target not set. **20 of 21 are killed.** The one that survives (the Machine's
+  instructions let into a block) changes no result: their tier handler hands the instruction back and the plain step sends it to the
+  Machine, as before. Four mutants survived earlier forms of the test and changed it (the digest after every round, the waits, the
+  wave states, planted matrix-operation counts); two survived because the code they broke could not be reached, and that code (a `catch`
+  around the handlers) was removed.
+* **The AMD ctest set** (`data/sp72/ctest.txt`; a build without LTO of the AMD targets): 324 tests, 236 pass, 87 skip, 1 fails for a tool
+  the partial build left out and passes once it is built; the same with `VGPU_AMD_BLOCKS=1` in every test's environment.
+* **inq**: the eight tests' outputs have the same checksum with the knob off and on, at one host thread and at the default.
+
+### Results
+
+Protocol. The knob's A/B is two copies of one library: `on/` is `work/` with the name `VGPU_AMD_BLOCKS` replaced, in the binary, by a
+variable the bench always sets (`VGPU_QUIET`), so the two sides are the same machine code and placement cannot enter. `tools/bench-amd/bench.py`,
+all 82 workload/target pairs, one host thread, 9 runs a side alternating, pinned to one physical core. The host ran other sessions' builds
+and tests and this round's own (1-minute load 6 to 14), and the median of a row moved by 10 to 20 % between passes of the same sides; so a
+table gives the **best** run of each side (interference makes a run slower, never faster), every A/B was taken twice, and a claim is made
+only where both passes agree. The rows that run no kernel at all (`api`, `stream`, `memcpy`, the launch rows) are the same code path on both
+sides and came out between 0.89 and 1.07: that is one row's noise here.
+
+**The knob, off against on** (on / off of wave-instructions per CPU second; pass A is the library before a change to a test-only function,
+pass F the final one; full tables in `data/sp72/knob.md`):
+
+| row | MI300X off, on (M/s, pass F) | on / off pass A | pass F | RX 6800 off, on (M/s, pass F) | on / off pass A | pass F |
+|---|---:|---:|---:|---:|---:|---:|
+| valu_int | 68.5, 72.6 | 1.26 | 1.06 | 64.7, 76.7 | 1.20 | 1.19 |
+| valu_f32 | 45.0, 51.9 | 1.13 | 1.15 | 58.5, 73.1 | 1.20 | 1.25 |
+| valu_f64 | 53.4, 70.3 | 1.10 | 1.32 | 76.0, 90.3 | 1.12 | 1.19 |
+| p_i64 | 43.1, 51.5 | 1.19 | 1.20 | 63.0, 81.8 | 1.25 | 1.30 |
+| p_cmp | 48.1, 57.8 | 1.15 | 1.20 | 76.3, 113.5 | 1.32 | 1.49 |
+| p_f64x | 13.1, 13.7 | 1.02 | 1.04 | 25.6, 23.7 | 1.11 | 0.92 |
+| divergent | 59.7, 71.3 | 1.20 | 1.19 | 78.4, 98.8 | 1.28 | 1.26 |
+| wave | 59.4, 78.2 | 1.30 | 1.32 | 81.3, 116.2 | 1.41 | 1.43 |
+| smem | 90.8, 120.3 | 1.34 | 1.33 | 126.7, 201.2 | 1.37 | 1.59 |
+| p_smem_wide | 81.7, 99.3 | 1.19 | 1.22 | 87.0, 113.4 | 1.30 | 1.30 |
+| mem | 26.8, 23.3 | 0.95 | 0.87 | 53.7, 56.2 | 0.96 | 1.05 |
+| narrow | 20.2, 19.8 | 0.99 | 0.98 | 26.8, 26.2 | 0.96 | 0.98 |
+| buf | 15.6, 15.2 | 0.98 | 0.98 | 26.7, 27.8 | 1.00 | 1.04 |
+| flat | 19.6, 19.1 | 0.94 | 0.98 | 33.8, 32.7 | 1.01 | 0.97 |
+| lds | 24.1, 22.5 | 0.96 | 0.94 | 51.0, 48.3 | 0.94 | 0.95 |
+| ldsx | 19.8, 25.4 | 1.05 | 1.28 | 41.3, 43.4 | 1.03 | 1.05 |
+| atomics | 22.3, 23.9 | 1.05 | 1.07 | 36.9, 39.0 | 1.14 | 1.06 |
+| mfma | 7.3, 7.1 | 1.01 | 0.97 | | | |
+| api (no kernel) | 7.7, 8.2 | 1.04 | 1.07 | 7.2, 7.4 | 0.94 | 1.02 |
+| stream (no kernel) | 0.2, 0.2 | 0.98 | 0.99 | 0.2, 0.2 | 0.91 | 0.89 |
+
+* Geometric mean of the 82 rows: 1.072 (pass A) and 1.077 (pass F). 35 rows are at 1.05 or more in both passes. Counters the same on both
+  sides in all 62 counted rows of both passes.
+* **The bar (5 % or more on three compute-bound rows) is met on every arithmetic row in both passes**: valu_int, valu_f32, valu_f64, p_i64,
+  p_cmp, divergent, wave on both targets, between 1.06 and 1.49. The spread between the passes of one row (valu_int on the MI300X 1.26 and
+  1.06, valu_f64 1.10 and 1.32) is the host.
+* **Memory rows: no gain; `lds` 4 to 6 % slower with the knob on, in both passes on both targets; `mem` on the MI300X 5 and 13 % slower.**
+  `VGPU_AMD_BLOCKS_STATS` says why (`data/sp72/blocks-stats.txt`): in `mem` and `narrow` 43 to 44 % of the instructions are in blocks, of
+  5 instructions; in `lds` 26 %, and a run there is 2.6 instructions of blocks that are 6.7 long. A wave's first store of a round and its
+  waits end its turn in the middle of a block, and a block left early costs its entry, a walk over what ran to count it, and a second block
+  for the rest. The arithmetic rows are 91 to 100 % in blocks of 8 to 53 instructions, all run to the end.
+
+**inq, the knob off against on** (`data/sp72/inq.md`; CPU seconds of the whole process, the best run of each side):
+
+| test | one host thread, off | on | on / off | instructions in blocks | a block run | default threads (8), off: wall s / CPU s | on | CPU on / off |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| eigensolvers::steepest_descent | 39.3 | 33.1 | 0.84 | 92 % | 8.5 | 16.9 / 46.3 | 16.0 / 43.2 | 0.93 |
+| hamiltonian::ks_hamiltonian | 33.1 | 29.7 | 0.90 | 86 % | 15.0 | 24.0 / 46.4 | 23.6 / 46.2 | 1.00 |
+| ground_state::initial_guess | 92.2 | 88.5 | 0.96 | 91 % | 8.2 | 40.7 / 137.6 | 39.6 / 131.0 | 0.95 |
+| solvers::poisson | 156.8 | 157.0 | 1.00 | 82 % | 14.7 | 81.1 / 189.3 | 106.0 / 198.9 | 1.05 |
+| operations::laplacian | | | | | | 6.8 / 6.3 | 6.5 / 6.2 | 0.99 |
+| operations::gradient | | | | | | 11.5 / 10.1 | 10.9 / 10.1 | 1.00 |
+| operations::transform | | | | | | 47.9 / 64.1 | 50.3 / 67.3 | 1.05 |
+| systems::electrons | | | | | | 71.6 / 104.5 | 74.9 / 97.5 | 0.93 |
+
+* One host thread, two passes a side: 16 % less CPU for steepest_descent, 10 % for ks_hamiltonian, 4 % for initial_guess, nothing for
+  poisson. Single runs of one side differ by 10 to 20 % between passes (steepest_descent off: 44.1 and 39.3 s; on: 39.1 and 33.1 s), so the
+  two smaller numbers are inside the noise and the first is not far outside it. (On a quieter stretch three runs of steepest_descent with
+  the knob on took 24.6 to 26.1 CPU-s, sampler attached; round sp69 measured 29.6 for its base on an idle host. Not a pair, but the same
+  ratio.)
+* The default threads are one pass (two for poisson) and say only that nothing is lost: 0.93 to 1.05, the three tests that are mostly
+  run-time compile (laplacian, gradient, transform) unchanged as expected.
+* Every run passes and every test's output has the same checksum off and on.
+* Less than the bench's arithmetic rows for the reason stage 1 gives: a third to a half of inq's time is memory instructions, the host
+  program and the run-time compile, and its blocks are 8 to 15 instructions between memory instructions and branches.
+
+**The knob off, against the base** (`data/sp72/knob-off.md`; `base` 77a8b8c8, `work` this branch with the variable unset, and the control
+`noop`: the base plus one function nothing calls in `gcn_exec.cpp`, the two A/Bs of a pass side by side on two cores):
+
+| | pass 1 | pass F |
+|---|---|---|
+| base against work (knob off): geometric mean of 82 rows | 0.996 | 0.993 |
+| ... rows below 0.97; lowest and highest row | 19; 0.77, 1.16 | 26; 0.79, 1.31 |
+| base against noop: geometric mean | 0.993 | 1.003 |
+| ... rows below 0.97; lowest and highest row | 22; 0.81, 1.20 | 17; 0.86, 1.28 |
+
+* This branch with the knob off cannot be told from the control: the same geometric means, the same number of rows below 0.97, the same
+  scatter of single rows (a fifth of the rows more than 3 % down in either, the lowest near 0.8). The control is the base's own code, so
+  that scatter is the host's and the unit's placement, not a change. **The round's condition "no row more than 3 % slower with the knob
+  off" could not be verified row by row on this host under this load**; what can be said is that the knob-off path differs from the base's
+  by one test of a flag a wave's turn, that the tier's own unit differs by one function at its end, and that the means agree with a no-op.
+* A third measurement of the rows that were low for this branch in both passes (25 runs a side, branch and control side by side again):
+  none is low a third time but valu_f32 on the MI300X (0.81, 0.96, 0.96 for the branch; 0.89, 0.88, 1.00 for the control). The control
+  moved atomics on the RX 6800 to 0.91 and smem on the MI300X to 1.10, and **valu_f64 on the RX 6800 came out at 1.22 for the branch and
+  1.23 for the control**: the base's own placement of that loop is a fifth slower than either build, with nothing changed that the loop
+  runs. Round sp70 found 3.5 % from placement on quiet runs; under this load it is the larger part of any single row.
+
+### What phase 2 should be
+
+Study 13's milestones 2 and 3, in that order of evidence:
+
+* **Longer blocks first for inq (milestone 3).** inq's block runs are 8 to 15 instructions and 82 to 92 % of its instructions are in blocks
+  already; what ends a block is a memory instruction or a branch. Global loads and stores, scalar loads and waits as members (called
+  through `tier_mach`, with the `catch` and its test), a taken branch going on into the block at its target, and a block that ends before
+  a store whose gate is armed instead of inside it: expected 1.05x to 1.15x on inq and on the memory rows, and it removes the loss on `lds`
+  and `mem`.
+* **Bound operations (milestone 2).** Operand decode is 17 to 32 % of an arithmetic row and 18 to 29 % of inq's time in the library; a block
+  that holds `{kernel, row offsets, constant rows}` and looks at EXEC once per stretch removes most of it for the integer, float, double,
+  compare and select families: expected 1.15x to 1.35x on arithmetic rows, 1.05x to 1.10x on inq.
+* **Generated fused runs (milestone 4)** only after those: the ceiling is 13x to 22x on the bench's arithmetic loops, and nothing else gets
+  near it, but it needs a compiler at run time, pays on the first run, and on inq it is bounded by the arithmetic share (17 to 21 % of the
+  library's time is *lanes*, 6 to 9 % *rows*).
+
+### Caveats and what is not solid
+
+* **The host.** One machine, shared for the whole round; no hardware counters. Timings are the best of 9 (or 15) alternating runs, every
+  A/B twice; a single row is good to about 10 %, a geometric mean to about 1 %. The stage 1 shares are of instruction-pointer samples, and
+  the split inside handlers (decode, rows, lanes) is approximate.
+* **The knob-off condition** is not verified per row (above).
+* **Which library was timed.** Pass F of the bench and the inq runs used the library built one step before the last: `digest_program`, a
+  function only the test calls, gained a parameter afterwards and two test cases were added. The block runner and everything a launch
+  runs were the committed text; the last library was built with LTO and ran the test (5 cases pass), and was not timed again. Pass 1 of
+  the knob-off A/B and pass A of the knob's were on earlier libraries, as the tables say.
+* **The stack-walking sampler crashes in about one run in four of `steepest_descent` with blocks on** (round sp69's `sprof.c`, which calls
+  `backtrace()` in its signal handler; the bench's `sigprof.c` records only the instruction pointer unless `SIGPROF_STACK=1` and is not
+  affected). It is the unwinder, not the simulator: the sample lands on the one instruction between `pop %rbp` and `lea -8(%r10),%rsp` in
+  the epilogue of `Machine::matrix_multiply_fast`, a function with a realigned stack, where GCC's unwind rules still find the saved
+  registers through `%rbp`, which is the caller's again. With blocks on the caller (`run_wave_blocks`) keeps the wave's address in `%rbp`,
+  so the unwinder reads the wave's first scalar registers as a frame and faults; with blocks off the caller's `%rbp` points at something
+  readable and the same wrong unwind goes unnoticed. Found with a `SIGSEGV` tracer (`libgcc_s.so.1`, fault address `0x100000000` and
+  `0x200000000`, the interrupted instruction and its unwind rules read back). No run without that sampler failed (inq: 28 runs with the
+  knob on; the bench: more than 3,000 processes with it on, none failed). A profiler that unwinds in a signal handler should not be used with
+  the knob on until that function's caller is given a frame pointer or the sampler stops unwinding there.
+* **Coverage of the timing**: one host thread. At all host threads the bench was run with the knob on for its results only (82 rows,
+  every workload's own check passes) and inq once a side; no A/B of rates at several threads was taken.
+* **Not run here**: `bench_amd_counters_blocks` itself (skips: hipcc 6.4.4), the e2e tests that need ROCm's full install (rocBLAS, PyTorch,
+  hipBLASLt's Stream-K GEMMs, vLLM), ASan and TSan builds, gfx1250 kernels, a second host. CI runs the first two groups.
+* **Design numbers that are estimates**: every "expected" gain of study 13's milestones 2 to 4 is derived from the class shares and the
+  native loops, not from a prototype of that layer.
+* Cleanup: this round's directory on server3 (`/tmp/sp72-amd-tier`: six trees and builds, the bench cache, logs) was removed by exact path; round sp70's inq directory was read and not changed.

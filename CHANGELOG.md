@@ -7,6 +7,17 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- AMD engine, the first piece of a compiled tier for AMD kernels ([design](docs/perf-design/13-amd-compiled-tier.md),
+  [round sp72](docs/perf-design/rounds/11-rounds-sp36-sp41.md)): with `VGPU_AMD_BLOCKS=1` (off by default) a straight-line run of
+  instructions the pre-decoded tier has handlers for goes as one *block*: the handlers are called back to back, what was asked before each
+  instruction is asked once, and the run's counters are added once. Results, counters, errors, the order waves and work-groups take turns in
+  and lockstep are those of one instruction at a time (`test_amd_gcn_blocks_same_bits`, `bench_amd_counters_blocks`). On one
+  host thread the AMD benchmark's arithmetic rows run 6 to 49 % faster with it (valu_int 1.06 to 1.26, valu_f32 1.13 to 1.25, valu_f64 1.10
+  to 1.32, p_i64 1.19 to 1.30, wave 1.30 to 1.43; geometric mean of all 82 rows 1.07) and inq's unit tests use 0 to 16 % less CPU; the
+  memory rows do not gain and the LDS row is 4 to 6 % slower, which is why it is opt-in.
+  `VGPU_AMD_BLOCKS_STATS=1` lists the blocks that ran most. Measured first: the dispatch loop is 18 to 35 % of an arithmetic-bound kernel on
+  this engine and operand decode 17 to 32 %, and the same arithmetic written as one host loop over a wave's lanes costs 13 to 22 times less
+  than the tier, which is what the design's later layers are for.
 - Host-GPU mode (experimental, opt-in), both modes: the share of the driver start that a launch must save by itself (the entry below) kept the
   start from programs of many short launches that repay it many times over: Rodinia hotspot, 1,000 launches of about 1 ms, was 2.27x faster in
   turbo mode before the share and 1.00x with it. A kernel the simulator has already run 200 times is now taken to be launched as many times
