@@ -312,3 +312,100 @@ ResizeSqrPixel 32f_C1R 0.73 super            st=0 n=2120 sum=1.240961e+04 wsum=5
 ResizeSqrPixel super factors 1 0.5           st=-23
 ResizeSqrPixel super factors 0.5 1           st=-23
 ResizeSqrPixel super factors 2 2             st=-23
+FilterGaussBorder 8u_C1R 3x3                 st=0 n=544 sum=64988 wsum=2941362
+FilterGaussBorder 8u_C1R 3x3 offset          st=0 n=464 sum=53642 wsum=2509486
+FilterGaussBorder 8u_C1R 3x3 constants       st=0 n=73984 sum=9425446 wsum=461802837
+FilterGaussBorder 8u_C1R 3x3 impulses on 0   st=0 n=73984 sum=31494 wsum=1536782
+FilterGaussBorder 8u_C1R 3x3 impulses on 255 st=0 n=73984 sum=18832131 wsum=922572670
+FilterGaussBorder 8u_C1R 5x5                 st=0 n=544 sum=62746 wsum=2863455
+FilterGaussBorder 8u_C1R 5x5 offset          st=0 n=464 sum=53369 wsum=2506764
+FilterGaussBorder 8u_C1R 5x5 constants       st=0 n=73984 sum=9432960 wsum=462170919
+FilterGaussBorder 8u_C1R 5x5 impulses on 0   st=0 n=73984 sum=29528 wsum=1442043
+FilterGaussBorder 8u_C1R 5x5 impulses on 255 st=0 n=73984 sum=18830017 wsum=922454241
+FilterGaussBorder 8u_C1R 7x7                 st=0 n=544 sum=64134 wsum=2962607
+FilterGaussBorder 8u_C1R 7x7 offset          st=0 n=464 sum=55913 wsum=2615653
+FilterGaussBorder 8u_C1R 7x7 constants       st=0 n=73984 sum=9430937 wsum=462071937
+FilterGaussBorder 8u_C1R 7x7 impulses on 0   st=0 n=73984 sum=26637 wsum=1304421
+FilterGaussBorder 8u_C1R 7x7 impulses on 255 st=0 n=73984 sum=18765299 wsum=919269152
+FilterGaussBorder 8u_C1R 9x9                 st=0 n=544 sum=59984 wsum=2717431
+FilterGaussBorder 8u_C1R 9x9 offset          st=0 n=464 sum=50612 wsum=2365726
+FilterGaussBorder 8u_C1R 9x9 constants       st=0 n=73984 sum=9371403 wsum=459155481
+FilterGaussBorder 8u_C1R 9x9 impulses on 0   st=0 n=73984 sum=23627 wsum=1155614
+FilterGaussBorder 8u_C1R 9x9 impulses on 255 st=0 n=73984 sum=18768309 wsum=919411073
+FilterGaussBorder 8u_C1R 11x11               st=0 n=544 sum=63166 wsum=2902354
+FilterGaussBorder 8u_C1R 11x11 offset        st=0 n=464 sum=52580 wsum=2451010
+FilterGaussBorder 8u_C1R 11x11 constants     st=0 n=73984 sum=9381807 wsum=459665349
+FilterGaussBorder 8u_C1R 11x11 impulses on 0 st=0 n=73984 sum=19951 wsum=976037
+FilterGaussBorder 8u_C1R 11x11 impulses on 255 st=0 n=73984 sum=18771985 wsum=919591917
+FilterGaussBorder 8u_C1R 13x13               st=0 n=544 sum=65641 wsum=3009515
+FilterGaussBorder 8u_C1R 13x13 offset        st=0 n=464 sum=53494 wsum=2490856
+FilterGaussBorder 8u_C1R 13x13 constants     st=0 n=73984 sum=9429492 wsum=462000953
+FilterGaussBorder 8u_C1R 13x13 impulses on 0 st=0 n=73984 sum=17033 wsum=835974
+FilterGaussBorder 8u_C1R 13x13 impulses on 255 st=0 n=73984 sum=18805792 wsum=921246530
+FilterGaussBorder 8u_C1R 15x15               st=0 n=544 sum=63637 wsum=2911430
+FilterGaussBorder 8u_C1R 15x15 offset        st=0 n=464 sum=52221 wsum=2439546
+FilterGaussBorder 8u_C1R 15x15 constants     st=0 n=73984 sum=9426313 wsum=461845454
+FilterGaussBorder 8u_C1R 15x15 impulses on 0 st=0 n=73984 sum=14158 wsum=696243
+FilterGaussBorder 8u_C1R 15x15 impulses on 255 st=0 n=73984 sum=18794387 wsum=920690376
+FilterGaussBorder border 0 mask 0            st=-9999
+FilterGaussBorder border 0 mask 1            st=-9999
+FilterGaussBorder border 0 mask 100          st=-9999
+FilterGaussBorder border 0 mask 101          st=-9999
+FilterGaussBorder border 0 mask 200          st=-9999
+FilterGaussBorder border 0 mask 201          st=-9999
+FilterGaussBorder border 0 mask 300          st=-9999
+FilterGaussBorder border 0 mask 400          st=-9999
+FilterGaussBorder border 0 mask 800          st=-9999
+FilterGaussBorder border 0 mask 801          st=-9999
+FilterGaussBorder border 1 mask 0            st=-9999
+FilterGaussBorder border 1 mask 1            st=-9999
+FilterGaussBorder border 1 mask 100          st=-9999
+FilterGaussBorder border 1 mask 101          st=-9999
+FilterGaussBorder border 1 mask 200          st=-9999
+FilterGaussBorder border 1 mask 201          st=-9999
+FilterGaussBorder border 1 mask 300          st=-9999
+FilterGaussBorder border 1 mask 400          st=-9999
+FilterGaussBorder border 1 mask 800          st=-9999
+FilterGaussBorder border 1 mask 801          st=-9999
+FilterGaussBorder border 2 mask 0            st=-33
+FilterGaussBorder border 2 mask 1            st=-33
+FilterGaussBorder border 2 mask 100          st=-33
+FilterGaussBorder border 2 mask 101          st=-33
+FilterGaussBorder border 2 mask 200          st=0
+FilterGaussBorder border 2 mask 201          st=0
+FilterGaussBorder border 2 mask 300          st=-33
+FilterGaussBorder border 2 mask 400          st=0
+FilterGaussBorder border 2 mask 800          st=0
+FilterGaussBorder border 2 mask 801          st=-33
+FilterGaussBorder border 3 mask 0            st=-9999
+FilterGaussBorder border 3 mask 1            st=-9999
+FilterGaussBorder border 3 mask 100          st=-9999
+FilterGaussBorder border 3 mask 101          st=-9999
+FilterGaussBorder border 3 mask 200          st=-9999
+FilterGaussBorder border 3 mask 201          st=-9999
+FilterGaussBorder border 3 mask 300          st=-9999
+FilterGaussBorder border 3 mask 400          st=-9999
+FilterGaussBorder border 3 mask 800          st=-9999
+FilterGaussBorder border 3 mask 801          st=-9999
+FilterGaussBorder border 4 mask 0            st=-9999
+FilterGaussBorder border 4 mask 1            st=-9999
+FilterGaussBorder border 4 mask 100          st=-9999
+FilterGaussBorder border 4 mask 101          st=-9999
+FilterGaussBorder border 4 mask 200          st=-9999
+FilterGaussBorder border 4 mask 201          st=-9999
+FilterGaussBorder border 4 mask 300          st=-9999
+FilterGaussBorder border 4 mask 400          st=-9999
+FilterGaussBorder border 4 mask 800          st=-9999
+FilterGaussBorder border 4 mask 801          st=-9999
+FilterGaussBorder null src, bad mask         st=-8
+FilterGaussBorder null dst, empty roi        st=-8
+FilterGaussBorder negative roi, bad border   st=-6
+FilterGaussBorder empty source               st=-6
+FilterGaussBorder negative offset, bad border st=-11
+FilterGaussBorder offset past the source     st=-11
+FilterGaussBorder empty roi, bad mask        st=-33
+FilterGaussBorder empty roi, zero step       st=0
+FilterGaussBorder zero step, bad border      st=-9999
+FilterGaussBorder step below roi width       st=-14
+FilterGaussBorder roi past the source        st=0
+FilterGaussBorder roi past the source        st=0 n=304 sum=21569 wsum=1032356

@@ -819,7 +819,7 @@ output. Anything that differs is a bug in this implementation.
 | `nccl_comm_ops` (e2e) | all 214 checks pass against NCCL 2.31.2 and the 128 that 2.29.7's header and library have pass against NCCL 2.29.7 (it hangs when one thread suspends the ranks in a group, so that part needs a newer release), at two ranks on two physical GPUs, and all 217 at four ranks (and three) sharing them with `NCCL_MULTI_RANK_GPU_ENABLE=1`, which NCCL 2.31.2 asks for when ranks share a GPU; the simulator runs it at two, three and four ranks on virtual devices: split, shrink, grow, revoke, suspend and resume, memory statistics, non-blocking, pre-multiplied sums, all-to-all, gather, scatter, scalable init, windows, the `nccl*Config` forms, the `ncclParam*` registry, the device API's host side, and their error codes |
 | `nvrtc_jit` | identical: compile a kernel at run time, load the PTX, launch it, same numbers |
 | `npp_ops` | all 48 bit-identical, across arithmetic, logic, conversion, colour, statistics, morphology and resizing |
-| `npp_imgproc` | 289 results: every integer image identical (a dozen near-ties marked approximate, within a count on a pixel or two), floats to 1e‑5 -- warps, rotation, remapping, ResizeSqrPixel, mirroring, logic and shifts, alpha compositing, gamma, demosaicing, lookup, statistics, histograms, integral images, rank and morphological filters, Prewitt gradients and Canny |
+| `npp_imgproc` | 289 results: every integer image identical (a dozen near-ties marked approximate, within a count on a pixel or two), floats to 1e‑5 -- warps, rotation, remapping, ResizeSqrPixel, mirroring, logic and shifts, alpha compositing, gamma, demosaicing, lookup, statistics, histograms, integral images, rank and morphological filters, the Gauss filter with a border (every mask size, constant and impulse images), Prewitt gradients and Canny |
 | `npp_segment` | watershed segmentation and marker-label compression: every buffer size and status; the segmented image under 8-way connectivity, every boundary type, 8- and 16-bit, a padded pitch; the marker labels of images without equal values; 4-way on images up to 4x4; label compression of any label image -- all identical. Labels of images with equal neighbouring values and 4-way on larger images are not (below) |
 | `nvjpeg_codec` | all 24 identical: header parsing exactly, pixels to within the IDCT's own tolerance |
 | `multi_gpu` | all 13 identical to two physical GPUs |
@@ -1354,7 +1354,11 @@ collecting every `npp*` name they call: 253 functions, all implemented:
 Watershed segmentation (`nppiSegmentWatershed_8u_C1IR`, `_16u_`), its
 buffer-size queries and `nppiCompressMarkerLabelsUF_32u_C1IR` with its own
 (`watershedSegmentationNPP`) were the last of the 253. Beyond the list,
-nothing else of NPP's is implemented -- `nppiLabelMarkersUF` and the
+`nppiFilterGaussBorder_8u_C1R` (and `_Ctx`), which saiga calls (pantheonsim #617), is
+reproduced bit for bit from NPP 13.0 and 12.3 on an RTX 3060: a separable float filter,
+vertical pass then horizontal, each an fma chain over the taps in the order 1, 0, 2, ...,
+truncated to 8 bits, with the card's taps (the comment in `npp_imgproc.cpp` has the
+measurements). Otherwise nothing else of NPP's is implemented -- `nppiLabelMarkersUF` and the
 compressed-marker-label info and contour functions among it, which the same
 sample does not call.
 
