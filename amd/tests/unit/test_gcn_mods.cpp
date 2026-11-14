@@ -267,11 +267,8 @@ Want sdwa(int op, int t, Tg tg, Mode m) {
     }
     case 47: return wf(out32(maxmin(f(a), f(b), true, m.ieee), m, 0, false));
     case 48: return wf(out32(maxmin(f(a), f(b), false, m.ieee), m, 0, false));
-    case 49: {   // (the RX 6800 keeps the destination's high half, where the executor zeroes it as gfx9 does: not compared, not fixed here)
-      Want w = wh(out16(maxmin(h(a), h(b), false, m.ieee), m, 0, false), gfx10 ? old & 0xFFFF0000u : 0, 0);
-      if (gfx10) w.mask = 0xFFFF;
-      return w;
-    }
+    case 49:   // (gfx10 keeps the destination's high half, as the RX 6800 does; gfx9 zeroes it: test_amd_gcn_hi16)
+      return wh(out16(maxmin(h(a), h(b), false, m.ieee), m, 0, false), gfx10 ? old & 0xFFFF0000u : 0, 0);
   }
   return {};
 }
