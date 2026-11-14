@@ -21,7 +21,10 @@ expect() {  # expect <name> <expected> <actual>
 }
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-echo 'void hip_stand_in(void) {}' > "$tmp/stand_in.c"
+# Link-time stand-ins only: the two functions the program calls, answering an error, so a run that
+# reached a stand-in instead of the simulator's library could not print the expected versions.
+printf '%s\n' 'int hipRuntimeGetVersion(int* v) { *v = -1; return 1; }' \
+  'int hipDriverGetVersion(int* v) { *v = -1; return 1; }' > "$tmp/stand_in.c"
 for n in 6 7; do
   mkdir -p "$tmp/lib$n"
   gcc -shared -fPIC -Wl,-soname,libamdhip64.so.$n -o "$tmp/lib$n/libamdhip64.so.$n" "$tmp/stand_in.c"
@@ -31,13 +34,15 @@ preload=""
 if command -v objdump >/dev/null; then
   preload=$(objdump -p "$shim/libamdhip64.so.7" 2>/dev/null | awk '/NEEDED/ && /lib(asan|tsan)\.so/ {print $2}')
 fi
+# A program that does not link is a failure, not a check skipped.
+linked() { "$@" || { echo "FAIL  could not build $3"; fail=1; return 1; }; }
 run() { LD_PRELOAD="$preload" VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" "$1"; }
 
-gcc -o "$tmp/six" "$root/amd/tests/e2e/hip_version.c" -Wl,--no-as-needed "$tmp/lib6/libamdhip64.so.6" -Wl,-rpath,"$shim" \
+linked gcc -o "$tmp/six" "$root/amd/tests/e2e/hip_version.c" -Wl,--no-as-needed "$tmp/lib6/libamdhip64.so.6" -Wl,-rpath,"$shim" \
   && expect "a program that needs libamdhip64.so.6 is on ROCm 6.4.43483" "runtime 60443483 driver 60443483" "$(run "$tmp/six")"
-gcc -o "$tmp/seven" "$root/amd/tests/e2e/hip_version.c" -Wl,--no-as-needed "$tmp/lib7/libamdhip64.so.7" -Wl,-rpath,"$shim" \
+linked gcc -o "$tmp/seven" "$root/amd/tests/e2e/hip_version.c" -Wl,--no-as-needed "$tmp/lib7/libamdhip64.so.7" -Wl,-rpath,"$shim" \
   && expect "one that needs .so.7 is on ROCm 7.2's 7.2.53211" "runtime 70253211 driver 70253211" "$(run "$tmp/seven")"
-gcc -o "$tmp/both" "$root/amd/tests/e2e/hip_version.c" -Wl,--no-as-needed "$tmp/lib6/libamdhip64.so.6" "$tmp/lib7/libamdhip64.so.7" \
+linked gcc -o "$tmp/both" "$root/amd/tests/e2e/hip_version.c" -Wl,--no-as-needed "$tmp/lib6/libamdhip64.so.6" "$tmp/lib7/libamdhip64.so.7" \
   && expect "one that needs both (a ROCm 7 program with a ROCm 6 library) is on 7.2" "runtime 70253211 driver 70253211" "$(run "$tmp/both")"
 # And one that loads the library by name at run time, as Python's ctypes does, needing neither.
 cat > "$tmp/loads.c" <<'C'
@@ -53,5 +58,5 @@ int main(void) {
   return 0;
 }
 C
-gcc -o "$tmp/loads" "$tmp/loads.c" -ldl && expect "one that loads the library by name is on 7.2" "runtime 70253211" "$(run "$tmp/loads")"
+linked gcc -o "$tmp/loads" "$tmp/loads.c" -ldl && expect "one that loads the library by name is on 7.2" "runtime 70253211" "$(run "$tmp/loads")"
 exit $fail

@@ -507,6 +507,11 @@ int gemm_bad_arg(cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k
 bool gemm_args_ok(cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, int lda, int ldb, int ldc) {
   return gemm_bad_arg(ta, tb, m, n, k, lda, ldb, ldc) == 0;
 }
+int gemm_batch_bad_arg(cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, int lda, int ldb, int ldc,
+                       int batch) {
+  if (const int bad = gemm_bad_arg(ta, tb, m, n, k, lda, ldb, ldc)) return bad;
+  return batch < 0 ? 14 : 0;
+}
 
 // What cuBLAS prints when it refuses an argument, as reference BLAS's XERBLA words it, on stdout: an RTX 3060
 // (cuBLAS 13.0) prints " ** On entry to SGER   parameter number 5 had an illegal value" for cublasSger with
@@ -524,6 +529,69 @@ cublasStatus_t illegal_arg(char letter, const char* rest, int param) {
   std::printf(" ** On entry to %c%s parameter number %d had an illegal value\n", letter, rest, param);
   return CUBLAS_STATUS_INVALID_VALUE;
 }
+cublasStatus_t illegal_arg(const char* routine, int param) {
+  std::printf(" ** On entry to %s parameter number %d had an illegal value\n", routine, param);
+  return CUBLAS_STATUS_INVALID_VALUE;
+}
+
+// The GemmEx family's line names the routine the program called, which reaches cublasGemmEx through others: the
+// field and the positions of lda, ldb, ldc and algo in that routine (its own argument list, the handle not counted, for
+// GemmEx and its batched forms; ?GEMM's for cublasSgemmEx, cublasCgemmEx and cublasCgemm3mEx). The outermost caller's
+// scope wins. An algorithm GemmEx does not know (CUBLAS_GEMM_DEFAULT .. ALGO23, DEFAULT_TENSOR_OP .. ALGO15_TENSOR_OP)
+// is refused after the sizes, as on the card.
+struct GemmExField {
+  const char* name;
+  int lda, ldb, ldc, algo;
+};
+constexpr GemmExField kGemmExField{"GEMM_EX ", 9, 12, 16, 18};
+constexpr GemmExField kGemmBatchedExField{"GEMM_EX ", 9, 12, 16, 19};
+constexpr GemmExField kGemmStridedBatchedExField{"GEMM_EX ", 9, 13, 18, 22};
+constexpr GemmExField kSgemmExField{"SGEMM_EX ", 8, 10, 13, 0};
+constexpr GemmExField kCgemmExField{"CGEMM_EX ", 8, 10, 13, 0};
+constexpr GemmExField kCgemm3mExField{"CGEMM ", 8, 10, 13, 0};
+thread_local const GemmExField* t_gemm_ex_field = nullptr;
+struct GemmExFieldScope {
+  const GemmExField* prev;
+  explicit GemmExFieldScope(const GemmExField& f) : prev(t_gemm_ex_field) {
+    if (!prev) t_gemm_ex_field = &f;
+  }
+  ~GemmExFieldScope() { t_gemm_ex_field = prev; }
+  GemmExFieldScope(const GemmExFieldScope&) = delete;
+  GemmExFieldScope& operator=(const GemmExFieldScope&) = delete;
+};
+bool known_gemm_algo(cublasGemmAlgo_t algo) {
+  const int a = static_cast<int>(algo);
+  return (a >= -1 && a <= 23) || (a >= 99 && a <= 115);
+}
+
+// The level-3 routines and the extensions print the line too, for the first bad argument by its position in
+// reference BLAS's routine (cuBLAS's own extensions number theirs the same way, the handle not counted), and refuse
+// what they refused before (measured on an RTX 3060, cuBLAS 13.0). The batched GEMMs count as ?GEMM with the batch
+// count 14th (the strides are not counted), trsmBatched as ?TRSM with it 12th. The fields are the card's, odd ones
+// included: "SYRK " for cublasSsyrkx, "TRMM" without its blank for S and C, "gemmStridedBatched", "BATCHED TRSM ".
+#define VGPU_XERBLA(letter, name, bad_arg)                                       \
+  if (valid(h))                                                                  \
+    if (const int bad_ = (bad_arg)) return illegal_arg((letter), (name), bad_)
+// ?symm, ?hemm: side 1, uplo 2, m 3, n 4, lda 7, ldb 9, ldc 12.
+int symm_bad_arg(cublasSideMode_t side, cublasFillMode_t uplo, int m, int n, int lda, int ldb, int ldc);
+// ?syrk, ?herk: uplo 1, trans 2, n 3, k 4, lda 7, ldc 10; with B (syr2k, her2k, syrkx, herkx), ldb 9 and ldc 12.
+int herk_bad_arg(cublasFillMode_t uplo, cublasOperation_t t, int n, int k, int lda, bool with_b, int ldb, int ldc);
+// ?trsm, ?trmm: side 1, uplo 2, trans 3, diag 4, m 5, n 6, lda 9, ldb 11 (trmm's C: ldc 13).
+int tri3_bad_arg(cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t t, cublasDiagType_t diag, int m,
+                 int n, int lda, int ldb);
+// ?geam: transa 1, transb 2, m 3, n 4, lda 7, ldb 10, ldc 12.
+int geam_bad_arg(cublasOperation_t ta, cublasOperation_t tb, int m, int n, int lda, int ldb, int ldc) {
+  if (!known_op(ta)) return 1;
+  if (!known_op(tb)) return 2;
+  if (m < 0) return 3;
+  if (n < 0) return 4;
+  if (lda < std::max(1, ta == CUBLAS_OP_N ? m : n)) return 7;
+  if (ldb < std::max(1, tb == CUBLAS_OP_N ? m : n)) return 10;
+  if (ldc < std::max(1, m)) return 12;
+  return 0;
+}
+// ?dgmm: mode 1, m 2, n 3, lda 5, ldc 9 (a zero incx is a stride of zero, and no error).
+int dgmm_bad_arg(cublasSideMode_t mode, int m, int n, int lda, int ldc);
 
 // A matrix whose pointer is not aligned to its element is refused by the
 // card's real GEMMs as NOT_SUPPORTED (an int8 C of GemmEx too).
@@ -541,6 +609,59 @@ bool tri3_args_ok(cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_
                   int n, int lda, int ldb) {
   return known_side(side) && known_fill(uplo) && known_op(t) && known_diag(diag) && m >= 0 && n >= 0 &&
          lda >= std::max(1, side == CUBLAS_SIDE_LEFT ? m : n) && ldb >= std::max(1, m);
+}
+int tri3_bad_arg(cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t t, cublasDiagType_t diag, int m,
+                 int n, int lda, int ldb) {
+  if (!known_side(side)) return 1;
+  if (!known_fill(uplo)) return 2;
+  if (!known_op(t)) return 3;
+  if (!known_diag(diag)) return 4;
+  if (m < 0) return 5;
+  if (n < 0) return 6;
+  if (lda < std::max(1, side == CUBLAS_SIDE_LEFT ? m : n)) return 9;
+  if (ldb < std::max(1, m)) return 11;
+  return 0;
+}
+// ?trmm's field: the card's has no blank after it for S and C.
+constexpr const char* trmm_field(char letter) { return letter == 'S' || letter == 'C' ? "TRMM" : "TRMM "; }
+int trmm_bad_arg(cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t t, cublasDiagType_t diag, int m,
+                 int n, int lda, int ldb, int ldc) {
+  if (const int bad = tri3_bad_arg(side, uplo, t, diag, m, n, lda, ldb)) return bad;
+  return ldc < std::max(1, m) ? 13 : 0;
+}
+int trsm_batch_bad_arg(cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t t, cublasDiagType_t diag, int m,
+                       int n, int lda, int ldb, int batch) {
+  if (const int bad = tri3_bad_arg(side, uplo, t, diag, m, n, lda, ldb)) return bad;
+  return batch < 0 ? 12 : 0;
+}
+int symm_bad_arg(cublasSideMode_t side, cublasFillMode_t uplo, int m, int n, int lda, int ldb, int ldc) {
+  if (!known_side(side)) return 1;
+  if (!known_fill(uplo)) return 2;
+  if (m < 0) return 3;
+  if (n < 0) return 4;
+  if (lda < std::max(1, side == CUBLAS_SIDE_LEFT ? m : n)) return 7;
+  if (ldb < std::max(1, m)) return 9;
+  if (ldc < std::max(1, m)) return 12;
+  return 0;
+}
+int herk_bad_arg(cublasFillMode_t uplo, cublasOperation_t t, int n, int k, int lda, bool with_b, int ldb, int ldc) {
+  const int rows = std::max(1, t == CUBLAS_OP_N ? n : k);
+  if (!known_fill(uplo)) return 1;
+  if (!known_op(t)) return 2;
+  if (n < 0) return 3;
+  if (k < 0) return 4;
+  if (lda < rows) return 7;
+  if (with_b && ldb < rows) return 9;
+  if (ldc < std::max(1, n)) return with_b ? 12 : 10;
+  return 0;
+}
+int dgmm_bad_arg(cublasSideMode_t mode, int m, int n, int lda, int ldc) {
+  if (!known_side(mode)) return 1;
+  if (m < 0) return 2;
+  if (n < 0) return 3;
+  if (lda < std::max(1, m)) return 5;
+  if (ldc < std::max(1, m)) return 9;
+  return 0;
 }
 
 // ---- fixed-point emulation of double precision ----
@@ -1141,6 +1262,7 @@ VGPU_EXPORT cublasStatus_t cublasSgemmStridedBatched(
     cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
     const float* alpha, const float* A, int lda, long long strideA, const float* B, int ldb,
     long long strideB, const float* beta, float* C, int ldc, long long strideC, int batchCount) {
+  VGPU_XERBLA('S', "gemmStridedBatched", gemm_batch_bad_arg(ta, tb, m, n, k, lda, ldb, ldc, batchCount));
   return gemm_strided<float>(h, ta, tb, m, n, k, alpha, A, lda, strideA, B, ldb, strideB, beta, C, ldc, strideC,
                              batchCount);
 }
@@ -1148,6 +1270,7 @@ VGPU_EXPORT cublasStatus_t cublasDgemmStridedBatched(
     cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
     const double* alpha, const double* A, int lda, long long strideA, const double* B, int ldb,
     long long strideB, const double* beta, double* C, int ldc, long long strideC, int batchCount) {
+  VGPU_XERBLA('D', "gemmStridedBatched", gemm_batch_bad_arg(ta, tb, m, n, k, lda, ldb, ldc, batchCount));
   return gemm_strided<double>(h, ta, tb, m, n, k, alpha, A, lda, strideA, B, ldb, strideB, beta, C, ldc, strideC,
                               batchCount);
 }
@@ -1157,6 +1280,7 @@ VGPU_EXPORT cublasStatus_t cublasSgemmBatched(cublasHandle_t h, cublasOperation_
                                               int lda, const float* const Barray[], int ldb,
                                               const float* beta, float* const Carray[], int ldc,
                                               int batchCount) {
+  VGPU_XERBLA('S', "gemmBatched", gemm_batch_bad_arg(ta, tb, m, n, k, lda, ldb, ldc, batchCount));
   return gemm_batched<float>(h, ta, tb, m, n, k, alpha, Aarray, lda, Barray, ldb, beta, Carray, ldc, batchCount);
 }
 VGPU_EXPORT cublasStatus_t cublasDgemmBatched(cublasHandle_t h, cublasOperation_t ta,
@@ -1165,6 +1289,7 @@ VGPU_EXPORT cublasStatus_t cublasDgemmBatched(cublasHandle_t h, cublasOperation_
                                               int lda, const double* const Barray[], int ldb,
                                               const double* beta, double* const Carray[], int ldc,
                                               int batchCount) {
+  VGPU_XERBLA('D', "gemmBatched", gemm_batch_bad_arg(ta, tb, m, n, k, lda, ldb, ldc, batchCount));
   return gemm_batched<double>(h, ta, tb, m, n, k, alpha, Aarray, lda, Barray, ldb, beta, Carray, ldc, batchCount);
 }
 
@@ -1360,23 +1485,27 @@ cublasStatus_t trsm(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t up
 VGPU_EXPORT cublasStatus_t cublasStrsm_v2(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo,
                                           cublasOperation_t trans, cublasDiagType_t diag, int m, int n,
                                           const float* alpha, const float* A, int lda, float* B, int ldb) {
+  VGPU_XERBLA('S', "TRSM ", tri3_bad_arg(side, uplo, trans, diag, m, n, lda, ldb));
   return trsm<float>(h, side, uplo, trans, diag, m, n, alpha, A, lda, B, ldb);
 }
 VGPU_EXPORT cublasStatus_t cublasDtrsm_v2(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo,
                                           cublasOperation_t trans, cublasDiagType_t diag, int m, int n,
                                           const double* alpha, const double* A, int lda, double* B, int ldb) {
+  VGPU_XERBLA('D', "TRSM ", tri3_bad_arg(side, uplo, trans, diag, m, n, lda, ldb));
   return trsm<double>(h, side, uplo, trans, diag, m, n, alpha, A, lda, B, ldb);
 }
 VGPU_EXPORT cublasStatus_t cublasStrsmBatched(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo,
                                               cublasOperation_t trans, cublasDiagType_t diag, int m, int n,
                                               const float* alpha, const float* const A[], int lda,
                                               float* const B[], int ldb, int batch) {
+  VGPU_XERBLA('S', "BATCHED TRSM ", trsm_batch_bad_arg(side, uplo, trans, diag, m, n, lda, ldb, batch));
   return trsm_batched<float>(h, side, uplo, trans, diag, m, n, alpha, A, lda, B, ldb, batch);
 }
 VGPU_EXPORT cublasStatus_t cublasDtrsmBatched(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo,
                                               cublasOperation_t trans, cublasDiagType_t diag, int m, int n,
                                               const double* alpha, const double* const A[], int lda,
                                               double* const B[], int ldb, int batch) {
+  VGPU_XERBLA('D', "BATCHED TRSM ", trsm_batch_bad_arg(side, uplo, trans, diag, m, n, lda, ldb, batch));
   return trsm_batched<double>(h, side, uplo, trans, diag, m, n, alpha, A, lda, B, ldb, batch);
 }
 
@@ -1600,11 +1729,13 @@ cublasStatus_t dgmm(cublasHandle_t h, cublasSideMode_t mode, int m, int n, const
 VGPU_EXPORT cublasStatus_t cublasSdgmm(cublasHandle_t h, cublasSideMode_t mode, int m, int n,
                                        const float* A, int lda, const float* x, int incx, float* C,
                                        int ldc) {
+  VGPU_XERBLA('S', "DGMM ", dgmm_bad_arg(mode, m, n, lda, ldc));
   return dgmm(h, mode, m, n, A, lda, x, incx, C, ldc);
 }
 VGPU_EXPORT cublasStatus_t cublasDdgmm(cublasHandle_t h, cublasSideMode_t mode, int m, int n,
                                        const double* A, int lda, const double* x, int incx, double* C,
                                        int ldc) {
+  VGPU_XERBLA('D', "DGMM ", dgmm_bad_arg(mode, m, n, lda, ldc));
   return dgmm(h, mode, m, n, A, lda, x, incx, C, ldc);
 }
 VGPU_EXPORT cublasStatus_t cublasSaxpy_v2(cublasHandle_t h, int n, const float* alpha,
@@ -1817,7 +1948,12 @@ VGPU_EXPORT cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t ta,
                    (int)Atype, (int)Btype, (int)Ctype, (int)computeType);
     return CUBLAS_STATUS_NOT_SUPPORTED;
   }
-  if (!gemm_args_ok(ta, tb, m, n, k, lda, ldb, ldc)) return CUBLAS_STATUS_INVALID_VALUE;
+  {
+    const GemmExField& f = t_gemm_ex_field ? *t_gemm_ex_field : kGemmExField;
+    if (const int bad = gemm_bad_arg(ta, tb, m, n, k, lda, ldb, ldc))
+      return illegal_arg(f.name, bad == 8 ? f.lda : bad == 10 ? f.ldb : bad == 13 ? f.ldc : bad);
+    if (!known_gemm_algo(algo)) return illegal_arg(f.name, f.algo);
+  }
   if (Ctype != CUDA_C_32F && Ctype != CUDA_C_64F && !gemm_aligned(A, B, C, type_bytes(Atype), type_bytes(Ctype)))
     return CUBLAS_STATUS_NOT_SUPPORTED;
   if (compute_32i(computeType) &&
@@ -1895,6 +2031,7 @@ VGPU_EXPORT cublasStatus_t cublasGemmStridedBatchedEx(
     cublasComputeType_t computeType, cublasGemmAlgo_t algo) {
   const size_t ea = type_bytes(Atype), eb = type_bytes(Btype), ec = type_bytes(Ctype);
   if (!ea || !eb || !ec) return CUBLAS_STATUS_NOT_SUPPORTED;
+  const GemmExFieldScope field(kGemmStridedBatchedExField);
   for (int i = 0; i < batchCount; ++i) {
     const cublasStatus_t s = cublasGemmEx(
         h, ta, tb, m, n, k, alpha, static_cast<const char*>(A) + (size_t)i * strideA * ea, Atype,
@@ -1926,6 +2063,7 @@ VGPU_EXPORT cublasStatus_t cublasGemmBatchedEx(
   const auto a = fetch<const void*>(Aarray, static_cast<size_t>(batchCount));
   const auto b = fetch<const void*>(Barray, static_cast<size_t>(batchCount));
   const auto c = fetch<void*>(Carray, static_cast<size_t>(batchCount));
+  const GemmExFieldScope field(kGemmBatchedExField);
   for (int i = 0; i < batchCount; ++i) {
     const cublasStatus_t st = cublasGemmEx(h, ta, tb, m, n, k, alpha, a[i], Atype, lda, b[i], Btype,
                                            ldb, beta, c[i], Ctype, ldc, computeType, algo);
@@ -2883,22 +3021,25 @@ cublasStatus_t gemm_ex_complex(cublasHandle_t h, cublasOperation_t ta, cublasOpe
   });
 }
 
-cublasStatus_t cgemm_ex(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
-                        const cuComplex* alpha, const void* A, cudaDataType Atype, int lda, const void* B,
+cublasStatus_t cgemm_ex(const GemmExField& field, cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m,
+                        int n, int k, const cuComplex* alpha, const void* A, cudaDataType Atype, int lda, const void* B,
                         cudaDataType Btype, int ldb, const cuComplex* beta, void* C, cudaDataType Ctype, int ldc) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (!cex_type(Atype, Ctype) || Btype != Atype) return CUBLAS_STATUS_NOT_SUPPORTED;
+  const GemmExFieldScope scope(field);
   return cublasGemmEx(h, ta, tb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C, Ctype, ldc,
                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
-// herk (alpha, beta float) and syrk (cuComplex) over a C_32F or C_8I A.
+// herk (alpha, beta float) and syrk (cuComplex) over a C_32F or C_8I A. A bad argument prints the line of `name`
+// ("CHERK " for cublasCherkEx and cublasCherk3mEx, "CSYRK ", "CSYRK3M "), by ?HERK's positions (lda 7, ldc 10).
 template <class S>
-cublasStatus_t cherk_ex(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, cublasOperation_t t, int n, int k,
-                        const S* alpha, const void* A, cudaDataType Atype, int lda, const S* beta, void* C,
-                        cudaDataType Ctype, int ldc) {
+cublasStatus_t cherk_ex(const char* name, cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, cublasOperation_t t,
+                        int n, int k, const S* alpha, const void* A, cudaDataType Atype, int lda, const S* beta,
+                        void* C, cudaDataType Ctype, int ldc) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (!cex_type(Atype, Ctype)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (const int bad = herk_bad_arg(uplo, t, n, k, lda, false, 0, ldc)) return illegal_arg(name, bad);
   if (Atype == CUDA_C_32F)
     return cherk<cuComplex, S>(h, hermitian, uplo, t, n, k, alpha, static_cast<const cuComplex*>(A), lda, beta,
                                static_cast<cuComplex*>(C), ldc);
@@ -2926,16 +3067,17 @@ VGPU_EXPORT cublasStatus_t cublasSgemmEx(cublasHandle_t h, cublasOperation_t ta,
                                          cudaDataType Ctype, int ldc) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (Ctype == CUDA_C_32F || Ctype == CUDA_C_64F || Ctype == CUDA_R_32I) return CUBLAS_STATUS_NOT_SUPPORTED;
+  const GemmExFieldScope field(kSgemmExField);
   return cublasGemmEx(h, ta, tb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C, Ctype, ldc,
                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
-#define VGPU_CGEMM_EX(NAME)                                                                                        \
+#define VGPU_CGEMM_EX(NAME, FIELD)                                                                                 \
   VGPU_EXPORT cublasStatus_t NAME(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, \
                                   const cuComplex* alpha, const void* A, cudaDataType Atype, int lda, const void* B, \
                                   cudaDataType Btype, int ldb, const cuComplex* beta, void* C, cudaDataType Ctype,   \
                                   int ldc) {                                                                         \
-    return cgemm_ex(h, ta, tb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C, Ctype, ldc);                   \
+    return cgemm_ex(FIELD, h, ta, tb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C, Ctype, ldc);            \
   }                                                                                                                  \
   VGPU_EXPORT cublasStatus_t NAME##_64(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int64_t m,      \
                                        int64_t n, int64_t k, const cuComplex* alpha, const void* A,                  \
@@ -2944,30 +3086,30 @@ VGPU_EXPORT cublasStatus_t cublasSgemmEx(cublasHandle_t h, cublasOperation_t ta,
                                        int64_t ldc) {                                                                \
     for (int64_t v : {m, n, k, lda, ldb, ldc})                                                                       \
       if (!fits_int(v)) return CUBLAS_STATUS_NOT_SUPPORTED;                                                          \
-    return cgemm_ex(h, ta, tb, (int)m, (int)n, (int)k, alpha, A, Atype, (int)lda, B, Btype, (int)ldb, beta, C,       \
+    return cgemm_ex(FIELD, h, ta, tb, (int)m, (int)n, (int)k, alpha, A, Atype, (int)lda, B, Btype, (int)ldb, beta, C,\
                     Ctype, (int)ldc);                                                                                \
   }
-VGPU_CGEMM_EX(cublasCgemmEx)
-VGPU_CGEMM_EX(cublasCgemm3mEx)
+VGPU_CGEMM_EX(cublasCgemmEx, kCgemmExField)
+VGPU_CGEMM_EX(cublasCgemm3mEx, kCgemm3mExField)
 #undef VGPU_CGEMM_EX
 
-#define VGPU_CHERK_EX(NAME, S, HERM)                                                                               \
+#define VGPU_CHERK_EX(NAME, S, HERM, FIELD)                                                                        \
   VGPU_EXPORT cublasStatus_t NAME(cublasHandle_t h, cublasFillMode_t uplo, cublasOperation_t t, int n, int k,        \
                                   const S* alpha, const void* A, cudaDataType Atype, int lda, const S* beta, void* C, \
                                   cudaDataType Ctype, int ldc) {                                                     \
-    return cherk_ex<S>(h, HERM, uplo, t, n, k, alpha, A, Atype, lda, beta, C, Ctype, ldc);                           \
+    return cherk_ex<S>(FIELD, h, HERM, uplo, t, n, k, alpha, A, Atype, lda, beta, C, Ctype, ldc);                    \
   }                                                                                                                  \
   VGPU_EXPORT cublasStatus_t NAME##_64(cublasHandle_t h, cublasFillMode_t uplo, cublasOperation_t t, int64_t n,      \
                                        int64_t k, const S* alpha, const void* A, cudaDataType Atype, int64_t lda,    \
                                        const S* beta, void* C, cudaDataType Ctype, int64_t ldc) {                    \
     for (int64_t v : {n, k, lda, ldc})                                                                               \
       if (!fits_int(v)) return CUBLAS_STATUS_NOT_SUPPORTED;                                                          \
-    return cherk_ex<S>(h, HERM, uplo, t, (int)n, (int)k, alpha, A, Atype, (int)lda, beta, C, Ctype, (int)ldc);       \
+    return cherk_ex<S>(FIELD, h, HERM, uplo, t, (int)n, (int)k, alpha, A, Atype, (int)lda, beta, C, Ctype, (int)ldc);\
   }
-VGPU_CHERK_EX(cublasCherkEx, float, true)
-VGPU_CHERK_EX(cublasCherk3mEx, float, true)
-VGPU_CHERK_EX(cublasCsyrkEx, cuComplex, false)
-VGPU_CHERK_EX(cublasCsyrk3mEx, cuComplex, false)
+VGPU_CHERK_EX(cublasCherkEx, float, true, "CHERK ")
+VGPU_CHERK_EX(cublasCherk3mEx, float, true, "CHERK ")
+VGPU_CHERK_EX(cublasCsyrkEx, cuComplex, false, "CSYRK ")
+VGPU_CHERK_EX(cublasCsyrk3mEx, cuComplex, false, "CSYRK3M ")
 #undef VGPU_CHERK_EX
 
 /* ---- the remaining typed level-1 routines ----

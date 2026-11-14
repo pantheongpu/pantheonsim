@@ -14,6 +14,12 @@
 //   - cudaStreamEndCapture on a stream that joined the capture (not the one
 //     that began it) is cudaErrorStreamCaptureUnmatched and invalidates the
 //     capture: the simulator let the capture go on.
+//   - A wait that would merge two captures (902) invalidates both, and one by the legacy stream on an event of a
+//     capture (906) invalidates that capture; the simulator invalidated only the waiting stream's, or none. Once a
+//     capture is invalidated, a wait on its event from a stream outside it is cudaErrorInvalidValue (the simulator
+//     forked the stream into the capture) and from one of its own streams 901.
+//   - cudaStreamAddCallback on a capturing stream is cudaErrorStreamCaptureUnsupported and the capture goes on without
+//     it; the simulator invalidated the capture.
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -24,8 +30,9 @@ static int mode_ = 0;
   std::printf("FAIL mode %d line %d: %s -> %d, expected %d\n", mode_, __LINE__, #x, got_, static_cast<int>(want)); ++fails; } } while (0)
 
 __global__ void bump(int* p) { if (p) *p += 1; }
+static void CUDART_CB never(cudaStream_t, cudaError_t, void*) { std::printf("FAIL the refused callback ran\n"); }
 
-static cudaStream_t c, s2;
+static cudaStream_t c, s2, s3;
 static cudaEvent_t e, e0;
 static int* d;
 
@@ -49,6 +56,7 @@ int main() {
   WANT(cudaMalloc(&d, 64), cudaSuccess);
   WANT(cudaStreamCreateWithFlags(&c, cudaStreamNonBlocking), cudaSuccess);
   WANT(cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking), cudaSuccess);
+  WANT(cudaStreamCreateWithFlags(&s3, cudaStreamNonBlocking), cudaSuccess);
   WANT(cudaEventCreate(&e), cudaSuccess);
   WANT(cudaEventCreate(&e0), cudaSuccess);
   WANT(cudaEventRecord(e0, 0), cudaSuccess);
@@ -114,12 +122,55 @@ int main() {
     WANT(status(c), cudaStreamCaptureStatusInvalidated);
     WANT(status(s2), cudaStreamCaptureStatusInvalidated);
     end_invalidated();
+
+    // A merge invalidates both captures; then the event cannot be waited for from outside (1) or inside (901).
+    WANT(cudaStreamBeginCapture(c, mode), cudaSuccess);
+    WANT(cudaStreamBeginCapture(s3, mode), cudaSuccess);
+    WANT(cudaEventRecord(e, c), cudaSuccess);
+    WANT(cudaStreamWaitEvent(s3, e, 0), cudaErrorStreamCaptureMerge);
+    WANT(status(c), cudaStreamCaptureStatusInvalidated);
+    WANT(status(s3), cudaStreamCaptureStatusInvalidated);
+    WANT(cudaStreamWaitEvent(s2, e, 0), cudaErrorInvalidValue);
+    WANT(status(s2), cudaStreamCaptureStatusNone);
+    WANT(cudaStreamWaitEvent(0, e, 0), cudaErrorInvalidValue);
+    WANT(cudaStreamWaitEvent(c, e, 0), cudaErrorStreamCaptureInvalidated);
+    {
+      cudaGraph_t g = nullptr;
+      WANT(cudaStreamEndCapture(s3, &g), cudaErrorStreamCaptureInvalidated);
+      WANT(g == nullptr, true);
+    }
+    end_invalidated();
+    // cudaStreamAddCallback is refused and the capture goes on without it (the simulator invalidated it).
+    WANT(cudaStreamBeginCapture(c, mode), cudaSuccess);
+    bump<<<1, 1, 0, c>>>(d);
+    WANT(cudaStreamAddCallback(c, never, nullptr, 0), cudaErrorStreamCaptureUnsupported);
+    WANT(cudaGetLastError(), cudaErrorStreamCaptureUnsupported);
+    WANT(status(c), cudaStreamCaptureStatusActive);
+    bump<<<1, 1, 0, c>>>(d);
+    WANT(cudaGetLastError(), cudaSuccess);
+    {
+      cudaGraph_t g = nullptr;
+      size_t nodes = 0;
+      WANT(cudaStreamEndCapture(c, &g), cudaSuccess);
+      if (g) WANT(cudaGraphGetNodes(g, nullptr, &nodes), cudaSuccess);
+      WANT(nodes, 2);
+      if (g) WANT(cudaGraphDestroy(g), cudaSuccess);
+    }
+    // The legacy stream's wait invalidates the event's capture.
+    WANT(cudaStreamBeginCapture(c, mode), cudaSuccess);
+    WANT(cudaEventRecord(e, c), cudaSuccess);
+    WANT(cudaStreamWaitEvent(0, e, 0), cudaErrorStreamCaptureImplicit);
+    WANT(status(c), cudaStreamCaptureStatusInvalidated);
+    WANT(cudaStreamWaitEvent(s2, e, 0), cudaErrorInvalidValue);
+    WANT(status(s2), cudaStreamCaptureStatusNone);
+    end_invalidated();
   }
   WANT(cudaDeviceSynchronize(), cudaSuccess);
   WANT(cudaEventDestroy(e), cudaSuccess);
   WANT(cudaEventDestroy(e0), cudaSuccess);
   WANT(cudaStreamDestroy(c), cudaSuccess);
   WANT(cudaStreamDestroy(s2), cudaSuccess);
+  WANT(cudaStreamDestroy(s3), cudaSuccess);
   WANT(cudaFree(d), cudaSuccess);
   std::printf("%s\n", fails ? "FAILED" : "PASS");
   return fails ? 1 : 0;

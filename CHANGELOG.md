@@ -7,6 +7,19 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- NVIDIA driver: a call made after `exit()` has torn the driver down, from the destructor of a library that loaded libcuda itself, now
+  answers `CUDA_ERROR_DEINITIALIZED` (4), as NVIDIA's driver does (#646). NVHPC's OpenACC runtime (26.9) dlopens libcuda, retains the primary
+  context once and releases it from its destructor, after the driver's own teardown; the simulator answered that release from its destroyed
+  state as one with nothing retained (`CUDA_ERROR_INVALID_CONTEXT`, "released more times than it was retained"), and every `nvc -acc`
+  program, McCode/McStas `--openacc` instruments among them, ended with "Accelerator Fatal Error" and exit status 1 after a correct run. An
+  RTX 3060 answers the same release 4, which NVHPC ignores. A release with nothing retained while the program runs is still 201, as on the
+  card.
+- `vgpu run --gpu amd/...` needs only the HIP shim ([#647](https://github.com/pantheongpu/pantheonsim/issues/647)): it no longer refuses
+  to start when `build/shim/libcuda.so.1` is missing, and says so when `libamdhip64.so.6` is, or when the program needs an AMD library the
+  build does not have (ROCm SMI, AMD SMI, rocprofiler-sdk), with the target that builds it. `cmake --build build --target vgpuhip` now
+  also builds `vgpu` and writes the HIP links in `build/shim` on every build, not only when the library is relinked, so a HIP-only build
+  runs. NVIDIA runs still require `libcuda.so.1`, with the same message.
+
 - Host-GPU mode (experimental, opt-in), both modes: while the real driver is not started, a launch that would start it only because the program
   has already simulated as long as the start costs (the start-cost account) must now also save a share of the start by itself: 5 ms, or 12.5 ms
   for a kernel's first launch judged by its static estimate (`VGPU_HOST_GPU_START_LAUNCHES`, `0` for the rule before). Four short CUDA Samples
@@ -128,6 +141,15 @@ release says what runs and what it produces, never how fast a real GPU would run
   and the GEMMs (`?gemm`, `cublasHgemm`, `?gemm3m`) print reference BLAS's line for the first bad argument on stdout, as
   the card does (" ** On entry to SGER   parameter number 5 had an illegal value"); `?symv`/`?hemv` refuse silently, and
   `?gemv` prints nothing (found by differential testing; `e2e_card_edges_blas2`).
+- cuBLAS: the level-3 routines and the extensions print the card's line for their first bad argument on stdout too:
+  `?symm`, `?hemm`, `?syrk`, `?herk`, `?syr2k`, `?her2k`, `?syrkx`, `?herkx`, `?trsm`, `?trmm`, `?geam` (and `_64`),
+  `?dgmm`, `?gemmBatched`, `?gemmStridedBatched`, `?trsmBatched`, `cublasHgemm(Strided)Batched`,
+  `cublasCgemm3m(Strided)Batched`, `cublasGemmEx`, `cublasGemmBatchedEx`, `cublasGemmStridedBatchedEx` (and `_64`),
+  `cublasSgemmEx`, `cublasCgemmEx`, `cublasCgemm3mEx` and the Ex herk/syrk forms, each with the field and position an
+  RTX 3060's cuBLAS 13.0 prints (" ** On entry to SSYMM  parameter number 7 had an illegal value", "SBATCHED TRSM ",
+  "GEMM_EX " with GemmEx's own positions). `cublasCgemm3mBatched` printed `CgemmBatched`'s field. `cublasGemmEx` and its
+  batched forms refuse an algorithm outside `CUBLAS_GEMM_DEFAULT`..`ALGO23` and `DEFAULT_TENSOR_OP`..`ALGO15_TENSOR_OP`,
+  as the card does; they ran it (found by differential testing; `e2e_card_edges_blas3`).
 - Runtime: `cudaMemcpy3D` and `cudaMemcpy3DAsync` between pitched pointers check pitches and `ysize` as an RTX 3060 does. One
   row of one slice accepts a pitch of 0 (it was `cudaErrorInvalidPitchValue`) and refuses a set pitch narrower than the
   row with `cudaErrorInvalidValue`, the 3D form of the one-row `cudaMemcpy2D` fix; more than one slice needs a `ysize` of
@@ -145,6 +167,17 @@ release says what runs and what it produces, never how fast a real GPU would run
   is `CUSPARSE_STATUS_INVALID_VALUE` from both (it was NOT_INITIALIZED, or success for the size).
   `cusparseCsr2cscEx2`/`_bufferSize` take `CUSPARSE_CSR2CSC_ALG1` only and refuse a null handle, the size is never 0,
   and a null buffer is refused (`e2e_card_edges_cusparse`).
+- cuSPARSE: `cusparseSpMV_bufferSize` asks for the workspace an RTX 3060's cuSPARSE 13.0 asks for with every format,
+  algorithm, operation and index type for single, double and complex values (and half and bfloat16 with `CSR_ALG2`
+  and `COO_ALG2`); every one was given the single-precision CSR size, where the card asks 515 bytes and up for
+  `CSR_ALG2` (CSC's for A^T), 524 and up for COO and nothing for COO's A^T, and steps at other entry counts for double
+  (2048) and complex values. With COO and A^T, `cusparseSpMV` takes a null buffer. `cusparseSpMV` and its
+  `_bufferSize` print the card's line on stderr for a refused argument (" ** On entry to cusparseSpMV() parameter
+  number 10 (externalBuffer) had an illegal value: NULL pointer", dimension mismatches, a conjugate transpose of
+  real data, an unsupported type combination, an algorithm of another format), unless `VGPU_QUIET=1`; the size
+  refuses a null alpha or beta, an unknown operation, x or y of the wrong size and an algorithm of another format
+  (CSR's for COO, COO's for CSC), which it took, and an unknown compute type is `CUSPARSE_STATUS_INVALID_VALUE` from
+  both, as on the card (it was NOT_SUPPORTED) (found by differential testing; `e2e_card_edges_spmv`).
 - Driver: `cuCtxSetCurrent` takes a destroyed context, as an RTX 3060 does (it was `CUDA_ERROR_INVALID_CONTEXT`), and every
   call that needs a context answers `CUDA_ERROR_CONTEXT_IS_DESTROYED` while the current one is dead: destroyed, a primary
   context released to nothing, or reset. `cudaDeviceReset` now resets the driver's primary context as
@@ -154,6 +187,24 @@ release says what runs and what it produces, never how fast a real GPU would run
   queries (`cudaGetDeviceCount`, `cudaGetDevice`, `cudaGetDeviceProperties`, `cudaDeviceGetAttribute`,
   `cudaPointerGetAttributes`) no longer make the primary context current or active, as on the card
   (`e2e_card_edges_context`).
+- Driver and runtime: with a destroyed context current, `cuCtxGetDevice` names its device as an RTX 3060 (CUDA 13.0) does
+  (it was `CUDA_ERROR_INVALID_CONTEXT`), and the runtime's calls that use the device (`cudaFree(0)`, `cudaMalloc`,
+  `cudaDeviceSynchronize`, `cudaStreamCreate`, ...) answer `cudaErrorDeviceUninitialized` and leave it current; they made
+  the primary context current and succeeded. For a dead context (destroyed, or a primary one not active) `cuCtxGetId` is
+  `CUDA_ERROR_CONTEXT_IS_DESTROYED`, and `cuCtxGetApiVersion` is that for the current context and
+  `CUDA_ERROR_INVALID_CONTEXT` for a named one; they succeeded, or answered INVALID_CONTEXT. `cuCtxGetFlags` answers 0 for
+  a primary context that is not active (it was `CUDA_ERROR_CONTEXT_IS_DESTROYED`). `cudaInitDevice` makes the primary
+  context active, current on no thread, and applies `deviceFlags` to it with `cudaInitDeviceFlagsAreValid`, refusing a
+  bad value (then leaving the context current, as the card does); it did neither, and refused any other bit of `flags`,
+  which the card ignores (found by differential testing; `e2e_card_edges_context`).
+- Runtime: stream capture as an RTX 3060 (CUDA 13.0) does it, in every mode. A wait that would merge two captures
+  (`cudaErrorStreamCaptureMerge`) invalidates both, not only the waiting stream's; the legacy stream's
+  `cudaStreamWaitEvent` is `cudaErrorStreamCaptureImplicit` and invalidates the capture while a blocking stream is
+  capturing (whatever the event) or when the event is a capture's; once an event's capture is invalidated, a wait on
+  it from a stream outside it is `cudaErrorInvalidValue` (the stream was forked into the dead capture) and from one of
+  its streams `cudaErrorStreamCaptureInvalidated`. `cudaStreamAddCallback` on a capturing stream is refused and the
+  capture goes on without it; it was invalidated (found by differential testing; `e2e_card_edges_capture`,
+  `e2e_capture_streams`).
 - AMD: the SDWA, DPP and VOP3P modifiers and the denormal and IEEE modes around them, audited against the guides and an RX 6800
   (follow-up to pantheonsim #613). The output modifier (`mul:2`, `mul:4`, `div:2`) did nothing on gfx942 and gfx950 only with IEEE mode
   or output denormals on; it now does nothing then on gfx90a, gfx1030 and gfx1100 too (CDNA2 to CDNA4 guides, 6.5, the RDNA3 guide,
@@ -171,8 +222,31 @@ release says what runs and what it produces, never how fast a real GPU would run
   addend whatever MODE says and keeps denormal halves, as the card does. New test `test_amd_gcn_mods`
   (`amd/tests/data/asm_mods.s`: 50 SDWA and DPP, 36 VOP3P and VOP3 and 24 gfx11 VOP3 DPP instructions over 1024 edge inputs, in three modes,
   gfx90a, gfx942, gfx1030 and gfx1100, tier off and on; the gfx1030 kernels run on the card gave exactly what the test expects).
-  test_amd_gcn_same_bits: 96 lines re-recorded, the ones these change (its header lists them). Not fixed: gfx1030's VOP2 16-bit
-  results keep the destination's high half on the card (`v_min_f16_e32`), where the executor zeroes it as gfx9 does.
+  test_amd_gcn_same_bits: 96 lines re-recorded, the ones these change (its header lists them).
+- AMD: a 16-bit vector result on gfx1030 now keeps the destination register's high half, as an RX 6800 and an RX 6700 XT do for every
+  16-bit VOP1, VOP2 and VOP3 result (e32, e64, DPP, DPP8; follow-up to pantheonsim #613); the executor zeroed it as gfx9 does.
+  `v_sat_pk_u8_i16` still zeroes it, as the cards and the guide's `{16'b0, ...}` say. gfx90a's `v_mad_f16`, `v_mad_u16`, `v_mad_i16`,
+  `v_fma_f16` and `v_div_fixup_f16` keep it too (the CDNA2 guide: "hi 16 bits are preserved"), as gfx942 and gfx950 already did;
+  their `_legacy` forms still zero it. gfx1030 ran none of `v_frexp_mant_f16`, `v_frexp_exp_i16_f16`, `v_sin_f16`, `v_cos_f16`,
+  `v_ldexp_f16`, `v_sat_pk_u8_i16`, `v_cvt_norm_i16_f16` and `v_cvt_norm_u16_f16` ("decoded but not implemented"); they run now, and
+  give the cards' bits (the sine and cosine of an infinity are 0xfe00 there). New test `test_amd_gcn_hi16` (`amd/tests/data/asm_hi16.s`,
+  75 instruction slots, gfx90a, gfx942 and gfx1030, tier off and on; the gfx1030 one against the cards' dwords).
+- AMD: gfx1030's NaNs are now the card's (an RX 6800 and an RX 6700 XT; follow-up to pantheonsim #613). A NaN result is the first NaN
+  source in operand order after its abs/neg (so `v_sub` and `v_subrev` flip the sign of the NaN they pass on), quieted with IEEE mode
+  on and passed through as it is (a signalling NaN too) with IEEE mode off; with no NaN source (inf - inf, 0 * inf, sqrt(-1),
+  fract(inf)) it is the negative default NaN, 0xfe00 or 0xffc00000; conversions carry the payload over; `v_fma`'s 0 * inf beats a NaN
+  addend; `v_min`/`v_max` with IEEE mode let a signalling NaN win; `v_min3`, `v_max3` and `v_med3` follow the guides' pseudocode over
+  those (with -0 below +0). The executor took NaNs from the host's arithmetic, in whichever order kept the old digests. `v_div_fixup`
+  takes S2's NaN, then S1's, and makes an infinity of a NaN quotient, as the card does. `v_sin_f32` of a whole number of turns is +0.
+  `v_div_fixup_f16` gave the quotient's magnitude for 0/y on every target; it gives the signed zero of the guides' pseudocode, as the
+  card does. The tier hands gfx1030's NaN results, its `v_div_fixup_f32` and its `v_sin_f32` to the interpreter. New test
+  `test_amd_gcn_nan` (`amd/tests/data/asm_nan.s`: 65 f16 and f32 instructions over pairs of 11 special values, IEEE mode on and off,
+  every dword against the cards'). test_amd_gcn_same_bits: 31 lines re-recorded (its header lists them).
+- AMD: gfx1100 refused eleven instructions as "decoded but not implemented": `v_frexp_mant_f16`, `v_frexp_exp_i16_f16`, `v_sin_f16`,
+  `v_cos_f16`, `v_ldexp_f16`, `v_sat_pk_u8_i16`, `v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16`, and the VOP3 `v_ashrrev_i16`, `v_max_i16`
+  and `v_min_i16`. They run now, through the code gfx1030 uses (AMD's machine-readable RDNA3 ISA describes each in the same words as its
+  RDNA2 one; no RDNA3 card was run). `test_amd_gcn_hi16` runs them on gfx1100 against the gfx1030 cards' low halves and checks that
+  every gfx1100 16-bit result keeps the other half of its register. test_amd_gcn_same_bits: 7 gfx1100 lines re-recorded.
   `amd/tests/hipcc/rdna3.cpp` expected `v_add_f32_e64 ... div:2` to halve in a default-mode (IEEE on) hipcc kernel; it now expects the
   modifier ignored (`rdna3.gfx1100` and `rdna3.w64.gfx1100` rebuilt: host code only, the device code is the same).
 - AMD: the clamp bit of the integer instructions saturates their result on every target, as the CDNA3 and CDNA4 guides say (6.5, and
@@ -336,7 +410,23 @@ release says what runs and what it produces, never how fast a real GPU would run
   routine on the card ([cuBLAS](nvidia/docs/cublas.md)). New unit test `test_cublas_host_mode_device_result` (pantheonsim #638).
 - NPP, CUDA 12 build: `nppGetStreamContext`, `nppGetStream` and `nppSetStream` (NPP 12's own stream, which CUDA 13's NPP removed)
   are exported from the shim, filling the context as NPP 12.3 does on an RTX 3060. New e2e test `e2e_npp_stream_context` (skips
-  on CUDA 13). `nppiFilterGaussBorder_8u_C1R_Ctx` is still absent (pantheonsim #617).
+  on CUDA 13) (pantheonsim #617).
+- NPP: `nppiFilterBoxBorder_8u_C1R`, `nppiGradientVectorPrewittBorder_8u16s_C1R` and `nppiFilterCannyBorder_8u_C1R` (and
+  their `_Ctx` forms) read the right pixels with a nonzero `oSrcOffset`. They took `pSrc` for the image's origin, but it points at
+  the pixel `oSrcOffset` names, as an RTX 3060 (NPP 13.0) shows; so a ROI inside the image read pixels `oSrcOffset` too far on,
+  past the image's end. A zero offset is unchanged. The `npp_imgproc` golden (`e2e_library_goldens`) has the box filter and the
+  gradients on ROIs at an offset reaching the source's right and bottom edge, measured on the card. Canny is not pinned there:
+  at a nonzero offset the card's result depends on what its scratch buffer held before the call; the simulator gives the
+  full image's result for the ROI, which is what the card gives at offset zero.
+- NPP: `nppiFilterGaussBorder_8u_C1R_Ctx` and its plain CUDA 12 form, with every mask NPP gives it (3x3 to 15x15), bit for bit
+  as NPP 13.0 and NPP 12.3 on an RTX 3060 on random, constant and impulse images. Measured: a separable single-precision filter,
+  vertical then horizontal, each an fma chain over the taps in the order 1, 0, 2, ..., n-1, truncated to 8 bits (so a constant
+  image can come out a count low, 3 to 2 with 3x3, which is what an earlier attempt could not explain); the taps are the card's
+  (the 32f form's impulse response is exactly their products), with sigma 0.6 + 0.4 * (n/2) rather than the header's formula.
+  Replicate is the only border, the source image's edge replicates (pSrc is the pixel at `oSrcOffset`), and the argument checks
+  and their order are the card's: null pointer, size, offset out of range, border mode, mask size, then an empty ROI succeeds and
+  a destination step below the ROI width is `NPP_STEP_ERROR`. The card's output is pinned in the `npp_imgproc` golden
+  (`e2e_library_goldens`) (pantheonsim #617).
 - HIP: `hipGraphInstantiateWithParams` takes `hipGraphInstantiateFlagUpload` and `hipGraphInstantiateFlagDeviceLaunch`, as ROCm's
   HIP does there (all four flags); it refused anything but AutoFreeOnLaunch and UseNodePriority with `hipErrorInvalidValue`, so
   Colvars, which instantiates its graphs with Upload and an `uploadStream`, stopped on its first frame. With Upload the graph is

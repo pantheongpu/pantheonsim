@@ -767,6 +767,133 @@ static void resize_modes() {
   }
 }
 
+/* ---------------- Gauss filter with border control (#617) ---------------- */
+
+// Every mask size on a random image (whole, and a ROI at an offset that runs
+// past the image's edge), the 256 constant images and the 256 impulses on
+// black and on white, which expose the taps and the truncation, and the
+// argument checks in their order.
+static void gauss_border() {
+  const NppiMaskSize masks[] = {NPP_MASK_SIZE_3_X_3, NPP_MASK_SIZE_5_X_5, NPP_MASK_SIZE_7_X_7, NPP_MASK_SIZE_9_X_9,
+                                NPP_MASK_SIZE_11_X_11, NPP_MASK_SIZE_13_X_13, NPP_MASK_SIZE_15_X_15};
+  char name[96];
+  for (NppiMaskSize m : masks) {
+    const int w = m == NPP_MASK_SIZE_3_X_3 ? 3 : m == NPP_MASK_SIZE_5_X_5 ? 5 : (int(m) - 400) / 50 + 7;
+    {
+      Img<Npp8u> s(29, 17, 1), d(29, 17, 1, false);
+      std::snprintf(name, sizeof name, "FilterGaussBorder 8u_C1R %dx%d", w, w);
+      report(name, nppiFilterGaussBorder_8u_C1R_Ctx(s.dev, s.step(), {29, 17}, {0, 0}, d.dev, d.step(), {29, 17}, m,
+                                                    NPP_BORDER_REPLICATE, ctx()),
+             d);
+      Img<Npp8u> e(26, 16, 1, false);
+      std::snprintf(name, sizeof name, "FilterGaussBorder 8u_C1R %dx%d offset", w, w);
+      report(name, nppiFilterGaussBorder_8u_C1R_Ctx(s.at(5, 3), s.step(), {29, 17}, {5, 3}, e.dev, e.step(), {26, 16}, m,
+                                                    NPP_BORDER_REPLICATE, ctx()),
+             e);
+    }
+    for (int kind = 0; kind < 3; ++kind) {
+      std::vector<Npp8u> all;
+      int st = 0;
+      for (int v = 0; v < 256; ++v) {
+        Img<Npp8u> s(17, 17, 1, false, Npp8u(kind == 0 ? v : kind == 1 ? 0 : 255)), d(17, 17, 1, false);
+        if (kind) {
+          s.host[static_cast<size_t>(8) * s.stride + 8] = Npp8u(v);
+          s.upload();
+        }
+        if (int r = nppiFilterGaussBorder_8u_C1R_Ctx(s.dev, s.step(), {17, 17}, {0, 0}, d.dev, d.step(), {17, 17}, m,
+                                                     NPP_BORDER_REPLICATE, ctx()))
+          st = r;
+        std::vector<Npp8u> o(d.host.size());
+        cudaMemcpy(o.data(), d.dev, o.size(), cudaMemcpyDeviceToHost);
+        for (int y = 0; y < 17; ++y) all.insert(all.end(), o.begin() + y * d.stride, o.begin() + y * d.stride + 17);
+      }
+      std::snprintf(name, sizeof name, "FilterGaussBorder 8u_C1R %dx%d %s", w, w,
+                    kind == 0 ? "constants" : kind == 1 ? "impulses on 0" : "impulses on 255");
+      report_values(name, st, all);
+    }
+  }
+  Img<Npp8u> s(16, 16, 1), d(16, 16, 1, false);
+  const NppiMaskSize M = NPP_MASK_SIZE_5_X_5;
+  const NppiBorderType R = NPP_BORDER_REPLICATE;
+  for (int bt = 0; bt <= 4; ++bt)
+    for (int mi : {0, 1, 100, 101, 200, 201, 300, 400, 800, 801}) {
+      std::snprintf(name, sizeof name, "FilterGaussBorder border %d mask %d", bt, mi);
+      report_status(name, nppiFilterGaussBorder_8u_C1R_Ctx(s.dev, s.step(), {16, 16}, {0, 0}, d.dev, d.step(), {16, 16},
+                                                           NppiMaskSize(mi), NppiBorderType(bt), ctx()));
+    }
+  const NppiMaskSize Z = NPP_MASK_SIZE_1_X_3;
+  const NppiBorderType X = NPP_BORDER_WRAP;
+  struct Case {
+    const char* what;
+    const Npp8u* src;
+    NppiSize ssz;
+    NppiPoint off;
+    Npp8u* dst;
+    int ds;
+    NppiSize roi;
+    NppiMaskSize m;
+    NppiBorderType bt;
+  } cases[] = {
+      {"null src, bad mask", nullptr, {16, 16}, {0, 0}, d.dev, d.step(), {16, 16}, Z, R},
+      {"null dst, empty roi", s.dev, {16, 16}, {0, 0}, nullptr, d.step(), {0, 16}, M, R},
+      {"negative roi, bad border", s.dev, {16, 16}, {0, 0}, d.dev, d.step(), {-1, 16}, M, X},
+      {"empty source", s.dev, {16, 0}, {0, 0}, d.dev, d.step(), {16, 16}, M, R},
+      {"negative offset, bad border", s.at(2, 2), {16, 16}, {-2, -2}, d.dev, d.step(), {8, 8}, M, X},
+      {"offset past the source", s.dev, {16, 16}, {0, 16}, d.dev, d.step(), {4, 4}, M, R},
+      {"empty roi, bad mask", s.dev, {16, 16}, {0, 0}, d.dev, d.step(), {0, 16}, Z, R},
+      {"empty roi, zero step", s.dev, {16, 16}, {0, 0}, d.dev, 0, {16, 0}, M, R},
+      {"zero step, bad border", s.dev, {16, 16}, {0, 0}, d.dev, 0, {16, 16}, M, X},
+      {"step below roi width", s.dev, {16, 16}, {0, 0}, d.dev, 8, {16, 16}, M, R},
+      {"roi past the source", s.dev, {8, 8}, {0, 0}, d.dev, d.step(), {16, 16}, M, R},
+  };
+  for (const Case& c : cases) {
+    std::snprintf(name, sizeof name, "FilterGaussBorder %s", c.what);
+    report_status(name, nppiFilterGaussBorder_8u_C1R_Ctx(c.src, s.step(), c.ssz, c.off, c.dst, c.ds, c.roi, c.m, c.bt,
+                                                         ctx()));
+  }
+  // The ROI past the source's edge, whose outside pixels replicate it.
+  report("FilterGaussBorder roi past the source", 0, d);
+}
+
+/* ---------------- border filters at a source offset ---------------- */
+
+// pSrc points at the pixel oSrcOffset names, not at the image's origin: the
+// box filter and the Prewitt gradients on a ROI inside the image, its left
+// and top halo real pixels and its right and bottom edge the image's.
+static void border_offsets() {
+  char name[96];
+  Img<Npp8u> s(29, 17, 1);
+  const struct { NppiPoint off; NppiSize roi; } rois[] = {{{6, 4}, {23, 13}}, {{20, 9}, {9, 8}}};
+  for (const auto& r : rois) {
+    Img<Npp8u> d(r.roi.width, r.roi.height, 1, false);
+    std::snprintf(name, sizeof name, "FilterBoxBorder offset %d,%d", r.off.x, r.off.y);
+    report(name,
+           nppiFilterBoxBorder_8u_C1R_Ctx(s.at(r.off.x, r.off.y), s.step(), {29, 17}, r.off, d.dev, d.step(), r.roi,
+                                          {5, 3}, {2, 1}, NPP_BORDER_REPLICATE, ctx()),
+           d);
+    for (NppiNorm norm : {nppiNormL1, nppiNormL2}) {
+      Img<Npp16s> gx(r.roi.width, r.roi.height, 1, false), gy(r.roi.width, r.roi.height, 1, false),
+          gm(r.roi.width, r.roi.height, 1, false);
+      Img<Npp32f> ga(r.roi.width, r.roi.height, 1, false);
+      const int st = nppiGradientVectorPrewittBorder_8u16s_C1R_Ctx(
+          s.at(r.off.x, r.off.y), s.step(), {29, 17}, r.off, gx.dev, gx.step(), gy.dev, gy.step(), gm.dev, gm.step(),
+          ga.dev, ga.step(), r.roi, NPP_MASK_SIZE_3_X_3, norm, NPP_BORDER_REPLICATE, ctx());
+      const char* part[] = {"x", "y", "mag", "angle"};
+      for (int i = 0; i < 4; ++i) {
+        std::snprintf(name, sizeof name, "GradientVectorPrewitt offset %d,%d %s norm %d", r.off.x, r.off.y, part[i],
+                      int(norm));
+        if (i == 0) report(name, st, gx);
+        if (i == 1) report(name, st, gy);
+        if (i == 2) report(name, st, gm);
+        if (i == 3) report(name, st, ga);
+      }
+    }
+  }
+  // Not Canny: on an RTX 3060 (NPP 13.0) its result at a nonzero offset depends on what the scratch buffer held
+  // before the call (81, 80 or 17 pixels unlike the full image's, after a full-image call, an offset call or a
+  // zeroed buffer), so there is no one answer to pin.
+}
+
 int main() {
   if (cudaFree(0) != cudaSuccess) {
     std::printf("no CUDA device\n");
@@ -779,5 +906,7 @@ int main() {
   filters();
   misc();
   resize_modes();
+  gauss_border();
+  border_offsets();
   return g_lines > 0 ? 0 : 1;
 }
