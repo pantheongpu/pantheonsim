@@ -379,7 +379,10 @@ target_link_options(vgpuhip PRIVATE "-Wl,--version-script=${CMAKE_SOURCE_DIR}/am
 set_target_properties(vgpuhip PROPERTIES LINK_DEPENDS "${CMAKE_SOURCE_DIR}/amd/src/libamdhip64.map")
 # ROCm 7 renamed the library libamdhip64.so.7; a program built with it asks for
 # that name, and the loader goes by the file name, so both point here.
-add_custom_command(TARGET vgpuhip POST_BUILD
+# A target of their own that runs on every build of vgpuhip, not a POST_BUILD step,
+# which runs only when the library is relinked: build/shim removed under an
+# up-to-date library stayed empty (#647).
+add_custom_target(vgpuhip_shim
   COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.6"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.7"
@@ -388,7 +391,9 @@ add_custom_command(TARGET vgpuhip POST_BUILD
   # (as ROCm's libraries do) gets one copy of it, and one set of devices.
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so.1"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so"
-  COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7, libhsa-runtime64.so.1)")
+  COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7, libhsa-runtime64.so.1)"
+  VERBATIM)
+add_dependencies(vgpuhip vgpuhip_shim)
 # rocminfo for a machine without ROCm (amd/src/rocminfo.cpp): the HSA system
 # and its agents, from the HSA runtime above. A session runs it as rocminfo
 # where the host has no ROCm rocminfo of its own.
@@ -1356,6 +1361,9 @@ add_custom_command(TARGET vgpu_cli POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/amd/tools/amd-smi" "${CMAKE_BINARY_DIR}/bin/amd-smi"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/amd/tools/rocm_agent_enumerator" "${CMAKE_BINARY_DIR}/bin/rocm_agent_enumerator"
   COMMENT "Installing drop-in monitoring tools into build/bin")
+# `vgpu run --gpu amd/...` is how a HIP program is run, so building the HIP shim
+# alone (cmake --build build --target vgpuhip) builds the launcher too (#647).
+add_dependencies(vgpuhip vgpu_cli)
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -2117,6 +2125,12 @@ target_compile_definitions(test_amd_gcn_int_clamp PRIVATE VGPU_SOURCE_DIR="${CMA
 # SDWA, DPP and VOP3P modifiers (clamp, output modifier, selects, op_sel, neg) and v_div_scale's clamp, against an RX 6800's results.
 vgpu_unit_test(test_amd_gcn_mods amd/tests/unit/test_gcn_mods.cpp)
 target_compile_definitions(test_amd_gcn_mods PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# What a 16-bit vector result leaves in the destination's high half (gfx9: zeroed, but the VOP3 multiply-adds; gfx10: kept), against an RX 6800.
+vgpu_unit_test(test_amd_gcn_hi16 amd/tests/unit/test_gcn_hi16.cpp)
+target_compile_definitions(test_amd_gcn_hi16 PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# Which NaN a gfx1030 float instruction gives (sign, payload, quieting, the invalid-operation NaN), against an RX 6800.
+vgpu_unit_test(test_amd_gcn_nan amd/tests/unit/test_gcn_nan.cpp)
+target_compile_definitions(test_amd_gcn_nan PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn_abandon amd/tests/unit/test_gcn_abandon.cpp)
 target_compile_definitions(test_amd_gcn_abandon PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_hostcall amd/tests/unit/test_hostcall.cpp)
@@ -2684,6 +2698,10 @@ set_tests_properties(amd_hip_abi PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIM
 add_test(NAME amd_hip_version COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip_version.sh)
 set_tests_properties(amd_hip_version PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
+# `vgpu run --gpu amd/...` from a build with the HIP shim and no CUDA shim, and an NVIDIA run that still needs libcuda.so.1 (#647).
+add_test(NAME amd_vgpu_run COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_vgpu_run_amd.sh)
+set_tests_properties(amd_vgpu_run PROPERTIES DEPENDS "vgpu_cli;vgpuhip"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
 # When a captured copy takes its host source: at launch for heap and live locals, at capture for a gone frame's.
 add_test(NAME amd_graph_host_source COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_graph_host_source.sh)
 set_tests_properties(amd_graph_host_source PROPERTIES DEPENDS vgpuhip
@@ -2954,6 +2972,17 @@ if(TARGET vgpucuda)
     DRIVER_PROC_ADDRESS_TABLE="${CMAKE_SOURCE_DIR}/nvidia/tests/data/driver_proc_address.rtx3060.txt")
   add_test(NAME test_driver_proc_address COMMAND test_driver_proc_address)
   set_tests_properties(test_driver_proc_address PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/a100;VGPU_QUIET=1")
+endif()
+# A primary context released from a library's destructor at exit, after the driver's teardown, as NVHPC's OpenACC
+# runtime releases it: CUDA_ERROR_DEINITIALIZED, as on an RTX 3060 (pantheonsim #646). No toolkit header needed.
+if(TARGET vgpucuda)
+  add_executable(test_driver_release_at_exit nvidia/tests/unit/test_driver_release_at_exit.cpp)
+  target_link_libraries(test_driver_release_at_exit PRIVATE ${CMAKE_DL_LIBS})
+  add_dependencies(test_driver_release_at_exit vgpucuda)
+  target_compile_definitions(test_driver_release_at_exit PRIVATE VGPU_LIBCUDA_PATH="$<TARGET_FILE:vgpucuda>")
+  add_test(NAME test_driver_release_at_exit COMMAND test_driver_release_at_exit)
+  set_tests_properties(test_driver_release_at_exit PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100;VGPU_QUIET=1"
+    PASS_REGULAR_EXPRESSION "PASS" FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 # cuProfilerStart/Stop and cudaProfilerStart/Stop answer as an RTX 3060 does: not initialised, no context, a dead context, no
 # device (they used to succeed always). One process per group: see the test's header. No toolkit header needed.
@@ -4507,14 +4536,25 @@ foreach(_edge cublas cusolver cusparse)
       TIMEOUT 300)
   endif()
 endforeach()
+# cusparseSpMV's workspace sizes and the lines it prints for its refusals (card_edges_spmv.cu).
+if(TARGET vgpucudart AND TARGET vgpucusparse)
+  add_test(NAME e2e_card_edges_spmv COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh spmv -lcusparse)
+  set_tests_properties(e2e_card_edges_spmv PROPERTIES
+    DEPENDS "vgpucudart;vgpucusparse"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+endif()
 # cuBLAS's level-2 and GEMM argument checks and the lines it prints for them (card_edges_blas2.cu), and the driver's
 # current context against the runtime's calls (card_edges_context.cu).
 if(TARGET vgpucudart AND TARGET vgpucublas)
-  add_test(NAME e2e_card_edges_blas2 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh blas2 -lcublas)
-  set_tests_properties(e2e_card_edges_blas2 PROPERTIES
-    DEPENDS "vgpucudart;vgpucublas"
-    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-    TIMEOUT 300)
+  # (card_edges_blas3.cu: the level-3 routines' and the extensions' lines.)
+  foreach(_blas blas2 blas3)
+    add_test(NAME e2e_card_edges_${_blas} COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh ${_blas} -lcublas)
+    set_tests_properties(e2e_card_edges_${_blas} PROPERTIES
+      DEPENDS "vgpucudart;vgpucublas"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      TIMEOUT 300)
+  endforeach()
 endif()
 if(TARGET vgpucudart AND TARGET vgpucuda)
   add_test(NAME e2e_card_edges_context COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh context -lcuda)

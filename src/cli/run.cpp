@@ -151,6 +151,18 @@ bool is_cuda_soname(const std::string& soname) {
   return false;
 }
 
+// The AMD libraries the shim stands in for, and the CMake target that puts each
+// in build/shim. A HIP-only build has only the first two.
+const char* amd_soname_target(const std::string& soname) {
+  static const struct { const char* prefix; const char* target; } kAmd[] = {
+      {"libamdhip64.so.", "vgpuhip"},       {"libhsa-runtime64.so.", "vgpuhip"},
+      {"librocprofiler-sdk.so.", "vgpurocprof"}, {"librocm_smi64.so.", "vgpursmi"},
+      {"libamd_smi.so.", "vgpuamdsmi"}};
+  for (const auto& a : kAmd)
+    if (soname.rfind(a.prefix, 0) == 0) return a.target;
+  return nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // Locating things
 // ---------------------------------------------------------------------------
@@ -320,12 +332,6 @@ int cmd_run(const std::vector<std::string>& args) {
     return usage(stderr);
   }
 
-  const std::string shim = exe_dir() + "/shim";
-  if (!is_file(shim + "/libcuda.so.1"))
-    return fail("no simulator libraries at %s. Build them first (cmake --build <dir>), "
-                "and run the vgpu binary from that same build.",
-                shim);
-
   // Validate the device model now rather than letting the program discover it,
   // so a typo is one clear line instead of a failure inside CUDA init.
   std::string gpu = o.gpu;
@@ -333,7 +339,20 @@ int cmd_run(const std::vector<std::string>& args) {
     const char* e = std::getenv("VGPU_GPU");
     gpu = (e && e[0]) ? e : "nvidia/h100";
   }
-  vgpu::load_gpu(gpu);  // throws with the list of known models
+  const bool amd = vgpu::load_gpu(gpu).vendor == "amd";  // throws with the list of known models
+
+  // The library the vendor's programs reach the simulator through. An AMD run needs
+  // the HIP shim and not the CUDA driver's, so a build of the HIP target alone runs
+  // (#647).
+  const std::string shim = exe_dir() + "/shim";
+  if (amd && !is_file(shim + "/libamdhip64.so.6"))
+    return fail("no HIP shim at %s/libamdhip64.so.6. Build it first "
+                "(cmake --build <dir> --target vgpuhip), and run the vgpu binary from that same build.",
+                shim);
+  if (!amd && !is_file(shim + "/libcuda.so.1"))
+    return fail("no simulator libraries at %s. Build them first (cmake --build <dir>), "
+                "and run the vgpu binary from that same build.",
+                shim);
 
   const std::string program = resolve_program(args[i]);
   std::vector<std::string> argv_str(args.begin() + i, args.end());
@@ -367,6 +386,20 @@ int cmd_run(const std::vector<std::string>& args) {
                  "          Rebuild the program against the CUDA version the shim was built for,\n"
                  "          or rebuild the shim against the program's toolkit.\n",
                  program.c_str(), n.c_str(), detail.c_str());
+    return 1;
+  }
+
+  // The same for the AMD libraries, each its own target: a HIP-only build has
+  // libamdhip64 but not ROCm SMI, and without this a program that needs it would
+  // load the host's, or stop in the loader with nothing said about the build.
+  for (const auto& n : dyn.needed) {
+    const char* target = amd_soname_target(n);
+    if (!target || is_file(shim + "/" + n)) continue;
+    std::fprintf(stderr,
+                 "vgpu run: %s needs %s, but\n"
+                 "          this build of the simulator has no %s.\n"
+                 "          Build it with: cmake --build <dir> --target %s\n",
+                 program.c_str(), n.c_str(), n.c_str(), target);
     return 1;
   }
 
