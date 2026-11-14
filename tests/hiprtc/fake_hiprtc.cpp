@@ -27,6 +27,19 @@
 namespace {
 const char* const kDependencies[] = {"libamd_comgr.so.3", "libhiprtc-builtins.so"};   // (the names the cache reads out of this file)
 
+// A dependency by its name, which the loader finds through this library's RUNPATH ($ORIGIN). Under ThreadSanitizer dlopen is
+// libtsan's interceptor, so the loader takes libtsan for the caller and never looks at that RUNPATH: then the same file is opened by
+// its path, beside this library.
+void* open_dependency(const char* name) {
+  if (void* h = dlopen(name, RTLD_NOW | RTLD_LOCAL)) return h;
+  Dl_info me{};
+  if (!dladdr(reinterpret_cast<void*>(&open_dependency), &me) || !me.dli_fname) return nullptr;
+  const std::string self = me.dli_fname;
+  const size_t slash = self.rfind('/');
+  if (slash == std::string::npos) return nullptr;
+  return dlopen((self.substr(0, slash + 1) + name).c_str(), RTLD_NOW | RTLD_LOCAL);
+}
+
 struct Program {
   std::string src, name;
   std::vector<std::string> headers, include_names, exprs, lowered;
@@ -100,8 +113,8 @@ API int hiprtcCompileProgram(void* prog, int n, const char** options) {
   }
   if (const char* ms = std::getenv("FAKE_HIPRTC_SLEEP_MS")) usleep(static_cast<useconds_t>(std::atoi(ms)) * 1000);
   // The compiler library and the built-in header, loaded by name as the real library loads them.
-  void* comgr = dlopen(kDependencies[0], RTLD_NOW | RTLD_LOCAL);
-  void* builtins = dlopen(kDependencies[1], RTLD_NOW | RTLD_LOCAL);
+  void* comgr = open_dependency(kDependencies[0]);
+  void* builtins = open_dependency(kDependencies[1]);
   using VersionFn = const char* (*)();
   const auto version = comgr ? reinterpret_cast<VersionFn>(dlsym(comgr, "fake_comgr_version")) : nullptr;
   const char* header = builtins ? static_cast<const char*>(dlsym(builtins, "__hipRTC_header")) : nullptr;
