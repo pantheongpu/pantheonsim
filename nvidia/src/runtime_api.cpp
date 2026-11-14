@@ -1235,13 +1235,16 @@ cudaError_t traced_call(const char* api, Body body, A... a) {
     note_kept(*kept);
   }
   vgpu::profiling::ApiCall call(api);
-  const cudaError_t rc = [&] {
+  // A block, not a lambda: a lambda capturing `a` by reference reloads each argument through the reference, and
+  // UBSan's enum check then refuses the out-of-range enum values the bodies are there to refuse.
+  cudaError_t rc;
+  {
     struct Depth {
       Depth() { ++t_traced_depth; }
       ~Depth() { --t_traced_depth; }
     } depth;
-    return body(a...);
-  }();
+    rc = body(a...);
+  }
   // Every call that fails makes its error the thread's last error, as on an RTX 3060: cudaEventElapsedTime on an
   // event never recorded, cudaStreamEndCapture on a stream not capturing, cudaMemcpy2D with a pitch too small, and
   // the rest that do not go through guard(). A query's not-ready is not an error. Only the program's own call counts:
