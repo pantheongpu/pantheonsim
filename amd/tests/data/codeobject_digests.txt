@@ -43,6 +43,9 @@ data/asm_hwid11.gfx1100.o	da8d864ccb3acd93
 data/asm_hwid12.gfx1201.o	52a4153f56d0cfd5
 data/asm_images.gfx1100.o	582894df421c4e25
 data/asm_images90a.gfx90a.o	7ddb936913f430e5
+data/asm_int_clamp.gfx1030.o	1e66bc1660a0948
+data/asm_int_clamp.gfx90a.o	834097a4dd422151
+data/asm_int_clamp.gfx942.o	91e7cf3e97260d82
 data/asm_isa_gaps.gfx942.o	2345a9fa4bd18927
 data/asm_issue621.gfx90a.o	e9f4fdf4a5b3ff87
 data/asm_issue621.gfx942.o	5c09fa8b91c40754

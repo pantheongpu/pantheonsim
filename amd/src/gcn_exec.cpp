@@ -3057,8 +3057,11 @@ struct Machine {
       if (reversed) std::swap(a, b);
       const uint64_t c = takes_carry ? (carried_in >> lane) & 1 : 0;
       const uint64_t r = add ? a + b + c : a - b - c;
-      if (add ? (r >> 32) & 1 : a < b + c) carried_out |= uint64_t{1} << lane;
-      write_lane(w, in.dst[0], lane, static_cast<uint32_t>(r));
+      const bool carry = add ? (r >> 32) & 1 : a < b + c;
+      if (carry) carried_out |= uint64_t{1} << lane;
+      // Clamped, the result saturates (a sum past 32 bits is their maximum, a difference below zero is zero) and the carry out is
+      // the unclamped one's (CDNA3 guide: "Supports saturation (unsigned 32-bit integer domain)"; an RX 6800 does the same).
+      write_lane(w, in.dst[0], lane, in.clamp && carry ? (add ? 0xFFFFFFFFu : 0u) : static_cast<uint32_t>(r));
     }
     write_scalar(w, in.dst[1], carried_out);
     return true;
@@ -3969,7 +3972,7 @@ struct Machine {
     if (!(op == "v_mad_u16"_op || op == "v_mad_i16"_op)) goto L_ladder_14;
     {
       each([&](uint32_t lane) {
-        if (in.clamp && is_guide_arch(in)) {   // CLAMP "supports saturation" (CDNA3 and CDNA4 guides, 6.5)
+        if (in.clamp) {   // CLAMP "supports saturation" (CDNA3 and CDNA4 guides, 6.5; an RX 6800 saturates too)
           const int64_t v = op == "v_mad_u16"_op ? int64_t{u16(0, lane)} * u16(1, lane) + u16(2, lane)
                                                  : int64_t{i16(0, lane)} * i16(1, lane) + i16(2, lane);
           write_lane(w, in.dst[0], lane, static_cast<uint16_t>(op == "v_mad_u16"_op ? std::min<int64_t>(v, 65535) : std::clamp<int64_t>(v, -32768, 32767)));
@@ -5180,7 +5183,7 @@ struct Machine {
     {
       each([&](uint32_t lane) {
         const int32_t d = int32_t{u16(1, lane)} - u16(0, lane);
-        write_lane(w, in.dst[0], lane, static_cast<uint16_t>(in.clamp && is_guide_arch(in) ? std::max(d, 0) : d));
+        write_lane(w, in.dst[0], lane, static_cast<uint16_t>(in.clamp ? std::max(d, 0) : d));
       });
     }
     break;
@@ -5273,8 +5276,8 @@ struct Machine {
       // for the hi form); the masked form leaves out the bytes where the second source, the reference, is zero.
       each([&](uint32_t lane) {
         const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
-        write_lane(w, in.dst[0], lane,
-                   (sad_bytes(a, b, op == "v_msad_u8"_op) << (op == "v_sad_hi_u8"_op ? 16 : 0)) + lane_src(w, in.src[2], lane));
+        const uint64_t r = (uint64_t{sad_bytes(a, b, op == "v_msad_u8"_op)} << (op == "v_sad_hi_u8"_op ? 16 : 0)) + lane_src(w, in.src[2], lane);
+        write_lane(w, in.dst[0], lane, in.clamp ? static_cast<uint32_t>(std::min<uint64_t>(r, 0xFFFFFFFFu)) : static_cast<uint32_t>(r));   // (clamped, it saturates)
       });
     }
     break;
@@ -5284,7 +5287,8 @@ struct Machine {
       each([&](uint32_t lane) {
         const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
         const auto d = [](uint32_t x, uint32_t y) { return x > y ? x - y : y - x; };
-        write_lane(w, in.dst[0], lane, d(a & 0xFFFF, b & 0xFFFF) + d(a >> 16, b >> 16) + lane_src(w, in.src[2], lane));
+        const uint64_t r = uint64_t{d(a & 0xFFFF, b & 0xFFFF)} + d(a >> 16, b >> 16) + lane_src(w, in.src[2], lane);
+        write_lane(w, in.dst[0], lane, in.clamp ? static_cast<uint32_t>(std::min<uint64_t>(r, 0xFFFFFFFFu)) : static_cast<uint32_t>(r));   // (clamped, it saturates)
       });
     }
     break;
@@ -5344,7 +5348,7 @@ struct Machine {
     if (!(op == "v_mad_i32_i16"_op)) goto L_ladder_11;
     {
       each([&](uint32_t lane) {
-        if (in.clamp && is_guide_arch(in)) {
+        if (in.clamp) {
           const int64_t v = int64_t{i16(0, lane)} * i16(1, lane) + static_cast<int32_t>(lane_src(w, in.src[2], lane));
           write_lane(w, in.dst[0], lane, static_cast<uint32_t>(std::clamp<int64_t>(v, INT32_MIN, INT32_MAX)));
           return;
@@ -5394,7 +5398,7 @@ struct Machine {
     if (!(op == "v_mad_u16"_op || op == "v_mad_i16"_op)) goto L_ladder_11;
     {
       each([&](uint32_t lane) {
-        if (in.clamp && is_guide_arch(in)) {   // CLAMP "supports saturation" (CDNA3 and CDNA4 guides, 6.5)
+        if (in.clamp) {   // CLAMP "supports saturation" (CDNA3 and CDNA4 guides, 6.5; an RX 6800 saturates too)
           const int64_t v = op == "v_mad_u16"_op ? int64_t{u16(0, lane)} * u16(1, lane) + u16(2, lane)
                                                  : int64_t{i16(0, lane)} * i16(1, lane) + i16(2, lane);
           write_lane(w, in.dst[0], lane, static_cast<uint16_t>(op == "v_mad_u16"_op ? std::min<int64_t>(v, 65535) : std::clamp<int64_t>(v, -32768, 32767)));
@@ -5543,7 +5547,7 @@ struct Machine {
           if (!(op == "v_mad_u32_u16"_op)) goto L_ladder_12;
           {
             each([&](uint32_t lane) {
-              if (in.clamp && is_guide_arch(in)) {
+              if (in.clamp) {
                 write_lane(w, in.dst[0], lane, static_cast<uint32_t>(std::min<uint64_t>(uint64_t{u16(0, lane)} * u16(1, lane) + lane_src(w, in.src[2], lane), 0xFFFFFFFFull)));
                 return;
               }
@@ -6100,6 +6104,11 @@ struct Machine {
     if (!(op == "v_mad_legacy_u16"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
+        if (in.clamp) {   // (CDNA3 guide: "Supports saturation (unsigned 16-bit integer domain)")
+          const uint64_t v = uint64_t{lane_src(w, in.src[0], lane) & 0xFFFF} * (lane_src(w, in.src[1], lane) & 0xFFFF) + (lane_src(w, in.src[2], lane) & 0xFFFF);
+          write_lane(w, in.dst[0], lane, static_cast<uint16_t>(std::min<uint64_t>(v, 0xFFFF)));
+          return;
+        }
         write_lane(w, in.dst[0], lane,
                    static_cast<uint16_t>(lane_src(w, in.src[0], lane) * lane_src(w, in.src[1], lane) +
                                          lane_src(w, in.src[2], lane)));
@@ -6543,6 +6552,12 @@ struct Machine {
       // The low 24 bits of each factor, signed.
       each([&](uint32_t lane) {
         const auto i24 = [](uint32_t v) { return static_cast<int32_t>(v << 8) >> 8; };
+        if (in.clamp) {   // (clamped, the sum saturates to the int32 range)
+          const int64_t r = int64_t{i24(lane_src(w, in.src[0], lane))} * i24(lane_src(w, in.src[1], lane)) +
+                            static_cast<int32_t>(lane_src(w, in.src[2], lane));
+          write_lane(w, in.dst[0], lane, static_cast<uint32_t>(std::clamp<int64_t>(r, INT32_MIN, INT32_MAX)));
+          return;
+        }
         write_lane(w, in.dst[0], lane,
                    static_cast<uint32_t>(i24(lane_src(w, in.src[0], lane))) * static_cast<uint32_t>(i24(lane_src(w, in.src[1], lane))) +
                        lane_src(w, in.src[2], lane));   // (unsigned: the wrap is the same bits and is not undefined)
@@ -6554,13 +6569,16 @@ struct Machine {
     {
       sdst_bits = 0;
       each([&](uint32_t lane) {
-        // A signed 32x32 product added to a signed 64-bit value, and whether
-        // that overflowed.
+        // A signed 32x32 product added to a signed 64-bit value. The scalar bit is bit 64 of the 65-bit result,
+        // "{ D1.i1, D0.i64 } = 65'B(65'I(S0.i32) * 65'I(S1.i32) + 65'I(S2.i64))" (CDNA3 guide): the sign of the
+        // exact result, which an RX 6800 gives too -- not whether the sum overflowed. Clamped, the result
+        // saturates to the int64 range.
         const __int128 p = static_cast<__int128>(static_cast<int32_t>(lane_src(w, in.src[0], lane))) *
                                static_cast<int32_t>(lane_src(w, in.src[1], lane)) +
                            static_cast<int64_t>(lane_src64(w, in.src[2], lane));
-        write_lane64(w, in.dst[0], lane, static_cast<uint64_t>(p));
-        if (p != static_cast<int64_t>(p)) sdst_bits |= uint64_t{1} << lane;
+        const __int128 r = !in.clamp ? p : p < INT64_MIN ? __int128{INT64_MIN} : p > INT64_MAX ? __int128{INT64_MAX} : p;
+        write_lane64(w, in.dst[0], lane, static_cast<uint64_t>(r));
+        if (p < 0) sdst_bits |= uint64_t{1} << lane;
       });
       if (in.dst.size() > 1) write_scalar(w, in.dst[1], sdst_bits);
     }
@@ -6627,6 +6645,11 @@ struct Machine {
       each([&](uint32_t lane) {
         // The low 24 bits of each source, as signed numbers; the product wraps, so it is formed unsigned.
         const auto i24 = [](uint32_t v) { return static_cast<int32_t>(v << 8) >> 8; };
+        if (in.clamp) {   // (the VOP3 form's clamp: the 48-bit product saturates to the int32 range, as an RX 6800 does)
+          const int64_t p = int64_t{i24(lane_src(w, in.src[0], lane))} * i24(lane_src(w, in.src[1], lane));
+          write_lane(w, in.dst[0], lane, static_cast<uint32_t>(std::clamp<int64_t>(p, INT32_MIN, INT32_MAX)));
+          return;
+        }
         write_lane(w, in.dst[0], lane,
                    static_cast<uint32_t>(i24(lane_src(w, in.src[0], lane))) * static_cast<uint32_t>(i24(lane_src(w, in.src[1], lane))));
       });
@@ -6648,6 +6671,11 @@ struct Machine {
     if (!(op == "v_mul_lo_u16_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
+        if (in.clamp) {   // (CDNA3 guide: "Supports saturation (unsigned 16-bit integer domain)")
+          write_lane(w, in.dst[0], lane,
+                     static_cast<uint16_t>(std::min<uint32_t>((lane_src(w, in.src[0], lane) & 0xFFFF) * (lane_src(w, in.src[1], lane) & 0xFFFF), 0xFFFF)));
+          return;
+        }
         write_lane(w, in.dst[0], lane,
                    static_cast<uint16_t>(lane_src(w, in.src[0], lane) * lane_src(w, in.src[1], lane)));
       });
@@ -6718,9 +6746,9 @@ struct Machine {
     if (!(op == "v_mad_u32_u24"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_lane(w, in.dst[0], lane,
-                   (lane_src(w, in.src[0], lane) & 0xFFFFFFu) * (lane_src(w, in.src[1], lane) & 0xFFFFFFu) +
-                       lane_src(w, in.src[2], lane));
+        const uint64_t r = uint64_t{lane_src(w, in.src[0], lane) & 0xFFFFFFu} * (lane_src(w, in.src[1], lane) & 0xFFFFFFu) +
+                           lane_src(w, in.src[2], lane);
+        write_lane(w, in.dst[0], lane, in.clamp ? static_cast<uint32_t>(std::min<uint64_t>(r, 0xFFFFFFFFu)) : static_cast<uint32_t>(r));   // (clamped, it saturates)
       });
     }
     break;
@@ -7222,7 +7250,7 @@ struct Machine {
     {
       each([&](uint32_t lane) {
         const uint32_t a = lane_src(w, in.src[1], lane), b = lane_src(w, in.src[0], lane);
-        write_lane(w, in.dst[0], lane, in.clamp && is_guide_arch(in) && a < b ? 0u : a - b);   // (clamped, a difference below zero is zero)
+        write_lane(w, in.dst[0], lane, in.clamp && a < b ? 0u : a - b);   // (clamped, a difference below zero is zero)
       });
     }
     break;
@@ -7272,9 +7300,9 @@ struct Machine {
     if (!(op == "v_mul_u32_u24_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        // Only the low 24 bits of each source take part.
-        write_lane(w, in.dst[0], lane,
-                   (lane_src(w, in.src[0], lane) & 0xFFFFFF) * (lane_src(w, in.src[1], lane) & 0xFFFFFF));
+        // Only the low 24 bits of each source take part; clamped (the VOP3 form), the 48-bit product saturates.
+        const uint64_t p = uint64_t{lane_src(w, in.src[0], lane) & 0xFFFFFF} * (lane_src(w, in.src[1], lane) & 0xFFFFFF);
+        write_lane(w, in.dst[0], lane, in.clamp ? static_cast<uint32_t>(std::min<uint64_t>(p, 0xFFFFFFFFu)) : static_cast<uint32_t>(p));
       });
     }
     break;
@@ -7481,8 +7509,9 @@ struct Machine {
             const unsigned __int128 p = static_cast<unsigned __int128>(lane_src(w, in.src[0], lane)) *
                                             lane_src(w, in.src[1], lane) +
                                         lane_src64(w, in.src[2], lane);
-            write_lane64(w, in.dst[0], lane, static_cast<uint64_t>(p));
-            if (static_cast<uint64_t>(p >> 64)) sdst_bits |= uint64_t{1} << lane;
+            const bool carry = static_cast<uint64_t>(p >> 64) != 0;
+            write_lane64(w, in.dst[0], lane, in.clamp && carry ? ~uint64_t{0} : static_cast<uint64_t>(p));   // (clamped, it saturates)
+            if (carry) sdst_bits |= uint64_t{1} << lane;
           });
           if (in.dst.size() > 1) write_scalar(w, in.dst[1], sdst_bits);
         } else if (w.exec) {

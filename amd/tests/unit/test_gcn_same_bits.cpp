@@ -16,7 +16,11 @@
 // 15838): the baseline's digest of them was the text of "decoded but not implemented", and a real RX 6800 runs the instructions (the bench-amd probe
 // workload p_pk16 uses all three and matches its host reference there). Nine more were recorded after the fix of issue #613, from the tree that has
 // it: gfx1250's v_div_fmas_f32/f64 and v_div_fixup_f32/f64 with a clamp or an output modifier (lines 12493 to 12577), which the baseline wrote
-// unclamped and unscaled. Every other digest is the baseline's.
+// unclamped and unscaled. Twenty more were recorded after the integer clamp fix (test_amd_gcn_int_clamp), from the tree that has it: v_mad_i64_i32 and
+// gfx1250's v_mad_co_i64_i32, whose scalar bit is bit 64 of the 65-bit result (the CDNA3 guide and an RX 6800) where the baseline wrote whether the
+// sum overflowed, and integer instructions with the clamp bit (v_add_co_u32, v_sub_co_u32, v_subrev_nc_u32, v_mul_i32_i24, v_mad_i32_i24, v_mad_u16)
+// that the baseline left unsaturated (lines 1230-1232, 3193-3195, 5072-5074, 7305, 9109, 12041, 12412, 12593, 12766-12768, 12770, 12775, 16046).
+// Every other digest is the baseline's.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>

@@ -116,6 +116,12 @@ for t in gfx90a gfx942; do
   echo "wrote $(pwd)/asm_div_clamp.$t.o"
 done
 
+# The clamp bit of the integer instructions (test_amd_gcn_int_clamp): the same scheme, gfx90a, gfx942 and gfx1030 (wave32).
+for t in gfx90a gfx942 gfx1030; do
+  "$clang" -x assembler-with-cpp -D"$(echo "$t" | tr a-z A-Z)" -target amdgcn-amd-amdhsa -mcpu=$t -c asm_int_clamp.s -o asm_int_clamp.$t.o
+  echo "wrote $(pwd)/asm_int_clamp.$t.o"
+done
+
 # gfx1250's: the same for what the CDNA 5 document defines and the executor refused (test_amd_gcn_cdna_gaps).
 for src in asm_cdna5_gaps; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -c "$src.s" -o "$src.gfx1250.o"

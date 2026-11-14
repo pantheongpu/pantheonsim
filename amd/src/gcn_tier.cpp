@@ -2894,8 +2894,9 @@ void tier_classify(Inst& in) {
       if ((e.flags & kCdnaOnly) && in.arch != gcn::Target::Gfx90a && in.arch != gcn::Target::Gfx942 && in.arch != gcn::Target::Gfx950) return fail();
       if ((e.flags & (kNoOmod | kFloatOut)) && in.omod) return fail();
       if ((e.flags & kFloatOut) && in.clamp) return fail();
-      // (CDNA3 and CDNA4 apply the clamp bit to the integer instructions that have one and to the conversions to float: the interpreter's.)
-      if (in.clamp && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && (!is_f || (e.flags & kIgnoreMods))) return fail();
+      // (The clamp bit of an integer instruction saturates its result, on every target -- CDNA3 and CDNA4 guides, 6.5, and an RX 6800 --
+      // and CDNA3 and CDNA4 apply it to the conversions to float too: the interpreter's.)
+      if (in.clamp && (!is_f || ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && (e.flags & kIgnoreMods)))) return fail();
       // (gfx942 and gfx950 apply or ignore an output modifier by MODE and flush what it makes denormal, CDNA3 and CDNA4 guides, 6.5: the interpreter's.)
       if (in.omod && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && !(e.flags & kIgnoreMods)) return fail();
       for (int k = 0; k < e.arity; ++k) {
@@ -2998,6 +2999,7 @@ void tier_classify(Inst& in) {
       const std::string& nm = in.name;
       const bool takes = nm.find("_addc_") != std::string::npos || nm.find("_subb") != std::string::npos;
       if (takes && in.src.size() < 3) return;
+      if (in.clamp) return fail();   // (clamped, the result saturates: the interpreter's carry_alu)
       if (!vgpr_dst(in.dst[0], f.dst, 1) || !scalar_dst(in.dst[1], f.dst2)) return fail();
       if (!lane_src32(in.src[0], f.src[0], false) || !lane_src32(in.src[1], f.src[1], false)) return fail();
       if (takes && !scalar_src(in.src[2], f.src[2])) return fail();
@@ -3203,6 +3205,7 @@ void tier_classify(Inst& in) {
     }
     case Cat::Mad64: {
       if (!vector_enc || in.dst.empty() || in.dst.size() > 2 || in.src.size() < 3) return;
+      if (in.clamp) return fail();   // (clamped, the result saturates: the interpreter's)
       if (!vgpr_dst(in.dst[0], f.dst, 2)) return fail();
       if (!lane_src32(in.src[0], f.src[0], false) || !lane_src32(in.src[1], f.src[1], false) || !lane_src64(in.src[2], f.src[2], false)) return fail();
       if (in.dst.size() == 2 && !scalar_dst(in.dst[1], f.dst2)) return fail();
