@@ -42,6 +42,12 @@ release says what runs and what it produces, never how fast a real GPU would run
   and `gesvd` with `m < n` is `CUSOLVER_STATUS_INVALID_VALUE` with info 0 (it was NOT_SUPPORTED). `gesvd` with `jobu = 'O'` or
   `jobvt = 'O'` works, writing the vectors over A; it was refused. `cusolverDnSetAdvOptions` refuses unknown functions and algorithms
   (`e2e_card_edges_cusolver`).
+- cuSPARSE: `cusparseCreateCsr/Csc/Coo` refuse an unknown index base and more entries than the matrix has places,
+  `cusparseCreateDnMat` an unknown order and a leading dimension below a column (COL) or row (ROW), and `cusparseSpMV` an unknown
+  operation, a null alpha or beta, a non-CSR algorithm for a CSR matrix, and a compute type the card does not offer for the data
+  (`CUSPARSE_STATUS_NOT_SUPPORTED`, also from `cusparseSpMV_bufferSize`). The `cusparseSetMat*` setters refuse values their enums do
+  not have, destroying a null handle or descriptor succeeds, and `cusparseGetErrorName`/`String` give the card's texts
+  (`e2e_card_edges_cusparse`).
 - Runtime: a copy, fill or kernel launch issued on a stream behind a host function that has not finished returns at once and runs
   after it, in stream order, as on an RTX 3060. It used to run inside the call after waiting for the host function, so a host function
   that waits for something the program does after the call (Celeritas' `AsyncSnapshotTest.device_pending`) hung the program.
