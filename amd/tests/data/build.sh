@@ -128,6 +128,16 @@ for t in gfx90a gfx942 gfx1030 gfx1100; do
   echo "wrote $(pwd)/asm_mods.$t.o"
 done
 
+# What a 16-bit result leaves in the destination's high half (test_amd_gcn_hi16): the same scheme, gfx90a, gfx942, gfx1030 and gfx1100.
+for t in gfx90a gfx942 gfx1030 gfx1100; do
+  "$clang" -nogpulib -x assembler-with-cpp -D"$(echo "$t" | tr a-z A-Z)" -target amdgcn-amd-amdhsa -mcpu=$t -c asm_hi16.s -o asm_hi16.$t.o
+  echo "wrote $(pwd)/asm_hi16.$t.o"
+done
+
+# Which NaN a float instruction gives (test_amd_gcn_nan): gfx1030 (wave32), the object the cards ran.
+"$clang" -nogpulib -x assembler-with-cpp -target amdgcn-amd-amdhsa -mcpu=gfx1030 -c asm_nan.s -o asm_nan.gfx1030.o
+echo "wrote $(pwd)/asm_nan.gfx1030.o"
+
 # gfx1250's: the same for what the CDNA 5 document defines and the executor refused (test_amd_gcn_cdna_gaps).
 for src in asm_cdna5_gaps; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -c "$src.s" -o "$src.gfx1250.o"

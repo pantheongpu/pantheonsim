@@ -119,8 +119,10 @@ int main() {
     for (int i = 0; i < kN; ++i) CHECK(h[i] == (100 + i) + (1000 + i));
     CK(cudaGraphExecDestroy(e));
     CK(cudaGraphDestroy(g));
-    // Recorded again outside a capture, the event is an ordinary one.
+    // Recorded again outside a capture, the event is an ordinary one (waited for first: on a card the record
+    // may not have completed when it is queried).
     CK(cudaEventRecord(fork, s1));
+    CK(cudaEventSynchronize(fork));
     CK(cudaEventQuery(fork));
   }
 
@@ -146,26 +148,32 @@ int main() {
     WANT(cudaStreamWaitEvent(s1, outside, 0), cudaErrorStreamCaptureIsolation);
     WANT(cudaStreamEndCapture(s1, &g), cudaErrorStreamCaptureInvalidated);
 
-    // Two captures cannot be merged by a wait.
+    // Two captures cannot be merged by a wait; the attempt invalidates both (an RTX 3060). s1 is a blocking stream
+    // and still capturing, so the legacy stream cannot wait (the card answers that for any event then).
     CK(cudaStreamBeginCapture(s1, cudaStreamCaptureModeRelaxed));
     CK(cudaStreamBeginCapture(s3, cudaStreamCaptureModeRelaxed));
     CK(cudaEventRecord(fork, s1));
     WANT(cudaStreamWaitEvent(s3, fork, 0), cudaErrorStreamCaptureMerge);
     WANT(cudaStreamEndCapture(s3, &g), cudaErrorStreamCaptureInvalidated);
-    // The legacy stream cannot be forked into a capture.
     WANT(cudaStreamWaitEvent(0, fork, 0), cudaErrorStreamCaptureImplicit);
     // A stream already capturing cannot begin again.
     WANT(cudaStreamBeginCapture(s1, cudaStreamCaptureModeRelaxed), cudaErrorIllegalState);
-    CK(cudaStreamEndCapture(s1, &g));
-    CK(cudaGraphDestroy(g));
+    WANT(cudaStreamEndCapture(s1, &g), cudaErrorStreamCaptureInvalidated);
+    // The legacy stream cannot be forked into a capture (which that invalidates).
+    CK(cudaStreamBeginCapture(s1, cudaStreamCaptureModeRelaxed));
+    CK(cudaEventRecord(fork, s1));
+    WANT(cudaStreamWaitEvent(0, fork, 0), cudaErrorStreamCaptureImplicit);
+    WANT(cudaStreamEndCapture(s1, &g), cudaErrorStreamCaptureInvalidated);
     // The legacy stream cannot capture at all.
     WANT(cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed), cudaErrorStreamCaptureUnsupported);
 
     // A callback is not supported under capture, and neither is synchronizing
-    // the capturing stream; each invalidates the capture.
+    // the capturing stream. The callback is refused and the capture goes on (an RTX 3060); the synchronization
+    // invalidates it.
     CK(cudaStreamBeginCapture(s1, cudaStreamCaptureModeRelaxed));
     WANT(cudaStreamAddCallback(s1, never, nullptr, 0), cudaErrorStreamCaptureUnsupported);
-    WANT(cudaStreamEndCapture(s1, &g), cudaErrorStreamCaptureInvalidated);
+    CK(cudaStreamEndCapture(s1, &g));
+    CK(cudaGraphDestroy(g));
     CK(cudaStreamBeginCapture(s1, cudaStreamCaptureModeRelaxed));
     WANT(cudaStreamSynchronize(s1), cudaErrorStreamCaptureUnsupported);
     WANT(cudaStreamEndCapture(s1, &g), cudaErrorStreamCaptureInvalidated);
@@ -250,6 +258,9 @@ int main() {
     void* args[] = {&slots, &seen};
     CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(neighbours), dim3(blocks), dim3(32),
                                    args, 0, s1));
+    // (An RTX 3060 under WSL, driver 13.3, refuses this launch with cudaErrorStreamCaptureUnsupported and invalidates
+    // the capture; the simulator keeps CUDA's documented child-graph capture. This is where the test and the card
+    // part.)
     CK(cudaGraphLaunch(inner, s1));                 // a child node, not run now
     cudaGraph_t g;
     CK(cudaStreamEndCapture(s1, &g));

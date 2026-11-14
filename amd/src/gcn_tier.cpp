@@ -2939,6 +2939,8 @@ void tier_classify(Inst& in) {
             break;
           default: break;   // v_min_f32 and v_max_f32 (MODE.IEEE decides), the rounding and the angles in turns: the interpreter's
         }
+        if (in.arch == gcn::Target::Gfx1030) f.nan = kNanHandBack;   // (gfx1030's NaNs are the card's: the interpreter's rdna2_nan)
+        if (in.arch == gcn::Target::Gfx1030 && e.k == FSIN_R) return fail();   // (and its sine of a whole number of turns, +0)
         const int kernel = (e.flags & kTrigTurns) && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) ? e.k + 1 : e.k;
         f.kern = reinterpret_cast<AnyFn>(T.f32[kernel]);
         f.run = e.k == FLDEXP ? TIER_RUN(h_ldexp) : TIER_RUN(h_f32);
@@ -3311,6 +3313,7 @@ void tier_classify(Inst& in) {
       if (!vgpr_dst(in.dst.empty() ? Operand() : in.dst[0], f.dst, dbl ? 2 : 1)) return fail();
       if (scale ? (in.dst.size() != 2 || !scalar_dst(in.dst[1], f.dst2)) : in.dst.size() != 1) return fail();
       if (in.clamp || in.omod) return fail();   // (the interpreter's write_float / write_double: issue #613, and v_div_scale's on an RX 6800)
+      if (in.arch == gcn::Target::Gfx1030 && e.k == 2) return fail();   // (gfx1030's v_div_fixup_f32 NaNs: the interpreter's rdna2_nan)
       for (int k = 0; k < 3; ++k)
         if (!(dbl ? lane_src64(in.src[k], f.src[k], true) : lane_src32(in.src[k], f.src[k], true))) return fail();
       f.sub = static_cast<uint32_t>(e.k);

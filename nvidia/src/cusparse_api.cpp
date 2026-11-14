@@ -1032,7 +1032,88 @@ cusparseStatus_t spmv(cusparseHandle_t h, cusparseOperation_t op, const void* al
                                            : CUSPARSE_STATUS_INTERNAL_ERROR;
 }
 
-cusparseStatus_t spmv_check(cusparseOperation_t op, const SpMat& A, const DnVec& X, const DnVec& Y,
+// What an RTX 3060's cuSPARSE 13.0 prints on stderr when it refuses SpMV's arguments: for an argument by its position,
+//   " ** On entry to cusparseSpMV() parameter number 10 (externalBuffer) had an illegal value: NULL pointer"
+// and for a combination, " ** On entry to cusparseSpMV(): dimension mismatch, ...", each followed by a blank line.
+// VGPU_QUIET=1 silences them, as it does the simulator's own lines.
+cusparseStatus_t sp_illegal(const char* api, int num, const char* name, const std::string& what) {
+  if (!quiet())
+    std::fprintf(stderr, " ** On entry to %s() parameter number %d (%s) had an illegal value: %s\n\n", api, num, name,
+                 what.c_str());
+  return CUSPARSE_STATUS_INVALID_VALUE;
+}
+cusparseStatus_t sp_refuse(const char* api, cusparseStatus_t st, const std::string& what) {
+  if (!quiet()) std::fprintf(stderr, " ** On entry to %s(): %s\n\n", api, what.c_str());
+  return st;
+}
+// The names the card's lines give the data types; the others are "UNKNOWN=(cudaDataType) 7".
+std::string sp_type_name(cudaDataType t) {
+  switch (static_cast<int>(t)) {
+    case CUDA_R_32F: return "CUDA_R_32F";
+    case CUDA_R_64F: return "CUDA_R_64F";
+    case CUDA_R_16F: return "CUDA_R_16F";
+    case CUDA_R_8I: return "CUDA_R_8I";
+    case CUDA_C_32F: return "CUDA_C_32F";
+    case CUDA_C_64F: return "CUDA_C_64F";
+    case CUDA_C_16F: return "CUDA_C_16F";
+    case CUDA_R_8U: return "CUDA_R_8U";
+    case CUDA_R_32I: return "CUDA_R_32I";
+    case CUDA_R_32U: return "CUDA_R_32U";
+    case CUDA_R_16BF: return "CUDA_R_16BF";
+    case CUDA_C_16BF: return "CUDA_C_16BF";
+    case 20: return "CUDA_R_16I";
+    case 22: return "CUDA_R_16U";
+    case 24: return "CUDA_R_64I";
+    case 26: return "CUDA_R_64U";
+    default: return "UNKNOWN=(cudaDataType) " + std::to_string(static_cast<int>(t));
+  }
+}
+const char* sp_op_name(cusparseOperation_t op) {
+  return op == CUSPARSE_OPERATION_NON_TRANSPOSE ? "NON_TRANSPOSE"
+         : op == CUSPARSE_OPERATION_TRANSPOSE   ? "TRANSPOSE"
+                                                : "CONJUGATE_TRANSPOSE";
+}
+const char* sp_spmv_alg_name(cusparseSpMVAlg_t alg) {
+  switch (static_cast<int>(alg)) {
+    case 1: return "SPMV_COO_ALG1";
+    case 2: return "SPMV_CSR_ALG1";
+    case 3: return "SPMV_CSR_ALG2";
+    case 4: return "SPMV_COO_ALG2";
+    case 5: return "SPMV_SELL_ALG1";
+    default: return "SPMV_BSR_ALG1";
+  }
+}
+
+// SpMV's arguments in the card's order, the descriptors' contents aside: the handle (1), the operation (2), alpha (3),
+// A (4), x (5), beta (6), y (7), the compute type (8: the ten types cuSPARSE computes in pass, any other is refused
+// here, by name), the algorithm (9: 0 to 6), and for cusparseSpMV_bufferSize the size (10). Measured on an RTX 3060.
+cusparseStatus_t spmv_args(const char* api, cusparseHandle_t h, cusparseOperation_t op, const void* alpha,
+                           const void* matA, const void* vecX, const void* beta, const void* vecY, cudaDataType ct,
+                           cusparseSpMVAlg_t alg, bool sizing, const void* bytes) {
+  const std::string null = "NULL pointer";
+  if (!h) return sp_illegal(api, 1, "handle", null);
+  if (op != CUSPARSE_OPERATION_NON_TRANSPOSE && op != CUSPARSE_OPERATION_TRANSPOSE &&
+      op != CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE)
+    return sp_illegal(api, 2, "opA", "(cusparseOperation_t) " + std::to_string(static_cast<int>(op)));
+  if (!alpha) return sp_illegal(api, 3, "alpha", null);
+  if (!matA) return sp_illegal(api, 4, "matA", null);
+  if (!vecX) return sp_illegal(api, 5, "vecX", null);
+  if (!beta) return sp_illegal(api, 6, "beta", null);
+  if (!vecY) return sp_illegal(api, 7, "vecY", null);
+  switch (static_cast<int>(ct)) {
+    case CUDA_R_32F: case CUDA_R_64F: case CUDA_R_16F: case CUDA_R_8I: case CUDA_C_32F: case CUDA_C_64F:
+    case CUDA_C_16F: case CUDA_R_32I: case CUDA_R_16BF: case CUDA_C_16BF:
+      break;
+    default:
+      return sp_illegal(api, 8, "computeType", "(cudaDataType) " + sp_type_name(ct));
+  }
+  if (static_cast<int>(alg) < 0 || static_cast<int>(alg) > 6)
+    return sp_illegal(api, 9, "alg", "(cusparseSpMVAlg_t) " + std::to_string(static_cast<int>(alg)));
+  if (sizing && !bytes) return sp_illegal(api, 10, "bufferSize", null);
+  return CUSPARSE_STATUS_SUCCESS;
+}
+
+cusparseStatus_t spmv_check(const char* api, cusparseOperation_t op, const SpMat& A, const DnVec& X, const DnVec& Y,
                             cudaDataType ct, cusparseSpMVAlg_t alg) {
   // Blocked-ELL is SpMM's alone; sliced ELL takes CUSPARSE_SPMV_SELL_ALG1 (5)
   // or the default, with A, x and y of one type (an RTX 3060's 13.0 refuses
@@ -1043,52 +1124,112 @@ cusparseStatus_t spmv_check(cusparseOperation_t op, const SpMat& A, const DnVec&
     if (A.value_type != X.type || A.value_type != Y.type) return CUSPARSE_STATUS_NOT_SUPPORTED;
     if (A.slice <= 0) return CUSPARSE_STATUS_INVALID_VALUE;  // NVIDIA's faults on the device
   }
+  // x and y sized for op(A), y first (the card's order, before the types and the algorithm).
+  {
+    const bool t = op != CUSPARSE_OPERATION_NON_TRANSPOSE;
+    auto mismatch = [&](const char* dim, int64_t want, const char* vec, int64_t got) {
+      return sp_refuse(api, CUSPARSE_STATUS_INVALID_VALUE,
+                       std::string("dimension mismatch, matA.") + dim + " (" + std::to_string(want) + ") != " + vec +
+                           ".size (" + std::to_string(got) + ") with operation " + sp_op_name(op));
+    };
+    if ((t ? A.cols : A.rows) != Y.size) return mismatch(t ? "cols" : "rows", t ? A.cols : A.rows, "vecY", Y.size);
+    if ((t ? A.rows : A.cols) != X.size) return mismatch(t ? "rows" : "cols", t ? A.rows : A.cols, "vecX", X.size);
+  }
+  const std::string types = "matA (" + sp_type_name(A.value_type) + "), vecX (" + sp_type_name(X.type) + "), vecY (" +
+                            sp_type_name(Y.type) + "), compute (" + sp_type_name(ct) + ")";
   if (!type_bytes(ct)) return CUSPARSE_STATUS_NOT_SUPPORTED;
-  if (bad_conj(op, A.value_type)) return CUSPARSE_STATUS_INVALID_VALUE;
-  if (!complex_combo_ok(A.value_type, X.type, Y.type, ct, true)) return CUSPARSE_STATUS_NOT_SUPPORTED;
+  if (bad_conj(op, A.value_type))
+    return sp_refuse(api, CUSPARSE_STATUS_INVALID_VALUE,
+                     "type of " + types + " is not valid when opA is CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE");
+  const std::string unsupported = "type combination of " + types + " is not supported";
+  if (!complex_combo_ok(A.value_type, X.type, Y.type, ct, true))
+    return sp_refuse(api, CUSPARSE_STATUS_NOT_SUPPORTED, unsupported);
   // A, x and y of one real type compute in that type, half and bfloat16 in single (an RTX 3060's cuSPARSE 13.0
   // refuses single data computed in double or half, and half computed in half).
   if (!is_complex(A.value_type) && A.value_type == X.type && A.value_type == Y.type && !is_complex(ct)) {
     const cudaDataType want =
         A.value_type == CUDA_R_16F || A.value_type == CUDA_R_16BF ? CUDA_R_32F : A.value_type;
-    if (ct != want) return CUSPARSE_STATUS_NOT_SUPPORTED;
+    if (ct != want) return sp_refuse(api, CUSPARSE_STATUS_NOT_SUPPORTED, unsupported);
   }
-  // CSR takes the default, CSR_ALG1 and CSR_ALG2 (0, 2, 3); the COO and sliced-ELL algorithms are invalid for it.
-  if (A.format == CUSPARSE_FORMAT_CSR && alg != CUSPARSE_SPMV_ALG_DEFAULT && alg != CUSPARSE_SPMV_CSR_ALG1 &&
-      alg != CUSPARSE_SPMV_CSR_ALG2)
-    return CUSPARSE_STATUS_INVALID_VALUE;
+  // CSR and CSC take the default, CSR_ALG1 and CSR_ALG2 (0, 2, 3), COO the default, COO_ALG1 and COO_ALG2 (0, 1, 4);
+  // the others are refused with the format's name (CSC's is CSR's).
+  {
+    const int a = static_cast<int>(alg);
+    const bool csr = A.format == CUSPARSE_FORMAT_CSR || A.format == CUSPARSE_FORMAT_CSC;
+    if ((csr && a != 0 && a != 2 && a != 3) || (A.format == CUSPARSE_FORMAT_COO && a != 0 && a != 1 && a != 4))
+      return sp_illegal(api, 9, "alg",
+                        std::string(sp_spmv_alg_name(alg)) + " is not valid with " + (csr ? "CSR" : "COO") +
+                            " matrix format");
+  }
   // BSR: only A itself, as NVIDIA's (CUSPARSE_SPMV_BSR_ALG1) takes it.
   if (A.format == kFormatBsr && op != CUSPARSE_OPERATION_NON_TRANSPOSE) return CUSPARSE_STATUS_NOT_SUPPORTED;
   return CUSPARSE_STATUS_SUCCESS;
 }
 
-// The workspace cusparseSpMV asks for. The simulator's SpMV needs none, but an RTX 3060's cuSPARSE 13.0 asks for
-// some whenever A has entries, and its cusparseSpMV refuses a null buffer then; so the size is the card's, for CSR
-// with the default algorithm or CSR_ALG1: 7 + 4 bytes per started 1536 entries with 32-bit indices, 15 + 8 with
-// 64-bit (per 2048 entries for double A^T). Other formats and algorithms are given the same size; the card asks for
-// more there (CSR_ALG2 551 bytes and up for A itself, COO 540 and up), which the simulator does not use.
-size_t spmv_buffer_bytes(cusparseOperation_t op, const SpMat& A) {
+// The workspace cusparseSpMV asks for. The simulator's SpMV needs none, but an RTX 3060's cuSPARSE 13.0 asks for some
+// whenever A has entries, and its cusparseSpMV refuses a null buffer then; so the size is the card's. Measured for
+// nnz from 1 to 4.2 million, CSR, CSC and COO with 32-bit and 64-bit indices, A, x and y of one type (half and
+// bfloat16 computed in single), every algorithm and operation; it depends on nnz alone:
+//   - CSR (and CSC for op(A) = A^T, which is CSR's A): CSR_ALG2 asks 507 + 2i + (c + i) * ceil(nnz / 1024) +
+//     c * ceil(nnz / 2^20) bytes, i the index size, c = 2i + 2 * (the compute type's size). The other algorithms, and
+//     CSR_ALG2 for the transposed product, ask 7 + 4 * ceil(nnz / p) (32-bit indices) or 15 + 8 * ceil(nnz / p),
+//     p = 1536 for single, 2048 for double, 512 for single complex (256 with 64-bit indices), 384 for double complex.
+//   - COO: 508 + s * (ceil(nnz / p) + ceil(nnz / 1024p)) for A itself, nothing for A^T and A^H; (p, s) is (2048, 16)
+//     for single with 32-bit indices, (2048, 24) for double and single complex, (1280, 40) for double complex, and with
+//     64-bit indices (2048, 24), (2048, 32), (1024, 32), (1024, 48) for single, double, single and double complex.
+//     Half and bfloat16 ask single's with COO_ALG2.
+// Anything else (half's other forms, mixed types or indices, BSR, sliced ELL) is given the single-precision CSR size.
+size_t spmv_buffer_bytes(cusparseOperation_t op, const SpMat& A, const DnVec& X, const DnVec& Y, cudaDataType ct,
+                         cusparseSpMVAlg_t alg) {
   if (A.nnz <= 0) return 0;
-  const int64_t per = op != CUSPARSE_OPERATION_NON_TRANSPOSE && A.value_type == CUDA_R_64F ? 2048 : 1536;
-  const auto chunks = static_cast<size_t>((A.nnz + per - 1) / per);
+  const auto up = [&](int64_t per) { return static_cast<size_t>((A.nnz + per - 1) / per); };
+  const bool i64 = A.row_type == CUSPARSE_INDEX_64I;
+  const cudaDataType v = A.value_type;
+  const bool half = v == CUDA_R_16F || v == CUDA_R_16BF;
+  const bool measured = X.type == v && Y.type == v && ct == (half ? CUDA_R_32F : v) &&
+                        (half || v == CUDA_R_32F || v == CUDA_R_64F || v == CUDA_C_32F || v == CUDA_C_64F);
+  const int a = static_cast<int>(alg);
+  if (measured && (A.format == CUSPARSE_FORMAT_CSR || A.format == CUSPARSE_FORMAT_CSC) && A.row_type == A.col_type) {
+    const bool itself = (A.format == CUSPARSE_FORMAT_CSR) == (op == CUSPARSE_OPERATION_NON_TRANSPOSE);
+    if (a == 3 && itself) {
+      const size_t i = i64 ? 8 : 4, c = 2 * i + 2 * type_bytes(ct);
+      return 507 + 2 * i + (c + i) * up(1024) + c * up(1 << 20);
+    }
+    if (!half) {
+      const int64_t per = v == CUDA_R_32F ? 1536 : v == CUDA_R_64F ? 2048 : v == CUDA_C_32F ? (i64 ? 256 : 512) : 384;
+      return i64 ? 15 + 8 * up(per) : 7 + 4 * up(per);
+    }
+  }
+  if (measured && A.format == CUSPARSE_FORMAT_COO && (!half || a == 4)) {
+    if (op != CUSPARSE_OPERATION_NON_TRANSPOSE) {
+      if (!half) return 0;
+    } else {
+      const size_t s = half || v == CUDA_R_32F ? (i64 ? 24 : 16) : v == CUDA_R_64F ? (i64 ? 32 : 24)
+                     : v == CUDA_C_32F                       ? (i64 ? 32 : 24)
+                                                             : (i64 ? 48 : 40);
+      const int64_t per = v == CUDA_C_64F ? (i64 ? 1024 : 1280) : v == CUDA_C_32F && i64 ? 1024 : 2048;
+      return 508 + s * (up(per) + up(per * 1024));
+    }
+  }
+  const size_t chunks = up(1536);
   return A.row_type == CUSPARSE_INDEX_64I || A.col_type == CUSPARSE_INDEX_64I ? 15 + 8 * chunks : 7 + 4 * chunks;
 }
 }  // namespace
 
 VGPU_EXPORT cusparseStatus_t cusparseSpMV_bufferSize(cusparseHandle_t h, cusparseOperation_t op,
-                                                     const void*, cusparseConstSpMatDescr_t matA,
-                                                     cusparseConstDnVecDescr_t vecX, const void*,
+                                                     const void* alpha, cusparseConstSpMatDescr_t matA,
+                                                     cusparseConstDnVecDescr_t vecX, const void* beta,
                                                      cusparseDnVecDescr_t vecY, cudaDataType ct,
                                                      cusparseSpMVAlg_t alg, size_t* bytes) {
-  // A null handle, descriptor or size is an invalid value on the card.
-  if (!h || !matA || !vecX || !vecY || !bytes) return CUSPARSE_STATUS_INVALID_VALUE;
+  constexpr const char* api = "cusparseSpMV_bufferSize";
+  if (const cusparseStatus_t st = spmv_args(api, h, op, alpha, matA, vecX, beta, vecY, ct, alg, true, bytes)) return st;
   *bytes = 0;
   if (known(matA) && known(vecX) && known(vecY)) {
     const auto& A = *reinterpret_cast<const SpMat*>(matA);
-    if (const cusparseStatus_t st = spmv_check(op, A, *reinterpret_cast<const DnVec*>(vecX),
-                                               *reinterpret_cast<const DnVec*>(vecY), ct, alg))
-      return st;
-    *bytes = spmv_buffer_bytes(op, A);
+    const auto& X = *reinterpret_cast<const DnVec*>(vecX);
+    const auto& Y = *reinterpret_cast<const DnVec*>(vecY);
+    if (const cusparseStatus_t st = spmv_check(api, op, A, X, Y, ct, alg)) return st;
+    *bytes = spmv_buffer_bytes(op, A, X, Y, ct, alg);
   }
   return CUSPARSE_STATUS_SUCCESS;
 }
@@ -1098,14 +1239,13 @@ VGPU_EXPORT cusparseStatus_t cusparseSpMV(cusparseHandle_t h, cusparseOperation_
                                           cusparseConstDnVecDescr_t vecX, const void* beta,
                                           cusparseDnVecDescr_t vecY, cudaDataType ct,
                                           cusparseSpMVAlg_t alg, void* buffer) {
-  // A null handle or descriptor is an invalid value (an RTX 3060); one the library does not know is not initialized.
-  if (!h || !matA || !vecX || !vecY) return CUSPARSE_STATUS_INVALID_VALUE;
+  constexpr const char* api = "cusparseSpMV";
+  // A null handle or argument, an unknown operation, compute type or algorithm are invalid values (an RTX 3060),
+  // not read through; a descriptor the library does not know is not initialized.
+  if (const cusparseStatus_t st = spmv_args(api, h, op, alpha, matA, vecX, beta, vecY, ct, alg, false, nullptr))
+    return st;
   if (!known(h) || !known(matA) || !known(vecX) || !known(vecY))
     return CUSPARSE_STATUS_NOT_INITIALIZED;
-  // An unknown operation and a null alpha or beta are invalid values (an RTX 3060), not read through.
-  if (!alpha || !beta || (op != CUSPARSE_OPERATION_NON_TRANSPOSE && op != CUSPARSE_OPERATION_TRANSPOSE &&
-                          op != CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE))
-    return CUSPARSE_STATUS_INVALID_VALUE;
   if (capturing(h)) {
     auto held = std::make_shared<Held>();
     const cusparseHandle_t hc = held->handle(h);
@@ -1119,9 +1259,9 @@ VGPU_EXPORT cusparseStatus_t cusparseSpMV(cusparseHandle_t h, cusparseOperation_
   const auto& A = *reinterpret_cast<const SpMat*>(matA);
   const auto& X = *reinterpret_cast<const DnVec*>(vecX);
   auto& Y = *reinterpret_cast<DnVec*>(vecY);
-  if (const cusparseStatus_t st = spmv_check(op, A, X, Y, ct, alg); st != CUSPARSE_STATUS_SUCCESS) return st;
+  if (const cusparseStatus_t st = spmv_check(api, op, A, X, Y, ct, alg); st != CUSPARSE_STATUS_SUCCESS) return st;
   // The card refuses a null buffer where cusparseSpMV_bufferSize asks for one (A has entries).
-  if (!buffer && spmv_buffer_bytes(op, A)) return CUSPARSE_STATUS_INVALID_VALUE;
+  if (!buffer && spmv_buffer_bytes(op, A, X, Y, ct, alg)) return sp_illegal(api, 10, "externalBuffer", "NULL pointer");
   return any_complex({A.value_type, X.type, Y.type, ct}) ? spmv<cd>(h, op, alpha, A, X, beta, Y, ct)
                                                          : spmv<double>(h, op, alpha, A, X, beta, Y, ct);
 }
