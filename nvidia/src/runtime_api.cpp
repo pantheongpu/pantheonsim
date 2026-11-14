@@ -5042,8 +5042,9 @@ VGPU_EXPORT cudaError_t cudaDeviceGetByPCIBusId(int* device, const char* pciBusI
 static cudaError_t cudaStreamAddCallback_traced(cudaStream_t stream, cudaStreamCallback_t cb, void* user, unsigned int /*p3*/) {
   if (const cudaError_t dead = dead_context()) return dead;
   // Not supported under stream capture, as documented -- cudaLaunchHostFunc is
-  // the one that is -- so a capturing stream refuses it and the capture fails.
-  if (capture_refuse(stream, "cudaStreamAddCallback")) return cudaErrorStreamCaptureUnsupported;
+  // the one that is -- so a capturing stream refuses it. The capture goes on without it, in every mode, as on an
+  // RTX 3060 (CUDA 13.0); it was invalidated.
+  if (capture_active(stream)) return cudaErrorStreamCaptureUnsupported;
   if (cb) cb(stream, cudaSuccess, user);
   return cudaSuccess;
 }
@@ -11689,6 +11690,27 @@ void invalidate_capture_id(unsigned long long id, const char* why) {
 
 cudaError_t capture_wait(cudaStream_t stream, bool captured, unsigned long long id,
                          const std::vector<void*>& deps) {
+  // The legacy stream waits for every blocking stream too: while one is capturing (its capture invalidated or not)
+  // the wait is cudaErrorStreamCaptureImplicit and invalidates that capture, whatever the event, as on an RTX 3060
+  // (CUDA 13.0). (The streams' flags are looked up without g_graph_mu, which stream_is_blocking's lock does not nest
+  // in.)
+  if ((stream == nullptr || stream == cudaStreamLegacy) && g_captures_active.load(std::memory_order_acquire)) {
+    std::vector<void*> keys;
+    {
+      std::lock_guard<std::mutex> lock(g_graph_mu);
+      for (const auto& [key, sc] : g_stream_capture) keys.push_back(key);
+    }
+    std::erase_if(keys, [](void* k) { return !stream_is_blocking(static_cast<cudaStream_t>(k)); });
+    if (!keys.empty()) {
+      std::lock_guard<std::mutex> lock(g_graph_mu);
+      for (void* k : keys)
+        if (StreamCapture* sc = stream_capture(static_cast<cudaStream_t>(k)); sc && !sc->cap->graph->invalidated) {
+          sc->cap->graph->invalidated = true;
+          sc->cap->graph->invalidated_by = "a wait by the legacy stream, which a capturing blocking stream joins";
+        }
+      return cudaErrorStreamCaptureImplicit;
+    }
+  }
   std::lock_guard<std::mutex> lock(g_graph_mu);
   StreamCapture* sc = stream_capture(stream);
   const auto invalidate = [&](const char* why) {
@@ -11712,18 +11734,33 @@ cudaError_t capture_wait(cudaStream_t stream, bool captured, unsigned long long 
   std::vector<GraphNodeRec*> pos;
   for (void* d : deps)
     if (auto* n = static_cast<GraphNodeRec*>(d); cap->graph->holds(n)) pos.push_back(n);
+  // As an RTX 3060 (CUDA 13.0) does in every capture mode: a merge invalidates both captures and the legacy stream's
+  // wait the event's; once the event's capture is invalidated, a wait on it from a stream outside the capture is an
+  // invalid value (no fork) and from one of its own streams cudaErrorStreamCaptureInvalidated.
+  const auto invalidate_events = [&](const char* why) {
+    if (!cap->graph->invalidated) {
+      cap->graph->invalidated = true;
+      cap->graph->invalidated_by = why;
+    }
+  };
   if (sc) {
     if (sc->cap != cap) {
       invalidate("a wait that would merge two captures");
+      invalidate_events("a wait that would merge two captures");
       return cudaErrorStreamCaptureMerge;
     }
+    if (cap->graph->invalidated) return cudaErrorStreamCaptureInvalidated;
     for (GraphNodeRec* n : pos)   // a join
       if (std::find(sc->deps.begin(), sc->deps.end(), n) == sc->deps.end()) sc->deps.push_back(n);
     return cudaSuccess;
   }
+  if (cap->graph->invalidated) return cudaErrorInvalidValue;
   // A fork: the stream joins the capture, starting where the event's stream was.
   // Not the legacy stream, which every other stream synchronizes with.
-  if (stream == nullptr || stream == cudaStreamLegacy) return cudaErrorStreamCaptureImplicit;
+  if (stream == nullptr || stream == cudaStreamLegacy) {
+    invalidate_events("a wait by the legacy stream on an event of the capture");
+    return cudaErrorStreamCaptureImplicit;
+  }
   g_stream_capture[reinterpret_cast<void*>(stream)] = StreamCapture{cap, std::move(pos), {}, {}, {}};
   return cudaSuccess;
 }

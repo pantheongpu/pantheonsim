@@ -127,6 +127,14 @@ release says what runs and what it produces, never how fast a real GPU would run
   context active, current on no thread, and applies `deviceFlags` to it with `cudaInitDeviceFlagsAreValid`, refusing a
   bad value (then leaving the context current, as the card does); it did neither, and refused any other bit of `flags`,
   which the card ignores (found by differential testing; `e2e_card_edges_context`).
+- Runtime: stream capture as an RTX 3060 (CUDA 13.0) does it, in every mode. A wait that would merge two captures
+  (`cudaErrorStreamCaptureMerge`) invalidates both, not only the waiting stream's; the legacy stream's
+  `cudaStreamWaitEvent` is `cudaErrorStreamCaptureImplicit` and invalidates the capture while a blocking stream is
+  capturing (whatever the event) or when the event is a capture's; once an event's capture is invalidated, a wait on
+  it from a stream outside it is `cudaErrorInvalidValue` (the stream was forked into the dead capture) and from one of
+  its streams `cudaErrorStreamCaptureInvalidated`. `cudaStreamAddCallback` on a capturing stream is refused and the
+  capture goes on without it; it was invalidated (found by differential testing; `e2e_card_edges_capture`,
+  `e2e_capture_streams`).
 - AMD: the SDWA, DPP and VOP3P modifiers and the denormal and IEEE modes around them, audited against the guides and an RX 6800
   (follow-up to pantheonsim #613). The output modifier (`mul:2`, `mul:4`, `div:2`) did nothing on gfx942 and gfx950 only with IEEE mode
   or output denormals on; it now does nothing then on gfx90a, gfx1030 and gfx1100 too (CDNA2 to CDNA4 guides, 6.5, the RDNA3 guide,
