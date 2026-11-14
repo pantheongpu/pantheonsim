@@ -36,6 +36,12 @@ release says what runs and what it produces, never how fast a real GPU would run
   and LICENSE_ERROR were all "CUBLAS_STATUS_INTERNAL_ERROR", and the string was the name). An empty `cublasSgemm` may pass a null C,
   and `cublasSetMatrix`/`cublasGetMatrix` with a short leading dimension no longer leave a runtime last error
   (`e2e_card_edges_cublas`).
+- cuSOLVER: `getrs` refuses an unknown operation, negative sizes and short leading dimensions; it solved with them, and `n = -1`
+  aborted the program with `std::length_error`. `potrf`, `potrs`, `syevd` and `gesvd` refuse unknown fill modes and jobs, negative
+  sizes and short leading dimensions with LAPACK's info (minus the argument's position), `getrf` with `lda < m` succeeds with info -4,
+  and `gesvd` with `m < n` is `CUSOLVER_STATUS_INVALID_VALUE` with info 0 (it was NOT_SUPPORTED). `gesvd` with `jobu = 'O'` or
+  `jobvt = 'O'` works, writing the vectors over A; it was refused. `cusolverDnSetAdvOptions` refuses unknown functions and algorithms
+  (`e2e_card_edges_cusolver`).
 - Runtime: a copy, fill or kernel launch issued on a stream behind a host function that has not finished returns at once and runs
   after it, in stream order, as on an RTX 3060. It used to run inside the call after waiting for the host function, so a host function
   that waits for something the program does after the call (Celeritas' `AsyncSnapshotTest.device_pending`) hung the program.

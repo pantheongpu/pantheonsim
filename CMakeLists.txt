@@ -4468,7 +4468,7 @@ if(TARGET vgpucudart)
       TIMEOUT 300)
   endforeach()
 endif()
-foreach(_edge cublas)
+foreach(_edge cublas cusolver)
   if(TARGET vgpucudart AND TARGET vgpu${_edge})
     add_test(NAME e2e_card_edges_${_edge} COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh ${_edge} -l${_edge})
     set_tests_properties(e2e_card_edges_${_edge} PROPERTIES
