@@ -7,6 +7,21 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Under `vgpu run --preload`, where the driver is loaded privately (#597), CUPTI and NVSHMEM now find it: they looked driver
+  functions up in the global scope only, which a private library is not in. CUPTI's callbacks named a placeholder for the current
+  context instead of the one the program's driver calls find current, and `nvshmemx_cumodule_init` and `nvshmemx_culibrary_init`
+  failed, so a module loaded with the driver API never got its `nvshmemi_device_state_d`. They now ask the runtime's lookup, which
+  tries the private driver first (`nvidia/src/driver_symbol.hpp`). So does the runtime's own check for driver-API managed memory
+  before deferring an asynchronous copy, which still looked in the global scope only. `e2e_preload_torch_like` runs a third program
+  (`preload_torch_peers.cpp`), and `lint_driver_lookups` keeps any shim other than the driver from looking a driver function up in
+  the global scope alone.
+- `cuProfilerStart`, `cuProfilerStop`, `cudaProfilerStart` and `cudaProfilerStop` answer as an RTX 3060 does (CUDA 13.0); they
+  used to succeed always. The driver's return `CUDA_ERROR_NOT_INITIALIZED` before `cuInit`, `CUDA_ERROR_INVALID_CONTEXT` with no
+  current context, `CUDA_ERROR_CONTEXT_IS_DESTROYED` when the current context is dead (destroyed, or a primary context released
+  to nothing or reset), and a dead context's fault. The runtime's are runtime calls like any other: they start the runtime and make
+  the primary context current on the calling thread, and answer a dead context's fault or `cudaErrorNoDevice`. And after
+  `cuDevicePrimaryCtxReset`, the runtime's next call makes the primary context active again, as on the card
+  (`cuDevicePrimaryCtxGetState` kept reporting it inactive). New test `test_profiler_control`.
 - Runtime: a copy, fill or kernel launch issued on a stream behind a host function that has not finished returns at once and runs
   after it, in stream order, as on an RTX 3060. It used to run inside the call after waiting for the host function, so a host function
   that waits for something the program does after the call (Celeritas' `AsyncSnapshotTest.device_pending`) hung the program.
