@@ -13753,13 +13753,16 @@ std::atomic<bool> g_abandoned{false};
 // instruction for each step that returned true -- and a block runs no further than the last instruction after which the loop would not yet
 // have ended the turn (`slice`), so a turn ends on the instruction it ends on without blocks. Machine::block_pc is run_round's `pc`: where
 // the instruction that threw is.
+#define VGPU_BLOCKS_KEEP_FRAME() __asm__ volatile("" : : "r"(__builtin_frame_address(0)))
 [[gnu::noinline]] void run_wave_blocks(Machine& m, Wave& w, Group& group, uint64_t slice) {
   uint64_t& pc = m.block_pc;
   pc = w.pc;
-  // (A frame pointer for this function: an unwinder that reads a callee's saved registers through %rbp one instruction late -- the
-  // epilogue of a function with a realigned stack, sampled by a profiler -- then finds a frame here and not whatever this function kept
-  // in the register. Round sp72.)
-  __asm__ volatile("" : : "r"(__builtin_frame_address(0)));
+  // (A frame pointer for this function and the two above it, as run_groups has one: an unwinder that reads a callee's saved registers
+  // through %rbp one instruction late -- the last instructions of a function with a realigned stack, sampled by a profiler that walks the
+  // stack in its signal handler -- takes this function's saved %rbp for the callee's, and what it finds there has to be a frame again, all
+  // the way up. With the wave's address in %rbp here it crashed one run in four of an inq test; with a frame here and none in
+  // run_round_blocks, every run. Rounds sp72 and sp73.)
+  VGPU_BLOCKS_KEEP_FRAME();
   uint64_t n = w.round_steps;
   for (;;) {
     // Where the wave is: at the instruction of the block it left, or the one after it (a plain step ran that instruction), or anywhere.
@@ -13872,6 +13875,7 @@ std::atomic<bool> g_abandoned{false};
 // the loop of run_round is where the interpreter's time is, and a test of a flag or a second loop beside it re-laid it and cost the rows
 // that run through it 2 to 5 % with blocks off (round sp73).
 [[gnu::noinline]] bool run_round_blocks(Machine& m, Group& group, uint64_t slice) {
+  VGPU_BLOCKS_KEEP_FRAME();   // (see run_wave_blocks)
   if (g_abandoned.load(std::memory_order_relaxed)) abandon();
   bool runnable = false;
   // A wave that waits for a global load gives the others its turn (Wave::soft_yield), as the load's
@@ -13919,6 +13923,7 @@ std::atomic<bool> g_abandoned{false};
 
 // A round where blocks may be on: with them while they pay in this dispatch on this thread (Machine::blocks_live), else the plain one.
 [[gnu::noinline]] bool run_round_live(Machine& m, Group& group, uint64_t slice = 0) {
+  VGPU_BLOCKS_KEEP_FRAME();   // (see run_wave_blocks)
   return m.blocks_live ? run_round_blocks(m, group, slice) : run_round(m, group, slice);
 }
 
