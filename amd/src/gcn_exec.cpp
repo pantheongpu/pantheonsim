@@ -12682,6 +12682,8 @@ struct Machine {
   }
   int tier_step(Wave& w, Group& g, const Inst& in) {
     if (w.vgpr_msb || w.gpr_idx || w.vskip || !FloatMode::is_default(w.mode)) return 0;
+    // Bank conflicts read every lane's address, which the tier's handlers do not give: the interpreter runs the LDS instruction.
+    if (d.count_lds_banks && in.fast.unit == gcn::tier::kUnitLds) return 0;
     if (in.fast.mach) return tier_mach(w, g, in);
     if (__builtin_expect(!w.tier.ok, 0)) make_tier_regs(w, g);
     gcn::tier::Regs& r = w.tier.r;
@@ -12703,6 +12705,10 @@ struct Machine {
     c.mops[static_cast<int>(in.mops_type)] += in.mops;
     ++stats.instructions;
     ++*unit_slot[in.fast.unit];
+    if (in.fast.lds_rd | in.fast.lds_wr) {   // (an LDS instruction's bytes, as step() counts them)
+      if (in.fast.lds_rd) count_bytes(c, w.exec, in.fast.lds_rd, false, true);
+      if (in.fast.lds_wr) count_bytes(c, w.exec, in.fast.lds_wr, true, true);
+    }
     return done;
   }
   // A debugger session's check before an instruction (the std::string it builds for the kernel's name kept this frame's stack and its
