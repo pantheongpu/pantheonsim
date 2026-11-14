@@ -1626,6 +1626,8 @@ vgpu_unit_test(test_lockstep_look)
 vgpu_unit_test(test_sass_lea)
 # ULDC c[bank][URa + offset]: the offset is signed and the address wraps in the 64 KiB bank (pantheonsim #499).
 vgpu_unit_test(test_sass_uldc_indexed)
+# A lane group switched away from on a backward branch keeps its uniform registers; the PTX of the same kernel agrees (pantheonsim #642).
+vgpu_unit_test(test_sass_uniform_switch)
 # Kernels launched while the host has floating-point traps enabled (#605): no SIGFPE, the host environment as it was.
 vgpu_unit_test(test_launch_fp_traps)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
