@@ -97,6 +97,24 @@ release says what runs and what it produces, never how fast a real GPU would run
   queries (`cudaGetDeviceCount`, `cudaGetDevice`, `cudaGetDeviceProperties`, `cudaDeviceGetAttribute`,
   `cudaPointerGetAttributes`) no longer make the primary context current or active, as on the card
   (`e2e_card_edges_context`).
+- AMD: the SDWA, DPP and VOP3P modifiers and the denormal and IEEE modes around them, audited against the guides and an RX 6800
+  (follow-up to pantheonsim #613). The output modifier (`mul:2`, `mul:4`, `div:2`) did nothing on gfx942 and gfx950 only with IEEE mode
+  or output denormals on; it now does nothing then on gfx90a, gfx1030 and gfx1100 too (CDNA2 to CDNA4 guides, 6.5, and the card, which
+  a code object's defaults always hit), and applied, a result it makes denormal is flushed keeping its sign while a zero becomes +0;
+  the tier leaves an output modifier to the interpreter there. `v_div_scale_f32` and `v_div_scale_f64` wrote their result unclamped
+  and unscaled: the card clamps it (a NaN to 0) and scales it like any VOP3 float result (every target, gfx1250's too). neg_lo and neg_hi on the packed integer
+  instructions (`v_pk_add_u16` and the rest) were ignored by the interpreter and the tier; they flip the half's top bit, as the card
+  does. gfx90a and gfx1030 take the guides' rule for `v_min`/`v_max` (f16, f32, f64, packed): -0 is below +0, and with IEEE mode a
+  signalling NaN gives a NaN, without it the other operand (the CDNA2 guide's pseudocode, and the card); they took the host's fmin and
+  fmax; there a denormal operand is a zero where MODE flushes input
+  denormals (the result is an operand, which the host's DAZ left as it was). A half's denormals are flushed where `float_denorm_mode_16_64`
+  says (the card does; they were always kept). gfx1030's SDWA comparisons (`v_cmp_*_sdwa`) were refused as not implemented. gfx11's
+  VOP3 DPP with op_sel read the first source from its own lane, not the shuffled one. On gfx1030 `v_dot2_f32_f16` flushes a denormal
+  addend whatever MODE says and keeps denormal halves, as the card does. New test `test_amd_gcn_mods`
+  (`amd/tests/data/asm_mods.s`: 50 SDWA and DPP, 36 VOP3P and VOP3 and 24 gfx11 VOP3 DPP instructions over 1024 edge inputs, in three modes,
+  gfx90a, gfx942, gfx1030 and gfx1100, tier off and on; the gfx1030 kernels run on the card gave exactly what the test expects).
+  test_amd_gcn_same_bits: 96 lines re-recorded, the ones these change (its header lists them). Not fixed: gfx1030's VOP2 16-bit
+  results keep the destination's high half on the card (`v_min_f16_e32`), where the executor zeroes it as gfx9 does.
 - AMD: the clamp bit of the integer instructions saturates their result on every target, as the CDNA3 and CDNA4 guides say (6.5, and
   "Supports saturation" on each add and subtract) and as an RX 6800 does. The VOP3b adds and subtracts with a carry out (`v_add_co_u32`,
   `v_sub_co_u32`, `v_subrev_co_u32`, `v_addc_co_u32`, `v_subb_co_u32`, `v_subbrev_co_u32`, RDNA's `_co_ci_` forms) and `v_mad_u64_u32` /

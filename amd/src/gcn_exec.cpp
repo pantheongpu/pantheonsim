@@ -534,7 +534,8 @@ struct Wave {
 // does both at once, for the mode that flushes both. A float instruction
 // takes MODE's single-precision fields, a double one the 16/64-bit fields.
 // A half's denormals are a float's normal numbers, so the host cannot flush
-// them this way: halves keep their denormals whatever MODE says.
+// them this way: Machine::half_in and half_out do, for the instructions that
+// read and write halves through the Machine's helpers.
 //
 // Every kernel PyTorch's and ROCm's libraries ship asks for round to nearest
 // even with denormals kept, which the host already does; this costs nothing
@@ -1027,7 +1028,7 @@ struct Machine {
   // A source as one lane sees it: a vector register's lane, or the same
   // scalar value for every lane.
   uint32_t lane_src(const Wave& w, const Operand& o, uint32_t lane) const {
-    if (&o == dpp_operand) return (*dpp_values)[lane];
+    if (&o == dpp_operand) return o.sel == 6 ? (*dpp_values)[lane] : selected((*dpp_values)[lane], o.sel, o.sext);   // (op_sel's half: below)
     if (o.kind == OperandKind::Vgpr) {
       const uint32_t v = w.vgpr[o.index][lane];
       return o.sel == 6 ? v : selected(v, o.sel, o.sext);
@@ -1100,6 +1101,19 @@ struct Machine {
     if (o.kind == OperandKind::Literal && o.literal_high) return static_cast<uint64_t>(o.value) << 32;
     return scalar(w, o);
   }
+  // MODE's 16/64-bit denormal bits for a half: bit 6 keeps denormal inputs, bit 7 denormal results; where one is clear, a denormal half
+  // becomes a zero of its sign (an RX 6800 with float_denorm_mode_16_64 0: v_pk_add_f16 of 0x0001 and 0 is 0, v_cvt_f32_f16 of 0x0080 is
+  // 0). FloatMode cannot do this for a half (its denormals are a float's normal numbers), so the instructions that read a half through
+  // lane_half, lane_half_f or packed_half and write one through write_half do, and the packed and mixed-precision ones.
+  static uint16_t half_in(const Wave& w, uint16_t b) { return (w.mode & 0x40) || (b & 0x7C00) ? b : static_cast<uint16_t>(b & 0x8000); }
+  static _Float16 half_out(const Wave& w, _Float16 h) {
+    uint16_t b;
+    std::memcpy(&b, &h, 2);
+    if ((w.mode & 0x80) || (b & 0x7C00)) return h;
+    b &= 0x8000;
+    std::memcpy(&h, &b, 2);
+    return h;
+  }
   // A source read as a half: the low half of the register, or an inline
   // constant, which is the number itself rather than a float's bits.
   _Float16 lane_half(const Wave& w, const Operand& o, uint32_t lane) const {
@@ -1107,7 +1121,7 @@ struct Machine {
     if (o.kind == OperandKind::InlineFloat) {
       h = static_cast<_Float16>(o.fvalue);
     } else {
-      const uint16_t bits = static_cast<uint16_t>(lane_src(w, o, lane));
+      const uint16_t bits = half_in(w, static_cast<uint16_t>(lane_src(w, o, lane)));
       std::memcpy(&h, &bits, 2);
     }
     if (o.abs) {   // the sign bit cleared (a -0 and a NaN too: "h < 0" is false for them)
@@ -1123,7 +1137,7 @@ struct Machine {
   float lane_half_f(const Wave& w, const Operand& o, uint32_t lane) const {
     float f;
     if (o.kind == OperandKind::InlineFloat) f = static_cast<float>(static_cast<_Float16>(o.fvalue));
-    else f = packed::half_to_float(static_cast<uint16_t>(lane_src(w, o, lane)));
+    else f = packed::half_to_float(half_in(w, static_cast<uint16_t>(lane_src(w, o, lane))));
     if (o.abs) f = std::fabs(f);   // the sign bit cleared (a -0 and a NaN too), as lane_half's
     return o.neg ? -f : f;
   }
@@ -1236,12 +1250,14 @@ struct Machine {
       }
       if (finite_in) v = std::signbit(static_cast<float>(v)) ? static_cast<_Float16>(-65504.0f) : static_cast<_Float16>(65504.0f);
     }
+    v = half_out(w, v);
     // The output multiplier and the clamp apply to a half result as to a single one.
     if (in.omod || in.clamp) {
       float f = static_cast<float>(v);
       if (in.omod && !omod_ignored(w, in, 7)) {
+        if (omod_rules(in) && f == 0) f = 0.0f;   // (-0 to +0)
         f *= in.omod == 1 ? 2.0f : in.omod == 2 ? 4.0f : 0.5f;
-        if (is_guide_arch(in) && (f == 0 || std::fabs(f) < 6.103515625e-05f)) f = 0.0f;   // (a half's least normal is 2^-14)
+        if (omod_rules(in) && std::fabs(f) < 6.103515625e-05f) f = std::copysign(0.0f, f);   // (a half's least normal is 2^-14)
       }
       if (in.clamp) f = clamp01(f);
       v = static_cast<_Float16>(f);
@@ -1321,7 +1337,7 @@ struct Machine {
     } else {
       bits = static_cast<uint16_t>(lane_src(w, o, lane) >> (16 * top));
     }
-    const float f = static_cast<float>(as_half(bits));
+    const float f = static_cast<float>(as_half(half_in(w, bits)));
     return ((half ? in.neg_hi : in.neg_lo) >> k) & 1 ? -f : f;
   }
 
@@ -1360,7 +1376,7 @@ struct Machine {
     packed::WaveArgs a;
     a.op = kind;
     a.clamp = in.clamp;
-    a.guide = is_guide_arch(in);
+    a.guide = ieee_minmax(in);
     a.ieee = (w.mode >> 9) & 1;
     a.exec = w.exec;
     a.dst = w.vgpr[in.dst[0].index].data();
@@ -1376,7 +1392,7 @@ struct Machine {
   bool dot2_f16_wave(Wave& w, const Inst& in, bool c_form, uint64_t* redo) {
     // (gfx942 and gfx950 flush the denormal halves and the denormal float of a dot product and its result, CDNA3 and CDNA4 guides, 6.4: the
     // lane loops do that, this does not.)
-    if (is_guide_arch(in) || !packed_plain(w, in)) return false;
+    if (is_guide_arch(in) || in.arch == gcn::Target::Gfx1030 || !packed_plain(w, in)) return false;   // (gfx1030: its addend, the lane loop's)
     packed::DotArgs d;
     d.c_form = c_form;
     d.exec = w.exec;
@@ -1459,25 +1475,31 @@ struct Machine {
     return is_guide_arch(in) && std::fpclassify(f) == FP_SUBNORMAL ? std::copysign(0.0f, f) : f;
   }
   // A float result, held to [0, 1] where the instruction asked for it.
-  // CDNA3 and CDNA4 (guides, 6.5): "Output modifiers are not compatible with output denormals: if output denormals are enabled, then output
-  // modifiers are ignored ... Output modifiers are ignored if the IEEE mode bit is set to 1." Applied, they flush denormals and a -0 to +0.
-  // `denorm_bit` is the FP_DENORM bit that allows output denormals for the type: 5 for single precision, 7 for double and half.
+  // CDNA2, CDNA3 and CDNA4 (guides, 6.5): "Output modifiers are not compatible with output denormals: if output denormals are enabled, then
+  // output modifiers are ignored ... Output modifiers are ignored if the IEEE mode bit is set to 1." Applied, "-0 is flushed to +0" and a
+  // result the multiplier makes denormal is flushed to zero, keeping its sign (an RX 6800: -2^-126 div:2 is -0; it ignores the output
+  // modifier with IEEE mode or output denormals on, as the guides say). The rules of every target with an IEEE mode bit (gfx9, gfx10, gfx11);
+  // gfx12 and gfx1250 apply the multiplier as they did. `denorm_bit` is the FP_DENORM bit that allows output denormals for the type: 5 for
+  // single precision, 7 for double and half.
+  static bool omod_rules(const Inst& in) { return in.arch != gcn::Target::Gfx1200 && in.arch != gcn::Target::Gfx1250; }
   static bool omod_ignored(const Wave& w, const Inst& in, uint32_t denorm_bit) {
-    return is_guide_arch(in) && (((w.mode >> 9) & 1) || ((w.mode >> denorm_bit) & 1));
+    return omod_rules(in) && (((w.mode >> 9) & 1) || ((w.mode >> denorm_bit) & 1));
   }
   void write_float(Wave& w, const Inst& in, uint32_t lane, float v) {
     // The output multiplier, then the clamp, as the ISA orders them.
     if (in.omod && !omod_ignored(w, in, 5)) {
+      if (omod_rules(in) && v == 0) v = 0.0f;
       v *= in.omod == 1 ? 2.0f : in.omod == 2 ? 4.0f : 0.5f;
-      if (is_guide_arch(in) && (v == 0 || std::fpclassify(v) == FP_SUBNORMAL)) v = 0.0f;
+      if (omod_rules(in) && std::fpclassify(v) == FP_SUBNORMAL) v = std::copysign(0.0f, v);
     }
     if (in.clamp) v = clamp01(v);
     write_lane(w, in.dst[0], lane, as_bits(v));
   }
   void write_double(Wave& w, const Inst& in, uint32_t lane, double v) {
     if (in.omod && !omod_ignored(w, in, 7)) {
+      if (omod_rules(in) && v == 0) v = 0.0;
       v *= in.omod == 1 ? 2.0 : in.omod == 2 ? 4.0 : 0.5;
-      if (is_guide_arch(in) && (v == 0 || std::fpclassify(v) == FP_SUBNORMAL)) v = 0.0;
+      if (omod_rules(in) && std::fpclassify(v) == FP_SUBNORMAL) v = std::copysign(0.0, v);
     }
     if (in.clamp) v = clamp01(v);
     write_lane64(w, in.dst[0], lane, as_bits(v));
@@ -3008,15 +3030,16 @@ struct Machine {
   // The three instructions a float division is built from: v_div_scale, v_div_fmas and v_div_fixup (gcn_divide.hpp has the pseudocode
   // they follow, and where it departs from the guides). The compiler scales the operands, refines a reciprocal, and these put the
   // result back; the sequence lands on the correctly rounded quotient. v_div_fmas and v_div_fixup are VOP3 float results like any other:
-  // the output modifier and the clamp apply (clang folds fmin(fmax(a / b, 0), 1) into the fixup's clamp bit, issue #613). v_div_scale's
-  // result is written whole.
+  // the output modifier and the clamp apply (clang folds fmin(fmax(a / b, 0), 1) into the fixup's clamp bit, issue #613). So do they to
+  // v_div_scale's result, which the guides do not say: an RX 6800 clamps it (a NaN to 0) and, with IEEE mode off and denormals flushed,
+  // doubles it for mul:2; VCC is the unmodified instruction's.
   void divide_step(Wave& w, const Inst& in, uint32_t lane) {
     const OpName op(in);
     if (op.size() > 4 && op.compare(op.size() - 4, 4, "_f64") == 0) {
       const double s0 = lane_double(w, in.src[0], lane), s1 = lane_double(w, in.src[1], lane), s2 = lane_double(w, in.src[2], lane);
       if (op == "v_div_scale_f64"_op) {
         const auto r = gcn::divide::div_scale_reference(s0, s1, s2);
-        write_lane64(w, in.dst[0], lane, as_bits(r.value));
+        write_double(w, in, lane, r.value);
         if (r.vcc) sdst_bits |= uint64_t{1} << lane;
       } else if (op == "v_div_fmas_f64"_op) {
         write_double(w, in, lane, gcn::divide::div_fmas(s0, s1, s2, (w.vcc >> lane) & 1));
@@ -3028,7 +3051,7 @@ struct Machine {
     const float s0 = lane_float(w, in.src[0], lane), s1 = lane_float(w, in.src[1], lane), s2 = lane_float(w, in.src[2], lane);
     if (op == "v_div_scale_f32"_op) {
       const auto r = gcn::divide::div_scale_reference(s0, s1, s2);
-      write_lane(w, in.dst[0], lane, as_bits(r.value));
+      write_float(w, in, lane, r.value);
       if (r.vcc) sdst_bits |= uint64_t{1} << lane;
     } else if (op == "v_div_fmas_f32"_op) {
       write_float(w, in, lane, gcn::divide::div_fmas(s0, s1, s2, (w.vcc >> lane) & 1));
@@ -5656,10 +5679,16 @@ struct Machine {
                 const bool sgn = name.find("_i16") != std::string::npos;
                 const bool clamps = in.clamp && (name.find("add") != std::string::npos || name.find("sub") != std::string::npos ||
                                                  name.find("mad") != std::string::npos);
+                // neg_lo and neg_hi flip the top bit of an integer half as they flip a half's sign (an RX 6800: v_pk_add_u16 of zeros with
+                // neg_lo:[1,0] neg_hi:[0,1] is 0x80008000; v_pk_add_i16 with neg_lo:[1,1] and clamp saturates -32768 + -32768).
+                const auto part = [&](uint32_t k, uint32_t h, uint32_t lane) {
+                  const uint16_t b = packed_bits(w, in, k, h, lane);
+                  return static_cast<uint16_t>(((h ? in.neg_hi : in.neg_lo) >> k) & 1 ? b ^ 0x8000u : b);
+                };
                 each([&](uint32_t lane) {
                   uint32_t r = 0;
                   for (uint32_t h = 0; h < 2; ++h) {
-                    const uint16_t x = packed_bits(w, in, 0, h, lane), y = packed_bits(w, in, 1, h, lane);
+                    const uint16_t x = part(0, h, lane), y = part(1, h, lane);
                     const int16_t sx = static_cast<int16_t>(x), sy = static_cast<int16_t>(y);
                     int64_t v;
                     switch (kind) {
@@ -5675,8 +5704,8 @@ struct Machine {
                       case MinI: v = std::min(sx, sy); break;
                       case MaxU: v = std::max(x, y); break;
                       case MinU: v = std::min(x, y); break;
-                      case MadU: v = int64_t{x} * y + packed_bits(w, in, 2, h, lane); break;
-                      case MadI: v = int64_t{sx} * sy + static_cast<int16_t>(packed_bits(w, in, 2, h, lane)); break;
+                      case MadU: v = int64_t{x} * y + part(2, h, lane); break;
+                      case MadI: v = int64_t{sx} * sy + static_cast<int16_t>(part(2, h, lane)); break;
                       default: throw Error::make(Err::Unsupported, name, " is decoded but not implemented");
                     }
                     // The clamp holds an add or a subtract to what 16 bits hold.
@@ -5709,7 +5738,9 @@ struct Machine {
                     }
                   }
                   each([&](uint32_t lane) {
-                    const float c = lane_float(w, in.src[2], lane);
+                    float c = lane_float(w, in.src[2], lane);
+                    // (an RX 6800 flushes a denormal addend, whatever MODE says, and keeps denormal halves)
+                    if (in.arch == gcn::Target::Gfx1030 && std::fpclassify(c) == FP_SUBNORMAL) c = std::copysign(0.0f, c);
                     double sum = dot_flush_float(in, (in.neg_lo >> 2) & 1 ? -double(c) : double(c));
                     for (uint32_t h = 0; h < 2; ++h) {
                       _Float16 a, b;
@@ -5844,6 +5875,13 @@ struct Machine {
           x.src[k].sel = 5;
         }
       x.op_sel &= 8;
+      // gfx11's VOP3 DPP with op_sel: the first source is still the shuffled one (cross_lane_alu's, by its address), now the copy's.
+      struct Repoint {
+        const Operand*& at;
+        const Operand* was;
+        ~Repoint() { at = was; }
+      } repoint{dpp_operand, dpp_operand};
+      if (dpp_operand == &in.src[0]) dpp_operand = &x.src[0];
       vector_alu(w, x);
       return;
     }
@@ -6524,7 +6562,7 @@ struct Machine {
     {
       // Where one is a NaN the other is kept, as fmin and fmax keep it.
       each([&](uint32_t lane) {
-        if (is_guide_arch(in)) {   // by the half's bits, which keep a signaling NaN to be quieted
+        if (ieee_minmax(in)) {   // by the half's bits, which keep a signaling NaN to be quieted
           const _Float16 ha = lane_half(w, in.src[0], lane), hb = lane_half(w, in.src[1], lane);
           write_half(w, in, lane, as_half(gfx9_minmax_half(as_bits(ha), as_bits(hb), op == "v_min_f16_e32"_op, (w.mode >> 9) & 1)));
           return;
@@ -6794,7 +6832,7 @@ struct Machine {
           const uint32_t bits = o.kind == OperandKind::InlineFloat
                                     ? as_bits(static_cast<_Float16>(o.fvalue))
                                     : lane_src(w, o, lane) >> (((in.op_sel >> k) & 1) ? 16 : 0);
-          float f = static_cast<float>(as_half(static_cast<uint16_t>(bits)));
+          float f = static_cast<float>(as_half(half_in(w, static_cast<uint16_t>(bits))));
           if (o.abs) f = std::fabs(f);
           return o.neg ? -f : f;
         };
@@ -6804,7 +6842,7 @@ struct Machine {
           write_lane(w, in.dst[0], lane, as_bits(r));
           return;
         }
-        const uint32_t bits = as_bits(static_cast<_Float16>(r));
+        const uint32_t bits = as_bits(half_out(w, static_cast<_Float16>(r)));
         const uint32_t was = w.vgpr[in.dst[0].index][lane];
         w.vgpr[in.dst[0].index][lane] = op == "v_fma_mixlo_f16"_op ? (was & 0xFFFF0000u) | bits
                                                                 : (was & 0x0000FFFFu) | bits << 16;
@@ -7441,9 +7479,9 @@ struct Machine {
         // to a half. Where one is a NaN, min and max keep the other.
         uint32_t r = 0;
         for (uint32_t half = 0; half < 2; ++half) {
-          if (is_guide_arch(in) && (op == "v_pk_min_f16"_op || op == "v_pk_max_f16"_op)) {   // by the halves' bits, as v_min_f16
+          if (ieee_minmax(in) && (op == "v_pk_min_f16"_op || op == "v_pk_max_f16"_op)) {   // by the halves' bits, as v_min_f16
             const auto bits_of = [&](uint32_t k) {
-              uint16_t b = packed_bits(w, in, k, half, lane);
+              uint16_t b = half_in(w, packed_bits(w, in, k, half, lane));
               return static_cast<uint16_t>(((half ? in.neg_hi : in.neg_lo) >> k) & 1 ? b ^ 0x8000 : b);
             };
             uint16_t rb = gfx9_minmax_half(bits_of(0), bits_of(1), op == "v_pk_min_f16"_op, (w.mode >> 9) & 1);
@@ -7454,10 +7492,10 @@ struct Machine {
           const float x = packed_half(w, in, 0, half, lane), y = packed_half(w, in, 1, half, lane);
           const float v = op == "v_pk_add_f16"_op   ? x + y
                           : op == "v_pk_mul_f16"_op ? x * y
-                          : op == "v_pk_min_f16"_op ? (is_guide_arch(in) || in.arch == gcn::Target::Gfx1250 ? hw_min(in, w.mode, x, y) : packed::pk_fminf(x, y))
-                          : op == "v_pk_max_f16"_op ? (is_guide_arch(in) || in.arch == gcn::Target::Gfx1250 ? hw_max(in, w.mode, x, y) : packed::pk_fmaxf(x, y))
+                          : op == "v_pk_min_f16"_op ? (ieee_minmax(in) || in.arch == gcn::Target::Gfx1250 ? hw_min(in, w.mode, x, y) : packed::pk_fminf(x, y))
+                          : op == "v_pk_max_f16"_op ? (ieee_minmax(in) || in.arch == gcn::Target::Gfx1250 ? hw_max(in, w.mode, x, y) : packed::pk_fmaxf(x, y))
                                                  : std::fma(x, y, packed_half(w, in, 2, half, lane));
-          _Float16 h = static_cast<_Float16>(in.clamp ? clamp01(v) : v);
+          _Float16 h = half_out(w, static_cast<_Float16>(in.clamp ? clamp01(v) : v));
           if (std::isinf(static_cast<float>(h)) && fp16_ovfl(w, in) && std::isfinite(x) && std::isfinite(y) &&
               (op != "v_pk_fma_f16"_op || std::isfinite(packed_half(w, in, 2, half, lane))) && op != "v_pk_min_f16"_op && op != "v_pk_max_f16"_op)
             h = static_cast<_Float16>(std::signbit(static_cast<float>(h)) ? -65504.0f : 65504.0f);
@@ -8814,6 +8852,10 @@ struct Machine {
   // gfx942's and gfx950's (CDNA3 and CDNA4 guides, V_MIN_F32 and V_MAX_F32): with MODE.IEEE (bit 9) a signaling NaN operand gives that NaN
   // quieted (the first operand first); otherwise a NaN operand gives the other; -0 is below +0; and the rest is the comparison.
   static bool is_guide_arch(const Inst& in) { return in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950; }
+  // Who takes that rule: gfx942 and gfx950, gfx90a (the CDNA2 guide's V_MIN_F32 and V_MAX_F32 are the same pseudocode) and gfx1030 (an RX
+  // 6800: v_pk_max_f16 of -0 and +0 is +0, and of a signaling NaN with IEEE mode on a NaN, then held to 0 by the clamp). gfx11 and gfx12:
+  // not established, the host's fmin and fmax as before.
+  static bool ieee_minmax(const Inst& in) { return is_guide_arch(in) || in.arch == gcn::Target::Gfx90a || in.arch == gcn::Target::Gfx1030; }
   template <typename T>
   static T gfx9_minmax(T x, T y, bool is_min, bool ieee) {
     const auto signaling = [](T v) {
@@ -8829,15 +8871,28 @@ struct Machine {
   }
   // The same over half-precision bit patterns (a half's signaling NaN has bit 9 of the mantissa clear).
   static uint16_t gfx9_minmax_half(uint16_t a, uint16_t b, bool is_min, bool ieee) { return packed::minmax_half_bits(a, b, is_min, ieee); }
+  // A denormal operand of the guides' minimum and maximum is read as a zero of its sign where MODE flushes input denormals (bit 4 for a
+  // float, 6 for a double): the result is an operand, which the host's DAZ does not touch (an RX 6800: max(2^-149, -1) is 0 then).
+  template <typename T>
+  static T minmax_in(uint32_t mode, T v) {   // (by the bits: under the host's DAZ a denormal compares and classifies as zero)
+    if ((mode >> (sizeof(T) == 4 ? 4 : 6)) & 1) return v;
+    if constexpr (sizeof(T) == 4) {
+      const uint32_t b = std::bit_cast<uint32_t>(v);
+      return (b & 0x7F800000u) || !(b & 0x7FFFFFu) ? v : std::bit_cast<T>(b & 0x80000000u);
+    } else {
+      const uint64_t b = std::bit_cast<uint64_t>(v);
+      return (b & 0x7FF0000000000000ull) || !(b & 0xFFFFFFFFFFFFFull) ? v : std::bit_cast<T>(b & (1ull << 63));
+    }
+  }
   template <typename T>
   static T hw_min(const Inst& in, uint32_t mode, T x, T y) {
-    if (is_guide_arch(in)) return gfx9_minmax(x, y, true, (mode >> 9) & 1);
+    if (ieee_minmax(in)) return gfx9_minmax(minmax_in(mode, x), minmax_in(mode, y), true, (mode >> 9) & 1);
     if (in.arch != gcn::Target::Gfx1250) return nan_fmin<0>(x, y);
     return std::isnan(x) && std::isnan(y) ? quieted(x) : static_cast<T>(num_min(x, y));
   }
   template <typename T>
   static T hw_max(const Inst& in, uint32_t mode, T x, T y) {
-    if (is_guide_arch(in)) return gfx9_minmax(x, y, false, (mode >> 9) & 1);
+    if (ieee_minmax(in)) return gfx9_minmax(minmax_in(mode, x), minmax_in(mode, y), false, (mode >> 9) & 1);
     if (in.arch != gcn::Target::Gfx1250) return nan_fmax<0>(x, y);
     return std::isnan(x) && std::isnan(y) ? quieted(x) : static_cast<T>(num_max(x, y));
   }

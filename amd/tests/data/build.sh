@@ -122,6 +122,12 @@ for t in gfx90a gfx942 gfx1030; do
   echo "wrote $(pwd)/asm_int_clamp.$t.o"
 done
 
+# The modifiers the clamp rounds left (test_amd_gcn_mods): SDWA, DPP, VOP3P, v_div_scale; the same scheme, gfx90a, gfx942, gfx1030 and gfx1100.
+for t in gfx90a gfx942 gfx1030 gfx1100; do
+  "$clang" -x assembler-with-cpp -D"$(echo "$t" | tr a-z A-Z)" -target amdgcn-amd-amdhsa -mcpu=$t -c asm_mods.s -o asm_mods.$t.o
+  echo "wrote $(pwd)/asm_mods.$t.o"
+done
+
 # gfx1250's: the same for what the CDNA 5 document defines and the executor refused (test_amd_gcn_cdna_gaps).
 for src in asm_cdna5_gaps; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -c "$src.s" -o "$src.gfx1250.o"
