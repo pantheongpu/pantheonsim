@@ -565,7 +565,18 @@ void set_sticky_error(State& s, cudaError_t code) { s.rt->set_context_fault(stat
 // RTX 3060, after a failed device assert, stream and event calls, allocation,
 // copies and launches all answer cudaErrorAssert; asking which device is
 // current, or what a device is, still succeeds.
+bool driver_binding_stale();
+void bind_driver_context();
 cudaError_t dead_context() {
+  // These are the calls that use the device without guard() (streams, events, synchronisation): like guard()'s calls
+  // they make the primary context current on the driver's side when the thread has none (bind_driver_context).
+  if (driver_binding_stale()) {
+    State& s = st();
+    if (s.initialized.load(std::memory_order_acquire) && !vgpu::profiling::silenced()) {
+      std::lock_guard<std::recursive_mutex> lock(s.mu);
+      bind_driver_context();
+    }
+  }
   const cudaError_t e = sticky_error();
   if (e != cudaSuccess) g_last_error = e;
   return e;
@@ -1001,22 +1012,35 @@ void announce_module_profiled(RegisteredModule& m, int dev) {
 // context as they do on the card.
 std::atomic<unsigned> g_driver_loads{0};
 thread_local int t_unbound_device = -1;
+thread_local int t_bound_device = -1;       // the device bind_driver_context last bound on this thread
+thread_local unsigned t_bound_loads = 0;    // and g_driver_loads then
+using DriverHasContext = int (*)();
+std::atomic<DriverHasContext> g_driver_has_context{nullptr};   // vgpu_driver_thread_has_context_v1, once looked up
+// Whether bind_driver_context has something to do on this thread, without the lock: a device it has not bound, a
+// driver loaded (or a primary context reset) since, or a thread the program has left with no context
+// (cuCtxSetCurrent(NULL), or destroying its own): an RTX 3060's next runtime call that uses the device makes the
+// primary context current again then. A context of the program's own that is current stays current.
+bool driver_binding_stale() {
+  if (t_bound_device != t_current_device || t_bound_loads != g_driver_loads.load(std::memory_order_acquire)) return true;
+  const DriverHasContext has = g_driver_has_context.load(std::memory_order_acquire);
+  return has && !has();
+}
 void bind_driver_context() {
-  thread_local int bound = -1;
-  thread_local unsigned bound_loads = 0;
   const unsigned loads = g_driver_loads.load(std::memory_order_acquire);
-  if (bound == t_current_device && bound_loads == loads) return;
   using Bind = int (*)(int);
   static Bind fn = nullptr;   // (callers hold the API lock)
   static unsigned fn_loads = ~0u;
   if (fn_loads != loads) {
     fn = reinterpret_cast<Bind>(driver_dlsym("vgpu_driver_bind_primary_v1"));
+    g_driver_has_context.store(reinterpret_cast<DriverHasContext>(driver_dlsym("vgpu_driver_thread_has_context_v1")),
+                               std::memory_order_release);
     fn_loads = loads;
   }
+  if (!driver_binding_stale()) return;
   if (fn) fn(t_current_device);
   t_unbound_device = fn ? -1 : t_current_device;
-  bound = t_current_device;
-  bound_loads = loads;
+  t_bound_device = t_current_device;
+  t_bound_loads = loads;
 }
 
 // The body of every API call: the lock, initialisation, the dead-context
@@ -1048,7 +1072,9 @@ cudaError_t guard_impl(const char* api, bool needs_context, F&& body) {
       // A profiler's own question (vgpu::profiling::Silence) is not the
       // program using the runtime: it binds no context and creates none.
       const bool silent = call.silenced();
-      if (!silent) bind_driver_context();
+      // Only a call that uses the device binds its context: an RTX 3060's cudaGetDeviceCount, cudaGetDevice and the
+      // other queries (guard_query) do not make the primary context current or active (cudaSetDevice binds itself).
+      if (!silent && needs_context) bind_driver_context();
       // cudaSetDevice makes the context of the device it selects, which is not
       // the one that was current when it was called (see its body).
       if (std::strcmp(api, "cudaSetDevice") != 0) announce_context(silent);
@@ -2402,6 +2428,12 @@ static cudaError_t cudaDeviceReset_body(void) {
   } catch (const std::exception& e) {
     if (!quiet()) std::fprintf(stderr, "[vgpu] cudaDeviceReset: %s\n", e.what());
   }
+  // The driver's primary context of the device is no longer active, as after cuDevicePrimaryCtxReset: its driver calls
+  // are CUDA_ERROR_CONTEXT_IS_DESTROYED until the runtime's next call that uses the device, which binds it again (an RTX
+  // 3060, CUDA 13.0).
+  using Deactivate = void (*)(int);
+  if (const auto off = reinterpret_cast<Deactivate>(driver_dlsym("vgpu_driver_primary_deactivate_v1"))) off(dev);
+  g_driver_loads.fetch_add(1, std::memory_order_release);
   return cudaSuccess;
 }
 

@@ -88,6 +88,15 @@ release says what runs and what it produces, never how fast a real GPU would run
   is `CUSPARSE_STATUS_INVALID_VALUE` from both (it was NOT_INITIALIZED, or success for the size).
   `cusparseCsr2cscEx2`/`_bufferSize` take `CUSPARSE_CSR2CSC_ALG1` only and refuse a null handle, the size is never 0,
   and a null buffer is refused (`e2e_card_edges_cusparse`).
+- Driver: `cuCtxSetCurrent` takes a destroyed context, as an RTX 3060 does (it was `CUDA_ERROR_INVALID_CONTEXT`), and every
+  call that needs a context answers `CUDA_ERROR_CONTEXT_IS_DESTROYED` while the current one is dead: destroyed, a primary
+  context released to nothing, or reset. `cudaDeviceReset` now resets the driver's primary context as
+  `cuDevicePrimaryCtxReset` does, so the driver's calls are `CUDA_ERROR_CONTEXT_IS_DESTROYED` until the runtime's next
+  call that uses the device; they succeeded. That call, after `cuCtxSetCurrent(NULL)` or destroying the program's own
+  context, makes the primary context current again, as on the card (the thread was left with none). The runtime's
+  queries (`cudaGetDeviceCount`, `cudaGetDevice`, `cudaGetDeviceProperties`, `cudaDeviceGetAttribute`,
+  `cudaPointerGetAttributes`) no longer make the primary context current or active, as on the card
+  (`e2e_card_edges_context`).
 - AMD: the clamp bit of the integer instructions saturates their result on every target, as the CDNA3 and CDNA4 guides say (6.5, and
   "Supports saturation" on each add and subtract) and as an RX 6800 does. The VOP3b adds and subtracts with a carry out (`v_add_co_u32`,
   `v_sub_co_u32`, `v_subrev_co_u32`, `v_addc_co_u32`, `v_subb_co_u32`, `v_subbrev_co_u32`, RDNA's `_co_ci_` forms) and `v_mad_u64_u32` /
