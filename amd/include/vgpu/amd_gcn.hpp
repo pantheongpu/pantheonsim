@@ -150,6 +150,16 @@ enum class Mix : uint8_t {
 };
 // And a matrix instruction's input type, for SQ_INSTS_VALU_MFMA_MOPS_*.
 enum class MopsType : uint8_t { None, I8, F16, BF16, F32, F64, F8, Count };
+// The names the dispatch statistics line (VGPU_DISPATCH_STATS) prints them under; None has none.
+inline const char* mix_name(Mix m) {
+  static const char* const names[] = {"none", "add_f16", "add_f32", "add_f64", "mul_f16", "mul_f32", "mul_f64", "fma_f16", "fma_f32",
+                                      "fma_f64", "trans_f16", "trans_f32", "trans_f64", "cvt", "int32", "int64"};
+  return static_cast<size_t>(m) < sizeof names / sizeof *names ? names[static_cast<size_t>(m)] : "?";
+}
+inline const char* mops_name(MopsType t) {
+  static const char* const names[] = {"none", "i8", "f16", "bf16", "f32", "f64", "f8"};
+  return static_cast<size_t>(t) < sizeof names / sizeof *names ? names[static_cast<size_t>(t)] : "?";
+}
 
 // gfx1100 stands for RDNA3 (gfx11), whose encodings are its own: every
 // gfx11 GPU decodes alike. gfx1200 for RDNA4 (gfx12) likewise.

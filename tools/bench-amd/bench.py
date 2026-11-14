@@ -301,6 +301,19 @@ def counting_run(binary, wl, size, build, gpu, tmp, args):
     return totals, ""
 
 
+
+def parse_dispatch_line(line):
+    """One VGPU_DISPATCH line as a dict: every number an int, and the fields that are text (mix=, mops=, kernel=) as they are.
+    Fields are key=value, so a key this does not know is carried along, not an error."""
+    row = {}
+    for kv in line.split()[1:]:
+        key, _, value = kv.partition("=")
+        try:
+            row[key] = int(value)
+        except ValueError:
+            row[key] = value
+    return row
+
 def probe_counting_run(binary, wl, size, build, gpu, tmp, args):
     """Counts from the shim's own VGPU_DISPATCH_STATS probe: the program run directly on one host thread, one line a
     launch. The same DispatchStats numbers rocprofv3's counters are made of, without rocprofv3 (which needs ROCm's
@@ -316,7 +329,7 @@ def probe_counting_run(binary, wl, size, build, gpu, tmp, args):
         with open(path) as f:
             for line in f:
                 if line.startswith("VGPU_DISPATCH "):
-                    rows.append({k: int(v) for k, v in (kv.split("=") for kv in line.split()[1:])})
+                    rows.append(parse_dispatch_line(line))
     except OSError:
         pass
     finally:

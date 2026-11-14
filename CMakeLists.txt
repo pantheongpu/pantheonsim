@@ -2124,6 +2124,12 @@ vgpu_unit_test(test_amd_bundle amd/tests/unit/test_bundle.cpp)
 target_compile_definitions(test_amd_bundle PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn_counters amd/tests/unit/test_gcn_counters.cpp)
 target_compile_definitions(test_amd_gcn_counters PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The bytes a lane of an LDS instruction moves, by name, and that every ds_ name the decoder knows is decided.
+vgpu_unit_test(test_amd_gcn_memtraffic amd/tests/unit/test_gcn_memtraffic.cpp)
+target_compile_definitions(test_amd_gcn_memtraffic PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# LDS bank conflicts against what an RX 6800 and an RX 6700 XT counted, in the model and in the executor.
+vgpu_unit_test(test_amd_gcn_lds_banks amd/tests/unit/test_gcn_lds_banks.cpp)
+target_compile_definitions(test_amd_gcn_lds_banks PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # rocprofiler-sdk's interface from a tool's side: the test is the tool, and
 # runs a HIP program through libamdhip64.
 add_executable(test_amd_rocprofiler amd/tests/unit/test_rocprofiler.cpp)
