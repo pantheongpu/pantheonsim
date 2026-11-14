@@ -4032,7 +4032,7 @@ the rule only ever adds launches to those the share of 50 sends. Exact mode's re
 not which kernels may run on the card.
 
 By the numbers of the table, on the rig: hotspot's launch saves about 0.8 to 0.9 ms (the estimate is the shortest launch seen, less a card path
-of 0.107 ms), so the start is bought at about its 300th launch, where the account alone bought it at the 210th in Round sp66;
+of 0.107 ms), so the start is bought at about its 300th launch, where the account alone bought it at the 210th in Round sp66 (measured below: the 289th against the 241st);
 threadFenceReduction and dct8x8 never reach 200 launches of a kernel; LargeKernelParameter's launches save a third of the 0.5 ms; sc_gpu's save
 about 0.5 ms and may fall either side.
 
@@ -4054,6 +4054,30 @@ touched; the output is the mode-off output in each. Steps 1 to 37 pass on server
 ignored) the unit tests and step 37 fail ([`data/sp69/README.md`](../data/sp69/README.md) has both outputs). The harness has the forms
 `exactr0` and `turbor0` (`VGPU_HOST_GPU_START_REPEATS=0`) for A/B runs.
 
-**On the card.** Not measured yet at this commit: server3 has no card. The run to make (hotspot, sc_gpu and the four Samples first, then the
-programs with 200 launches or more that do not start the driver today, then the keep list of the integration) is in
-[`data/sp69/README.md`](../data/sp69/README.md).
+**On the card** (one A10G, g5.xlarge, 6c64b703; [`data/sp69/card.md`](../data/sp69/card.md); `r0` is the rule before, `l0` the account alone):
+
+| program (10 runs, median s) | sim | exact | exactr0 | turbo | turbor0 | turbol0 |
+|---|---:|---:|---:|---:|---:|---:|
+| rodinia/hotspot | 1.05 | 1.06 | 1.06 | **0.57** | 1.06 | 0.51 |
+| rodinia/sc_gpu | 0.97 | 0.98 | 0.98 | 0.98 | 0.98 | 0.79 |
+| samples/MC_EstimatePiInlineP | 3.06 | 3.07 | 3.06 | 3.07 | 3.07 | 3.30 |
+| samples/dct8x8 | 0.94 | 0.95 | 0.95 | 0.95 | 0.95 | 1.12 |
+| samples/threadFenceReduction | 0.35 | 0.35 | 0.35 | 0.35 | 0.35 | 0.52 |
+| samples/LargeKernelParameter | 0.40 | 0.42 | 0.42 | 0.42 | 0.42 | 0.42 |
+
+* **hotspot** is 1.85x in turbo mode (712 of 1,000 launches on the card), from 1.00x; the account alone gives 2.05x on this rig (760 launches).
+  The difference is the 48 more launches simulated before the start is bought (288 against 240): the price of waiting until the launches made
+  would have repaid it.
+* **The four Samples** send no launch in exact or turbo mode and run at the simulator's time; under the account alone three of them lose
+  0.17 to 0.24 s again (LargeKernelParameter's account does not fill on this rig's faster run of it).
+* **sc_gpu** is not helped: its launch takes 0.6 ms in the simulator and saves under the 0.5 ms floor, so it stays at the simulator's time
+  (1.24x under the account alone). Lowering the floor to reach it would bring the bar within twice LargeKernelParameter's launches; left.
+* **The other programs with 200 launches or more that did not start the driver** (3DCONV, ADI, JACOBI1D, needle, cudaGraphsPerfScaling; 5 runs)
+  still do not, and asyncAllocation is unchanged (1.09 s against 3.44 s).
+* **The keep list of the integration** (3MM, FDTD-2D, LU, SYR2K, SYRK, JACOBI2D, gaussian, lud, particlefilter_float, atomicAggregate,
+  atomicPerf, black-scholes; 3 runs): no program more than 3 % slower than with `START_REPEATS=0` (largest atomicPerf turbo +1.0 %, 3MM exact
+  +0.9 %), the same launches on the card.
+* **Outputs.** Every exact and turbo output of the three sets is identical to the simulator's, except particlefilter_float and
+  cudaGraphsPerfScaling, whose simulator runs differ from each other (a clock seed, printed timings).
+* **Card CI** (`tools/card-ci/run-card-ci.sh`): PASS at 6c64b703: e2e_host_gpu (the card steps) and e2e_host_gpu_stub (steps 1 to 37, built with the rig's nvcc), the unit
+  tests, verify 31 identical and 0 different, turbo verify `words_outside=0`, division `differ=0`.

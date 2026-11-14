@@ -7,6 +7,7 @@ the dev machine's CUDA 13.0 toolkit (nvcc, the headers, `libcudart`, `libcudadev
 
 | file | what |
 |---|---|
+| `card.md` | the A10G run: hotspot, sc_gpu and the four Samples in six forms; the other programs of 200 launches or more; the integration's keep list |
 | `start-who.md` | which launch starts the driver under the new rule, at the default start cost and at 0.08 s, with `VGPU_HOST_GPU_START_REPEATS=0` beside it; the launches per kernel of the programs that matter |
 
 ## Tests on server3
@@ -36,7 +37,7 @@ FAIL: 400 launches of one kernel, of 2383 us each, did not start a driver that c
 FAIL: many started the driver after ? launches of its kernel, not after 200 to 399:
 ```
 
-## The card run (one A10G; not made yet)
+## The card run (one A10G; results in `card.md`)
 
 Build as in `../summary-2026-11-13/README.md` (targets `vgpucudart`, `vgpucuda`), corpora from `tools/bench/real/pack_corpora.sh` in `~/corp`.
 `turbor0` and `exactr0` are the rule before the round (`VGPU_HOST_GPU_START_REPEATS=0`), `turbol0` and `exactl0` the account alone

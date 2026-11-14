@@ -472,6 +472,10 @@ launched as many times again, so the start is bought when the launches already m
 * *Exact mode.* The rule is the same in both modes and decides only when the driver starts: which kernels may run on the card, and so the
   bits of an exact run, are not its business.
 
+On an A10G hotspot's turbo run goes from 1.06 s (1.00x) to 0.57 s (1.85x; 2.05x under the account alone, which buys the start 48 launches
+sooner); the four Samples send nothing and stay at the simulator's time; Rodinia sc_gpu (launches of 0.6 ms, under the floor) is not helped;
+no program of the integration's keep list is more than 3 % slower, and every output is the one it was.
+
 `VGPU_HOST_GPU_START_REPEATS=0` is the rule before. Numbers, the per-kernel table and the tests:
 [Round sp69](rounds/11-rounds-sp36-sp41.md#round-sp69-host-gpu-the-driver-start-of-a-program-of-many-short-launches).
 

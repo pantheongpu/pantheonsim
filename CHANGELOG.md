@@ -12,7 +12,8 @@ release says what runs and what it produces, never how fast a real GPU would run
   turbo mode before the share and 1.00x with it. A kernel the simulator has already run 200 times is now taken to be launched as many times
   again, and its launch must repay the start within the launches of that kernel run so far (at most 500) instead of within 50, when those
   are more (`VGPU_HOST_GPU_START_REPEATS`, `0` for the rule before). The four short CUDA Samples the share protects still do not start the
-  driver: two launch a kernel about 100 times, one has two launches in all, and the launches of the fourth save under 0.5 ms each.
+  driver: two launch a kernel about 100 times, one has two launches in all, and the launches of the fourth save under 0.5 ms each. On an
+  A10G hotspot's turbo run is 1.85x faster than the simulator again (1.05 s to 0.57 s) and the four run at the simulator's time.
 
 - Host-GPU mode (experimental, opt-in), both modes: while the real driver is not started, a launch that would start it only because the program
   has already simulated as long as the start costs (the start-cost account) must now also save a share of the start by itself: 5 ms, or 12.5 ms
