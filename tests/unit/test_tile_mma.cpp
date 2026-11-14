@@ -6,6 +6,7 @@
 // integer sums in 64 bits clamped after each block, fused multiply-adds in the current rounding mode.
 #pragma GCC optimize("fp-contract=off")
 
+#include <algorithm>
 #include <bit>
 #include <cfenv>
 #include <cmath>

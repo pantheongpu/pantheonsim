@@ -1264,7 +1264,7 @@ hipError_t module_on(State& s, FatBinary& fb, int ordinal, Module** out) {
                                             ". Build it with --offload-arch=" + gfx + ".");
   try {
     auto m = std::make_unique<Module>();
-    m->object = vgpu::amd::load_code_object(std::string(*code), "the program's " + gfx + " code");
+    m->object = vgpu::amd::load_code_object(*code, "the program's " + gfx + " code");
     m->device = ordinal;
     place(*m, d.memory());
     // Its __managed__ variables' pointers, to the memory each already has.
@@ -2056,7 +2056,7 @@ hipError_t load_module(State& s, vgpu::runtime::Device* d, const void* image, Mo
   const uint64_t size = shoff + uint64_t{shentsize} * shnum;
   try {
     auto m = std::make_unique<Module>();
-    m->object = vgpu::amd::load_code_object(std::string(reinterpret_cast<const char*>(bytes), size), "the image");
+    m->object = vgpu::amd::load_code_object(std::string_view(reinterpret_cast<const char*>(bytes), size), "the image");
     // VGPU_DUMP_CODE_OBJECTS=<dir> keeps a copy of every code object a
     // program loads, named for its first kernel: what a library builds at
     // run time (MIOpen's convolutions, rocFFT's plans) is otherwise nowhere
@@ -2151,10 +2151,13 @@ hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
 hipError_t hipModuleLoad(hipModule_t* module, const char* path) {
   const ApiCall api("hipModuleLoad", module, path);
   if (!module || !path || !*path) return record(state(), hipErrorInvalidValue);
+  // Both refusals are the thread's last error, as every failing call is in ROCm's HIP (HIP_RETURN in clr's
+  // hip_module.cpp; FatBinaryInfo::ExtractFatBinaryUsingCOMGR gives these two codes). OpenMM's kernel cache tries
+  // hipModuleLoad first and reads hipGetLastError after a miss, expecting hipErrorFileNotFound.
   std::ifstream in(path, std::ios::binary);
-  if (!in) return fail(hipErrorFileNotFound, std::string("no code object at ") + path);
+  if (!in) return record(state(), fail(hipErrorFileNotFound, std::string("no code object at ") + path));
   const std::string bytes((std::istreambuf_iterator<char>(in)), {});
-  if (bytes.empty()) return fail(hipErrorInvalidImage, std::string(path) + " is empty");
+  if (bytes.empty()) return record(state(), fail(hipErrorInvalidImage, std::string(path) + " is empty"));
   return hipModuleLoadData(module, bytes.data());
 }
 
@@ -2200,13 +2203,24 @@ hipError_t hipModuleGetFunction(hipFunction_t* function, hipModule_t module, con
   const ApiCall api("hipModuleGetFunction", function, module, name);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!function || !module || !name) return record(s, hipErrorInvalidValue);
+  // The order and codes of ROCm's HIP: a missing out-pointer or name first, then a null module.
+  if (!function || !name || !*name) return record(s, hipErrorInvalidValue);
+  if (!module) return record(s, hipErrorInvalidResourceHandle);
   Module* m = reinterpret_cast<Module*>(module);
   const Kernel* k = vgpu::amd::find_kernel(m->object, name);
   // A linked module's kernels are its members'.
   for (Module* member : m->members)
     if (!k && (k = vgpu::amd::find_kernel(member->object, name))) m = member;
-  if (!k) return record(s, fail(hipErrorNotFound, std::string("the code object has no kernel named ") + name));
+  if (!k) {
+    // Asking every loaded module for a kernel until one has it is how Tensile (rocBLAS, hipBLASLt) finds its
+    // GEMM kernels: hipErrorNotFound from the modules before the right one is expected, and it clears the error
+    // and asks the next. Said on stderr, each of those probes read as a failure (#636), so the miss is only said
+    // when no module loaded in the process has the kernel, which is a name the program got wrong.
+    const bool elsewhere = std::any_of(s.modules.begin(), s.modules.end(),
+                                       [&](const auto& other) { return vgpu::amd::find_kernel(other->object, name) != nullptr; });
+    const std::string what = std::string("the code object has no kernel named ") + name;
+    return record(s, elsewhere ? hipErrorNotFound : fail(hipErrorNotFound, what));
+  }
   auto f = std::make_unique<Function>();
   f->module = m;
   f->kernel = k;
@@ -2219,8 +2233,8 @@ hipError_t hipModuleGetGlobal(void** dptr, size_t* bytes, hipModule_t module, co
   const ApiCall api("hipModuleGetGlobal", dptr, bytes, module, name);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!module) return record(s, hipErrorInvalidResourceHandle);
   if (!name || !*name || (!dptr && !bytes)) return record(s, hipErrorInvalidValue);
+  if (!module) return record(s, hipErrorInvalidResourceHandle);
   Module* m = reinterpret_cast<Module*>(module);
   const vgpu::amd::GlobalVar* g = vgpu::amd::find_global(m->object, name);
   for (Module* member : m->members)
@@ -7484,7 +7498,7 @@ hipError_t hipLinkComplete(void* link, void** binary, size_t* size) {
           bytes = reinterpret_cast<const uint8_t*>(code->data());
           size = code->size();
         }
-        const vgpu::amd::CodeObject o = vgpu::amd::load_code_object(std::string(reinterpret_cast<const char*>(bytes), size), "link input");
+        const vgpu::amd::CodeObject o = vgpu::amd::load_code_object(std::string_view(reinterpret_cast<const char*>(bytes), size), "link input");
         if (o.isa != arch.substr(0, o.isa.size()) && !arch.empty())
           return record(state(), fail(hipErrorInvalidImage, "link input " + std::to_string(i) + " is built for " + o.isa +
                                                                ", and this device is " + arch));
@@ -7876,7 +7890,7 @@ const Loaded* load(int ordinal, const void* bytes, size_t size, std::string* why
   }
   try {
     auto m = std::make_unique<Loaded>();
-    m->object = load_code_object(std::string(static_cast<const char*>(bytes), size), "the code object");
+    m->object = load_code_object(std::string_view(static_cast<const char*>(bytes), size), "the code object");
     m->host_image = m->object.image;   // place() gives up the object's own copy
     vgpu::runtime::Device& d = s.rt->device(ordinal);
     place(*m, d.memory());

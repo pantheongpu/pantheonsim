@@ -123,6 +123,8 @@ struct Event {
 // runtime's set_enabled, and the runtime, the driver and the shim all read it through the function the dynamic linker
 // picks for them. A flag defined in the header (inline, weak or hidden) is one object for each library that carries it,
 // and the shim's markers and the driver's records then read one that nobody set.
+// That the dynamic linker picks one copy for every library is the version node they all put these functions in
+// (VGPU_PROFILING_1, vgpu_version_script in CMakeLists.txt), not the driver being in the global scope.
 bool enabled();
 void set_enabled(bool on);
 

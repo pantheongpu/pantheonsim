@@ -351,6 +351,7 @@ variable is unset by default.
 | --- | --- | --- |
 | `VGPU_QUIET` | `1` silences stderr diagnostics. | off |
 | `VGPU_TRACE` | `1` logs every runtime and driver entry point. | off |
+| `VGPU_LOAD_PLAIN` | AMD: `1` reads code objects as before [#565](https://github.com/pantheongpu/pantheonsim/issues/565): a compressed bundle inflated through a buffer and copied out (by default a kept entry is inflated straight into its place), a linked object's image zeroed before its sections are copied in, and no request for 2 MB pages for the buffers a code object is read into. The bytes read are the same either way (`test_amd_codeobject_same_bits_plain`, `test_amd_bundle`); for ruling the loader out when a result looks wrong. | off |
 | `VGPU_TRACE_API`, `VGPU_TRACE_LAUNCHES` | AMD: `1` names each HIP call, or what each launch runs, one line to stderr each. | off |
 | `VGPU_SASS_TRACE=<warp>` | Print every SASS instruction one warp runs, with the lane group and the first lane's results; after a `BSSY`, `BSYNC`, `BREAK` or `BMOV` it adds the barrier masks. | off |
 | `VGPU_SASS_TRACE_KERNEL=<text>` | Restrict the trace to kernels whose name contains the text. | all |

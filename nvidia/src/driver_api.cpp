@@ -3382,6 +3382,17 @@ static CUresult cuMemcpyDtoDAsync_impl(CUdeviceptr a, CUdeviceptr b, size_t n, C
   return cuMemcpyDtoDAsync_v2_impl(a, b, n, st);
 }
 
+// Deprecated, and still exported by the driver (cudarc 0.19 binds it when it loads libcuda, pantheonsim #627). An RTX
+// 3060 (CUDA 13.0, driver 610.88) answers CUDA_ERROR_NOT_INITIALIZED before cuInit and CUDA_ERROR_NOT_SUPPORTED
+// after it, whatever the arguments (null, a configuration file that does not exist, an output mode out of range) and
+// with or without a current context.
+static CUresult cuProfilerInitialize_impl(const char* configFile, const char* outputFile, int outputMode);
+VGPU_EXPORT CUresult cuProfilerInitialize(const char* configFile, const char* outputFile, int outputMode) { return traced("cuProfilerInitialize", cuProfilerInitialize_impl, configFile, outputFile, outputMode); }
+static CUresult cuProfilerInitialize_impl(const char* configFile, const char* outputFile, int outputMode) {
+  (void)configFile, (void)outputFile, (void)outputMode;
+  return api("cuProfilerInitialize", true, false, [](ShimState&) { return CUDA_ERROR_NOT_SUPPORTED; });
+}
+
 // No profiler collects anything to start or stop; the card succeeds.
 static CUresult cuProfilerStart_impl(void);
 VGPU_EXPORT CUresult cuProfilerStart(void) { return traced("cuProfilerStart", cuProfilerStart_impl); }
@@ -3832,6 +3843,13 @@ static CUresult cuMemGetAddressRange_v2_impl(CUdeviceptr* base, size_t* size, CU
     if (size) *size = sz;
     return CUDA_SUCCESS;
   });
+}
+// The unsuffixed name the driver still exports (pantheonsim #627), with the 64-bit ABI as this library's other
+// unsuffixed names of the CUDA 3.2 renames have (cuMemAlloc, cuMemFree).
+static CUresult cuMemGetAddressRange_impl(CUdeviceptr* base, size_t* size, CUdeviceptr dptr);
+VGPU_EXPORT CUresult cuMemGetAddressRange(CUdeviceptr* base, size_t* size, CUdeviceptr dptr) { return traced("cuMemGetAddressRange", cuMemGetAddressRange_impl, base, size, dptr); }
+static CUresult cuMemGetAddressRange_impl(CUdeviceptr* base, size_t* size, CUdeviceptr dptr) {
+  return cuMemGetAddressRange_v2_impl(base, size, dptr);
 }
 
 /* ---- host (pinned) memory: aligned host allocations every device maps ----
@@ -7257,7 +7275,7 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuTexRefGetFlags), VGPU_PROC(cuTexRefSetAddressMode), VGPU_PROC(cuTexRefGetAddressMode),
     VGPU_PROC(cuTexRefSetFilterMode), VGPU_PROC(cuTexRefGetFilterMode),
     VGPU_PROC(cuSurfRefSetArray), VGPU_PROC(cuSurfRefGetArray),
-    VGPU_PROC(cuProfilerStart), VGPU_PROC(cuProfilerStop),
+    VGPU_PROC(cuProfilerInitialize), VGPU_PROC(cuProfilerStart), VGPU_PROC(cuProfilerStop),
     VGPU_PROC(cuGraphicsUnregisterResource), VGPU_PROC(cuGraphicsMapResources),
     // OpenGL, EGL and VDPAU interop: exported, and refused (driver_gl.inc).
     VGPU_PROC(cuGraphicsGLRegisterBuffer), VGPU_PROC(cuGraphicsGLRegisterImage), VGPU_PROC(cuGLGetDevices_v2),
@@ -7278,6 +7296,24 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuSurfObjectDestroy),
 };
 
+// This library's own export of `name`, or null. dlsym searches the library's dependencies too; only this
+// library's own definition is an answer.
+void* own_export(const std::string& name) {
+  static void* const self = [] {
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<void*>(&own_export), &info) || !info.dli_fname) return (void*)nullptr;
+    return dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+  }();
+  if (!self) return nullptr;
+  void* fn = dlsym(self, name.c_str());
+  if (!fn) return nullptr;
+  Dl_info where{}, mine{};
+  if (!dladdr(fn, &where) || !dladdr(reinterpret_cast<void*>(&own_export), &mine) ||
+      where.dli_fbase != mine.dli_fbase)
+    return nullptr;
+  return fn;
+}
+
 // A driver function this library exports but the table above does not list:
 // cuMemGetAllocationGranularity and the rest of the virtual memory API, which
 // NanoVDB fetches with cudaGetDriverEntryPoint and calls without checking.
@@ -7286,25 +7322,54 @@ const ProcEntry kProcTable[] = {
 // depends on the version it asked for, so that stays the table's decision.
 void* exported_proc(const std::string& name) {
   if (name.rfind("cu", 0) != 0) return nullptr;
-  static void* const self = [] {
-    Dl_info info{};
-    if (!dladdr(reinterpret_cast<void*>(&exported_proc), &info) || !info.dli_fname) return (void*)nullptr;
-    return dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
-  }();
-  if (!self) return nullptr;
-  void* fn = dlsym(self, name.c_str());
-  if (!fn || dlsym(self, (name + "_v2").c_str())) return nullptr;
-  // dlsym searches the library's dependencies too; only this library's own
-  // definition is an answer.
-  Dl_info where{}, mine{};
-  if (!dladdr(fn, &where) || !dladdr(reinterpret_cast<void*>(&exported_proc), &mine) ||
-      where.dli_fbase != mine.dli_fbase)
-    return nullptr;
+  void* fn = own_export(name);
+  if (!fn || own_export(name + "_v2")) return nullptr;
   return fn;
 }
 
-// Versioned/suffixed request names resolve to the same synchronous impls:
-// strip _v2/_v3 and _ptsz/_ptds suffixes when looking up.
+// Every ABI each driver function has had, by the CUDA version that brought it, from NVIDIA's typedef headers
+// (scripts/gen_driver_proc_versions.py). Sorted by name, then version.
+struct ProcVersion {
+  const char* name;
+  int version;
+  int kind;   // 0: an ABI of the name; 1 / 2: from this version its per-thread-stream form is <symbol>_ptsz / _ptds
+};
+const ProcVersion kProcVersions[] = {
+#include "driver_proc_versions.inc"
+};
+
+enum class Versioned { kUnknown, kFound, kNotSufficient };
+
+// Which export a caller that asks for `name` at `cuda_version` wants, as the driver answers it: the k-th ABI the
+// headers give for the name (by version) is <name> for the first and <name>_v<k> after it, and the newest one
+// not newer than the caller's version is the one it was written against (cuGraphExecUpdate at 12000 is
+// cuGraphExecUpdate_v2, cuCtxCreate at 12000 cuCtxCreate_v3 and at 13000 cuCtxCreate_v4). With the per-thread
+// default stream asked for, the per-thread form of that ABI when the headers give one by then. An RTX 3060 answers
+// so for every name of the headers (nvidia/tests/data/driver_proc_address.rtx3060.txt).
+Versioned versioned_symbol(const char* name, int cuda_version, bool per_thread, std::string* symbol) {
+  const auto by_name = [](const ProcVersion& a, const ProcVersion& b) { return std::strcmp(a.name, b.name) < 0; };
+  const ProcVersion key{name, 0, 0};
+  const auto range = std::equal_range(std::begin(kProcVersions), std::end(kProcVersions), key, by_name);
+  if (range.first == range.second) return Versioned::kUnknown;
+  int abis = 0, abi = 0, pt_kind = 0;
+  for (auto it = range.first; it != range.second; ++it) {
+    if (it->kind == 0) ++abis;
+    if (it->version > cuda_version) continue;
+    if (it->kind == 0)
+      abi = abis;
+    else
+      pt_kind = it->kind;
+  }
+  if (abi == 0) return Versioned::kNotSufficient;
+  *symbol = name;
+  if (abi > 1) *symbol += "_v" + std::to_string(abi);
+  if (per_thread && pt_kind) *symbol += pt_kind == 1 ? "_ptsz" : "_ptds";
+  return Versioned::kFound;
+}
+
+// Requests with a _v2/_v3 or _ptsz/_ptds suffix (which the card does not resolve; the plain name and the
+// version are how it is asked) resolve here to the export of that name, and otherwise, like the names the
+// headers do not give, to the table's synchronous impls with the suffix stripped.
 void* find_proc(const std::string& request) {
   std::string base = request;
   for (const char* suf : {"_ptsz", "_ptds", "_v3", "_v2"}) {
@@ -7312,6 +7377,8 @@ void* find_proc(const std::string& request) {
     if (base.size() > l && base.compare(base.size() - l, l, suf) == 0)
       base = base.substr(0, base.size() - l);
   }
+  if (base != request && request.rfind("cu", 0) == 0)
+    if (void* fn = own_export(request)) return fn;
   for (const auto& e : kProcTable) {
     if (base == e.name) return e.fn;
     // Table entries themselves may carry _v2 (e.g. cuMemGetAddressRange_v2).
@@ -7332,23 +7399,37 @@ VGPU_EXPORT CUresult cuGetProcAddress(const char* symbol, void** pfn, int cudaVe
 
 static CUresult cuGetProcAddress_v2_impl(const char* symbol, void** pfn, int cudaVersion, unsigned long long flags, int* symbolStatus);
 VGPU_EXPORT CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion, unsigned long long flags, int* symbolStatus) { return traced("cuGetProcAddress_v2", cuGetProcAddress_v2_impl, symbol, pfn, cudaVersion, flags, symbolStatus); }
+// A name the driver does not have, or not at the version asked for, is CUDA_SUCCESS with a null function and the
+// status saying which (CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND 1, _VERSION_NOT_SUFFICIENT 2), as on an RTX 3060.
 static CUresult cuGetProcAddress_v2_impl(const char* symbol, void** pfn, int cudaVersion,
                                          unsigned long long flags, int* symbolStatus) {
   if (!symbol || !pfn) return CUDA_ERROR_INVALID_VALUE;
-  (void)flags;
+  constexpr unsigned long long kPerThreadDefaultStream = 2;   // CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM
   void* fn = nullptr;
-  // Bootstrap: cudart resolves cuGetProcAddress through itself, and the
-  // requested cudaVersion selects which signature it expects.
-  if (std::strcmp(symbol, "cuGetProcAddress") == 0)
-    fn = cudaVersion >= 12000 ? reinterpret_cast<void*>(&cuGetProcAddress_v2)
-                              : reinterpret_cast<void*>(&cuGetProcAddress);
-  if (!fn) fn = find_proc(symbol);
+  int status = 1;   // CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND
+  std::string want;
+  switch (versioned_symbol(symbol, cudaVersion, (flags & kPerThreadDefaultStream) != 0, &want)) {
+    case Versioned::kFound:
+      fn = own_export(want);
+      // The per-thread form this library does not have: the legacy one, as the driver does.
+      if (!fn && (flags & kPerThreadDefaultStream) &&
+          versioned_symbol(symbol, cudaVersion, false, &want) == Versioned::kFound)
+        fn = own_export(want);
+      break;
+    case Versioned::kNotSufficient:
+      status = 2;   // CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT
+      break;
+    case Versioned::kUnknown:
+      fn = find_proc(symbol);
+      break;
+  }
+  if (fn) status = 0;
   if (trace())
     std::fprintf(stderr, "[vgpu][trace] cuGetProcAddress(\"%s\", v%d) -> %s\n", symbol, cudaVersion,
-                 fn ? "ok" : "MISSING");
+                 fn ? (want.empty() ? "ok" : want.c_str()) : status == 2 ? "VERSION_NOT_SUFFICIENT" : "MISSING");
   *pfn = fn;
-  if (symbolStatus) *symbolStatus = fn ? 0 : 1;  // SUCCESS : SYMBOL_NOT_FOUND
-  return fn ? CUDA_SUCCESS : CUDA_ERROR_NOT_FOUND;
+  if (symbolStatus) *symbolStatus = status;
+  return CUDA_SUCCESS;
 }
 
 static CUresult cuGetProcAddress_impl(const char* symbol, void** pfn, int cudaVersion, unsigned long long flags);

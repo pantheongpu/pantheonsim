@@ -218,6 +218,92 @@ extern "C" __global__ void add_bias(float* x, int n) { if (threadIdx.x < n) x[th
   cuModuleUnload(first);
 }
 
+// NVRTC's include search (#619): no host directory. A program that brings its
+// own standard headers, as ThrustRTC does (its <cstdint> has int64_t as long
+// long, glibc's has long), compiles with them and nothing else; one that asks
+// for a host header it did not bring cannot open it; and what NVRTC puts in
+// front of every program (size_t, NULL, clock_t, std::move, std::forward,
+// std::initializer_list, printf, assert) is there without an include. Measured
+// with CUDA 13.0's libnvrtc on an RTX 3060.
+static void own_standard_headers() {
+  const char* headers[] = {
+      "#pragma once\n#include <climits>\ntypedef signed char int8_t;\ntypedef signed int int32_t;\n"
+      "typedef signed long long int64_t;\ntypedef unsigned char uint8_t;\ntypedef unsigned long long uint64_t;\n"
+      "typedef signed long intptr_t;\n#define INT64_MAX LLONG_MAX\n#define UINT8_MAX UCHAR_MAX\n",
+      "#pragma once\n#define CHAR_BIT 8\n#define UCHAR_MAX 255\n#define INT_MAX 2147483647\n"
+      "#define LLONG_MAX 9223372036854775807LL\n",
+      "#pragma once\n#define FLT_MAX 3.402823466e+38F\n"};
+  const char* names[] = {"cstdint", "climits", "cfloat"};
+  const char* src = R"(
+#include <cstdint>
+#include "cfloat"
+template <class A, class B> struct same { enum { value = 0 }; };
+template <class A> struct same<A, A> { enum { value = 1 }; };
+static_assert(same<int64_t, long long>::value, "int64_t is the program's own");
+extern "C" __global__ void trtc_fill(float* x, int n) {
+  int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  uint8_t top = UINT8_MAX;
+  if (i < n) x[i] = (INT64_MAX == 9223372036854775807LL ? 1.0f : 0.0f) + (FLT_MAX > 1e38f ? 2.0f : 0.0f) + top + (float)i;
+}
+)";
+  const std::string ptx = compile(src, "saxpy.cu", {"--gpu-architecture=compute_80"}, {}, nullptr, 3, headers, names);
+  check(!ptx.empty(), "a program with its own <cstdint>, <climits> and <cfloat> (ThrustRTC's) compiles with them");
+  if (!ptx.empty()) {
+    std::vector<float> x(16, -1.0f);
+    const bool ran = run(ptx, "trtc_fill", x, 16);
+    check(ran && x[0] == 258.0f && x[15] == 273.0f, "and runs with its own definitions");
+  }
+
+  const char* builtins = R"(
+__device__ int total(std::initializer_list<int> l) { int s = 0; for (int v : l) s += v; return s; }
+template <class T> __device__ T pass(T&& v) { return std::forward<T>(v); }
+extern "C" __global__ void prelude(float* x, int n) {
+  size_t i = threadIdx.x;
+  ptrdiff_t d = 1;
+  clock_t c = 0;
+  int* none = NULL;
+  int moved = std::move(d);
+  assert(none == 0);
+  if (i < (size_t)n) x[i] = total({1, 2, 3}) + pass(moved) + (float)c;
+  if (i > 4096) printf("unreached\n");
+}
+)";
+  const std::string bp = compile(builtins, "prelude.cu", {"--gpu-architecture=compute_80"});
+  check(!bp.empty(), "size_t, ptrdiff_t, clock_t, NULL, std::initializer_list, std::move, std::forward, assert and printf "
+                     "need no include");
+  if (!bp.empty()) {
+    std::vector<float> x(8, 0.0f);
+    check(run(bp, "prelude", x, 8) && x[0] == 7.0f && x[7] == 7.0f, "and the kernel that uses them runs");
+  }
+
+  {  // A clean compile leaves the log empty, as NVIDIA's does: no warning from the builtins' own headers.
+    nvrtcProgram p;
+    if (nvrtcCreateProgram(&p, builtins, "prelude.cu", 0, nullptr, nullptr) == NVRTC_SUCCESS) {
+      const char* opts[] = {"--gpu-architecture=compute_80"};
+      const bool ok = nvrtcCompileProgram(p, 1, opts) == NVRTC_SUCCESS;
+      const std::string log = log_of(p);
+      check(ok && (log.empty() || log[0] == '\0'), "and its compile log is empty");
+      if (!log.empty() && log[0] != '\0') std::printf("     compile log: %s\n", log.substr(0, 400).c_str());
+      nvrtcDestroyProgram(&p);
+    }
+  }
+
+  for (const char* host : {"stdint.h", "cstdint", "cmath", "stdio.h", "type_traits"}) {
+    nvrtcProgram p;
+    const std::string s = std::string("#include <") + host + ">\nextern \"C\" __global__ void k() {}\n";
+    if (nvrtcCreateProgram(&p, s.c_str(), "host.cu", 0, nullptr, nullptr) != NVRTC_SUCCESS) {
+      check(false, "nvrtcCreateProgram");
+      continue;
+    }
+    const char* opts[] = {"--gpu-architecture=compute_80"};
+    const nvrtcResult rc = nvrtcCompileProgram(p, 1, opts);
+    const std::string log = log_of(p);
+    const std::string what = std::string("#include <") + host + "> of a host header is NVRTC_ERROR_COMPILATION, naming it";
+    check(rc == NVRTC_ERROR_COMPILATION && log.find(host) != std::string::npos, what.c_str());
+    nvrtcDestroyProgram(&p);
+  }
+}
+
 static void compile_error() {
   nvrtcProgram p;
   CK(nvrtcCreateProgram(&p, "__global__ void k() { undeclared_thing(); }", "bad.cu", 0, nullptr, nullptr));
@@ -601,6 +687,7 @@ int main() {
   name_expressions_and_headers();
   struct_parameter();
   function_outlives_later_modules();
+  own_standard_headers();
   compile_error();
   cubin_is_real();
   lto_and_optix();

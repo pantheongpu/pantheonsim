@@ -1307,7 +1307,9 @@ void print_smi_usage(FILE* to) {
       "  -r, --gpu-reset             Reset the GPUs: the driver's volatile state and any\n"
       "                              pending page retirement or row remap take effect\n"
       "  topo -m                     How the GPUs are connected\n"
-      "  nvlink -s | -e              NVLink status, or error counters, of GPUs that have it\n"
+      "  nvlink -s | -e | -c | -cBridge | -gt d|r\n"
+      "                              NVLink status, error counters, capabilities, bridge\n"
+      "                              and traffic, of GPUs that have it (nvlink -h)\n"
       "\n"
       "VirtualGPU additions:\n"
       "      --details               Append the virtual device details to the table\n"
@@ -1322,30 +1324,79 @@ void print_smi_usage(FILE* to) {
       "Exit status: 0 success, 2 invalid argument, 6 no such device.\n");
 }
 
-// `nvidia-smi nvlink -s` and `-e`: link state and error counters, for the GPUs
-// whose profile names their links (telemetry.nvlink). The speed is NVLink's
-// per-link rate by generation, from NVIDIA's data sheets: 25 GB/s for NVLink 3
-// and 26.562 GB/s for NVLink 4; a generation not listed here prints no speed.
-// Links are all up and error counters zero -- see nvmlDeviceGetNvLinkState in
-// nvidia/src/nvml_api.cpp for the assumptions.
-void print_nvlink(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>& sel, bool errors) {
+// `nvidia-smi nvlink`: one block per GPU, with each display asked for, for
+// the GPUs whose profile names their links (telemetry.nvlink). The speed is
+// NVLink's per-link rate by generation, from NVIDIA's data sheets: 25 GB/s for
+// NVLink 3 and 26.562 GB/s for NVLink 4; a generation not listed here prints
+// no speed. Links are all up, error and traffic counters zero, and the
+// capabilities those of nvmlDeviceGetNvLinkCapability -- see
+// nvidia/src/nvml_api.cpp for the assumptions. -cBridge prints no link lines:
+// the profiles with NVLink are SXM boards, whose links run through the
+// baseboard, not a bridge. A GPU without NVLink prints its name only.
+void print_nvlink(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>& sel,
+                  const std::vector<char>& ops, int only_link) {
+  if (ops.empty()) return;
   for (uint32_t i : sel) {
     const auto& d = s.devices[i];
     std::printf("GPU %u: %s (UUID: %s)\n", i, d.name, d.uuid);
-    for (uint32_t link = 0; link < d.nvlink_count; ++link) {
-      if (errors) {
-        std::printf("\t Link %u: Replay Errors: 0\n", link);
-        std::printf("\t Link %u: Recovery Errors: 0\n", link);
-        std::printf("\t Link %u: CRC Errors: 0\n", link);
-      } else if (d.nvlink_version == 3) {
-        std::printf("\t Link %u: 25 GB/s\n", link);
-      } else if (d.nvlink_version == 4) {
-        std::printf("\t Link %u: 26.562 GB/s\n", link);
-      } else {
-        std::printf("\t Link %u: <active>\n", link);
+    for (char op : ops) {
+      for (uint32_t link = 0; link < d.nvlink_count; ++link) {
+        if (only_link >= 0 && link != static_cast<uint32_t>(only_link)) continue;
+        if (op == 'e') {
+          std::printf("\t Link %u: Replay Errors: 0\n", link);
+          std::printf("\t Link %u: Recovery Errors: 0\n", link);
+          std::printf("\t Link %u: CRC Errors: 0\n", link);
+        } else if (op == 'c') {
+          std::printf("\t Link %u, P2P is supported: true\n", link);
+          std::printf("\t Link %u, Access to system memory supported: false\n", link);
+          std::printf("\t Link %u, P2P atomics supported: true\n", link);
+          std::printf("\t Link %u, System memory atomics supported: false\n", link);
+          std::printf("\t Link %u, SLI is supported: false\n", link);
+          std::printf("\t Link %u, Link is supported: true\n", link);
+        } else if (op == 'd' || op == 'r') {
+          const char* kind = op == 'd' ? "Data" : "Raw";
+          std::printf("\t Link %u: %s Tx: 0 KiB\n", link, kind);
+          std::printf("\t Link %u: %s Rx: 0 KiB\n", link, kind);
+        } else if (op != 's') {
+          // 'b' (no bridge on an SXM board) and 'u' (refused earlier).
+        } else if (d.nvlink_version == 3) {
+          std::printf("\t Link %u: 25 GB/s\n", link);
+        } else if (d.nvlink_version == 4) {
+          std::printf("\t Link %u: 26.562 GB/s\n", link);
+        } else {
+          std::printf("\t Link %u: <active>\n", link);
+        }
       }
     }
   }
+}
+
+// nvidia-smi's own text for `nvlink -h` and bare `nvlink`.
+void print_nvlink_usage() {
+  std::printf(
+      "\n    nvlink -- Display NvLink information.\n\n"
+      "    Usage: nvidia-smi nvlink [options]\n\n"
+      "    Options include:\n"
+      "    [-h | --help]: Display help information\n"
+      "    [-i | --id]: Enumeration index, PCI bus ID or UUID.\n"
+      "    [-l | --link]: Limit a command to a specific link.  Without this flag, all link information is displayed.\n"
+      "    [-s | --status]: Display link state (active/inactive).\n"
+      "    [-c | --capabilities]: Display link capabilities.\n"
+      "    [-p | --pcibusid]: Display remote node PCI bus ID for a link.\n"
+      "    [-R | --remotelinkinfo]: Display remote device PCI bus ID and NvLink ID for a link.\n"
+      "    [-e | --errorcounters]: Display error counters for a link.\n"
+      "    [-ec | --crcerrorcounters]: Display per-lane CRC error counters for a link.\n"
+      "    [-gt | --getthroughput]: Display link throughput counters for specified counter type\n"
+      "       The arguments consist of character string representing the type of traffic counted:\n"
+      "          d: Display tx and rx data payload in KiB\n"
+      "          r: Display tx and rx data payload and protocol overhead in KiB if supported\n"
+      "    [-gLowPwrInfo | --getLowPowerInfo]: Get NvLink Low Power Info\n"
+      "    [-gBwMode | --getBandwidthMode]: Get NvLink Bandwidth mode\n"
+      "    [-cBridge | --checkBridge]: Check NvLink Bridge presence\n"
+      "    [-gLWidth | --getLinkWidth]: Get NvLink Link Width\n"
+      "    [-info | --info]: Display device nvlink info\n\n"
+      "    The simulator has no link settings to change: -re, -sLowPwrThres, -sBwMode,\n"
+      "    -sLWidth and the deprecated counter options are refused.\n\n");
 }
 
 void print_topo_usage(FILE* to) {
@@ -2018,7 +2069,10 @@ int cmd_smi(const std::vector<std::string>& args) {
   bool header = true, units = true, list = false, xml = false, topo = false;
   int reset_ecc = -1;   // -p: 0 volatile, 1 aggregate
   bool gpu_reset = false;   // -r
-  int nvlink = 0;           // nvlink -s: 's', -e: 'e'
+  bool nvlink = false;      // the nvlink subcommand, its displays in order
+  std::vector<char> nvlink_ops;
+  int nvlink_link = -1;     // nvlink -l
+  std::string nvlink_unmodelled;
   long long loop_ms = 0;
   auto fail = [](const std::string& msg) {
     std::fprintf(stderr, "vgpu smi: %s\n", msg.c_str());
@@ -2109,16 +2163,70 @@ int cmd_smi(const std::vector<std::string>& args) {
       topo = true;
       ++i;
     } else if (a == "nvlink") {
-      // -s (state) and -e (error counters), the two every health check runs.
-      // The rest of the subcommand (capabilities, utilization counters,
-      // remote devices) needs link topology no profile has.
-      if (i + 1 >= args.size() || (args[i + 1] != "-s" && args[i + 1] != "--status" &&
-                                   args[i + 1] != "-e" && args[i + 1] != "--errorcounters")) {
-        std::fprintf(stderr, "vgpu smi: nvlink supports -s (--status) and -e (--errorcounters)\n");
-        return 2;
+      // The subcommand takes the rest of the line, as nvidia-smi's does:
+      // -i and -l anywhere after it, and any number of display options. A
+      // GPU without NVLink prints nothing under its name for any of them
+      // (#640: QOKit runs `nvlink -cBridge` with check=True).
+      if (i + 1 >= args.size()) {
+        print_nvlink_usage();
+        return 0;
       }
-      nvlink = args[i + 1] == "-s" || args[i + 1] == "--status" ? 's' : 'e';
-      ++i;
+      for (++i; i < args.size(); ++i) {
+        const std::string& o = args[i];
+        auto value = [&](std::string* out) {
+          if (i + 1 >= args.size()) {
+            std::printf("Option \"%s\" is missing its value.\n", o.c_str());
+            return false;
+          }
+          *out = args[++i];
+          return true;
+        };
+        std::string v;
+        if (o == "-h" || o == "--help") {
+          print_nvlink_usage();
+          return 0;
+        } else if (o == "-i" || o == "--id") {
+          if (!value(&id_spec)) return 2;
+        } else if (o == "-l" || o == "--link") {
+          long long n = 0;
+          if (!value(&v)) return 2;
+          if (!vgpu::cli::parse_int(v, 0, 1023, &n)) return fail("-l takes a link number, not '" + v + "'");
+          nvlink_link = static_cast<int>(n);
+        } else if (o == "-s" || o == "--status") {
+          nvlink_ops.push_back('s');
+        } else if (o == "-e" || o == "--errorcounters") {
+          nvlink_ops.push_back('e');
+        } else if (o == "-c" || o == "--capabilities") {
+          nvlink_ops.push_back('c');
+        } else if (o == "-cBridge" || o == "--checkBridge") {
+          nvlink_ops.push_back('b');
+        } else if (o == "-gt" || o == "--getthroughput") {
+          if (!value(&v)) return 2;
+          if (v != "d" && v != "r") return fail("-gt takes d (data) or r (raw), not '" + v + "'");
+          nvlink_ops.push_back(v == "d" ? 'd' : 'r');
+        } else if (o == "-p" || o == "--pcibusid" || o == "-R" || o == "--remotelinkinfo" ||
+                   o == "-ec" || o == "--crcerrorcounters" || o == "-gLowPwrInfo" ||
+                   o == "--getLowPowerInfo" || o == "-gBwMode" || o == "--getBandwidthMode" ||
+                   o == "-gLWidth" || o == "--getLinkWidth" || o == "-info" || o == "--info") {
+          // Recognized, but the answer (the remote end, per-lane counters,
+          // power and width settings) is in no profile: nothing to print on
+          // a GPU without links, refused on one with them.
+          nvlink_ops.push_back('u');
+          nvlink_unmodelled = o;
+        } else if (o == "-re" || o == "--reseterrorcounters" || o == "-sLowPwrThres" ||
+                   o == "--setLowPowerThreshold" || o == "-sBwMode" || o == "--setBandwidthMode" ||
+                   o == "-sLWidth" || o == "--setLinkWidth" || o == "-sc" || o == "--setcontrol" ||
+                   o == "-gc" || o == "--getcontrol" || o == "-g" || o == "--getcounters" ||
+                   o == "-r" || o == "--resetcounters") {
+          return fail("nvlink " + o + " changes or reads deprecated link settings, which the simulator does not have");
+        } else {
+          std::printf("Option \"%s\" is not recognized.\n", o.c_str());
+          return 2;
+        }
+      }
+      // `nvlink -i 0` or `nvlink -l 0` alone: nothing to display, as with nvidia-smi.
+      nvlink = true;
+      break;
     } else if (a == "-r" || a == "--gpu-reset") {
       gpu_reset = true;
     } else if (a == "-L" || a == "--list-gpus" || a == "--list") {
@@ -2338,7 +2446,13 @@ int cmd_smi(const std::vector<std::string>& args) {
     if (topo) {
       print_topology(snap);
     } else if (nvlink) {
-      print_nvlink(snap, sel, nvlink == 'e');
+      for (uint32_t i : sel)
+        if (!nvlink_unmodelled.empty() && snap.devices[i].nvlink_count > 0) {
+          std::fprintf(stderr, "vgpu smi: nvlink %s needs link data no profile has\n",
+                       nvlink_unmodelled.c_str());
+          return 2;
+        }
+      print_nvlink(snap, sel, nvlink_ops, nvlink_link);
     } else if (list) {
       for (uint32_t i : sel)
         std::printf("GPU %u: %s (UUID: %s)\n", i, snap.devices[i].name, snap.devices[i].uuid);

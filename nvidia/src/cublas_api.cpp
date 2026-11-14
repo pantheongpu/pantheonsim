@@ -36,6 +36,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -221,6 +222,32 @@ inline bool host_result_under_capture(cublasHandle_t h) {
   cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
   if (cudaStreamIsCapturing(hh->stream, &st) != cudaSuccess) return false;
   return st == cudaStreamCaptureStatusActive;
+}
+
+// A reduction's result pointer that is device memory while the handle is in host pointer mode (pantheonsim #638).
+// cuBLAS documents a host pointer there, but programs pass a cudaMalloc one (GauXC's gdot does), and an RTX 3060
+// (cuBLAS 13.1) answers differently per routine, measured with every routine and its _64 form:
+//   - the dot products (?dot, ?dotu, ?dotc, DotEx, DotcEx) with n > 0 store the result through the device pointer
+//     and return SUCCESS, as in device pointer mode;
+//   - the same with n <= 0, and every other reduction (?nrm2, ?asum, i?amax, i?amin, Nrm2Ex, AsumEx, IamaxEx,
+//     IaminEx) at any n, write to the pointer as host memory and the process dies with SIGSEGV.
+// The first is done here as the card does it. The crash is not imitated: those calls are INVALID_VALUE, said once
+// per routine on stderr. Managed memory is host memory here as on the card, so it takes the plain host write.
+inline bool device_result_in_host_mode(cublasHandle_t h, const void* result) {
+  Handle* hh = reinterpret_cast<Handle*>(h);
+  return hh && hh->pointer_mode == CUBLAS_POINTER_MODE_HOST && vgpu::is_device_va(reinterpret_cast<uint64_t>(result));
+}
+inline cublasStatus_t refuse_device_result(const char* routine) {
+  static std::mutex mu;
+  static std::set<std::string> said;
+  std::lock_guard<std::mutex> lock(mu);
+  if (said.insert(routine).second && !quiet())
+    std::fprintf(stderr,
+                 "[vgpu] cuBLAS %s: the result pointer is device memory but the handle is in CUBLAS_POINTER_MODE_HOST; "
+                 "an RTX 3060 crashes on this call, so it is refused with CUBLAS_STATUS_INVALID_VALUE (only the dot "
+                 "products with n > 0 store through a device pointer in host mode; set CUBLAS_POINTER_MODE_DEVICE)\n",
+                 routine);
+  return CUBLAS_STATUS_INVALID_VALUE;
 }
 
 // Column-major element access with a leading dimension.
@@ -1345,10 +1372,12 @@ cublasStatus_t gemv(cublasHandle_t h, cublasOperation_t trans, int m, int n, con
 }
 
 // The reductions hand their answer back through a host or device pointer,
-// depending on the handle's pointer mode.
+// depending on the handle's pointer mode -- or, for a dot product in host mode,
+// on where the pointer is (device_result_in_host_mode above).
 template <class R>
 void put_result(cublasHandle_t h, R* result, R value) {
-  if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE) {
+  if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE ||
+      vgpu::is_device_va(reinterpret_cast<uint64_t>(result))) {
     vgpu::profiling::Silence silent;
     cudaMemcpy(result, &value, sizeof value, kH2D);
   } else
@@ -1396,6 +1425,7 @@ cublasStatus_t dot(cublasHandle_t h, int n, const T* x, int incx, const T* y, in
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (!result) return CUBLAS_STATUS_INVALID_VALUE;
   if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (n <= 0 && device_result_in_host_mode(h, result)) return refuse_device_result("?dot");
   if (deferred_to_graph(h, [=] { dot<T>(h, n, x, incx, y, incy, result); }))
     return CUBLAS_STATUS_SUCCESS;
   long double acc = 0.0L;
@@ -1414,6 +1444,7 @@ cublasStatus_t nrm2(cublasHandle_t h, int n, const T* x, int incx, T* result) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (!result) return CUBLAS_STATUS_INVALID_VALUE;
   if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (device_result_in_host_mode(h, result)) return refuse_device_result("?nrm2");
   if (deferred_to_graph(h, [=] { nrm2<T>(h, n, x, incx, result); }))
     return CUBLAS_STATUS_SUCCESS;
   long double acc = 0.0L;
@@ -1435,6 +1466,7 @@ cublasStatus_t asum(cublasHandle_t h, int n, const T* x, int incx, T* result) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (!result) return CUBLAS_STATUS_INVALID_VALUE;
   if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (device_result_in_host_mode(h, result)) return refuse_device_result("?asum");
   if (deferred_to_graph(h, [=] { asum<T>(h, n, x, incx, result); }))
     return CUBLAS_STATUS_SUCCESS;
   long double acc = 0.0L;
@@ -1453,6 +1485,7 @@ cublasStatus_t iamax(cublasHandle_t h, int n, const T* x, int incx, R* result) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (!result) return CUBLAS_STATUS_INVALID_VALUE;
   if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (device_result_in_host_mode(h, result)) return refuse_device_result("I?amax");
   if (deferred_to_graph(h, [=] { iamax<T, R>(h, n, x, incx, result); }))
     return CUBLAS_STATUS_SUCCESS;
   R best = 0;
@@ -1939,16 +1972,20 @@ cd ex_scalar(cublasHandle_t h, const void* p, cudaDataType t) {
 void ex_result(cublasHandle_t h, void* result, cudaDataType t, cd v, cudaDataType exec) {
   std::vector<uint8_t> b(ex_bytes(t));
   ex_put(t, b.data(), v, exec);
-  if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE) store(result, b);
+  if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE ||
+      vgpu::is_device_va(reinterpret_cast<uint64_t>(result)))   // a dot product's device result in host mode
+    store(result, b);
   else std::memcpy(result, b.data(), b.size());
 }
 
-// A reduction's checks and its graph capture, then `body`.
+// A reduction's checks and its graph capture, then `body`. `device_ok` says whether
+// the card stores a device result given in host pointer mode (a dot product with n > 0).
 template <class Body>
-cublasStatus_t ex_reduce(cublasHandle_t h, void* result, Body body) {
+cublasStatus_t ex_reduce(cublasHandle_t h, void* result, const char* routine, bool device_ok, Body body) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (!result) return CUBLAS_STATUS_INVALID_VALUE;
   if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (!device_ok && device_result_in_host_mode(h, result)) return refuse_device_result(routine);
   if (deferred_to_graph(h, [=] { body(); })) return CUBLAS_STATUS_SUCCESS;
   body();
   return CUBLAS_STATUS_SUCCESS;
@@ -1957,7 +1994,7 @@ cublasStatus_t ex_reduce(cublasHandle_t h, void* result, Body body) {
 cublasStatus_t dot_ex(cublasHandle_t h, int n, const void* x, cudaDataType xt, int incx, const void* y,
                       cudaDataType yt, int incy, void* result, cudaDataType rt, cudaDataType et, bool conj) {
   if (!ex_known(xt) || yt != xt || rt != xt || et != ex_exec(xt)) return CUBLAS_STATUS_NOT_SUPPORTED;
-  return ex_reduce(h, result, [=] {
+  return ex_reduce(h, result, conj ? "DotcEx" : "DotEx", n > 0, [=] {
     cd acc = 0;
     if (n > 0) {
       const auto xv = ex_load(x, xt, n, incx), yv = ex_load(y, yt, n, incy);
@@ -1971,7 +2008,7 @@ cublasStatus_t nrm2_ex(cublasHandle_t h, int n, const void* x, cudaDataType xt, 
                        cudaDataType rt, cudaDataType et) {
   if (!ex_known(xt) || rt != (ex_complex(xt) ? ex_real(xt) : xt) || et != ex_real(xt))
     return CUBLAS_STATUS_NOT_SUPPORTED;
-  return ex_reduce(h, result, [=] {
+  return ex_reduce(h, result, "Nrm2Ex (or Scnrm2, Dznrm2)", false, [=] {
     double acc = 0;
     if (n > 0 && incx > 0)
       for (const cd& v : ex_load(x, xt, n, incx)) acc += std::norm(v);
@@ -1984,7 +2021,7 @@ cublasStatus_t asum_ex(cublasHandle_t h, int n, const void* x, cudaDataType xt, 
                        cudaDataType rt, cudaDataType et) {
   if (!ex_known(xt) || rt != ex_real(xt) || et != (ex_complex(xt) ? xt : ex_real(xt)))
     return CUBLAS_STATUS_NOT_SUPPORTED;
-  return ex_reduce(h, result, [=] {
+  return ex_reduce(h, result, "AsumEx (or Scasum, Dzasum)", false, [=] {
     double acc = 0;
     if (n > 0 && incx > 0)
       for (const cd& v : ex_load(x, xt, n, incx)) acc += std::fabs(v.real()) + std::fabs(v.imag());
@@ -2000,6 +2037,8 @@ cublasStatus_t iamax_ex(cublasHandle_t h, int n, const void* x, cudaDataType xt,
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (!result) return CUBLAS_STATUS_INVALID_VALUE;
   if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (device_result_in_host_mode(h, result))
+    return refuse_device_result(min ? "IaminEx (or I?amin)" : "IamaxEx (or Icamax, Izamax)");
   if (deferred_to_graph(h, [=] { iamax_ex<R>(h, n, x, xt, incx, result, min); })) return CUBLAS_STATUS_SUCCESS;
   R best = 0;
   if (n > 0 && incx > 0) {

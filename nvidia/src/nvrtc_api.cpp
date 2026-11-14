@@ -33,9 +33,11 @@
 //
 // The two compilers differ where it matters: nvcc pre-includes cuda_runtime.h,
 // and with it the host's <stdint.h> and <math.h>, so a program that defines
-// int64_t or INFINITY itself -- PyTorch's jiterator does both -- compiles under
-// NVRTC and fails under nvcc. VGPU_NVRTC=nvcc forces the nvcc path;
-// VGPU_NVRTC_LIB names the library to use.
+// int64_t or INFINITY itself (PyTorch's jiterator) or brings its own <cstdint>
+// (ThrustRTC) compiles under NVRTC and fails under nvcc. The nvcc path is
+// therefore run with NVRTC's include search: no host directory, the toolkit
+// headers in __CUDACC_RTC__ mode ("NVRTC's include search" below).
+// VGPU_NVRTC=nvcc forces the nvcc path; VGPU_NVRTC_LIB names the library to use.
 //
 // This is what makes the JIT frameworks reachable: CuPy, Numba, Triton and
 // PyTorch's inductor all compile kernels through NVRTC and then load the result
@@ -53,6 +55,7 @@
 
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -136,7 +139,8 @@ std::string tempdir() {
   ::mkdir(base.c_str(), 0700);
   static std::atomic_int seq{0};
   const std::string d = base + "/" + std::to_string(seq.fetch_add(1));
-  ::mkdir(d.c_str(), 0700);
+  // A program going away on another thread removes the process's directory when it is empty.
+  for (int tries = 0; tries < 8 && ::mkdir(d.c_str(), 0700) != 0 && errno == ENOENT; ++tries) ::mkdir(base.c_str(), 0700);
   return d;
 }
 
@@ -152,6 +156,240 @@ std::string read_file(const std::string& path) {
   std::ostringstream ss;
   ss << f.rdbuf();
   return ss.str();
+}
+
+std::string shq(const std::string& s);
+
+// ---- NVRTC's include search, on the nvcc path ----
+//
+// NVRTC searches no host directory: a program sees the CUDA builtins
+// (cuda_runtime.h's device half, which NVRTC compiles in __CUDACC_RTC__ mode),
+// the headers handed to nvrtcCreateProgram, and the -I/--include-path
+// directories, nothing else. <stdint.h>, <cstdint>, <cmath> and the rest fail
+// to open, so programs that need them bring their own: ThrustRTC passes its own
+// <cstdint> (int64_t is long long there, long in glibc), PyTorch's jiterator
+// defines int64_t and INFINITY itself (#619). nvcc instead pre-includes
+// cuda_runtime.h in its host mode, which pulls in glibc's and libstdc++'s
+// headers, and the two definitions clash.
+//
+// So nvcc is run the way NVRTC compiles: the toolkit headers in __CUDACC_RTC__
+// mode, and the host compiler's preprocessor with no system directories
+// (-nostdinc) and none of its own predefined macros (-undef: NVRTC defines no
+// __GNUC__, __linux__ or __x86_64__, measured). What NVRTC itself puts in
+// front of a program, measured on CUDA 13.0's on an RTX 3060, comes from
+// kRtcPrelude: size_t, ptrdiff_t, clock_t, NULL (an int 0), std::move,
+// std::forward and std::initializer_list, and nothing else of the standard
+// library (std::is_same, std::size_t, std::nullptr_t, std::min are absent).
+// cuda_runtime.h's RTC branch includes two of NVRTC's builtin headers, which
+// the toolkit does not ship; their stand-ins are kRtcTarget ("target", which is
+// <nv/target>) and an empty nvrtc_device_runtime.h. And in RTC mode the
+// headers declare the device intrinsics (__shfl_sync, atomicAdd, the math
+// functions, __half's operators) without defining them, because NVRTC links
+// their definitions from its builtins library; nvcc has none, so the program
+// ends with kRtcDefinitions, the toolkit's own .hpp definitions of them, which
+// support RTC mode for exactly that purpose, and cuda_fp16.h / cuda_bf16.h are
+// asked to include theirs (__FORCE_INCLUDE_CUDA_*_HPP_FROM_*_H__). The PTX that
+// comes out is the one NVRTC gives for the programs compared (math, atomics,
+// shuffles, textures, fp16/bf16/fp8, wmma, printf/assert).
+const char* const kRtcDir = ".vgpu-nvrtc";   // inside the program's scratch directory
+const char* const kRtcPrelude = R"(#pragma once
+typedef unsigned long size_t;
+typedef long ptrdiff_t;
+typedef long clock_t;
+#define NULL 0
+namespace __vgpu_nvrtc {
+template <class T> struct unref { typedef T type; };
+template <class T> struct unref<T&> { typedef T type; };
+template <class T> struct unref<T&&> { typedef T type; };
+}
+namespace std {
+template <class E> class initializer_list {
+  const E* _M_array;
+  size_t _M_len;
+  __attribute__((host)) __attribute__((device)) constexpr initializer_list(const E* a, size_t l) : _M_array(a), _M_len(l) {}
+ public:
+  typedef E value_type;
+  typedef const E& reference;
+  typedef const E& const_reference;
+  typedef size_t size_type;
+  typedef const E* iterator;
+  typedef const E* const_iterator;
+  __attribute__((host)) __attribute__((device)) constexpr initializer_list() noexcept : _M_array(0), _M_len(0) {}
+  __attribute__((host)) __attribute__((device)) constexpr size_t size() const noexcept { return _M_len; }
+  __attribute__((host)) __attribute__((device)) constexpr const E* begin() const noexcept { return _M_array; }
+  __attribute__((host)) __attribute__((device)) constexpr const E* end() const noexcept { return _M_array + _M_len; }
+};
+template <class T> __attribute__((host)) __attribute__((device)) constexpr typename __vgpu_nvrtc::unref<T>::type&& move(T&& t) noexcept {
+  return static_cast<typename __vgpu_nvrtc::unref<T>::type&&>(t);
+}
+template <class T> __attribute__((host)) __attribute__((device)) constexpr T&& forward(typename __vgpu_nvrtc::unref<T>::type& t) noexcept {
+  return static_cast<T&&>(t);
+}
+template <class T> __attribute__((host)) __attribute__((device)) constexpr T&& forward(typename __vgpu_nvrtc::unref<T>::type&& t) noexcept {
+  return static_cast<T&&>(t);
+}
+}
+)";
+const char* const kRtcTarget = "#pragma once\n#include <nv/target>\n";
+// The headers cuda_runtime.h's RTC branch declares but does not define, in the
+// order its host branch includes them, as cuda_runtime.h itself includes them
+// (the internal-header macro keeps their "must not be used directly" warnings
+// out of the program log). __has_include keeps a toolkit that lacks one
+// (sm_100_rt.hpp is new in 12.8) compiling.
+const char* const kRtcDefinitions = R"(#pragma once
+#if !defined(__CUDA_INCLUDE_COMPILER_INTERNAL_HEADERS__)
+#define __CUDA_INCLUDE_COMPILER_INTERNAL_HEADERS__
+#define __VGPU_NVRTC_UNDEF_INTERNAL_HEADERS__
+#endif
+#if defined(__CUDA_ARCH__)
+#if __has_include("crt/device_functions.hpp")
+#include "crt/device_functions.hpp"
+#endif
+#if __has_include("crt/device_double_functions.hpp")
+#include "crt/device_double_functions.hpp"
+#endif
+#if __has_include("device_atomic_functions.hpp")
+#include "device_atomic_functions.hpp"
+#endif
+#if __has_include("sm_20_atomic_functions.hpp")
+#include "sm_20_atomic_functions.hpp"
+#endif
+#if __has_include("sm_20_intrinsics.hpp")
+#include "sm_20_intrinsics.hpp"
+#endif
+#if __has_include("sm_30_intrinsics.hpp")
+#include "sm_30_intrinsics.hpp"
+#endif
+#if __has_include("sm_32_atomic_functions.hpp")
+#include "sm_32_atomic_functions.hpp"
+#endif
+#if __has_include("sm_32_intrinsics.hpp")
+#include "sm_32_intrinsics.hpp"
+#endif
+#if __has_include("sm_35_intrinsics.hpp")
+#include "sm_35_intrinsics.hpp"
+#endif
+#if __has_include("sm_60_atomic_functions.hpp")
+#include "sm_60_atomic_functions.hpp"
+#endif
+#if __has_include("sm_61_intrinsics.hpp")
+#include "sm_61_intrinsics.hpp"
+#endif
+#if __has_include("crt/sm_70_rt.hpp")
+#include "crt/sm_70_rt.hpp"
+#endif
+#if __has_include("crt/sm_80_rt.hpp")
+#include "crt/sm_80_rt.hpp"
+#endif
+#if __has_include("crt/sm_90_rt.hpp")
+#include "crt/sm_90_rt.hpp"
+#endif
+#if __has_include("crt/sm_100_rt.hpp")
+#include "crt/sm_100_rt.hpp"
+#endif
+#if __has_include("crt/math_functions.hpp")
+#include "crt/math_functions.hpp"
+#endif
+#endif
+#if __has_include("vector_functions.hpp")
+#include "vector_functions.hpp"
+#endif
+#if defined(__VGPU_NVRTC_UNDEF_INTERNAL_HEADERS__)
+#undef __CUDA_INCLUDE_COMPILER_INTERNAL_HEADERS__
+#undef __VGPU_NVRTC_UNDEF_INTERNAL_HEADERS__
+#endif
+)";
+
+std::string real_path(const std::string& p);
+
+// Whether a name in an include directory is the CUDA toolkit's: its runtime,
+// device and math headers, the libraries' headers, and CCCL (cuda/, nv/, cub/,
+// thrust/). Nothing of glibc's or libstdc++'s matches.
+bool cuda_header_name(const std::string& n) {
+  static const char* const kPrefixes[] = {
+      "cuda", "cublas", "cufft", "curand", "cusolver", "cusparse", "cupti", "cuComplex.h", "cufile.h", "npp", "nvrtc.h",
+      "nvJitLink.h", "nvPTXCompiler.h", "nvToolsExt", "nvtx3", "nvfunctional", "nv_decode.h", "nvjpeg.h", "nvblas.h",
+      "nvml.h", "nvvm.h", "nvperf_", "generated_cuda", "generated_nvtx", "sm_", "crt", "cooperative_groups", "device_",
+      "driver_", "host_config.h", "host_defines.h", "builtin_types.h", "channel_descriptor.h", "common_functions.h",
+      "fatbinary_section.h", "library_types.h", "math_constants.h", "math_functions.h", "mma.h", "surface_",
+      "texture_", "vector_functions", "vector_types.h", "cub", "thrust"};
+  if (n == "nv") return true;   // CCCL's <nv/target>
+  for (const char* p : kPrefixes)
+    if (n.rfind(p, 0) == 0) return true;
+  return false;
+}
+
+// Where the toolkit's headers share a directory with the host's: Debian's and
+// Ubuntu's nvidia-cuda-toolkit put cuda_runtime.h, crt/ and the rest straight
+// into /usr/include, beside glibc, and nvcc (/usr/bin/nvcc) passes no -I for
+// them, the host compiler's own search finding them. With that search off,
+// the toolkit headers have to come from somewhere else; the directory is
+// returned, or "" for a toolkit with an include directory of its own
+// (/usr/local/cuda-X, NVIDIA's packages), which nvcc puts on the path itself.
+const std::string& shared_toolkit_include() {
+  static const std::string found = [] {
+    std::vector<std::string> dirs;
+    if (FILE* f = popen("command -v nvcc 2>/dev/null", "r")) {
+      char buf[PATH_MAX] = {0};
+      if (fgets(buf, sizeof buf, f)) {
+        const std::string nvcc = real_path(std::string(buf).substr(0, std::strcspn(buf, "\n")));
+        const size_t slash = nvcc.find_last_of('/');
+        if (slash != std::string::npos) {
+          const std::string bin = nvcc.substr(0, slash);
+          const std::string root = bin.substr(0, bin.find_last_of('/'));
+          for (const char* sub : {"/targets/x86_64-linux/include", "/targets/sbsa-linux/include", "/include"})
+            dirs.push_back(root + sub);
+        }
+      }
+      pclose(f);
+    }
+    dirs.push_back("/usr/include");
+    struct stat st;
+    for (const std::string& d : dirs) {
+      if (::stat((d + "/cuda_runtime.h").c_str(), &st) != 0) continue;
+      const bool shared = d == "/usr/include" || d == "/usr/local/include" || ::stat((d + "/stdio.h").c_str(), &st) == 0;
+      return shared ? d : std::string();
+    }
+    return std::string();
+  }();
+  return found;
+}
+
+// The stand-ins above, written under the program's scratch directory, and on a
+// shared layout a directory of links to the toolkit's own headers alone (the
+// set NVRTC compiles against), so that none of the host's is reachable. Returns
+// the directory, or "" when it cannot be written.
+std::string write_rtc_environment(const std::string& dir) {
+  const std::string rtc = dir + "/" + kRtcDir;
+  ::mkdir(rtc.c_str(), 0700);
+  bool ok = write_file(rtc + "/vgpu_nvrtc_prelude.h", kRtcPrelude) && write_file(rtc + "/target", kRtcTarget) &&
+            write_file(rtc + "/nvrtc_device_runtime.h", "#pragma once\n") &&
+            write_file(rtc + "/vgpu_nvrtc_definitions.h", kRtcDefinitions);
+  const std::string& shared = shared_toolkit_include();
+  if (ok && !shared.empty()) {
+    const std::string links = rtc + "/toolkit";
+    ok = ::mkdir(links.c_str(), 0700) == 0;
+    if (DIR* d = ok ? ::opendir(shared.c_str()) : nullptr) {
+      while (const dirent* e = ::readdir(d)) {
+        const std::string n = e->d_name;
+        if (n == "." || n == ".." || !cuda_header_name(n)) continue;
+        if (::symlink((shared + "/" + n).c_str(), (links + "/" + n).c_str()) != 0) ok = false;
+      }
+      ::closedir(d);
+    }
+  }
+  return ok ? rtc : std::string();
+}
+
+// The nvcc options that make the compile NVRTC's (see above). The prelude goes
+// in by name through the host preprocessor's -include, ahead of nvcc's own
+// cuda_runtime.h, and is found on the -I path (nvcc's --pre-include would put
+// it after; -Xcompiler would split a path that has a comma in it).
+std::string rtc_nvcc_options(const std::string& rtc) {
+  return " -D__CUDACC_RTC__ -D__LP64__=1 -U__NVCC__ -D__FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__"
+         " -D__FORCE_INCLUDE_CUDA_BF16_HPP_FROM_BF16_H__ -Xcompiler -nostdinc -Xcompiler -undef"
+         " -Xcompiler -include,vgpu_nvrtc_prelude.h -I " + shq(rtc) +
+         (shared_toolkit_include().empty() ? std::string() : " -I " + shq(rtc + "/toolkit"));
 }
 
 bool have_nvcc() { return std::system("command -v nvcc >/dev/null 2>&1") == 0; }
@@ -174,7 +412,11 @@ void remove_tree(const std::string& dir) {
 }
 
 Program::~Program() {
-  if (!scratch.empty() && !trace()) remove_tree(scratch);
+  if (scratch.empty() || trace()) return;
+  remove_tree(scratch);
+  // And the process's directory above it, once it holds no other program's.
+  const size_t slash = scratch.find_last_of('/');
+  if (slash != std::string::npos && slash > 0) ::rmdir(scratch.substr(0, slash).c_str());
 }
 
 // ---- the toolkit's NVRTC ----
@@ -679,6 +921,12 @@ VGPU_EXPORT nvrtcResult nvrtcCompileProgram(nvrtcProgram prog, int num_options,
     }
   }
 
+  const std::string rtc = write_rtc_environment(dir);
+  if (rtc.empty()) {
+    p->log += "vgpu nvrtc: cannot write the builtin headers\n";
+    return NVRTC_ERROR_COMPILATION;
+  }
+
   std::string source = p->source;
   // Name expressions: NVRTC's contract is to report the mangled symbol for a
   // C++ expression such as "kernel<float>". Getting that right needs the
@@ -687,6 +935,10 @@ VGPU_EXPORT nvrtcResult nvrtcCompileProgram(nvrtcProgram prog, int num_options,
   for (size_t i = 0; i < p->name_expressions.size(); ++i)
     source += "\n__device__ const void* vgpu_nvrtc_name_" + std::to_string(i) + " = (const void*)&(" +
               p->name_expressions[i] + ");\n";
+
+  // Last, after the program and its name expressions: the definitions of the
+  // builtins its headers only declared (NVRTC links them in from its library).
+  source += "\n#include <vgpu_nvrtc_definitions.h>\n";
 
   const std::string base = safe_name(p->name, "program.cu");
   const std::string cu = dir + "/" + base + (base.find(".cu") == std::string::npos ? ".cu" : "");
@@ -699,6 +951,7 @@ VGPU_EXPORT nvrtcResult nvrtcCompileProgram(nvrtcProgram prog, int num_options,
 
   std::string common = " -Wno-deprecated-gpu-targets -I " + shq(dir);
   for (const auto& o : nvcc_opts) common += " " + shq(o);
+  common += rtc_nvcc_options(rtc);
   std::string cmd = "nvcc --ptx" + common + " -o " + shq(ptx) + " " + shq(cu) + " 2> " + shq(err);
   p->cubin_cmd = "nvcc --cubin" + common + " -o " + shq(dir + "/out.cubin") + " " + shq(cu) + " 2> " +
                  shq(dir + "/cubin-stderr.txt");

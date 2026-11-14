@@ -540,9 +540,19 @@ endfunction()
 # A version script naming the soname's own version node, which is how NVIDIA
 # tags these symbols. Getting it wrong makes the loader warn about missing
 # version information on every call.
+#
+# Except the profiling engine's functions (vgpu::profiling, src/core/profiling.cpp), which go in a version node every
+# shim shares (VGPU_PROFILING_MAP_NODE). Each shim carries its own copy of the engine, and the process must use one: a
+# library's Silence has to be the runtime's, or the runtime records the copies cuBLAS makes on the program's behalf as
+# the program's cudaMemcpy. The dynamic linker binds each library's references to the first definition in the global
+# scope whose version matches. Under the soname's own node no two shims' versions match, and only the unversioned
+# libcuda.so.1, when it was in the global scope, made them agree: `vgpu run --preload` now loads it privately (#597),
+# and PyTorch's profiler listed cuBLAS's copies. In one shared node they all agree on the first shim loaded, and an
+# unversioned libcuda still matches them all.
+set(VGPU_PROFILING_MAP_NODE "VGPU_PROFILING_1 {\n  global: extern \"C++\" { vgpu::profiling::*; };\n};\n")
 function(vgpu_version_script _libname _soversion _out)
   set(_path "${CMAKE_BINARY_DIR}/maps/lib${_libname}.so.${_soversion}.map")
-  file(WRITE "${_path}" "lib${_libname}.so.${_soversion} {\n  global: *;\n  local: ${VGPU_LOCAL_STD_TABLES};\n};\n")
+  file(WRITE "${_path}" "lib${_libname}.so.${_soversion} {\n  global: *;\n  local: ${VGPU_LOCAL_STD_TABLES};\n};\n${VGPU_PROFILING_MAP_NODE}")
   set(${_out} "${_path}" PARENT_SCOPE)
 endfunction()
 
@@ -2000,6 +2010,10 @@ target_compile_definitions(test_amd_gcn_packed_same_bits PRIVATE VGPU_SOURCE_DIR
 # The code object reader (codeobject.cpp) against digests of what it read before it was made faster.
 vgpu_unit_test(test_amd_codeobject_same_bits amd/tests/unit/test_codeobject_same_bits.cpp)
 target_compile_definitions(test_amd_codeobject_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# And with VGPU_LOAD_PLAIN=1, the reading from before pantheonsim #565 (bundles inflated through a buffer, images zeroed first, no
+# huge-page advice): the same digests both ways.
+add_test(NAME test_amd_codeobject_same_bits_plain COMMAND test_amd_codeobject_same_bits)
+set_tests_properties(test_amd_codeobject_same_bits_plain PROPERTIES ENVIRONMENT "VGPU_LOAD_PLAIN=1")
 # The digest tests again on the baseline x86-64 code of the AMD engine's SIMD paths (VGPU_SIMD=base keeps mfma_math.hpp and packed_math.hpp off
 # AVX2, FMA and F16C): the recorded bits are the same on every CPU the engine runs on, not only on one with those units.
 # (Not under ThreadSanitizer, where it would only repeat the same checks twenty times slower.)
@@ -2073,6 +2087,9 @@ target_compile_definitions(test_amd_gcn_cdna_gaps PRIVATE VGPU_SOURCE_DIR="${CMA
 # Three bugs other programs ran into (issues #578, #579, #580): a negative scratch offset, a scalar load into VCC, a packed constant zero.
 vgpu_unit_test(test_amd_gcn_issues_nov11 amd/tests/unit/test_gcn_issues_nov11.cpp)
 target_compile_definitions(test_amd_gcn_issues_nov11 PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# Issue #621: a whole-wave load into accumulation registers the wave had not used yet lost all but the last of them.
+vgpu_unit_test(test_amd_gcn_issue621 amd/tests/unit/test_gcn_issue621.cpp)
+target_compile_definitions(test_amd_gcn_issue621 PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # A kernel with a dynamic stack gets the device's stack size of scratch (issue #585): the code object and execute, then a HIP launch.
 vgpu_unit_test(test_amd_gcn_dyn_stack amd/tests/unit/test_gcn_dyn_stack.cpp)
 target_compile_definitions(test_amd_gcn_dyn_stack PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -2082,6 +2099,13 @@ target_include_directories(test_amd_hip_dyn_stack PRIVATE tests/framework amd/in
 target_compile_definitions(test_amd_hip_dyn_stack PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME test_amd_hip_dyn_stack COMMAND test_amd_hip_dyn_stack)
 set_tests_properties(test_amd_hip_dyn_stack PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1" FAIL_REGULAR_EXPRESSION "FAIL")
+# Tensile's module-by-module kernel lookup misses quietly; a kernel in no module is still said (issue #636).
+add_executable(test_amd_hip_module_probe amd/tests/unit/test_hip_module_probe.cpp)
+target_link_libraries(test_amd_hip_module_probe PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_module_probe PRIVATE amd/include)
+target_compile_definitions(test_amd_hip_module_probe PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME test_amd_hip_module_probe COMMAND test_amd_hip_module_probe)
+set_tests_properties(test_amd_hip_module_probe PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x" FAIL_REGULAR_EXPRESSION "FAIL")
 # v_div_fmas / v_div_fixup with the clamp bit or an output modifier (issue #613).
 vgpu_unit_test(test_amd_gcn_div_clamp amd/tests/unit/test_gcn_div_clamp.cpp)
 target_compile_definitions(test_amd_gcn_div_clamp PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -2656,6 +2680,14 @@ set_tests_properties(amd_hip_version PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_graph_host_source COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_graph_host_source.sh)
 set_tests_properties(amd_graph_host_source PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
+# hipGraphInstantiateWithParams with Upload and an uploadStream, and the other flags ROCm takes there (#628).
+add_test(NAME amd_graph_instantiate_params COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_graph_instantiate_params.sh)
+set_tests_properties(amd_graph_instantiate_params PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
+# A failing module or function call is the thread's last error, as in ROCm's HIP (#635).
+add_test(NAME amd_module_last_error COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_module_last_error.sh)
+set_tests_properties(amd_module_last_error PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
 # The GCN decoder against the real assembler, on a code object built here and now.
 add_test(NAME amd_gcn_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_gcn_disasm.sh)
 set_tests_properties(amd_gcn_disasm PROPERTIES DEPENDS test_amd_gcn
@@ -2901,6 +2933,17 @@ if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
   add_test(NAME test_driver_gl_stubs COMMAND test_driver_gl_stubs)
   set_tests_properties(test_driver_gl_stubs PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/a100;VGPU_QUIET=1")
 endif()
+# cuGetProcAddress by name and CUDA version, against what an RTX 3060 answered for every name (pantheonsim #626),
+# and cuProfilerInitialize (pantheonsim #627). No toolkit header needed.
+if(TARGET vgpucuda)
+  add_executable(test_driver_proc_address nvidia/tests/unit/test_driver_proc_address.cpp)
+  target_link_libraries(test_driver_proc_address PRIVATE vgpucuda ${CMAKE_DL_LIBS})
+  target_include_directories(test_driver_proc_address PRIVATE tests/framework)
+  target_compile_definitions(test_driver_proc_address PRIVATE
+    DRIVER_PROC_ADDRESS_TABLE="${CMAKE_SOURCE_DIR}/nvidia/tests/data/driver_proc_address.rtx3060.txt")
+  add_test(NAME test_driver_proc_address COMMAND test_driver_proc_address)
+  set_tests_properties(test_driver_proc_address PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/a100;VGPU_QUIET=1")
+endif()
 # Runtime entry points the toolkit exports and this one lacked (cudaMemset3D,
 # cudaChooseDevice, cudaDeviceGetByPCIBusId, the 2D array copies, the texture
 # descriptor getters, cudaFuncGetName and cudaFuncGetParamInfo, ...).
@@ -2963,6 +3006,12 @@ if(TARGET vgpucublas)
   target_include_directories(test_cublas_band_heap PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
   add_test(NAME test_cublas_band_heap COMMAND test_cublas_band_heap)
   set_tests_properties(test_cublas_band_heap PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1" TIMEOUT 600)
+  # The reductions in host pointer mode with a device result: the dot products store through it, the rest are refused (#638).
+  add_executable(test_cublas_host_mode_device_result nvidia/tests/unit/test_cublas_host_mode_device_result.cpp)
+  target_link_libraries(test_cublas_host_mode_device_result PRIVATE vgpucublas vgpucudart)
+  target_include_directories(test_cublas_host_mode_device_result PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_cublas_host_mode_device_result COMMAND test_cublas_host_mode_device_result)
+  set_tests_properties(test_cublas_host_mode_device_result PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1" TIMEOUT 300)
 endif()
 # cublasGemmEx with half, bfloat16 and int8 operands, likewise.
 if(TARGET vgpucublas)
@@ -3118,7 +3167,7 @@ if(TARGET vgpucublas)
                           "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas"
                           "blas_level23_paths:cublas" "blas_host_sums:cublas" "blas_grouped:cublas" "blas_packed_paths:cublas"
                           "blas_batched_paths:cublas" "blas_64_paths:cublas" "blas_legacy_paths:cublas"
-                          "rand_paths:curand" "rand_host_fill:curand" "driver_entry_late:cudart" "npp_stream_context:nppc:nppidei:nppial" "npp_host_ops:nppc:nppial:nppif:nppig:nppim:nppitc" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
+                          "rand_paths:curand" "rand_host_fill:curand" "rand_poisson:curand" "driver_entry_late:cudart" "npp_stream_context:nppc:nppidei:nppial" "npp_host_ops:nppc:nppial:nppif:nppig:nppim:nppitc" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
                           "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss1_kkt:cudss1" "cudss_paths:cudss"
                           "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp" "nvcomp_streaming:nvcomp" "nvcomp_cpu:nvcomp_cpu:nvcomp"
                           "nvshmem_host:nvshmem_host" "solver_dense_paths:cusolver" "solver_rf_paths:cusolver"
@@ -3150,6 +3199,15 @@ if(TARGET vgpucublas)
       SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
   endforeach()
+
+  # The same NVRTC program on the shim's nvcc path (no toolkit libnvrtc): NVRTC's include search, no host
+  # headers, so programs with their own <cstdint> (ThrustRTC) or int64_t (the jiterator) compile (#619).
+  add_test(NAME e2e_nvrtc_paths_nvcc
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh nvrtc_paths nvrtc cuda)
+  set_tests_properties(e2e_nvrtc_paths_nvcc PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_NVRTC=nvcc"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
 
   # The same TF32 program with NVIDIA_TF32_OVERRIDE=0: TF32 is off everywhere, explicit FAST_TF32 included.
   add_test(NAME e2e_blas_tf32_override
@@ -4287,6 +4345,10 @@ if(Python3_Interpreter_FOUND)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_driver_arg_sizes.py
                    ${CUDA_ABI_INCLUDE})
   set_tests_properties(lint_driver_arg_sizes PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+  # Every ABI the toolkit's typedef headers name is in the table cuGetProcAddress resolves by (pantheonsim #626).
+  add_test(NAME lint_driver_proc_versions
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/gen_driver_proc_versions.py --check "${CUDA_ABI_INCLUDE}")
+  set_tests_properties(lint_driver_proc_versions PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 60)
   # Every function cuda_runtime_api.h and cuda.h declare is a name the built shims export.
   add_test(NAME lint_header_exports
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_header_exports.py ${CUDA_ABI_INCLUDE})
@@ -4856,6 +4918,14 @@ set_tests_properties(e2e_preload_fnptr PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 300)
+# vgpu run --preload and programs that use the shim as PyTorch does, without PyTorch: the driver reached through the runtime
+# with no cuInit of the program's own, and the profiling engine around a cuBLAS call (one engine for every shim).
+add_test(NAME e2e_preload_torch_like COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_preload_torch_like.sh)
+set_tests_properties(e2e_preload_torch_like PROPERTIES
+  DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 300)
 # The per-thread default stream's names (cudaMemcpy_ptds, ...), which a
 # program built with nvcc --default-stream per-thread calls; COLMAP does.
 add_test(NAME e2e_per_thread_stream COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_per_thread_stream.sh)
@@ -4876,6 +4946,13 @@ set_tests_properties(e2e_async_host_events_driver PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 600)
+# Copies, fills, symbol copies, cudaFreeAsync and kernel launches behind a host function that waits for the host return at once and
+# run after it, in stream order; the synchronous calls wait for them (#634).
+add_test(NAME e2e_async_host_copies COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_async_host_copies.sh)
+set_tests_properties(e2e_async_host_copies PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 300)
 # A kernel launch returns before the kernel finishes; events and streams behind it are not ready until it has run (#523).
 add_test(NAME e2e_async_launch_events COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_async_launch_events.sh)
 set_tests_properties(e2e_async_launch_events PROPERTIES

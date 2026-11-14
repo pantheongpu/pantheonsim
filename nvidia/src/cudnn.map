@@ -1,3 +1,7 @@
 libcudnn.so.9 {
   global: *;
 };
+/* The profiling engine in the version node every shim shares: see vgpu_version_script in CMakeLists.txt. */
+VGPU_PROFILING_1 {
+  global: extern "C++" { vgpu::profiling::*; };
+};
