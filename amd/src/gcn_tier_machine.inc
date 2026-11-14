@@ -259,7 +259,9 @@ int tier_fence(Wave& w, const Inst& in) {
 }
 
 // The instructions the tier hands to the Machine, by Op::mach: 3 s_barrier, 6 s_endpgm, 7 scalar memory, 8 packed halves, 10 the accumulation register moves, 11 a cache fence, 12 a VOPD pair, else a global access.
-int tier_mach(Wave& w, Group& g, const Inst& in) {
+// (Always in line: tier_step is its caller on every memory instruction, and a second caller -- the block runner -- had the compiler make it
+// a function of its own, which cost the memory rows 1 to 2 % with blocks off.)
+[[gnu::always_inline]] inline int tier_mach(Wave& w, Group& g, const Inst& in) {
   switch (in.fast.mach) {
     case 3: return tier_barrier(w, in);
     case 6: return tier_endpgm(w, in);
