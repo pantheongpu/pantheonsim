@@ -238,6 +238,7 @@ VGPU_GEMV_BATCHED(TSS, __nv_bfloat16, __nv_bfloat16, float, float, CUDA_R_32F, C
   VGPU_EXPORT cublasStatus_t cublas##P##syrkx(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t, int n,   \
                                               int k, const T* alpha, const T* A, int lda, const T* B, int ldb,    \
                                               const T* beta, T* C, int ldc) {                                     \
+    VGPU_XERBLA(#P[0], #P[0] == 'S' ? "SYRK " : "SYRKX", herk_bad_arg(u, t, n, k, lda, true, ldb, ldc));          \
     return csyrkx<T, T>(h, false, u, t, n, k, alpha, A, lda, B, ldb, beta, C, ldc);                               \
   }
 VGPU_GETRI(S, float)
@@ -249,22 +250,26 @@ VGPU_GETRI(Z, cuDoubleComplex)
 VGPU_EXPORT cublasStatus_t cublasCherkx(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t, int n, int k,
                                         const cuComplex* alpha, const cuComplex* A, int lda, const cuComplex* B,
                                         int ldb, const float* beta, cuComplex* C, int ldc) {
+  VGPU_XERBLA('C', "HERKX", herk_bad_arg(u, t, n, k, lda, true, ldb, ldc));
   return csyrkx<cuComplex, float>(h, true, u, t, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 VGPU_EXPORT cublasStatus_t cublasZherkx(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t, int n, int k,
                                         const cuDoubleComplex* alpha, const cuDoubleComplex* A, int lda,
                                         const cuDoubleComplex* B, int ldb, const double* beta, cuDoubleComplex* C,
                                         int ldc) {
+  VGPU_XERBLA('Z', "HERKX", herk_bad_arg(u, t, n, k, lda, true, ldb, ldc));
   return csyrkx<cuDoubleComplex, double>(h, true, u, t, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 
 VGPU_EXPORT cublasStatus_t cublasCdgmm(cublasHandle_t h, cublasSideMode_t mode, int m, int n, const cuComplex* A,
                                        int lda, const cuComplex* x, int incx, cuComplex* C, int ldc) {
+  VGPU_XERBLA('C', "DGMM ", dgmm_bad_arg(mode, m, n, lda, ldc));
   return cdgmm(h, mode, m, n, A, lda, x, incx, C, ldc);
 }
 VGPU_EXPORT cublasStatus_t cublasZdgmm(cublasHandle_t h, cublasSideMode_t mode, int m, int n,
                                        const cuDoubleComplex* A, int lda, const cuDoubleComplex* x, int incx,
                                        cuDoubleComplex* C, int ldc) {
+  VGPU_XERBLA('Z', "DGMM ", dgmm_bad_arg(mode, m, n, lda, ldc));
   return cdgmm(h, mode, m, n, A, lda, x, incx, C, ldc);
 }
 
@@ -289,6 +294,7 @@ VGPU_EXPORT cublasStatus_t cublasCgemm3mBatched(cublasHandle_t h, cublasOperatio
                                                 int n, int k, const cuComplex* alpha, const cuComplex* const A[],
                                                 int lda, const cuComplex* const B[], int ldb, const cuComplex* beta,
                                                 cuComplex* const C[], int ldc, int batch) {
+  VGPU_XERBLA('C', "gemm3mBatched", gemm_batch_bad_arg(ta, tb, m, n, k, lda, ldb, ldc, batch));
   return cublasCgemmBatched(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, batch);
 }
 VGPU_EXPORT cublasStatus_t cublasCgemm3mStridedBatched(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb,
@@ -296,6 +302,7 @@ VGPU_EXPORT cublasStatus_t cublasCgemm3mStridedBatched(cublasHandle_t h, cublasO
                                                        const cuComplex* A, int lda, long long sA, const cuComplex* B,
                                                        int ldb, long long sB, const cuComplex* beta, cuComplex* C,
                                                        int ldc, long long sC, int batch) {
+  VGPU_XERBLA('C', "gemm3mStridedBatched", gemm_batch_bad_arg(ta, tb, m, n, k, lda, ldb, ldc, batch));
   return cublasCgemmStridedBatched(h, ta, tb, m, n, k, alpha, A, lda, sA, B, ldb, sB, beta, C, ldc, sC, batch);
 }
 
@@ -308,7 +315,7 @@ VGPU_EXPORT cublasStatus_t cublasHgemmStridedBatched(cublasHandle_t h, cublasOpe
                                                      const __half* beta, __half* C, int ldc, long long sC,
                                                      int batch) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (batch < 0) return CUBLAS_STATUS_INVALID_VALUE;   // as the card answers
+  VGPU_XERBLA('H', "gemmStridedBatched", gemm_batch_bad_arg(ta, tb, m, n, k, lda, ldb, ldc, batch));
   return cublasGemmStridedBatchedEx(h, ta, tb, m, n, k, alpha, A, CUDA_R_16F, lda, sA, B, CUDA_R_16F, ldb, sB, beta,
                                     C, CUDA_R_16F, ldc, sC, batch, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT);
 }
@@ -316,6 +323,7 @@ VGPU_EXPORT cublasStatus_t cublasHgemmBatched(cublasHandle_t h, cublasOperation_
                                               int n, int k, const __half* alpha, const __half* const A[], int lda,
                                               const __half* const B[], int ldb, const __half* beta,
                                               __half* const C[], int ldc, int batch) {
+  VGPU_XERBLA('H', "gemmBatched", gemm_batch_bad_arg(ta, tb, m, n, k, lda, ldb, ldc, batch));
   return cublasGemmBatchedEx(h, ta, tb, m, n, k, alpha, reinterpret_cast<const void* const*>(A), CUDA_R_16F, lda,
                              reinterpret_cast<const void* const*>(B), CUDA_R_16F, ldb, beta,
                              reinterpret_cast<void* const*>(C), CUDA_R_16F, ldc, batch, CUBLAS_COMPUTE_16F,

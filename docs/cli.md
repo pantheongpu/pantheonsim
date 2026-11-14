@@ -54,6 +54,11 @@ and says so if a CUDA library it needs is not in this build (a CUDA 12 program
 against a CUDA 13 build), or if a `DT_RPATH` would hide the simulator (see
 `--preload`).
 
+An AMD run (`--gpu amd/...`) needs only the HIP shim, `build/shim/libamdhip64.so.6`:
+`cmake --build build --target vgpuhip` builds it and `vgpu`, and no CUDA library.
+A program that needs an AMD library the build lacks (ROCm SMI, AMD SMI,
+rocprofiler-sdk) is stopped with the target that builds it.
+
 **Device**
 
 | Option | Meaning |

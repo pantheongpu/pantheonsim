@@ -38,6 +38,10 @@ data/asm_ds_tr.gfx950.o	cd632a50402cd1e2
 data/asm_dyn_stack.gfx942.o	ad07388fc3ed184e
 data/asm_fminmax11.gfx1100.o	186f82fb6abc01b9
 data/asm_fminmax12.gfx1201.o	dad1870abd4be860
+data/asm_hi16.gfx1030.o	c7b00e8f7ed26113
+data/asm_hi16.gfx1100.o	d2e1c17fc85c1689
+data/asm_hi16.gfx90a.o	b4432f3e3019c782
+data/asm_hi16.gfx942.o	2a26d9540a8d9e45
 data/asm_hwid.gfx942.o	219502aa1a798adc
 data/asm_hwid11.gfx1100.o	da8d864ccb3acd93
 data/asm_hwid12.gfx1201.o	52a4153f56d0cfd5
@@ -65,6 +69,7 @@ data/asm_mods.gfx1100.o	e3f64aa5e4f0165d
 data/asm_mods.gfx90a.o	4699c994e9b729f1
 data/asm_mods.gfx942.o	e907be3cabedda36
 data/asm_mulhi.gfx942.o	43ad510470faf4ad
+data/asm_nan.gfx1030.o	d69615257b221843
 data/asm_permlane.gfx1100.o	6768595450bd87c
 data/asm_permute_exec.gfx942.o	6ebd1555fdb9b13c
 data/asm_quad.gfx942.o	b7ea0876449944cd

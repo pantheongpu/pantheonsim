@@ -111,7 +111,7 @@ VTEST(init_device_starts_a_device_without_making_it_current) {
   VCHECK_EQ(cudaInitDevice(1, 0, cudaInitDeviceFlagsAreValid), cudaSuccess);
   VCHECK_EQ(cudaInitDevice(99, 0, 0), cudaErrorInvalidDevice);
   VCHECK_EQ(cudaInitDevice(-1, 0, 0), cudaErrorInvalidDevice);
-  VCHECK_EQ(cudaInitDevice(0, 0, 0x80), cudaErrorInvalidValue);   // an undefined flag
+  VCHECK_EQ(cudaInitDevice(0, 0, 0x80), cudaSuccess);   // an undefined flag is ignored, as on an RTX 3060 (e2e_card_edges_context)
 }
 
 VTEST(a_pci_bus_id_names_the_device_it_came_from) {

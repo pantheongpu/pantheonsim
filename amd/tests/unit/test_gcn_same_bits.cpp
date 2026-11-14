@@ -25,6 +25,15 @@
 // baseline took the host's fmin and fmax (9 gfx90a lines in 5094-5304, 6 gfx1030 lines); gfx1250's v_div_scale_f32/f64 with a clamp
 // or an output modifier, which the baseline wrote unmodified (lines 12755, 12757, 12761, 12762); and gfx1030's SDWA comparisons (v_cmp_*_sdwa,
 // 77 lines; with the 6 above, the gfx1030 lines in 14958-15958), whose baseline digest was the text of "decoded but not implemented".
+// Sixty-four more were recorded after the high-half fix (test_amd_gcn_hi16), from the tree that has it: gfx1030's 16-bit VOP1, VOP2 and VOP3
+// results (57 lines in 14869-16049: v_add_f16, v_fma_f16, v_add_nc_u16, v_cvt_f16_f32 and the rest), which keep the destination's high half as an RX
+// 6800 does where the baseline zeroed it, and gfx90a's v_fma_f16 and v_div_fixup_f16 (7 lines in 4930-4971), which keep it as the CDNA2 guide says.
+// Thirty-one more after the gfx1030 NaN rules (test_amd_gcn_nan), from the tree that has them: 20 gfx1030 lines in 14954-16019 whose result is a
+// NaN (v_sub_f16/f32, v_div_fixup_f16/f32, v_fma_f32, v_min_f32, v_floor_f32, v_ceil_f32, v_frexp_mant_f32: now the cards' NaN) or a sine of a
+// whole number of turns (v_sin_f32, now +0), and v_div_fixup_f16 on the other targets (11 lines: 1098, 3046-3047, 4930-4931, 6842-6844, 8653,
+// 12637-12638), whose 0/y case now gives the guides' signed zero where the baseline gave the quotient's magnitude.
+// Seven more after gfx1100 ran its VOP3 v_ashrrev_i16, v_max_i16 and v_min_i16 as gfx1030 does (lines 6229, 7083-7085, 7116-7118), whose
+// baseline digest was the text of "decoded but not implemented".
 // Every other digest is the baseline's.
 #include <cstdint>
 #include <cstdio>
