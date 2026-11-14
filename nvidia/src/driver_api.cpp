@@ -213,8 +213,9 @@ struct ShimState {
   std::map<int, unsigned> primary_flags;
   std::set<int> primary_active;
   // Contexts cuCtxDestroy has destroyed: cuCtxSetCurrent still takes one, as an RTX 3060 does (the calls after it are
-  // CUDA_ERROR_CONTEXT_IS_DESTROYED), where a handle that never was a context is CUDA_ERROR_INVALID_CONTEXT.
-  std::set<uintptr_t> destroyed_contexts;
+  // CUDA_ERROR_CONTEXT_IS_DESTROYED), where a handle that never was a context is CUDA_ERROR_INVALID_CONTEXT. With the
+  // device each was made on: cuCtxGetDevice still names it.
+  std::map<uintptr_t, int> destroyed_contexts;
   std::unordered_map<int, uintptr_t> primary_ctx;      // device -> primary ctx handle
   // Retain count per device. A release with nothing retained is an error the
   // caller needs to see: it means some other component's retain is about to
@@ -520,14 +521,16 @@ struct StreamContext {
 // primary context that is not active (released to nothing, or reset by cuDevicePrimaryCtxReset or cudaDeviceReset until
 // the runtime uses the device again). An RTX 3060 answers the calls that need a context with
 // CUDA_ERROR_CONTEXT_IS_DESTROYED then; cuCtxGetCurrent still hands the handle back.
-bool current_context_dead(ShimState& s) {
-  if (ctx_stack().empty()) return false;
-  const uintptr_t h = ctx_stack().back();
+bool context_dead(ShimState& s, uintptr_t h) {
   const auto it = s.contexts.find(h);
   if (it == s.contexts.end()) return true;
   const auto primary = s.primary_ctx.find(it->second);
   return primary != s.primary_ctx.end() && primary->second == h && !s.primary_active.count(it->second);
 }
+bool current_context_dead(ShimState& s) { return !ctx_stack().empty() && context_dead(s, ctx_stack().back()); }
+// Set once cuCtxDestroy has destroyed a context, so that the runtime's question whether the thread's context is alive
+// (vgpu_driver_thread_has_context_v1) takes no lock in a program that never destroys one.
+std::atomic<bool> g_context_destroyed{false};
 
 // Wraps an API body: locks, checks init, catches and maps errors.
 template <class F>
@@ -542,7 +545,8 @@ CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
     report(name, "no current context (create one with cuCtxCreate or cuDevicePrimaryCtxRetain + cuCtxSetCurrent)");
     return CUDA_ERROR_INVALID_CONTEXT;
   }
-  if (s.initialized && !t_stream_context && current_context_dead(s) && needs_current_context(name)) {
+  if (s.initialized && !t_stream_context && current_context_dead(s) && needs_current_context(name) &&
+      !(s.contexts.count(ctx_stack().back()) && std::strcmp(name, "cuCtxGetFlags") == 0)) {
     report(name, "the current context is no longer alive (destroyed, released, or reset)");
     return CUDA_ERROR_CONTEXT_IS_DESTROYED;
   }
@@ -1053,7 +1057,15 @@ VGPU_EXPORT int vgpu_driver_has_managed_v1() {
 // For the runtime (runtime_api.cpp, bind_driver_context): whether the calling thread has a context current. After
 // cuCtxSetCurrent(NULL) an RTX 3060's next runtime call that uses the device makes the primary context current again.
 // Thread-local only, no lock.
-VGPU_EXPORT int vgpu_driver_thread_has_context_v1() { return t_ctx_stack && !t_ctx_stack->empty(); }
+// A destroyed context that is current is no context to it: the runtime's next call that uses the device asks
+// vgpu_driver_bind_primary_v1, which refuses it.
+VGPU_EXPORT int vgpu_driver_thread_has_context_v1() {
+  if (!t_ctx_stack || t_ctx_stack->empty()) return 0;
+  if (!g_context_destroyed.load(std::memory_order_acquire)) return 1;
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  return s.contexts.count(t_ctx_stack->back()) ? 1 : 0;
+}
 // cudaDeviceReset took the device's primary context out of the active state, as cuDevicePrimaryCtxReset does: until
 // the runtime uses the device again, the driver's calls in it are CUDA_ERROR_CONTEXT_IS_DESTROYED (an RTX 3060).
 VGPU_EXPORT void vgpu_driver_primary_deactivate_v1(int dev) {
@@ -1062,16 +1074,43 @@ VGPU_EXPORT void vgpu_driver_primary_deactivate_v1(int dev) {
   s.primary_active.erase(dev);
 }
 
+// The runtime's one reference to a device's primary context, taken the first time it uses the device; the context is
+// active from then on. Caller holds the lock.
+void runtime_retains_primary(ShimState& s, int dev) {
+  ensure_primary(s, dev);
+  static std::set<int> retained;
+  if (retained.insert(dev).second) ++s.primary_refs[dev];
+  s.primary_active.insert(dev);
+}
+
+// cudaInitDevice: the device's primary context becomes active, current on no thread, as on an RTX 3060 (CUDA 13.0);
+// with `flags` >= 0 (cudaInitDeviceFlagsAreValid) those are its flags from then on, MAP_HOST not kept. The runtime has
+// checked them.
+VGPU_EXPORT int vgpu_driver_primary_activate_v1(int dev, int flags) {
+  if (cuInit_impl(0) != CUDA_SUCCESS) return CUDA_ERROR_NOT_INITIALIZED;
+  return api("vgpu_driver_primary_activate", true, false, [&](ShimState& s) {
+    check_device(s, dev);
+    runtime_retains_primary(s, dev);
+    if (flags >= 0) {
+      const unsigned f = static_cast<unsigned>(flags) & ~kCtxMapHost;
+      s.primary_flags[dev] = f;
+      s.ctx_state[s.primary_ctx[dev]].flags = (f & kCtxSettableMask) | kCtxMapHost;
+    }
+    return CUDA_SUCCESS;
+  });
+}
+
 VGPU_EXPORT int vgpu_driver_bind_primary_v1(int dev) {
   if (cuInit_impl(0) != CUDA_SUCCESS) return CUDA_ERROR_NOT_INITIALIZED;
   return api("vgpu_driver_bind_primary", true, false, [&](ShimState& s) {
     check_device(s, dev);
-    ensure_primary(s, dev);
+    runtime_retains_primary(s, dev);
     auto it = s.primary_ctx.find(dev);
-    static std::set<int> retained;   // the runtime's one reference per device
-    if (retained.insert(dev).second) ++s.primary_refs[dev];
-    s.primary_active.insert(dev);
     auto& stack = ctx_stack();
+    // A destroyed context the program made current stays current, and the runtime's call fails: an RTX 3060 answers
+    // cudaFree(0), cudaMalloc, cudaDeviceSynchronize, cudaStreamCreate and the rest with cudaErrorDeviceUninitialized.
+    if (!stack.empty() && !s.contexts.count(stack.back()) && s.destroyed_contexts.count(stack.back()))
+      return CUDA_ERROR_CONTEXT_IS_DESTROYED;
     bool primary_current = false;
     if (!stack.empty())
       for (const auto& [d, h] : s.primary_ctx) primary_current |= h == stack.back();
@@ -1351,9 +1390,10 @@ static CUresult cuCtxDestroy_v2_impl(CUcontext ctx) {
       peer_link(s, p.first, p.second, false);   // (before the context is forgotten: the link names its device)
       return true;
     });
+    s.destroyed_contexts[h] = s.contexts[h];
+    g_context_destroyed.store(true, std::memory_order_release);
     s.contexts.erase(h);
     s.ctx_state.erase(h);
-    s.destroyed_contexts.insert(h);
     // Measured on an RTX 3060: destroying the thread's current context makes the one below it
     // current; destroying one further down the stack leaves it there, and a pop hands it back.
     if (!ctx_stack().empty() && ctx_stack().back() == h) ctx_stack().pop_back();
@@ -1440,6 +1480,12 @@ static CUresult cuCtxGetDevice_impl(CUdevice* device) {
   return api("cuCtxGetDevice", true, false, [&](ShimState& s) {
     if (!device) return CUDA_ERROR_INVALID_VALUE;
     if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
+    // A destroyed context that is current still names its device, as on an RTX 3060 (CUDA 13.0).
+    if (const auto gone = s.destroyed_contexts.find(ctx_stack().back());
+        gone != s.destroyed_contexts.end() && !s.contexts.count(gone->first)) {
+      *device = gone->second;
+      return CUDA_SUCCESS;
+    }
     *device = current_device(s);
     return CUDA_SUCCESS;
   });
@@ -6152,6 +6198,10 @@ static CUresult cuCtxSetLimit_impl(int limit, size_t value) {
 }
 // The context an entry point means: the one named, or the thread's current one for NULL.
 // CUDA_ERROR_INVALID_CONTEXT for none, or for one that does not exist.
+// (The context queries below on a context that is no longer alive, as an RTX 3060 (CUDA 13.0) answers them: a destroyed
+// context, or a primary one that is not active. cuCtxGetId is CUDA_ERROR_CONTEXT_IS_DESTROYED for it, named or current;
+// cuCtxGetApiVersion is that for the current one and CUDA_ERROR_INVALID_CONTEXT for one it is given; cuCtxGetFlags
+// answers 0 for a primary context that is not active, whose flags a reset or the last release cleared.)
 static CUresult named_or_current_context(ShimState& s, CUcontext ctx, uintptr_t* out) {
   if (ctx) {
     const uintptr_t h = reinterpret_cast<uintptr_t>(ctx);
@@ -6168,6 +6218,8 @@ static CUresult cuCtxGetApiVersion_impl(CUcontext ctx, unsigned int* v);
 VGPU_EXPORT CUresult cuCtxGetApiVersion(CUcontext ctx, unsigned int* v) { return traced("cuCtxGetApiVersion", cuCtxGetApiVersion_impl, ctx, v); }
 static CUresult cuCtxGetApiVersion_impl(CUcontext ctx, unsigned int* v) {
   return api("cuCtxGetApiVersion", true, false, [&](ShimState& s) {
+    if (!ctx && current_context_dead(s)) return CUDA_ERROR_CONTEXT_IS_DESTROYED;
+    if (ctx && context_dead(s, reinterpret_cast<uintptr_t>(ctx))) return CUDA_ERROR_INVALID_CONTEXT;
     uintptr_t h = 0;
     if (const CUresult r = named_or_current_context(s, ctx, &h); r != CUDA_SUCCESS) return r;
     if (!v) return CUDA_ERROR_INVALID_VALUE;
@@ -6194,7 +6246,7 @@ static CUresult cuCtxGetFlags_impl(unsigned int* f) {
     uintptr_t h = 0;
     if (const CUresult r = named_or_current_context(s, nullptr, &h); r != CUDA_SUCCESS) return r;
     if (!f) return CUDA_ERROR_INVALID_VALUE;
-    *f = s.ctx_state[h].flags;
+    *f = context_dead(s, h) ? 0u : s.ctx_state[h].flags;
     return CUDA_SUCCESS;
   });
 }
@@ -6215,6 +6267,10 @@ static CUresult cuCtxGetId_impl(CUcontext ctx, unsigned long long* id);
 VGPU_EXPORT CUresult cuCtxGetId(CUcontext ctx, unsigned long long* id) { return traced("cuCtxGetId", cuCtxGetId_impl, ctx, id); }
 static CUresult cuCtxGetId_impl(CUcontext ctx, unsigned long long* id) {
   return api("cuCtxGetId", true, false, [&](ShimState& s) {
+    const uintptr_t named = reinterpret_cast<uintptr_t>(ctx);
+    if (ctx ? s.destroyed_contexts.count(named) || (s.contexts.count(named) && context_dead(s, named))
+            : current_context_dead(s))
+      return CUDA_ERROR_CONTEXT_IS_DESTROYED;
     uintptr_t h = 0;
     if (const CUresult r = named_or_current_context(s, ctx, &h); r != CUDA_SUCCESS) return r;
     if (!id) return CUDA_ERROR_INVALID_VALUE;

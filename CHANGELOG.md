@@ -97,6 +97,16 @@ release says what runs and what it produces, never how fast a real GPU would run
   queries (`cudaGetDeviceCount`, `cudaGetDevice`, `cudaGetDeviceProperties`, `cudaDeviceGetAttribute`,
   `cudaPointerGetAttributes`) no longer make the primary context current or active, as on the card
   (`e2e_card_edges_context`).
+- Driver and runtime: with a destroyed context current, `cuCtxGetDevice` names its device as an RTX 3060 (CUDA 13.0) does
+  (it was `CUDA_ERROR_INVALID_CONTEXT`), and the runtime's calls that use the device (`cudaFree(0)`, `cudaMalloc`,
+  `cudaDeviceSynchronize`, `cudaStreamCreate`, ...) answer `cudaErrorDeviceUninitialized` and leave it current; they made
+  the primary context current and succeeded. For a dead context (destroyed, or a primary one not active) `cuCtxGetId` is
+  `CUDA_ERROR_CONTEXT_IS_DESTROYED`, and `cuCtxGetApiVersion` is that for the current context and
+  `CUDA_ERROR_INVALID_CONTEXT` for a named one; they succeeded, or answered INVALID_CONTEXT. `cuCtxGetFlags` answers 0 for
+  a primary context that is not active (it was `CUDA_ERROR_CONTEXT_IS_DESTROYED`). `cudaInitDevice` makes the primary
+  context active, current on no thread, and applies `deviceFlags` to it with `cudaInitDeviceFlagsAreValid`, refusing a
+  bad value (then leaving the context current, as the card does); it did neither, and refused any other bit of `flags`,
+  which the card ignores (found by differential testing; `e2e_card_edges_context`).
 - AMD: the SDWA, DPP and VOP3P modifiers and the denormal and IEEE modes around them, audited against the guides and an RX 6800
   (follow-up to pantheonsim #613). The output modifier (`mul:2`, `mul:4`, `div:2`) did nothing on gfx942 and gfx950 only with IEEE mode
   or output denormals on; it now does nothing then on gfx90a, gfx1030 and gfx1100 too (CDNA2 to CDNA4 guides, 6.5, the RDNA3 guide,
