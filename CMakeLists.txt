@@ -4456,6 +4456,19 @@ if(TARGET vgpucudart)
     TIMEOUT 600)
 endif()
 
+# Edge cases of the runtime and the math libraries against an RTX 3060 (CUDA 13.0): the last error of every failed
+# call, copy kinds, 2D pitches, allocation flags, invalidated captures, and the cuBLAS, cuSOLVER and cuSPARSE
+# argument checks and status texts (nvidia/tests/e2e/card_edges_*.cu).
+if(TARGET vgpucudart)
+  foreach(_edge last_error copy_kind pitch alloc_flags capture)
+    add_test(NAME e2e_card_edges_${_edge} COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh ${_edge})
+    set_tests_properties(e2e_card_edges_${_edge} PROPERTIES
+      DEPENDS vgpucudart
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      TIMEOUT 300)
+  endforeach()
+endif()
+
 # The session's ncu: Nsight Compute's command line answered from the simulator's
 # counters, checked against kernels whose metrics follow from their addresses.
 if(TARGET vgpucudart)
