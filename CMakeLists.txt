@@ -2961,6 +2961,17 @@ if(TARGET vgpucuda)
   add_test(NAME test_driver_proc_address COMMAND test_driver_proc_address)
   set_tests_properties(test_driver_proc_address PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/a100;VGPU_QUIET=1")
 endif()
+# A primary context released from a library's destructor at exit, after the driver's teardown, as NVHPC's OpenACC
+# runtime releases it: CUDA_ERROR_DEINITIALIZED, as on an RTX 3060 (pantheonsim #646). No toolkit header needed.
+if(TARGET vgpucuda)
+  add_executable(test_driver_release_at_exit nvidia/tests/unit/test_driver_release_at_exit.cpp)
+  target_link_libraries(test_driver_release_at_exit PRIVATE ${CMAKE_DL_LIBS})
+  add_dependencies(test_driver_release_at_exit vgpucuda)
+  target_compile_definitions(test_driver_release_at_exit PRIVATE VGPU_LIBCUDA_PATH="$<TARGET_FILE:vgpucuda>")
+  add_test(NAME test_driver_release_at_exit COMMAND test_driver_release_at_exit)
+  set_tests_properties(test_driver_release_at_exit PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100;VGPU_QUIET=1"
+    PASS_REGULAR_EXPRESSION "PASS" FAIL_REGULAR_EXPRESSION "FAIL")
+endif()
 # cuProfilerStart/Stop and cudaProfilerStart/Stop answer as an RTX 3060 does: not initialised, no context, a dead context, no
 # device (they used to succeed always). One process per group: see the test's header. No toolkit header needed.
 if(TARGET vgpucuda AND TARGET vgpucudart)

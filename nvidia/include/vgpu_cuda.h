@@ -55,6 +55,7 @@ typedef enum cudaError_enum {
   CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED = 713,
   CUDA_ERROR_NOT_SUPPORTED = 801,
   CUDA_ERROR_UNKNOWN = 999,
+  CUDA_ERROR_DEINITIALIZED = 4,   // every call once exit() has torn the driver down (#646)
 } CUresult;
 
 typedef int CUdevice;

@@ -275,7 +275,19 @@ struct ShimState {
     size_t persisting_l2 = 0;
   };
   std::map<int, Limits> limits;
+  ~ShimState();
 };
+
+// Whether the process has started to exit and the driver's state is gone: set by ~ShimState, which runs among exit()'s
+// handlers, in reverse order of registration. A library that loads libcuda itself, after its own start (NVHPC's OpenACC
+// runtime dlopens it at the first compute region), has its destructors run after that, by the dynamic linker's
+// _dl_fini, and they still call the driver: NVHPC 26.9's libaccdevice releases the primary context it retained
+// (pantheonsim #646). The state they would find is destroyed -- its maps empty, so that release used to be counted
+// as one with nothing retained, CUDA_ERROR_INVALID_CONTEXT, which NVHPC treats as fatal. NVIDIA's driver has torn
+// itself down by then too and answers every such call CUDA_ERROR_DEINITIALIZED (measured on an RTX 3060, driver
+// 610.88: NVHPC's release at exit returns 4, which it ignores), and so does api() from then on.
+std::atomic<bool> g_driver_torn_down{false};
+ShimState::~ShimState() { g_driver_torn_down.store(true, std::memory_order_release); }
 
 ShimState& state() {
   static ShimState s;
@@ -535,6 +547,10 @@ std::atomic<bool> g_context_destroyed{false};
 // Wraps an API body: locks, checks init, catches and maps errors.
 template <class F>
 CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
+  if (g_driver_torn_down.load(std::memory_order_acquire)) {   // exit() has destroyed the state (#646)
+    if (trace_calls()) std::fprintf(stderr, "[vgpu][call] %s -> %d (after exit)\n", name, static_cast<int>(CUDA_ERROR_DEINITIALIZED));
+    return CUDA_ERROR_DEINITIALIZED;
+  }
   ShimState& s = state();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
   if (needs_init && !s.initialized) {

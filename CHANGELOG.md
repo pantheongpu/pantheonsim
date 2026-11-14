@@ -7,6 +7,14 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- NVIDIA driver: a call made after `exit()` has torn the driver down, from the destructor of a library that loaded libcuda itself, now
+  answers `CUDA_ERROR_DEINITIALIZED` (4), as NVIDIA's driver does (#646). NVHPC's OpenACC runtime (26.9) dlopens libcuda, retains the primary
+  context once and releases it from its destructor, after the driver's own teardown; the simulator answered that release from its destroyed
+  state as one with nothing retained (`CUDA_ERROR_INVALID_CONTEXT`, "released more times than it was retained"), and every `nvc -acc`
+  program, McCode/McStas `--openacc` instruments among them, ended with "Accelerator Fatal Error" and exit status 1 after a correct run. An
+  RTX 3060 answers the same release 4, which NVHPC ignores. A release with nothing retained while the program runs is still 201, as on the
+  card.
+
 - Host-GPU mode (experimental, opt-in), both modes: while the real driver is not started, a launch that would start it only because the program
   has already simulated as long as the start costs (the start-cost account) must now also save a share of the start by itself: 5 ms, or 12.5 ms
   for a kernel's first launch judged by its static estimate (`VGPU_HOST_GPU_START_LAUNCHES`, `0` for the rule before). Four short CUDA Samples
