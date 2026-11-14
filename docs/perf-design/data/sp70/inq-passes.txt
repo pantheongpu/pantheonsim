@@ -1,0 +1,170 @@
+# pass 1 base
+laplacian 5.77 6.38 0.26 rc=0 pass=1 out=fb35b478
+gradient 9.75 9.14 0.31 rc=0 pass=1 out=cada440c
+steepest_descent 16.84 54.13 1.05 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 21.63 63.35 2.93 rc=0 pass=1 out=4918124d
+initial_guess 44.23 368.84 4.61 rc=0 pass=1 out=def4f106
+transform 43.10 77.35 1.10 rc=0 pass=1 out=9116dd42
+electrons 50.72 162.59 1.15 rc=0 pass=1 out=ce3cf4a9
+poisson 62.95 324.02 1.62 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 1 c1
+laplacian 6.07 6.27 0.22 rc=0 pass=1 out=fb35b478
+gradient 10.02 9.20 0.29 rc=0 pass=1 out=cada440c
+steepest_descent 16.65 52.78 1.00 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 21.57 64.15 2.94 rc=0 pass=1 out=4918124d
+initial_guess 38.51 274.86 4.38 rc=0 pass=1 out=def4f106
+transform 43.21 73.71 1.12 rc=0 pass=1 out=9116dd42
+electrons 49.11 120.62 1.19 rc=0 pass=1 out=ce3cf4a9
+poisson 65.32 325.24 1.61 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 1 c2
+laplacian 5.82 5.39 0.21 rc=0 pass=1 out=fb35b478
+gradient 10.65 8.74 0.23 rc=0 pass=1 out=cada440c
+steepest_descent 16.67 44.23 0.88 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 21.44 40.36 1.21 rc=0 pass=1 out=4918124d
+initial_guess 37.50 132.23 1.92 rc=0 pass=1 out=def4f106
+transform 43.38 56.38 0.89 rc=0 pass=1 out=9116dd42
+electrons 49.00 80.84 0.96 rc=0 pass=1 out=ce3cf4a9
+poisson 64.60 187.52 1.39 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 1 c3
+laplacian 6.32 5.22 0.24 rc=0 pass=1 out=fb35b478
+gradient 10.34 8.74 0.23 rc=0 pass=1 out=cada440c
+steepest_descent 15.49 40.37 0.85 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 21.47 40.87 1.55 rc=0 pass=1 out=4918124d
+initial_guess 35.46 124.31 2.21 rc=0 pass=1 out=def4f106
+transform 44.23 56.36 0.88 rc=0 pass=1 out=9116dd42
+electrons 48.28 78.35 0.91 rc=0 pass=1 out=ce3cf4a9
+poisson 64.32 187.17 1.36 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 1 c4
+laplacian 6.06 5.33 0.22 rc=0 pass=1 out=fb35b478
+gradient 10.05 8.72 0.25 rc=0 pass=1 out=cada440c
+steepest_descent 15.27 40.27 0.95 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 21.08 40.27 1.21 rc=0 pass=1 out=4918124d
+initial_guess 35.39 123.68 2.21 rc=0 pass=1 out=def4f106
+transform 43.37 56.26 0.87 rc=0 pass=1 out=9116dd42
+electrons 49.15 78.30 0.92 rc=0 pass=1 out=ce3cf4a9
+poisson 64.15 184.86 1.37 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 2 base
+laplacian 6.28 6.25 0.27 rc=0 pass=1 out=fb35b478
+gradient 10.14 9.25 0.28 rc=0 pass=1 out=cada440c
+steepest_descent 16.75 53.83 1.05 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 21.53 64.18 2.84 rc=0 pass=1 out=4918124d
+initial_guess 44.54 361.42 4.65 rc=0 pass=1 out=def4f106
+transform 44.11 75.91 1.08 rc=0 pass=1 out=9116dd42
+electrons 52.47 162.35 1.19 rc=0 pass=1 out=ce3cf4a9
+poisson 63.43 325.99 1.63 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 2 c1
+laplacian 5.82 6.42 0.27 rc=0 pass=1 out=fb35b478
+gradient 10.24 9.26 0.27 rc=0 pass=1 out=cada440c
+steepest_descent 16.68 52.86 0.98 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 21.79 65.14 3.63 rc=0 pass=1 out=4918124d
+initial_guess 38.82 272.60 4.48 rc=0 pass=1 out=def4f106
+transform 44.82 74.32 1.13 rc=0 pass=1 out=9116dd42
+electrons 49.42 120.04 1.22 rc=0 pass=1 out=ce3cf4a9
+poisson 64.04 325.34 1.64 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 2 c2
+laplacian 6.35 5.32 0.23 rc=0 pass=1 out=fb35b478
+gradient 10.13 8.75 0.23 rc=0 pass=1 out=cada440c
+steepest_descent 16.62 44.32 0.84 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 20.93 40.58 1.20 rc=0 pass=1 out=4918124d
+initial_guess 36.79 130.65 1.80 rc=0 pass=1 out=def4f106
+transform 44.91 56.83 0.87 rc=0 pass=1 out=9116dd42
+electrons 48.62 80.70 0.93 rc=0 pass=1 out=ce3cf4a9
+poisson 64.31 187.58 1.36 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 2 c3
+laplacian 6.12 5.35 0.22 rc=0 pass=1 out=fb35b478
+gradient 9.92 8.75 0.23 rc=0 pass=1 out=cada440c
+steepest_descent 15.64 40.37 0.88 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 21.32 40.30 1.24 rc=0 pass=1 out=4918124d
+initial_guess 35.75 123.57 2.14 rc=0 pass=1 out=def4f106
+transform 43.40 56.25 0.89 rc=0 pass=1 out=9116dd42
+electrons 48.66 78.17 0.88 rc=0 pass=1 out=ce3cf4a9
+poisson 64.72 187.52 1.38 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 2 c4
+laplacian 6.11 5.29 0.24 rc=0 pass=1 out=fb35b478
+gradient 9.94 8.77 0.24 rc=0 pass=1 out=cada440c
+steepest_descent 15.21 40.15 0.87 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 21.33 40.18 1.22 rc=0 pass=1 out=4918124d
+initial_guess 35.90 124.08 2.22 rc=0 pass=1 out=def4f106
+transform 45.48 55.94 0.90 rc=0 pass=1 out=9116dd42
+electrons 53.62 84.39 0.90 rc=0 pass=1 out=ce3cf4a9
+poisson 75.21 203.72 1.45 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 3 base
+laplacian 5.80 6.44 0.24 rc=0 pass=1 out=fb35b478
+gradient 12.87 9.15 0.27 rc=0 pass=1 out=cada440c
+steepest_descent 16.83 53.99 0.99 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 20.98 65.17 2.83 rc=0 pass=1 out=4918124d
+initial_guess 44.29 369.13 4.74 rc=0 pass=1 out=def4f106
+transform 42.70 77.02 1.12 rc=0 pass=1 out=9116dd42
+electrons 50.35 161.28 1.22 rc=0 pass=1 out=ce3cf4a9
+poisson 64.22 324.37 1.69 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 3 c1
+laplacian 5.89 6.44 0.26 rc=0 pass=1 out=fb35b478
+gradient 9.98 9.21 0.26 rc=0 pass=1 out=cada440c
+steepest_descent 16.63 52.85 0.96 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 20.92 64.19 2.89 rc=0 pass=1 out=4918124d
+initial_guess 38.34 275.44 4.41 rc=0 pass=1 out=def4f106
+transform 42.74 74.49 1.15 rc=0 pass=1 out=9116dd42
+electrons 48.17 121.20 1.20 rc=0 pass=1 out=ce3cf4a9
+poisson 62.91 325.37 1.58 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 3 c2
+laplacian 5.75 5.30 0.24 rc=0 pass=1 out=fb35b478
+gradient 9.94 8.86 0.23 rc=0 pass=1 out=cada440c
+steepest_descent 16.43 43.75 0.85 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 20.89 40.43 1.24 rc=0 pass=1 out=4918124d
+initial_guess 37.18 132.03 1.87 rc=0 pass=1 out=def4f106
+transform 42.72 57.50 0.87 rc=0 pass=1 out=9116dd42
+electrons 47.97 81.22 0.94 rc=0 pass=1 out=ce3cf4a9
+poisson 63.48 187.93 1.33 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 3 c3
+laplacian 5.78 5.33 0.24 rc=0 pass=1 out=fb35b478
+gradient 9.92 8.82 0.26 rc=0 pass=1 out=cada440c
+steepest_descent 15.52 40.28 0.91 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 20.96 40.32 1.29 rc=0 pass=1 out=4918124d
+initial_guess 35.70 126.02 2.10 rc=0 pass=1 out=def4f106
+transform 43.12 56.78 0.89 rc=0 pass=1 out=9116dd42
+electrons 48.46 78.54 0.92 rc=0 pass=1 out=ce3cf4a9
+poisson 64.39 186.88 1.38 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 3 c4
+laplacian 5.82 5.32 0.22 rc=0 pass=1 out=fb35b478
+gradient 10.01 8.77 0.25 rc=0 pass=1 out=cada440c
+steepest_descent 15.39 40.41 0.91 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 20.97 40.75 1.49 rc=0 pass=1 out=4918124d
+initial_guess 35.89 123.38 2.17 rc=0 pass=1 out=def4f106
+transform 42.22 56.54 0.90 rc=0 pass=1 out=9116dd42
+electrons 47.66 78.50 0.87 rc=0 pass=1 out=ce3cf4a9
+poisson 63.71 186.93 1.39 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 4 v_fmax
+laplacian 5.82 5.40 0.21 rc=0 pass=1 out=fb35b478
+gradient 9.92 8.78 0.25 rc=0 pass=1 out=cada440c
+steepest_descent 15.46 40.06 0.87 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 22.28 40.65 1.57 rc=0 pass=1 out=4918124d
+initial_guess 35.41 124.63 1.86 rc=0 pass=1 out=def4f106
+transform 43.28 56.94 0.87 rc=0 pass=1 out=9116dd42
+electrons 48.31 78.05 0.94 rc=0 pass=1 out=ce3cf4a9
+poisson 63.36 189.03 1.36 rc=0 pass=1 out=bd6e875a
+DONE
+# pass 4 final
+laplacian 5.81 5.39 0.20 rc=0 pass=1 out=fb35b478
+gradient 10.20 8.80 0.25 rc=0 pass=1 out=cada440c
+steepest_descent 15.28 40.46 0.89 rc=0 pass=1 out=988a2f2e
+ks_hamiltonian 21.08 41.08 1.51 rc=0 pass=1 out=4918124d
+initial_guess 36.89 123.27 1.81 rc=0 pass=1 out=def4f106
+transform 44.89 56.30 0.88 rc=0 pass=1 out=9116dd42
+electrons 48.59 78.08 0.88 rc=0 pass=1 out=ce3cf4a9
+poisson 64.45 186.34 1.33 rc=0 pass=1 out=bd6e875a
+DONE

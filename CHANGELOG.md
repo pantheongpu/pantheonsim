@@ -7,6 +7,20 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- AMD engine, speed on a program of doubles, reductions and managed memory (inq's unit tests on the simulated MI300X,
+  [round sp70](docs/perf-design/rounds/11-rounds-sp36-sp41.md)); results, counters and the order work-groups run in are unchanged:
+  - **A default changes**: without `VGPU_THREADS` a dispatch is spread over one host thread for each physical core the process may use
+    (`include/vgpu/host_cores.hpp`), not one for each hardware thread. On an 8-core, 16-thread host the second thread of a core bought no wall
+    time: the default now uses 17 to 52 % less CPU time for the same wall time (ground_state::initial_guess 280 to 134 CPU-s, solvers::poisson
+    327 to 189, wall time within 3 %), and four tests with large grids run at once finish 3 to 4 % sooner. `VGPU_THREADS` still takes any number. The NVIDIA engines are unchanged.
+  - The per-thread pool of vector register files holds 288 files instead of 32: the work-groups of a kernel with barriers (a reduction) are
+    held several at a time and end together, and each burst took fresh 64 KB files zeroed whole (initial_guess 44.3 s to 38.3 s, 374 to 280
+    CPU-s; systems::electrons 162 to 122 CPU-s).
+  - `v_min_f64` and `v_max_f64` are four lanes at a time where the host has AVX2, with the C library's fmin/fmax bits
+    (eigensolvers::steepest_descent 45 to 41 CPU-s).
+  - A wave's three- and four-word loads and stores of managed or host memory (`hipMallocManaged`, `hipHostMalloc`) go to memory as one batch
+    on one host thread, as its one- and two-word ones did (hamiltonian::ks_hamiltonian with `VGPU_THREADS=1`: 30.7 s to 27.4 s).
+
 - Host-GPU mode (experimental, opt-in), both modes: while the real driver is not started, a launch that would start it only because the program
   has already simulated as long as the start costs (the start-cost account) must now also save a share of the start by itself: 5 ms, or 12.5 ms
   for a kernel's first launch judged by its static estimate (`VGPU_HOST_GPU_START_LAUNCHES`, `0` for the rule before). Four short CUDA Samples
