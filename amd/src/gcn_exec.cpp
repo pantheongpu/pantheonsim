@@ -325,6 +325,10 @@ struct PooledAllocator {
   }
 };
 
+// The register files made new (allocated and zeroed whole) rather than taken from a thread's pool: amd::vgpr_files_made, for the test
+// that holds the pool to the number of waves a thread keeps resident.
+std::atomic<uint64_t> g_vgpr_files_made{0};
+
 // One wavefront: its own scalar registers, VCC, EXEC and SCC, and 64 lanes of
 // vector registers.
 // A wave's vector registers: 256 of them to begin with, and more -- up to the 1024 a gfx1250 wave may be given -- once an
@@ -344,6 +348,12 @@ struct VgprFile {
     Rows() = default;
     explicit Rows(size_t count) {
       if (count == kVgprs && pool_take(*this)) return;
+      make_new(count);
+    }
+    // A fresh file: 64 KB allocated and zeroed whole, and counted (amd::vgpr_files_made). Out of line and cold: the path a wave takes
+    // when the pool has a file stays what it was.
+    [[gnu::noinline, gnu::cold]] void make_new(size_t count) {
+      g_vgpr_files_made.fetch_add(1, std::memory_order_relaxed);
       resize(count);
       dirty = n;
     }
@@ -395,7 +405,12 @@ struct VgprFile {
 
    private:
     struct Pool {
-      static constexpr size_t kMax = 32;   // 64 KB each
+      // 64 KB each. As many as the waves a host thread holds at once (run_groups' kMaxResidentWaves): the work-groups of a kernel
+      // with a barrier are held several at a time and end close together, and with room for 32 files the pool overflowed at
+      // each such burst and the groups admitted next took fresh files, zeroed whole -- 19% of the time of inq's
+      // ground_state::initial_guess, 23% of systems::electrons (Round sp70). A thread that never holds that many never fills it.
+      // (288: run_groups admits a group while fewer than 256 waves are resident, and a group is up to 32 waves.)
+      static constexpr size_t kMax = 288;
       struct Block {
         Row* p;
         size_t dirty;
@@ -13710,6 +13725,7 @@ std::atomic<bool> g_matrix_fast{true};
 }
 bool matrix_fast_path() { return g_matrix_fast.load(std::memory_order_relaxed); }
 uint64_t matrix_tile_count() { return g_matrix_tiles; }
+uint64_t vgpr_files_made() { return g_vgpr_files_made.load(std::memory_order_relaxed); }
 void set_matrix_fast_path(bool on) { g_matrix_fast.store(on); }
 
 void abandon_dispatches() { g_abandoned.store(true); }
