@@ -63,6 +63,40 @@ release says what runs and what it produces, never how fast a real GPU would run
   (`CUSPARSE_STATUS_NOT_SUPPORTED`, also from `cusparseSpMV_bufferSize`). The `cusparseSetMat*` setters refuse values their enums do
   not have, destroying a null handle or descriptor succeeds, and `cusparseGetErrorName`/`String` give the card's texts
   (`e2e_card_edges_cusparse`).
+- cuBLAS: `?gemv` takes what an RTX 3060's cuBLAS 13.0 takes. A negative `m` or `n` is an empty product and a zero
+  increment is a stride of zero (`incx = 0` reads `x[0]` for every element; with `incy = 0`, `y[0]` keeps row 0's result):
+  the simulator refused them with `CUBLAS_STATUS_INVALID_VALUE`, leaving `y` as it was where the card computes it. An
+  operation other than N is a transpose (`CUBLAS_OP_CONJG` is `conj(A)` for `cgemv`/`zgemv` and `A` for the real types; it
+  was taken as `A^H`), and `cgemv`/`zgemv` refuse an `lda` below `m`, which they read past. The other level-2 routines
+  and the GEMMs (`?gemm`, `cublasHgemm`, `?gemm3m`) print reference BLAS's line for the first bad argument on stdout, as
+  the card does (" ** On entry to SGER   parameter number 5 had an illegal value"); `?symv`/`?hemv` refuse silently, and
+  `?gemv` prints nothing (found by differential testing; `e2e_card_edges_blas2`).
+- Runtime: `cudaMemcpy3D` and `cudaMemcpy3DAsync` between pitched pointers check pitches and `ysize` as an RTX 3060 does. One
+  row of one slice accepts a pitch of 0 (it was `cudaErrorInvalidPitchValue`) and refuses a set pitch narrower than the
+  row with `cudaErrorInvalidValue`, the 3D form of the one-row `cudaMemcpy2D` fix; more than one slice needs a `ysize` of
+  at least the rows (0 included: the simulator took 0 for the rows and copied); a set `ysize` that does not hold the rows
+  from `pos.y` is `cudaErrorInvalidValue` (it copied overlapping slices). An extent with a side of 0 copies nothing; the
+  simulator copied one row or one slice for a height or depth of 0 (`e2e_card_edges_pitch`).
+- cuSOLVER: `potrf` (`cusolverDn?potrf`, `cusolverDnXpotrf`) of a matrix that is not positive definite leaves A as an
+  RTX 3060 does: the columns before the failing one factored, NaN on the failing diagonal, and then, from the lower
+  triangle, the rest factored with that column taken as 0; from the upper, NaN in every row from the failing one. The
+  simulator left A untouched (measured up to n = 32; the card factors larger matrices in blocks, which changes the part
+  after the failing column). `getrf` without pivoting multiplies the column below a zero pivot by 0 and goes on, as
+  the card does; it skipped the column, leaving it as it was (`e2e_card_edges_cusolver`, `test_host_dense`).
+- cuSPARSE: `cusparseSpMV_bufferSize` asks for the workspace the card asks for (11 bytes and up for a CSR matrix with
+  entries) and `cusparseSpMV` refuses a null buffer then; it asked for 0 and took null. A null handle, matrix or vector
+  is `CUSPARSE_STATUS_INVALID_VALUE` from both (it was NOT_INITIALIZED, or success for the size).
+  `cusparseCsr2cscEx2`/`_bufferSize` take `CUSPARSE_CSR2CSC_ALG1` only and refuse a null handle, the size is never 0,
+  and a null buffer is refused (`e2e_card_edges_cusparse`).
+- Driver: `cuCtxSetCurrent` takes a destroyed context, as an RTX 3060 does (it was `CUDA_ERROR_INVALID_CONTEXT`), and every
+  call that needs a context answers `CUDA_ERROR_CONTEXT_IS_DESTROYED` while the current one is dead: destroyed, a primary
+  context released to nothing, or reset. `cudaDeviceReset` now resets the driver's primary context as
+  `cuDevicePrimaryCtxReset` does, so the driver's calls are `CUDA_ERROR_CONTEXT_IS_DESTROYED` until the runtime's next
+  call that uses the device; they succeeded. That call, after `cuCtxSetCurrent(NULL)` or destroying the program's own
+  context, makes the primary context current again, as on the card (the thread was left with none). The runtime's
+  queries (`cudaGetDeviceCount`, `cudaGetDevice`, `cudaGetDeviceProperties`, `cudaDeviceGetAttribute`,
+  `cudaPointerGetAttributes`) no longer make the primary context current or active, as on the card
+  (`e2e_card_edges_context`).
 - AMD: the clamp bit of the integer instructions saturates their result on every target, as the CDNA3 and CDNA4 guides say (6.5, and
   "Supports saturation" on each add and subtract) and as an RX 6800 does. The VOP3b adds and subtracts with a carry out (`v_add_co_u32`,
   `v_sub_co_u32`, `v_subrev_co_u32`, `v_addc_co_u32`, `v_subb_co_u32`, `v_subbrev_co_u32`, RDNA's `_co_ci_` forms) and `v_mad_u64_u32` /

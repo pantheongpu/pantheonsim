@@ -212,6 +212,9 @@ struct ShimState {
   // a retain until a reset or until its last reference is released.
   std::map<int, unsigned> primary_flags;
   std::set<int> primary_active;
+  // Contexts cuCtxDestroy has destroyed: cuCtxSetCurrent still takes one, as an RTX 3060 does (the calls after it are
+  // CUDA_ERROR_CONTEXT_IS_DESTROYED), where a handle that never was a context is CUDA_ERROR_INVALID_CONTEXT.
+  std::set<uintptr_t> destroyed_contexts;
   std::unordered_map<int, uintptr_t> primary_ctx;      // device -> primary ctx handle
   // Retain count per device. A release with nothing retained is an error the
   // caller needs to see: it means some other component's retain is about to
@@ -513,6 +516,19 @@ struct StreamContext {
   StreamContext& operator=(const StreamContext&) = delete;
 };
 
+// Whether the thread's current context is no longer alive: destroyed (cuCtxDestroy, here or on another thread), or a
+// primary context that is not active (released to nothing, or reset by cuDevicePrimaryCtxReset or cudaDeviceReset until
+// the runtime uses the device again). An RTX 3060 answers the calls that need a context with
+// CUDA_ERROR_CONTEXT_IS_DESTROYED then; cuCtxGetCurrent still hands the handle back.
+bool current_context_dead(ShimState& s) {
+  if (ctx_stack().empty()) return false;
+  const uintptr_t h = ctx_stack().back();
+  const auto it = s.contexts.find(h);
+  if (it == s.contexts.end()) return true;
+  const auto primary = s.primary_ctx.find(it->second);
+  return primary != s.primary_ctx.end() && primary->second == h && !s.primary_active.count(it->second);
+}
+
 // Wraps an API body: locks, checks init, catches and maps errors.
 template <class F>
 CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
@@ -525,6 +541,10 @@ CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
   if (s.initialized && ctx_stack().empty() && !t_stream_context && needs_current_context(name)) {
     report(name, "no current context (create one with cuCtxCreate or cuDevicePrimaryCtxRetain + cuCtxSetCurrent)");
     return CUDA_ERROR_INVALID_CONTEXT;
+  }
+  if (s.initialized && !t_stream_context && current_context_dead(s) && needs_current_context(name)) {
+    report(name, "the current context is no longer alive (destroyed, released, or reset)");
+    return CUDA_ERROR_CONTEXT_IS_DESTROYED;
   }
   // The fault first and the name only when there is one: nearly every call finds none, and matching the name
   // against the calls a dead context still answers is eleven string comparisons.
@@ -1030,6 +1050,18 @@ VGPU_EXPORT int vgpu_driver_has_managed_v1() {
   return !s.managed.empty();
 }
 
+// For the runtime (runtime_api.cpp, bind_driver_context): whether the calling thread has a context current. After
+// cuCtxSetCurrent(NULL) an RTX 3060's next runtime call that uses the device makes the primary context current again.
+// Thread-local only, no lock.
+VGPU_EXPORT int vgpu_driver_thread_has_context_v1() { return t_ctx_stack && !t_ctx_stack->empty(); }
+// cudaDeviceReset took the device's primary context out of the active state, as cuDevicePrimaryCtxReset does: until
+// the runtime uses the device again, the driver's calls in it are CUDA_ERROR_CONTEXT_IS_DESTROYED (an RTX 3060).
+VGPU_EXPORT void vgpu_driver_primary_deactivate_v1(int dev) {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  s.primary_active.erase(dev);
+}
+
 VGPU_EXPORT int vgpu_driver_bind_primary_v1(int dev) {
   if (cuInit_impl(0) != CUDA_SUCCESS) return CUDA_ERROR_NOT_INITIALIZED;
   return api("vgpu_driver_bind_primary", true, false, [&](ShimState& s) {
@@ -1321,6 +1353,7 @@ static CUresult cuCtxDestroy_v2_impl(CUcontext ctx) {
     });
     s.contexts.erase(h);
     s.ctx_state.erase(h);
+    s.destroyed_contexts.insert(h);
     // Measured on an RTX 3060: destroying the thread's current context makes the one below it
     // current; destroying one further down the stack leaves it there, and a pop hands it back.
     if (!ctx_stack().empty() && ctx_stack().back() == h) ctx_stack().pop_back();
@@ -1373,7 +1406,9 @@ static CUresult cuCtxSetCurrent_impl(CUcontext ctx) {
       return CUDA_SUCCESS;
     }
     uintptr_t h = check_handle(reinterpret_cast<uintptr_t>(ctx), kTagCtx, "context");
-    if (!s.contexts.count(h)) return CUDA_ERROR_INVALID_CONTEXT;
+    // A destroyed context is made current and the call succeeds, as on an RTX 3060 (CUDA 13.0); the calls that need
+    // the context then answer CUDA_ERROR_CONTEXT_IS_DESTROYED (api()).
+    if (!s.contexts.count(h) && !s.destroyed_contexts.count(h)) return CUDA_ERROR_INVALID_CONTEXT;
     if (!ctx_stack().empty())
       ctx_stack().back() = h;
     else
@@ -3405,13 +3440,7 @@ static CUresult cuProfilerInitialize_impl(const char* configFile, const char* ou
 static CUresult profiler_control(const char* name) {
   return api(name, true, false, [](ShimState& s) {
     if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
-    const uintptr_t h = ctx_stack().back();
-    const auto it = s.contexts.find(h);
-    if (it == s.contexts.end()) return CUDA_ERROR_CONTEXT_IS_DESTROYED;
-    const auto primary = s.primary_ctx.find(it->second);
-    if (primary != s.primary_ctx.end() && primary->second == h && !s.primary_active.count(it->second))
-      return CUDA_ERROR_CONTEXT_IS_DESTROYED;
-    return CUDA_SUCCESS;
+    return current_context_dead(s) ? CUDA_ERROR_CONTEXT_IS_DESTROYED : CUDA_SUCCESS;
   });
 }
 static CUresult cuProfilerStart_impl(void);

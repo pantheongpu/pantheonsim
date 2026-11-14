@@ -14,6 +14,12 @@
 //     enums do not have.
 //   - Destroying a null handle or descriptor is a success.
 //   - cusparseGetErrorName/String: the card's names and sentences.
+//   - cusparseSpMV_bufferSize asks for a workspace whenever A has entries (11 bytes for a small CSR matrix with
+//     32-bit indices, 23 with 64-bit), and cusparseSpMV refuses a null one then (the simulator asked for 0 and took
+//     null). A has no entries: 0, and null is fine. A null handle, matrix or vector is an invalid value from both
+//     (the simulator said NOT_INITIALIZED for SpMV and success for the size).
+//   - cusparseCsr2cscEx2 and its _bufferSize take CUSPARSE_CSR2CSC_ALG1 only, and refuse a null handle; the size
+//     is never 0 and cusparseCsr2cscEx2 refuses a null buffer, even for an empty matrix.
 #include <cuda_runtime.h>
 #include <cusparse.h>
 
@@ -106,6 +112,65 @@ int main() {
     WANT(cusparseDestroySpMat(Ah), ok);
     WANT(cusparseDestroyDnVec(Xh), ok);
     WANT(cusparseDestroyDnVec(Yh), ok);
+  }
+  // Workspace sizes and null pointers.
+  WANT(cusparseSpMV_bufferSize(h, NT, &one, A, X, &zero, Y, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, &bytes), ok);
+  WANT(bytes, 11);
+  WANT(cusparseSpMV_bufferSize(h, CUSPARSE_OPERATION_TRANSPOSE, &one, A, X, &zero, Y, CUDA_R_32F, CUSPARSE_SPMV_CSR_ALG1,
+                               &bytes), ok);
+  WANT(bytes, 11);
+  WANT(cusparseSpMV(h, NT, &one, A, X, &zero, Y, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, nullptr), bad);
+  WANT(cusparseSpMV(nullptr, NT, &one, A, X, &zero, Y, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, buf), bad);
+  WANT(cusparseSpMV(h, NT, &one, nullptr, X, &zero, Y, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, buf), bad);
+  WANT(cusparseSpMV(h, NT, &one, A, nullptr, &zero, Y, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, buf), bad);
+  WANT(cusparseSpMV(h, NT, &one, A, X, &zero, nullptr, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, buf), bad);
+  WANT(cusparseSpMV_bufferSize(nullptr, NT, &one, A, X, &zero, Y, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, &bytes), bad);
+  WANT(cusparseSpMV_bufferSize(h, NT, &one, nullptr, X, &zero, Y, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, &bytes), bad);
+  WANT(cusparseSpMV_bufferSize(h, NT, &one, A, X, &zero, Y, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, nullptr), bad);
+  {
+    cusparseSpMatDescr_t A64, A0;
+    WANT(cusparseCreateCsr(&A64, 2, 2, 2, mem + 256, mem + 320, dval, CUSPARSE_INDEX_64I, CUSPARSE_INDEX_64I, Z,
+                           CUDA_R_32F), ok);
+    WANT(cusparseSpMV_bufferSize(h, NT, &one, A64, X, &zero, Y, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, &bytes), ok);
+    WANT(bytes, 23);
+    WANT(cusparseCreateCsr(&A0, 2, 2, 0, drp, dci, dval, I32, I32, Z, CUDA_R_32F), ok);
+    WANT(cusparseSpMV_bufferSize(h, NT, &one, A0, X, &zero, Y, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, &bytes), ok);
+    WANT(bytes, 0);
+    cudaMemset(drp, 0, 3 * sizeof(int));
+    WANT(cusparseSpMV(h, NT, &one, A0, X, &zero, Y, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, nullptr), ok);
+    cudaMemcpy(drp, rp, sizeof rp, cudaMemcpyHostToDevice);
+    WANT(cusparseDestroySpMat(A64), ok);
+    WANT(cusparseDestroySpMat(A0), ok);
+  }
+  // csr2cscEx2: ALG1 only, and always a workspace.
+  {
+    int* cp = mem + 640;
+    int* ri = mem + 660;
+    float* cv = reinterpret_cast<float*>(mem + 680);
+    const auto NUM = CUSPARSE_ACTION_NUMERIC;
+    for (int alg : {0, 2, 3, -1}) {
+      const auto a = static_cast<cusparseCsr2CscAlg_t>(alg);
+      WANT(cusparseCsr2cscEx2_bufferSize(h, 2, 2, 2, dval, drp, dci, cv, cp, ri, CUDA_R_32F, NUM, Z, a, &bytes), bad);
+      WANT(cusparseCsr2cscEx2(h, 2, 2, 2, dval, drp, dci, cv, cp, ri, CUDA_R_32F, NUM, Z, a, buf), bad);
+    }
+    const auto A1 = CUSPARSE_CSR2CSC_ALG1;
+    WANT(cusparseCsr2cscEx2_bufferSize(h, 2, 2, 2, dval, drp, dci, cv, cp, ri, CUDA_R_32F, NUM, Z, A1, &bytes), ok);
+    WANT(bytes > 0, true);
+    WANT(cusparseCsr2cscEx2_bufferSize(h, 0, 0, 0, dval, drp, dci, cv, cp, ri, CUDA_R_32F, NUM, Z, A1, &bytes), ok);
+    WANT(bytes > 0, true);
+    WANT(cusparseCsr2cscEx2_bufferSize(nullptr, 2, 2, 2, dval, drp, dci, cv, cp, ri, CUDA_R_32F, NUM, Z, A1, &bytes), bad);
+    WANT(cusparseCsr2cscEx2(h, 2, 2, 2, dval, drp, dci, cv, cp, ri, CUDA_R_32F, NUM, Z, A1, nullptr), bad);
+    WANT(cusparseCsr2cscEx2(h, 0, 0, 0, dval, drp, dci, cv, cp, ri, CUDA_R_32F, NUM, Z, A1, nullptr), bad);
+    WANT(cusparseCsr2cscEx2(nullptr, 2, 2, 2, dval, drp, dci, cv, cp, ri, CUDA_R_32F, NUM, Z, A1, buf), bad);
+    void* work = nullptr;
+    WANT(cusparseCsr2cscEx2_bufferSize(h, 2, 2, 2, dval, drp, dci, cv, cp, ri, CUDA_R_32F, NUM, Z, A1, &bytes), ok);
+    WANT(cudaMalloc(&work, bytes), cudaSuccess);
+    WANT(cusparseCsr2cscEx2(h, 2, 2, 2, dval, drp, dci, cv, cp, ri, CUDA_R_32F, NUM, Z, A1, work), ok);
+    WANT(cudaDeviceSynchronize(), cudaSuccess);
+    int cph[3] = {};
+    cudaMemcpy(cph, cp, sizeof cph, cudaMemcpyDeviceToHost);
+    WANT(cph[0] == 0 && cph[1] == 1 && cph[2] == 2, true);
+    WANT(cudaFree(work), cudaSuccess);
   }
 
   // Legacy descriptor fields.

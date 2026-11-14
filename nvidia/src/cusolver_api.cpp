@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <complex>
 #include <cstdio>
 #include <cstdlib>
@@ -119,6 +120,42 @@ bool known_uplo(cublasFillMode_t u) { return u == CUBLAS_FILL_MODE_LOWER || u ==
 
 // Cholesky. Returns 0, or the 1-based index of the leading minor that failed.
 int potrf(Mat& A, int n, bool lower) { return vgpu::hostdense::potrf(A.v.data(), A.ld, n, lower); }
+
+// potrf as an RTX 3060's cuSOLVER 13.0 (cusolverDn?potrf, cusolverDnXpotrf) leaves a matrix that is not positive
+// definite, failing at leading minor j: the columns before j factored, NaN at A(j,j), and then
+//   - from the lower triangle, the factorization goes on as if column j were 0 (its entries below the diagonal are
+//     set to 0, and a later failing column is the same);
+//   - from the upper triangle, every entry of rows j.. of the triangle is NaN.
+// Measured for n up to 32 (float and double); the card factors larger matrices in blocks, which changes what it
+// leaves after the failing column. The columns before it and info are the card's at every size measured.
+int potrf_as_card(Mat& A, int n, bool lower) {
+  const int rc = potrf(A, n, lower);
+  if (rc == 0) return 0;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  auto el = [&](int i, int j) -> double& { return lower ? A(i, j) : A(j, i); };   // the factor's (i, j), i >= j
+  for (int j = rc - 1; j < n; ++j) {
+    double d = el(j, j);
+    for (int k = 0; k < j; ++k) d -= el(j, k) * el(j, k);
+    if (!(d > 0.0)) {
+      if (!lower) {
+        for (int r = j; r < n; ++r)
+          for (int c = r; c < n; ++c) el(c, r) = nan;
+        break;
+      }
+      el(j, j) = nan;
+      for (int i = j + 1; i < n; ++i) el(i, j) = 0.0;
+      continue;
+    }
+    d = std::sqrt(d);
+    el(j, j) = d;
+    for (int i = j + 1; i < n; ++i) {
+      double t = el(i, j);
+      for (int k = 0; k < j; ++k) t -= el(i, k) * el(j, k);
+      el(i, j) = t / d;
+    }
+  }
+  return rc;
+}
 
 // LU with partial pivoting. ipiv is LAPACK's: 1-based row that row i was
 // swapped with. A null ipiv means the caller asked for no pivoting.
@@ -302,9 +339,9 @@ VGPU_EXPORT cusolverStatus_t cusolverGetVersion(int* v) {
       return uplo == CUBLAS_FILL_MODE_FULL ? CUSOLVER_STATUS_EXECUTION_FAILED : bad;            \
     Mat a;                                                                                     \
     if (!load<T>(A, (size_t)lda * n, &a, lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;        \
-    const int rc = potrf(a, n, uplo == CUBLAS_FILL_MODE_LOWER);                                \
+    const int rc = potrf_as_card(a, n, uplo == CUBLAS_FILL_MODE_LOWER);                        \
     set_info(info, rc);                                                                        \
-    if (rc == 0 && !save<T>(A, a.v)) return CUSOLVER_STATUS_EXECUTION_FAILED;                  \
+    if (!save<T>(A, a.v)) return CUSOLVER_STATUS_EXECUTION_FAILED;                             \
     return CUSOLVER_STATUS_SUCCESS;                                                            \
   }                                                                                            \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##potrs(cusolverDnHandle_t h, cublasFillMode_t uplo,\
@@ -803,9 +840,9 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXpotrf(cusolverDnHandle_t h, cusolverDnPa
     using T = decltype(t);
     Mat a;
     if (!load<T>(A, (size_t)lda * n, &a, (int)lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;
-    const int rc = potrf(a, (int)n, uplo == CUBLAS_FILL_MODE_LOWER);
+    const int rc = potrf_as_card(a, (int)n, uplo == CUBLAS_FILL_MODE_LOWER);
     set_info(info, rc);
-    if (rc == 0 && !save<T>(A, a.v)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+    if (!save<T>(A, a.v)) return CUSOLVER_STATUS_EXECUTION_FAILED;
     return CUSOLVER_STATUS_SUCCESS;
   });
 }
