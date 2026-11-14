@@ -83,6 +83,11 @@ release says what runs and what it produces, never how fast a real GPU would run
   simulator left A untouched (measured up to n = 32; the card factors larger matrices in blocks, which changes the part
   after the failing column). `getrf` without pivoting multiplies the column below a zero pivot by 0 and goes on, as
   the card does; it skipped the column, leaving it as it was (`e2e_card_edges_cusolver`, `test_host_dense`).
+- cuSPARSE: `cusparseSpMV_bufferSize` asks for the workspace the card asks for (11 bytes and up for a CSR matrix with
+  entries) and `cusparseSpMV` refuses a null buffer then; it asked for 0 and took null. A null handle, matrix or vector
+  is `CUSPARSE_STATUS_INVALID_VALUE` from both (it was NOT_INITIALIZED, or success for the size).
+  `cusparseCsr2cscEx2`/`_bufferSize` take `CUSPARSE_CSR2CSC_ALG1` only and refuse a null handle, the size is never 0,
+  and a null buffer is refused (`e2e_card_edges_cusparse`).
 - AMD: the clamp bit of the integer instructions saturates their result on every target, as the CDNA3 and CDNA4 guides say (6.5, and
   "Supports saturation" on each add and subtract) and as an RX 6800 does. The VOP3b adds and subtracts with a carry out (`v_add_co_u32`,
   `v_sub_co_u32`, `v_subrev_co_u32`, `v_addc_co_u32`, `v_subb_co_u32`, `v_subbrev_co_u32`, RDNA's `_co_ci_` forms) and `v_mad_u64_u32` /

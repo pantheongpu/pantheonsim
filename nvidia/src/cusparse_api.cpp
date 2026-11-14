@@ -1061,17 +1061,35 @@ cusparseStatus_t spmv_check(cusparseOperation_t op, const SpMat& A, const DnVec&
   if (A.format == kFormatBsr && op != CUSPARSE_OPERATION_NON_TRANSPOSE) return CUSPARSE_STATUS_NOT_SUPPORTED;
   return CUSPARSE_STATUS_SUCCESS;
 }
+
+// The workspace cusparseSpMV asks for. The simulator's SpMV needs none, but an RTX 3060's cuSPARSE 13.0 asks for
+// some whenever A has entries, and its cusparseSpMV refuses a null buffer then; so the size is the card's, for CSR
+// with the default algorithm or CSR_ALG1: 7 + 4 bytes per started 1536 entries with 32-bit indices, 15 + 8 with
+// 64-bit (per 2048 entries for double A^T). Other formats and algorithms are given the same size; the card asks for
+// more there (CSR_ALG2 551 bytes and up for A itself, COO 540 and up), which the simulator does not use.
+size_t spmv_buffer_bytes(cusparseOperation_t op, const SpMat& A) {
+  if (A.nnz <= 0) return 0;
+  const int64_t per = op != CUSPARSE_OPERATION_NON_TRANSPOSE && A.value_type == CUDA_R_64F ? 2048 : 1536;
+  const auto chunks = static_cast<size_t>((A.nnz + per - 1) / per);
+  return A.row_type == CUSPARSE_INDEX_64I || A.col_type == CUSPARSE_INDEX_64I ? 15 + 8 * chunks : 7 + 4 * chunks;
+}
 }  // namespace
 
-VGPU_EXPORT cusparseStatus_t cusparseSpMV_bufferSize(cusparseHandle_t, cusparseOperation_t op,
+VGPU_EXPORT cusparseStatus_t cusparseSpMV_bufferSize(cusparseHandle_t h, cusparseOperation_t op,
                                                      const void*, cusparseConstSpMatDescr_t matA,
                                                      cusparseConstDnVecDescr_t vecX, const void*,
                                                      cusparseDnVecDescr_t vecY, cudaDataType ct,
                                                      cusparseSpMVAlg_t alg, size_t* bytes) {
-  if (bytes) *bytes = 0;   // host-computed: no device workspace to size
-  if (known(matA) && known(vecX) && known(vecY))
-    return spmv_check(op, *reinterpret_cast<const SpMat*>(matA), *reinterpret_cast<const DnVec*>(vecX),
-                      *reinterpret_cast<const DnVec*>(vecY), ct, alg);
+  // A null handle, descriptor or size is an invalid value on the card.
+  if (!h || !matA || !vecX || !vecY || !bytes) return CUSPARSE_STATUS_INVALID_VALUE;
+  *bytes = 0;
+  if (known(matA) && known(vecX) && known(vecY)) {
+    const auto& A = *reinterpret_cast<const SpMat*>(matA);
+    if (const cusparseStatus_t st = spmv_check(op, A, *reinterpret_cast<const DnVec*>(vecX),
+                                               *reinterpret_cast<const DnVec*>(vecY), ct, alg))
+      return st;
+    *bytes = spmv_buffer_bytes(op, A);
+  }
   return CUSPARSE_STATUS_SUCCESS;
 }
 
@@ -1080,6 +1098,8 @@ VGPU_EXPORT cusparseStatus_t cusparseSpMV(cusparseHandle_t h, cusparseOperation_
                                           cusparseConstDnVecDescr_t vecX, const void* beta,
                                           cusparseDnVecDescr_t vecY, cudaDataType ct,
                                           cusparseSpMVAlg_t alg, void* buffer) {
+  // A null handle or descriptor is an invalid value (an RTX 3060); one the library does not know is not initialized.
+  if (!h || !matA || !vecX || !vecY) return CUSPARSE_STATUS_INVALID_VALUE;
   if (!known(h) || !known(matA) || !known(vecX) || !known(vecY))
     return CUSPARSE_STATUS_NOT_INITIALIZED;
   // An unknown operation and a null alpha or beta are invalid values (an RTX 3060), not read through.
@@ -1100,6 +1120,8 @@ VGPU_EXPORT cusparseStatus_t cusparseSpMV(cusparseHandle_t h, cusparseOperation_
   const auto& X = *reinterpret_cast<const DnVec*>(vecX);
   auto& Y = *reinterpret_cast<DnVec*>(vecY);
   if (const cusparseStatus_t st = spmv_check(op, A, X, Y, ct, alg); st != CUSPARSE_STATUS_SUCCESS) return st;
+  // The card refuses a null buffer where cusparseSpMV_bufferSize asks for one (A has entries).
+  if (!buffer && spmv_buffer_bytes(op, A)) return CUSPARSE_STATUS_INVALID_VALUE;
   return any_complex({A.value_type, X.type, Y.type, ct}) ? spmv<cd>(h, op, alpha, A, X, beta, Y, ct)
                                                          : spmv<double>(h, op, alpha, A, X, beta, Y, ct);
 }
@@ -1545,14 +1567,21 @@ size_t element_bytes(cudaDataType t) {
 }  // namespace
 
 VGPU_EXPORT cusparseStatus_t cusparseCsr2cscEx2_bufferSize(
-    cusparseHandle_t h, int, int, int, const void*, const int*, const int*, void*, int*, int*,
+    cusparseHandle_t h, int, int n, int nnz, const void*, const int*, const int*, void*, int*, int*,
     cudaDataType valType, cusparseAction_t copyValues, cusparseIndexBase_t,
-    cusparseCsr2CscAlg_t, size_t* bufferSize) {
+    cusparseCsr2CscAlg_t alg, size_t* bufferSize) {
+  if (!h) return CUSPARSE_STATUS_INVALID_VALUE;   // as on an RTX 3060
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (!bufferSize) return CUSPARSE_STATUS_INVALID_VALUE;
   if (copyValues == CUSPARSE_ACTION_NUMERIC && !element_bytes(valType))
     return CUSPARSE_STATUS_NOT_SUPPORTED;
-  *bufferSize = 0;  // the work happens on the host
+  // CUSPARSE_CSR2CSC_ALG1 (also the default, 1) is the only algorithm the card's cuSPARSE 13.0 takes.
+  if (alg != CUSPARSE_CSR2CSC_ALG1) return CUSPARSE_STATUS_INVALID_VALUE;
+  // The work happens on the host, but the card always asks for a workspace and cusparseCsr2cscEx2 refuses a null
+  // one, so the size is the card's for small problems: 1431 bytes, 8 per column, 256 + 4 per entry when there are
+  // any, and 384 more for values (it grows faster for many entries, its sort's own workspace).
+  *bufferSize = 1431 + 8 * static_cast<size_t>(std::max(n, 0)) + (nnz > 0 ? 256 + 4 * static_cast<size_t>(nnz) : 0) +
+                (copyValues == CUSPARSE_ACTION_NUMERIC ? 384 : 0);
   return CUSPARSE_STATUS_SUCCESS;
 }
 
@@ -1560,6 +1589,7 @@ VGPU_EXPORT cusparseStatus_t cusparseCsr2cscEx2(
     cusparseHandle_t h, int m, int n, int nnz, const void* csrVal, const int* csrRowPtr,
     const int* csrColInd, void* cscVal, int* cscColPtr, int* cscRowInd, cudaDataType valType,
     cusparseAction_t copyValues, cusparseIndexBase_t idxBase, cusparseCsr2CscAlg_t alg, void* buffer) {
+  if (!h) return CUSPARSE_STATUS_INVALID_VALUE;   // as on an RTX 3060
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (capturing(h)) {
     auto held = std::make_shared<Held>();
@@ -1576,6 +1606,8 @@ VGPU_EXPORT cusparseStatus_t cusparseCsr2cscEx2(
   if (!numeric && copyValues != CUSPARSE_ACTION_SYMBOLIC) return CUSPARSE_STATUS_INVALID_VALUE;
   const size_t vb = element_bytes(valType);
   if (numeric && !vb) return CUSPARSE_STATUS_NOT_SUPPORTED;
+  // Only CUSPARSE_CSR2CSC_ALG1, and the workspace cusparseCsr2cscEx2_bufferSize always asks for (an RTX 3060).
+  if (alg != CUSPARSE_CSR2CSC_ALG1 || !buffer) return CUSPARSE_STATUS_INVALID_VALUE;
   if (n == 0) return CUSPARSE_STATUS_SUCCESS;
   if (!cscColPtr) return CUSPARSE_STATUS_INVALID_VALUE;
   const int base = idxBase == CUSPARSE_INDEX_BASE_ONE ? 1 : 0;
