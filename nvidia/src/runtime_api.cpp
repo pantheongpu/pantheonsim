@@ -566,7 +566,7 @@ void set_sticky_error(State& s, cudaError_t code) { s.rt->set_context_fault(stat
 // copies and launches all answer cudaErrorAssert; asking which device is
 // current, or what a device is, still succeeds.
 bool driver_binding_stale();
-void bind_driver_context();
+cudaError_t bind_driver_context();
 cudaError_t dead_context() {
   // These are the calls that use the device without guard() (streams, events, synchronisation): like guard()'s calls
   // they make the primary context current on the driver's side when the thread has none (bind_driver_context).
@@ -574,7 +574,10 @@ cudaError_t dead_context() {
     State& s = st();
     if (s.initialized.load(std::memory_order_acquire) && !vgpu::profiling::silenced()) {
       std::lock_guard<std::recursive_mutex> lock(s.mu);
-      bind_driver_context();
+      if (const cudaError_t b = bind_driver_context(); b != cudaSuccess) {
+        g_last_error = b;
+        return b;
+      }
     }
   }
   const cudaError_t e = sticky_error();
@@ -1025,7 +1028,9 @@ bool driver_binding_stale() {
   const DriverHasContext has = g_driver_has_context.load(std::memory_order_acquire);
   return has && !has();
 }
-void bind_driver_context() {
+// cudaErrorDeviceUninitialized when the thread's current context is one the program destroyed: an RTX 3060 (CUDA 13.0)
+// keeps it current and fails the runtime's calls that use the device (cudaFree(0), cudaMalloc, cudaStreamCreate, ...).
+cudaError_t bind_driver_context() {
   const unsigned loads = g_driver_loads.load(std::memory_order_acquire);
   using Bind = int (*)(int);
   static Bind fn = nullptr;   // (callers hold the API lock)
@@ -1036,11 +1041,13 @@ void bind_driver_context() {
                                std::memory_order_release);
     fn_loads = loads;
   }
-  if (!driver_binding_stale()) return;
-  if (fn) fn(t_current_device);
+  if (!driver_binding_stale()) return cudaSuccess;
+  constexpr int kContextIsDestroyed = 709;   // CUDA_ERROR_CONTEXT_IS_DESTROYED
+  if (fn && fn(t_current_device) == kContextIsDestroyed) return cudaErrorDeviceUninitialized;
   t_unbound_device = fn ? -1 : t_current_device;
   t_bound_device = t_current_device;
   t_bound_loads = loads;
+  return cudaSuccess;
 }
 
 // The body of every API call: the lock, initialisation, the dead-context
@@ -1074,7 +1081,11 @@ cudaError_t guard_impl(const char* api, bool needs_context, F&& body) {
       const bool silent = call.silenced();
       // Only a call that uses the device binds its context: an RTX 3060's cudaGetDeviceCount, cudaGetDevice and the
       // other queries (guard_query) do not make the primary context current or active (cudaSetDevice binds itself).
-      if (!silent && needs_context) bind_driver_context();
+      if (!silent && needs_context)
+        if (const cudaError_t b = bind_driver_context(); b != cudaSuccess) {
+          g_last_error = b;
+          return b;
+        }
       // cudaSetDevice makes the context of the device it selects, which is not
       // the one that was current when it was called (see its body).
       if (std::strcmp(api, "cudaSetDevice") != 0) announce_context(silent);
@@ -2179,7 +2190,7 @@ static cudaError_t cudaSetDevice_body(int device) {
   return guard_query("cudaSetDevice", [&](State& s) {
     if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
     t_current_device = device;
-    bind_driver_context();
+    (void)bind_driver_context();   // (with a destroyed context current the card's process corrupts its heap here)
     // The real runtime makes the device's context here (measured: its streams
     // and the context record are told within cudaSetDevice), not at the next
     // call that needs it.
@@ -2251,16 +2262,28 @@ VGPU_EXPORT cudaError_t cudaChooseDevice(int* device, const struct cudaDevicePro
   return traced_call("cudaChooseDevice", cudaChooseDevice_traced, device, prop);
 }
 
-// cudaInitDevice: starts the runtime and the device's primary context without
-// making the device current. The only flag is cudaInitDeviceFlagsAreValid,
-// which says deviceFlags is to be applied; those are cudaSetDeviceFlags's, and
-// this engine keeps none of them (cudaGetDeviceFlags is always 0).
+// cudaInitDevice: starts the runtime and the device's primary context without making the device current. Measured on
+// an RTX 3060 (CUDA 13.0): the primary context is active afterwards and current on no thread; deviceFlags are applied
+// (the primary context's flags, as cuDevicePrimaryCtxSetFlags's but MAP_HOST taken and not kept) only when `flags` has
+// cudaInitDeviceFlagsAreValid, its other bits ignored, and then a value above 0xff or two scheduling modes are
+// cudaErrorInvalidValue -- with the context active all the same, and current on the calling thread. (The runtime keeps
+// no flags of its own: cudaGetDeviceFlags is still 0.)
 static cudaError_t cudaInitDevice_traced(int device, unsigned int deviceFlags, unsigned int flags) {
-  (void)deviceFlags;
-  if (flags & ~1u) return cudaErrorInvalidValue;   // cudaInitDeviceFlagsAreValid is the only one
   return guard_query("cudaInitDevice", [&](State& s) {
     if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
-    return cudaSuccess;
+    const bool apply = flags & 1u;   // cudaInitDeviceFlagsAreValid
+    const unsigned sched = deviceFlags & 7u;
+    const bool ok = !apply || (deviceFlags <= 0xffu && (sched == 0 || sched == 1 || sched == 2 || sched == 4));
+    using Activate = int (*)(int, int);
+    if (const auto on = reinterpret_cast<Activate>(driver_dlsym("vgpu_driver_primary_activate_v1")))
+      on(device, apply && ok ? static_cast<int>(deviceFlags) : -1);
+    if (ok) return cudaSuccess;
+    // Refused, the card's call leaves the device's primary context current too.
+    const int was = t_current_device;
+    t_current_device = device;
+    (void)bind_driver_context();
+    t_current_device = was;
+    return cudaErrorInvalidValue;
   });
 }
 
@@ -5019,8 +5042,9 @@ VGPU_EXPORT cudaError_t cudaDeviceGetByPCIBusId(int* device, const char* pciBusI
 static cudaError_t cudaStreamAddCallback_traced(cudaStream_t stream, cudaStreamCallback_t cb, void* user, unsigned int /*p3*/) {
   if (const cudaError_t dead = dead_context()) return dead;
   // Not supported under stream capture, as documented -- cudaLaunchHostFunc is
-  // the one that is -- so a capturing stream refuses it and the capture fails.
-  if (capture_refuse(stream, "cudaStreamAddCallback")) return cudaErrorStreamCaptureUnsupported;
+  // the one that is -- so a capturing stream refuses it. The capture goes on without it, in every mode, as on an
+  // RTX 3060 (CUDA 13.0); it was invalidated.
+  if (capture_active(stream)) return cudaErrorStreamCaptureUnsupported;
   if (cb) cb(stream, cudaSuccess, user);
   return cudaSuccess;
 }
@@ -11666,6 +11690,27 @@ void invalidate_capture_id(unsigned long long id, const char* why) {
 
 cudaError_t capture_wait(cudaStream_t stream, bool captured, unsigned long long id,
                          const std::vector<void*>& deps) {
+  // The legacy stream waits for every blocking stream too: while one is capturing (its capture invalidated or not)
+  // the wait is cudaErrorStreamCaptureImplicit and invalidates that capture, whatever the event, as on an RTX 3060
+  // (CUDA 13.0). (The streams' flags are looked up without g_graph_mu, which stream_is_blocking's lock does not nest
+  // in.)
+  if ((stream == nullptr || stream == cudaStreamLegacy) && g_captures_active.load(std::memory_order_acquire)) {
+    std::vector<void*> keys;
+    {
+      std::lock_guard<std::mutex> lock(g_graph_mu);
+      for (const auto& [key, sc] : g_stream_capture) keys.push_back(key);
+    }
+    std::erase_if(keys, [](void* k) { return !stream_is_blocking(static_cast<cudaStream_t>(k)); });
+    if (!keys.empty()) {
+      std::lock_guard<std::mutex> lock(g_graph_mu);
+      for (void* k : keys)
+        if (StreamCapture* sc = stream_capture(static_cast<cudaStream_t>(k)); sc && !sc->cap->graph->invalidated) {
+          sc->cap->graph->invalidated = true;
+          sc->cap->graph->invalidated_by = "a wait by the legacy stream, which a capturing blocking stream joins";
+        }
+      return cudaErrorStreamCaptureImplicit;
+    }
+  }
   std::lock_guard<std::mutex> lock(g_graph_mu);
   StreamCapture* sc = stream_capture(stream);
   const auto invalidate = [&](const char* why) {
@@ -11689,18 +11734,33 @@ cudaError_t capture_wait(cudaStream_t stream, bool captured, unsigned long long 
   std::vector<GraphNodeRec*> pos;
   for (void* d : deps)
     if (auto* n = static_cast<GraphNodeRec*>(d); cap->graph->holds(n)) pos.push_back(n);
+  // As an RTX 3060 (CUDA 13.0) does in every capture mode: a merge invalidates both captures and the legacy stream's
+  // wait the event's; once the event's capture is invalidated, a wait on it from a stream outside the capture is an
+  // invalid value (no fork) and from one of its own streams cudaErrorStreamCaptureInvalidated.
+  const auto invalidate_events = [&](const char* why) {
+    if (!cap->graph->invalidated) {
+      cap->graph->invalidated = true;
+      cap->graph->invalidated_by = why;
+    }
+  };
   if (sc) {
     if (sc->cap != cap) {
       invalidate("a wait that would merge two captures");
+      invalidate_events("a wait that would merge two captures");
       return cudaErrorStreamCaptureMerge;
     }
+    if (cap->graph->invalidated) return cudaErrorStreamCaptureInvalidated;
     for (GraphNodeRec* n : pos)   // a join
       if (std::find(sc->deps.begin(), sc->deps.end(), n) == sc->deps.end()) sc->deps.push_back(n);
     return cudaSuccess;
   }
+  if (cap->graph->invalidated) return cudaErrorInvalidValue;
   // A fork: the stream joins the capture, starting where the event's stream was.
   // Not the legacy stream, which every other stream synchronizes with.
-  if (stream == nullptr || stream == cudaStreamLegacy) return cudaErrorStreamCaptureImplicit;
+  if (stream == nullptr || stream == cudaStreamLegacy) {
+    invalidate_events("a wait by the legacy stream on an event of the capture");
+    return cudaErrorStreamCaptureImplicit;
+  }
   g_stream_capture[reinterpret_cast<void*>(stream)] = StreamCapture{cap, std::move(pos), {}, {}, {}};
   return cudaSuccess;
 }

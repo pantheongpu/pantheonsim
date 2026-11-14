@@ -128,6 +128,15 @@ release says what runs and what it produces, never how fast a real GPU would run
   and the GEMMs (`?gemm`, `cublasHgemm`, `?gemm3m`) print reference BLAS's line for the first bad argument on stdout, as
   the card does (" ** On entry to SGER   parameter number 5 had an illegal value"); `?symv`/`?hemv` refuse silently, and
   `?gemv` prints nothing (found by differential testing; `e2e_card_edges_blas2`).
+- cuBLAS: the level-3 routines and the extensions print the card's line for their first bad argument on stdout too:
+  `?symm`, `?hemm`, `?syrk`, `?herk`, `?syr2k`, `?her2k`, `?syrkx`, `?herkx`, `?trsm`, `?trmm`, `?geam` (and `_64`),
+  `?dgmm`, `?gemmBatched`, `?gemmStridedBatched`, `?trsmBatched`, `cublasHgemm(Strided)Batched`,
+  `cublasCgemm3m(Strided)Batched`, `cublasGemmEx`, `cublasGemmBatchedEx`, `cublasGemmStridedBatchedEx` (and `_64`),
+  `cublasSgemmEx`, `cublasCgemmEx`, `cublasCgemm3mEx` and the Ex herk/syrk forms, each with the field and position an
+  RTX 3060's cuBLAS 13.0 prints (" ** On entry to SSYMM  parameter number 7 had an illegal value", "SBATCHED TRSM ",
+  "GEMM_EX " with GemmEx's own positions). `cublasCgemm3mBatched` printed `CgemmBatched`'s field. `cublasGemmEx` and its
+  batched forms refuse an algorithm outside `CUBLAS_GEMM_DEFAULT`..`ALGO23` and `DEFAULT_TENSOR_OP`..`ALGO15_TENSOR_OP`,
+  as the card does; they ran it (found by differential testing; `e2e_card_edges_blas3`).
 - Runtime: `cudaMemcpy3D` and `cudaMemcpy3DAsync` between pitched pointers check pitches and `ysize` as an RTX 3060 does. One
   row of one slice accepts a pitch of 0 (it was `cudaErrorInvalidPitchValue`) and refuses a set pitch narrower than the
   row with `cudaErrorInvalidValue`, the 3D form of the one-row `cudaMemcpy2D` fix; more than one slice needs a `ysize` of
@@ -145,6 +154,17 @@ release says what runs and what it produces, never how fast a real GPU would run
   is `CUSPARSE_STATUS_INVALID_VALUE` from both (it was NOT_INITIALIZED, or success for the size).
   `cusparseCsr2cscEx2`/`_bufferSize` take `CUSPARSE_CSR2CSC_ALG1` only and refuse a null handle, the size is never 0,
   and a null buffer is refused (`e2e_card_edges_cusparse`).
+- cuSPARSE: `cusparseSpMV_bufferSize` asks for the workspace an RTX 3060's cuSPARSE 13.0 asks for with every format,
+  algorithm, operation and index type for single, double and complex values (and half and bfloat16 with `CSR_ALG2`
+  and `COO_ALG2`); every one was given the single-precision CSR size, where the card asks 515 bytes and up for
+  `CSR_ALG2` (CSC's for A^T), 524 and up for COO and nothing for COO's A^T, and steps at other entry counts for double
+  (2048) and complex values. With COO and A^T, `cusparseSpMV` takes a null buffer. `cusparseSpMV` and its
+  `_bufferSize` print the card's line on stderr for a refused argument (" ** On entry to cusparseSpMV() parameter
+  number 10 (externalBuffer) had an illegal value: NULL pointer", dimension mismatches, a conjugate transpose of
+  real data, an unsupported type combination, an algorithm of another format), unless `VGPU_QUIET=1`; the size
+  refuses a null alpha or beta, an unknown operation, x or y of the wrong size and an algorithm of another format
+  (CSR's for COO, COO's for CSC), which it took, and an unknown compute type is `CUSPARSE_STATUS_INVALID_VALUE` from
+  both, as on the card (it was NOT_SUPPORTED) (found by differential testing; `e2e_card_edges_spmv`).
 - Driver: `cuCtxSetCurrent` takes a destroyed context, as an RTX 3060 does (it was `CUDA_ERROR_INVALID_CONTEXT`), and every
   call that needs a context answers `CUDA_ERROR_CONTEXT_IS_DESTROYED` while the current one is dead: destroyed, a primary
   context released to nothing, or reset. `cudaDeviceReset` now resets the driver's primary context as
@@ -154,6 +174,24 @@ release says what runs and what it produces, never how fast a real GPU would run
   queries (`cudaGetDeviceCount`, `cudaGetDevice`, `cudaGetDeviceProperties`, `cudaDeviceGetAttribute`,
   `cudaPointerGetAttributes`) no longer make the primary context current or active, as on the card
   (`e2e_card_edges_context`).
+- Driver and runtime: with a destroyed context current, `cuCtxGetDevice` names its device as an RTX 3060 (CUDA 13.0) does
+  (it was `CUDA_ERROR_INVALID_CONTEXT`), and the runtime's calls that use the device (`cudaFree(0)`, `cudaMalloc`,
+  `cudaDeviceSynchronize`, `cudaStreamCreate`, ...) answer `cudaErrorDeviceUninitialized` and leave it current; they made
+  the primary context current and succeeded. For a dead context (destroyed, or a primary one not active) `cuCtxGetId` is
+  `CUDA_ERROR_CONTEXT_IS_DESTROYED`, and `cuCtxGetApiVersion` is that for the current context and
+  `CUDA_ERROR_INVALID_CONTEXT` for a named one; they succeeded, or answered INVALID_CONTEXT. `cuCtxGetFlags` answers 0 for
+  a primary context that is not active (it was `CUDA_ERROR_CONTEXT_IS_DESTROYED`). `cudaInitDevice` makes the primary
+  context active, current on no thread, and applies `deviceFlags` to it with `cudaInitDeviceFlagsAreValid`, refusing a
+  bad value (then leaving the context current, as the card does); it did neither, and refused any other bit of `flags`,
+  which the card ignores (found by differential testing; `e2e_card_edges_context`).
+- Runtime: stream capture as an RTX 3060 (CUDA 13.0) does it, in every mode. A wait that would merge two captures
+  (`cudaErrorStreamCaptureMerge`) invalidates both, not only the waiting stream's; the legacy stream's
+  `cudaStreamWaitEvent` is `cudaErrorStreamCaptureImplicit` and invalidates the capture while a blocking stream is
+  capturing (whatever the event) or when the event is a capture's; once an event's capture is invalidated, a wait on
+  it from a stream outside it is `cudaErrorInvalidValue` (the stream was forked into the dead capture) and from one of
+  its streams `cudaErrorStreamCaptureInvalidated`. `cudaStreamAddCallback` on a capturing stream is refused and the
+  capture goes on without it; it was invalidated (found by differential testing; `e2e_card_edges_capture`,
+  `e2e_capture_streams`).
 - AMD: the SDWA, DPP and VOP3P modifiers and the denormal and IEEE modes around them, audited against the guides and an RX 6800
   (follow-up to pantheonsim #613). The output modifier (`mul:2`, `mul:4`, `div:2`) did nothing on gfx942 and gfx950 only with IEEE mode
   or output denormals on; it now does nothing then on gfx90a, gfx1030 and gfx1100 too (CDNA2 to CDNA4 guides, 6.5, the RDNA3 guide,
