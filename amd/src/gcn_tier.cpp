@@ -2897,8 +2897,8 @@ void tier_classify(Inst& in) {
       // (The clamp bit of an integer instruction saturates its result, on every target -- CDNA3 and CDNA4 guides, 6.5, and an RX 6800 --
       // and CDNA3 and CDNA4 apply it to the conversions to float too: the interpreter's.)
       if (in.clamp && (!is_f || ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && (e.flags & kIgnoreMods)))) return fail();
-      // (gfx9, gfx10 and gfx11 apply or ignore an output modifier by MODE and flush what it makes denormal, CDNA2 to CDNA4 guides, 6.5, and an
-      // RX 6800: the interpreter's.)
+      // (gfx9, gfx10 and gfx11 apply or ignore an output modifier by MODE and flush what it makes denormal, CDNA2 to CDNA4 guides, 6.5, the
+      // RDNA3 guide, 7.2.3.1, and an RX 6800: the interpreter's.)
       if (in.omod && in.arch != gcn::Target::Gfx1200 && in.arch != gcn::Target::Gfx1250 && !(e.flags & kIgnoreMods)) return fail();
       for (int k = 0; k < e.arity; ++k) {
         if ((e.k == ALIGNBIT || e.k == ALIGNBYTE) && !is_f && k == 2 && in.src[2].bits16 && !in.src[2].hi && !in.src[2].sext && (in.src[2].sel == 6 || in.src[2].sel == 4)) {

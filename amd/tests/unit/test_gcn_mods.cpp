@@ -7,7 +7,8 @@
 // The kernels are amd/tests/data/asm_mods.s, each run in three modes (IEEE on with denormals kept, as compilers make kernels; IEEE off;
 // IEEE off with denormals flushed). The expected values below are the ISA guides' pseudocode and section 6.5 (the output modifier, then the
 // clamp; the output modifier does nothing with IEEE mode on or output denormals kept), and an RX 6800 (gfx1030) running the gfx1030 object
-// gave exactly them. gfx90a, gfx942 and gfx1100 follow the same rules; no card of theirs has run the kernels.
+// gave exactly them. gfx90a, gfx942 and gfx1100 follow the same rules (the RDNA3 guide's 7.2.3.1 states the output modifier's as CDNA's 6.5
+// does); no card of theirs has run the kernels.
 // Run with the tier off and on.
 #include <bit>
 #include <cmath>

@@ -270,8 +270,8 @@ hipcc/rdna2.gfx1030#0:gfx1030	37dfa74dd7033293
 hipcc/rdna2.gfx1031#0:gfx1031	9cd8b4db10b24bbd
 hipcc/rdna2.w64.gfx1030#0:gfx1030	907076767b553176
 hipcc/rdna2.w64.gfx1031#0:gfx1031	ecba51457300c3b0
-hipcc/rdna3.gfx1100#0:gfx1100	8ec39080a5baf99b
-hipcc/rdna3.w64.gfx1100#0:gfx1100	9c9d6ea61e82d1a6
+hipcc/rdna3.gfx1100#0:gfx1100	9bc38e1f13854e01
+hipcc/rdna3.w64.gfx1100#0:gfx1100	ab64ce5d0b1a8864
 hipcc/rdna4.gfx1201#0:gfx1201	c973bb2282c1ae3b
 hipcc/rocm/6.4/chevron.gfx942#0:gfx942	eefbeead11ceffa
 hipcc/rocm/6.4/cooperative.gfx942#0:gfx942	33ad5be30ca0efbb
