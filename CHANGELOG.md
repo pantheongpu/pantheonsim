@@ -114,8 +114,15 @@ release says what runs and what it produces, never how fast a real GPU would run
   addend whatever MODE says and keeps denormal halves, as the card does. New test `test_amd_gcn_mods`
   (`amd/tests/data/asm_mods.s`: 50 SDWA and DPP, 36 VOP3P and VOP3 and 24 gfx11 VOP3 DPP instructions over 1024 edge inputs, in three modes,
   gfx90a, gfx942, gfx1030 and gfx1100, tier off and on; the gfx1030 kernels run on the card gave exactly what the test expects).
-  test_amd_gcn_same_bits: 96 lines re-recorded, the ones these change (its header lists them). Not fixed: gfx1030's VOP2 16-bit
-  results keep the destination's high half on the card (`v_min_f16_e32`), where the executor zeroes it as gfx9 does.
+  test_amd_gcn_same_bits: 96 lines re-recorded, the ones these change (its header lists them).
+- AMD: a 16-bit vector result on gfx1030 now keeps the destination register's high half, as an RX 6800 and an RX 6700 XT do for every
+  16-bit VOP1, VOP2 and VOP3 result (e32, e64, DPP, DPP8; follow-up to pantheonsim #613); the executor zeroed it as gfx9 does.
+  `v_sat_pk_u8_i16` still zeroes it, as the cards and the guide's `{16'b0, ...}` say. gfx90a's `v_mad_f16`, `v_mad_u16`, `v_mad_i16`,
+  `v_fma_f16` and `v_div_fixup_f16` keep it too (the CDNA2 guide: "hi 16 bits are preserved"), as gfx942 and gfx950 already did;
+  their `_legacy` forms still zero it. gfx1030 ran none of `v_frexp_mant_f16`, `v_frexp_exp_i16_f16`, `v_sin_f16`, `v_cos_f16`,
+  `v_ldexp_f16`, `v_sat_pk_u8_i16`, `v_cvt_norm_i16_f16` and `v_cvt_norm_u16_f16` ("decoded but not implemented"); they run now, and
+  give the cards' bits (the sine and cosine of an infinity are 0xfe00 there). New test `test_amd_gcn_hi16` (`amd/tests/data/asm_hi16.s`,
+  75 instruction slots, gfx90a, gfx942 and gfx1030, tier off and on; the gfx1030 one against the cards' dwords).
   `amd/tests/hipcc/rdna3.cpp` expected `v_add_f32_e64 ... div:2` to halve in a default-mode (IEEE on) hipcc kernel; it now expects the
   modifier ignored (`rdna3.gfx1100` and `rdna3.w64.gfx1100` rebuilt: host code only, the device code is the same).
 - AMD: the clamp bit of the integer instructions saturates their result on every target, as the CDNA3 and CDNA4 guides say (6.5, and

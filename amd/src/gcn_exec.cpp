@@ -3151,11 +3151,20 @@ struct Machine {
         m.narrow_dst = &in.dst[0];
         m.narrow_dst_sel = 5;
         m.narrow_dst_preserve = true;
-      } else if (in.enc == gcn::Enc::Vop3 && !(in.op_sel & 8) && is_guide_arch(in) && in.asm_name.find("legacy") == std::string::npos &&
+      } else if (in.enc == gcn::Enc::Vop3 && !(in.op_sel & 8) && (is_guide_arch(in) || in.arch == gcn::Target::Gfx90a) &&
+                 in.asm_name.find("legacy") == std::string::npos &&
                  (in.name == "v_mad_f16" || in.name == "v_mad_u16" || in.name == "v_mad_i16" || in.name == "v_fma_f16" ||
                   in.name == "v_div_fixup_f16")) {
-        // CDNA3 and CDNA4 guides, V_MAD_F16 and the rest (opcodes 515 to 519): "If OPSEL[3] is 0 Result is written to 16 LSBs of
+        // CDNA2, CDNA3 and CDNA4 guides, V_MAD_F16 and the rest (opcodes 515 to 519): "If OPSEL[3] is 0 Result is written to 16 LSBs of
         // destination VGPR and hi 16 bits are preserved." (The gfx8-style "legacy" forms zero them: "this is different from V_MAD_F16".)
+        m.narrow_dst = &in.dst[0];
+        m.narrow_dst_sel = 4;
+        m.narrow_dst_preserve = true;
+      } else if (in.arch == gcn::Target::Gfx1030 && !in.sdwa && in.dst[0].bits16 && in.dst[0].kind == OperandKind::Vgpr &&
+                 in.name.rfind("v_sat_pk_u8_i16", 0) != 0) {
+        // gfx10 keeps the high half under every 16-bit VOP1, VOP2 and VOP3 result, e32, e64, DPP and DPP8 alike (an RX 6800 and an RX
+        // 6700 XT, test_amd_gcn_hi16; LLVM's zeroesHigh16BitsOfDest: "On gfx10, all 16-bit instructions preserve the high bits"), where
+        // gfx9 zeroes it. v_sat_pk_u8_i16 zeroes it on the cards too ("D.u32 = {16'b0, sat8(...), sat8(...)}"). SDWA says for itself.
         m.narrow_dst = &in.dst[0];
         m.narrow_dst_sel = 4;
         m.narrow_dst_preserve = true;
@@ -3530,7 +3539,12 @@ struct Machine {
         double r;
         if (!std::isfinite(x)) {
           // The CDNA guides' own examples give the half NaN of an infinity's sine and cosine as 0xfe00 ("V_SIN_F16(0x7c00) => 0xfe00
-          // // sin(+INF) = NAN"), the sign bit set; RDNA's is the positive one.
+          // // sin(+INF) = NAN"), the sign bit set; RDNA's is the positive one. gfx1030 (an RX 6800): 0xfe00 for an infinity, and a NaN
+          // source quieted (0x7e00 gives 0x7e00).
+          if (in.arch == gcn::Target::Gfx1030) {
+            write_half(w, in, lane, std::isnan(x) ? static_cast<_Float16>(x) : std::bit_cast<_Float16>(uint16_t{0xFE00}));
+            return;
+          }
           write_half(w, in, lane, gcn::is_rdna(in.arch) ? static_cast<_Float16>(std::numeric_limits<double>::quiet_NaN())
                                                          : std::bit_cast<_Float16>(uint16_t{0xFE00}));
           return;
@@ -4910,6 +4924,19 @@ struct Machine {
         "v_pk_fmac_f16", "v_sat_pk_u8_i16", "v_mac_f16", "v_mad_legacy_f16"};
     return kDefined.count(name) != 0;
   }
+  // The 16-bit instructions of gfx1030 that gfx9_added_alu runs, which the RDNA2 code did not have: an RX 6800 and an RX 6700 XT give what
+  // those bodies give, bit for bit, on the inputs of test_amd_gcn_hi16 (ones, halves, twos, denormals, infinities, a NaN, zeros of both signs).
+  static bool rdna2_shares(const std::string& full) {
+    std::string name = full;
+    for (const char* suffix : {"_e32", "_e64", "_dpp"})
+      if (name.size() > std::strlen(suffix) && name.compare(name.size() - std::strlen(suffix), std::strlen(suffix), suffix) == 0) {
+        name.resize(name.size() - std::strlen(suffix));
+        break;
+      }
+    static const std::set<std::string_view> kShared = {"v_sin_f16", "v_cos_f16", "v_frexp_mant_f16", "v_frexp_exp_i16_f16", "v_ldexp_f16",
+                                                       "v_sat_pk_u8_i16", "v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16"};
+    return kShared.count(name) != 0;
+  }
   // The VALU instructions of the CDNA3 and CDNA4 guides that gfx942 and gfx950 have and that the gfx1250 and RDNA code already does by another
   // name or under the same one: run under the name that code knows (v_fma_legacy_f16 is the fused v_fma_f16; v_mac_f16 and v_mad_legacy_f16 are the MAD
   // forms, whose product is rounded to a half first).
@@ -5896,7 +5923,8 @@ struct Machine {
     if ((in.arch == gcn::Target::Gfx1250 ||
          (in.arch == gcn::Target::Gfx950 && (op == "v_minimum3_f32"_op || op == "v_maximum3_f32"_op ||
                                              op == "v_pk_minimum3_f16"_op || op == "v_pk_maximum3_f16"_op))) &&
-        cdna5_alu(w, in, op)) {return;} else if (gcn::is_rdna(in.arch) && rdna_alu(w, in, op)) {return;} else if (carry_alu(w, in)) {return;} else if (more_alu(w, in, op)) {return;} else if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950 || (in.arch == gcn::Target::Gfx90a && cdna2_defines(in.name))) &&
+        cdna5_alu(w, in, op)) {return;} else if (gcn::is_rdna(in.arch) && rdna_alu(w, in, op)) {return;} else if (carry_alu(w, in)) {return;} else if (more_alu(w, in, op)) {return;} else if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950 || (in.arch == gcn::Target::Gfx90a && cdna2_defines(in.name)) ||
+         (in.arch == gcn::Target::Gfx1030 && rdna2_shares(in.name))) &&
         gfx9_added_alu(w, in)) {return;} else {
   switch (op.hash()) {
     case "v_mov_b16_e32"_op.hash: case "v_mov_b16_e64"_op.hash: case "v_mov_b16"_op.hash:

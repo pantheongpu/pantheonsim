@@ -25,6 +25,9 @@
 // baseline took the host's fmin and fmax (9 gfx90a lines in 5094-5304, 6 gfx1030 lines); gfx1250's v_div_scale_f32/f64 with a clamp
 // or an output modifier, which the baseline wrote unmodified (lines 12755, 12757, 12761, 12762); and gfx1030's SDWA comparisons (v_cmp_*_sdwa,
 // 77 lines; with the 6 above, the gfx1030 lines in 14958-15958), whose baseline digest was the text of "decoded but not implemented".
+// Sixty-four more were recorded after the high-half fix (test_amd_gcn_hi16), from the tree that has it: gfx1030's 16-bit VOP1, VOP2 and VOP3
+// results (57 lines in 14869-16049: v_add_f16, v_fma_f16, v_add_nc_u16, v_cvt_f16_f32 and the rest), which keep the destination's high half as an RX
+// 6800 does where the baseline zeroed it, and gfx90a's v_fma_f16 and v_div_fixup_f16 (7 lines in 4930-4971), which keep it as the CDNA2 guide says.
 // Every other digest is the baseline's.
 #include <cstdint>
 #include <cstdio>
