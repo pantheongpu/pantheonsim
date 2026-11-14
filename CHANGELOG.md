@@ -7,6 +7,32 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- AMD engine, blocks (`VGPU_AMD_BLOCKS=1`, still off by default), second round ([round sp73](docs/perf-design/rounds/11-rounds-sp36-sp41.md),
+  [design](docs/perf-design/13-amd-compiled-tier.md)):
+  - **Fixed**: the first form of blocks made the interpreter slower with the knob off. `v_fma_f64` loops (the bench's valu_f64) ran 13 %
+    slower on the simulated MI300X and 23 % on the RX 6800, other rows 2 to 5 %. With the knob off the interpreter's loop is again the
+    code it was: 0.993 to 1.001 of the rate before blocks over the bench's 62 kernel rows in two builds (a control with no change:
+    0.999 to 1.001). Single rows still move 3 to 5 % from one link of the library to the next (smem on the RX 6800 is 5 % low in this one).
+  - The three functions of the blocks' loop keep frame pointers: a profiler that walks the stack in its signal handler crashed one run in
+    four of an inq test with the knob on, and no longer does (12 of 12 runs).
+  - Memory instructions, scalar loads and waits are inside blocks, and a wave whose turn ends inside a block goes on in it. The rows
+    that lost with the knob on in the first form no longer do (`lds` 0.92 to 0.96 before, 0.99 to 1.01 now; `mem` 1.00 to 1.02): where
+    waves give up their turn every few instructions blocks turn themselves off.
+  - Runs of 32-bit integer instructions on vector registers and constants call their lane kernels directly (`VGPU_AMD_BLOCKS_BOUND=0`
+    turns that off): valu_int 1.33 times the rate without blocks (1.16 to 1.21 without the binding), p_sdwa 1.20 to 1.30.
+  - With the knob on, one host thread: geometric mean of the bench's 62 kernel rows 1.11, arithmetic rows 1.09 to 1.35, no row more than
+    2 % slower than with it off; inq's unit tests use 1 to 4 % less CPU (round sp72's 16 % for one of them was a loaded host's number). Results, counters and errors are those of one instruction at a time.
+- AMD engine, the first piece of a compiled tier for AMD kernels ([design](docs/perf-design/13-amd-compiled-tier.md),
+  [round sp72](docs/perf-design/rounds/11-rounds-sp36-sp41.md)): with `VGPU_AMD_BLOCKS=1` (off by default) a straight-line run of
+  instructions the pre-decoded tier has handlers for goes as one *block*: the handlers are called back to back, what was asked before each
+  instruction is asked once, and the run's counters are added once. Results, counters, errors, the order waves and work-groups take turns in
+  and lockstep are those of one instruction at a time (`test_amd_gcn_blocks_same_bits`, `bench_amd_counters_blocks`). On one
+  host thread the AMD benchmark's arithmetic rows run 6 to 49 % faster with it (valu_int 1.06 to 1.26, valu_f32 1.13 to 1.25, valu_f64 1.10
+  to 1.32, p_i64 1.19 to 1.30, wave 1.30 to 1.43; geometric mean of all 82 rows 1.07) and inq's unit tests use 0 to 16 % less CPU; the
+  memory rows do not gain and the LDS row is 4 to 6 % slower, which is why it is opt-in.
+  `VGPU_AMD_BLOCKS_STATS=1` lists the blocks that ran most. Measured first: the dispatch loop is 18 to 35 % of an arithmetic-bound kernel on
+  this engine and operand decode 17 to 32 %, and the same arithmetic written as one host loop over a wave's lanes costs 13 to 22 times less
+  than the tier, which is what the design's later layers are for.
 - AMD run-time compilation (hiprtc) is cached ([round sp71](docs/perf-design/rounds/11-rounds-sp36-sp41.md)). A program that compiles kernels at
   run time (VkFFT's plans, CuPy's and PyTorch's kernels) calls ROCm's own `libhiprtc`, about 150 ms a kernel on any GPU; `build/shim` now has a
   `libhiprtc` (`.so.6` and `.so.7`) that loads ROCm's, forwards every entry point, and keeps what a compile returned -- the code, the log, the

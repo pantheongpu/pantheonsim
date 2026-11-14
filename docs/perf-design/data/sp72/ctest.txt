@@ -1,0 +1,14 @@
+The AMD ctest set of this branch on server3: `ctest -R "amd|host_cores" -j3` in a build without LTO (`ct`: the targets test_amd_*, the AMD
+tools and benches, vgpu, vgpuhip, vgpurocprof, vgpuamdsmi, vgpursmi; not the whole tree), once as it is and once with VGPU_AMD_BLOCKS=1 in
+the environment of every test.
+
+knob off:  324 tests, 236 passed, 87 skipped by their own checks, 1 failed (amd_tools: "no vgpu-rocminfo", a tool the partial build had
+           left out; built, the test passes)                                                        763 s
+knob on:   324 tests, 236 passed, 87 skipped, 1 failed (amd_tools, the same; passes once the tool is built)   742 s
+
+The same tests pass, skip and fail both ways. Skipped here: the tests that need ROCm's full install or a container (bench_amd_counters and
+bench_amd_counters_blocks among them: the expected counts are those of hipcc 7.2 and the host has 6.4.4; the round's own A/B compares the
+counters of all 62 counted rows instead), PyTorch, vLLM, rocprofv3, RVS, Ollama.
+
+test_amd_gcn_blocks_same_bits itself (3 cases, 14,400 + 800 program runs each way): passes in the LTO build, the build without LTO and
+the ctest build; with VGPU_BLOCKS_PROGRAMS=3000 (108,000 runs each way) no run differs.

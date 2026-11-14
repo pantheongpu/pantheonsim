@@ -1,0 +1,34 @@
+VGPU_AMD_BLOCKS_STATS=2 with VGPU_AMD_BLOCKS=1 on the final build of round sp73 (../sp72/scripts/stats.sh with BUILD=p3/build), one host thread:
+the share of instructions in blocks and the length of a run (and of the blocks run). mem, narrow and lds: their machines go back to the
+plain loop after 256 turns of under 16 instructions, so almost nothing of them is in blocks.
+
+== bench valu_int (MI300X)
+AMD blocks: 8195456 of 8196608 instructions ran in blocks (100.0%), 512448 block runs, 16.0 instructions a run (16.0 a whole block), 6 blocks
+== bench valu_f32 (MI300X)
+AMD blocks: 5637248 of 5638400 instructions ran in blocks (100.0%), 512448 block runs, 11.0 instructions a run (11.0 a whole block), 6 blocks
+== bench valu_f64 (MI300X)
+AMD blocks: 8198976 of 8200192 instructions ran in blocks (100.0%), 1024512 block runs, 8.0 instructions a run (8.0 a whole block), 7 blocks
+== bench p_i64 (MI300X)
+AMD blocks: 8258528 of 8258944 instructions ran in blocks (100.0%), 192256 block runs, 43.0 instructions a run (43.0 a whole block), 5 blocks
+== bench p_cmp (MI300X)
+AMD blocks: 13573376 of 13573632 instructions ran in blocks (100.0%), 256384 block runs, 52.9 instructions a run (52.9 a whole block), 4 blocks
+== bench divergent (MI300X)
+AMD blocks: 16228724 of 17905518 instructions ran in blocks (90.6%), 1805012 block runs, 9.0 instructions a run (9.0 a whole block), 26 blocks
+== bench wave (MI300X)
+AMD blocks: 7940480 of 7940608 instructions ran in blocks (100.0%), 256384 block runs, 31.0 instructions a run (31.0 a whole block), 4 blocks
+== bench mem (MI300X)
+AMD blocks: 77116 of 5501952 instructions ran in blocks (1.4%), 12956 block runs, 6.0 instructions a run (11.2 a whole block), 28 blocks
+== bench narrow (MI300X)
+AMD blocks: 84450 of 9527808 instructions ran in blocks (0.9%), 14746 block runs, 5.7 instructions a run (11.4 a whole block), 16 blocks
+== bench lds (MI300X)
+AMD blocks: 2664 of 4752960 instructions ran in blocks (0.1%), 520 block runs, 5.1 instructions a run (18.2 a whole block), 19 blocks
+== bench smem (MI300X)
+AMD blocks: 32465472 of 32477056 instructions ran in blocks (100.0%), 987136 block runs, 32.9 instructions a run (32.9 a whole block), 6 blocks
+== inq steepest_descent (MI300X, one host thread)
+AMD blocks: 931419382 of 1227200583 instructions ran in blocks (75.9%), 106061250 block runs, 8.8 instructions a run (9.3 a whole block), 858 blocks
+== inq ks_hamiltonian (MI300X, one host thread)
+AMD blocks: 264665332 of 332970525 instructions ran in blocks (79.5%), 11626327 block runs, 22.8 instructions a run (33.7 a whole block), 3515 blocks
+== inq initial_guess (MI300X, one host thread)
+AMD blocks: 437078871 of 2273257402 instructions ran in blocks (19.2%), 34262551 block runs, 12.8 instructions a run (14.0 a whole block), 3651 blocks
+== inq poisson (MI300X, one host thread)
+AMD blocks: 2302406394 of 3213335074 instructions ran in blocks (71.7%), 137579579 block runs, 16.7 instructions a run (30.0 a whole block), 1746 bloc

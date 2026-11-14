@@ -12,6 +12,7 @@
 // answer.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -165,6 +166,7 @@ inline bool is_gfx12(Target t) { return t == Target::Gfx1200 || t == Target::Gfx
 // gfx10.3 has a register per id.
 inline bool packs_work_item_ids(Target t) { return t != Target::Gfx1030; }
 
+struct TierBlock;
 struct Inst {
   Enc enc = Enc::Unknown;
   uint32_t opcode = 0;
@@ -322,7 +324,75 @@ struct Inst {
       return *this;
     }
   } next;
+  // The straight-line run of tier instructions that starts at this one (TierBlock, below; Machine::block_at makes it the first time a wave is
+  // here with VGPU_AMD_BLOCKS on): null until then, TierBlock::none() where no run worth one starts here. Set once, by whichever thread
+  // comes first, and read by any; a copy of an instruction starts without one.
+  struct Block {
+    mutable const TierBlock* p = nullptr;
+    Block() = default;
+    Block(const Block&) {}
+    Block& operator=(const Block&);
+    ~Block();
+  } block;
 };
+
+// A run of consecutive instructions the pre-decoded tier has handlers for or hands to the Machine (Op::mach: memory instructions and the
+// like; not a barrier and not s_endpgm, which stop the wave), ending with the first branch (it is the run's last instruction) or before
+// the first instruction that is neither; and what running it adds to the counters. The instructions are the decode cache's, which
+// outlives the run. (amd/src/gcn_exec.cpp: Machine::make_block and run_block; docs/perf-design/13-amd-compiled-tier.md.)
+struct TierBlock {
+  std::vector<const Inst*> insts;
+  // What each instruction is to the runner. kPlain: a handler that does the instruction or hands it back. kTurn: a handler that can also
+  // end the wave's turn (a plain store, whose first of a round waits for the group's other waves; a wait for loads). kMach: the Machine's
+  // (it counts itself, moves the program counter itself, and can throw).
+  // kBound: the first instruction of a run of bound integer operations (below); kBoundIn: the others of the run (one at a time they are plain).
+  enum Kind : uint8_t { kPlain, kTurn, kMach, kBound, kBoundIn };
+  std::vector<uint8_t> kind;
+  // A counter raised: the 64-bit counter `at` bytes into the dispatch's DispatchStats goes up by n.
+  struct Add {
+    uint32_t at;
+    uint32_t n;
+  };
+  // A stretch: the plain instructions [begin, end) and the one that is not plain at `end` (none where `end` is the block's length; the
+  // last stretch of a block that ends with one that is not plain is empty). adds[first_add, first_add + n_adds) is what running all of
+  // the plain ones counts (the instruction total, each unit, each mix and matrix-operation slot: a handful of entries), added once.
+  struct Stretch {
+    uint32_t begin, end, first_add, n_adds;
+  };
+  std::vector<Stretch> stretches;
+  std::vector<uint32_t> stretch_of;   // by instruction: its stretch (an instruction that is not plain belongs to the stretch it ends)
+  std::vector<Add> adds;
+  // Runs of three or more integer instructions on vector registers and constants (tier::BoundInt): with every lane of the wave on, a run is
+  // its lane kernels called on the rows, one after the other, with no handler between. The instructions [begin, end), `bytes` of code,
+  // are bound_ops[first_op, ...) in order; adds[first_add, first_add + n_adds) is what they count. A run ends the stretch before it as an
+  // instruction that is not plain does (the next stretch begins at `end`).
+  struct BoundRun {
+    uint32_t begin, end, first_op, bytes, first_add, n_adds;
+  };
+  std::vector<BoundRun> bound;
+  std::vector<uint32_t> bound_of;            // by instruction, for kBound and kBoundIn: its run
+  std::vector<tier::BoundInt> bound_ops;
+  std::vector<std::array<uint32_t, 64>> constants;   // the rows of the constants the bound operations read
+  // Whether the block pays, found out over its first runs (Machine::judge_block): a block whose waves give up their turn every two or
+  // three instructions (waits for loads and first stores of a round, in a work-group of several waves) is entered and left more than it
+  // runs, and its instructions go one at a time again (`off`). Counted without locks by whichever threads run it first (a lost count
+  // changes when the answer comes, not what any instruction does), then read only.
+  mutable std::atomic<uint32_t> trial_runs{0}, trial_steps{0}, trial_stops{0};
+  mutable std::atomic<bool> judged{false}, off{false};
+  // What an instruction with no run to start points at (shared, never freed).
+  static const TierBlock* none() {
+    static const TierBlock kNone;
+    return &kNone;
+  }
+};
+inline Inst::Block& Inst::Block::operator=(const Block&) {
+  if (p != TierBlock::none()) delete p;
+  p = nullptr;
+  return *this;
+}
+inline Inst::Block::~Block() {
+  if (p != TierBlock::none()) delete p;
+}
 
 // The short form's name (Inst::short_name worked out), "" for an instruction that runs under its own.
 std::string short_name_of(const Inst& in);
