@@ -1,0 +1,17 @@
+ 0 killed by the_first_launch_rule_pays_the_start_too, a_launch_the_account_sends_saves_its_share_of_the_start, the_four_samples_that_lost_the_start_in_sp66_no_longer_buy_it: share: not asked (the account alone)
+ 1 killed by a_launch_that_cannot_repay_the_start_does_not_start_the_driver, one_large_launch_repays_the_start_at_once, the_start_is_bought_when_as_much_was_spent_renting: share: instead of the account
+ 2 killed by a_launch_that_cannot_repay_the_start_does_not_start_the_driver, one_large_launch_repays_the_start_at_once, the_start_is_bought_when_as_much_was_spent_renting: share: or the account
+ 3 killed by a_launch_the_account_sends_saves_its_share_of_the_start, a_first_launch_saves_a_larger_share_than_a_launch_with_a_history: share: the card path not subtracted
+ 4 killed by a_launch_the_account_sends_saves_its_share_of_the_start (second pass, after the exact-binary boundary check was added): share: more than, not at least
+ 5 killed by the_start_is_bought_when_as_much_was_spent_renting, the_first_launch_rule_pays_the_start_too, a_launch_the_account_sends_saves_its_share_of_the_start: share: the whole start
+ 6 killed by a_launch_the_account_sends_saves_its_share_of_the_start: share: not the start's (a fixed 0.25 s)
+ 7 killed by the_start_is_bought_when_as_much_was_spent_renting, the_first_launch_rule_pays_the_start_too, a_launch_the_account_sends_saves_its_share_of_the_start: share: the card path with the start
+ 8 killed by the_first_launch_rule_pays_the_start_too, the_four_samples_that_lost_the_start_in_sp66_no_longer_buy_it, a_first_launch_saves_a_larger_share_than_a_launch_with_a_history: share: no guard for 0
+ 9 killed by the_start_share_is_five_ms_by_default, a_launch_the_account_sends_saves_its_share_of_the_start, the_programs_whose_start_the_account_bought_and_repaid_still_buy_it: default: 25 launches
+10 killed by the_start_share_is_five_ms_by_default, a_launch_the_account_sends_saves_its_share_of_the_start, the_four_samples_that_lost_the_start_in_sp66_no_longer_buy_it: default: 100 launches
+11 killed by a_first_launch_saves_a_larger_share_than_a_launch_with_a_history: default: static share of 50
+12 killed by a_first_launch_saves_a_larger_share_than_a_launch_with_a_history: first launch: the history's share
+13 killed by the_first_launch_rule_pays_the_start_too, the_four_samples_that_lost_the_start_in_sp66_no_longer_buy_it, a_first_launch_saves_a_larger_share_than_a_launch_with_a_history: first launch: the static share even with 0
+14 killed by a_first_launch_saves_a_larger_share_than_a_launch_with_a_history: first launch: not the copy
+15 killed by one_large_launch_repays_the_start_at_once, the_first_launch_rule_pays_the_start_too, a_launch_the_account_sends_saves_its_share_of_the_start: cold: a launch never repays the start alone
+16 of 16 killed (15 in the first pass)

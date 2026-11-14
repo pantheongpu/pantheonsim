@@ -1,0 +1,821 @@
+[
+ {
+  "prog": "CORR",
+  "side": "sim",
+  "run": 0,
+  "rc": 0,
+  "wall": 67.174,
+  "gpu_time": 26.264401,
+  "out_hash": "96ba52add2de149b",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "CORR",
+  "side": "x0",
+  "run": 0,
+  "rc": 0,
+  "wall": 42.08,
+  "gpu_time": 2.011564,
+  "out_hash": "96ba52add2de149b",
+  "summary": [
+   "host_gpu: 1 launches ran on the card, 3 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 32.0 MiB went to the card, 16.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "CORR",
+  "side": "x1",
+  "run": 0,
+  "rc": 0,
+  "wall": 42.039,
+  "gpu_time": 2.010964,
+  "out_hash": "96ba52add2de149b",
+  "summary": [
+   "host_gpu: 1 launches ran on the card, 3 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 32.0 MiB went to the card, 16.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "COVAR",
+  "side": "sim",
+  "run": 0,
+  "rc": 0,
+  "wall": 70.883,
+  "gpu_time": 26.223886,
+  "out_hash": "96ba52add2de149b",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "COVAR",
+  "side": "x0",
+  "run": 0,
+  "rc": 0,
+  "wall": 41.977,
+  "gpu_time": 1.868367,
+  "out_hash": "96ba52add2de149b",
+  "summary": [
+   "host_gpu: 1 launches ran on the card, 2 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 32.0 MiB went to the card, 16.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "COVAR",
+  "side": "x1",
+  "run": 0,
+  "rc": 0,
+  "wall": 42.179,
+  "gpu_time": 1.865656,
+  "out_hash": "96ba52add2de149b",
+  "summary": [
+   "host_gpu: 1 launches ran on the card, 2 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 32.0 MiB went to the card, 16.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "ADI",
+  "side": "sim",
+  "run": 0,
+  "rc": 0,
+  "wall": 0.367,
+  "gpu_time": 0.294625,
+  "out_hash": "ebfe712e2b8bd028",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "ADI",
+  "side": "x0",
+  "run": 0,
+  "rc": 0,
+  "wall": 0.359,
+  "gpu_time": 0.287033,
+  "out_hash": "ebfe712e2b8bd028",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 2049 in the simulator (0 kernels not in the exact set, 2041 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "ADI",
+  "side": "x1",
+  "run": 0,
+  "rc": 0,
+  "wall": 0.364,
+  "gpu_time": 0.291977,
+  "out_hash": "ebfe712e2b8bd028",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 2049 in the simulator (0 kernels not in the exact set, 2041 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "hellinger",
+  "side": "sim",
+  "run": 0,
+  "rc": 0,
+  "wall": 42.862,
+  "gpu_time": null,
+  "out_hash": "c3ef86550c5323fa",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "hellinger",
+  "side": "x0",
+  "run": 0,
+  "rc": 0,
+  "wall": 42.947,
+  "gpu_time": null,
+  "out_hash": "c3ef86550c5323fa",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 1 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "hellinger",
+  "side": "x1",
+  "run": 0,
+  "rc": 0,
+  "wall": 6.764,
+  "gpu_time": null,
+  "out_hash": "c3ef86550c5323fa",
+  "summary": [
+   "host_gpu: 1 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 31.5 MiB went to the card, 9.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "knn",
+  "side": "sim",
+  "run": 0,
+  "rc": 0,
+  "wall": 16.963,
+  "gpu_time": null,
+  "out_hash": "b7d56911214653fb",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "knn",
+  "side": "x0",
+  "run": 0,
+  "rc": 0,
+  "wall": 17.015,
+  "gpu_time": null,
+  "out_hash": "c82c8a7678ea0a83",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 3 in the simulator (2 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "knn",
+  "side": "x1",
+  "run": 0,
+  "rc": 0,
+  "wall": 17.069,
+  "gpu_time": null,
+  "out_hash": "82550c62869ee53b",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 3 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "rod_nn",
+  "side": "sim",
+  "run": 0,
+  "rc": 0,
+  "wall": 0.021,
+  "gpu_time": null,
+  "out_hash": "3c20c13a34d62746",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "rod_nn",
+  "side": "x0",
+  "run": 0,
+  "rc": 0,
+  "wall": 0.021,
+  "gpu_time": null,
+  "out_hash": "3c20c13a34d62746",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 1 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "rod_nn",
+  "side": "x1",
+  "run": 0,
+  "rc": 0,
+  "wall": 0.022,
+  "gpu_time": null,
+  "out_hash": "3c20c13a34d62746",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 1 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "hec_nn",
+  "side": "sim",
+  "run": 0,
+  "rc": 0,
+  "wall": 0.027,
+  "gpu_time": null,
+  "out_hash": "56d5fc657cda7d1d",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "hec_nn",
+  "side": "x0",
+  "run": 0,
+  "rc": 0,
+  "wall": 0.027,
+  "gpu_time": null,
+  "out_hash": "56d5fc657cda7d1d",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 10 in the simulator (10 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "hec_nn",
+  "side": "x1",
+  "run": 0,
+  "rc": 0,
+  "wall": 0.028,
+  "gpu_time": null,
+  "out_hash": "56d5fc657cda7d1d",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 10 in the simulator (0 kernels not in the exact set, 8 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "CORR",
+  "side": "sim",
+  "run": 1,
+  "rc": 0,
+  "wall": 66.011,
+  "gpu_time": 26.251223,
+  "out_hash": "96ba52add2de149b",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "CORR",
+  "side": "x0",
+  "run": 1,
+  "rc": 0,
+  "wall": 42.229,
+  "gpu_time": 2.01619,
+  "out_hash": "96ba52add2de149b",
+  "summary": [
+   "host_gpu: 1 launches ran on the card, 3 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 32.0 MiB went to the card, 16.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "CORR",
+  "side": "x1",
+  "run": 1,
+  "rc": 0,
+  "wall": 42.116,
+  "gpu_time": 2.011946,
+  "out_hash": "96ba52add2de149b",
+  "summary": [
+   "host_gpu: 1 launches ran on the card, 3 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 32.0 MiB went to the card, 16.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "COVAR",
+  "side": "sim",
+  "run": 1,
+  "rc": 0,
+  "wall": 66.53,
+  "gpu_time": 26.529267,
+  "out_hash": "96ba52add2de149b",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "COVAR",
+  "side": "x0",
+  "run": 1,
+  "rc": 0,
+  "wall": 42.383,
+  "gpu_time": 1.869927,
+  "out_hash": "96ba52add2de149b",
+  "summary": [
+   "host_gpu: 1 launches ran on the card, 2 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 32.0 MiB went to the card, 16.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "COVAR",
+  "side": "x1",
+  "run": 1,
+  "rc": 0,
+  "wall": 42.401,
+  "gpu_time": 1.868222,
+  "out_hash": "96ba52add2de149b",
+  "summary": [
+   "host_gpu: 1 launches ran on the card, 2 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 32.0 MiB went to the card, 16.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "ADI",
+  "side": "sim",
+  "run": 1,
+  "rc": 0,
+  "wall": 0.348,
+  "gpu_time": 0.276408,
+  "out_hash": "ebfe712e2b8bd028",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "ADI",
+  "side": "x0",
+  "run": 1,
+  "rc": 0,
+  "wall": 0.359,
+  "gpu_time": 0.288004,
+  "out_hash": "ebfe712e2b8bd028",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 2049 in the simulator (0 kernels not in the exact set, 2041 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "ADI",
+  "side": "x1",
+  "run": 1,
+  "rc": 0,
+  "wall": 0.362,
+  "gpu_time": 0.290837,
+  "out_hash": "ebfe712e2b8bd028",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 2049 in the simulator (0 kernels not in the exact set, 2041 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "hellinger",
+  "side": "sim",
+  "run": 1,
+  "rc": 0,
+  "wall": 43.008,
+  "gpu_time": null,
+  "out_hash": "c3ef86550c5323fa",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "hellinger",
+  "side": "x0",
+  "run": 1,
+  "rc": 0,
+  "wall": 42.899,
+  "gpu_time": null,
+  "out_hash": "c3ef86550c5323fa",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 1 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "hellinger",
+  "side": "x1",
+  "run": 1,
+  "rc": 0,
+  "wall": 6.758,
+  "gpu_time": null,
+  "out_hash": "c3ef86550c5323fa",
+  "summary": [
+   "host_gpu: 1 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 31.5 MiB went to the card, 9.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "knn",
+  "side": "sim",
+  "run": 1,
+  "rc": 0,
+  "wall": 17.03,
+  "gpu_time": null,
+  "out_hash": "e3631d3c8be22d87",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "knn",
+  "side": "x0",
+  "run": 1,
+  "rc": 0,
+  "wall": 17.034,
+  "gpu_time": null,
+  "out_hash": "c496d6d6c9005074",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 3 in the simulator (2 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "knn",
+  "side": "x1",
+  "run": 1,
+  "rc": 0,
+  "wall": 16.709,
+  "gpu_time": null,
+  "out_hash": "9464ff3ba132ad47",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 3 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "rod_nn",
+  "side": "sim",
+  "run": 1,
+  "rc": 0,
+  "wall": 0.021,
+  "gpu_time": null,
+  "out_hash": "3c20c13a34d62746",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "rod_nn",
+  "side": "x0",
+  "run": 1,
+  "rc": 0,
+  "wall": 0.021,
+  "gpu_time": null,
+  "out_hash": "3c20c13a34d62746",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 1 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "rod_nn",
+  "side": "x1",
+  "run": 1,
+  "rc": 0,
+  "wall": 0.022,
+  "gpu_time": null,
+  "out_hash": "3c20c13a34d62746",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 1 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "hec_nn",
+  "side": "sim",
+  "run": 1,
+  "rc": 0,
+  "wall": 0.027,
+  "gpu_time": null,
+  "out_hash": "56d5fc657cda7d1d",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "hec_nn",
+  "side": "x0",
+  "run": 1,
+  "rc": 0,
+  "wall": 0.027,
+  "gpu_time": null,
+  "out_hash": "56d5fc657cda7d1d",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 10 in the simulator (10 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "hec_nn",
+  "side": "x1",
+  "run": 1,
+  "rc": 0,
+  "wall": 0.027,
+  "gpu_time": null,
+  "out_hash": "56d5fc657cda7d1d",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 10 in the simulator (0 kernels not in the exact set, 8 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "CORR",
+  "side": "sim",
+  "run": 2,
+  "rc": 0,
+  "wall": 66.865,
+  "gpu_time": 26.470888,
+  "out_hash": "96ba52add2de149b",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "CORR",
+  "side": "x0",
+  "run": 2,
+  "rc": 0,
+  "wall": 42.437,
+  "gpu_time": 2.004831,
+  "out_hash": "96ba52add2de149b",
+  "summary": [
+   "host_gpu: 1 launches ran on the card, 3 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 32.0 MiB went to the card, 16.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "CORR",
+  "side": "x1",
+  "run": 2,
+  "rc": 0,
+  "wall": 52.31,
+  "gpu_time": 2.011027,
+  "out_hash": "96ba52add2de149b",
+  "summary": [
+   "host_gpu: 1 launches ran on the card, 3 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 32.0 MiB went to the card, 16.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "COVAR",
+  "side": "sim",
+  "run": 2,
+  "rc": 0,
+  "wall": 67.438,
+  "gpu_time": 26.634072,
+  "out_hash": "96ba52add2de149b",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "COVAR",
+  "side": "x0",
+  "run": 2,
+  "rc": 0,
+  "wall": 42.478,
+  "gpu_time": 1.866363,
+  "out_hash": "96ba52add2de149b",
+  "summary": [
+   "host_gpu: 1 launches ran on the card, 2 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 32.0 MiB went to the card, 16.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "COVAR",
+  "side": "x1",
+  "run": 2,
+  "rc": 0,
+  "wall": 41.863,
+  "gpu_time": 1.868023,
+  "out_hash": "96ba52add2de149b",
+  "summary": [
+   "host_gpu: 1 launches ran on the card, 2 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 32.0 MiB went to the card, 16.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "ADI",
+  "side": "sim",
+  "run": 2,
+  "rc": 0,
+  "wall": 0.359,
+  "gpu_time": 0.286887,
+  "out_hash": "ebfe712e2b8bd028",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "ADI",
+  "side": "x0",
+  "run": 2,
+  "rc": 0,
+  "wall": 0.366,
+  "gpu_time": 0.29478,
+  "out_hash": "ebfe712e2b8bd028",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 2049 in the simulator (0 kernels not in the exact set, 2041 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "ADI",
+  "side": "x1",
+  "run": 2,
+  "rc": 0,
+  "wall": 0.367,
+  "gpu_time": 0.29514,
+  "out_hash": "ebfe712e2b8bd028",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 2049 in the simulator (0 kernels not in the exact set, 2041 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "hellinger",
+  "side": "sim",
+  "run": 2,
+  "rc": 0,
+  "wall": 43.055,
+  "gpu_time": null,
+  "out_hash": "c3ef86550c5323fa",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "hellinger",
+  "side": "x0",
+  "run": 2,
+  "rc": 0,
+  "wall": 43.025,
+  "gpu_time": null,
+  "out_hash": "c3ef86550c5323fa",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 1 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "hellinger",
+  "side": "x1",
+  "run": 2,
+  "rc": 0,
+  "wall": 6.758,
+  "gpu_time": null,
+  "out_hash": "c3ef86550c5323fa",
+  "summary": [
+   "host_gpu: 1 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 31.5 MiB went to the card, 9.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "knn",
+  "side": "sim",
+  "run": 2,
+  "rc": 0,
+  "wall": 16.765,
+  "gpu_time": null,
+  "out_hash": "1cd0fd346df7200b",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "knn",
+  "side": "x0",
+  "run": 2,
+  "rc": 0,
+  "wall": 17.138,
+  "gpu_time": null,
+  "out_hash": "468263dcb94eabb5",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 3 in the simulator (2 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "knn",
+  "side": "x1",
+  "run": 2,
+  "rc": 0,
+  "wall": 17.307,
+  "gpu_time": null,
+  "out_hash": "2de2b34a54a65d11",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 3 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "rod_nn",
+  "side": "sim",
+  "run": 2,
+  "rc": 0,
+  "wall": 0.021,
+  "gpu_time": null,
+  "out_hash": "3c20c13a34d62746",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "rod_nn",
+  "side": "x0",
+  "run": 2,
+  "rc": 0,
+  "wall": 0.021,
+  "gpu_time": null,
+  "out_hash": "3c20c13a34d62746",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 1 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "rod_nn",
+  "side": "x1",
+  "run": 2,
+  "rc": 0,
+  "wall": 0.021,
+  "gpu_time": null,
+  "out_hash": "3c20c13a34d62746",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 1 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "hec_nn",
+  "side": "sim",
+  "run": 2,
+  "rc": 0,
+  "wall": 0.028,
+  "gpu_time": null,
+  "out_hash": "56d5fc657cda7d1d",
+  "summary": [],
+  "idiom": []
+ },
+ {
+  "prog": "hec_nn",
+  "side": "x0",
+  "run": 2,
+  "rc": 0,
+  "wall": 0.027,
+  "gpu_time": null,
+  "out_hash": "56d5fc657cda7d1d",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 10 in the simulator (10 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ },
+ {
+  "prog": "hec_nn",
+  "side": "x1",
+  "run": 2,
+  "rc": 0,
+  "wall": 0.027,
+  "gpu_time": null,
+  "out_hash": "56d5fc657cda7d1d",
+  "summary": [
+   "host_gpu: 0 launches ran on the card, 10 in the simulator (0 kernels not in the exact set, 8 too small, 0 unsupported launch shapes, 0 failed on the card)",
+   "host_gpu: 0.0 MiB went to the card, 0.0 MiB came back"
+  ],
+  "idiom": []
+ }
+]

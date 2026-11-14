@@ -1,0 +1,27 @@
+polybenchGpu/bin/CORR _Z10std_kerneliiPfS_S_ plain=out div=out sqrt=out both=in sites=1 sfu=RCPx1,RSQx3
+polybenchGpu/bin/GRAMSCHM _Z19gramschmidt_kernel1iiPfS_S_i plain=out div=out sqrt=in both=in sites=1 sfu=RSQx2
+gpu-rodinia/bin/nn _Z6euclidP7latLongPfiff plain=out div=out sqrt=in both=in sites=1 sfu=RSQx2
+hec/src/asyncAllocation-cuda/main _Z7processPKfPfii plain=out div=out sqrt=in both=in sites=1 sfu=RSQx2
+hec/src/attention-paged-cuda/main _Z16norm_fill_kernelIfEvPT_ij plain=out div=out sqrt=in both=in sites=1 sfu=RSQx2
+hec/src/ced-cuda/main _Z12sobel_kernelPKhPhS1_ii plain=out div=out sqrt=out both=in sites=1 sfu=RCPx2,RSQx3
+hec/src/hellinger-cuda/main _Z9hellingerPKfS0_Pfiii plain=out div=out sqrt=in both=in sites=6 sfu=RSQx7
+hec/src/knn-cuda/main _Z14cuParallelSqrtPfii plain=out div=out sqrt=in both=in sites=1 sfu=RSQx2
+hec/src/nn-cuda/main _Z2nniffPK7latLongPf plain=out div=out sqrt=in both=in sites=1 sfu=RSQx2
+hec/src/sobel-cuda/main _Z12sobel_filterPK6uchar4PS_jj plain=out div=out sqrt=in both=in sites=4 sfu=RSQx5
+
+verdict counts (plain div sqrt both) over 2650 lines:
+     37 no sm_86 kernels 
+   1045 plain=in div=in sqrt=in both=in
+     66 plain=out div=in sqrt=out both=in
+      8 plain=out div=out sqrt=in both=in
+      2 plain=out div=out sqrt=out both=in
+   1492 plain=out div=out sqrt=out both=out
+
+first reason a square root site fails, per MUFU.RSQ of a plain register (all kernels, admitted or not):
+    170 ok
+     62 no guard branch after the MUFU.RSQ (a bare rsqrt)
+     57 a MUFU.RSQ under a predicate or of an operand that is not a plain register
+      8 no slow side ending in a branch to the join
+      7 a register holding an unrefined MUFU value is read after the idiom
+      2 memory, a barrier, another thread or control flow inside the idiom
+      2 an SFU instruction other than MUFU.RSQ in the idiom

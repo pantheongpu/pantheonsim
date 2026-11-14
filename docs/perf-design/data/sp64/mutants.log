@@ -1,0 +1,11 @@
+# scripts/mutants_all.sh on the kept build N (src 65b096b2), server3. rc 0: test_jit_threads passed (the mutant survived).
+pristine rc=0 | 4/4 tests passed
+mutant=queued_hooked rc=1 | [ FAIL ] jit_a_section_whose_compile_runs_is_on_the_plain_loop
+mutant=no_compile_log rc=1 | [ FAIL ] jit_the_statistics_have_a_line_for_each_compile
+mutant=log_before_summary rc=1 | [ FAIL ] jit_the_statistics_have_a_line_for_each_compile
+mutant=pch_never_used rc=1 | [ FAIL ] jit_the_runtime_header_is_precompiled_after_the_first_compile_and_read_by_the_compiles_after_it
+mutant=pch_never_built rc=1 | [ FAIL ] jit_the_runtime_header_is_precompiled_after_the_first_compile_and_read_by_the_compiles_after_it
+mutant=pch_no_fallback rc=0 | 
+mutant=pch_ignores_env rc=1 | [ FAIL ] jit_the_runtime_header_is_precompiled_after_the_first_compile_and_read_by_the_compiles_after_it
+mutant=pch_made_first rc=1 | [ FAIL ] jit_the_runtime_header_is_precompiled_after_the_first_compile_and_read_by_the_compiles_after_it
+# pch_no_fallback survived: a compile that failed with the precompiled header was run again without it, and no test reaches that path, because GCC ignores a .gch it cannot use (the test's .gch of garbage did not fail the compile). The path was removed after this run (the round's second commit); test_jit_threads passed again on that build (tests.log).

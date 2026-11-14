@@ -2,17 +2,22 @@
 // protocol, and the size rule (include/vgpu/host_gpu.hpp). The part that drives the real GPU is run by
 // nvidia/tests/e2e/run_host_gpu.sh, on a machine with a card.
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <algorithm>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <random>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "vgpu/host_gpu.hpp"
+#include "vgpu/host_gpu_image.hpp"
 #include "vtest.hpp"
 
 using namespace vgpu::hostgpu;
@@ -628,7 +633,154 @@ VTEST(the_first_launch_rule_pays_the_start_too) {   // the static estimate of th
   FirstLaunch f = gemm_shape();
   f.static_instrs = 60000;                                          // 1000x the code: 5 s estimated
   VCHECK(first_launch_offload(f, c, false, 0.0));                   // that launch repays it
-  VCHECK(first_launch_offload(gemm_shape(), c, false, c.start_cost_s));   // or the program has spent as much in the simulator already
+  // or the program has spent as much in the simulator already, and the launch saves its share of the start (12.5 ms for a static estimate: the gemm
+  // shape's 2.5 ms does not)
+  VCHECK(!first_launch_offload(gemm_shape(), c, false, c.start_cost_s));
+  f.static_instrs = 240;                                            // 4x the code: 19.7 ms estimated, 17.3 ms saved
+  VCHECK(first_launch_offload(f, c, false, c.start_cost_s));
+  VCHECK(!first_launch_offload(f, c, false, c.start_cost_s * 0.99));
+  Costs before = c;
+  before.start_launches = 0;                                        // (VGPU_HOST_GPU_START_LAUNCHES=0: the account alone, as before)
+  VCHECK(first_launch_offload(gemm_shape(), before, false, c.start_cost_s));
+}
+
+// ---- the share of the start a launch must save when only the account would send it (integration of sp64-sp68) ----
+// A launch of `sim_s` with no copies: its card path with the driver up is launch_s + kernel_s_default (107 us).
+static Estimate bare(double sim_s) {
+  Estimate e;
+  e.sim_s = sim_s;
+  return e;
+}
+
+VTEST(the_start_share_is_five_ms_by_default) {
+  const Costs c;
+  VCHECK(c.start_launches == 50);
+  VCHECK(c.start_cost_s / c.start_launches == 0.005);
+}
+
+VTEST(a_launch_the_account_sends_saves_its_share_of_the_start) {
+  const Costs c;
+  const double card = c.launch_s + c.kernel_s_default;
+  // exactly at the share it goes (the share is "at least"), just under it stays
+  VCHECK(should_offload_with_start(bare(0.005 + card + 1e-9), c, false, c.start_cost_s));
+  VCHECK(!should_offload_with_start(bare(0.005 + card - 1e-9), c, false, c.start_cost_s));
+  VCHECK(start_share_saved(bare(0.005 + card + 1e-9), c) && !start_share_saved(bare(0.005 + card - 1e-9), c));
+  // exactly at the share, with every number exact in binary: 0.375 s simulated against a card path of 0.125 s saves 0.25 s, the share of 0.5 s in 2
+  Costs exact = c;
+  exact.launch_s = 0;
+  exact.kernel_s_default = 0.125;
+  exact.start_cost_s = 0.5;
+  exact.start_launches = 2;
+  VCHECK(bare(0.375).sim_s - card_path_seconds(bare(0.375), exact) == exact.start_cost_s / exact.start_launches);
+  VCHECK(start_share_saved(bare(0.375), exact) && should_offload_with_start(bare(0.375), exact, false, 0.5));
+  // the account must still be full: the share alone buys nothing
+  VCHECK(!should_offload_with_start(bare(0.1), c, false, c.start_cost_s * 0.99));
+  VCHECK(should_offload_with_start(bare(0.1), c, false, c.start_cost_s));
+  // and a launch that repays the start by itself needs neither
+  VCHECK(should_offload_with_start(bare(1.0), c, false, 0.0));
+  // what the launch moves counts against what it saves: 7.5 ms with 8 MiB each way saves 5.9 ms, with 16 MiB each way 4.3 ms
+  Estimate e = bare(0.0075);
+  e.push_bytes = e.pull_bytes = 8ull << 20;
+  VCHECK(should_offload(e, c) && should_offload_with_start(e, c, false, c.start_cost_s));
+  e.push_bytes = e.pull_bytes = 16ull << 20;
+  VCHECK(should_offload(e, c) && !should_offload_with_start(e, c, false, c.start_cost_s));
+  VCHECK(should_offload_with_start(e, c, true, 0.0));   // with the driver up, the plain rule
+  // the share is the start's: twice the start, twice the share
+  Costs dear = c;
+  dear.start_cost_s = 0.5;
+  VCHECK(should_offload_with_start(bare(0.008), c, false, 10.0) && !should_offload_with_start(bare(0.008), dear, false, 10.0));
+  Costs few = c;
+  few.start_launches = 10;   // repaid within 10 launches: 25 ms a launch
+  VCHECK(!should_offload_with_start(bare(0.02), few, false, 10.0) && should_offload_with_start(bare(0.026), few, false, 10.0));
+}
+
+VTEST(the_four_samples_that_lost_the_start_in_sp66_no_longer_buy_it) {   // A10G, Round sp66: what the launch that bought the start was
+  const Costs c;
+  VCHECK(!should_offload_with_start(bare(0.0005), c, false, 0.45));   // LargeKernelParameter: under 0.5 ms a launch
+  VCHECK(!should_offload_with_start(bare(0.0035), c, false, 0.26));   // threadFenceReduction: about 3.5 ms
+  VCHECK(!should_offload_with_start(bare(0.0038), c, false, 0.26));   // dct8x8: 3.8 ms
+  FirstLaunch pi;   // a first launch whose static estimate is MC_EstimatePiInlineP's last kernel's (3.0 ms, logged on server3), after a 3.3 s launch
+  pi.blocks = 640;
+  pi.threads_per_block = 256;
+  pi.static_instrs = 59;
+  pi.back_edge = true;
+  pi.multiprocessors = 72;
+  pi.live_bytes = 1u << 20;
+  VCHECK(static_sim_seconds(pi.blocks, pi.threads_per_block, pi.static_instrs, c) > 0.003 && first_launch_offload(pi, c, true));
+  VCHECK(!first_launch_offload(pi, c, false, 3.3));
+  Costs before = c;
+  before.start_launches = 0;   // all four bought it under the account alone
+  for (double s : {0.0005, 0.0035, 0.0038}) VCHECK(should_offload_with_start(bare(s), before, false, 0.45));
+  VCHECK(first_launch_offload(pi, before, false, 3.3));
+}
+
+VTEST(the_programs_whose_start_the_account_bought_and_repaid_still_buy_it) {   // the launch that bought it (server3 and the rig, see host_gpu.hpp)
+  const Costs c;
+  VCHECK(should_offload_with_start(bare(0.028), c, false, 0.27));   // FDTD-2D, 28 ms on server3
+  VCHECK(should_offload_with_start(bare(0.023), c, false, 0.25));   // LU
+  VCHECK(should_offload_with_start(bare(0.0186), c, false, 0.26));  // GRAMSCHM
+  VCHECK(should_offload_with_start(bare(0.020), c, false, 0.25));   // gaussian on the rig (5.4 ms on server3, whose simulator is about 4x as fast)
+  VCHECK(should_offload_with_start(bare(0.008), c, false, 0.26));   // asyncAllocation (turbo) on the rig: 800 launches in 6.6 s
+  VCHECK(!should_offload_with_start(bare(0.0019), c, false, 0.26)); // ... and on server3, 1.9 ms: a faster simulator buys fewer starts
+  FirstLaunch mm3 = gemm_shape();                                    // 3MM's last kernel: 19 ms estimated, 0.32 s spent
+  mm3.static_instrs = 232;
+  VCHECK(first_launch_offload(mm3, c, false, 0.32));
+}
+
+VTEST(a_first_launch_saves_a_larger_share_than_a_launch_with_a_history) {   // its estimate is static: 12.5 ms against 5 ms
+  const Costs c;
+  VCHECK(c.start_launches_static == 20 && c.start_cost_s / c.start_launches_static == 0.0125);
+  FirstLaunch f = gemm_shape();
+  f.live_bytes = 0;   // (the card path: launch_s + kernel_s_default, as bare())
+  const double card = c.launch_s + c.kernel_s_default;
+  const auto with_instrs_for = [&](double sim_s) {   // the static instruction count whose estimate is closest to sim_s from above
+    FirstLaunch g = f;
+    const double per_instr = static_sim_seconds(g.blocks, g.threads_per_block, 1, c);
+    g.static_instrs = static_cast<uint64_t>(std::ceil(sim_s / per_instr));
+    return g;
+  };
+  // dct8x8's quantization kernel in turbo mode: 8.5 ms static, 8.4 ms saved; a launch with a history of 8.5 ms would buy the start, this one does not
+  VCHECK(!first_launch_offload(with_instrs_for(0.0085), c, false, 0.3));
+  VCHECK(should_offload_with_start(bare(0.0085), c, false, 0.3));
+  // HeCBench atomicPerf (15.5 ms) and 3MM (19 ms) still buy it
+  VCHECK(first_launch_offload(with_instrs_for(0.0155), c, false, 0.26));
+  VCHECK(first_launch_offload(with_instrs_for(0.019), c, false, 0.32));
+  // the bar: 12.5 ms saved (the largest count whose estimate is under it, and one more)
+  const double per_instr = static_sim_seconds(f.blocks, f.threads_per_block, 1, c);
+  FirstLaunch below = f, above = f;
+  below.static_instrs = static_cast<uint64_t>(std::floor((0.0125 + card) / per_instr));
+  above.static_instrs = below.static_instrs + 1;
+  VCHECK(static_sim_seconds(below.blocks, below.threads_per_block, below.static_instrs, c) - card < 0.0125);
+  VCHECK(static_sim_seconds(above.blocks, above.threads_per_block, above.static_instrs, c) - card >= 0.0125);
+  VCHECK(first_launch_offload(above, c, false, 1.0) && !first_launch_offload(below, c, false, 1.0));
+  VCHECK(first_launch_offload(below, c, true, 0.0));   // with the driver up, the plain rule
+  // the static share is its own: a launch with a history needs only 5 ms
+  Costs other = c;
+  other.start_launches_static = 50;
+  VCHECK(first_launch_offload(with_instrs_for(0.0085), other, false, 0.3));
+  other = c;
+  other.start_launches = 10;   // (25 ms for a launch with a history; the first launch's share stays 12.5 ms)
+  VCHECK(first_launch_offload(with_instrs_for(0.019), other, false, 0.32) && !should_offload_with_start(bare(0.019), other, false, 0.32));
+  // and VGPU_HOST_GPU_START_LAUNCHES=0 asks neither
+  other = c;
+  other.start_launches = 0;
+  VCHECK(first_launch_offload(with_instrs_for(0.0085), other, false, 0.3));
+}
+
+VTEST(a_start_share_of_zero_is_the_account_alone) {   // VGPU_HOST_GPU_START_LAUNCHES=0: the rule from sp43 to sp68
+  Costs c;
+  c.start_launches = 0;
+  for (double s : {50e-6, 0.0005, 0.001, 0.0035, 0.006, 0.01, 0.05, 0.4, 4.0})
+    for (double spent : {0.0, 0.1, 0.25, 5.0})
+      for (bool up : {false, true}) {
+        Estimate e = bare(s);
+        Estimate cold = e;
+        cold.start_s = c.start_cost_s;
+        const bool old_rule = should_offload(e, c) && (up || should_offload(cold, c) || spent >= c.start_cost_s);
+        VCHECK_EQ(should_offload_with_start(e, c, up, spent), old_rule);
+      }
+  c.start_launches = -1;   // (a negative count is no requirement either)
+  VCHECK(should_offload_with_start(bare(0.001), c, false, 1.0));
 }
 
 // ---- the division idiom (host_gpu.hpp division_idiom_only), on the shape ptxas 13.0 gave `a / b` for sm_86 (cuobjdump of an own kernel) ----
@@ -890,10 +1042,12 @@ VTEST(turbo_classes_every_kind_of_instruction) {
   VCHECK(turbo_class("ATOMS", {"ARRIVE", "64"}) == C::Never);
   // extra: named one by one
   for (const char* m : {"IDP", "VABSDIFF", "VABSDIFF4", "VIADDMNMX", "VIMNMX3", "FMNMX3", "F2IP", "FSWZADD", "REDUX", "LDGSTS", "LDGDEPBAR", "LDSM", "MOVM",
-                        "FFMA2", "FMUL2", "FADD2"})
+                        "FFMA2", "FMUL2", "FADD2", "B2R", "NANOSLEEP"})
     VCHECK(turbo_class(m, {}) == C::Extra);
+  VCHECK(turbo_class("LEPC", {}) == C::Call && !exact_opcode_allowed("LEPC", {}));   // (Round sp66: the return address of vprintf's call)
+  VCHECK(turbo_class("B2R", {"RESULT"}) == C::Extra && !exact_opcode_allowed("B2R", {"RESULT"}));   // (Round sp66; exact's set is unchanged)
   // never: textures, surfaces, what nobody named, what is not an instruction
-  for (const char* m : {"TEX", "TLD", "TLD4", "TXD", "SULD", "SUST", "QMMA", "BMMA", "OMMA", "HGMMA", "JMP", "NANOSLEEP", "BPT", "SYNCS", "STSM", "UTCMMA",
+  for (const char* m : {"TEX", "TLD", "TLD4", "TXD", "SULD", "SUST", "QMMA", "BMMA", "OMMA", "HGMMA", "JMP", "BPT", "SYNCS", "STSM", "UTCMMA",
                         "LDTM", "STTM", "UTMALDG", "VPRINTF", "", "mufu", "Unknown"})
     VCHECK(turbo_class(m, {}) == C::Never);
 }
@@ -912,9 +1066,9 @@ VTEST(turbo_whitelist_covers_the_decoder_and_nothing_unnamed) {
   VCHECK_EQ(n[InsnClass::Call], 2u);
   VCHECK_EQ(n[InsnClass::Tensor], 3u);
   VCHECK_EQ(n[InsnClass::AtomInt], 3u);   // ATOM, ATOMG, ATOMS with no modifier
-  VCHECK_EQ(n[InsnClass::Extra], 16u);
+  VCHECK_EQ(n[InsnClass::Extra], 17u);   // (B2R is a mnemonic of the BAR op, not an op of its own; NANOSLEEP is one)
   VCHECK_EQ(n[InsnClass::FloatRed] + n[InsnClass::AtomFloat] + n[InsnClass::AtomSwap], 0u);
-  VCHECK_EQ(n[InsnClass::Exact] + n[InsnClass::Never] + 31u, static_cast<unsigned>(names.size()));
+  VCHECK_EQ(n[InsnClass::Exact] + n[InsnClass::Never] + 32u, static_cast<unsigned>(names.size()));
   VCHECK(n[InsnClass::Never] >= 30);
   for (unsigned c = 0; c < kInsnClasses; ++c) VCHECK(std::string(insn_class_name(static_cast<InsnClass>(c))).size() > 3);
   VCHECK(std::string(insn_class_name(InsnClass::Never)) == "never" && std::string(insn_class_name(InsnClass::Exact)) == "exact");
@@ -938,6 +1092,13 @@ VTEST(a_call_must_stay_inside_the_kernel) {
   VCHECK(!call_stays_inside(true, true, -16, 0x0, 0x400));
   VCHECK(!call_stays_inside(false, true, 0x100, 0x0, 0x400));   // CALL.ABS
   VCHECK(!call_stays_inside(true, false, 0x100, 0x0, 0x400));   // through a register
+  // an absolute call to another section's first instruction is followed (Round sp66), and nothing else is
+  VCHECK(call_to_entry(false, true, 0x6ffb00000100, 0x6ffb00000100, 12));
+  VCHECK(!call_to_entry(false, true, 0x6ffb00000110, 0x6ffb00000100, 12));   // into the middle of a function
+  VCHECK(!call_to_entry(true, true, 0x6ffb00000100, 0x6ffb00000100, 12));    // a relative call is the section's own
+  VCHECK(!call_to_entry(false, false, 0x6ffb00000100, 0x6ffb00000100, 12));  // through a register
+  VCHECK(!call_to_entry(false, true, 0x6ffb00000100, 0x6ffb00000100, 0));    // a section with no code
+  VCHECK(!call_to_entry(false, true, -1, 0xffffffffffffffffull, 1));
 }
 
 VTEST(turbo_admits_by_class_and_switch) {
@@ -948,19 +1109,21 @@ VTEST(turbo_admits_by_class_and_switch) {
     for (C c : cs) m |= class_bit(c);
     return m;
   };
-  // the defaults: everything but float atomics with a value, swaps and what has no class
+  // the defaults (Round sp66): everything but what has no class; float atomics with a value and swaps included
+  VCHECK(def.atomics && def.off == 0 && !def.printf_off);
   VCHECK(turbo_refusal(mask({C::Exact}), def) == TurboRefusal::None);
   VCHECK(turbo_refusal(0, def) == TurboRefusal::None);
-  for (C c : {C::Mufu, C::Half, C::FloatRed, C::Call, C::Extra, C::Tensor, C::AtomInt}) VCHECK(turbo_refusal(mask({C::Exact, c}), def) == TurboRefusal::None);
-  VCHECK(turbo_refusal(mask({C::Exact, C::Mufu, C::Half, C::FloatRed, C::Call, C::Extra, C::Tensor, C::AtomInt}), def) == TurboRefusal::None);
-  VCHECK(turbo_refusal(mask({C::Exact, C::AtomFloat}), def) == TurboRefusal::Atomics);
-  VCHECK(turbo_refusal(mask({C::Exact, C::AtomSwap}), def) == TurboRefusal::Atomics);
+  for (C c : {C::Mufu, C::Half, C::FloatRed, C::Call, C::Extra, C::Tensor, C::AtomInt, C::AtomFloat, C::AtomSwap})
+    VCHECK(turbo_refusal(mask({C::Exact, c}), def) == TurboRefusal::None);
+  VCHECK(turbo_refusal(mask({C::Exact, C::Mufu, C::Half, C::FloatRed, C::Call, C::Extra, C::Tensor, C::AtomInt, C::AtomFloat, C::AtomSwap}), def) == TurboRefusal::None);
   VCHECK(turbo_refusal(mask({C::Never}), def) == TurboRefusal::Never);
-  // the opt-in
-  TurboSwitches at;
-  at.atomics = true;
-  VCHECK(turbo_refusal(mask({C::Exact, C::AtomFloat, C::AtomSwap, C::AtomInt}), at) == TurboRefusal::None);
-  VCHECK(turbo_refusal(mask({C::AtomSwap, C::Never}), at) == TurboRefusal::Never);   // nothing opts into Never
+  VCHECK(turbo_refusal(mask({C::AtomSwap, C::Never}), def) == TurboRefusal::Never);   // nothing admits Never
+  // VGPU_HOST_GPU_ATOMICS=0: float atomics with a value and swaps stay; integer atomics are the off list's
+  TurboSwitches no;
+  no.atomics = false;
+  VCHECK(turbo_refusal(mask({C::Exact, C::AtomFloat}), no) == TurboRefusal::Atomics);
+  VCHECK(turbo_refusal(mask({C::Exact, C::AtomSwap}), no) == TurboRefusal::Atomics);
+  VCHECK(turbo_refusal(mask({C::Exact, C::AtomInt, C::Mufu}), no) == TurboRefusal::None);
   // the off list: each name switches its class off, and only its class
   const struct { const char* name; std::vector<C> off; } rows[] = {
       {"mufu", {C::Mufu}}, {"tensor", {C::Tensor}}, {"half", {C::Half}}, {"call", {C::Call}}, {"red", {C::FloatRed}}, {"extra", {C::Extra}},
@@ -976,8 +1139,9 @@ VTEST(turbo_admits_by_class_and_switch) {
       VCHECK(turbo_refusal(class_bit(cls), sw) == want);
     }
   }
-  // the order: no class beats a switched-off class beats the opt-in
+  // the order: no class beats a switched-off class beats VGPU_HOST_GPU_ATOMICS=0
   TurboSwitches sw;
+  sw.atomics = false;
   VCHECK(parse_turbo_off("mufu", &sw.off));
   VCHECK(turbo_refusal(mask({C::Mufu, C::AtomSwap}), sw) == TurboRefusal::Off);
   VCHECK(turbo_refusal(mask({C::Mufu, C::AtomSwap, C::Never}), sw) == TurboRefusal::Never);
@@ -998,6 +1162,15 @@ VTEST(turbo_off_list_parses_names_and_refuses_the_rest) {
   VCHECK(!parse_turbo_off("MUFU", &off, &bad) && bad == "MUFU");
   VCHECK(!parse_turbo_off("mufu call", &off, &bad) && bad == "mufu call");
   VCHECK(!parse_turbo_off("exact", &off, &bad) && !parse_turbo_off("never", &off) && !parse_turbo_off("all", &off));
+  // printf (Round sp66) is not a class: it sets its own switch, and is a bad name where nobody asks for it
+  bool pf = true;
+  VCHECK(parse_turbo_off("mufu", &off, nullptr, &pf) && !pf && off == class_bit(InsnClass::Mufu));
+  VCHECK(parse_turbo_off("printf", &off, nullptr, &pf) && pf && off == 0);
+  pf = false;
+  VCHECK(parse_turbo_off("call,printf,red", &off, nullptr, &pf) && pf && off == (class_bit(InsnClass::Call) | class_bit(InsnClass::FloatRed)));
+  VCHECK(parse_turbo_off(nullptr, &off, nullptr, &pf) && !pf);
+  VCHECK(!parse_turbo_off("printf", &off, &bad) && bad == "printf");
+  VCHECK(!parse_turbo_off("print", &off, &bad, &pf) && bad == "print");
 }
 
 // The kernels of the spike again, as turbo mode sees them (the classes of exact_set_matches_the_measured_kernels above).
@@ -1007,22 +1180,22 @@ VTEST(turbo_takes_the_kernels_exact_refused_for_numerics) {
     for (const auto& [mn, mods] : code) m |= class_bit(turbo_class(mn, mods));
     return m;
   };
-  const TurboSwitches def;
+  const TurboSwitches def;   // (atomics admitted, Round sp66)
   TurboSwitches at;
-  at.atomics = true;
+  at.atomics = false;           // VGPU_HOST_GPU_ATOMICS=0
   // HeCBench silu forward (expf): refused in exact, admitted in turbo
   const ClassMask silu = classes({{"FFMA", {}}, {"MUFU", {"EX2"}}, {"MUFU", {"RCP"}}, {"FCHK", {}}, {"FADD", {"FTZ"}}});
   VCHECK(turbo_refusal(silu, def) == TurboRefusal::None);
   // HeCBench aop compute_partial_beta (double atomicAdd as a compare-and-swap loop): only with the opt-in
   const ClassMask aop = classes({{"DADD", {}}, {"ATOMS", {"CAST", "SPIN", "64"}}, {"DFMA", {}}});
-  VCHECK(turbo_refusal(aop, def) == TurboRefusal::Atomics && turbo_refusal(aop, at) == TurboRefusal::None);
+  VCHECK(turbo_refusal(aop, def) == TurboRefusal::None && turbo_refusal(aop, at) == TurboRefusal::Atomics);
   // HeCBench bh TreeBuildingKernel (ATOMG.E.CAS)
   const ClassMask bh = classes({{"FSETP", {"GEU", "AND"}}, {"ATOMG", {"E", "CAS", "STRONG", "GPU"}}});
-  VCHECK(turbo_refusal(bh, def) == TurboRefusal::Atomics && turbo_refusal(bh, at) == TurboRefusal::None);
+  VCHECK(turbo_refusal(bh, def) == TurboRefusal::None && turbo_refusal(bh, at) == TurboRefusal::Atomics);
   // a histogram (integer atomicAdd whose old value is used) and a float reduction: admitted
   VCHECK(turbo_refusal(classes({{"LDG", {"E"}}, {"ATOMG", {"E", "ADD", "STRONG", "GPU"}}, {"RED", {"E", "ADD", "F32.FTZ.RN", "STRONG", "GPU"}}}), def) == TurboRefusal::None);
   // a texture fetch: never, whatever is switched on
-  VCHECK(turbo_refusal(classes({{"TEX", {"SCR", "LL"}}, {"FMUL", {}}}), at) == TurboRefusal::Never);
+  VCHECK(turbo_refusal(classes({{"TEX", {"SCR", "LL"}}, {"FMUL", {}}}), def) == TurboRefusal::Never);
 }
 
 // ---- the first blocks of a launch, timed (Round sp60b) ----
@@ -1750,6 +1923,448 @@ VTEST(a_small_grid_s_floor_counts_the_followed_loop_s_bound) {
   g.blocks = 4096;
   g.bound_turns = 2048;
   VCHECK(sample_static_estimate(g) == g.static_s && !worth_sampling(g, c, 0.26));
+}
+
+// ---- Round sp65: a launch while the card holds the live memory ----
+
+VTEST(a_streak_launch_needs_the_driver_up_data_on_the_card_and_an_estimate) {
+  const Costs c;
+  StreakLaunch s;
+  s.sim_s = 0.00015;
+  s.card_only_bytes = 48ull << 20;   // GRAMSCHM: three 2048 x 2048 float matrices
+  s.card_kernel_s = 20e-6;
+  VCHECK(streak_offload(s, c, true));
+  VCHECK(!streak_offload(s, c, false));   // never what starts the driver
+  StreakLaunch none = s;
+  none.card_only_bytes = 0;               // the simulator holds everything: nothing to pull, today's rule decides
+  VCHECK(!streak_offload(none, c, true));
+  none.card_only_bytes = 1;
+  VCHECK(streak_offload(none, c, true) == (streak_keep_seconds(none, c) >= c.min_sim_s && streak_keep_seconds(none, c) > c.margin * streak_card_seconds(none, c)));
+  // a long launch with nothing on the card is the size rule's to decide (should_offload says yes to it), not this rule's
+  StreakLaunch long_none;
+  long_none.sim_s = 0.001;
+  long_none.card_kernel_s = 20e-6;
+  Estimate le;
+  le.sim_s = long_none.sim_s;
+  le.card_kernel_s = long_none.card_kernel_s;
+  VCHECK(should_offload(le, c) && !streak_offload(long_none, c, true));
+  StreakLaunch no_estimate = s;
+  no_estimate.sim_s = 0;
+  VCHECK(!streak_offload(no_estimate, c, true));
+  no_estimate.sim_s = -1;
+  VCHECK(!streak_offload(no_estimate, c, true));
+  no_estimate.sim_s = -1e-6;   // (with the pull added this would pass both bars)
+  VCHECK(!streak_offload(no_estimate, c, true));
+  no_estimate.sim_s = std::numeric_limits<double>::quiet_NaN();
+  VCHECK(!streak_offload(no_estimate, c, true));
+}
+
+VTEST(a_streak_launch_is_priced_with_the_pull_it_saves_and_the_push_it_needs) {
+  const Costs c;
+  StreakLaunch s;
+  s.sim_s = 0.00015;
+  s.card_only_bytes = 48ull << 20;
+  s.card_kernel_s = 20e-6;
+  // the two sides, by the formula
+  VCHECK(streak_keep_seconds(s, c) == s.sim_s + static_cast<double>(s.card_only_bytes) / c.pull_bytes_per_s);
+  VCHECK(streak_card_seconds(s, c) == c.launch_s + 20e-6);
+  s.push_bytes = 1 << 20;
+  VCHECK(streak_card_seconds(s, c) == c.launch_s + 20e-6 + static_cast<double>(1 << 20) / c.push_bytes_per_s);
+  // the same launch judged by should_offload alone stays: 150 us is under the floor, and the pull is not seen
+  Estimate e;
+  e.sim_s = s.sim_s;
+  e.push_bytes = s.push_bytes;
+  e.card_kernel_s = s.card_kernel_s;
+  VCHECK(!should_offload(e, c));
+  VCHECK(streak_offload(s, c, true));
+  // before the kernel has run on the card its time there is kernel_s_default
+  StreakLaunch fresh = s;
+  fresh.card_kernel_s.reset();
+  VCHECK(streak_card_seconds(fresh, c) == c.launch_s + c.kernel_s_default + static_cast<double>(1 << 20) / c.push_bytes_per_s);
+  // what the card needs pushed counts against it: much to push and little to pull back stays
+  StreakLaunch heavy = s;
+  heavy.card_only_bytes = 1 << 20;
+  heavy.push_bytes = 64ull << 20;
+  VCHECK(!streak_offload(heavy, c, true));
+  heavy.push_bytes = 0;
+  VCHECK(streak_offload(heavy, c, true));
+  // the rates are the Costs'
+  Costs free_pull = c;
+  free_pull.pull_bytes_per_s = 1e15;   // only the simulator's 150 us is left: under the floor
+  VCHECK(!streak_offload(s, free_pull, true));
+  Costs dear_push = c;
+  dear_push.push_bytes_per_s = 1e7;    // 1 MiB to push costs 0.1 s
+  VCHECK(!streak_offload(s, dear_push, true));
+  Costs slow_launch = c;
+  slow_launch.launch_s = 1.0;
+  VCHECK(!streak_offload(s, slow_launch, true));
+  Costs slow_default = c;
+  slow_default.kernel_s_default = 1.0;
+  VCHECK(streak_offload(s, slow_default, true) && !streak_offload(fresh, slow_default, true));
+}
+
+VTEST(a_streak_launch_keeps_the_margin_and_the_floor) {
+  const Costs c;
+  // a small live memory: 64 KiB to pull (6.6 us) and a kernel of 5 us; 50 us of simulator time beats 2 x 12 us, but the floor of 200 us asks more
+  StreakLaunch s;
+  s.card_only_bytes = 64 * 1024;
+  s.card_kernel_s = 5e-6;
+  s.sim_s = 50e-6;
+  VCHECK(streak_keep_seconds(s, c) > c.margin * streak_card_seconds(s, c));
+  VCHECK(!streak_offload(s, c, true));
+  // the floor is on the simulator's whole side, time plus pull
+  const double pull = static_cast<double>(s.card_only_bytes) / c.pull_bytes_per_s;
+  s.sim_s = c.min_sim_s - pull + 1e-9;
+  VCHECK(streak_offload(s, c, true));
+  s.sim_s = c.min_sim_s - pull - 1e-9;
+  VCHECK(!streak_offload(s, c, true));
+  // exactly at the floor: goes (the floor is "at least"); 1e6 bytes at 10 GB/s and 100 us add up to 200 us exactly in binary
+  StreakLaunch at;
+  at.card_only_bytes = 1000000;
+  at.card_kernel_s = 5e-6;
+  at.sim_s = 1e-4;
+  VCHECK(streak_keep_seconds(at, c) == c.min_sim_s && streak_offload(at, c, true));
+  // exactly at the margin: stays (the margin is "more than"); every number here is exact in binary
+  Costs exact = c;
+  exact.launch_s = 0.25;
+  exact.pull_bytes_per_s = 2;
+  StreakLaunch edge;
+  edge.card_only_bytes = 1;     // 0.5 s to pull
+  edge.card_kernel_s = 0.25;
+  edge.sim_s = 0.5;
+  VCHECK(streak_keep_seconds(edge, exact) == 1.0 && exact.margin * streak_card_seconds(edge, exact) == 1.0 && !streak_offload(edge, exact, true));
+  edge.sim_s = 0.5 + 1e-9;
+  VCHECK(streak_offload(edge, exact, true));
+  // the margin, found by bisection on the simulator's time against the formula: the launch goes just above margin x the card side, not at it
+  StreakLaunch m;
+  m.card_only_bytes = 1ull << 20;
+  m.push_bytes = 8ull << 20;
+  m.card_kernel_s = 300e-6;
+  const double card = streak_card_seconds(m, c);
+  const double mpull = static_cast<double>(m.card_only_bytes) / c.pull_bytes_per_s;
+  double lo = 0, hi = 1;
+  for (int i = 0; i < 200; ++i) {
+    m.sim_s = (lo + hi) / 2;
+    (streak_offload(m, c, true) ? hi : lo) = m.sim_s;
+  }
+  VCHECK(std::abs(hi - (c.margin * card - mpull)) < 1e-12);
+  VCHECK(c.margin * card - mpull > c.min_sim_s);   // (the bar found is the margin's, not the floor's)
+  Costs one = c;
+  one.margin = 1.0;
+  m.sim_s = card - mpull + 1e-9;
+  VCHECK(streak_offload(m, one, true) && !streak_offload(m, c, true));
+}
+
+VTEST(the_bans_weigh_a_launch_against_the_pull_it_saves_while_the_card_holds_memory) {
+  const Costs c;
+  // GRAMSCHM's kernel1 on the rig: 0.29 ms estimated, a card path that once took 0.5 ms, 48 MiB only on the card
+  StreakLaunch s;
+  s.sim_s = 0.00029;
+  s.card_only_bytes = 48ull << 20;
+  const double card_total = 0.0005;
+  VCHECK(ban_reference_seconds(s, c, true) == streak_keep_seconds(s, c));
+  VCHECK(!offload_paid_off(card_total, s.sim_s));                          // judged by the estimate alone: banned
+  VCHECK(offload_paid_off(card_total, ban_reference_seconds(s, c, true)));  // with the pull it saved: not
+  // the traffic ban's "slow" side reads the same reference: two launches that push a quarter of the memory, slow against the estimate alone
+  TrafficTable old_t, new_t;
+  const uint64_t live = 64ull << 20, push = 20ull << 20;
+  const double total = 0.002;   // over half of 0.29 ms, under half of 0.29 ms + 5 ms
+  VCHECK(!old_t.record("k", push, live, total, s.sim_s) && old_t.record("k", push, live, total, s.sim_s));
+  VCHECK(!new_t.record("k", push, live, total, ban_reference_seconds(s, c, true)) && !new_t.record("k", push, live, total, ban_reference_seconds(s, c, true)));
+  // and the reverse: with nothing only on the card, or with the rule switched off, the estimate alone, and the same slow launch is banned
+  StreakLaunch none = s;
+  none.card_only_bytes = 0;
+  VCHECK(ban_reference_seconds(none, c, true) == none.sim_s && !offload_paid_off(card_total, ban_reference_seconds(none, c, true)));
+  VCHECK(ban_reference_seconds(s, c, false) == s.sim_s && !offload_paid_off(card_total, ban_reference_seconds(s, c, false)));
+  // a launch slower than even the pull it saves is still banned
+  VCHECK(!offload_paid_off(0.1, ban_reference_seconds(s, c, true)));
+  // what is pushed does not enter the reference (it is the card's side), nor the card's kernel time
+  StreakLaunch pushed = s;
+  pushed.push_bytes = 1ull << 30;
+  pushed.card_kernel_s = 1.0;
+  VCHECK(ban_reference_seconds(pushed, c, true) == ban_reference_seconds(s, c, true));
+}
+
+VTEST(a_launch_with_a_zero_grid_or_block_dimension_is_the_simulator_s) {
+  const uint32_t one[3] = {1, 1, 1};
+  VCHECK(!launch_shape_empty(one, one));
+  const uint32_t big[3] = {65535, 65535, 64};
+  VCHECK(!launch_shape_empty(big, big));
+  for (int i = 0; i < 3; ++i) {
+    uint32_t g[3] = {4, 4, 4}, b[3] = {32, 8, 1};
+    g[i] = 0;
+    VCHECK(launch_shape_empty(g, b));   // PolyBench LU's last launches: grid 0x1x1 and 0x0x1
+    uint32_t g2[3] = {4, 4, 4}, b2[3] = {32, 8, 1};
+    b2[i] = 0;
+    VCHECK(launch_shape_empty(g2, b2));
+  }
+}
+
+// ---- what a kernel reaches besides its code (Round sp66) ----
+
+VTEST(externs_by_kind_and_what_each_mode_admits) {
+  using K = ExternKind;
+  VCHECK(extern_kind("vprintf", false) == K::Printf);
+  VCHECK(extern_kind("__assertfail", false) == K::Assert && extern_kind("__assert_fail", false) == K::Assert);
+  VCHECK(extern_kind("malloc", false) == K::Heap && extern_kind("free", false) == K::Heap);
+  VCHECK(extern_kind("cudaLaunchDeviceV2", true) == K::DeviceLaunch);
+  VCHECK(extern_kind("vprintf", true) == K::DeviceLaunch);   // (the device runtime's own name wins)
+  VCHECK(extern_kind("printf", false) == K::Other && extern_kind("vprintf_", false) == K::Other && extern_kind("", false) == K::Other);
+  VCHECK(extern_kind("Malloc", false) == K::Other && extern_kind("__nv_malloc", false) == K::Other);
+  // only vprintf, only in turbo mode, only when not switched off
+  VCHECK(extern_admitted(K::Printf, Mode::Turbo, false));
+  VCHECK(!extern_admitted(K::Printf, Mode::Turbo, true));
+  VCHECK(!extern_admitted(K::Printf, Mode::Exact, false));
+  VCHECK(!extern_admitted(K::Printf, Mode::Off, false));
+  for (K k : {K::Assert, K::Heap, K::DeviceLaunch, K::Other})
+    for (Mode m : {Mode::Exact, Mode::Turbo}) VCHECK(!extern_admitted(k, m, false));
+  const std::set<std::string> names = {extern_kind_name(K::Printf), extern_kind_name(K::Assert), extern_kind_name(K::Heap), extern_kind_name(K::DeviceLaunch),
+                                       extern_kind_name(K::Other)};
+  VCHECK(names.size() == 5 && names.count("vprintf") && names.count("__assertfail") && names.count("malloc/free"));
+}
+
+VTEST(texture_and_surface_instructions_are_named_and_never_admitted) {
+  for (const char* m : {"TEX", "TEXS", "TLD", "TLDS", "TLD4", "TLD4S", "TXD", "TXQ", "TMML", "SULD", "SUST", "SUATOM", "SURED", "SUQUERY"}) {
+    VCHECK(texture_mnemonic(m));
+    VCHECK(turbo_class(m, {}) == InsnClass::Never);   // what lets the device-wide refusal go: no class admits one
+    VCHECK(!exact_opcode_allowed(m, {}));
+  }
+  for (const char* m : {"LDG", "LDS", "LDC", "TEXDEPBAR", "ST", "SUB", "TLD5", "", "tex", "TE"}) VCHECK(!texture_mnemonic(m));
+}
+
+namespace {
+// A cubin-shaped ELF64 for the card image: sections by name, symbols, relocation tables (REL or RELA) against a section.
+struct ElfBuilder {
+  struct Sec { std::string name; uint32_t type; std::vector<uint8_t> bytes; uint64_t nobits = 0; uint32_t link = 0, info = 0; uint64_t entsize = 0; };
+  struct Sym { std::string name; uint16_t shndx; uint64_t value, size; uint8_t info; };
+  struct Rel { uint64_t offset; uint32_t sym, type; int64_t addend; };
+  std::vector<Sec> secs{{"", 0, {}}};
+  std::vector<Sym> syms{{"", 0, 0, 0, 0}};
+  uint16_t add(const std::string& name, uint32_t type, std::vector<uint8_t> bytes, uint64_t nobits = 0) {
+    secs.push_back({name, type, std::move(bytes), nobits});
+    return static_cast<uint16_t>(secs.size() - 1);
+  }
+  uint32_t sym(const std::string& name, uint16_t shndx, uint64_t value, uint64_t size = 4, uint8_t info = 0x11) {
+    syms.push_back({name, shndx, value, size, info});
+    return static_cast<uint32_t>(syms.size() - 1);
+  }
+  // Adds the relocation tables, the symbol and string tables and the section-name table, and lays the image out.
+  std::vector<uint8_t> build(const std::vector<std::tuple<uint16_t, bool, std::vector<Rel>>>& tables, std::vector<size_t>* table_index = nullptr) {
+    std::vector<uint8_t> strtab{0};
+    std::vector<uint8_t> symtab;
+    const auto put = [](std::vector<uint8_t>& v, uint64_t x, int n) { for (int k = 0; k < n; ++k) v.push_back(static_cast<uint8_t>(x >> (8 * k))); };
+    for (const Sym& y : syms) {
+      const uint32_t name_at = static_cast<uint32_t>(y.name.empty() ? 0 : strtab.size());
+      if (!y.name.empty()) strtab.insert(strtab.end(), y.name.begin(), y.name.end()), strtab.push_back(0);
+      put(symtab, name_at, 4);
+      put(symtab, y.info, 1);
+      put(symtab, 0, 1);
+      put(symtab, y.shndx, 2);
+      put(symtab, y.value, 8);
+      put(symtab, y.size, 8);
+    }
+    const uint16_t st = add(".symtab", 2, symtab);
+    const uint16_t ss = add(".strtab", 3, strtab);
+    secs[st].link = ss;
+    secs[st].entsize = 24;
+    for (const auto& [dst, rela, rels] : tables) {
+      std::vector<uint8_t> t;
+      for (const Rel& r : rels) {
+        put(t, r.offset, 8);
+        put(t, (uint64_t{r.sym} << 32) | r.type, 8);
+        if (rela) put(t, static_cast<uint64_t>(r.addend), 8);
+      }
+      const uint16_t i = add((rela ? ".rela" : ".rel") + secs[dst].name, rela ? 4 : 9, t);
+      secs[i].link = st;
+      secs[i].info = dst;
+      secs[i].entsize = rela ? 24 : 16;
+      if (table_index) table_index->push_back(i);
+    }
+    std::vector<uint8_t> shstr{0};
+    std::vector<uint32_t> name_at(secs.size() + 1, 0);
+    for (size_t i = 1; i < secs.size(); ++i) {
+      name_at[i] = static_cast<uint32_t>(shstr.size());
+      shstr.insert(shstr.end(), secs[i].name.begin(), secs[i].name.end());
+      shstr.push_back(0);
+    }
+    name_at[secs.size()] = static_cast<uint32_t>(shstr.size());
+    const std::string own = ".shstrtab";
+    shstr.insert(shstr.end(), own.begin(), own.end());
+    shstr.push_back(0);
+    secs.push_back({own, 3, shstr});
+    std::vector<uint8_t> img(64, 0);
+    std::vector<uint64_t> off(secs.size(), 0);
+    for (size_t i = 1; i < secs.size(); ++i) {
+      while (img.size() % 8) img.push_back(0);
+      off[i] = img.size();
+      img.insert(img.end(), secs[i].bytes.begin(), secs[i].bytes.end());
+    }
+    while (img.size() % 8) img.push_back(0);
+    const uint64_t shoff = img.size();
+    for (size_t i = 0; i < secs.size(); ++i) {
+      put(img, name_at[i], 4);
+      put(img, secs[i].type, 4);
+      put(img, 0, 8);
+      put(img, 0, 8);
+      put(img, off[i], 8);
+      put(img, secs[i].type == 8 ? secs[i].nobits : secs[i].bytes.size(), 8);
+      put(img, secs[i].link, 4);
+      put(img, secs[i].info, 4);
+      put(img, 8, 8);
+      put(img, secs[i].entsize, 8);
+    }
+    const uint8_t ident[16] = {0x7f, 'E', 'L', 'F', 2, 1, 1, 0x33, 7};
+    std::memcpy(img.data(), ident, 16);
+    const auto at = [&](size_t o, uint64_t x, int n) { for (int k = 0; k < n; ++k) img[o + k] = static_cast<uint8_t>(x >> (8 * k)); };
+    at(0x10, 2, 2);        // ET_EXEC
+    at(0x12, 190, 2);      // EM_CUDA
+    at(0x28, shoff, 8);
+    at(0x34, 64, 2);
+    at(0x3a, 64, 2);
+    at(0x3c, secs.size(), 2);
+    at(0x3e, secs.size() - 1, 2);
+    return img;
+  }
+};
+uint64_t rd64(const std::vector<uint8_t>& v, size_t o) { uint64_t x; std::memcpy(&x, &v[o], 8); return x; }
+// A section's header field in an image ElfBuilder made (sections in the order added).
+uint64_t sh_field(const std::vector<uint8_t>& img, size_t i, size_t field_off) { return rd64(img, rd64(img, 0x28) + 64 * i + field_off); }
+}  // namespace
+
+VTEST(the_card_image_has_the_simulator_s_addresses_of_the_module_s_variables) {
+  ElfBuilder b;
+  std::vector<uint8_t> code(64);
+  for (size_t k = 0; k < code.size(); ++k) code[k] = static_cast<uint8_t>(0x40 + k);
+  const uint16_t text = b.add(".text.k", 1, code);
+  const uint16_t c4 = b.add(".nv.constant4", 1, std::vector<uint8_t>(24, 0xee));
+  const uint16_t glob = b.add(".nv.global", 8, {}, 256);
+  const uint16_t c3 = b.add(".nv.constant3", 1, std::vector<uint8_t>(32, 0));
+  const uint16_t init = b.add(".nv.global.init", 1, std::vector<uint8_t>(16, 0));
+  const uint32_t g = b.sym("g", glob, 8, 64);
+  const uint32_t c = b.sym("c", c3, 4, 16);
+  const uint32_t str = b.sym("$str", init, 0, 16, 0x01);
+  const uint32_t vp = b.sym("vprintf", 0, 0, 0, 0x12);
+  const uint32_t kf = b.sym("k", text, 0, 64, 0x12);
+  std::vector<size_t> tab;
+  const std::vector<uint8_t> img = b.build({{text, true, {{0, g, 56, 4}, {16, g, 57, 4}, {32, vp, 58, 0}, {48, str, 56, 0}}},
+                                            {c4, false, {{0, c, 2, 0}, {8, kf, 35, 0}, {16, g, 4, 0}}}}, &tab);
+  const uint64_t gva = 0x7f0000100000ull, cva = 0x7f0000200000ull, iva = 0x7f0000300000ull;
+  const auto vars = [&](const std::string& sec) -> std::optional<uint64_t> {
+    if (sec == ".nv.global") return gva;
+    if (sec == ".nv.constant3") return cva;
+    if (sec == ".nv.global.init") return iva;
+    return std::nullopt;
+  };
+  const CardImage ci = card_image_at_sim_addresses(img.data(), img.size(), vars);
+  VCHECK(ci.ok && ci.why.empty());
+  VCHECK(ci.applied == 5 && ci.bytes.size() == img.size());
+  const uint64_t text_off = sh_field(img, text, 24), c4_off = sh_field(img, c4, 24);
+  // the code: the low half of g + 8 + 4 at bits 32-63 of the first instruction, the high half in the second, the string's low half in the fourth
+  uint64_t lo0 = rd64(ci.bytes, text_off), lo1 = rd64(ci.bytes, text_off + 16), lo3 = rd64(ci.bytes, text_off + 48);
+  VCHECK((lo0 >> 32) == ((gva + 12) & 0xffffffffu) && (lo0 & 0xffffffffu) == (rd64(img, text_off) & 0xffffffffu));
+  VCHECK((lo1 >> 32) == ((gva + 12) >> 32));
+  VCHECK((lo3 >> 32) == (iva & 0xffffffffu));
+  VCHECK(rd64(ci.bytes, text_off + 8) == rd64(img, text_off + 8));   // (the high word of a MOV is not the relocation's)
+  VCHECK(rd64(ci.bytes, text_off + 32) == rd64(img, text_off + 32) && rd64(ci.bytes, text_off + 40) == rd64(img, text_off + 40));   // vprintf's call: the driver's
+  // the bank: c's address (cva + 4) and g's (G64); the function descriptor left alone
+  VCHECK(rd64(ci.bytes, c4_off) == cva + 4 && rd64(ci.bytes, c4_off + 16) == gva + 8 && rd64(ci.bytes, c4_off + 8) == 0xeeeeeeeeeeeeeeeeull);
+  // the tables: only what was left, in order, and their sizes say so
+  VCHECK(sh_field(ci.bytes, tab[0], 32) == 24 && sh_field(img, tab[0], 32) == 96);
+  const uint64_t t0 = sh_field(ci.bytes, tab[0], 24);
+  VCHECK(rd64(ci.bytes, t0) == 32 && rd64(ci.bytes, t0 + 8) == ((uint64_t{vp} << 32) | 58));
+  VCHECK(sh_field(ci.bytes, tab[1], 32) == 16);
+  const uint64_t t1 = sh_field(ci.bytes, tab[1], 24);
+  VCHECK(rd64(ci.bytes, t1) == 8 && rd64(ci.bytes, t1 + 8) == ((uint64_t{kf} << 32) | 35));
+  // nothing else of the image moved
+  size_t changed = 0;
+  for (size_t k = 0; k < img.size(); ++k) changed += img[k] != ci.bytes[k];
+  VCHECK(changed > 0 && changed <= 4 * 4 + 2 * 8 + 2 * 8 + 2 * 24 + 2);
+  // no variable section named: the image as it was
+  const CardImage same = card_image_at_sim_addresses(img.data(), img.size(), [](const std::string&) -> std::optional<uint64_t> { return std::nullopt; });
+  VCHECK(same.ok && same.applied == 0 && same.bytes == img);
+  // only the constant bank's variables: the code's references to g are the driver's
+  const CardImage only_c = card_image_at_sim_addresses(img.data(), img.size(), [&](const std::string& sec) -> std::optional<uint64_t> {
+    return sec == ".nv.constant3" ? std::optional<uint64_t>(cva) : std::nullopt;
+  });
+  VCHECK(only_c.ok && only_c.applied == 1 && rd64(only_c.bytes, c4_off) == cva + 4 && rd64(only_c.bytes, text_off) == rd64(img, text_off));
+  VCHECK(sh_field(only_c.bytes, tab[0], 32) == 96 && sh_field(only_c.bytes, tab[1], 32) == 32);
+}
+
+VTEST(the_card_image_refuses_what_it_cannot_apply) {
+  const auto vars = [](const std::string& sec) -> std::optional<uint64_t> {
+    return sec == ".nv.global" ? std::optional<uint64_t>(0x7f0000100000ull) : std::nullopt;
+  };
+  const auto one = [&](uint32_t type, bool into_code, bool into_nobits, uint64_t offset) {
+    ElfBuilder b;
+    const uint16_t text = b.add(".text.k", 1, std::vector<uint8_t>(32, 0));
+    const uint16_t c4 = b.add(".nv.constant4", 1, std::vector<uint8_t>(16, 0));
+    const uint16_t glob = b.add(".nv.global", 8, {}, 64);
+    const uint32_t g = b.sym("g", glob, 0);
+    const std::vector<uint8_t> img = b.build({{into_nobits ? glob : into_code ? text : c4, true, {{offset, g, type, 0}}}});
+    return card_image_at_sim_addresses(img.data(), img.size(), vars);
+  };
+  VCHECK(one(56, true, false, 0).ok && one(57, true, false, 16).ok && one(58, true, false, 0).ok && one(75, true, false, 16).ok);
+  VCHECK(one(62, true, false, 0).ok && one(63, true, false, 0).ok);
+  VCHECK(one(2, false, false, 0).ok && one(4, false, false, 8).ok);
+  VCHECK(!one(35, false, false, 0).ok);                      // a function descriptor of a variable
+  VCHECK(!one(2, true, false, 0).ok && !one(56, false, false, 0).ok);   // a data type in code, a code type in data
+  VCHECK(!one(1, true, false, 0).ok);                        // a type nobody named
+  VCHECK(!one(56, true, false, 17).ok && !one(56, true, false, 32).ok);   // past the end of the code
+  VCHECK(!one(2, false, false, 9).ok && !one(2, false, false, 16).ok);    // past the end of the bank
+  VCHECK(one(2, false, false, 8).ok);                        // the last 8 bytes
+  VCHECK(!one(2, false, true, 0).ok);                        // into a section with no bytes
+  const CardImage bad = one(35, false, false, 0);
+  VCHECK(bad.bytes.empty() && bad.why.find("35") != std::string::npos);
+  // not an image
+  const uint8_t junk[80] = {0x7f, 'E', 'L', 'F', 1};
+  VCHECK(!card_image_at_sim_addresses(junk, sizeof junk, vars).ok);
+  VCHECK(!card_image_at_sim_addresses(junk, 10, vars).ok);
+  std::vector<uint8_t> trunc;
+  {
+    ElfBuilder b;
+    b.add(".text.k", 1, std::vector<uint8_t>(32, 0));
+    trunc = b.build({});
+  }
+  VCHECK(card_image_at_sim_addresses(trunc.data(), trunc.size(), vars).ok);
+  VCHECK(!card_image_at_sim_addresses(trunc.data(), trunc.size() - 1, vars).ok);   // the section headers run past the end
+  std::vector<uint8_t> elf32 = trunc;
+  elf32[4] = 1;   // ELFCLASS32: the same bytes are not a 64-bit image
+  VCHECK(!card_image_at_sim_addresses(elf32.data(), elf32.size(), vars).ok);
+  std::vector<uint8_t> nomagic = trunc;
+  nomagic[1] = 'e';
+  VCHECK(!card_image_at_sim_addresses(nomagic.data(), nomagic.size(), vars).ok);
+}
+
+VTEST(code_relocations_write_the_bits_the_loader_writes) {
+  uint8_t w[16];
+  const auto fill = [&] { for (int k = 0; k < 16; ++k) w[k] = static_cast<uint8_t>(0xa0 + k); };
+  const auto lo = [&] { uint64_t x; std::memcpy(&x, w, 8); return x; };
+  const auto hi = [&] { uint64_t x; std::memcpy(&x, w + 8, 8); return x; };
+  fill();
+  const uint64_t lo0 = lo(), hi0 = hi();
+  const uint64_t v = 0x0001234589abcdefull;
+  vgpu::sass::patch_code_word(w, 56, v);
+  VCHECK(lo() == ((lo0 & 0xffffffffu) | (uint64_t{0x89abcdef} << 32)) && hi() == hi0);
+  fill();
+  vgpu::sass::patch_code_word(w, 62, v);
+  VCHECK(lo() == ((lo0 & 0xffffffffu) | (uint64_t{0x89abcdef} << 32)) && hi() == hi0);
+  fill();
+  vgpu::sass::patch_code_word(w, 57, v);
+  VCHECK(lo() == ((lo0 & 0xffffffffu) | (uint64_t{0x00012345} << 32)) && hi() == hi0);
+  fill();
+  vgpu::sass::patch_code_word(w, 63, v);
+  VCHECK(lo() == ((lo0 & 0xffffffffu) | (uint64_t{0x00012345} << 32)) && hi() == hi0);
+  fill();
+  vgpu::sass::patch_code_word(w, 58, v);   // 49 bits at 32
+  VCHECK(lo() == ((lo0 & 0xffffffffu) | (v << 32)) && hi() == ((hi0 & ~uint64_t{0x1ffff}) | ((v >> 32) & 0x1ffff)));
+  fill();
+  const uint64_t a = 0x0000123456789abcull & ~uint64_t{3};
+  vgpu::sass::patch_code_word(w, 75, a);   // words: 8 bits at 16, the rest at 34
+  const uint64_t words = a >> 2;
+  VCHECK(((lo() >> 16) & 0xff) == (words & 0xff) && (lo() >> 34) == ((words >> 8) & 0x3fffffff) && (hi() & 0x1ffff) == ((words >> 38) & 0x1ffff));
+  VCHECK((lo() & 0xffff) == (lo0 & 0xffff) && ((lo() >> 24) & 0x3ff) == ((lo0 >> 24) & 0x3ff) && (hi() >> 17) == (hi0 >> 17));
+  for (uint32_t t : {56u, 57u, 58u, 62u, 63u, 75u}) VCHECK(vgpu::sass::code_reloc_type(t));
+  for (uint32_t t : {0u, 1u, 2u, 4u, 35u, 55u, 59u, 64u, 74u, 76u}) VCHECK(!vgpu::sass::code_reloc_type(t));
 }
 
 VTEST_MAIN

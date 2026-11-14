@@ -1,0 +1,36 @@
+Each line: the mutant, how many test cases failed against it, what it changes (mutants.py prints the test names).
+0 killed (1 test cases): no driver needed
+1 killed (1 test cases): no card data needed
+2 killed (1 test cases): no estimate needed
+3 killed (1 test cases): a negative estimate passes
+4 killed (3 test cases): the driver inverted
+5 killed (2 test cases): no floor
+6 killed (3 test cases): floor or margin
+7 killed (1 test cases): the floor strict
+8 killed (3 test cases): the floor on the simulator's time alone
+9 killed (1 test cases): no margin
+10 killed (1 test cases): the margin not strict
+11 killed (1 test cases): the margin doubled
+12 killed (3 test cases): the pull not charged
+13 killed (2 test cases): the pull at the push rate
+14 killed (2 test cases): the pull twice (and the push back)
+15 killed (2 test cases): the simulator's time left out
+16 killed (2 test cases): no launch cost
+17 killed (2 test cases): no kernel time
+18 killed (1 test cases): an unknown kernel time is free
+19 killed (2 test cases): the default always
+20 killed (1 test cases): the push not charged
+21 killed (1 test cases): the push at the pull rate
+22 killed (3 test cases): the card's side priced with the card-only bytes
+23 killed (1 test cases): the pull never counted
+24 killed (1 test cases): the pull always counted
+25 killed (1 test cases): the switch ignored
+26 killed (1 test cases): the card's side added
+27 killed (1 test cases): the switch inverted
+28 killed (1 test cases): never empty
+29 killed (1 test cases): grid x only
+30 killed (1 test cases): the grid only
+31 killed (1 test cases): the block only
+32 killed (1 test cases): z ignored
+33 killed (1 test cases): all must be zero
+34 of 34 killed

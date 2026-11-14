@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <shared_mutex>
@@ -180,6 +181,69 @@ inline void gate_access(GateLock& mu, TrackedMap& res, uint64_t addr, uint64_t l
     }
   }
   update(a);
+}
+
+// ---- verify mode: the compare, and the chunks the card may keep (sp67) ----
+// A verify run (VGPU_HOST_GPU_VERIFY) runs a launch on the card, copies every live range back (`card[i]` holds the card's bytes of `ranges[i]`), gives the card
+// copy up, runs the launch in the simulator and compares. `compare_with_card` reads the simulator's memory one 64 KiB chunk at a time into `scratch` (a buffer
+// that stays in the cache: one pass over each side, where a copy of every range into one more buffer the size of the range was three, and a fresh such buffer per
+// launch also a page fault per page) and calls `same(i, addr, n)` or `differ(i, addr, card, sim, n)` for each chunk; `equal[i]` gets the chunk indices of
+// ranges[i] whose bytes agree.
+template <class Same, class Differ>
+inline void compare_with_card(const MemoryManager& mem, const std::vector<std::pair<uint64_t, uint64_t>>& ranges, const std::vector<std::vector<uint8_t>>& card,
+                              std::vector<uint8_t>& scratch, std::vector<std::vector<uint64_t>>& equal, Same&& same, Differ&& differ) {
+  equal.resize(ranges.size());
+  scratch.resize(kChunkSize);
+  for (size_t i = 0; i < ranges.size(); ++i) {
+    equal[i].clear();
+    const auto [base, size] = ranges[i];
+    for (uint64_t off = 0; off < size; off += kChunkSize) {
+      const uint64_t n = std::min<uint64_t>(kChunkSize, size - off);
+      mem.read(base + off, scratch.data(), n);
+      if (std::memcmp(card[i].data() + off, scratch.data(), n) == 0) {
+        equal[i].push_back(off / kChunkSize);
+        same(i, base + off, n);
+      } else {
+        differ(i, base + off, card[i].data() + off, scratch.data(), n);
+      }
+    }
+  }
+}
+
+// After the compare, a chunk whose card bytes equal the simulator's is a valid card copy again: the card holds exactly what the simulator holds there (the card's
+// memory has not changed since it was copied back: no launch ran on it in between). Each such chunk that is the simulator's alone (Host: the copy was given up
+// before the simulator ran) becomes Both, so the next launch on the card does not push it. The others stay Host and are pushed: the next launch on the card still
+// starts from the simulator's memory everywhere, the rule of Round sp59. Before sp67 every chunk was pushed again before every launch of a verify run (PolyBench
+// 3DCONV, 254 launches on 128 MiB: 40 s against 0.38 s for the plain simulator, with a stand-in card).
+//
+// The gate then guards these chunks as it guards any card copy: a write of the host makes the chunk Host again (it is pushed), a read changes nothing (Both), a
+// free drops the entry, and the simulator's next launch gives the copy up first (Runtime::before_simulated), so no simulator launch ever runs with it. An entry
+// whose address or size is not the range's is left alone. `update(entry)` publishes an entry's new count of card-valid chunks (Runtime::Impl::update_slot); an
+// allocation that had no card-valid chunk and has one now is dropped from every thread's memory of recent lookups (MemoryManager::card_void_lookups), as after
+// a launch on the card: a remembered lookup would let the simulator's fast paths reach it without the gate. Returns the number of chunks made Both.
+template <class Update>
+inline uint64_t keep_verified_chunks(TrackedMap& res, MemoryManager& mem, const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
+                                     const std::vector<std::vector<uint64_t>>& equal, Update&& update) {
+  uint64_t kept = 0;
+  std::vector<uint64_t> newly;
+  for (size_t i = 0; i < ranges.size() && i < equal.size(); ++i) {
+    const auto it = res.find(ranges[i].first);
+    if (it == res.end() || it->second.size != ranges[i].second || equal[i].empty()) continue;
+    Tracked& a = it->second;
+    const bool was = a.r.card_valid() > 0;
+    uint64_t here = 0;
+    for (uint64_t c : equal[i])
+      if (c < a.r.chunks() && a.r.at(c) == Where::Host) {
+        a.r.set(c, Where::Both);
+        ++here;
+      }
+    if (!here) continue;
+    kept += here;
+    update(a);
+    if (!was) newly.push_back(a.base);
+  }
+  if (!newly.empty()) mem.card_void_lookups(newly);
+  return kept;
 }
 
 }  // namespace vgpu::hostgpu

@@ -397,3 +397,13 @@ Verification and tests:
 **Worth it**, for runs of repeated launches on the same buffers; the gain is 14x to 103x over write-through, 31x to 253x over the simulator on four programs of 6 to 45 minutes of simulation (FDTD-2D, aligned-types, babelstream, base64e), no effect on 50 of the 64 corpus programs, a loss on LU (-18% against write-through)
 and nothing on GRAMSCHM. Share of the corpus: 10% of launches are in programs that gain 1.5x or more, 5% of launches change. The profile's weak side stands: single-launch programs (GEMM, SYRK, SYR2K, 3MM) and SFU kernels are untouched by persistence; they need the first-launch decision (section 6, step 2) and a grown exact set.
 Suggested defaults: persistent on (it is), with a ban that also looks at the traffic: a kernel whose offloaded launches move more than a fixed share of the live memory each time (LU's) should go back to the simulator after two launches.
+
+### 7.5 Later: idioms in the exact set (Rounds sp43, sp44, sp68)
+
+A bare `MUFU` stays out of exact mode, but two of the sequences ptxas builds from one give the IEEE result whatever the card's last bits, and each has a
+switch: `VGPU_HOST_GPU_DIV=1` for the float division (`division_idiom_only` in `include/vgpu/host_gpu.hpp`, sp43) and `VGPU_HOST_GPU_SQRT=1` for the
+float square root (`include/vgpu/host_gpu_idiom.hpp`, sp68), which is recognised by running every path of the sequence on symbolic values against the
+code the card was checked with. Both are off by default: the evidence is one A10G's. For the square root it has to be: its refinement is not exact for
+every reciprocal square root one ulp off (a few hundred inputs in 2^31), so it is exact on a card only where that card's `MUFU.RSQ` happens to be right,
+and each architecture needs its own run of `tools/probes/hostgpu_mufu_card_experiment.sh`. What the square root gave on the A10G is in Round sp68:
+GRAMSCHM's device part went from 45 s to 3 s, once Round sp65's streak rule keeps its one-thread kernel on the card too.

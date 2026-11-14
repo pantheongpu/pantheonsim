@@ -1,0 +1,12 @@
+GEMVER VGPU_JIT=0 run 1 wall 0.65 s
+GEMVER VGPU_JIT=0 run 2 wall 0.65 s
+GEMVER VGPU_JIT=0 run 3 wall 0.65 s
+GEMVER VGPU_JIT=1 run 1 wall 0.68 s
+GEMVER VGPU_JIT=1 run 2 wall 0.65 s
+GEMVER VGPU_JIT=1 run 3 wall 0.65 s
+JACOBI1D VGPU_JIT=0 run 1 wall 2.45 s
+JACOBI1D VGPU_JIT=0 run 2 wall 2.45 s
+JACOBI1D VGPU_JIT=0 run 3 wall 2.47 s
+JACOBI1D VGPU_JIT=1 run 1 wall 2.49 s
+JACOBI1D VGPU_JIT=1 run 2 wall 2.49 s
+JACOBI1D VGPU_JIT=1 run 3 wall 2.50 s

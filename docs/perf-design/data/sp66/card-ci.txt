@@ -1,0 +1,35 @@
+== first pass (card CI, before the LEPC fix):
+GPU 0: NVIDIA A10G (UUID: GPU-a0fc543c-077c-b196-0eae-edddd0cef398)
+== build
+== unit tests
+== e2e (card present: a skip is a failure)
+
+The following tests FAILED:
+	781 - e2e_host_gpu (Failed)
+Errors while running CTest
+FAIL: e2e_host_gpu did not pass
+
+The following tests FAILED:
+	782 - e2e_host_gpu_stub (Failed)
+Errors while running CTest
+FAIL: e2e_host_gpu_stub did not pass
+== verify run, machine-readable summary
+host_gpu_verify: in_set_identical=31 in_set_different=0 other_identical=0 other_different=0
+== turbo verify run, machine-readable summary
+host_gpu_turbo: mode=turbo launches_card=38 launches_sim=42 card_s=0.274939 sim_s=2.895173 words_compared=132160678 words_different=2139207 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=1.1920929e-07 max_rel=1.19203336e-07
+host_gpu_refusals: refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=4 too_small=0 failed=0
+== SFU and division exhaustive checks (stride 257)
+== turbo mode's probes (reported; stride 257)
+NOTE: stride 257 is a smoke run, not all 2^32 patterns
+VERDICT kind=imax repeats
+VERDICT kind=iadd varies
+VERDICT kind=fred varies
+VERDICT kind=fatom varies
+VERDICT kind=dadd varies
+VERDICT kind=cas varies
+VERDICT kind=exch varies
+FAIL: card CI on NVIDIA A10G
+== second pass (the branch head's build: unit test, e2e_host_gpu and e2e_host_gpu_stub on the A10G):
+94/94 tests passed
+100% tests passed, 0 tests failed out of 1
+100% tests passed, 0 tests failed out of 1

@@ -1,0 +1,8 @@
+rodinia/particlefilter_float rc 0 host_gpu_verify: in_set_identical=18 in_set_different=0 other_identical=0 other_different=0
+samples/simpleHyperQ rc 0 host_gpu: verify _Z8kernel_APll (in the exact set): DIFFERENT, 64 KiB chunks: 1 | host_gpu: verify _Z8kernel_BPll (in the exact set): DIFFERENT, 64 KiB chunks: 1 | host_gpu_verify: in_set_identical=0 in_set_different=64 other_identical=0 other_different=0
+samples/convolutionSeparable rc 0 host_gpu_verify: in_set_identical=34 in_set_different=0 other_identical=0 other_different=0
+samples/dct8x8 rc 0 host_gpu_verify: in_set_identical=104 in_set_different=0 other_identical=0 other_different=0
+samples/segmentationTreeThrust rc 0 host_gpu_verify: in_set_identical=399 in_set_different=0 other_identical=0 other_different=0
+samples/sortingNetworks rc 0 host_gpu_verify: in_set_identical=285 in_set_different=0 other_identical=0 other_different=0
+samples/simpleCudaGraphs rc 0 host_gpu_verify: in_set_identical=12 in_set_different=0 other_identical=0 other_different=0
+samples/LargeKernelParameter rc 0 host_gpu_verify: in_set_identical=2002 in_set_different=0 other_identical=0 other_different=0

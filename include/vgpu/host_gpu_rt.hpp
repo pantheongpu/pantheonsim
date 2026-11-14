@@ -33,6 +33,9 @@ struct Stats {
   uint64_t sampled = 0, sample_sent = 0, sample_timeouts = 0;
   uint64_t sample_after_driver = 0;   // samples made although the driver's start had begun: always 0 (sample_plan refuses), printed to show it
   double sample_seconds = 0;
+  // Launches the card ran because the card held the live memory (vgpu/host_gpu.hpp streak_offload, Round sp65; also in `offloaded`), and the bytes
+  // only the card held at those launches: what the simulator would have pulled back first had it run them.
+  uint64_t streak_sent = 0, streak_card_only_bytes = 0;
 };
 
 // The forked copies of sampled launches (runtime.cpp): reaps the ones that have ended, waits for the rest when asked. Returns how many were

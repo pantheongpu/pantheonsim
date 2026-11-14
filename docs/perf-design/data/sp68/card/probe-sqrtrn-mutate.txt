@@ -1,0 +1,1 @@
+RESULT op=sqrtrn tested=16711936 differ=8128 max_ulp=1 first=0x00040400:card=0x1eb55f60:sim=0x1eb55f5f share=0.049% outside_tol=0 max_abs=1.09951163e+12 ordinary_outside_tol=0 ordinary_max_abs=1.90734863e-06

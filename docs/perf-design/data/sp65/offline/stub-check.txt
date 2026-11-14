@@ -1,0 +1,12 @@
+polybench/LU exact streak {'rc': 0, 'card': 883, 'sim': 3213, 'ref': 2048, 'small': 1163, 'sent': 0, 'mib': 0.0, 'rule': 1, 'push': 14128.0, 'pull': 14128.0, 'banned': 1}
+polybench/LU exact STREAK=0 {'rc': 0, 'card': 687, 'sim': 3409, 'ref': 2048, 'small': 1359, 'sent': 0, 'mib': 0.0, 'rule': 0, 'push': 10992.0, 'pull': 10992.0, 'banned': 1}
+polybench/LU turbo streak {'rc': 0, 'card': 4071, 'sim': 25, 'ref': 0, 'small': 21, 'sent': 2244, 'mib': 35904.0, 'rule': 1, 'push': 16.0, 'pull': 16.0, 'banned': 0}
+polybench/LU turbo STREAK=0 {'rc': 0, 'card': 772, 'sim': 3324, 'ref': 0, 'small': 3320, 'sent': 0, 'mib': 0.0, 'rule': 0, 'push': 12352.0, 'pull': 12352.0, 'banned': 1}
+rodinia/gaussian exact streak {'rc': 0, 'card': 460, 'sim': 562, 'ref': 511, 'small': 49, 'sent': 0, 'mib': 0.0, 'rule': 1, 'push': 920.9, 'pull': 920.9, 'banned': 0}
+rodinia/gaussian exact STREAK=0 {'rc': 0, 'card': 460, 'sim': 562, 'ref': 511, 'small': 49, 'sent': 0, 'mib': 0.0, 'rule': 0, 'push': 920.9, 'pull': 920.9, 'banned': 0}
+rodinia/gaussian turbo streak {'rc': 0, 'card': 921, 'sim': 101, 'ref': 0, 'small': 97, 'sent': 460, 'mib': 920.9, 'rule': 1, 'push': 2.0, 'pull': 2.0, 'banned': 0}
+rodinia/gaussian turbo STREAK=0 {'rc': 0, 'card': 462, 'sim': 560, 'ref': 0, 'small': 556, 'sent': 0, 'mib': 0.0, 'rule': 0, 'push': 924.9, 'pull': 924.9, 'banned': 0}
+rodinia/lud exact streak {'rc': 0, 'card': 30, 'sim': 160, 'ref': 127, 'small': 31, 'sent': 0, 'mib': 0.0, 'rule': 1, 'push': 120.0, 'pull': 120.0, 'banned': 0}
+rodinia/lud exact STREAK=0 {'rc': 0, 'card': 30, 'sim': 160, 'ref': 127, 'small': 31, 'sent': 0, 'mib': 0.0, 'rule': 0, 'push': 120.0, 'pull': 120.0, 'banned': 0}
+rodinia/lud turbo streak {'rc': 0, 'card': 144, 'sim': 46, 'ref': 0, 'small': 40, 'sent': 63, 'mib': 252.0, 'rule': 1, 'push': 4.0, 'pull': 4.0, 'banned': 0}
+rodinia/lud turbo STREAK=0 {'rc': 0, 'card': 27, 'sim': 163, 'ref': 0, 'small': 157, 'sent': 0, 'mib': 0.0, 'rule': 0, 'push': 108.0, 'pull': 108.0, 'banned': 0}

@@ -1,0 +1,25 @@
+| mutant | result |
+| no fork: an undecided guard is taken as true | KILLED by the_reference_has_the_six_paths_of_sqrt_rn, gramschmidt_kernel1_is_the_sqrt_idiom, corr_std_kernel_needs_both_idioms |
+| liveness never reads | KILLED by wrong_registers_are_refused, may_be_read_follows_branches_and_calls, a_write_under_a_predicate_covers_reads_under_it, pairs_and_addresses_are_counted_as_the_code_uses_them |
+| a predicated write covers reads of either polarity | KILLED by a_write_under_a_predicate_covers_reads_under_it |
+| a predicated branch kills on both edges | KILLED by a_write_under_a_predicate_covers_reads_under_it |
+| a rewritten predicate keeps its cover | KILLED by a_write_under_a_predicate_covers_reads_under_it |
+| no check of branches into the idiom | KILLED by control_flow_into_or_out_of_the_idiom_is_refused |
+| no check of code falling into the slow path | KILLED by each_structural_check_on_its_own |
+| the RET return address not checked | KILLED by control_flow_into_or_out_of_the_idiom_is_refused |
+| any MUFU form inside the idiom | SURVIVED |
+| memory and barriers allowed inside the idiom | KILLED by each_structural_check_on_its_own |
+| a MUFU value may flow through any instruction | SURVIVED |
+| the result on one path is enough | KILLED by a_sqrt_without_the_refinement_is_refused, wrong_registers_are_refused, a_changed_range_check_or_scale_is_refused |
+| the path keys not compared | KILLED by  |
+| predicates from a MUFU not checked | SURVIVED |
+| MUFU values left in registers not checked | KILLED by wrong_registers_are_refused |
+| IMAD.WIDE addend read as one register | KILLED by pairs_and_addresses_are_counted_as_the_code_uses_them |
+| a 64-bit address reads one register | KILLED by pairs_and_addresses_are_counted_as_the_code_uses_them |
+| a 128-bit store reads one register | KILLED by pairs_and_addresses_are_counted_as_the_code_uses_them |
+| a predicated MUFU starts a site | SURVIVED |
+| the subroutine entry may be reached by any branch | KILLED by each_structural_check_on_its_own |
+| a call of the division idiom into a sqrt slow path allowed | KILLED by each_structural_check_on_its_own |
+| a backward branch allowed in the idiom | SURVIVED |
+| the argument-independent guard check drops the X test | KILLED by the_reference_has_the_six_paths_of_sqrt_rn, gramschmidt_kernel1_is_the_sqrt_idiom, corr_std_kernel_needs_both_idioms |
+| the switch ignored: sqrt always on | KILLED by gramschmidt_kernel1_is_the_sqrt_idiom, corr_std_kernel_needs_both_idioms, the_switches_keep_the_old_verdicts |

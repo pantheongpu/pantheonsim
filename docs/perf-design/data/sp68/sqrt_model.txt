@@ -1,0 +1,21 @@
+# sqrt_model 6 6 1 (server3, all positive finite floats 0x00000001..0x7f7fffff, 2^31 - 2^23 inputs): inputs whose root is not the IEEE one when the
+# reciprocal square root is k ulp from the simulator's
+k=-6 wrong=10843 first=0x00003362
+k=-5 wrong=8028 first=0x00076c29
+k=-4 wrong=5604 first=0x001a00ea
+k=-3 wrong=3438 first=0x005239ea
+k=-2 wrong=1401 first=0x005dc5e6
+k=-1 wrong=383 first=0x00668a15
+k=+0 wrong=0 first=0x00000000
+k=+1 wrong=255 first=0x007749b9
+k=+2 wrong=1273 first=0x0059815f
+k=+3 wrong=3056 first=0x005239ea
+k=+4 wrong=5604 first=0x001a00ea
+k=+5 wrong=7907 first=0x00003362
+k=+6 wrong=11219 first=0x00003362
+# sqrt_model 2 6 1, with the fast path (x >= 2^-101) apart: most of the wrong inputs are on the fast path, over the whole range
+k=-2 first_fast=0x0d2a177f wrong=1401 fast_path_wrong=1262 first=0x005dc5e6 last=0x7f6e9372
+k=-1 first_fast=0x0d4d142a wrong=383 fast_path_wrong=345 first=0x00668a15 last=0x7f6e9372
+k=+0 first_fast=none wrong=0 fast_path_wrong=0
+k=+1 first_fast=0x0d6e9372 wrong=255 fast_path_wrong=229 first=0x007749b9 last=0x7f6e9372
+k=+2 first_fast=0x0d2a177f wrong=1273 fast_path_wrong=1147 first=0x0059815f last=0x7f6e9372

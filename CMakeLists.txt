@@ -1422,6 +1422,8 @@ vgpu_unit_test(test_yamlish)
 vgpu_unit_test(test_check_compare)
 vgpu_unit_test(test_host_gpu_logic)
 vgpu_unit_test(test_host_gpu_ref)
+# The square root idiom of host-GPU exact mode (include/vgpu/host_gpu_idiom.hpp), on real nvcc SASS (tests/unit/host_gpu_idiom_sass.inc): no card.
+vgpu_unit_test(test_host_gpu_idiom)
 # Turbo host-GPU mode's compare by tolerance (include/vgpu/host_gpu_tol.hpp): header-only, no card.
 vgpu_unit_test(test_host_gpu_tol)
 vgpu_unit_test(test_card_gate)
@@ -1860,6 +1862,9 @@ target_include_directories(test_jit_wait PRIVATE src)
 # age rule, and the notices (once a day; none with VGPU_JIT=auto, none for a compile cancelled at exit: child processes of the test itself).
 vgpu_unit_test(test_jit_cold)
 target_include_directories(test_jit_cold PRIVATE src)
+# Tier 2, round sp64: a section whose compile is running is on the plain loop, and the compile log of VGPU_JIT_STATS (child processes of the test).
+vgpu_unit_test(test_jit_threads)
+target_include_directories(test_jit_threads PRIVATE src)
 # Register residence of the generated code against the register-file code, on random regions (VGPU_JIT_RANDOM_UNITS=<n> for more).
 vgpu_unit_test(test_jit_resid)
 target_include_directories(test_jit_resid PRIVATE src)

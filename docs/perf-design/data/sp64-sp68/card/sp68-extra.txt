@@ -1,0 +1,20 @@
+host_gpu_verify: in_set_identical=6144 in_set_different=0 other_identical=0 other_different=0
+GRAMSCHM exact SQRT DIV verify wall 235.96 s
+hellinger sim run 1 wall 45.40 s
+hellinger sim run 2 wall 45.42 s
+hellinger sim run 3 wall 45.47 s
+host_gpu: 0 launches ran on the card, 1 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+hellinger x0 run 1 wall 45.40 s
+host_gpu: 0 launches ran on the card, 1 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+hellinger x0 run 2 wall 45.42 s
+host_gpu: 0 launches ran on the card, 1 in the simulator (1 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+hellinger x0 run 3 wall 45.43 s
+host_gpu: 1 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+hellinger x1 run 1 wall 6.75 s
+host_gpu: 1 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+hellinger x1 run 2 wall 6.74 s
+host_gpu: 1 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+hellinger x1 run 3 wall 6.75 s
+36e5d23868fbabcf1b9f87c1ad6bc973  /home/ubuntu/w/res/hell_sim.out
+d3618a3fb6d86778bbad557ac4b2e82b  /home/ubuntu/w/res/hell_x0.out
+f31ddbc1ad247cc9b9ee5d1cc7819523  /home/ubuntu/w/res/hell_x1.out

@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
 #include "vgpu/memory.hpp"
@@ -164,6 +166,13 @@ std::vector<Insn> faults_from_block_1() {
   c.insert(c.end(), {stg(10, 0, 0), imad_wide_i(12, 0, 0x10000000, 6), stg(12, 0, 0), exit_()});
   return c;
 }
+// A chain on every other word: buf[2 * (i + 64)] = buf[2 * i] + 1. Block b reads the words block b - 1 wrote, on a stride of two words,
+// which no run of consecutive elements is: on a host-mapped buffer the loads go through MemoryManager::host_load_batch and the stores
+// through host_store_batch (lane by lane with VGPU_FASTPATH=0).
+std::vector<Insn> strided_chain() {
+  return {s2r_ctaid(0), s2r_tid(1), kPtrLo, kPtrHi, imadi(2, 0, kThreads, 1), imad_wide_i(10, 2, 8, 6),
+          ldg_off(3, 10, 0), iadd3i(3, 3, 1, kRZ), stg(10, 3, 8 * kThreads), exit_()};
+}
 // buf[i] = the SM number.
 std::vector<Insn> sm_number() {
   std::vector<Insn> c = prologue();
@@ -183,6 +192,7 @@ struct Env {
   MemoryManager mem{1 << 24};
   DeviceProfile prof = load_gpu("nvidia/a10");   // sm_86
   uint64_t max_steps = 0;   // a warp's instruction budget for the launches (0: the default)
+  bool host = false;        // the buffer is host memory mapped at its own address (pinned / registered, as the runtimes map it), not an allocation
   std::shared_ptr<sass::Module> load(const std::vector<Insn>& code) {
     for (size_t i = 0; i < code.size(); ++i) {
       const sass::Instr ins = sass::decode(code[i].w, 16 * i, 86);
@@ -194,10 +204,18 @@ struct Env {
   }
   // One launch of `blocks` blocks of 64 threads over a buffer whose words start as 3 * index + 7.
   Result run(sass::Module& m, uint32_t blocks) {
-    const uint64_t buf = mem.alloc(uint64_t{kWords} * 4);
     std::vector<uint32_t> init(kWords);
     for (uint32_t i = 0; i < kWords; ++i) init[i] = 3 * i + 7;
-    mem.write(buf, init.data(), uint64_t{kWords} * 4);
+    uint32_t* hp = host ? static_cast<uint32_t*>(std::aligned_alloc(4096, uint64_t{kWords} * 4)) : nullptr;
+    const uint64_t buf = host ? reinterpret_cast<uint64_t>(hp) : mem.alloc(uint64_t{kWords} * 4);
+    // (with a host buffer, also an allocation of the device: a device with no memory in use has nothing to shadow, and is not tried)
+    const uint64_t dev = host ? mem.alloc(4096) : 0;
+    if (host) {
+      std::memcpy(hp, init.data(), uint64_t{kWords} * 4);
+      mem.map_host(buf, hp, uint64_t{kWords} * 4);
+    } else {
+      mem.write(buf, init.data(), uint64_t{kWords} * 4);
+    }
     exec::LaunchConfig cfg;
     cfg.grid = {blocks, 1, 1};
     cfg.block = {kThreads, 1, 1};
@@ -219,8 +237,15 @@ struct Env {
     const sass::ExactCounts after = sass::exact_counts();
     r.counts = {after.trials - before.trials, after.committed - before.committed, after.stopped - before.stopped, after.again - before.again};
     r.words.resize(kWords);
-    mem.read(buf, r.words.data(), uint64_t{kWords} * 4);
-    mem.free(buf);
+    if (host) {
+      std::memcpy(r.words.data(), hp, uint64_t{kWords} * 4);
+      mem.unmap_host(buf);
+      std::free(hp);
+      mem.free(dev);
+    } else {
+      mem.read(buf, r.words.data(), uint64_t{kWords} * 4);
+      mem.free(buf);
+    }
     return r;
   }
 };
@@ -251,10 +276,12 @@ void same_counters(const exec::LaunchStats& a, const exec::LaunchStats& b, const
 
 // The kernel in order, then with VGPU_EXACT_THREADS = 2, 3, 4 and 8 (three launches each, and each on a module of its own so that
 // no launch is held back by an earlier stop): the same words, the same counters, the same error, and the trial ending as `commits` says.
-Result same_as_in_order(const std::vector<Insn>& code, uint32_t blocks, bool commits, const std::string& name, uint64_t max_steps = 0) {
+Result same_as_in_order(const std::vector<Insn>& code, uint32_t blocks, bool commits, const std::string& name, uint64_t max_steps = 0,
+                        bool host = false) {
   Restore restore;
   Env e;
   e.max_steps = max_steps;
+  e.host = host;
   in_order();
   const Result ref = e.run(*e.load(code), blocks);
   VCHECK_EQ(ref.counts.trials, uint64_t{0});
@@ -320,6 +347,42 @@ VTEST(a_launch_whose_blocks_fail_without_touching_memory_fails_as_the_run_in_ord
 VTEST(a_kernel_that_reads_its_sm_number_on_a_grid_larger_than_the_device_is_stopped) {
   const Result r = same_as_in_order(sm_number(), 300, /*commits=*/false, "SM number");   // (the a10 has 72 SMs)
   for (uint32_t i = 0; i < 300 * kThreads; ++i) VCHECK_EQ(r.words[i], 0u);   // in order every block is on host thread 0
+}
+
+VTEST(a_block_that_reads_host_mapped_words_an_earlier_block_wrote_is_run_in_order) {
+  // host_load_batch and load_host_run make no note of their reads: host memory is outside the shadow, and a trial never lets a block
+  // write it (every writing method refuses host-mapped bytes before the store). So a block that reads what another block of the launch
+  // wrote to host-mapped memory can only be in a trial that the write stopped. This holds the batched host path to that.
+  const Result r = same_as_in_order(strided_chain(), 200, /*commits=*/false, "strided chain in host memory", 0, /*host=*/true);
+  VCHECK(r.error.empty());
+  for (uint32_t b = 0; b <= 200; ++b)
+    for (uint32_t t = 0; t < kThreads; ++t) {
+      const uint32_t i = 2 * (b * kThreads + t);
+      VCHECK_EQ(r.words[i], 3 * (2 * t) + 7 + b);   // row 0 plus b: each block saw the one before it
+      VCHECK_EQ(r.words[i + 1], 3 * (i + 1) + 7);   // the odd words untouched
+    }
+  // And it was the store to host memory that stopped it, not a word of the shadow.
+  Restore restore;
+  char log[] = "/tmp/vgpu_exact_host_XXXXXX";
+  const int fd = ::mkstemp(log);
+  VCHECK(fd >= 0);
+  ::close(fd);
+  ::setenv("VGPU_EXACT_LOG", log, 1);
+  Env e;
+  e.host = true;
+  exact("4");
+  const Result got = e.run(*e.load(strided_chain()), 200);
+  ::unsetenv("VGPU_EXACT_LOG");
+  std::string text;
+  if (FILE* f = std::fopen(log, "r")) {
+    char line[512];
+    while (std::fgets(line, sizeof line, f)) text += line;
+    std::fclose(f);
+  }
+  ::unlink(log);
+  VCHECK_EQ(got.counts.stopped, uint64_t{1});
+  VCHECK(got.words == r.words);
+  VCHECK_CONTAINS(text, "\tstopped\ta block wrote outside the device's own memory\t");
 }
 
 VTEST(a_kernel_whose_trial_was_stopped_is_held_back_and_tried_again_later) {
@@ -478,6 +541,93 @@ VTEST(every_reading_method_is_stopped_at_bytes_another_block_wrote_and_every_wri
   std::vector<uint8_t> now(init.size());
   mem.read(a, now.data(), now.size());
   VCHECK(now == init);
+}
+
+VTEST(host_mapped_memory_may_be_read_by_every_block_and_written_by_none) {
+  // The methods that read host-mapped bytes (host_load_batch, load_host_run, and the others' host paths) make no note: host memory is
+  // outside the shadow. That is sound only because no block of a trial can write it: every writing method, given a host-mapped address,
+  // stops the trial before the store, whether the mapping is at the host's own address (as the runtimes map pinned and registered
+  // memory) or inside the device's range.
+  MemoryManager mem{1 << 24};
+  const uint64_t a = mem.alloc(1 << 16);
+  constexpr uint64_t kBytes = 8192;
+  uint8_t* hp = static_cast<uint8_t*>(std::aligned_alloc(4096, kBytes));
+  uint8_t* hq = static_cast<uint8_t*>(std::aligned_alloc(4096, kBytes));
+  std::vector<uint8_t> init(kBytes);
+  for (size_t i = 0; i < kBytes; ++i) init[i] = static_cast<uint8_t>(i * 11 + 3);
+  std::memcpy(hp, init.data(), kBytes);
+  std::memcpy(hq, init.data(), kBytes);
+  const uint64_t own = reinterpret_cast<uint64_t>(hp);   // at the host's own address: outside the device's range
+  const uint64_t inside = a + 0x4000;                     // over device addresses (as tests/unit/test_load_batch16.cpp maps one)
+  mem.map_host(own, hp, kBytes);
+  mem.map_host(inside, hq, kBytes);
+  uint64_t v[64] = {};
+  uint8_t bytes[256] = {};
+  const uint8_t sizes[2] = {4, 4};
+  size_t done = 0;
+  const auto same = +[](void*, uint64_t old) -> uint64_t { return old; };
+  const auto lane = +[](void*, size_t, uint64_t old) -> uint64_t { return old + 1; };
+  for (const uint64_t h : {own, inside}) {
+    uint64_t addrs[32];
+    for (int i = 0; i < 32; ++i) addrs[i] = h + 0x100 + 8 * i;
+    // Two blocks, on two workers, read the same host bytes by every method: nothing stops, the values are the host's, the trial is kept.
+    if (h == own) {
+      Trial t(mem);
+      for (unsigned b = 0; b < 2; ++b) {
+        t.as(b, b);
+        uint64_t want[32];
+        for (int i = 0; i < 32; ++i) std::memcpy(&want[i], hp + 0x100 + 8 * i, 8);
+        VCHECK(mem.host_load_batch(addrs, 32, 8, v));
+        for (int i = 0; i < 32; ++i) VCHECK_EQ(v[i], want[i]);
+        VCHECK(mem.load_host_run(h + 0x100, bytes, 256, 8));
+        VCHECK(std::memcmp(bytes, hp + 0x100, 256) == 0);
+        VCHECK_EQ(mem.load_scalar(h + 0x100, 8), want[0]);
+        mem.read(h + 0x100, bytes, 64);
+        VCHECK(std::memcmp(bytes, hp + 0x100, 64) == 0);
+        mem.load_run(h + 0x100, bytes, 256, 8);
+        mem.load_batch(addrs, 32, 8, v);
+        mem.load_batch16(addrs, 4, v, v + 32);
+        mem.load_broadcast(h + 0x100, 32, 4, v);
+        mem.load_quad(h + 0x100, v);
+        VCHECK_EQ(v[0], want[0]);
+        mem.load_quad_run(h + 0x100, 2, v);
+        mem.load_fields(h + 0x100, sizes, 2, v);
+        mem.load_texels(addrs, 4, 1, 4, v);
+      }
+      t.as(0, 0);
+      VCHECK(t.end().committed);
+    }
+    // A single block writes host-mapped bytes by any method: the trial stops before the store.
+    const std::pair<const char*, std::function<void()>> writers[] = {
+        {"write", [&] { mem.write(h + 0x100, v, 8); }},
+        {"fill", [&] { const uint8_t z = 0; mem.fill(h + 0x100, &z, 1, 8); }},
+        {"store_scalar", [&] { mem.store_scalar(h + 0x100, 4, 5); }},
+        {"store_run", [&] { mem.store_run(h + 0x100, v, 128, 4); }},
+        {"store_host_run", [&] { mem.store_host_run(h + 0x100, v, 128, 4); }},
+        {"store_batch", [&] { mem.store_batch(addrs, 32, 8, v); }},
+        {"host_store_batch", [&] { mem.host_store_batch(addrs, 32, 8, v); }},
+        {"store_strided", [&] { mem.store_strided(h + 0x100, 8, 32, 8, v); }},
+        {"store_quad", [&] { mem.store_quad(h + 0x100, v); }},
+        {"store_quad_run", [&] { mem.store_quad_run(h + 0x100, 2, v); }},
+        {"rmw_scalar", [&] { mem.rmw_scalar_fn(h + 0x100, 4, same, nullptr, v); }},
+        {"rmw_if_changed", [&] { mem.rmw_if_changed_fn(h + 0x100, 4, same, nullptr, v); }},
+        {"atomic_rmw", [&] { mem.atomic_rmw_fn(h + 0x100, 4, same, nullptr, v, true); }},
+        {"rmw_batch", [&] { mem.rmw_batch_fn(addrs, 32, 8, lane, nullptr, v, &done, false, true); }},
+        {"host_address", [&] { mem.host_address(h + 0x100, 4); }},
+    };
+    for (int i = 0; i < 64; ++i) v[i] = 0x5a5a5a5a5a5a5a5aull + i;
+    for (const auto& [name, f] : writers) {
+      Trial t(mem);
+      if (!stops(f)) throw vtest::Failure(std::string(name) + " wrote host-mapped memory and the trial went on");
+      VCHECK(!t.end().committed);
+    }
+  }
+  VCHECK(std::memcmp(hp, init.data(), kBytes) == 0);   // no store was made
+  VCHECK(std::memcmp(hq, init.data(), kBytes) == 0);
+  mem.unmap_host(own);
+  mem.unmap_host(inside);
+  std::free(hp);
+  std::free(hq);
 }
 
 VTEST(blocks_may_share_what_they_only_read_and_keep_what_they_alone_write_and_a_stopped_trial_is_undone_to_the_byte) {

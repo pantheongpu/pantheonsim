@@ -1,0 +1,11 @@
+M1 compare: a chunk that differs is listed as agreeing: KILLED (exit 1; failing: compare_with_card_lists_the_chunks_that_agree_and_hands_over_the_others_with_their_bytes)
+M2 compare: the short last chunk is compared over a whole chunk: KILLED (exit 1; failing: compare_with_card_lists_the_chunks_that_agree_and_hands_over_the_others_with_their_bytes)
+M3 compare: the lists are not cleared between compares: KILLED (exit 1; failing: compare_with_card_lists_the_chunks_that_agree_and_hands_over_the_others_with_their_bytes)
+M4 keep: every listed chunk becomes Both, whatever its state: KILLED (exit 1; failing: keep_verified_chunks_gives_the_card_only_the_simulators_chunks_that_agreed)
+M5 keep: an agreeing chunk becomes Card, not Both: KILLED (exit 1; failing: chunks_kept_after_a_verify_are_guarded_by_the_gate_like_any_card_copy, keep_verified_chunks_gives_the_card_only_the_simulators_chunks_that_agreed)
+M6 keep: every chunk of the allocation becomes Both: KILLED (exit 1; failing: keep_verified_chunks_gives_the_card_only_the_simulators_chunks_that_agreed)
+M7 keep: a range of another size is not skipped: KILLED (exit 1; failing: keep_verified_chunks_gives_the_card_only_the_simulators_chunks_that_agreed)
+M8 keep: the lookups are not voided: KILLED (exit 1; failing: chunks_kept_after_a_verify_are_guarded_by_the_gate_like_any_card_copy)
+M9 keep: the new count is not published: KILLED (exit 1; failing: chunks_kept_after_a_verify_are_guarded_by_the_gate_like_any_card_copy, keep_verified_chunks_gives_the_card_only_the_simulators_chunks_that_agreed)
+M10 keep: an allocation that had a copy is voided, one that had none is not: KILLED (exit 1; failing: chunks_kept_after_a_verify_are_guarded_by_the_gate_like_any_card_copy)
+10 of 10 killed

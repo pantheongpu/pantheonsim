@@ -1,0 +1,4 @@
+#!/bin/bash
+# A compiler that answers the identity queries as the real one and fails every compile at once (the section is Failed: the plain loop).
+case "$1" in --version|-dumpmachine) exec /usr/bin/c++ "$@";; esac
+exit 1

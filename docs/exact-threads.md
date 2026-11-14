@@ -150,7 +150,7 @@ The other ways a block could see the order of blocks are closed one by one:
 | a kernel that launches kernels | not tried |
 | a kernel that polls memory (lockstep), cooperative launches, clusters (and `clusterlaunchcontrol.try_cancel`, which takes the next block from the hand-out) | not tried: these keep their own schedules |
 | textures and surfaces | not tried |
-| pinned, managed or registered host memory | reads are allowed (no block can write it: a store to host memory stops the trial); the host itself writing it during a launch is as visible in order |
+| pinned, managed or registered host memory | reads are allowed and not noted (the shadow covers the device's range only; `host_load_batch` and `load_host_run` make no note at all): no block can write it, because every writing method stops the trial before a store to a host-mapped address, wherever the mapping is; the host itself writing it during a launch is as visible in order |
 | virtual-memory reservations, mappings and handles, memory shared with another process, file-backed allocations | not tried: the same bytes may be mapped at two addresses, which a shadow by address cannot see |
 | an armed fault (`vgpu fault arm`), the host-GPU card gate, the result cache, a memory trace | not tried |
 | `VGPU_SASS_TRACE`, `VGPU_TRACE`, `VGPU_RACE`, `VGPU_TIER_STATS` | not tried: their output is in the order things ran |
@@ -240,9 +240,11 @@ and taken by compare-and-swap for reads and for writes, pieces and bytes kept, a
 
 `tests/unit/test_exact_threads.cpp` (also run with `VGPU_TIER=0` and `VGPU_FASTPATH=0`, which send the accesses through other
 methods of the memory manager, and with `VGPU_EXACT_PAGES=0`): kernels with independent blocks, blocks that store to the same words,
-a chain in which each block reads what the one before stored, a fault in block 1, a step budget that fails every block before its
+a chain in which each block reads what the one before stored (also on every other word of a host-mapped buffer, through the batched host
+path), a fault in block 1, a step budget that fails every block before its
 store, and `%smid` on a grid larger than the device, each compared word for word and counter for counter with the run in order at 2,
-3, 4 and 8 threads; every reading and writing method of `MemoryManager` against the shadow; a stopped trial undone to the byte across
+3, 4 and 8 threads; every reading and writing method of `MemoryManager` against the shadow; every writing method stopping the trial at
+a host-mapped address (at the host's own address and inside the device's range), and every reading method's host path kept; a stopped trial undone to the byte across
 chunk ends and at an allocation's tail.
 
 For the note by page: a second block, on the same worker and on another, in a page that a first block claimed whole (as its reader;

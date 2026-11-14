@@ -229,8 +229,8 @@ enum class InsnClass : uint8_t {
                // addresses as LDG and STG, so the card needs nothing that only the simulator holds
   Tensor,      // HMMA, IMMA, DMMA
   AtomInt,     // integer atomics that return the old value (ADD, MIN, MAX, AND, OR, XOR, INC, DEC): memory ends the same, the returned values depend on the order
-  AtomFloat,   // float atomics that return a value: opt-in (VGPU_HOST_GPU_ATOMICS=1)
-  AtomSwap,    // CAS, CAST.SPIN, EXCH: opt-in; the card does not agree with itself from run to run on programs built on these (09 doc, M2)
+  AtomFloat,   // float atomics that return a value: admitted unless VGPU_HOST_GPU_ATOMICS=0 (an opt-in until Round sp66)
+  AtomSwap,    // CAS, CAST.SPIN, EXCH: as AtomFloat; the card does not agree with itself from run to run on programs built on these (09 doc, M2)
   Never,       // textures, surfaces, anything not named
 };
 inline constexpr unsigned kInsnClasses = 11;
@@ -285,10 +285,13 @@ inline InsnClass turbo_class(const std::string& mnemonic, const std::vector<std:
   if (exact_opcode_allowed(mnemonic, mods)) return C::Exact;
   if (mnemonic == "MUFU") return C::Mufu;
   if (is_one_of({"HADD2", "HMUL2", "HFMA2", "HSETP2", "HSET2", "HMNMX2"})) return C::Half;
-  if (is_one_of({"CALL", "RET"})) return C::Call;
+  // (LEPC: the return address of an absolute call, CUDA 13's vprintf call; the card's own program counter, used by the call and its RET alone. Round sp66.)
+  if (is_one_of({"CALL", "RET", "LEPC"})) return C::Call;
   if (is_one_of({"HMMA", "IMMA", "DMMA"})) return C::Tensor;
+  // (Round sp66: B2R reads the result of a block's BAR.RED, the same function on both sides; NANOSLEEP is a hint that a spin-wait backs off, as cub's
+  // decoupled look-back does: neither touches anything the card lacks)
   if (is_one_of({"IDP", "VABSDIFF", "VABSDIFF4", "VIADDMNMX", "VIMNMX3", "FMNMX3", "F2IP", "FSWZADD", "REDUX", "LDGSTS", "LDGDEPBAR", "LDSM", "MOVM", "FFMA2",
-                 "FMUL2", "FADD2"}))
+                 "FMUL2", "FADD2", "B2R", "NANOSLEEP"}))
     return C::Extra;
   return C::Never;
 }
@@ -299,18 +302,66 @@ inline bool call_stays_inside(bool relative, bool to_label, int64_t target, uint
   return relative && to_label && target >= 0 && static_cast<uint64_t>(target) >= lo && static_cast<uint64_t>(target) <= hi;
 }
 
+// ---- what a kernel reaches besides its code (Round sp66) ----------------------------------------------------------------------------
+// A function the module calls but does not define (Cubin::externs): the driver links it when it loads the module on the card, the simulator runs a
+// builtin in its place. What each kind needs on the card, and so whether a kernel that reaches one can go there:
+//   * vprintf: the card writes the arguments to its printf buffer and the driver prints them when the host synchronises with the kernel, which the
+//     card path does at once (cuCtxSynchronize), after flushing the process's stdout; the text is the card's formatting of the card's values. Turbo
+//     mode admits it (VGPU_HOST_GPU_TURBO_OFF=printf keeps it out); exact mode does not (its promise is about memory, not about a second printer);
+//   * __assertfail: a failed assert on the card ends the kernel with a sticky error, the context is lost, and data only the card holds with it;
+//   * malloc and free: the card's heap is the card's own, outside the simulator's window: a pointer from it, kept in memory, means nothing to the
+//     simulator, and the simulator's heap is not on the card;
+//   * the device runtime (device-side launches, cudaDeviceSynchronize in a kernel): the child grids would be the card's, with the card's addresses;
+//   * anything else: not known.
+enum class ExternKind : uint8_t { Printf, Assert, Heap, DeviceLaunch, Other };
+inline ExternKind extern_kind(const std::string& name, bool device_runtime) {
+  if (device_runtime) return ExternKind::DeviceLaunch;
+  if (name == "vprintf") return ExternKind::Printf;
+  if (name == "__assertfail" || name == "__assert_fail") return ExternKind::Assert;
+  if (name == "malloc" || name == "free") return ExternKind::Heap;
+  return ExternKind::Other;
+}
+inline const char* extern_kind_name(ExternKind k) {
+  static const char* const n[] = {"vprintf", "__assertfail", "malloc/free", "device-side launch", "an unknown external function"};
+  return n[static_cast<unsigned>(k)];
+}
+inline bool extern_admitted(ExternKind k, Mode mode, bool printf_off) { return k == ExternKind::Printf && mode == Mode::Turbo && !printf_off; }
+
+// The texture and surface instructions: they read the simulator's own tables (the handle in the instruction or a register is an index into
+// them), so a kernel that holds one cannot run on the card. Neither the exact set nor any turbo class names them; a kernel without one does
+// not read a texture object, whatever objects exist (until Round sp66 one live texture object kept every launch of the device off the card).
+inline bool texture_mnemonic(const std::string& m) {
+  static const char* const kTex[] = {"TEX", "TEXS", "TLD", "TLDS", "TLD4", "TLD4S", "TXD", "TXQ", "TMML", "SULD", "SUST", "SUATOM", "SURED", "SUQUERY"};
+  for (const char* t : kTex)
+    if (m == t) return true;
+  return false;
+}
+
+// An absolute call to the first instruction of a code section of the module (Round sp66): a device function the compiler kept out of line, in a
+// section of its own (a -rdc build). The driver links the call to its own copy of the same code, so the call is followed: the callee's section is
+// classed with the kernel's. `base`, `count`: the section the target lies in (its first address, its instructions; 0 is no code).
+inline bool call_to_entry(bool relative, bool to_label, int64_t target, uint64_t base, uint64_t count) {
+  return !relative && to_label && target >= 0 && count > 0 && static_cast<uint64_t>(target) == base;
+}
+
 // The classes a kernel holds, as bits, and what the mode's switches make of them.
 using ClassMask = uint32_t;
 inline constexpr ClassMask class_bit(InsnClass c) { return ClassMask{1} << static_cast<unsigned>(c); }
 
 struct TurboSwitches {
-  bool atomics = false;     // VGPU_HOST_GPU_ATOMICS=1: float atomics with a returned value, CAS, CAST.SPIN and EXCH
+  // Float atomics with a returned value, CAS, CAST.SPIN and EXCH: admitted unless VGPU_HOST_GPU_ATOMICS=0 (Round sp66; an opt-in before, see
+  // docs/perf-design/12-host-gpu-turbo.md section 2 for why the default changed).
+  bool atomics = true;
   ClassMask off = 0;        // VGPU_HOST_GPU_TURBO_OFF: classes switched off for an experiment
+  bool printf_off = false;  // VGPU_HOST_GPU_TURBO_OFF=printf: a kernel that calls vprintf stays in the simulator (Round sp66)
 };
 
-// VGPU_HOST_GPU_TURBO_OFF=mufu,tensor,half,call,atomics,red,extra (a comma list). False, with the bad name in *bad, for anything else.
-inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad = nullptr) {
+// VGPU_HOST_GPU_TURBO_OFF=mufu,tensor,half,call,atomics,red,extra,printf (a comma list). False, with the bad name in *bad, for anything else.
+// `printf` is not a class of instructions (a kernel's call to vprintf is, once admitted, of the call class): it sets *printf_off, and is a bad
+// name when printf_off is null.
+inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad = nullptr, bool* printf_off = nullptr) {
   *off = 0;
+  if (printf_off) *printf_off = false;
   if (!text) return true;
   const std::string t(text);
   for (size_t at = 0; at <= t.size();) {
@@ -325,6 +376,7 @@ inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad =
     else if (name == "atomics") *off |= class_bit(InsnClass::AtomInt) | class_bit(InsnClass::AtomFloat) | class_bit(InsnClass::AtomSwap);
     else if (name == "red") *off |= class_bit(InsnClass::FloatRed);
     else if (name == "extra") *off |= class_bit(InsnClass::Extra);
+    else if (name == "printf" && printf_off) *printf_off = true;
     else {
       if (bad) *bad = name;
       return false;
@@ -338,7 +390,7 @@ enum class TurboRefusal : uint8_t {
   None,      // admitted
   Never,     // an instruction outside every class
   Off,       // a class switched off with VGPU_HOST_GPU_TURBO_OFF
-  Atomics,   // a float atomic with a returned value, a CAS or an EXCH, without VGPU_HOST_GPU_ATOMICS=1
+  Atomics,   // a float atomic with a returned value, a CAS or an EXCH, with VGPU_HOST_GPU_ATOMICS=0
 };
 inline TurboRefusal turbo_refusal(ClassMask classes, const TurboSwitches& sw) {
   if (classes & class_bit(InsnClass::Never)) return TurboRefusal::Never;
@@ -497,6 +549,12 @@ struct Costs {
   // process wall time (docs/performance.md "Round sp42": the native process of a trivial program also takes 0.24 s). 0.25 rounds it up. VGPU_HOST_GPU_START_COST
   // sets it in seconds; 0 charges nothing (the rule before sp43: the driver starts at the first launch the per-launch rule accepts).
   double start_cost_s = 0.25;
+  // While the driver is not up, a launch that only the account sends (should_offload_with_start: the program has spent start_cost_s already, but the
+  // launch does not repay the start by itself) must save at least start_cost_s / start_launches by itself: the start is then repaid within this many
+  // launches like it. 0 asks nothing more of it (the account alone, the rule from sp43 to the integration of sp64-sp68; VGPU_HOST_GPU_START_LAUNCHES).
+  double start_launches = 50;
+  // ... and the first-launch rule's launch, whose estimate is static (0.2 to 80 times off), a larger share: start_cost_s / start_launches_static.
+  double start_launches_static = 20;
 };
 
 struct Estimate {
@@ -527,12 +585,80 @@ inline bool should_offload(const Estimate& e, const Costs& c) {
 //     This is the ski-rental rule: the start is bought only after as much has been spent renting as buying costs, so a start that turns out useless costs at most
 //     the time the program had already spent, never more than doubling it, and a program that never spends that much never starts the driver.
 // With the driver up the start is paid and only should_offload applies. start_cost_s <= 0 is the old rule.
+//
+// The account alone bought starts that short programs could not repay: it says the program has run long enough, not that the launches still to
+// come will save the start. On one A10G (Round sp66) four CUDA Samples whose newly admitted kernels made the account buy it lost 0.13 to 0.24 s:
+// LargeKernelParameter (launches of under 0.5 ms), threadFenceReduction (about 3.5 ms), dct8x8 (3.8 ms), and MC_EstimatePiInlineP, whose last
+// launch (a static estimate of 3.0 ms, by the first-launch rule) was sent after a 3.3 s launch had filled the account. So a launch the account
+// sends must also save a share of the start by itself (start_share_saved, Costs::start_launches): 5 ms with the defaults, the start repaid within
+// 50 launches like it. The launches that bought the start in the programs where it paid were longer: logged on server3 (integration of sp64-sp68),
+// whose simulator ran these programs about 4 times as fast as the A10G rig's, 18 to 28 ms in PolyBench FDTD-2D, LU and GRAMSCHM, 19 ms (static) in
+// 3MM, 5.4 ms in Rodinia gaussian (about 20 ms on the rig) and 1.9 ms in HeCBench asyncAllocation's turbo run (about 8 ms on the rig: 800 launches
+// in 6.6 s; 6.6x faster in turbo mode, Round sp66). The constant is fitted to that corpus on the rig: the closest are dct8x8 below it (1.3x) and
+// asyncAllocation above it (1.6x), and a host whose simulator is much faster than the rig's sees shorter launches and buys fewer starts.
+// A first launch sent by its static estimate (first_launch_offload) must save start_cost_s / start_launches_static, 12.5 ms: the estimate does not
+// depend on the host, and on server3 it was 8.5 ms for the dct8x8 kernel whose first launch would otherwise buy the start in turbo mode, against 15.5 ms
+// in HeCBench atomicPerf (1.43x in turbo mode on the rig, Round sp66) and 19 ms in 3MM (1.25x).
+// Launches that repay the start alone (the sampled ones of SYRK, SYR2K, 2MM, COVAR, CORR and black-scholes among them) are not affected, and
+// neither is any launch once the driver is up.
+inline bool start_share_saved(const Estimate& e, const Costs& c) {
+  if (!(c.start_launches > 0)) return true;
+  return e.sim_s - card_path_seconds(e, c) >= c.start_cost_s / c.start_launches;
+}
 inline bool should_offload_with_start(const Estimate& e, const Costs& c, bool driver_started, double eligible_sim_spent_s) {
   if (!should_offload(e, c)) return false;                      // not worth a card even with the driver up
   if (driver_started || c.start_cost_s <= 0) return true;
   Estimate cold = e;
   cold.start_s = c.start_cost_s;
-  return should_offload(cold, c) || eligible_sim_spent_s >= c.start_cost_s;
+  if (should_offload(cold, c)) return true;                     // the launch repays the start by itself
+  return eligible_sim_spent_s >= c.start_cost_s && start_share_saved(e, c);   // (`e`: the card path with the driver up)
+}
+
+// ---- a launch while the card holds the live memory (Round sp65) ---------------------------------------------------------------------
+// With the residency of the live memory (Residency), a launch on the card leaves every live chunk the card's alone (Where::Card), and a launch the
+// simulator runs first pulls every such chunk back and leaves every chunk the simulator's (Residency::sim_launch), so the next card launch pushes them
+// all again. should_offload weighs the launch's simulator time alone against the card path: a short launch between two card launches (PolyBench
+// GRAMSCHM's two small kernels between its long one, Rodinia gaussian's Fan1 between its Fan2) is then kept in the simulator, which pulls the whole
+// live memory back for it, and the card launch after it pushes it all again: Round sp65 measured X MiB moved that way over the corpus.
+// So, once the card holds chunks the simulator does not, a launch of a kernel with an estimate is priced with what each side really moves:
+//   keeping it costs its simulator time AND the pull of every chunk only the card holds (`card_only_bytes`), at the size rule's pull rate;
+//   sending it costs the launch, the card's time for the kernel (its last time there; kernel_s_default before it has run there) and the push of the
+//   chunks the simulator holds alone (`push_bytes`): nothing else moves, the card copy stays.
+// It goes when keeping it costs `margin` times sending it, and at least min_sim_s (the same margin and floor as should_offload, now on both sides'
+// real costs). The pushes the next card launch would make after a simulator launch are not counted: they are not paid if no card launch follows,
+// so the rule errs towards the simulator. Only with the driver up (a launch is never what starts it: the start-cost rules are untouched) and only
+// when the card holds data (`card_only_bytes` > 0, which needs the last launch that touched the memory to have run on the card).
+struct StreakLaunch {
+  double sim_s = 0;                       // the history's estimate (SimTimeTable::predict)
+  uint64_t card_only_bytes = 0;           // live bytes in Where::Card chunks: what the simulator pulls before it runs the launch
+  uint64_t push_bytes = 0;                // live bytes in Where::Host chunks: what the card needs first
+  std::optional<double> card_kernel_s;    // this kernel's last time on the card
+};
+// What keeping the launch in the simulator costs, and what sending it does.
+inline double streak_keep_seconds(const StreakLaunch& s, const Costs& c) {
+  return s.sim_s + static_cast<double>(s.card_only_bytes) / c.pull_bytes_per_s;
+}
+inline double streak_card_seconds(const StreakLaunch& s, const Costs& c) {
+  return c.launch_s + s.card_kernel_s.value_or(c.kernel_s_default) + static_cast<double>(s.push_bytes) / c.push_bytes_per_s;
+}
+inline bool streak_offload(const StreakLaunch& s, const Costs& c, bool driver_started) {
+  if (!driver_started || s.card_only_bytes == 0 || !(s.sim_s > 0)) return false;
+  const double keep = streak_keep_seconds(s, c);
+  return keep >= c.min_sim_s && keep > c.margin * streak_card_seconds(s, c);
+}
+
+// What the bans (offload_paid_off, TrafficTable) weigh a card launch's path against: the simulator's estimate, and while the card holds chunks the
+// simulator does not (`card_only_bytes` > 0, the streak rule on), the pull that keeping the launch would have cost as well, whichever rule sent it.
+// Against the estimate alone, one slow launch of GRAMSCHM's 1-block kernel1 (0.15 ms on the card, 0.29 ms estimated, sent by the size rule)
+// ended its offloading and broke the streak for the rest of the run (Round sp65, D).
+inline double ban_reference_seconds(const StreakLaunch& s, const Costs& c, bool streak_rule) {
+  return streak_rule && s.card_only_bytes > 0 ? streak_keep_seconds(s, c) : s.sim_s;
+}
+
+// A grid or block with a zero dimension is the simulator's to refuse with its own error (cudaErrorInvalidValue, as the A10G answers with the CUDA 13.0 runtime); on the card the launch
+// fails, and with memory resident there that ended the mode with an internal error (PolyBench LU's last lu_kernel1, Round sp65).
+inline bool launch_shape_empty(const uint32_t grid[3], const uint32_t block[3]) {
+  return !grid[0] || !grid[1] || !grid[2] || !block[0] || !block[1] || !block[2];
 }
 
 // ---- start-up of the real driver ---------------------------------------------------------------------------------------------------
@@ -691,7 +817,9 @@ inline bool first_launch_offload(const FirstLaunch& f, const Costs& c, bool driv
   e.sim_s = static_sim_seconds(f.blocks, f.threads_per_block, f.static_instrs, c);
   e.push_bytes = f.live_bytes;
   e.pull_bytes = f.live_bytes;
-  return should_offload_with_start(e, c, driver_started, eligible_sim_spent_s);
+  Costs fc = c;   // (the static estimate's share of the start, see should_offload_with_start; none when start_launches asks none)
+  if (c.start_launches > 0) fc.start_launches = c.start_launches_static;
+  return should_offload_with_start(e, fc, driver_started, eligible_sim_spent_s);
 }
 
 // ---- the first blocks of a launch, timed (docs/perf-design/12-host-gpu-turbo.md "The first blocks of a launch, timed"; Round sp60b) ----------

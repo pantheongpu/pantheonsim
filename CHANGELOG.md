@@ -7,6 +7,63 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Host-GPU mode (experimental, opt-in), both modes: while the real driver is not started, a launch that would start it only because the program
+  has already simulated as long as the start costs (the start-cost account) must now also save a share of the start by itself: 5 ms, or 12.5 ms
+  for a kernel's first launch judged by its static estimate (`VGPU_HOST_GPU_START_LAUNCHES`, `0` for the rule before). Four short CUDA Samples
+  (LargeKernelParameter, threadFenceReduction, MC_EstimatePiInlineP, dct8x8) paid a 0.15 to 0.25 s start for launches of a few milliseconds and
+  ran 7 to 47 % slower than in the simulator; launches long enough to repay the start, and every launch once the driver is up, are decided as
+  before. With `VGPU_HOST_GPU_LOG` the launch that starts the driver says which rule sent it.
+
+- Tier 2 (`VGPU_JIT=1`, still off by default), the compile ([round sp64](docs/perf-design/rounds/11-rounds-sp36-sp41.md)): a section
+  whose compile is running is now on the plain run loop instead of the counting loop, which cost the program 2 to 8 % for as long as the
+  compile took (a whole run when the compile did not finish before the end, as at sixteen threads). With GCC the runtime header that every
+  generated source includes is compiled once into the cache's runtime directory (about 53 MB) after the first compile of a process that
+  found none, and every later compile reads it: 0.33 to 0.37 s less a compile on the measuring host, half of a small section's, the same
+  object bytes; `VGPU_JIT_PCH=0` turns it off. `VGPU_JIT_STATS` prints a `jit-compile:` line for each compile (why, size, when it was asked
+  for, started and done, how it ended) and a `jit-pch:` line. At sixteen threads a compile longer than the program still never finishes.
+  Results and counters are unchanged.
+
+- Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: while the card holds memory the simulator does not (the launch before ran
+  there), a launch of a kernel with an estimate is weighed with what each side really moves: keeping it in the simulator costs its time plus
+  pulling back every chunk only the card holds, sending it costs the launch, the kernel's time on the card and the push of what only the
+  simulator holds. Before, a short launch between two card launches stayed in the simulator for its own time alone, pulled the whole live memory
+  back, and the next card launch pushed it all again. Measured on one A10G (Round sp65): PolyBench LU 11.6 s to 1.5 s in turbo mode and with
+  `VGPU_HOST_GPU_DIV=1`, Rodinia gaussian 0.99 s to 0.53 s, GRAMSCHM's traffic from 98 GB to 40 GB each way; outputs identical.
+  `VGPU_HOST_GPU_STREAK=0` keeps the old rule; the summary's `host_gpu_streak:` line counts the launches sent this way
+  ([design](docs/perf-design/12-host-gpu-turbo.md), section 9). A launch with a grid or block dimension of 0 now stays in the simulator, which
+  reports its own configuration error, instead of failing on the card (it ended the mode with an internal error when the card held memory).
+- Host-GPU mode (experimental, opt-in), exact mode: `VGPU_HOST_GPU_SQRT=1` also admits kernels whose only instructions outside the exact set are
+  the IEEE square root sequence nvcc builds for `sqrtf` and `__fsqrt_rn` (`MUFU.RSQ`, a range check, a refinement, a slow-path subroutine), alone or
+  beside the division sequence of `VGPU_HOST_GPU_DIV=1`. The sequence is recognised by what it computes, every path of it against the code an A10G
+  ran over all 2^32 inputs with no difference; a bare `rsqrtf` stays out. Off by default: unlike the division's, the refinement is not exact for every
+  reciprocal square root one ulp off, so it is exact only on a card whose `MUFU.RSQ` passes `tools/probes/hostgpu_mufu_card_experiment.sh` (so far the
+  A10G). On an A10G (Round sp68) every launch of the admitted kernels was identical under `VGPU_HOST_GPU_VERIFY`; HeCBench hellinger ran 6.4x faster;
+  PolyBench GRAMSCHM's device part went from 44.6 s to 3.1 s once combined with Round sp65's rule (on its own the one-thread kernel stays in the
+  simulator for its size). `tools/probes/hostgpu_idiom_scan` lists, without running a program, which of its kernels are in the exact set and by which
+  idiom ([docs/cli.md](docs/cli.md), [rounds](docs/perf-design/rounds/11-rounds-sp36-sp41.md)).
+
+- Host-GPU mode (experimental, opt-in), `VGPU_HOST_GPU_VERIFY`: after each compare the chunks whose bytes on the card equal the simulator's
+  stay on the card, and only the others (and what the host wrote since) are pushed before the next launch; before, all live memory was pushed
+  before every launch. The simulator still runs each launch with no card copy valid, and the program's output is the simulator's as before.
+  On a stand-in card (server3, Round sp67) PolyBench 3DCONV under verify goes from 39.3 s to 6.2 s (0.37 s plain), the other seven programs
+  measured from 1.0x to 1.4x faster; on an A10G 3DCONV 46.5 s to 8.5 s and the others 1.04x to 1.29x faster, every launch identical; the exit summary's "MiB went to the card" is smaller accordingly
+  ([docs/perf-design/10-host-gpu-hooks.md](docs/perf-design/10-host-gpu-hooks.md) section 8, pantheonsim #569).
+
+- Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: what a kernel's module holds besides code no longer keeps the kernel in the
+  simulator by itself. A kernel that uses the module's `__device__` or `__constant__` variables can run on the card: the card is given a copy of
+  the module whose references to the variables are the simulator's addresses (so `cudaMemcpyToSymbol`, `cudaMemcpyFromSymbol`,
+  `cudaGetSymbolAddress` and the simulator's own kernels see the same copy), and the constant banks with `__constant__` variables are filled from
+  the simulator's before each launch. A kernel is judged by the external functions it calls itself, not by its module's: one that calls `malloc`,
+  `free` or `assert`, or launches kernels, stays in the simulator; a module with `__managed__` variables still keeps all its kernels there. A live
+  texture object no longer keeps every launch of the device off the card (texture and surface instructions are refused by the kernel's code, as
+  they always were), nor does a launch from a CUDA graph (a kernel that sets a conditional handle is kept by what it calls). Exact mode's results are still the simulator's bits. Turbo mode also admits kernels that call `printf` with an immediate absolute call (the card's lines are
+  printed when the launch is waited for, after the program's earlier output; `VGPU_HOST_GPU_TURBO_OFF=printf` keeps them out; nvcc 13.0 calls
+  `vprintf` through a register, which is not followed yet, so on that toolkit such kernels still stay) and, by default, float
+  atomics with a returned value, compare-and-swap and exchange (`VGPU_HOST_GPU_ATOMICS=0` keeps them out; an opt-in before).
+  `VGPU_HOST_GPU_WIDER=0` restores the earlier rules for A/B runs, and with `VGPU_HOST_GPU_LOG` the exit summary lists per kernel the launches kept
+  in the simulator and why, with their simulator seconds (`host_gpu_kept:`) ([design](docs/perf-design/12-host-gpu-turbo.md), section 10;
+  Round sp66; pantheonsim #587). Measured on one A10G: the 45 programs whose decisions change go from 1.08x to 1.12x
+  (exact) and from 1.20x to 1.60x (turbo) against the simulator, outputs identical; four short programs lose 0.13 to 0.24 s to the driver start.
 - Under `vgpu run --preload`, where the driver is loaded privately (#597), CUPTI and NVSHMEM now find it: they looked driver
   functions up in the global scope only, which a private library is not in. CUPTI's callbacks named a placeholder for the current
   context instead of the one the program's driver calls find current, and `nvshmemx_cumodule_init` and `nvshmemx_culibrary_init`

@@ -1,0 +1,6 @@
+First pass (the tests of commit fff6f7b1): the survivors and the count; every other mutant was killed.
+ 1 SURVIVED: no card data needed
+ 3 SURVIVED: a negative estimate passes
+ 7 SURVIVED: the floor strict
+10 SURVIVED: the margin not strict
+19 of 23 killed

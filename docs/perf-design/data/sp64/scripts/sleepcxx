@@ -1,0 +1,4 @@
+#!/bin/bash
+# A compiler that answers the identity queries as the real one and never finishes a compile (the section stays Queued).
+case "$1" in --version|-dumpmachine) exec /usr/bin/c++ "$@";; esac
+exec sleep 100000

@@ -17,7 +17,10 @@
 #
 # Acceptance (the script prints one VERDICT line per item and exits 0 only when every IEEE item passes and the harness sees its mutation):
 #   VERDICT div      PASS  <=>  all 12 RESULT lines of op=div have differ=0 and tested=4294967296      -> VGPU_HOST_GPU_DIV may become the default
-#   VERDICT sqrtrn   PASS  <=>  differ=0 over all 2^32 patterns                                          -> a recognizer of the sqrt.rn idiom may be written and enabled
+#   VERDICT sqrtrn   PASS  <=>  differ=0 over all 2^32 patterns                                          -> VGPU_HOST_GPU_SQRT=1 (Round sp68's recogniser) may be trusted on
+#                                                                                                          this card: the refinement is NOT exact for every
+#                                                                                                          rsqrt one ulp off (test_host_gpu_ref), so each
+#                                                                                                          architecture needs its own PASS
 #   VERDICT rcprn    PASS  <=>  differ=0 over all 2^32 patterns                                          -> same for rcp.rn
 #   VERDICT harness  PASS  <=>  the three mutated runs (stride 257) each report differ > 0
 #   INFO bare MUFU lines (rcp rsq sqrt ex2 lg2) are printed with their differ counts and max_ulp and never fail the script.

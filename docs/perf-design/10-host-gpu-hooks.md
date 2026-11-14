@@ -127,3 +127,41 @@ The alternative is a native-Linux card (an A10G on AWS, not approved).
 | no workload slower with the mode on | **not re-measured** (no card; section 6). #459's traffic ban and first-launch rule are the fix for LU, measured on the A10G |
 | identical hashes on all eligible workloads | **not re-measured** (section 6). The verify mode and the A10G corpus run stand |
 | off by default and bit-identical when off | yes: the new code runs only after `VGPU_HOST_GPU=exact`; with it unset the only change is `card_blocker()` which is never called, and the config keys write nothing unless set. The one visible change with the mode OFF: none. With a typo in `VGPU_HOST_GPU` a line is printed (before: silent off) |
+
+## 8. Verify mode gives the card back the chunks that agreed (Round sp67, pantheonsim #569)
+
+Round sp59 made verify mode give the card copy up before the simulator runs a launch (`Runtime::before_simulated`: every chunk Host, nothing pulled), so the
+simulator's launch never runs with a card copy valid: its accesses take the batched and hot-location paths of a plain run, and the per-lane scalar path that
+Round sp45 measured (2DCONV 1.65 s against 0.41 s plain) is no longer on a verify run's way. #569 asked for those fast paths with a card copy; measured first
+on this branch's base (server3, stand-in card), they already run: 2DCONV verify 0.70 s against 0.49 s plain, and the rest of the gap is the launch's copies.
+What sp59's rule cost instead was that every launch pushed all live memory again: PolyBench 3DCONV, 254 launches on 128 MiB, 39.3 s against 0.37 s plain.
+
+The change: after the compare in `note_simulated`, a chunk whose card bytes equal the simulator's becomes a valid card copy again (`keep_verified_chunks`,
+vgpu/host_gpu_track.hpp): Host to Both. The next launch on the card pushes only the chunks that are still Host. The compare itself reads the simulator's
+memory one chunk at a time into a buffer that stays in the cache, and the buffers of the card's bytes are kept from launch to launch
+(`compare_with_card`; `Pending::reset`).
+
+Why the gate's promises hold:
+
+* **The simulator never runs a launch with a card copy valid.** Unchanged: `before_simulated` gives every chunk up before every simulator launch, the
+  repeat of a card launch (verify) and any other one (the `reset_for_simulator` path, whose pull is skipped in verify mode). A kept chunk is Both from the
+  compare to the next launch, never during one, so the atomics of the simulator's host threads never meet the gate's slow path (the bug of sp59).
+* **The next launch on the card starts from the simulator's memory.** A chunk is kept only when its bytes on the card, copied back right after the card's
+  launch, equal the simulator's after the simulator's launch; no launch runs on the card between the copy and the compare. Every other chunk stays Host and is
+  pushed. In turbo mode the bytewise test comes first, so a chunk that differs within tolerance is pushed too: differences still do not carry from one
+  launch to the next.
+* **What the host does between launches is seen.** A kept chunk is an ordinary card copy for the inventory of section 2: a host write (`write`, `fill`,
+  a device-to-device copy, which declines a card-valid allocation and falls back to `read` + `write`) asks the gate and makes the chunk Host, so it is pushed
+  again; a host read changes nothing (Both) and pulls nothing (the simulator's memory is the truth in verify mode); a free drops the entry; an IPC export drops it
+  too (its pull is skipped in verify mode, as every pull is). An allocation that had no card-valid chunk and has one now is dropped from every thread's lookup memory (`card_void_lookups`, as after
+  a launch on the card), so no remembered lookup reaches it without the gate.
+* **Exclusive.** The change of chunk states is made in `note_simulated`, which holds the gate's lock exclusively: a thread's `GateMemory` of settled chunks
+  is voided by the generation, as for every other change.
+* **Nothing else moves.** Only verify runs reach the code (the pending launch exists only then); plain runs never construct the mode, and `exact` and `turbo`
+  without verify take the paths they took. The program's output is the simulator's, as before. A verify run now keeps one buffer per live range for the card's
+  bytes between launches (the size of live memory), where it allocated and freed one per launch.
+
+Tests: `test_host_gpu_track` (`compare_with_card_...`, `keep_verified_chunks_...`, `chunks_kept_after_a_verify_are_guarded_by_the_gate_...`), 10 of 10 mutants
+killed (data/sp67/mutants.txt); `run_host_gpu_stub.sh` step 28 (a stand-in card that keeps memory and computes nothing: an allocation no kernel touches goes once,
+a host memset of part of it goes again, 12.1 MiB pushed where the base pushed 36.0, and a 17th differing chunk would show a missed memset). Measurements: Round
+sp67 in [rounds/11-rounds-sp36-sp41.md](rounds/11-rounds-sp36-sp41.md).

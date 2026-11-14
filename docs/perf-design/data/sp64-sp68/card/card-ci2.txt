@@ -1,0 +1,49 @@
+GPU 0: NVIDIA A10G (UUID: GPU-b4bc725f-7e64-4017-cce8-612d1e9e3e28)
+== build
+== unit tests
+== e2e (card present: a skip is a failure)
+
+100% tests passed, 0 tests failed out of 1
+
+Total Test time (real) =  32.64 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Total Test time (real) = 152.05 sec
+== verify run, machine-readable summary
+host_gpu_verify: in_set_identical=31 in_set_different=0 other_identical=0 other_different=0
+== turbo verify run, machine-readable summary
+host_gpu_turbo: mode=turbo launches_card=38 launches_sim=42 card_s=0.087305 sim_s=2.875042 words_compared=132160678 words_different=2139207 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=1.1920929e-07 max_rel=1.19203336e-07
+host_gpu_refusals: refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=4 too_small=0 failed=0
+== SFU and division exhaustive checks (stride 257)
+RESULT op=div a=0x3f800000 tested=16711936 differ=0 max_ulp=0 first=0x00000000:card=0x00000000:sim=0x00000000 share=0.000% outside_tol=0 max_abs=0 ordinary_outside_tol=0 ordinary_max_abs=0
+RESULT op=div a=0x40400000 tested=16711936 differ=0 max_ulp=0 first=0x00000000:card=0x00000000:sim=0x00000000 share=0.000% outside_tol=0 max_abs=0 ordinary_outside_tol=0 ordinary_max_abs=0
+RESULT op=div a=0x3dcccccd tested=16711936 differ=0 max_ulp=0 first=0x00000000:card=0x00000000:sim=0x00000000 share=0.000% outside_tol=0 max_abs=0 ordinary_outside_tol=0 ordinary_max_abs=0
+RESULT op=div a=0xc0200000 tested=16711936 differ=0 max_ulp=0 first=0x00000000:card=0x00000000:sim=0x00000000 share=0.000% outside_tol=0 max_abs=0 ordinary_outside_tol=0 ordinary_max_abs=0
+RESULT op=div a=0x7bf00000 tested=16711936 differ=0 max_ulp=0 first=0x00000000:card=0x00000000:sim=0x00000000 share=0.000% outside_tol=0 max_abs=0 ordinary_outside_tol=0 ordinary_max_abs=0
+RESULT op=div a=0x0a000000 tested=16711936 differ=0 max_ulp=0 first=0x00000000:card=0x00000000:sim=0x00000000 share=0.000% outside_tol=0 max_abs=0 ordinary_outside_tol=0 ordinary_max_abs=0
+RESULT op=div a=0x3f9e3779 tested=16711936 differ=0 max_ulp=0 first=0x00000000:card=0x00000000:sim=0x00000000 share=0.000% outside_tol=0 max_abs=0 ordinary_outside_tol=0 ordinary_max_abs=0
+RESULT op=div a=0x7f7fffff tested=16711936 differ=0 max_ulp=0 first=0x00000000:card=0x00000000:sim=0x00000000 share=0.000% outside_tol=0 max_abs=0 ordinary_outside_tol=0 ordinary_max_abs=0
+RESULT op=div a=0x00000000 tested=16711936 differ=0 max_ulp=0 first=0x00000000:card=0x00000000:sim=0x00000000 share=0.000% outside_tol=0 max_abs=0 ordinary_outside_tol=0 ordinary_max_abs=0
+RESULT op=div a=0x7f800000 tested=16711936 differ=0 max_ulp=0 first=0x00000000:card=0x00000000:sim=0x00000000 share=0.000% outside_tol=0 max_abs=0 ordinary_outside_tol=0 ordinary_max_abs=0
+RESULT op=div a=0xff800000 tested=16711936 differ=0 max_ulp=0 first=0x00000000:card=0x00000000:sim=0x00000000 share=0.000% outside_tol=0 max_abs=0 ordinary_outside_tol=0 ordinary_max_abs=0
+RESULT op=div a=0x7fc00000 tested=16711936 differ=0 max_ulp=0 first=0x00000000:card=0x00000000:sim=0x00000000 share=0.000% outside_tol=0 max_abs=0 ordinary_outside_tol=0 ordinary_max_abs=0
+RESULT op=rcp tested=16711936 differ=2174217 max_ulp=1 first=0x00800f90:card=0x7e7fe0e3:sim=0x7e7fe0e4 share=13.010% outside_tol=0 max_abs=5.0706024e+30 ordinary_outside_tol=0 ordinary_max_abs=0.0625
+RESULT op=rsq tested=16711936 differ=1796879 max_ulp=2 first=0x00800384:card=0x5efffc7b:sim=0x5efffc7c share=10.752% outside_tol=0 max_abs=5.49755814e+11 ordinary_outside_tol=0 ordinary_max_abs=6.10351562e-05
+RESULT op=sqrt tested=16711936 differ=1398291 max_ulp=1 first=0x00801394:card=0x200009c9:sim=0x200009ca share=8.367% outside_tol=0 max_abs=1.09951163e+12 ordinary_outside_tol=0 ordinary_max_abs=1.90734863e-06
+RESULT op=ex2 tested=16711936 differ=735807 max_ulp=2 first=0x33b8ad28:card=0x3f800000:sim=0x3f800001 share=4.403% outside_tol=0 max_abs=2.02824096e+31 ordinary_outside_tol=0 ordinary_max_abs=2.02824096e+31
+RESULT op=lg2 tested=16711936 differ=4163350 max_ulp=160188 first=0x00800384:card=0xc2fbffeb:sim=0xc2fbffec share=24.912% outside_tol=262 max_abs=7.62939453e-06 ordinary_outside_tol=262 ordinary_max_abs=1.90734863e-06
+== turbo mode's probes (reported; stride 257)
+RESULT op=sin tested=16711936 differ=15955607 max_ulp=4294967295 first=0x01c9134c:card=0x00000000:sim=0x01c9134a share=95.474% outside_tol=7680160 max_abs=1 ordinary_outside_tol=735729 ordinary_max_abs=3.57627869e-07
+RESULT op=cos tested=16711936 differ=7622978 max_ulp=4294967295 first=0x35afee74:card=0x3f7fffff:sim=0x3f800000 share=45.614% outside_tol=5297494 max_abs=2 ordinary_outside_tol=6053 ordinary_max_abs=3.42726707e-07
+RESULT op=tanh tested=16711936 differ=931482 max_ulp=128 first=0x39b89f20:card=0x39b89f20:sim=0x39b89f1f share=5.574% outside_tol=357 max_abs=7.62939453e-06 ordinary_outside_tol=357 ordinary_max_abs=7.62939453e-06
+NOTE: stride 257 is a smoke run, not all 2^32 patterns
+VERDICT kind=imax repeats
+VERDICT kind=iadd varies
+VERDICT kind=fred varies
+VERDICT kind=fatom varies
+VERDICT kind=dadd varies
+VERDICT kind=cas varies
+VERDICT kind=exch varies
+PASS: card CI on NVIDIA A10G
+CARDCI EXIT 0
