@@ -3987,3 +3987,73 @@ driver states): 105 of 105 pass. Mutants ([`data/sp64-sp68/mutants.py`](../data/
   against 34.2 with `WIDER=0` (sp66), 3DCONV verify 8.53 s (sp67), hellinger 45.4 s to 6.75 s with `VGPU_HOST_GPU_SQRT=1` and GRAMSCHM 302.6 s to
   125.2 s, its verify run 6,144 launches identical (sp68). sp64's JIT changes showed nothing on the rig's 4 vCPUs (GEMVER and JACOBI1D within 2 %);
   that round measured at 1 and 16 threads on server3.
+
+## Round sp69 (host-GPU: the driver start of a program of many short launches)
+
+Branch `sp69-hotspot-start`, on `speed-round-sp64-sp68` (d2c54ae0). Data and commands: [`data/sp69/`](../data/sp69/README.md).
+
+**The regression.** Rodinia hotspot (1,000 launches of one kernel, `calculate_temp`, on a 64 x 64 grid) ran 2.27x faster in turbo mode than in
+the simulator on the A10G in Round sp66 (1.18 s to 0.52 s: 789 of the 1,000 launches on the card, the first 209 simulated until the start-cost
+account reached 0.25 s). In the summary run of 2026-11-13 on the integration branch it is 1.00x (1.04 s simulated, 1.04 s turbo, no launch on
+the card), and the stand-in run of the integration says why (`data/sp64-sp68/start-who.md`: "never started", 998 launches "too small"). The
+cause is the start share of the integration (`start_share_saved`): a launch the account sends must save `start_cost / 50`, 5 ms, by itself, and
+a hotspot launch takes about 1 ms on the rig (0.39 ms on server3) and saves 0.9 ms. The share asks whether 50 launches like this one repay the
+start; hotspot has 1,000, which save about 0.9 s between them against a start of 0.23 s. The same share keeps the driver from Rodinia sc_gpu
+(1,432 launches of about 0.7 ms on the rig, 1.32x in Round sp66 and 0.99x in the summary run) and, on server3, from HeCBench asyncAllocation
+(800 launches of 1.9 ms).
+
+**What tells hotspot from the four.** The share was put in for four CUDA Samples that paid a start they did not repay (LargeKernelParameter,
+threadFenceReduction, MC_EstimatePiInlineP, dct8x8). Per kernel, from the `host_gpu_kept` lines of a stand-in run on server3 (launches of the
+kernel, simulator seconds; the rig's simulator is 2 to 3 times slower):
+
+| program | kernel | launches | sim s (server3) | a launch on the rig |
+|---|---|---:|---:|---|
+| rodinia/hotspot | `calculate_temp` | 1,000 | 0.426 | about 1.0 ms |
+| rodinia/sc_gpu | `kernel_compute_cost` | 1,432 | 0.305 | about 0.7 ms |
+| hecbench/asyncAllocation | `process` | 800 | 1.221 | 4 to 5 ms |
+| samples/threadFenceReduction | `reduceSinglePass` | 100 | 0.132 | about 3.5 ms |
+| samples/dct8x8 | `CUDAkernel2DCT` (its one kernel with more than two launches that the modes admit) | 101 | 0.151 | about 3.8 ms |
+| samples/LargeKernelParameter | `kernelDefault`, `kernelLargeParam` | 1,001 each | 0.147, 0.101 | 0.2 to 0.3 ms |
+| samples/MC_EstimatePiInlineP | (its second kernel, by the first-launch rule) | 1 | | 3.0 ms static |
+
+A launch of threadFenceReduction or dct8x8 saves more than a launch of hotspot, so no bar on the launch separates them; the number of launches
+does. And LargeKernelParameter has as many launches as hotspot, but each saves 0.1 to 0.2 ms by the estimate, and on the card they did not
+repay any of the start: with 134 to 163 launches sent in Round sp66 the program lost 0.22 s, the whole of it.
+
+**The rule** (`include/vgpu/host_gpu.hpp` `start_share_launches`, `Costs::start_repeats`, `Costs::start_repeats_max`): while the driver is down,
+a launch the account sends must repay the start within 50 launches like it, or, once the simulator has run its kernel 200 times, within as many
+launches as it has run it, at most 500. A kernel launched that often is taken to be launched as many times again, so the start is bought when
+the launches already made would have repaid it; a saving under 0.5 ms a launch (the start over 500) is within the error of the card path's
+estimate and never buys it. `VGPU_HOST_GPU_START_REPEATS=0` is the rule before (the share of 50 launches whatever the kernel's history), and
+`VGPU_HOST_GPU_START_LAUNCHES=0` is still the account alone. The count is the kernel's launches the simulator has run in this process
+(`SimTimeTable::samples`). Nothing else changes: the account is still asked first, a first launch judged by its static estimate keeps its own
+share (12.5 ms: MC_EstimatePiInlineP), a launch that repays the start alone and every launch once the driver is up are decided as before, and
+the rule only ever adds launches to those the share of 50 sends. Exact mode's results cannot change: the rule decides when the driver starts,
+not which kernels may run on the card.
+
+By the numbers of the table, on the rig: hotspot's launch saves about 0.8 to 0.9 ms (the estimate is the shortest launch seen, less a card path
+of 0.107 ms), so the start is bought at about its 300th launch, where the account alone bought it at the 210th in Round sp66;
+threadFenceReduction and dct8x8 never reach 200 launches of a kernel; LargeKernelParameter's launches save a third of the 0.5 ms; sc_gpu's save
+about 0.5 ms and may fall either side.
+
+**On server3** (the stand-in driver, `data/sp64-sp68/startwho.py`, [`data/sp69/start-who.md`](../data/sp69/start-who.md)): with the default
+cost hotspot does not start the driver there (its launch saves 0.29 ms on that faster simulator) and asyncAllocation (turbo) now does, at its
+412th launch (1.9 ms in the simulator against a card path of 0.9 ms); with `VGPU_HOST_GPU_START_COST=0.08`, which stands in for the rig's slower
+simulator as in the integration, hotspot starts it at its 283rd launch and does not with `VGPU_HOST_GPU_START_REPEATS=0`. The four Samples
+start nothing in either mode at the default cost, and at 0.08 only what they started before the round (dct8x8 in turbo mode by the first-launch
+rule, as in the integration's table). One more effect showed: Rodinia gaussian in exact mode sits at the 5 ms bar on server3 (its `Fan2` launch
+at the moment the account fills is 5.2 to 5.6 ms and shrinks from there), so under the share of 50 the driver started in two runs of three and
+never in the third; in such a run it now starts at the 200th `Fan2` launch.
+
+**Tests.** `test_host_gpu_logic`, four new tests (the defaults and the count's bounds; hotspot's launch at 267 and 268 launches seen, the account
+still asked, the bar at exactly the start over the count, a dearer start, the 0.5 ms floor; the four Samples at every count up to their own;
+`START_REPEATS=0` equal to the share of 50 over a grid, and the rule never refusing what that share sends): 109 of 109 pass. The stand-in test
+`e2e_host_gpu_stub` has a step 37: `many` launches one kernel 400 times, each a hundredth of the start cost it is given, and starts the driver
+between its 200th and 400th launch; with `VGPU_HOST_GPU_START_REPEATS=0`, and for the same program with 150 launches, the driver is never
+touched; the output is the mode-off output in each. Steps 1 to 37 pass on server3. With the rule taken out of `start_share_launches` (the count
+ignored) the unit tests and step 37 fail ([`data/sp69/README.md`](../data/sp69/README.md) has both outputs). The harness has the forms
+`exactr0` and `turbor0` (`VGPU_HOST_GPU_START_REPEATS=0`) for A/B runs.
+
+**On the card.** Not measured yet at this commit: server3 has no card. The run to make (hotspot, sc_gpu and the four Samples first, then the
+programs with 200 launches or more that do not start the driver today, then the keep list of the integration) is in
+[`data/sp69/README.md`](../data/sp69/README.md).

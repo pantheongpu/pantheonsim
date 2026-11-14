@@ -783,6 +783,101 @@ VTEST(a_start_share_of_zero_is_the_account_alone) {   // VGPU_HOST_GPU_START_LAU
   VCHECK(should_offload_with_start(bare(0.001), c, false, 1.0));
 }
 
+// ---- a kernel launched many times (Round sp69; host_gpu.hpp start_share_launches): the start repaid within the launches of it seen so far ----
+VTEST(the_start_is_repaid_within_fifty_launches_until_a_kernel_has_run_two_hundred_times) {
+  const Costs c;
+  VCHECK(c.start_repeats == 200 && c.start_repeats_max == 500);
+  for (uint64_t kept : {0ull, 1ull, 50ull, 51ull, 199ull}) VCHECK(start_share_launches(c, kept) == 50);
+  VCHECK(start_share_launches(c, 200) == 200);
+  VCHECK(start_share_launches(c, 201) == 201);
+  VCHECK(start_share_launches(c, 499) == 499 && start_share_launches(c, 500) == 500);
+  VCHECK(start_share_launches(c, 501) == 500 && start_share_launches(c, 1000000) == 500);   // at most 500 count: 0.5 ms saved at the least
+  VCHECK(c.start_cost_s / start_share_launches(c, 1000000) == 0.0005);
+  Costs more = c;
+  more.start_launches = 300;   // never fewer launches than start_launches
+  VCHECK(start_share_launches(more, 199) == 300 && start_share_launches(more, 250) == 300 && start_share_launches(more, 301) == 301);
+  more.start_launches = 600;   // ... even above the most that count
+  VCHECK(start_share_launches(more, 100000) == 600);
+  Costs longer = c;
+  longer.start_repeats_max = 2000;
+  VCHECK(start_share_launches(longer, 1500) == 1500 && start_share_launches(longer, 2500) == 2000);
+  Costs sooner = c;
+  sooner.start_repeats = 60;
+  VCHECK(start_share_launches(sooner, 59) == 50 && start_share_launches(sooner, 60) == 60);
+  Costs off = c;
+  off.start_repeats = 0;       // VGPU_HOST_GPU_START_REPEATS=0
+  for (uint64_t kept : {0ull, 199ull, 200ull, 100000ull}) VCHECK(start_share_launches(off, kept) == 50);
+  off.start_repeats = -1;
+  VCHECK(start_share_launches(off, 100000) == 50);
+}
+
+VTEST(many_short_launches_of_one_kernel_buy_the_start_when_as_many_again_repay_it) {
+  const Costs c;
+  // Rodinia hotspot on the A10G rig: 1,000 launches of 1.04 ms, each saving 0.933 ms (card path 107 us): 268 of them repay 0.25 s
+  const Estimate hs = bare(0.00104);
+  VCHECK(!should_offload_with_start(hs, c, false, 0.30));         // (the default: no launch of the kernel seen)
+  VCHECK(!should_offload_with_start(hs, c, false, 0.30, 199));
+  VCHECK(!should_offload_with_start(hs, c, false, 0.30, 200));    // 200 are enough to count on, but would repay 0.187 s
+  VCHECK(!should_offload_with_start(hs, c, false, 0.30, 267));
+  VCHECK(should_offload_with_start(hs, c, false, 0.30, 268));
+  VCHECK(should_offload_with_start(hs, c, false, 0.30, 999));
+  VCHECK(start_share_saved(hs, c, 268) && !start_share_saved(hs, c, 267) && !start_share_saved(hs, c));
+  // the account is still asked
+  VCHECK(!should_offload_with_start(hs, c, false, c.start_cost_s * 0.99, 999));
+  VCHECK(should_offload_with_start(hs, c, false, c.start_cost_s, 999));
+  // the bar is exactly the start over the launches seen (binary-exact numbers: a start of 0.25 s, 256 launches, 1/1024 s saved each)
+  Costs exact = c;
+  exact.launch_s = 0;
+  exact.kernel_s_default = 1.0 / 1024;
+  VCHECK(bare(2.0 / 1024).sim_s - card_path_seconds(bare(2.0 / 1024), exact) == exact.start_cost_s / 256);
+  exact.margin = 1.5;
+  VCHECK(should_offload_with_start(bare(2.0 / 1024), exact, false, 1.0, 256));
+  VCHECK(!should_offload_with_start(bare(2.0 / 1024), exact, false, 1.0, 255));
+  // HeCBench asyncAllocation on server3 (1.9 ms a launch, 800 launches): 200 launches seen repay 0.36 s
+  VCHECK(!should_offload_with_start(bare(0.0019), c, false, 0.26, 199) && should_offload_with_start(bare(0.0019), c, false, 0.38, 200));
+  // a longer start needs more launches seen, in proportion (0.4 s / 0.933 ms: 429), and one that 500 launches do not repay is not bought
+  Costs dear = c;
+  dear.start_cost_s = 0.4;
+  VCHECK(!should_offload_with_start(hs, dear, false, 1.0, 428) && should_offload_with_start(hs, dear, false, 1.0, 429));
+  dear.start_cost_s = 0.5;
+  VCHECK(!should_offload_with_start(hs, dear, false, 1.0, 536) && !should_offload_with_start(hs, dear, false, 1.0, 100000));
+  // at most 500 launches count: a launch that saves under 0.5 ms does not buy the start however often its kernel ran
+  VCHECK(!should_offload_with_start(bare(0.0006), c, false, 1.0, 100000));   // 0.493 ms saved
+  VCHECK(should_offload_with_start(bare(0.00061), c, false, 1.0, 500) && !should_offload_with_start(bare(0.00061), c, false, 1.0, 496));   // 0.503 ms: 498 repay it
+  // a launch not worth a card with the driver up is not sent however often its kernel ran (PolyBench JACOBI1D: 20,000 launches of 0.12 ms)
+  VCHECK(!should_offload(bare(0.00012), c) && !should_offload_with_start(bare(0.00012), c, false, 2.0, 19000));
+  // with the driver up the count is not asked
+  VCHECK(should_offload_with_start(hs, c, true, 0.0, 0));
+}
+
+VTEST(the_four_samples_still_do_not_buy_the_start_with_their_launch_counts) {   // A10G: launches of each kernel, what each takes
+  const Costs c;
+  for (uint64_t kept = 0; kept <= 101; ++kept) VCHECK(!should_offload_with_start(bare(0.0035), c, false, 0.36, kept));    // threadFenceReduction: 101 launches
+  for (uint64_t kept = 0; kept <= 118; ++kept) VCHECK(!should_offload_with_start(bare(0.0038), c, false, 0.97, kept));    // dct8x8: 118 launches in all
+  // LargeKernelParameter: two kernels, 1,001 launches each, 0.19 and 0.28 ms a launch (0.47 s in 2,002): 0.17 ms saved at the most
+  for (uint64_t kept = 0; kept <= 1001; ++kept) VCHECK(!should_offload_with_start(bare(0.00028), c, false, 0.47, kept));
+  VCHECK(!should_offload_with_start(bare(0.00056), c, false, 0.47, 1001));   // ... nor on a host twice as slow (0.453 ms saved)
+  // (MC_EstimatePiInlineP's launch is a first launch: first_launch_offload takes no count)
+}
+
+VTEST(start_repeats_of_zero_is_the_share_of_fifty_launches_whatever_the_history) {   // VGPU_HOST_GPU_START_REPEATS=0: the rule of sp64-sp68
+  Costs off;
+  off.start_repeats = 0;
+  const Costs c;
+  for (double s : {50e-6, 0.0005, 0.001, 0.0035, 0.0052, 0.006, 0.05, 0.4})
+    for (double spent : {0.0, 0.1, 0.25, 5.0})
+      for (bool up : {false, true})
+        for (uint64_t kept : {0ull, 199ull, 200ull, 5000ull, 1000000ull}) {
+          VCHECK_EQ(should_offload_with_start(bare(s), off, up, spent, kept), should_offload_with_start(bare(s), c, up, spent));
+          // and the count only ever adds launches: what the share of fifty sends is sent whatever the count
+          if (should_offload_with_start(bare(s), c, up, spent)) { VCHECK(should_offload_with_start(bare(s), c, up, spent, kept)); }
+        }
+  VCHECK(!should_offload_with_start(bare(0.00104), off, false, 0.30, 999));
+  Costs none = c;   // VGPU_HOST_GPU_START_LAUNCHES=0 is still the account alone
+  none.start_launches = 0;
+  VCHECK(should_offload_with_start(bare(0.0005), none, false, 0.25, 0) && should_offload_with_start(bare(0.0005), none, false, 0.25, 5000));
+}
+
 // ---- the division idiom (host_gpu.hpp division_idiom_only), on the shape ptxas 13.0 gave `a / b` for sm_86 (cuobjdump of an own kernel) ----
 using K = CodeInsn::Kind;
 static CodeInsn ci(K kind, uint64_t pc, int64_t target = -1, int src0 = -1, int src1 = -1) {

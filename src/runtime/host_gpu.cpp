@@ -1179,6 +1179,11 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
       const double n = std::strtod(v, &end);
       if (end != v && n >= 0) r->impl_->costs.start_launches = n;
     }
+    if (const char* v = std::getenv("VGPU_HOST_GPU_START_REPEATS"); v && *v) {   // 0: the share is start_launches' whatever the kernel's history (the rule before Round sp69)
+      char* end = nullptr;
+      const double n = std::strtod(v, &end);
+      if (end != v && n >= 0) r->impl_->costs.start_repeats = n;
+    }
     if (const char* mb = std::getenv("VGPU_HOST_GPU_MAX_MIB")) r->impl_->max_bytes = std::strtoull(mb, nullptr, 10) << 20;
     g_summary_impl = r->impl_;
     std::atexit([] {
@@ -1419,7 +1424,8 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     ++im.stats.simulated;
     return false;
   }
-  const bool by_size = forced || im.verify || should_offload_with_start(e, im.costs, im.start_sh != nullptr, im.eligible_sim_spent_s);
+  const uint64_t kept_before = im.sim_times.samples(fn.name);   // this kernel's launches the simulator has run so far (start_share_launches, host_gpu.hpp)
+  const bool by_size = forced || im.verify || should_offload_with_start(e, im.costs, im.start_sh != nullptr, im.eligible_sim_spent_s, kept_before);
   // Round sp65: while the card holds chunks the simulator does not, keeping this launch would pull them back first, and sending it moves only what
   // the simulator holds alone (streak_offload). `ref_s` is what the simulator side was expected to cost: the bans below weigh the card path against it.
   bool streak = false;
@@ -1441,9 +1447,9 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   if (!im.start_sh && !im.start_failed && logging()) {
     Estimate cold = e;
     cold.start_s = std::max(im.costs.start_cost_s, 0.0);
-    std::fprintf(stderr, "host_gpu: %s starts the driver: %s (sim %.3f ms, card path with the start %.3f ms, %.3f s of eligible launches simulated so far)\n",
+    std::fprintf(stderr, "host_gpu: %s starts the driver: %s (sim %.3f ms, card path with the start %.3f ms, %.3f s of eligible launches simulated so far, %llu of this kernel)\n",
                  fn.name.c_str(), forced ? "sampled" : im.verify ? "verify" : first_launch_rule ? "first-launch rule" : "size rule", e.sim_s * 1e3,
-                 card_path_seconds(cold, im.costs) * 1e3, im.eligible_sim_spent_s);
+                 card_path_seconds(cold, im.costs) * 1e3, im.eligible_sim_spent_s, static_cast<unsigned long long>(kept_before));
   }
   // The card path. Anything that goes wrong before the kernel has run leaves the simulator's memory as it was.
   if (!im.await_start()) {   // the driver is unusable (said once on stderr): this launch and all later ones are the simulator's

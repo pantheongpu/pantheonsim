@@ -66,6 +66,12 @@
 #  35. a kernel that calls a device function of another section (host_gpu_rdc.cu, -rdc=true: an absolute call) reaches the card path in turbo mode,
 #      whose scan follows the call into the callee's code, and not in exact mode; the output is unchanged;
 #  36. a kernel launched from a CUDA graph reaches the card path in both modes; the output is unchanged.
+# The driver start of a program of many short launches (Round sp69; include/vgpu/host_gpu.hpp start_share_launches):
+#  37. `many` launches one kernel 400 times, each launch about a hundredth of the start cost it is given (read from a run whose cost is never repaid):
+#      no launch saves the share of the start a launch must save by itself (a 50th), but once the simulator has run the kernel 200 times the start
+#      must only be repaid within as many launches again, and the driver starts; with VGPU_HOST_GPU_START_REPEATS=0 (the rule before) it is never
+#      touched, nor is it by `manyfew`, the same program with 150 launches (which would repay the start as well, but are too few to say that as many
+#      follow); the output is the mode-off output in each.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -456,5 +462,31 @@ grep -q '^host_gpu_refused:' "$work/rdc_turbo.err" && { echo "FAIL: turbo refuse
 diff -q "$work/off_rdc.out" "$work/rdc_turbo.out" > /dev/null || { echo "FAIL: turbo mode changes the output of host_gpu_rdc"; fails=1; }
 PROG=rdc run rdc_exact x VGPU_HOST_GPU=exact "${reach[@]}" || { echo "FAIL: the exact rdc run failed"; fails=1; }
 [[ ! -s "$work/rdc_exact.log" ]] || { echo "FAIL: exact mode sent a kernel with a call to the card: $(calls rdc_exact)"; fails=1; }
-(( fails == 0 )) && { echo "PASS: first launch $first ms against a driver start of $init_ms ms; driver calls in the big run: $(calls on_big)"; exit 0; }
+# 37. (Round sp69) many short launches of one kernel. The cost: 100 times the shortest launch, so a launch saves at most a 100th of it and the
+# simulator has spent it after about 100 launches; from the 200th launch on, the launches so far would repay it if the card path took up to half
+# the launch (it takes 0.1 ms by the estimate, so the launch must take 0.3 ms or more: see the check).
+for arg in many manyfew; do
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" "$arg" > "$work/off_$arg.out" 2> "$work/off_$arg.err" || { echo "FAIL: the $arg run with the mode off failed"; tail -5 "$work/off_$arg.err"; exit 1; }
+done
+run many_never many VGPU_HOST_GPU=exact VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=1000 || { echo "FAIL: the many run with a start cost of 1000 s failed"; fails=1; }
+[[ ! -s "$work/many_never.log" ]] || { echo "FAIL: many reached the driver although the start could never be repaid: $(calls many_never)"; fails=1; }
+many_us="$(sed -n 's/^min_launch_us=\([0-9]*\).*/\1/p' "$work/many_never.err" | head -1)"
+if [[ -n "$many_us" ]] && (( many_us >= 300 )); then
+  many_cost="$(awk -v us="$many_us" 'BEGIN { printf "%.6f", us / 10000 }')"
+  many=(VGPU_HOST_GPU=exact VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST="$many_cost" STUB_INIT_MS=50)
+  run many_run many "${many[@]}" || { echo "FAIL: the many run failed"; tail -5 "$work/many_run.err"; fails=1; }
+  grep -q '^cuInit$' "$work/many_run.log" || { echo "FAIL: 400 launches of one kernel, of $many_us us each, did not start a driver that costs $many_cost s: $(calls many_run); $(grep -c 'stays in the simulator' "$work/many_run.err") launches stayed"; fails=1; }
+  many_at="$(sed -n 's/.*starts the driver: size rule .* \([0-9]*\) of this kernel).*/\1/p' "$work/many_run.err" | head -1)"
+  [[ -n "$many_at" ]] && (( many_at >= 200 && many_at < 400 )) || { echo "FAIL: many started the driver after ${many_at:-?} launches of its kernel, not after 200 to 399: $(grep 'starts the driver' "$work/many_run.err" | head -1)"; fails=1; }
+  diff -q "$work/off_many.out" "$work/many_run.out" > /dev/null || { echo "FAIL: the start changes the output of many"; fails=1; }
+  run many_old many "${many[@]}" VGPU_HOST_GPU_START_REPEATS=0 || { echo "FAIL: the many run with VGPU_HOST_GPU_START_REPEATS=0 failed"; fails=1; }
+  [[ ! -s "$work/many_old.log" ]] || { echo "FAIL: with VGPU_HOST_GPU_START_REPEATS=0 many reached the driver: $(calls many_old)"; fails=1; }
+  diff -q "$work/off_many.out" "$work/many_old.out" > /dev/null || { echo "FAIL: VGPU_HOST_GPU_START_REPEATS=0 changes the output of many"; fails=1; }
+  run many_few manyfew "${many[@]}" || { echo "FAIL: the manyfew run failed"; fails=1; }
+  [[ ! -s "$work/many_few.log" ]] || { echo "FAIL: 150 launches of one kernel reached the driver: $(calls many_few)"; fails=1; }
+  diff -q "$work/off_manyfew.out" "$work/many_few.out" > /dev/null || { echo "FAIL: the mode changes the output of manyfew"; fails=1; }
+else
+  echo "FAIL: the shortest launch of many took ${many_us:-?} us: too short for the test (under 300 us)"; fails=1
+fi
+(( fails == 0 )) && { echo "PASS: first launch $first ms against a driver start of $init_ms ms; driver calls in the big run: $(calls on_big); many launches of ${many_us:-?} us started the driver after ${many_at:-?} of them"; exit 0; }
 exit 1

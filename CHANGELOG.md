@@ -7,6 +7,13 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Host-GPU mode (experimental, opt-in), both modes: the share of the driver start that a launch must save by itself (the entry below) kept the
+  start from programs of many short launches that repay it many times over: Rodinia hotspot, 1,000 launches of about 1 ms, was 2.27x faster in
+  turbo mode before the share and 1.00x with it. A kernel the simulator has already run 200 times is now taken to be launched as many times
+  again, and its launch must repay the start within the launches of that kernel run so far (at most 500) instead of within 50, when those
+  are more (`VGPU_HOST_GPU_START_REPEATS`, `0` for the rule before). The four short CUDA Samples the share protects still do not start the
+  driver: two launch a kernel about 100 times, one has two launches in all, and the launches of the fourth save under 0.5 ms each.
+
 - Host-GPU mode (experimental, opt-in), both modes: while the real driver is not started, a launch that would start it only because the program
   has already simulated as long as the start costs (the start-cost account) must now also save a share of the start by itself: 5 ms, or 12.5 ms
   for a kernel's first launch judged by its static estimate (`VGPU_HOST_GPU_START_LAUNCHES`, `0` for the rule before). Four short CUDA Samples
