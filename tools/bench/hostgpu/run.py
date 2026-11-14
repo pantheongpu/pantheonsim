@@ -16,7 +16,8 @@ and timeouts' meaning).  See docs/perf-design/12-host-gpu-turbo.md.
          --json out.json --md out.md
   run.py --dry-run          # self-test, no card, no simulator (wired into ctest)
 
-Forms.  sim, exact, exactdiv (exact with VGPU_HOST_GPU_DIV=1), turbo, exact0 and turbo0
+Forms.  sim, exact, exactdiv (exact with VGPU_HOST_GPU_DIV=1), exacti (exact with VGPU_HOST_GPU_DIV=1 and
+VGPU_HOST_GPU_SQRT=1: both opt-in idioms), turbo, exact0 and turbo0
 (exact and turbo with VGPU_HOST_GPU_SAMPLE=0: no launch is sampled), and exactw and turbow (with
 VGPU_HOST_GPU_SAMPLE=whole: whole blocks only, the rule of Round sp60b), and exactn and turbon (with
 VGPU_HOST_GPU_STREAK=0: no launch is sent because the card holds the memory, the rule of Round sp61), and exactw0 and
@@ -57,8 +58,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "real"))
 import real  # noqa: E402  (tools/bench/real/real.py: the corpus manifest and the timing-line filter)
 
-FORMS = ("sim", "exact", "exact0", "exactw", "exactn", "exactw0", "exactl0", "exactdiv", "turbo", "turbo0", "turbow", "turbon", "turbow0", "turbol0", "verify")
-CARD_FORMS = ("exact", "exact0", "exactw", "exactn", "exactw0", "exactl0", "exactdiv", "turbo", "turbo0", "turbow", "turbon", "turbow0", "turbol0")   # the timed forms that use the card, in the table's order
+FORMS = ("sim", "exact", "exact0", "exactw", "exactn", "exactw0", "exactl0", "exactdiv", "exacti", "turbo", "turbo0", "turbow", "turbon", "turbow0", "turbol0", "verify")
+CARD_FORMS = ("exact", "exact0", "exactw", "exactn", "exactw0", "exactl0", "exactdiv", "exacti", "turbo", "turbo0", "turbow", "turbon", "turbow0", "turbol0")   # the timed forms that use the card, in the table's order
 # lines the simulator or the mode prints: never part of the program's output
 OURS = re.compile(r"^(host_gpu[a-z_]*:|\[vgpu\]|vgpu:)")
 # A word of the output is a number when all of it is one and it has a fraction or an exponent: an integer (a count, an index, a checksum printed in
@@ -217,10 +218,12 @@ def compare_outputs(sim, other, atol, rtol):
 
 def form_env(form, a):
     env = {}
-    if form in ("exact", "exact0", "exactw", "exactn", "exactw0", "exactl0", "exactdiv"):
+    if form in ("exact", "exact0", "exactw", "exactn", "exactw0", "exactl0", "exactdiv", "exacti"):
         env["VGPU_HOST_GPU"] = "exact"
-        if form == "exactdiv":
+        if form in ("exactdiv", "exacti"):
             env["VGPU_HOST_GPU_DIV"] = "1"   # the IEEE division sequence joins the exact set (docs/cli.md)
+        if form == "exacti":
+            env["VGPU_HOST_GPU_SQRT"] = "1"   # and the IEEE square root sequence (Round sp68): exact with both opt-in idioms
     elif form in ("turbo", "turbo0", "turbow", "turbon", "turbow0", "turbol0", "verify"):
         env["VGPU_HOST_GPU"] = "turbo"
         env["VGPU_HOST_GPU_ATOL"] = repr(a.atol)
@@ -689,6 +692,7 @@ def selftest():
     check(form_env("sim", B) == {}, "sim sets nothing")
     check(form_env("exact", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_ATOMICS": "1"}, "exact env")
     check(form_env("exactdiv", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_DIV": "1", "VGPU_HOST_GPU_ATOMICS": "1"}, "exactdiv env")
+    check(form_env("exacti", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_DIV": "1", "VGPU_HOST_GPU_SQRT": "1", "VGPU_HOST_GPU_ATOMICS": "1"}, "exacti env")
     v = form_env("verify", B)
     check(v["VGPU_HOST_GPU"] == "turbo" and v["VGPU_HOST_GPU_VERIFY"] == "all" and float(v["VGPU_HOST_GPU_RTOL"]) == 1e-5 and v["VGPU_HOST_GPU_ATOMICS"] == "1", "verify env")
     check("VGPU_HOST_GPU_VERIFY" not in form_env("turbo", B), "turbo env")
@@ -723,7 +727,7 @@ def main():
     ap.add_argument("--corpora", default="polybench,rodinia,hecbench")
     ap.add_argument("--programs", default="", help="comma list of corpus/name or name; default all")
     ap.add_argument("--skip", default="", help="comma list of corpus/name or name to leave out")
-    ap.add_argument("--forms", default="sim,exact,turbo", help="of sim,exact,exact0,exactw,exactn,exactw0,exactl0,exactdiv,turbo,turbo0,turbow,turbon,turbow0,turbol0,verify (exactdiv: exact with VGPU_HOST_GPU_DIV=1; exact0, turbo0: with VGPU_HOST_GPU_SAMPLE=0; exactw, turbow: with VGPU_HOST_GPU_SAMPLE=whole; exactn, turbon: with VGPU_HOST_GPU_STREAK=0; exactw0, turbow0: with VGPU_HOST_GPU_WIDER=0, the safety rules before Round sp66; exactl0, turbol0: with VGPU_HOST_GPU_START_LAUNCHES=0; verify: one untimed turbo run with VGPU_HOST_GPU_VERIFY=all)")
+    ap.add_argument("--forms", default="sim,exact,turbo", help="of sim,exact,exact0,exactw,exactn,exactw0,exactl0,exactdiv,exacti,turbo,turbo0,turbow,turbon,turbow0,turbol0,verify (exactdiv: exact with VGPU_HOST_GPU_DIV=1; exacti: exact with VGPU_HOST_GPU_DIV=1 and VGPU_HOST_GPU_SQRT=1; exact0, turbo0: with VGPU_HOST_GPU_SAMPLE=0; exactw, turbow: with VGPU_HOST_GPU_SAMPLE=whole; exactn, turbon: with VGPU_HOST_GPU_STREAK=0; exactw0, turbow0: with VGPU_HOST_GPU_WIDER=0, the safety rules before Round sp66; exactl0, turbol0: with VGPU_HOST_GPU_START_LAUNCHES=0; verify: one untimed turbo run with VGPU_HOST_GPU_VERIFY=all)")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--long-secs", type=float, default=120, help="a program whose first sim run takes longer gets --long-runs runs")
     ap.add_argument("--long-runs", type=int, default=1)
