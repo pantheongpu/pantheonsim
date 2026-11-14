@@ -66,7 +66,7 @@ against a CUDA 13 build), or if a `DT_RPATH` would hide the simulator (see
 
 | Option | Meaning |
 | --- | --- |
-| `--threads <n>` | Host threads that run blocks, at least 1. Default: one per core. |
+| `--threads <n>` | Host threads that run blocks, at least 1. Default: one per CPU the process may use on the NVIDIA engines, one per physical core it may use on the AMD engine (two hardware threads of a core count once). |
 | `--max-steps <n>` | Per-thread instruction budget, a guard against a kernel that never ends. `0` turns the guard off. |
 | `--strict` | Refuse undefined behaviour instead of continuing. See [diagnostics](diagnostics.md). |
 | `--race` | Detect shared-memory data races. See [diagnostics](diagnostics.md). |
@@ -279,7 +279,7 @@ variable is unset by default.
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `VGPU_THREADS` | Host threads used to run blocks. | one per core (`make run` and `./run` set half the cores unless this or `threads:` is set) |
+| `VGPU_THREADS` | Host threads used to run blocks. | NVIDIA engines: one per CPU the process may use (its affinity mask and cgroup quota). AMD engine: one per physical core among them, since Round sp70 (`include/vgpu/host_cores.hpp`): on an 8-core, 16-thread host the second thread of a core gave no wall time and doubled the CPU time. (`make run` and `./run` set half the cores unless this or `threads:` is set) |
 | `VGPU_ASYNC_LAUNCH` | A kernel launch on a `cudaStreamNonBlocking` stream returns before the kernel has run (`cudaEventQuery` on work behind it is `cudaErrorNotReady`). `all` does the same on streams made with `cudaStreamCreate`; `0` runs every launch inside its call. Never used with a profiler, `VGPU_TRACE`, a managed allocation or a CUDA library shim loaded (docs/perf-design/streams.md). | non-blocking streams |
 | `VGPU_EXACT_THREADS` | `N`, beside `VGPU_THREADS=1` only: the blocks of a launch still leave the bytes, counters and errors of running in order, and a launch is run on `N` host threads when a trial under a shadow of device memory shows that no block touched what another wrote; any other launch is undone and run in order ([exact-threads.md](exact-threads.md)). SASS engine; the PTX and AMD engines run in order as before. | unset (in order on one thread) |
 | `VGPU_EXACT_LOG` | `<file>`: appends a line for each launch `VGPU_EXACT_THREADS` applied to (kernel, blocks, threads, `committed`, `stopped` or `in order`, the reason, bytes kept for undoing, 4 KiB pages touched); a trial that a note by page stopped and that was tried again by word has a line with `again` before it. | unset |

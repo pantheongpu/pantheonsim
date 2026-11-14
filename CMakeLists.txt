@@ -1783,6 +1783,11 @@ target_include_directories(test_nvcomp_codecs PRIVATE nvidia/src)
 add_executable(print_host_cpus tests/host_cpus/print_host_cpus.cpp)
 target_include_directories(print_host_cpus PRIVATE include)
 add_test(NAME host_cpus COMMAND ${CMAKE_SOURCE_DIR}/tests/host_cpus/run_host_cpus.sh $<TARGET_FILE:print_host_cpus>)
+# ... and the physical cores among them, which is what the AMD engine spreads a dispatch over (vgpu/host_cores.hpp): topology trees
+# made by the test, so it says the same on any host.
+add_executable(test_host_cores tests/host_cores/test_host_cores.cpp)
+target_include_directories(test_host_cores PRIVATE include)
+add_test(NAME host_cores COMMAND test_host_cores)
 # AMD code objects: what a HIP program hands the driver to run.
 vgpu_unit_test(test_amd_codeobject amd/tests/unit/test_codeobject.cpp)
 target_compile_definitions(test_amd_codeobject PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

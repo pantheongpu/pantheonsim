@@ -40,6 +40,7 @@
 #include "vgpu/exec/amd_run_scan.hpp"
 #include "vgpu/exec/lockstep.hpp"
 #include "vgpu/error.hpp"
+#include "vgpu/host_cores.hpp"
 #include "vgpu/host_cpus.hpp"
 #include "mfma_math.hpp"
 #include "gcn_matrix_kernels.hpp"
@@ -325,6 +326,10 @@ struct PooledAllocator {
   }
 };
 
+// The register files made new (allocated and zeroed whole) rather than taken from a thread's pool: amd::vgpr_files_made, for the test
+// that holds the pool to the number of waves a thread keeps resident.
+std::atomic<uint64_t> g_vgpr_files_made{0};
+
 // One wavefront: its own scalar registers, VCC, EXEC and SCC, and 64 lanes of
 // vector registers.
 // A wave's vector registers: 256 of them to begin with, and more -- up to the 1024 a gfx1250 wave may be given -- once an
@@ -344,6 +349,12 @@ struct VgprFile {
     Rows() = default;
     explicit Rows(size_t count) {
       if (count == kVgprs && pool_take(*this)) return;
+      make_new(count);
+    }
+    // A fresh file: 64 KB allocated and zeroed whole, and counted (amd::vgpr_files_made). Out of line and cold: the path a wave takes
+    // when the pool has a file stays what it was.
+    [[gnu::noinline, gnu::cold]] void make_new(size_t count) {
+      g_vgpr_files_made.fetch_add(1, std::memory_order_relaxed);
       resize(count);
       dirty = n;
     }
@@ -395,7 +406,12 @@ struct VgprFile {
 
    private:
     struct Pool {
-      static constexpr size_t kMax = 32;   // 64 KB each
+      // 64 KB each. As many as the waves a host thread holds at once (run_groups' kMaxResidentWaves): the work-groups of a kernel
+      // with a barrier are held several at a time and end close together, and with room for 32 files the pool overflowed at
+      // each such burst and the groups admitted next took fresh files, zeroed whole -- 19% of the time of inq's
+      // ground_state::initial_guess, 23% of systems::electrons (Round sp70). A thread that never holds that many never fills it.
+      // (288: run_groups admits a group while fewer than 256 waves are resident, and a group is up to 32 waves.)
+      static constexpr size_t kMax = 288;
       struct Block {
         Row* p;
         size_t dirty;
@@ -10370,9 +10386,14 @@ struct Machine {
     return mem.host_map_possible(addrs[0]) ? mem.host_store_batch(addrs, n, bytes, vals) || mem.store_batch(addrs, n, bytes, vals)
                                            : mem.store_batch(addrs, n, bytes, vals);
   }
+  // One batch of loads, wherever the first address is: a host mapping's (managed and host memory, which load_batch declines after a
+  // table lookup under a lock) is asked first.
+  bool load_any(const uint64_t* addrs, uint32_t n, uint32_t bytes, uint64_t* vals) const {
+    return mem.host_map_possible(addrs[0]) ? mem.host_load_batch(addrs, n, bytes, vals) || mem.load_batch(addrs, n, bytes, vals)
+                                           : mem.load_batch(addrs, n, bytes, vals);
+  }
   bool load_wave(const uint64_t* addrs, uint32_t n, uint32_t bytes, uint64_t* vals) const {
-    // (An address in a host mapping is the host batch's, asked first: load_batch declines it, after a table lookup under a lock.)
-    if (mem.host_map_possible(addrs[0]) ? mem.host_load_batch(addrs, n, bytes, vals) || mem.load_batch(addrs, n, bytes, vals) : mem.load_batch(addrs, n, bytes, vals)) return true;
+    if (load_any(addrs, n, bytes, vals)) return true;
     if (bytes != 8) return false;
     uint64_t bits = 0, odd = 0;
     for (uint32_t i = 0; i < n; ++i) bits |= addrs[i], odd |= addrs[i] & 4;
@@ -10459,7 +10480,8 @@ struct Machine {
       a4[n - 1] = pair_first ? a + 8 : a;
     }
     if (!n) return true;
-    if ((bits & 3) || !mem.load_batch(a8, n, 8, v8) || !mem.load_batch(a4, n, 4, v4)) return false;
+    // (load_any: three words a lane of managed memory were declined here and read a lane at a time, Round sp70)
+    if ((bits & 3) || !load_any(a8, n, 8, v8) || !load_any(a4, n, 4, v4)) return false;
     uint32_t* rows[3];
     rows_of(w, dst, 3, rows);
     uint32_t* const r0 = rows[0];
@@ -13096,7 +13118,7 @@ bool Machine::wave_store_words(Wave& w, uint32_t from, const uint64_t* lane_addr
   }
   if (!n) return true;
   if (bits & 3) return false;
-  return mem.store_batch(a, n, 4, v);
+  return store_wave(a, n, 4, v);   // (a host mapping's batch first, as the loads': Round sp70)
 }
 
 bool Machine::wave_load4(Wave& w, uint32_t from, const uint64_t* lane_addr, const Operand& dst) {
@@ -13118,10 +13140,11 @@ bool Machine::wave_load4(Wave& w, uint32_t from, const uint64_t* lane_addr, cons
   }
   if (!n) return true;
   if (bits & 3) return false;
+  // (load_any: a quad of managed memory -- a complex double of inq's -- was declined here and read a lane at a time, Round sp70)
   for (uint32_t c = 0; c < n8; c += kLanes)
-    if (!mem.load_batch(a8 + c, std::min<uint32_t>(kLanes, n8 - c), 8, v8 + c)) return false;
+    if (!load_any(a8 + c, std::min<uint32_t>(kLanes, n8 - c), 8, v8 + c)) return false;
   for (uint32_t c = 0; c < n4; c += kLanes)
-    if (!mem.load_batch(a4 + c, std::min<uint32_t>(kLanes, n4 - c), 4, v4 + c)) return false;
+    if (!load_any(a4 + c, std::min<uint32_t>(kLanes, n4 - c), 4, v4 + c)) return false;
   uint32_t* rows[4];
   rows_of(w, dst, 4, rows);
   uint32_t* const r0 = rows[0];
@@ -13253,7 +13276,10 @@ unsigned worker_count(uint64_t groups) {
     const int v = std::atoi(t);
     want = v > 0 ? static_cast<unsigned>(v) : 1;
   } else {
-    want = vgpu::host_cpus();  // the CPUs this process may use, quota included
+    // The cores this process may use, quota included: one host thread a core, not one a hardware thread. A second thread on a
+    // core gave no wall time and doubled the CPU time on an 8-core, 16-thread host (vgpu/host_cores.hpp; Round sp70).
+    // VGPU_THREADS says otherwise, as before.
+    want = vgpu::host_cores();
   }
   if (want == 0) want = 1;
   if (want > groups) want = static_cast<unsigned>(groups);
@@ -13710,6 +13736,8 @@ std::atomic<bool> g_matrix_fast{true};
 }
 bool matrix_fast_path() { return g_matrix_fast.load(std::memory_order_relaxed); }
 uint64_t matrix_tile_count() { return g_matrix_tiles; }
+uint64_t vgpr_files_made() { return g_vgpr_files_made.load(std::memory_order_relaxed); }
+unsigned default_workers() { return worker_count(~uint64_t{0}); }
 void set_matrix_fast_path(bool on) { g_matrix_fast.store(on); }
 
 void abandon_dispatches() { g_abandoned.store(true); }
