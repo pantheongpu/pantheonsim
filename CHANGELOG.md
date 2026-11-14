@@ -73,6 +73,15 @@ release says what runs and what it produces, never how fast a real GPU would run
     (eigensolvers::steepest_descent 45 to 41 CPU-s).
   - A wave's three- and four-word loads and stores of managed or host memory (`hipMallocManaged`, `hipHostMalloc`) go to memory as one batch
     on one host thread, as its one- and two-word ones did (hamiltonian::ks_hamiltonian with `VGPU_THREADS=1`: 30.7 s to 27.4 s).
+- NVIDIA runtime, stream capture: anything a program does on the legacy stream while a blocking stream takes part in a capture is
+  now `cudaErrorStreamCaptureImplicit` (906), is not done, and invalidates every capture a blocking stream takes part in, in every
+  capture mode, as an RTX 3060 (CUDA 13.0) answers: a launch, a copy or fill (the synchronous `cudaMemcpy` and `cudaMemset` too), an
+  event record, `cudaStreamQuery` and `cudaStreamSynchronize`, a host function, a stream-ordered allocation or free, a prefetch, a graph
+  launch or upload, and the stream's flags, priority, id, device and attributes; `cudaStreamIsCapturing(0)` and
+  `cudaStreamGetCaptureInfo(0)` answer it without invalidating. A copy or fill of nothing, an unknown copy kind and a null result
+  pointer are answered first, as on the card. The simulator did all of them (only `cudaStreamWaitEvent` was refused) and built a graph
+  that lacked the work. The simulator's own libraries' runtime calls are not counted. `cudaStreamIsCapturing` with a null status is
+  `cudaErrorInvalidValue` (it answered success). Driver API calls on the legacy stream are not covered yet.
 - NVIDIA driver: a call made after `exit()` has torn the driver down, from the destructor of a library that loaded libcuda itself, now
   answers `CUDA_ERROR_DEINITIALIZED` (4), as NVIDIA's driver does (#646). NVHPC's OpenACC runtime (26.9) dlopens libcuda, retains the primary
   context once and releases it from its destructor, after the driver's own teardown; the simulator answered that release from its destroyed
