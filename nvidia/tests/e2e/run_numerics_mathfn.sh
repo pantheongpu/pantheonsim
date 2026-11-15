@@ -34,6 +34,12 @@ shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 if ! command -v nvcc >/dev/null 2>&1; then
   echo "SKIP: nvcc not found (e2e needs the CUDA toolkit to compile the app)"; exit 0
 fi
+# The pinned lines are those of the CUDA 13.0 math library (libdevice) as nvcc 13.0 compiles it; another release's library is other
+# code and gives other last bits (the CUDA 12.0 job differed on every pinned file), so only a 13.0 toolkit is held to the pins.
+nvcc_rel="$(nvcc --version | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')"
+if [[ "$nvcc_rel" != "13.0" ]]; then
+  echo "SKIP: nvcc is release ${nvcc_rel:-unknown}; the pinned math-function lines are CUDA 13.0's"; exit 0
+fi
 shopt -s nullglob
 cudart_libs=("$shim"/libcudart.so.[0-9]*)
 shopt -u nullglob
