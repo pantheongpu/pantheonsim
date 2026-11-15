@@ -20,6 +20,7 @@ One line per document. Start with the repository [README](../README.md); the des
 * [telemetry.md](telemetry.md): device discovery, NVML, nvidia-smi, rocm-smi, fault injection.
 * [registers.md](registers.md): the PCI and MMIO register model.
 * [cooperative.md](cooperative.md): cooperative launch and the grid barrier.
+* [matrix-numerics.md](matrix-numerics.md): which sum each profile's tensor core or matrix core makes, and whether that is measured on a card, published, or unmeasured.
 * [exact-threads.md](exact-threads.md): `VGPU_EXACT_THREADS`, blocks on several host threads with the bits of running them in order.
 * [pantheon-workloads.md](pantheon-workloads.md): running the pantheon workloads.
 

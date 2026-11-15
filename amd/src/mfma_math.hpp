@@ -198,6 +198,59 @@ inline double mfma_dot_fma(const double* a, const double* bt, uint32_t k, double
   for (uint32_t i = 0; i < k; ++i) sum = mfma_fma(bt[i], a[i], sum);
   return sum;
 }
+// ---- CDNA2 (gfx90a, an MI250X): the binary16 and bfloat16 forms ------------------------------------------------------------
+//
+// What the FTTN paper reports of an MI250X for binary16 and bfloat16 inputs with a binary32 accumulator (Li, Li, Fang, Swirydowicz,
+// Laguna, Gopalakrishnan, "FTTN: Feature-Targeted Testing for Numerical Properties of NVIDIA & AMD Matrix Accelerators", CCGrid
+// 2024, arXiv 2403.00232, the MI250X rows of its results table; through rocWMMA, so v_mfma_f32_16x16x16f16 and
+// v_mfma_f32_16x16x16bf16_1k):
+//   * subnormal inputs are not handled, and subnormal outputs are not either;
+//   * three extra bits and round to nearest, ties to even: every addition is a correctly rounded binary32 one;
+//   * "FMA unit width 1": the sum is rounded after every product, in the order of K, not once for the instruction.
+// So: a subnormal element of A or B and a subnormal C are read as zero, each product (exact in binary32: 11 x 11 or 8 x 8 significant
+// bits) is added to the running binary32 sum with one rounding to nearest even, and a sum in the subnormal range becomes zero.
+//
+// OPT-IN (VGPU_MFMA_CDNA2=fttn; amd::cdna2_matrix_model): off by default, the double sum below is what runs. This is the paper's
+// features, not a measurement of ours (no CDNA2 card is at hand), and they do not fix a bit-exact rule: the published bit-level
+// model of the same card (MMA-Sim, arXiv 2511.10909: products added in pairs, then fours, each sum rounded and flushed) prints the
+// same FTTN row, and gives 255.875 on the paper's motivating example where this rule gives the paper's 0. What is
+// chosen here and NOT known: the flushed zero keeps the sign of what it replaces; a subnormal running sum is flushed at each step, not
+// only at the end; a NaN result is the NaN the double sum below gives (the earlier rule). The paper ran the two 16x16x16 forms; the
+// other binary16 and bfloat16 shapes of gfx90a (32x32x8, 4x4x4, the bfloat16 forms without _1k) are given the same rule by
+// extension. The binary32 and binary64 forms are not touched: FTTN's programs put neighbouring K into different instructions there,
+// so its "width 1" says nothing about the sum inside one of them (docs/matrix-numerics.md).
+//
+// `min_normal` is the smallest normal number of the input format (2^-14 for binary16, 2^-126 for bfloat16).
+inline void cdna2_flush_inputs(double* v, size_t n, double min_normal) {
+  for (size_t i = 0; i < n; ++i)
+    if (v[i] != 0 && std::fabs(v[i]) < min_normal) v[i] = std::copysign(0.0, v[i]);   // (a NaN compares false: kept)
+}
+inline float cdna2_flush32(float v) { return v != 0 && std::fabs(v) < 1.17549435e-38f ? std::copysign(0.0f, v) : v; }
+// One output: c and k products, a[t] * b[t * bstride], operands already flushed. Returns the binary32 sum as a double; a NaN means
+// "a NaN came up" and the caller takes the earlier double sum's NaN.
+inline double cdna2_dot_seq32(const double* a, const double* b, size_t bstride, uint32_t k, double c) {
+  float sum = static_cast<float>(c);
+  for (uint32_t t = 0; t < k; ++t)
+    sum = cdna2_flush32(std::fma(static_cast<float>(a[t]), static_cast<float>(b[t * bstride]), sum));
+  return static_cast<double>(sum);
+}
+// A whole tile, in the layouts of mfma_tile_f (a: m rows of k; bk: k rows of n; c and out: m rows of n). The operands are flushed
+// in place first (the buffers are the instruction's own).
+template <int Order>
+inline double mfma_tile_ordered(const double* arow, const double* bcol, uint32_t n, uint32_t k, double c);
+template <int Order>
+inline void cdna2_tile_seq32(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk, const double* c, double* out) {
+  for (uint32_t i = 0; i < m; ++i)
+    for (uint32_t j = 0; j < n; ++j) {
+      double r = cdna2_dot_seq32(a + size_t{i} * k, bk + j, n, k, c[size_t{i} * n + j]);
+      if (r != r) {
+        const double d = mfma_tile_ordered<Order>(a + size_t{i} * k, bk + j, n, k, c[size_t{i} * n + j]);
+        if (d != d) r = d;   // (else: a NaN only the binary32 sum reaches, an overflow met by the opposite infinity: the default NaN it gave)
+      }
+      out[size_t{i} * n + j] = r;
+    }
+}
+
 // acc + a * b in 64 bits, wrapping as the hardware's integer adders do (done unsigned: the signed overflow is undefined, and a sanitizer says so).
 inline int64_t wrap_madd(int64_t acc, int64_t a, int64_t b) {
   return static_cast<int64_t>(static_cast<uint64_t>(acc) + static_cast<uint64_t>(a) * static_cast<uint64_t>(b));

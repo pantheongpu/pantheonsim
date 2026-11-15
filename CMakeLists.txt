@@ -1659,7 +1659,7 @@ vgpu_unit_test(test_launch_fp_traps)
 vgpu_unit_test(test_simd)
 # An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.
 vgpu_unit_test(test_tc_ampere)
-# The vector kernels of that sum against a frozen copy of the earlier form, bit for bit, over random and adversarial operands.
+# The vector kernels of that sum against its scalar form, bit for bit, over random and adversarial operands (on the tiles the dispatcher gives them).
 vgpu_unit_test(test_tc_ampere_fast)
 # IMMA.16816 / 16832 (8-bit operands) straight from the registers (include/vgpu/exec/imma_frag.hpp) against the definition, every sign combination.
 vgpu_unit_test(test_imma_frag)
@@ -2447,6 +2447,13 @@ target_compile_definitions(test_amd_hipcc_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_S
 
 vgpu_unit_test(test_amd_hipcc_mfma amd/tests/unit/test_hipcc_mfma.cpp)
 target_compile_definitions(test_amd_hipcc_mfma PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The opt-in rule for gfx90a's binary16 and bfloat16 matrix instructions, what the FTTN paper's summary of an MI250X reads as
+# (subnormals as zero, a binary32 rounding after every product): the paper's ten tests as fixed vectors and its motivating GEMM, on
+# and off; gfx942 unchanged; and once more with VGPU_MFMA_CDNA2=fttn in the environment, the switch a user has (docs/matrix-numerics.md).
+vgpu_unit_test(test_amd_cdna2_matrix amd/tests/unit/test_cdna2_matrix.cpp)
+target_compile_definitions(test_amd_cdna2_matrix PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME test_amd_cdna2_matrix_switched_on COMMAND test_amd_cdna2_matrix)
+set_tests_properties(test_amd_cdna2_matrix_switched_on PROPERTIES ENVIRONMENT "VGPU_MFMA_CDNA2=fttn")
 
 vgpu_unit_test(test_amd_gcn_globals amd/tests/unit/test_gcn_globals.cpp)
 target_compile_definitions(test_amd_gcn_globals PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

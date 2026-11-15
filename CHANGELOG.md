@@ -25,6 +25,28 @@ Fixes and additions since 0.2.0. The two bugs that release shipped are fixed: `s
 ([#488](https://github.com/pantheongpu/pantheonsim/issues/488)) and a kernel that could not read another simulated GPU's memory after
 `cudaDeviceEnablePeerAccess` ([#598](https://github.com/pantheongpu/pantheonsim/issues/598)). The release carries the simulator prebuilt for the
 GitHub Action. The list below is every entry that was under Unreleased.
+- Tensor cores: the sum now follows the device, and more devices have a measured one ([docs/matrix-numerics.md](docs/matrix-numerics.md),
+  issue #664). **Results of f16, bf16 and tf32 `wmma`, `mma.sync` and `HMMA` change on these profiles**; nothing else changes.
+  - Compute capability 7.5 (t4, rtx2080ti), 8.0 (a100*, a30) and 8.9 (l4, l40, l40s, rtx4080, rtx4090, rtx6000-ada) take the RTX 3060's
+    rule (chunks of 8 products, tf32 4, truncating). Measured 2026-11-15: a Tesla T4, an A100-SXM4-40GB, an A10G, an L4 and an L40S print
+    the RTX 3060's probe lines; the A100 also 8,388,608 of 8,388,608 dumped results.
+  - Compute capability 9.0 (h100*, h200*, gh200-480gb) takes an H100's: the same rule in chunks of 16 (tf32 8), cut one bit lower.
+    Measured on an H100 PCIe: 8,388,608 of 8,388,608 dumped results and the card's own probe lines on both engines. The FTTN paper's
+    motivating example now gives 191.875 on the h100 profile, as on the card and in the paper (it gave 0).
+  - The SASS engine chose the sum by the cubin's architecture and the PTX engine by the profile, so the two disagreed for an sm_86
+    binary on the default (h100) profile, and an sm_80 binary on an rtx3060 profile did not sum as the card does. Both ask the device.
+  - Four corners of the rule in the subnormal range are fixed (two confirmed on an RTX 3060, two from the published models): a
+    subnormal f32 result is cut, not rounded; a chunk starting from a zero accumulator has an alignment floor; a subnormal accumulator
+    counts at the smallest normal exponent; a negative sum that rounds to zero is +0.
+  - `VGPU_TC_EXACT=0` still gives the sequential sums everywhere. New values: `force` (the RTX 3060's rule on devices without a measured
+    one) and `published` (Blackwell profiles take the published model, the H100's numbers: no card of ours has run it, so it is off by
+    default). Blackwell and the other unmeasured capabilities keep the sequential sum.
+  - Cost: the H100 rule and every tile with an f16 accumulator run in scalar code; their speed was not measured.
+- AMD: `VGPU_MFMA_CDNA2=fttn` (off by default) makes the mi250x profile's f16 and bf16 matrix instructions sum as the FTTN paper's
+  MI250X row reads (subnormals as zero, one f32 rounding after every product). Paper only: no AMD matrix-core card has been measured,
+  and the default sums of every AMD profile are unchanged.
+- `tools/fttn/`: fetches, builds and runs the FTTN test suite (arXiv 2403.00232) on the simulator and on a card, with the paper's
+  motivating example, a card script, a fitter for tensor-core dumps and a checker that holds the simulator's code to a card's dump.
 
 - AMD counters: the `VGPU_DISPATCH_STATS` line now ends with the bytes the active lanes ask for (`vmem_bytes_rd`, `vmem_bytes_wr`, `lds_bytes_rd`, `lds_bytes_wr`),
   the vector instruction mix (`mix=`), the matrix work by type (`mops=`) and the kernel's name (`kernel=`). The mix and the matrix work were already counted

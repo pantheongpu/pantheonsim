@@ -1,0 +1,54 @@
+diff -ru a/utility/amd/amd_utility.hpp b/utility/amd/amd_utility.hpp
+--- a/utility/amd/amd_utility.hpp
++++ b/utility/amd/amd_utility.hpp
+@@ -12,9 +12,15 @@
+ 
+ // GEMM configuration.
+ 
++#ifndef M_TILES
+ #define M_TILES 512
++#endif
++#ifndef N_TILES
+ #define N_TILES 512
++#endif
++#ifndef K_TILES
+ #define K_TILES 512
++#endif
+ 
+ #define M_GLOBAL (M * M_TILES)
+ #define N_GLOBAL (N * N_TILES)
+diff -ru a/utility/nvidia/nvidia_utility.cuh b/utility/nvidia/nvidia_utility.cuh
+--- a/utility/nvidia/nvidia_utility.cuh
++++ b/utility/nvidia/nvidia_utility.cuh
+@@ -13,9 +13,15 @@
+ 
+ // GEMM configuration.
+ 
++#ifndef M_TILES
+ #define M_TILES 512
++#endif
++#ifndef N_TILES
+ #define N_TILES 512
++#endif
++#ifndef K_TILES
+ #define K_TILES 512
++#endif
+ 
+ #define M_GLOBAL (M * M_TILES)
+ #define N_GLOBAL (N * N_TILES)
+@@ -111,6 +117,7 @@
+   cudaMemcpy(h_c, d_c, 16*16*sizeof(returntype), cudaMemcpyDeviceToHost);
+ }
+ 
++#ifndef FTTN_FP16_ONLY   /* sm_75 and older: mma.h has no tf32, bf16 or double fragments */
+ __global__ void wmma_ker_32(FP32 *a, FP32 *b, FP32 *c, bool init) {
+ 
+   // Declare fragments.
+@@ -210,6 +217,7 @@
+   cudaMemcpy(h_c, d_c, 16*16*sizeof(double), cudaMemcpyDeviceToHost);
+ }
+ 
++#endif /* FTTN_FP16_ONLY */
+ 
+ template <typename inputtype, typename returntype>
+ __global__ void simple_wmma_16(inputtype *a, inputtype *b, returntype *c, returntype *d, int m_ld, int n_ld, int k_ld, float alpha, float beta)
