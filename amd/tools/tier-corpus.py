@@ -237,6 +237,10 @@ for t in ['f', 'lt', 'eq', 'le', 'gt', 'ne', 'ge', 't']:
         add('v_cmpx_%s_%s vcc, v[2:3], v[4:5]' % (t, ty))
 for ops in ['v[2:3], v[2:3], v3', 'v[0:1], v[2:3], -3', 'v[0:1], 1.5, v4', 'v[0:1], v[2:3], 0']:
     add('v_ldexp_f64 ' + ops)
+# (a constant under a modifier, which the assembler writes neg(...) and abs(...))
+for op in ['v_min_f64', 'v_max_f64', 'v_cmp_lt_f64', 'v_cmp_nge_f64', 'v_add_f64', 'v_mul_f64']:
+    for ops in ['neg(1.0), v[4:5]', 'v[2:3], neg(0.5)', 'abs(-1.0), v[4:5]', 'neg(abs(-2.0)), v[4:5]', 'neg(0), v[4:5]']:
+        add('%s %s, %s' % (op, 'vcc' if 'cmp' in op else 'v[0:1]', ops))
 for op in ['v_cvt_f64_i32', 'v_cvt_f64_u32']:
     for ops in ['v[0:1], v1', 'v[0:1], s1', 'v[0:1], 7', 'v[1:2], v1', 'v[0:1], -1', 'v[1:2], v2']:
         add('%s_e32 %s' % (op, ops))

@@ -14721,12 +14721,12 @@ uint32_t draw(Rng& r, uint32_t flavour) {
     return half(static_cast<uint32_t>(x), static_cast<uint32_t>(x >> 40)) | uint32_t{half(static_cast<uint32_t>(x >> 32), static_cast<uint32_t>(x >> 48))} << 16;
   }
   if (flavour == 1 || flavour == 13) return static_cast<uint32_t>(x) & 0xFF;
-  if (flavour == 36 || flavour == 37) {
+  if (flavour >= 36 && flavour <= 38) {
     // (Doubles for the tier's row handlers of register pairs, Round sp74: a word is zero one time in four and the sign bit alone one in
     // eight, so that a pair is a zero of either sign often; otherwise the high word of a number near 1, of either sign, which as a low
-    // word is any bits. No NaN, infinity or denormal in 36, so that the rows run whole; in 37 one word in 64 is the high word of one, or of
-    // the largest or the smallest normal number, and half the lanes are off.)
-    if (flavour == 37 && (x >> 56) % 64 == 0) {
+    // word is any bits. No NaN, infinity or denormal in 36, so that the rows run whole; in 37 and 38 one word in 64 is the high word of one,
+    // or of the largest or the smallest normal number, and half the lanes are off (37) or all but one run of consecutive lanes (38).)
+    if (flavour != 36 && (x >> 56) % 64 == 0) {
       static constexpr uint32_t kOdd[] = {0x7FF00000u, 0xFFF00000u, 0x7FF80000u, 0x7FF00001u, 0x000FFFFFu, 0x00000001u, 0x7FEFFFFFu, 0x00100000u};
       return kOdd[(x >> 32) % std::size(kOdd)];
     }
@@ -14804,11 +14804,15 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
   w.vcc = r.next() & all;
   w.m0 = draw(r, flavour);
   w.scc = r.next() & 1;
-  if ((flavour == 36 || flavour == 37) && in.name.rfind("v_ldexp_f64", 0) == 0 && in.src.size() > 1) {
-    // (v_ldexp_f64's exponent: small, so that the result is a normal number; in 37 one in 64 takes it past either end of them.)
+  if (flavour == 38) {   // (one run of lanes on, from a random lane: the lanes before it and after it are off)
+    const uint32_t start = static_cast<uint32_t>(r.next() % w.lanes), length = 1 + static_cast<uint32_t>(r.next() % (w.lanes - start));
+    w.exec = (length == 64 ? ~uint64_t{0} : ((uint64_t{1} << length) - 1)) << start;
+  }
+  if (flavour >= 36 && flavour <= 38 && in.name.rfind("v_ldexp_f64", 0) == 0 && in.src.size() > 1) {
+    // (v_ldexp_f64's exponent: small, so that the result is a normal number; in 37 and 38 one in 64 takes it past either end of them.)
     const auto exponent = [&] {
       const uint64_t x = r.next();
-      return static_cast<uint32_t>(flavour == 37 && (x & 63) == 0 ? static_cast<int32_t>((x >> 8) % 4400) - 2200 : static_cast<int32_t>((x >> 8) % 25) - 12);
+      return static_cast<uint32_t>(flavour != 36 && (x & 63) == 0 ? static_cast<int32_t>((x >> 8) % 4400) - 2200 : static_cast<int32_t>((x >> 8) % 25) - 12);
     };
     if (in.src[1].kind == OperandKind::Vgpr)
       for (uint32_t& v : w.vgpr[in.src[1].index]) v = exponent();
