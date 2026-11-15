@@ -121,7 +121,8 @@ struct Kernels {
   // rounded to f32 (never fused), a NaN result the canonical 0x7fffffff (f16
   // accumulator: 0x7fff), exactly as the SASS executor's general form
   // computes it. `out` may not alias the inputs. With bit 4 of `kind` set (16 + kind) the sum is an RTX 3060's tensor-core
-  // sum instead (vgpu/exec/tc_ampere.hpp): chunks of 8 products (4 for tf32) with the accumulator, truncated.
+  // sum instead (vgpu/exec/tc_ampere.hpp): chunks of 8 products (4 for tf32) with the accumulator, truncated; with bit 5 (32 + kind) an
+  // H100's (chunks of 16, cut one bit lower). tc86::kernel_kind_bits gives the bits for a device.
   void (*hmma)(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const uint32_t* b,
                const uint32_t* c, uint32_t* out);
 

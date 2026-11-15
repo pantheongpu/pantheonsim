@@ -1887,8 +1887,8 @@ VGPU_EXPORT cublasStatus_t cublasIdamax_v2_64(cublasHandle_t h, int64_t n, const
    FAST_TF32 forms, all computed here in single precision). The int8 path with
    an int32 result takes only what cuBLAS documents for it: lda and ldb
    multiples of 4, A and B 4-byte aligned and op(B) = N; anything else is
-   NOT_SUPPORTED, as is a real matrix not aligned to its element. A bad handle is reported before a bad type, and a bad type
-   before a bad argument, in that order on the card too. */
+   NOT_SUPPORTED, as is a real matrix not aligned to its element. A bad handle is reported first, then A and B of two
+   types, then a bad argument, then an unknown type (gemm_ex_checks), then a combination not in the table. */
 namespace {
 
 // CUBLAS_COMPUTE_32F_EMULATED_16BFX9 (78) and CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT
@@ -1921,6 +1921,48 @@ bool gemm_ex_supported(cudaDataType a, cudaDataType b, cudaDataType c, cublasCom
   }
 }
 
+// The Ex routines' type checks, as an RTX 3060's cuBLAS 13.0 makes them (all values read as integers, so that one no
+// enumerator names is never loaded as the enum):
+//   - a data type outside CUDA_R_32F .. CUDA_C_16BF (0..15; the newer 4- and 8-bit types among the values above) is
+//     unknown: INVALID_VALUE, with no line, after the arguments' checks; A and B of two types are NOT_SUPPORTED before
+//     them;
+//   - a compute type may also be a cudaDataType, as in CUDA 10: CUDA_R_32F and CUDA_C_32F mean CUBLAS_COMPUTE_32F,
+//     CUDA_R_64F and CUDA_C_64F 64F, CUDA_R_16F 16F and CUDA_R_32I 32I; a value from 64 up that names no
+//     cublasComputeType_t is unknown to the batched forms (INVALID_VALUE), and NOT_SUPPORTED to cublasGemmEx, as is
+//     any other value.
+bool ex_type_known(int t) { return t >= 0 && t <= 15; }
+int ex_compute(int ct) {
+  switch (ct) {
+    case 0: case 4: return CUBLAS_COMPUTE_32F;
+    case 1: case 5: return CUBLAS_COMPUTE_64F;
+    case 2: return CUBLAS_COMPUTE_16F;
+    case 10: return CUBLAS_COMPUTE_32I;
+    default: return ct;
+  }
+}
+bool ex_compute_named(int ct) { return ct == 64 || ct == 65 || (ct >= 68 && ct <= 75) || (ct >= 77 && ct <= 79); }
+bool ex_compute_unknown(int ct) { return ct >= 64 && !ex_compute_named(ct); }
+// The checks the three GemmEx forms make before their own: two types for A and B (NOT_SUPPORTED), then a bad argument
+// (its line, by the calling routine's positions), then an unknown data type or, for the batched forms, compute type.
+// SUCCESS when the call goes on.
+cublasStatus_t gemm_ex_checks(const GemmExField& f, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                              int lda, int ldb, int ldc, int at, int bt, int ct, int compute, cublasGemmAlgo_t algo,
+                              bool batched) {
+  if (at != bt) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (const int bad = gemm_bad_arg(ta, tb, m, n, k, lda, ldb, ldc))
+    return illegal_arg(f.name, bad == 8 ? f.lda : bad == 10 ? f.ldb : bad == 13 ? f.ldc : bad);
+  if (!known_gemm_algo(algo)) return illegal_arg(f.name, f.algo);
+  if (!ex_type_known(at) || !ex_type_known(ct)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (batched && ex_compute_unknown(compute)) return CUBLAS_STATUS_INVALID_VALUE;
+  return CUBLAS_STATUS_SUCCESS;
+}
+// Whether the (known) types and compute type are a combination GemmEx computes.
+bool gemm_ex_takes(int at, int ct, int compute) {
+  return ex_compute_named(compute) &&
+         gemm_ex_supported(static_cast<cudaDataType>(at), static_cast<cudaDataType>(at), static_cast<cudaDataType>(ct),
+                           static_cast<cublasComputeType_t>(compute));
+}
+
 // alpha and beta are typed by the compute type, and are complex when C is.
 size_t gemm_scalar_bytes(cublasComputeType_t ct, cudaDataType c) {
   return compute_scalar_bytes(ct) * (c == CUDA_C_32F || c == CUDA_C_64F ? 2 : 1);
@@ -1939,21 +1981,21 @@ VGPU_EXPORT cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t ta,
                                         const void* alpha, const void* A, cudaDataType Atype,
                                         int lda, const void* B, cudaDataType Btype, int ldb,
                                         const void* beta, void* C, cudaDataType Ctype, int ldc,
-                                        cublasComputeType_t computeType, cublasGemmAlgo_t algo) {
+                                        cublasComputeType_t computeTypeIn, cublasGemmAlgo_t algo) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (!gemm_ex_supported(Atype, Btype, Ctype, computeType)) {
+  const int at = enum_value(Atype), bt = enum_value(Btype), ct = enum_value(Ctype);
+  const int compute = ex_compute(enum_value(computeTypeIn));
+  if (const cublasStatus_t st = gemm_ex_checks(t_gemm_ex_field ? *t_gemm_ex_field : kGemmExField, ta, tb, m, n, k, lda,
+                                               ldb, ldc, at, bt, ct, compute, algo, false);
+      st != CUBLAS_STATUS_SUCCESS)
+    return st;
+  if (!gemm_ex_takes(at, ct, compute)) {
     if (trace())
-      std::fprintf(stderr,
-                   "[vgpu] cublasGemmEx: unsupported type combination (A=%d B=%d C=%d compute=%d)\n",
-                   (int)Atype, (int)Btype, (int)Ctype, (int)computeType);
+      std::fprintf(stderr, "[vgpu] cublasGemmEx: unsupported type combination (A=%d B=%d C=%d compute=%d)\n", at, bt,
+                   ct, compute);
     return CUBLAS_STATUS_NOT_SUPPORTED;
   }
-  {
-    const GemmExField& f = t_gemm_ex_field ? *t_gemm_ex_field : kGemmExField;
-    if (const int bad = gemm_bad_arg(ta, tb, m, n, k, lda, ldb, ldc))
-      return illegal_arg(f.name, bad == 8 ? f.lda : bad == 10 ? f.ldb : bad == 13 ? f.ldc : bad);
-    if (!known_gemm_algo(algo)) return illegal_arg(f.name, f.algo);
-  }
+  const auto computeType = static_cast<cublasComputeType_t>(compute);
   if (Ctype != CUDA_C_32F && Ctype != CUDA_C_64F && !gemm_aligned(A, B, C, type_bytes(Atype), type_bytes(Ctype)))
     return CUBLAS_STATUS_NOT_SUPPORTED;
   if (compute_32i(computeType) &&
@@ -2028,7 +2070,22 @@ VGPU_EXPORT cublasStatus_t cublasGemmStridedBatchedEx(
     const void* alpha, const void* A, cudaDataType Atype, int lda, long long strideA,
     const void* B, cudaDataType Btype, int ldb, long long strideB, const void* beta, void* C,
     cudaDataType Ctype, int ldc, long long strideC, int batchCount,
-    cublasComputeType_t computeType, cublasGemmAlgo_t algo) {
+    cublasComputeType_t computeTypeIn, cublasGemmAlgo_t algo) {
+  // As an RTX 3060 answers (gemm_ex_checks): then no batch is a success, and after the combination's check a negative
+  // count is one too.
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  const int compute = ex_compute(enum_value(computeTypeIn));
+  {
+    const int at = enum_value(Atype), ct = enum_value(Ctype);
+    if (const cublasStatus_t st = gemm_ex_checks(t_gemm_ex_field ? *t_gemm_ex_field : kGemmStridedBatchedExField, ta,
+                                                 tb, m, n, k, lda, ldb, ldc, at, enum_value(Btype), ct, compute, algo,
+                                                 true);
+        st != CUBLAS_STATUS_SUCCESS)
+      return st;
+    if (batchCount == 0) return CUBLAS_STATUS_SUCCESS;
+    if (!gemm_ex_takes(at, ct, compute)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  }
+  const auto computeType = static_cast<cublasComputeType_t>(compute);
   const size_t ea = type_bytes(Atype), eb = type_bytes(Btype), ec = type_bytes(Ctype);
   if (!ea || !eb || !ec) return CUBLAS_STATUS_NOT_SUPPORTED;
   const GemmExFieldScope field(kGemmStridedBatchedExField);
@@ -2048,12 +2105,25 @@ VGPU_EXPORT cublasStatus_t cublasGemmBatchedEx(
     cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
     const void* alpha, const void* const Aarray[], cudaDataType Atype, int lda,
     const void* const Barray[], cudaDataType Btype, int ldb, const void* beta, void* const Carray[],
-    cudaDataType Ctype, int ldc, int batchCount, cublasComputeType_t computeType,
+    cudaDataType Ctype, int ldc, int batchCount, cublasComputeType_t computeTypeIn,
     cublasGemmAlgo_t algo) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (batchCount < 0) return CUBLAS_STATUS_INVALID_VALUE;
-  if (batchCount == 0) return CUBLAS_STATUS_SUCCESS;
-  if (!Aarray || !Barray || !Carray) return CUBLAS_STATUS_INVALID_VALUE;
+  // As an RTX 3060 answers (gemm_ex_checks): then no batch, and an empty C, is a success; then the combination's check;
+  // then a null C array is INVALID_VALUE and a negative count EXECUTION_FAILED.
+  const int compute = ex_compute(enum_value(computeTypeIn));
+  {
+    const int at = enum_value(Atype), ct = enum_value(Ctype);
+    if (const cublasStatus_t st = gemm_ex_checks(t_gemm_ex_field ? *t_gemm_ex_field : kGemmBatchedExField, ta, tb, m,
+                                                 n, k, lda, ldb, ldc, at, enum_value(Btype), ct, compute, algo, true);
+        st != CUBLAS_STATUS_SUCCESS)
+      return st;
+    if (batchCount == 0 || m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
+    if (!gemm_ex_takes(at, ct, compute)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  }
+  const auto computeType = static_cast<cublasComputeType_t>(compute);
+  if (!Carray) return CUBLAS_STATUS_INVALID_VALUE;
+  if (batchCount < 0) return CUBLAS_STATUS_EXECUTION_FAILED;
+  if (!Aarray || !Barray) return CUBLAS_STATUS_INVALID_VALUE;
   // The operations travel as integers: the arguments are only checked by the per-matrix cublasGemmEx below, and a
   // lambda copying an out-of-range enum is a load UBSan's enum check refuses.
   const int ta_i = static_cast<int>(ta), tb_i = static_cast<int>(tb);
@@ -2997,7 +3067,6 @@ CMat cex_mat(const void* p, cudaDataType t, int ld, int cols, int rows) {
   for (size_t i = 0; 2 * i < raw.size(); ++i) m.v[i] = cd(raw[2 * i], raw[2 * i + 1]);
   return m;
 }
-bool cex_type(cudaDataType a, cudaDataType c) { return (a == CUDA_C_32F || a == CUDA_C_8I) && c == CUDA_C_32F; }
 
 cublasStatus_t gemm_ex_complex(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
                                const void* alpha, const void* A, cudaDataType Atype, int lda, const void* B, int ldb,
@@ -3026,10 +3095,13 @@ cublasStatus_t gemm_ex_complex(cublasHandle_t h, cublasOperation_t ta, cublasOpe
 }
 
 cublasStatus_t cgemm_ex(const GemmExField& field, cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m,
-                        int n, int k, const cuComplex* alpha, const void* A, cudaDataType Atype, int lda, const void* B,
-                        cudaDataType Btype, int ldb, const cuComplex* beta, void* C, cudaDataType Ctype, int ldc) {
+                        int n, int k, const cuComplex* alpha, const void* A, const cudaDataType& Atype, int lda,
+                        const void* B, const cudaDataType& Btype, int ldb, const cuComplex* beta, void* C,
+                        const cudaDataType& Ctype, int ldc) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (!cex_type(Atype, Ctype) || Btype != Atype) return CUBLAS_STATUS_NOT_SUPPORTED;
+  const int at = enum_value(Atype), ct = enum_value(Ctype);
+  if (at != enum_value(Btype) || !(at == CUDA_C_32F || at == CUDA_C_8I) || ct != CUDA_C_32F)
+    return CUBLAS_STATUS_NOT_SUPPORTED;
   const GemmExFieldScope scope(field);
   return cublasGemmEx(h, ta, tb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C, Ctype, ldc,
                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
@@ -3039,11 +3111,17 @@ cublasStatus_t cgemm_ex(const GemmExField& field, cublasHandle_t h, cublasOperat
 // ("CHERK " for cublasCherkEx and cublasCherk3mEx, "CSYRK ", "CSYRK3M "), by ?HERK's positions (lda 7, ldc 10).
 template <class S>
 cublasStatus_t cherk_ex(const char* name, cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, cublasOperation_t t,
-                        int n, int k, const S* alpha, const void* A, cudaDataType Atype, int lda, const S* beta,
-                        void* C, cudaDataType Ctype, int ldc) {
+                        int n, int k, const S* alpha, const void* A, const cudaDataType& AtypeIn, int lda,
+                        const S* beta, void* C, const cudaDataType& CtypeIn, int ldc) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (!cex_type(Atype, Ctype)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  // As an RTX 3060 answers: a bad argument first, then nothing to do is a success whatever the types, then an unknown
+  // type (gemm_ex_checks) is INVALID_VALUE and a combination other than C_32F or C_8I into C_32F NOT_SUPPORTED.
   if (const int bad = herk_bad_arg(uplo, t, n, k, lda, false, 0, ldc)) return illegal_arg(name, bad);
+  if (n == 0) return CUBLAS_STATUS_SUCCESS;
+  const int at = enum_value(AtypeIn), ct = enum_value(CtypeIn);
+  if (!ex_type_known(at) || !ex_type_known(ct)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (!(at == CUDA_C_32F || at == CUDA_C_8I) || ct != CUDA_C_32F) return CUBLAS_STATUS_NOT_SUPPORTED;
+  const auto Atype = static_cast<cudaDataType>(at);
   if (Atype == CUDA_C_32F)
     return cherk<cuComplex, S>(h, hermitian, uplo, t, n, k, alpha, static_cast<const cuComplex*>(A), lda, beta,
                                static_cast<cuComplex*>(C), ldc);
@@ -3070,6 +3148,9 @@ VGPU_EXPORT cublasStatus_t cublasSgemmEx(cublasHandle_t h, cublasOperation_t ta,
                                          const void* B, cudaDataType Btype, int ldb, const float* beta, void* C,
                                          cudaDataType Ctype, int ldc) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  // An unknown type is NOT_SUPPORTED here (measured), not GemmEx's INVALID_VALUE.
+  if (!ex_type_known(enum_value(Atype)) || !ex_type_known(enum_value(Btype)) || !ex_type_known(enum_value(Ctype)))
+    return CUBLAS_STATUS_NOT_SUPPORTED;
   if (Ctype == CUDA_C_32F || Ctype == CUDA_C_64F || Ctype == CUDA_R_32I) return CUBLAS_STATUS_NOT_SUPPORTED;
   const GemmExFieldScope field(kSgemmExField);
   return cublasGemmEx(h, ta, tb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C, Ctype, ldc,

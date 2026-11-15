@@ -1,0 +1,33 @@
+# Mutation evidence, server3, 2026-11-15: one change to a copy of a source, the named unit test rebuilt with it, must fail.
+# (tensor-core rule: include/vgpu/exec/tc_ampere.hpp, test_tc_ampere; MI250X opt-in rule: amd/src/mfma_math.hpp and gcn_exec.cpp, test_amd_cdna2_matrix)
+# First run. Three survived: one mutant was equivalent as written (vector-takes-f16-accumulator: its condition never let an f16
+# accumulator through) and two found holes in the tests (no vector overflowed a 32-bit Hopper sum; the accumulator's own flush was
+# hidden by the flush of the first sum). A test was added for each and the three were run again (second run): all killed.
+hopper-grid-25 | killed by test_tc_ampere: hopper_card_vectors the_hopper_rule_agrees_with_an_independent_form the_subnormal_corners the_fttn_tests_by_rule
+hopper-chunk-8 | killed by test_tc_ampere: hopper_card_vectors the_hopper_rule_agrees_with_an_independent_form the_fttn_tests_by_rule
+hopper-tf32-chunk-4 | killed by test_tc_ampere: the_hopper_rule_agrees_with_an_independent_form
+ampere-chunk-16 | killed by test_tc_ampere: hopper_card_vectors
+floor-off-by-one | killed by test_tc_ampere: the_subnormal_corners
+no-floor | killed by test_tc_ampere: the_subnormal_corners
+subnormal-acc-at-own-bit | killed by test_tc_ampere: the_subnormal_corners
+subnormal-result-rounded | killed by test_tc_ampere: the_subnormal_corners avx2_equals_scalar
+f16-negative-zero-kept | killed by test_tc_ampere: the_subnormal_corners
+vector-takes-tiny-tiles | killed by test_tc_ampere: the_subnormal_corners
+vector-takes-f16-accumulator | SURVIVED
+wmma-tf32-cap-ignored | killed by test_tc_ampere: hopper_card_vectors
+wide-sum-in-32-bits | SURVIVED
+no-input-flush | killed by test_amd_cdna2_matrix: an_mi250x_sums_binary16_and_bfloat16_as_the_fttn_paper_reports
+no-result-flush | killed by test_amd_cdna2_matrix: an_mi250x_sums_binary16_and_bfloat16_as_the_fttn_paper_reports
+round-once-not-per-product | killed by test_amd_cdna2_matrix: an_mi250x_sums_binary16_and_bfloat16_as_the_fttn_paper_reports the_motivating_example_is_0_on_an_mi250x_as_the_paper_reports
+also-on-gfx942 | killed by test_amd_cdna2_matrix: gfx942_keeps_the_double_sum the_motivating_example_is_0_on_an_mi250x_as_the_paper_reports
+no-accumulator-flush-tile-path | SURVIVED
+no-accumulator-flush-reference-path | SURVIVED
+on-by-default | killed by test_amd_cdna2_matrix: the_rule_is_off_unless_the_environment_asks_for_it
+tile-path-keeps-double-sum | killed by test_amd_cdna2_matrix: an_mi250x_sums_binary16_and_bfloat16_as_the_fttn_paper_reports the_motivating_example_is_0_on_an_mi250x_as_the_paper_reports
+# second run
+wide-sum-in-32-bits | killed by test_tc_ampere: a_hopper_chunk_needs_more_than_32_bits
+vector-kernel-takes-f16-accumulator-tiles | killed by test_tc_ampere: the_subnormal_corners
+no-accumulator-flush-tile-path | killed by test_amd_cdna2_matrix: an_mi250x_sums_binary16_and_bfloat16_as_the_fttn_paper_reports
+no-accumulator-flush-reference-path | killed by test_amd_cdna2_matrix: an_mi250x_sums_binary16_and_bfloat16_as_the_fttn_paper_reports
+unmutated test_tc_ampere | 10/10 tests passed
+unmutated test_amd_cdna2_matrix | 6/6 tests passed

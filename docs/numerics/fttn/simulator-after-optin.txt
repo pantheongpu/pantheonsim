@@ -1,0 +1,145 @@
+amd.mi250x.gfx90a.bf16in.txt | MI250X No 3 RTN Yes Yes 1 RTN
+amd.mi250x.gfx90a.fp16in.txt | MI250X No 3 RTN Yes Yes 1 RTN
+amd.mi250x.gfx90a.fp64in.txt | MI250X Yes 3 RTN Yes Yes 1 RTN
+amd.mi250x.gfx90a.motivating.txt | D=0.000000 bits=0x00000000
+amd.mi250x.gfx90a.tf-fp32in.txt | MI250X Yes 3 RTN Yes Yes 1 RTN
+amd.mi300x.gfx942.bf16in.txt | MI300X Yes 3 RTN Yes Yes 10 RTN
+amd.mi300x.gfx942.fp16in.txt | MI300X Yes 3 RTN Yes Yes 16 RTN
+amd.mi300x.gfx942.fp64in.txt | MI300X Yes 3 RTN Yes Yes 1 RTN
+amd.mi300x.gfx942.motivating.txt | D=192.000000 bits=0x43400000
+amd.mi300x.gfx942.tf-fp32in.txt | MI300X Yes 3 RTN Yes Yes 1 RTN
+amd.mi325x.gfx942.bf16in.txt | MI325X Yes 3 RTN Yes Yes 10 RTN
+amd.mi325x.gfx942.fp16in.txt | MI325X Yes 3 RTN Yes Yes 16 RTN
+amd.mi325x.gfx942.fp64in.txt | MI325X Yes 3 RTN Yes Yes 1 RTN
+amd.mi325x.gfx942.motivating.txt | D=192.000000 bits=0x43400000
+amd.mi325x.gfx942.tf-fp32in.txt | MI325X Yes 3 RTN Yes Yes 1 RTN
+amd.mi350x.gfx942.bf16in.txt | MI350X No 0 N.A. N.A. 1 N.A.
+amd.mi350x.gfx942.fp16in.txt | MI350X No 0 N.A. N.A. 1 N.A.
+amd.mi350x.gfx942.fp64in.txt | MI350X No 0 N.A. N.A. 1 N.A.
+amd.mi350x.gfx942.motivating.txt |  rc=1 hip Runtime Error at: motivating.cpp:29 no kernel image is available for execution on the device
+amd.mi350x.gfx942.tf-fp32in.txt | MI350X No 0 N.A. N.A. 1 N.A.
+amd.mi455x.gfx942.bf16in.txt | MI455X No 0 N.A. N.A. 1 N.A.
+amd.mi455x.gfx942.fp16in.txt | MI455X No 0 N.A. N.A. 1 N.A.
+amd.mi455x.gfx942.fp64in.txt | MI455X No 0 N.A. N.A. 1 N.A.
+amd.mi455x.gfx942.motivating.txt |  rc=1 hip Runtime Error at: motivating.cpp:29 no kernel image is available for execution on the device
+amd.mi455x.gfx942.tf-fp32in.txt | MI455X No 0 N.A. N.A. 1 N.A.
+amd.rx7900xtx.gfx1100.bf16in.txt | RX 7900 XTX Yes 3 RTN Yes Yes 10 RTN
+amd.rx7900xtx.gfx1100.fp16in.txt | RX 7900 XTX Yes 3 RTN Yes Yes 16 RTN
+amd.rx7900xtx.gfx1100.fp64in.txt | RX 7900 XTX No 0 N.A. N.A. 1 N.A.
+amd.rx7900xtx.gfx1100.motivating.txt | D=192.000000 bits=0x43400000
+amd.rx7900xtx.gfx1100.tf-fp32in.txt | RX 7900 XTX No 0 N.A. N.A. 1 N.A.
+amd.rx9070xt.gfx1201.fp64in.txt | RX 9070 XT No 0 N.A. N.A. 1 N.A.
+amd.rx9070xt.gfx1201.motivating.txt | D=192.000000 bits=0x43400000
+amd.rx9070xt.gfx1201.tf-fp32in.txt | RX 9070 XT No 0 N.A. N.A. 1 N.A.
+nvidia.a100.sm_80.bf16in.ptx.txt | A100-SXM4-80GB Yes 1 Trucate N.A. N.A. 8 N.A.
+nvidia.a100.sm_80.bf16in.sass.txt | A100-SXM4-80GB Yes 1 Trucate N.A. N.A. 8 N.A.
+nvidia.a100.sm_80.fp16in.ptx.txt | A100-SXM4-80GB Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.a100.sm_80.fp16in.sass.txt | A100-SXM4-80GB Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.a100.sm_80.fp64in.ptx.txt | A100-SXM4-80GB Yes 3 RTN Yes Yes 1 RTN
+nvidia.a100.sm_80.fp64in.sass.txt | A100-SXM4-80GB Yes 3 RTN Yes Yes 1 RTN
+nvidia.a100.sm_80.motivating.ptx.txt | D=0.000000 bits=0x00000000
+nvidia.a100.sm_80.motivating.sass.txt | D=0.000000 bits=0x00000000
+nvidia.a100.sm_80.tf-fp32in.ptx.txt | A100-SXM4-80GB Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.a100.sm_80.tf-fp32in.sass.txt | A100-SXM4-80GB Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.a10g.sm_86.bf16in.ptx.txt | A10G Yes 1 Trucate N.A. N.A. 8 N.A.
+nvidia.a10g.sm_86.bf16in.sass.txt | A10G Yes 1 Trucate N.A. N.A. 8 N.A.
+nvidia.a10g.sm_86.fp16in.ptx.txt | A10G Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.a10g.sm_86.fp16in.sass.txt | A10G Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.a10g.sm_86.fp64in.ptx.txt | A10G Yes 3 RTN Yes Yes 1 RTN
+nvidia.a10g.sm_86.fp64in.sass.txt | A10G Yes 3 RTN Yes Yes 1 RTN
+nvidia.a10g.sm_86.motivating.ptx.txt | D=0.000000 bits=0x00000000
+nvidia.a10g.sm_86.motivating.sass.txt | D=0.000000 bits=0x00000000
+nvidia.a10g.sm_86.tf-fp32in.ptx.txt | A10G Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.a10g.sm_86.tf-fp32in.sass.txt | A10G Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.b200.sm_100.bf16in.ptx.txt | B200 Yes 1 Trucate N.A. N.A. 10 N.A.
+nvidia.b200.sm_100.bf16in.sass.txt | B200 Yes 1 Trucate N.A. N.A. 10 N.A.
+nvidia.b200.sm_100.fp16in.ptx.txt | B200 Yes 1 Trucate N.A. N.A. 16 RTN
+nvidia.b200.sm_100.fp16in.sass.txt | B200 Yes 1 Trucate N.A. N.A. 16 RTN
+nvidia.b200.sm_100.fp64in.ptx.txt | B200 Yes 3 RTN Yes Yes 1 RTN
+nvidia.b200.sm_100.fp64in.sass.txt | B200 Yes 3 RTN Yes Yes 1 RTN
+nvidia.b200.sm_100.motivating.ptx.txt | D=191.875000 bits=0x433fe000
+nvidia.b200.sm_100.motivating.sass.txt | D=191.875000 bits=0x433fe000
+nvidia.b200.sm_100.tf-fp32in.ptx.txt | B200 Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.b200.sm_100.tf-fp32in.sass.txt | B200 Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.h100.sm_90.bf16in.ptx.txt | H100 80GB HBM3 Yes 1 Trucate N.A. N.A. 10 N.A.
+nvidia.h100.sm_90.bf16in.sass.txt | H100 80GB HBM3 Yes 1 Trucate N.A. N.A. 10 N.A.
+nvidia.h100.sm_90.fp16in.ptx.txt | H100 80GB HBM3 Yes 1 Trucate N.A. N.A. 16 RTN
+nvidia.h100.sm_90.fp16in.sass.txt | H100 80GB HBM3 Yes 1 Trucate N.A. N.A. 16 RTN
+nvidia.h100.sm_90.fp64in.ptx.txt | H100 80GB HBM3 Yes 3 RTN Yes Yes 1 RTN
+nvidia.h100.sm_90.fp64in.sass.txt | H100 80GB HBM3 Yes 3 RTN Yes Yes 1 RTN
+nvidia.h100.sm_90.motivating.ptx.txt | D=191.875000 bits=0x433fe000
+nvidia.h100.sm_90.motivating.sass.txt | D=191.875000 bits=0x433fe000
+nvidia.h100.sm_90.tf-fp32in.ptx.txt | H100 80GB HBM3 Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.h100.sm_90.tf-fp32in.sass.txt | H100 80GB HBM3 Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.l40s.sm_89.bf16in.ptx.txt | L40S Yes 1 Trucate N.A. N.A. 8 N.A.
+nvidia.l40s.sm_89.bf16in.sass.txt | L40S Yes 1 Trucate N.A. N.A. 8 N.A.
+nvidia.l40s.sm_89.fp16in.ptx.txt | L40S Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.l40s.sm_89.fp16in.sass.txt | L40S Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.l40s.sm_89.fp64in.ptx.txt | L40S Yes 3 RTN Yes Yes 1 RTN
+nvidia.l40s.sm_89.fp64in.sass.txt | L40S Yes 3 RTN Yes Yes 1 RTN
+nvidia.l40s.sm_89.motivating.ptx.txt | D=0.000000 bits=0x00000000
+nvidia.l40s.sm_89.motivating.sass.txt | D=0.000000 bits=0x00000000
+nvidia.l40s.sm_89.tf-fp32in.ptx.txt | L40S Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.l40s.sm_89.tf-fp32in.sass.txt | L40S Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.l4.sm_89.bf16in.ptx.txt | L4 Yes 1 Trucate N.A. N.A. 8 N.A.
+nvidia.l4.sm_89.bf16in.sass.txt | L4 Yes 1 Trucate N.A. N.A. 8 N.A.
+nvidia.l4.sm_89.fp16in.ptx.txt | L4 Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.l4.sm_89.fp16in.sass.txt | L4 Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.l4.sm_89.fp64in.ptx.txt | L4 Yes 3 RTN Yes Yes 1 RTN
+nvidia.l4.sm_89.fp64in.sass.txt | L4 Yes 3 RTN Yes Yes 1 RTN
+nvidia.l4.sm_89.motivating.ptx.txt | D=0.000000 bits=0x00000000
+nvidia.l4.sm_89.motivating.sass.txt | D=0.000000 bits=0x00000000
+nvidia.l4.sm_89.tf-fp32in.ptx.txt | L4 Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.l4.sm_89.tf-fp32in.sass.txt | L4 Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.rtx2080ti.sm_75.fp16in.ptx.txt | RTX 2080 Ti Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.rtx2080ti.sm_75.fp16in.sass.txt | RTX 2080 Ti Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.rtx2080ti.sm_75.motivating.ptx.txt | D=0.000000 bits=0x00000000
+nvidia.rtx2080ti.sm_75.motivating.sass.txt | D=0.000000 bits=0x00000000
+nvidia.rtx3060.sm_75.fp16in.ptx.txt | RTX 3060 Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.rtx3060.sm_75.fp16in.sass.txt | RTX 3060 Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.rtx3060.sm_75.motivating.ptx.txt | D=0.000000 bits=0x00000000
+nvidia.rtx3060.sm_75.motivating.sass.txt | D=0.000000 bits=0x00000000
+nvidia.rtx3060.sm_80.bf16in.ptx.txt | RTX 3060 Yes 1 Trucate N.A. N.A. 8 N.A.
+nvidia.rtx3060.sm_80.bf16in.sass.txt | RTX 3060 Yes 1 Trucate N.A. N.A. 8 N.A.
+nvidia.rtx3060.sm_80.fp16in.ptx.txt | RTX 3060 Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.rtx3060.sm_80.fp16in.sass.txt | RTX 3060 Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.rtx3060.sm_80.fp64in.ptx.txt | RTX 3060 Yes 3 RTN Yes Yes 1 RTN
+nvidia.rtx3060.sm_80.fp64in.sass.txt | RTX 3060 Yes 3 RTN Yes Yes 1 RTN
+nvidia.rtx3060.sm_80.motivating.ptx.txt | D=0.000000 bits=0x00000000
+nvidia.rtx3060.sm_80.motivating.sass.txt | D=0.000000 bits=0x00000000
+nvidia.rtx3060.sm_80.tf-fp32in.ptx.txt | RTX 3060 Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.rtx3060.sm_80.tf-fp32in.sass.txt | RTX 3060 Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.rtx3060.sm_86.bf16in.ptx.txt | RTX 3060 Yes 1 Trucate N.A. N.A. 8 N.A.
+nvidia.rtx3060.sm_86.bf16in.sass.txt | RTX 3060 Yes 1 Trucate N.A. N.A. 8 N.A.
+nvidia.rtx3060.sm_86.fp16in.ptx.txt | RTX 3060 Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.rtx3060.sm_86.fp16in.sass.txt | RTX 3060 Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.rtx3060.sm_86.fp64in.ptx.txt | RTX 3060 Yes 3 RTN Yes Yes 1 RTN
+nvidia.rtx3060.sm_86.fp64in.sass.txt | RTX 3060 Yes 3 RTN Yes Yes 1 RTN
+nvidia.rtx3060.sm_86.motivating.ptx.txt | D=0.000000 bits=0x00000000
+nvidia.rtx3060.sm_86.motivating.sass.txt | D=0.000000 bits=0x00000000
+nvidia.rtx3060.sm_86.tf-fp32in.ptx.txt | RTX 3060 Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.rtx3060.sm_86.tf-fp32in.sass.txt | RTX 3060 Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.rtx5090.sm_120.bf16in.ptx.txt | RTX 5090 Yes 1 Trucate N.A. N.A. 10 N.A.
+nvidia.rtx5090.sm_120.bf16in.sass.txt | RTX 5090 Yes 1 Trucate N.A. N.A. 10 N.A.
+nvidia.rtx5090.sm_120.fp16in.ptx.txt | RTX 5090 Yes 1 Trucate N.A. N.A. 16 RTN
+nvidia.rtx5090.sm_120.fp16in.sass.txt | RTX 5090 Yes 1 Trucate N.A. N.A. 16 RTN
+nvidia.rtx5090.sm_120.fp64in.ptx.txt | RTX 5090 Yes 3 RTN Yes Yes 1 RTN
+nvidia.rtx5090.sm_120.fp64in.sass.txt | RTX 5090 Yes 3 RTN Yes Yes 1 RTN
+nvidia.rtx5090.sm_120.motivating.ptx.txt | D=191.875000 bits=0x433fe000
+nvidia.rtx5090.sm_120.motivating.sass.txt | D=191.875000 bits=0x433fe000
+nvidia.rtx5090.sm_120.tf-fp32in.ptx.txt | RTX 5090 Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.rtx5090.sm_120.tf-fp32in.sass.txt | RTX 5090 Yes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.rtx-pro-6000.sm_120.bf16in.ptx.txt | RTX PRO 6000 Blackwell Workstation EditionYes 1 Trucate N.A. N.A. 10 N.A.
+nvidia.rtx-pro-6000.sm_120.bf16in.sass.txt | RTX PRO 6000 Blackwell Workstation EditionYes 1 Trucate N.A. N.A. 10 N.A.
+nvidia.rtx-pro-6000.sm_120.fp16in.ptx.txt | RTX PRO 6000 Blackwell Workstation EditionYes 1 Trucate N.A. N.A. 16 RTN
+nvidia.rtx-pro-6000.sm_120.fp16in.sass.txt | RTX PRO 6000 Blackwell Workstation EditionYes 1 Trucate N.A. N.A. 16 RTN
+nvidia.rtx-pro-6000.sm_120.fp64in.ptx.txt | RTX PRO 6000 Blackwell Workstation EditionYes 3 RTN Yes Yes 1 RTN
+nvidia.rtx-pro-6000.sm_120.fp64in.sass.txt | RTX PRO 6000 Blackwell Workstation EditionYes 3 RTN Yes Yes 1 RTN
+nvidia.rtx-pro-6000.sm_120.motivating.ptx.txt | D=191.875000 bits=0x433fe000
+nvidia.rtx-pro-6000.sm_120.motivating.sass.txt | D=191.875000 bits=0x433fe000
+nvidia.rtx-pro-6000.sm_120.tf-fp32in.ptx.txt | RTX PRO 6000 Blackwell Workstation EditionYes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.rtx-pro-6000.sm_120.tf-fp32in.sass.txt | RTX PRO 6000 Blackwell Workstation EditionYes 1 Trucate N.A. N.A. 4 N.A.
+nvidia.t4.sm_75.fp16in.ptx.txt | Tesla T4 Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.t4.sm_75.fp16in.sass.txt | Tesla T4 Yes 1 Trucate N.A. N.A. 8 RTN
+nvidia.t4.sm_75.motivating.ptx.txt | D=0.000000 bits=0x00000000
+nvidia.t4.sm_75.motivating.sass.txt | D=0.000000 bits=0x00000000

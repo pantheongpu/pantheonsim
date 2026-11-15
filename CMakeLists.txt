@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pantheonsim VERSION 0.2.0 LANGUAGES C CXX)
+project(pantheonsim VERSION 0.2.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -1659,7 +1659,7 @@ vgpu_unit_test(test_launch_fp_traps)
 vgpu_unit_test(test_simd)
 # An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.
 vgpu_unit_test(test_tc_ampere)
-# The vector kernels of that sum against a frozen copy of the earlier form, bit for bit, over random and adversarial operands.
+# The vector kernels of that sum against its scalar form, bit for bit, over random and adversarial operands (on the tiles the dispatcher gives them).
 vgpu_unit_test(test_tc_ampere_fast)
 # IMMA.16816 / 16832 (8-bit operands) straight from the registers (include/vgpu/exec/imma_frag.hpp) against the definition, every sign combination.
 vgpu_unit_test(test_imma_frag)
@@ -2184,6 +2184,9 @@ target_compile_definitions(test_amd_gcn_hi16 PRIVATE VGPU_SOURCE_DIR="${CMAKE_SO
 # Which NaN a gfx1030 float instruction gives (sign, payload, quieting, the invalid-operation NaN), against an RX 6800.
 vgpu_unit_test(test_amd_gcn_nan amd/tests/unit/test_gcn_nan.cpp)
 target_compile_definitions(test_amd_gcn_nan PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# gfx1030 NaNs in the SDWA, DPP, fmamk/fmaak, packed, double and dot-product forms, against an RX 6800 and an RX 6700 XT.
+vgpu_unit_test(test_amd_gcn_nan2 amd/tests/unit/test_gcn_nan2.cpp)
+target_compile_definitions(test_amd_gcn_nan2 PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn_abandon amd/tests/unit/test_gcn_abandon.cpp)
 target_compile_definitions(test_amd_gcn_abandon PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_hostcall amd/tests/unit/test_hostcall.cpp)
@@ -2444,6 +2447,13 @@ target_compile_definitions(test_amd_hipcc_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_S
 
 vgpu_unit_test(test_amd_hipcc_mfma amd/tests/unit/test_hipcc_mfma.cpp)
 target_compile_definitions(test_amd_hipcc_mfma PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The opt-in rule for gfx90a's binary16 and bfloat16 matrix instructions, what the FTTN paper's summary of an MI250X reads as
+# (subnormals as zero, a binary32 rounding after every product): the paper's ten tests as fixed vectors and its motivating GEMM, on
+# and off; gfx942 unchanged; and once more with VGPU_MFMA_CDNA2=fttn in the environment, the switch a user has (docs/matrix-numerics.md).
+vgpu_unit_test(test_amd_cdna2_matrix amd/tests/unit/test_cdna2_matrix.cpp)
+target_compile_definitions(test_amd_cdna2_matrix PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME test_amd_cdna2_matrix_switched_on COMMAND test_amd_cdna2_matrix)
+set_tests_properties(test_amd_cdna2_matrix_switched_on PROPERTIES ENVIRONMENT "VGPU_MFMA_CDNA2=fttn")
 
 vgpu_unit_test(test_amd_gcn_globals amd/tests/unit/test_gcn_globals.cpp)
 target_compile_definitions(test_amd_gcn_globals PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -4621,11 +4631,14 @@ if(TARGET vgpucudart AND TARGET vgpucublas)
   endforeach()
 endif()
 if(TARGET vgpucudart AND TARGET vgpucuda)
-  add_test(NAME e2e_card_edges_context COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh context -lcuda)
-  set_tests_properties(e2e_card_edges_context PROPERTIES
-    DEPENDS "vgpucudart;vgpucuda"
-    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-    TIMEOUT 300)
+  # (card_edges_module_arch.cu: the module loaders handed code for another GPU.)
+  foreach(_drv context module_arch)
+    add_test(NAME e2e_card_edges_${_drv} COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh ${_drv} -lcuda)
+    set_tests_properties(e2e_card_edges_${_drv} PROPERTIES
+      DEPENDS "vgpucudart;vgpucuda"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      TIMEOUT 300)
+  endforeach()
 endif()
 
 # The session's ncu: Nsight Compute's command line answered from the simulator's
@@ -5123,6 +5136,12 @@ set_tests_properties(e2e_async_host_copies PROPERTIES
 # A kernel launch returns before the kernel finishes; events and streams behind it are not ready until it has run (#523).
 add_test(NAME e2e_async_launch_events COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_async_launch_events.sh)
 set_tests_properties(e2e_async_launch_events PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 600)
+# cudaEventDestroy right after cudaStreamWaitEvent must not release the waiting stream early (Ta-Cuda/tacuda#5).
+add_test(NAME e2e_async_wait_destroyed_event COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_async_wait_destroyed_event.sh)
+set_tests_properties(e2e_async_wait_destroyed_event PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 600)

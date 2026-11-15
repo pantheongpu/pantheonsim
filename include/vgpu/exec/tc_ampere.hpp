@@ -1,4 +1,4 @@
-// The sum a GA10x (sm_86) tensor core makes of an f16, bf16 or tf32 matrix product with an f32 or f16 accumulator.
+// The sum a Turing, Ampere or Ada (sm_75, sm_80, sm_86, sm_89) tensor core makes, and with other numbers a Hopper (sm_90) one, of an f16, bf16 or tf32 matrix product with an f32 or f16 accumulator.
 //
 // An RTX 3060 does not add the products one at a time in f32. Measured on the card by black-box probing (mma.sync m16n8k8 and
 // wmma 16x16x16 and 16x16x8 in f16, bf16 and tf32, random finite operands over narrow and wide exponent ranges, special values,
@@ -23,8 +23,12 @@
 // otherwise the infinity there is, and the finite terms do not matter. A chunk whose finite sum overflows the format is an infinity
 // for the next chunk (checked against the card, element by element, on random bf16 and tf32 data whose products reach 2^254).
 //
-// Not covered, and left as they were (the sequential sum): the m8n8k4 form, the sparse forms, and other architectures (Hopper and
-// Blackwell tensor cores are not this unit; sm_80 and sm_89 are not measured). Not probed: results in the f32 subnormal range (here
+// The same rule holds on Turing, GA100 and Ada cards (a Tesla T4, an A100, an L4 and an L40S print the RTX 3060's lines of the
+// probes that pin it). An H100 sums by the same rule with two numbers changed -- chunks of 16 products (tf32: 8) and terms cut
+// at 2^(top - 26) -- measured on an H100 PCIe, every one of 8,388,608 results: the general form at the end of this file (mma_wide).
+// device_sum_model below says which device takes which.
+//
+// Not covered, and left as they were (the sequential sum): the m8n8k4 form, the sparse forms, and Blackwell (not measured). Not probed when the rule was first measured: results in the f32 subnormal range (here
 // ldexp's), and the sign of a zero f16 accumulator (+0 by analogy with f32).
 #pragma once
 
@@ -59,22 +63,92 @@
 
 namespace vgpu::exec::tc86 {
 
-// VGPU_TC_EXACT=0 turns this model off: the tensor sums are then the sequential f32 ones of the earlier releases, bit for bit, on
-// every device. Read from the environment when the process starts and again at each launch (as VGPU_FASTPATH is), so a test can
-// set it between launches. (Function-local statics of inline functions: no external-linkage global of the shared code.)
-inline std::atomic<bool>& exact_flag() {
-  static std::atomic<bool> f{[] {
-    const char* v = std::getenv("VGPU_TC_EXACT");
-    return !(v && v[0] == '0');
-  }()};
+// VGPU_TC_EXACT chooses where this model is used. Unset (or anything else): on the devices device_sum_model below gives a model. `0`:
+// nowhere -- the tensor sums are then the sequential f32 ones of the earlier releases, bit for bit, on every device. `force`: on every
+// device, whatever its compute capability: one without a measured model takes the RTX 3060's (what the SASS engine did for an sm_86
+// cubin on any profile before the choice followed the device). `published`: a device without a measured model takes the model the
+// literature gives its architecture, where there is one (published_sum_model: Blackwell, compute capability 10.0 and 12.0). Read from the environment when the process starts
+// and again at each launch (as VGPU_FASTPATH is), so a test can set it between launches. (Function-local statics of inline functions:
+// no external-linkage global of the shared code.)
+enum : int { kModeOff = 0, kModeDevice = 1, kModeForce = 2, kModePublished = 3 };
+inline int parse_mode(const char* v) {
+  if (!v) return kModeDevice;
+  if (v[0] == '0') return kModeOff;
+  if (v[0] == 'f' || v[0] == 'F') return kModeForce;       // "force"
+  if (v[0] == 'p' || v[0] == 'P') return kModePublished;   // "published"
+  return kModeDevice;
+}
+inline std::atomic<int>& mode_flag() {
+  static std::atomic<int> f{parse_mode(std::getenv("VGPU_TC_EXACT"))};
   return f;
 }
-inline void refresh_exact(const char* v) { exact_flag().store(!(v && v[0] == '0'), std::memory_order_relaxed); }
+inline void refresh_exact(const char* v) { mode_flag().store(parse_mode(v), std::memory_order_relaxed); }
 inline void refresh_exact() { refresh_exact(std::getenv("VGPU_TC_EXACT")); }
-inline bool exact_enabled() { return exact_flag().load(std::memory_order_relaxed); }
+inline int exact_mode() { return mode_flag().load(std::memory_order_relaxed); }
+inline bool exact_enabled() { return exact_mode() != kModeOff; }
 
-// Whether a device of this compute capability sums as an RTX 3060 does (only the part that was measured), and the switch is on.
-inline bool applies(int cc_major, int cc_minor) { return cc_major == 8 && cc_minor == 6 && exact_enabled(); }
+// ---- Which sum a device's tensor core makes: one named property, decided in one place ------------------------------------------
+//
+// SumModel is the property. device_sum_model() is the only table from a device (its compute capability) to its model, and every
+// engine asks sum_model() / sum_rule() rather than comparing sm numbers. Each row says where it comes from; docs/matrix-numerics.md
+// has the cards, drivers, toolkits, dates and the lines compared, in a form that can move into the device profiles.
+//
+//   Sequential  acc += a * b in f32, k in order, round to nearest even. No card is known to do this: it is what a device whose
+//               tensor core we have not measured gets (7.0, 8.7, 10.x, 11.0, 12.x).
+//   Ampere      the rule at the top of this file: chunks of 8 products (tf32: 4), terms cut at 2^(top - 25).
+//                 8.6  measured: RTX 3060 (106,496 results), A10G        8.0  measured: A100-SXM4-40GB (8,388,608 results)
+//                 8.9  measured: L4, L40S          7.5  measured: Tesla T4 (f16; a Turing card has no bf16 or tf32 form)
+//               (each prints the RTX 3060's lines of simd_lane_forms and float_half_forms; the T4 the f16 lines of the first)
+//   Hopper      the same rule with other numbers: chunks of 16 products (tf32: 8, so an m16n8k4 is one chunk and a wmma 16x16x8,
+//               which compiles to two of them, two), terms cut at 2^(top - 26).
+//                 9.0  measured: H100 PCIe -- 8,388,608 wmma results (f16, bf16 and tf32, f32 and f16 accumulators, random and
+//                      special values), every one reproduced, and the card's lines of both probes (mma.sync m16n8k8 tf32 among them)
+//               published, NOT measured by us, and so not a device's model by default (published_sum_model, VGPU_TC_EXACT=published):
+//                 10.0, 12.0  Blackwell: MMA-Sim (Xie et al., arXiv 2511.10909) and Khattak and Mikaitis (arXiv 2512.07004) give
+//                      B200 and RTX PRO 6000 Blackwell the Hopper numbers for f16, bf16 and tf32
+// The same two papers give this rule and these numbers for every card above; the four corners in the subnormal range (the cut of a
+// subnormal f32 result, the floor under a zero accumulator, a subnormal accumulator's position, +0 for a negative sum that rounds to
+// zero) are theirs, and the first two are confirmed on an RTX 3060 (tests/unit/test_tc_ampere.cpp, the_subnormal_corners).
+enum class SumModel : uint8_t { Sequential, Ampere, Hopper };
+struct SumRule {
+  const char* name;
+  unsigned chunk;        // products to a chunk, f16 and bf16
+  unsigned chunk_tf32;   // ... tf32
+  int grid;              // a chunk's terms are cut at 2^(top - grid)
+};
+inline constexpr SumRule kAmpereRule{"ampere: chunks of 8 (tf32 4), cut at 2^(top-25)", 8, 4, 25};
+inline constexpr SumRule kHopperRule{"hopper: chunks of 16 (tf32 8), cut at 2^(top-26)", 16, 8, 26};
+
+inline SumModel device_sum_model(int cc_major, int cc_minor) {
+  if ((cc_major == 7 && cc_minor == 5) || (cc_major == 8 && (cc_minor == 0 || cc_minor == 6 || cc_minor == 9))) return SumModel::Ampere;
+  if (cc_major == 9 && cc_minor == 0) return SumModel::Hopper;
+  return SumModel::Sequential;
+}
+inline bool device_sums_chunked(int cc_major, int cc_minor) { return device_sum_model(cc_major, cc_minor) != SumModel::Sequential; }
+
+// What the literature gives a device we have not measured (see the table above), or Sequential where it gives nothing.
+inline SumModel published_sum_model(int cc_major, int cc_minor) {
+  return (cc_major == 10 || cc_major == 12) && cc_minor == 0 ? SumModel::Hopper : SumModel::Sequential;
+}
+// The model in force for a device now: the switch, then the device. Forced, a device without a measured model takes Ampere's; with
+// `published`, the published one if there is one.
+inline SumModel sum_model(int cc_major, int cc_minor) {
+  const int mode = exact_mode();
+  if (mode == kModeOff) return SumModel::Sequential;
+  const SumModel m = device_sum_model(cc_major, cc_minor);
+  if (m != SumModel::Sequential) return m;
+  return mode == kModeForce ? SumModel::Ampere : mode == kModePublished ? published_sum_model(cc_major, cc_minor) : m;
+}
+inline const SumRule* rule_of(SumModel m) { return m == SumModel::Ampere ? &kAmpereRule : m == SumModel::Hopper ? &kHopperRule : nullptr; }
+// The rule in force for a device, or null for the sequential sum.
+inline const SumRule* sum_rule(int cc_major, int cc_minor) { return rule_of(sum_model(cc_major, cc_minor)); }
+inline bool applies(int cc_major, int cc_minor) { return sum_model(cc_major, cc_minor) != SumModel::Sequential; }
+// The bits simd::Kernels::hmma's `kind` carries for the model: 16 Ampere, 32 Hopper, 0 the sequential sum.
+inline constexpr unsigned kKindAmpere = 16, kKindHopper = 32;
+inline unsigned kernel_kind_bits(int cc_major, int cc_minor) {
+  const SumModel m = sum_model(cc_major, cc_minor);
+  return m == SumModel::Ampere ? kKindAmpere : m == SumModel::Hopper ? kKindHopper : 0u;
+}
 
 // The format of the multiplicands: the smallest normal exponent, for the frame positions.
 inline constexpr int kEminF16 = -14;
@@ -134,6 +208,18 @@ inline int32_t align_term(int32_t sig, int32_t s) {
   return sig < 0 ? -static_cast<int32_t>(v) : static_cast<int32_t>(v);
 }
 
+// A magnitude of at most 24 significant bits times 2^e as an f32, truncated toward zero: below the normal range that is onto the
+// subnormal grid, 2^-149 (not ldexp's round to nearest), and a magnitude that truncates to nothing is +0 whatever the sign.
+inline float finish_f32_rz(uint32_t mag, int e, bool negative) {
+  if (e < -149) {
+    const int drop = -149 - e;
+    mag = drop >= 32 ? 0u : mag >> drop;
+    e = -149;
+  }
+  if (mag == 0) return 0.0f;
+  const float f = std::ldexp(static_cast<float>(mag), e);   // (exact now, or an infinity past the range)
+  return negative ? -f : f;
+}
 // The value S * 2^g (S a signed 32-bit integer) truncated toward zero to 24 significant bits, as an f32 (a zero is +0).
 inline float to_f32_rz(int32_t S, int32_t g) {
   if (S == 0) return 0.0f;
@@ -144,16 +230,27 @@ inline float to_f32_rz(int32_t S, int32_t g) {
     mag >>= (n - 24);
     e += n - 24;
   }
-  const float f = std::ldexp(static_cast<float>(mag), e);
-  return S < 0 ? -f : f;
+  return finish_f32_rz(mag, e, S < 0);
 }
 
-// The same value rounded to nearest even to f16, as the float that holds it.
+// The same value rounded to nearest even to f16, as the float that holds it (a sum that rounds to zero is +0 whatever its sign).
 inline float to_f16_rn(int32_t S, int32_t g) {
   if (S == 0) return 0.0f;
   const double d = std::ldexp(static_cast<double>(S), g);
-  return vgpu::simd::f16_to_f32(vgpu::simd::f64_to_f16_bits(d));
+  const float r = vgpu::simd::f16_to_f32(vgpu::simd::f64_to_f16_bits(d));
+  return r == 0 ? 0.0f : r;
 }
+
+// The frame position of a finite nonzero accumulator: its leading bit + 1, and a subnormal one counts at the smallest normal exponent
+// of its format (-126 for an f32 accumulator, -14 for an f16 one), as a subnormal operand does.
+inline int32_t acc_frame(const Acc& c, bool acc_f16) {
+  const int32_t lead = (32 - std::countl_zero(static_cast<uint32_t>(c.sig < 0 ? -c.sig : c.sig))) - 1 + c.lsb + 1;
+  return std::max(lead, acc_f16 ? -13 : -125);
+}
+// The floor of a chunk's largest frame position when its accumulator is zero: 2^-131 for an f32 result and 2^-19 for an f16 one when
+// the terms are cut at 2^(top - 25), one lower for each bit the cut is lower (an H100's: -132 and -20). In the published models'
+// terms this is the alignment exponent floor -132 / -20 (-133 / -21).
+inline int32_t zero_acc_floor(int grid, bool acc_f16) { return (acc_f16 ? 6 : -106) - grid; }
 
 }  // namespace detail
 
@@ -175,8 +272,10 @@ inline float chunk_finite(const Dec* a, size_t astride, const Dec* b, size_t bst
   }
   const detail::Acc c = detail::decode_acc(acc);
   if (c.sig != 0) {
-    const int32_t T = (32 - std::countl_zero(static_cast<uint32_t>(c.sig < 0 ? -c.sig : c.sig))) - 1 + c.lsb + 1;
+    const int32_t T = detail::acc_frame(c, acc_f16);
     if (T > top) top = T;
+  } else if (top != INT32_MIN) {
+    top = std::max(top, detail::zero_acc_floor(25, acc_f16));
   }
   if (top == INT32_MIN) return 0.0f;   // all terms zero: +0
   const int32_t g = top - 25;
@@ -1350,22 +1449,153 @@ __attribute__((target("avx2"))) inline void mma_avx2(unsigned M, unsigned N, uns
 }
 #endif
 
+// Whether a product of a nonzero element of A (M x K) and one of B (K x N) can have a frame position below -124: the smallest
+// exponent fields of the two, added (a subnormal float counts as field 1). Infinities and NaNs are not looked at.
+inline bool tiny_products(unsigned M, unsigned N, unsigned K, const float* A, size_t lda, const float* B, size_t ldb) {
+  const auto least = [](const float* p, size_t ld, unsigned rows, unsigned cols) {
+    uint32_t m = 255;
+    for (unsigned r = 0; r < rows; ++r)
+      for (unsigned c = 0; c < cols; ++c) {
+        const uint32_t b = std::bit_cast<uint32_t>(p[r * ld + c]) & 0x7fffffffu;
+        const uint32_t e = b >> 23;
+        m = std::min(m, b == 0 ? 255u : e == 0 ? 1u : e);
+      }
+    return m;
+  };
+  const uint32_t a = least(A, lda, M, K);
+  if (a >= 129) return false;
+  return a + least(B, ldb, K, N) < 129;
+}
+
 // D = C + A x B, by the rule above, with the vector code where there is a CPU level for it.
 inline void mma(unsigned M, unsigned N, unsigned K, unsigned chunk, int emin, bool acc_f16, const float* A, size_t lda, const float* B,
                 size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
 #ifdef VGPU_TC86_AVX2
-  if (N % 8 == 0 && simd::enabled() && simd::kernels().level != simd::Level::Base) {
-    if (!acc_f16) {
-      mma_avx2(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);
-      return;
-    }
-    if (K % chunk == 0 && (chunk == 8 || chunk == 4)) {   // (the f16 accumulator has the chunked form only)
-      mma_avx2_acc<true>(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);
-      return;
-    }
+  // The vector kernels are the rule as it was first measured, without the four corners added since (a result in the f32 subnormal
+  // range cut onto its grid, the floor of a zero accumulator's chunk, a subnormal accumulator's frame position, +0 for a negative sum
+  // that rounds to zero: detail::finish_f32_rz, zero_acc_floor, acc_frame). They take a tile only where no element can reach one:
+  //   * an f32 accumulator with f16 operands never can (a product is at least 2^-48 and a multiple of it);
+  //   * with bf16 or tf32 operands it can only if some product can be below 2^-125: tiny_products() looks, and the scalar code takes
+  //     the tile if so (the lanes a vector kernel hands back for a subnormal result go through to_f32_rz, which has the cut);
+  //   * an f16 accumulator can with ordinary small numbers (a product below 2^-19, a sum that cancels into the f16 subnormal range),
+  //     so its tiles are the scalar code's.
+  if (N % 8 == 0 && !acc_f16 && simd::enabled() && simd::kernels().level != simd::Level::Base &&
+      !(emin == kEminWide && tiny_products(M, N, K, A, lda, B, ldb))) {
+    mma_avx2(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);
+    return;
   }
 #endif
   mma_scalar(M, N, K, chunk, emin, acc_f16, A, lda, B, ldb, C, ldc, D, ldd);
+}
+
+// ---- The rule with its numbers open: any chunk up to 16 products and any cut up to 2^(top - 28) ------------------------------------
+//
+// Scalar, in 64-bit sums (seventeen terms below 2^29 do not fit the 32-bit lanes of the Ampere kernels above). It is the rule of
+// chunk_finite word for word, and with chunk 8 or 4 and grid 25 it gives mma_scalar's bits (test_tc_ampere holds it to that).
+namespace detail {
+inline int64_t align_term64(int64_t sig, int32_t s) {
+  if (sig == 0) return 0;
+  const uint64_t mag = static_cast<uint64_t>(sig < 0 ? -sig : sig);
+  const uint64_t v = s >= 0 ? (s >= 40 ? 0u : mag << s) : (-s >= 64 ? 0u : mag >> -s);
+  return sig < 0 ? -static_cast<int64_t>(v) : static_cast<int64_t>(v);
+}
+inline float to_f32_rz64(int64_t S, int32_t g) {
+  if (S == 0) return 0.0f;
+  uint64_t mag = static_cast<uint64_t>(S < 0 ? -S : S);
+  const int n = 64 - std::countl_zero(mag);
+  int e = g;
+  if (n > 24) {
+    mag >>= (n - 24);
+    e += n - 24;
+  }
+  return finish_f32_rz(static_cast<uint32_t>(mag), e, S < 0);
+}
+inline float to_f16_rn64(int64_t S, int32_t g) {
+  if (S == 0) return 0.0f;
+  const double d = std::ldexp(static_cast<double>(S), g);   // (exact: |S| < 2^53)
+  const float r = vgpu::simd::f16_to_f32(vgpu::simd::f64_to_f16_bits(d));
+  return r == 0 ? 0.0f : r;
+}
+}  // namespace detail
+
+inline float chunk_finite_wide(const Dec* a, size_t astride, const Dec* b, size_t bstride, unsigned n, float acc, bool acc_f16, int grid) {
+  int32_t top = INT32_MIN;
+  int64_t psig[16];
+  int32_t plsb[16];
+  for (unsigned t = 0; t < n; ++t) {
+    const Dec& x = a[t * astride];
+    const Dec& y = b[t * bstride];
+    psig[t] = static_cast<int64_t>(x.sig) * y.sig;
+    plsb[t] = x.lsb + y.lsb;
+    if (psig[t] != 0) {
+      const int32_t T = x.ex + y.ex + 1;
+      if (T > top) top = T;
+    }
+  }
+  const detail::Acc c = detail::decode_acc(acc);
+  if (c.sig != 0) {
+    const int32_t T = detail::acc_frame(c, acc_f16);
+    if (T > top) top = T;
+  } else if (top != INT32_MIN) {
+    top = std::max(top, detail::zero_acc_floor(grid, acc_f16));
+  }
+  if (top == INT32_MIN) return 0.0f;   // all terms zero: +0
+  const int32_t g = top - grid;
+  int64_t S = detail::align_term64(c.sig, c.lsb - g);
+  for (unsigned t = 0; t < n; ++t) S += detail::align_term64(psig[t], plsb[t] - g);
+  return acc_f16 ? detail::to_f16_rn64(S, g) : detail::to_f32_rz64(S, g);
+}
+
+#pragma GCC push_options
+#pragma GCC optimize("fp-contract=off")
+inline void mma_wide(unsigned M, unsigned N, unsigned K, unsigned chunk, int grid, int emin, bool acc_f16, const float* A, size_t lda,
+                     const float* B, size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
+  constexpr unsigned kMaxM = 32, kMaxN = 32, kMaxK = 16;
+  Dec da[kMaxM * kMaxK], db[kMaxK * kMaxN];
+  uint16_t row_special[kMaxM], col_special[kMaxN];   // bit c: chunk c holds an infinity or a NaN
+  for (unsigned i = 0; i < M; ++i) {
+    uint16_t bits = 0;
+    for (unsigned k = 0; k < K; ++k) {
+      const float v = A[i * lda + k];
+      if (!std::isfinite(v)) bits |= static_cast<uint16_t>(1u << (k / chunk));
+      da[i * K + k] = decode_operand(std::isfinite(v) ? v : 0.0f, emin);
+    }
+    row_special[i] = bits;
+  }
+  for (unsigned j = 0; j < N; ++j) {
+    uint16_t bits = 0;
+    for (unsigned k = 0; k < K; ++k) {
+      const float v = B[k * ldb + j];
+      if (!std::isfinite(v)) bits |= static_cast<uint16_t>(1u << (k / chunk));
+      db[k * N + j] = decode_operand(std::isfinite(v) ? v : 0.0f, emin);
+    }
+    col_special[j] = bits;
+  }
+  for (unsigned i = 0; i < M; ++i)
+    for (unsigned j = 0; j < N; ++j) {
+      float acc = C[i * ldc + j];
+      for (unsigned k0 = 0, c = 0; k0 < K; k0 += chunk, ++c) {
+        const unsigned n = (K - k0 < chunk) ? K - k0 : chunk;
+        if (((row_special[i] | col_special[j]) >> c & 1) || !std::isfinite(acc))
+          acc = chunk_special(&A[i * lda + k0], 1, &B[k0 * ldb + j], ldb, n, acc);
+        else
+          acc = chunk_finite_wide(&da[i * K + k0], 1, &db[k0 * N + j], N, n, acc, acc_f16, grid);
+      }
+      D[i * ldd + j] = acc;
+    }
+}
+#pragma GCC pop_options
+
+// D = C + A x B by a named rule: Ampere's goes to the kernels above, any other to the general form. `tf32`: the operands are tf32.
+// `max_chunk` is for a caller that holds more K than one instruction does: a wmma 16x16x8 tf32 fragment is two m16n8k4 on a card,
+// so its chunks are at most 4 whatever the rule's.
+inline void mma(const SumRule& r, bool tf32, unsigned M, unsigned N, unsigned K, int emin, bool acc_f16, const float* A, size_t lda, const float* B,
+                size_t ldb, const float* C, size_t ldc, float* D, size_t ldd, unsigned max_chunk = 16) {
+  const unsigned chunk = std::min(tf32 ? r.chunk_tf32 : r.chunk, max_chunk);
+  if (r.grid == kAmpereRule.grid && chunk == (tf32 ? kAmpereRule.chunk_tf32 : kAmpereRule.chunk))
+    mma(M, N, K, chunk, emin, acc_f16, A, lda, B, ldb, C, ldc, D, ldd);
+  else
+    mma_wide(M, N, K, chunk, r.grid, emin, acc_f16, A, lda, B, ldb, C, ldc, D, ldd);
 }
 
 }  // namespace vgpu::exec::tc86

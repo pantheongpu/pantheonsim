@@ -1,0 +1,46 @@
+The AMD ctest set (ctest -R "amd|host_cores" -j3, a tree without LTO), with VGPU_AMD_BLOCKS unset and with VGPU_AMD_BLOCKS=1 in every
+test's environment. The 88 skipped tests are the ones that need ROCm's full install, hipcc 7.2's expected counters, a card or a model.
+
+== the merged head a33ead36, knob off
+  passed: 240, skipped: 88, failed or timed out: 0
+  100% tests passed, 0 tests failed out of 328
+  Total Test time (real) = 672.25 sec
+== the merged head a33ead36, VGPU_AMD_BLOCKS=1
+  passed: 240, skipped: 88, failed or timed out: 0
+  100% tests passed, 0 tests failed out of 328
+  Total Test time (real) = 661.02 sec
+== the final sources (05a898c7), knob off
+  passed: 240, skipped: 88, failed or timed out: 0
+  100% tests passed, 0 tests failed out of 328
+  Total Test time (real) = 724.36 sec
+== the final sources (05a898c7), VGPU_AMD_BLOCKS=1
+  passed: 240, skipped: 88, failed or timed out: 0
+  100% tests passed, 0 tests failed out of 328
+  Total Test time (real) = 725.17 sec
+
+== the sources after the test fix (fdaca835), knob off
+  passed: 240, skipped: 88, failed or timed out: 0
+  100% tests passed, 0 tests failed out of 328
+== the sources after the test fix (fdaca835), VGPU_AMD_BLOCKS=1
+  passed: 240, skipped: 88, failed or timed out: 0
+  100% tests passed, 0 tests failed out of 328
+
+The statuses, test by test, are the same in the six runs.
+
+The same-bits tests in the LTO build of the final sources before the test fix (w4, 05a898c7; the doubles' flavours 36 and 37 did not run):
+  tier handlers: 26612 of 36035 shapes, 969900 runs each way, 94279 handed back to the interpreter
+  1/1 tests passed
+  blocks: 14400 runs each way, 10473872 instructions of which 7000236 in blocks, 12093 runs with a block, 644 threw, 11874 ended, 7 handed back
+  memory in blocks: 900 runs each way, 16800 instructions, 10830 in blocks, 3295 of them the Machine's, 649 threw, 251 ended
+  bound integer runs: 1200 runs each way, 40709 instructions, 13093 as bound operations
+  64-bit and SDWA rows: 1200 runs each way, 37956 instructions, 29387 inside blocks
+  8/8 tests passed
+
+... and after it (w5, fdaca835; flavours 36, 37 and 38 run for the instructions with "64" in their name):
+  tier handlers: 26696 of 36119 shapes, 1032279 runs each way, 99376 handed back to the interpreter
+  1/1 tests passed
+  blocks: 14400 runs each way, 10146942 instructions of which 6518092 in blocks, 12005 runs with a block, 743 threw, 11815 ended, 7 handed back
+  memory in blocks: 900 runs each way, 16800 instructions, 10830 in blocks, 3295 of them the Machine's, 649 threw, 251 ended
+  bound integer runs: 1200 runs each way, 40709 instructions, 13200 as bound operations
+  64-bit and SDWA rows: 1200 runs each way, 37956 instructions, 29402 inside blocks
+  8/8 tests passed
