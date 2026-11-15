@@ -372,6 +372,24 @@ VTEST(the_subnormal_corners) {
   VCHECK_EQ(bits(tc86::detail::to_f32_rz64(-3, -150)), 0x80000001u);
 }
 
+// Sixteen products of the same sign near the top of their frame, and an accumulator beside them: the aligned terms add up past 2^31
+// (16 x 3.996 x 2^25 + 1.9 x 2^25), which is why the Hopper rule's sums are 64 bits wide. The sum is exact here (every term is a
+// multiple of the cut), so the answer is the real-number sum cut to 24 bits.
+VTEST(a_hopper_chunk_needs_more_than_32_bits) {
+  for (const float sign : {1.0f, -1.0f}) {
+    float a[16], b[16], d;
+    const float big = 2047.0f / 1024.0f;   // the largest f16 significand
+    for (int k = 0; k < 16; ++k) a[k] = big, b[k] = sign * big;
+    const float c = sign * 1.9f;
+    tc86::mma(tc86::kHopperRule, false, 1, 1, 16, tc86::kEminF16, false, a, 16, b, 1, &c, 1, &d, 1);
+    const double exact = 16.0 * (static_cast<double>(big) * big) * sign + static_cast<double>(c);   // exact in double
+    float want = static_cast<float>(exact);
+    if (std::fabs(static_cast<double>(want)) > std::fabs(exact)) want = std::nextafterf(want, 0.0f);   // toward zero
+    VCHECK_EQ(bits(d), bits(want));
+    VCHECK(std::fabs(exact) * 0x1p25 > 0x1p31);   // (in units of the cut, 2^(1 - 26): past 32 bits)
+  }
+}
+
 // The FTTN paper's tests (Li et al., CCGrid 2024, arXiv 2403.00232) as fixed vectors on element (1,1) of D = A x B + C, f16 operands,
 // by each rule: what its programs print on the cards. One extra bit and truncation on both; blocks of 8 on an RTX 3060, a T4, an A10G,
 // an A100, an L4 and an L40S, of 16 on an H100; and its motivating GEMM (section V: D = C - A x B, K = 2^13) is 0 on the first and

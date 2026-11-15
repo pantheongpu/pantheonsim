@@ -140,6 +140,7 @@ std::vector<Vec> vectors() {
       {"a negative subnormal A with C = -0: +0 (the fifteen other products are +0)", 'h', {{0, -kSubH, 1.0f}}, -0.0f, 0u, bits(-0x1p-24f)},
       {"chosen: a flushed subnormal times an infinity is 0 * inf", 'h', {{0, kSubH, INFINITY}}, 0.0f, kNan, 0x7f800000u},
       {"chosen: a subnormal running sum is flushed at once (2^-127 then + 2^-127)", 'b', {{0, kMinB, 0.5f}, {1, kMinB, 0.5f}}, 0.0f, 0u, bits(0x1p-126f)},
+      {"chosen: a subnormal C is read as zero before the first product (2^-126 + 2^-127)", 'b', {{0, kMinB, 1.0f}}, 0x1p-127f, bits(0x1p-126f), 0x00c00000u},
       {"an infinity", 'h', {{0, INFINITY, 1.0f}, {1, 1.0f, 1.0f}}, 3.0f, 0x7f800000u, 0x7f800000u},
   };
   // T_blk_fma_width: 1 in C, a half ulp at k = 0 and another moved along K. Rounded once for the block the two make an ulp; rounded
