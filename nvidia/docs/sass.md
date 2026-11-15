@@ -234,6 +234,18 @@ leaves it to, is the only place the switch is read. Measured against a fresh r8-
 (SASS) and 0.23x (PTX), `mma_ptx` at 0.28x (SASS) and 1.36x (PTX: its AVX2 form beats the sequential loop). Instruction counters are the
 same in both modes (`bench.sh --check-counters` passes with the switch at 0 and at 1).
 
+Since 2026-11-15 the rule is no longer sm_86's alone, and it is chosen by the device, not by the cubin (the paragraphs above describe
+how it was first measured and are kept as written). A Tesla T4, an A100, an A10G, an L4 and an L40S print the RTX 3060's lines of
+both probes, so compute capability 7.5, 8.0 and 8.9 take the same rule; an H100 sums by the same rule in chunks of 16 products
+(tf32: 8), cut at 2^(top - 26), and prints its own lines (`simd_lane_forms.h100.txt`, `float_half_forms.h100.txt`), which both
+engines reproduce, as they do 8,388,608 of 8,388,608 results of the card's dump. Blackwell is not measured and keeps the sequential
+sum (the published model is behind `VGPU_TC_EXACT=published`). Four corners of the rule in the subnormal range were wrong and are
+fixed (a subnormal f32 result is cut, not rounded; a zero accumulator's chunk has an alignment floor; a subnormal accumulator's
+position; +0 for a negative sum that rounds to zero); tiles that can reach them, and every f16-accumulator tile, run in the scalar
+code. The model per profile, the cards, drivers and dates, and what is still unmeasured: [docs/matrix-numerics.md](../../docs/matrix-numerics.md).
+`tc86::device_sum_model` is the one table; `e2e_simd_lane_forms` and `e2e_float_half_forms` build the probes for sm_75 (`-DNO80`),
+sm_80, sm_89, sm_90, sm_100 and sm_120 and hold each profile to its card's file or to the sequential pins.
+
 What stays different from the card: the SFU. `MUFU.RCP/RSQ/SQRT/EX2/LG2/SIN/COS/TANH` are not correctly rounded on the card (rcp,
 sqrt, rsqrt and ex2 are within 1 ulp of the correctly rounded result, lg2 near 1 has an absolute error, sin and cos and tanh differ
 more, `sin` of a tiny or huge argument is 0), and the simulator computes the correctly rounded function; the special values (zero,

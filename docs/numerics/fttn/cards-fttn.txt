@@ -1,0 +1,89 @@
+rtx3060 sm_75-fp16in | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 8 RTN
+rtx3060 sm_80-fp16in | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 8 RTN
+rtx3060 sm_86-fp16in | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 8 RTN
+rtx3060 sm_80-bf16in | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 8 N.A.
+rtx3060 sm_86-bf16in | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 8 N.A.
+rtx3060 sm_80-tf-fp32in | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 4 N.A.
+rtx3060 sm_86-tf-fp32in | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 4 N.A.
+rtx3060 sm_80-fp64in | NVIDIA GeForce RTX 3060 Yes 3 RTN Yes Yes 1 RTN
+rtx3060 sm_86-fp64in | NVIDIA GeForce RTX 3060 Yes 3 RTN Yes Yes 1 RTN
+rtx3060 sm_75-motivating | D=0.000000 bits=0x00000000
+rtx3060 sm_80-motivating | D=0.000000 bits=0x00000000
+rtx3060 sm_86-motivating | D=0.000000 bits=0x00000000
+t4 sm_75-fp16in | Tesla T4 Yes 1 Trucate N.A. N.A. 8 RTN
+t4 sm_75-motivating | D=0.000000 bits=0x00000000
+a10g sm_75-fp16in | NVIDIA A10G Yes 1 Trucate N.A. N.A. 8 RTN
+a10g sm_80-fp16in | NVIDIA A10G Yes 1 Trucate N.A. N.A. 8 RTN
+a10g sm_86-fp16in | NVIDIA A10G Yes 1 Trucate N.A. N.A. 8 RTN
+a10g sm_80-bf16in | NVIDIA A10G Yes 1 Trucate N.A. N.A. 8 N.A.
+a10g sm_86-bf16in | NVIDIA A10G Yes 1 Trucate N.A. N.A. 8 N.A.
+a10g sm_80-tf-fp32in | NVIDIA A10G Yes 1 Trucate N.A. N.A. 4 N.A.
+a10g sm_86-tf-fp32in | NVIDIA A10G Yes 1 Trucate N.A. N.A. 4 N.A.
+a10g sm_80-fp64in | NVIDIA A10G Yes 3 RTN Yes Yes 1 RTN
+a10g sm_86-fp64in | NVIDIA A10G Yes 3 RTN Yes Yes 1 RTN
+a10g sm_75-motivating | D=0.000000 bits=0x00000000
+a10g sm_80-motivating | D=0.000000 bits=0x00000000
+a10g sm_86-motivating | D=0.000000 bits=0x00000000
+l4 sm_75-fp16in | NVIDIA L4 Yes 1 Trucate N.A. N.A. 8 RTN
+l4 sm_80-fp16in | NVIDIA L4 Yes 1 Trucate N.A. N.A. 8 RTN
+l4 sm_86-fp16in | NVIDIA L4 Yes 1 Trucate N.A. N.A. 8 RTN
+l4 sm_89-fp16in | NVIDIA L4 Yes 1 Trucate N.A. N.A. 8 RTN
+l4 sm_80-bf16in | NVIDIA L4 Yes 1 Trucate N.A. N.A. 8 N.A.
+l4 sm_86-bf16in | NVIDIA L4 Yes 1 Trucate N.A. N.A. 8 N.A.
+l4 sm_89-bf16in | NVIDIA L4 Yes 1 Trucate N.A. N.A. 8 N.A.
+l4 sm_80-tf-fp32in | NVIDIA L4 Yes 1 Trucate N.A. N.A. 4 N.A.
+l4 sm_86-tf-fp32in | NVIDIA L4 Yes 1 Trucate N.A. N.A. 4 N.A.
+l4 sm_89-tf-fp32in | NVIDIA L4 Yes 1 Trucate N.A. N.A. 4 N.A.
+l4 sm_80-fp64in | NVIDIA L4 Yes 3 RTN Yes Yes 1 RTN
+l4 sm_86-fp64in | NVIDIA L4 Yes 3 RTN Yes Yes 1 RTN
+l4 sm_89-fp64in | NVIDIA L4 Yes 3 RTN Yes Yes 1 RTN
+l4 sm_75-motivating | D=0.000000 bits=0x00000000
+l4 sm_80-motivating | D=0.000000 bits=0x00000000
+l4 sm_86-motivating | D=0.000000 bits=0x00000000
+l4 sm_89-motivating | D=0.000000 bits=0x00000000
+l40s sm_75-fp16in | NVIDIA L40S Yes 1 Trucate N.A. N.A. 8 RTN
+l40s sm_80-fp16in | NVIDIA L40S Yes 1 Trucate N.A. N.A. 8 RTN
+l40s sm_86-fp16in | NVIDIA L40S Yes 1 Trucate N.A. N.A. 8 RTN
+l40s sm_89-fp16in | NVIDIA L40S Yes 1 Trucate N.A. N.A. 8 RTN
+l40s sm_80-bf16in | NVIDIA L40S Yes 1 Trucate N.A. N.A. 8 N.A.
+l40s sm_86-bf16in | NVIDIA L40S Yes 1 Trucate N.A. N.A. 8 N.A.
+l40s sm_89-bf16in | NVIDIA L40S Yes 1 Trucate N.A. N.A. 8 N.A.
+l40s sm_80-tf-fp32in | NVIDIA L40S Yes 1 Trucate N.A. N.A. 4 N.A.
+l40s sm_86-tf-fp32in | NVIDIA L40S Yes 1 Trucate N.A. N.A. 4 N.A.
+l40s sm_89-tf-fp32in | NVIDIA L40S Yes 1 Trucate N.A. N.A. 4 N.A.
+l40s sm_80-fp64in | NVIDIA L40S Yes 3 RTN Yes Yes 1 RTN
+l40s sm_86-fp64in | NVIDIA L40S Yes 3 RTN Yes Yes 1 RTN
+l40s sm_89-fp64in | NVIDIA L40S Yes 3 RTN Yes Yes 1 RTN
+l40s sm_75-motivating | D=0.000000 bits=0x00000000
+l40s sm_80-motivating | D=0.000000 bits=0x00000000
+l40s sm_86-motivating | D=0.000000 bits=0x00000000
+l40s sm_89-motivating | D=0.000000 bits=0x00000000
+a100 sm_75-fp16in | NVIDIA A100-SXM4-40GB Yes 1 Trucate N.A. N.A. 8 RTN
+a100 sm_80-fp16in | NVIDIA A100-SXM4-40GB Yes 1 Trucate N.A. N.A. 8 RTN
+a100 sm_80-bf16in | NVIDIA A100-SXM4-40GB Yes 1 Trucate N.A. N.A. 8 N.A.
+a100 sm_80-tf-fp32in | NVIDIA A100-SXM4-40GB Yes 1 Trucate N.A. N.A. 4 N.A.
+a100 sm_80-fp64in | NVIDIA A100-SXM4-40GB Yes 3 RTN Yes Yes 1 RTN
+a100 sm_75-motivating | D=0.000000 bits=0x00000000
+a100 sm_80-motivating | D=0.000000 bits=0x00000000
+h100 sm_75-fp16in | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 16 RTN
+h100 sm_80-fp16in | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 16 RTN
+h100 sm_86-fp16in | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 16 RTN
+h100 sm_89-fp16in | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 16 RTN
+h100 sm_90-fp16in | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 16 RTN
+h100 sm_80-bf16in | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 10 N.A.
+h100 sm_86-bf16in | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 10 N.A.
+h100 sm_89-bf16in | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 10 N.A.
+h100 sm_90-bf16in | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 10 N.A.
+h100 sm_80-tf-fp32in | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 4 N.A.
+h100 sm_86-tf-fp32in | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 4 N.A.
+h100 sm_89-tf-fp32in | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 4 N.A.
+h100 sm_90-tf-fp32in | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 4 N.A.
+h100 sm_80-fp64in | NVIDIA H100 PCIe Yes 3 RTN Yes Yes 1 RTN
+h100 sm_86-fp64in | NVIDIA H100 PCIe Yes 3 RTN Yes Yes 1 RTN
+h100 sm_89-fp64in | NVIDIA H100 PCIe Yes 3 RTN Yes Yes 1 RTN
+h100 sm_90-fp64in | NVIDIA H100 PCIe Yes 3 RTN Yes Yes 1 RTN
+h100 sm_75-motivating | D=191.875000 bits=0x433fe000
+h100 sm_80-motivating | D=191.875000 bits=0x433fe000
+h100 sm_86-motivating | D=191.875000 bits=0x433fe000
+h100 sm_89-motivating | D=191.875000 bits=0x433fe000
+h100 sm_90-motivating | D=191.875000 bits=0x433fe000
