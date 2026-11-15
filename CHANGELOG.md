@@ -7,6 +7,23 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Host-GPU modes (`VGPU_HOST_GPU=exact|turbo`, experimental): a launch whose blocks each take longer than the wait for its sample is no longer
+  kept in the simulator for want of an answer ([round sp75](docs/perf-design/rounds/11-rounds-sp36-sp41.md#round-sp75-host-gpu-a-block-that-outlasts-the-wait),
+  [design](docs/perf-design/12-host-gpu-turbo.md), section 12; pantheonsim #656, #657). The forked copy that times a launch's first blocks now stops
+  a block at a limit and answers with the time it ran, which is under what the block takes; the estimate and the rule that decides are
+  unchanged. A grid of 2 to 255 blocks whose kernel has no loop the sample inside the blocks follows is sampled the same way when its static
+  estimate reaches 30 ms. Against the stand-in driver the first launch of HeCBench aidw (78 s in the simulator on the build machine) and the
+  single launches of the CUDA Samples cudaTensorCoreGemm, tf32TensorCoreGemm and bf16TensorCoreGemm (5 to 83 s) are sent to the card;
+  **no card run has measured it yet** (`docs/perf-design/data/sp75/card-run.sh` is the run). aidw's second kernel is still simulated once (no
+  sample is taken while the driver is up), and launches under the sampling floor in a young process (MC_SingleAsianOptionP,
+  MC_EstimatePiInlineP, warpAggregatedAtomicsCG, Rodinia lavaMD) are not reached. `VGPU_HOST_GPU_SAMPLE_BLOCK=0` is the rule before. The
+  plain simulator and the bits of exact mode are unchanged.
+- Host-GPU modes: `VGPU_HOST_GPU_LOG=1` says why each launch stayed in the simulator. The `host_gpu_kept:` reasons, which read `size rule`
+  for every launch the size rule, the first-launch rule or a sample kept, now name the cause (`size rule: no estimate, not sampled: <why>`,
+  `size rule: the sampled estimate does not repay the card path and the driver start`, `size rule: the estimate does not beat the card path`,
+  `size rule: the estimate does not repay the driver start`, `size rule: the kernel is banned ...`), a `host_gpu_nosample:` line gives the
+  numbers behind an unsampled launch (the kernel's first two), and a sampled launch's decision is printed when it is made. A script that
+  matches the reason `size rule` exactly must match its prefix instead.
 - NVIDIA runtime: `cudaStreamWaitEvent` on an event that is still pending keeps the stream waiting after `cudaEventDestroy` of that event, as on a card. A wait (and a queued record) used to look the event up by its handle when the stream's worker reached it, found it destroyed and took it for complete, so the waiting stream ran early. This is what made Ta-Cuda's batch tests (tacuda#5) fail now and then under the default asynchronous launches and pass with `VGPU_ASYNC_LAUNCH=0`. The queued item now holds the event's state itself.
 - AMD engine, the tier's handlers for double-precision and 64-bit integer instructions ([round sp74](docs/perf-design/rounds/11-rounds-sp36-sp41.md),
   [design](docs/perf-design/13-amd-compiled-tier.md), section 13). On hosts with AVX2, with `VGPU_AMD_BLOCKS` off or on:
