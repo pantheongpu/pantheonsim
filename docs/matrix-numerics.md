@@ -75,7 +75,7 @@ special values (about 500 results a form and style have only finite operands), s
 m16n8k8 in f16, bf16 and tf32 on random registers) and FTTN's block test agree.
 
 File hashes of every card output are in `docs/numerics/fttn/cards-probe-sha256.txt`; FTTN's rows per card and cubin are in
-`docs/numerics/fttn/cards-fttn.txt`. The mutants the unit tests were held to (25, all killed after two tests were added) are in
+`docs/numerics/fttn/cards-fttn.txt`. The mutants the unit tests were held to (21, all killed once two tests were added) are in
 `docs/numerics/fttn/mutants.txt`.
 
 ### The corners in the subnormal range
