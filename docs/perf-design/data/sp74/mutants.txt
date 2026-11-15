@@ -1,0 +1,93 @@
+scripts/mutants.py on the tree without LTO: one edit of amd/src/gcn_tier.cpp at a time, test_amd_gcn_tier_same_bits rebuilt and run on
+the instructions in brackets (VGPU_TIER_ONLY), which must fail. 72 mutants: 71 killed, 1 that changes no result (54).
+
+== The first run, with the test as first written (its doubles' flavours 36 and 37 did not run: Round sp74, Tests and mutants)
+ 0 SURVIVED: min/max: two zeros of opposite sign are done by the row  [_f64 v]
+ 1 killed: min/max: a NaN operand is done by the row  [_f64 v; 643 of 14289 runs differ with the tier on:]
+ 2 killed: min/max: the maximum is the minimum  [_f64 v; 2975 of 14289 runs differ with the tier on:]
+ 3 killed: min/max: the lanes not done are ignored  [_f64 v; 663 of 14289 runs differ with the tier on:]
+ 4 killed: a pair's negation is dropped  [_f64; 2204 of 63591 runs differ with the tier on:]
+ 5 killed: a pair's absolute value is dropped  [_f64; 4941 of 63591 runs differ with the tier on:]
+ 6 SURVIVED: a constant's modifiers are dropped  [_f64]
+ 7 killed: a scalar pair is read as one register  [64; 9052 of 306339 runs differ with the tier on:]
+ 8 killed: the high row of a result is written to lanes that are off  [64; 4419 of 306339 runs differ with the tier on:]
+ 9 killed: a few lanes on: the high word is not written  [64; 7 of 306339 runs differ with the tier on:]
+10 killed: a 32-bit row is read as lanes 0 to 3 twice  [64; 2340 of 306339 runs differ with the tier on:]
+11 killed: one-input: a NaN result is written by the row  [_f64_e; 157 of 46794 runs differ with the tier on:]
+12 killed: one-input: floor is ceil  [v_floor_f64; 654 of 990 runs differ with the tier on:]
+13 killed: one-input: ceil is floor  [v_ceil_f64; 658 of 990 runs differ with the tier on:]
+14 killed: one-input: trunc is floor  [v_trunc_f64; 394 of 1089 runs differ with the tier on:]
+15 killed: one-input: rndne rounds toward zero  [v_rndne_f64; 355 of 1155 runs differ with the tier on:]
+16 killed: one-input: the reciprocal is the value's root  [v_rcp_f64; 450 of 990 runs differ with the tier on:]
+17 killed: one-input: the root is the reciprocal  [v_sqrt_f64; 613 of 792 runs differ with the tier on:]
+18 killed: compare: the lanes that are off are in the result  [v_cmp; 10659 of 144474 runs differ with the tier on:]
+19 killed: compare: ordered is less-than  [_o_f64; 1680 of 1716 runs differ with the tier on:]
+20 killed: compare: not-greater-or-equal ignores NaNs  [_nge_f64; 417 of 2343 runs differ with the tier on:]
+21 killed: compare: not-equal of doubles ignores NaNs  [_neq_f64; 425 of 2574 runs differ with the tier on:]
+22 killed: compare: less-or-equal of doubles is less-than  [_le_f64; 158 of 2310 runs differ with the tier on:]
+23 killed: compare: less-or-greater takes NaNs  [_lg_f64; 244 of 1287 runs differ with the tier on:]
+24 killed: compare: the doubles' always-true is never  [_tru_f64; 693 of 693 runs differ with the tier on:]
+25 killed: compare: lanes 4 to 7 of each eight are lanes 0 to 3  [_f64; 16111 of 63591 runs differ with the tier on:]
+26 killed: compare: unsigned is signed  [_u64; 4166 of 15048 runs differ with the tier on:]
+27 killed: compare: signed is unsigned  [_i64; 4112 of 9999 runs differ with the tier on:]
+28 killed: compare: the low words are compared signed  [64 ; 374 of 224424 runs differ with the tier on:]
+29 killed: compare: the low words decide whatever the high words  [64 ; 2996 of 224424 runs differ with the tier on:]
+30 killed: compare: equal looks at the high words only  [_eq_; 383 of 16170 runs differ with the tier on:]
+31 killed: compare: greater-than is less-than  [_gt_; 3663 of 18876 runs differ with the tier on:]
+32 killed: compare: the opposite tests are not turned over  [64 ; 2277 of 224424 runs differ with the tier on:]
+33 killed: compare: less-or-equal of integers is greater-or-equal  [_le_; 2178 of 14223 runs differ with the tier on:]
+34 killed: compare: the integers' always-true is never  [_t_; 1386 of 3762 runs differ with the tier on:]
+35 killed: compare: the kind is read from the wrong bits  [v_cmp; 7365 of 144474 runs differ with the tier on:]
+36 killed: compare: a uniform operand's high word is its low word  [64 ; 967 of 224424 runs differ with the tier on:]
+37 killed: v_add_f64, v_mul_f64, v_fma_f64 with lanes off: the last group of lanes that are on is left out  [_f64 v; 578 of 1428
+38 killed: v_add_f64, v_mul_f64, v_fma_f64 with lanes off: the result is merged by the lanes of the first group  [_f64 v; 4 of 1
+39 SURVIVED: v_add_f64, v_mul_f64, v_fma_f64 with lanes off: the NaN lanes are told from lane 0  [_f64 v]
+40 killed: v_add_f64, v_mul_f64, v_fma_f64 with lanes off: the groups start one group late  [_f64 v; 16 of 14289 runs differ wit
+41 killed: v_add_f64, v_mul_f64, v_fma_f64 with every lane on: a NaN result is written  [_f64 v; 137 of 14289 runs differ with t
+42 killed: shift: the count is not cut to 6 bits  [v_lshlrev_b64; 813 of 1254 runs differ with the tier on:]
+43 killed: shift: right is left  [v_lshrrev_b64; 1159 of 1188 runs differ with the tier on:]
+44 killed: v_lshl_add_u64: a count over 4 shifts  [v_lshl_add_u64; 198 of 660 runs differ with the tier on:]
+45 killed: v_lshl_add_u64: nothing is added  [v_lshl_add_u64; 660 of 660 runs differ with the tier on:]
+46 killed: v_cvt_f64_u32 converts as signed  [v_cvt_f64_u32; 312 of 693 runs differ with the tier on:]
+47 killed: v_frexp_mant_f64: a denormal is done by the row  [v_frexp_mant_f64; 466 of 1089 runs differ with the tier on:]
+48 killed: v_frexp_mant_f64: an infinity gets a fraction's exponent  [v_frexp_mant_f64; 15 of 1089 runs differ with the tier on:
+49 killed: v_frexp_mant_f64: the exponent is 1's  [v_frexp_mant_f64; 616 of 1089 runs differ with the tier on:]
+50 killed: v_ldexp_f64: a result past the largest number is done by the row  [v_ldexp_f64; 167 of 1650 runs differ with the tier
+51 killed: v_ldexp_f64: a result below the smallest normal number is done by the row  [v_ldexp_f64; 40 of 1650 runs differ with 
+52 SURVIVED: v_ldexp_f64: zero gets an exponent  [v_ldexp_f64]
+53 killed: v_ldexp_f64: an infinity or a NaN is done by the row  [v_ldexp_f64; 1 of 1650 runs differ with the tier on:]
+54 SURVIVED: v_ldexp_f64: the exponent is read without its sign  [v_ldexp_f64]
+55 killed: v_frexp_exp_i32_f64: one too few  [v_frexp_exp; 844 of 1485 runs differ with the tier on:]
+56 killed: v_frexp_exp_i32_f64: a denormal is done by the row  [v_frexp_exp; 538 of 1485 runs differ with the tier on:]
+57 killed: v_frexp_exp_i32_f64: an infinity has an exponent  [v_frexp_exp; 14 of 1485 runs differ with the tier on:]
+58 killed: v_cvt_i32_f64: a NaN is the host's 0x80000000  [v_cvt_i32_f64; 152 of 1485 runs differ with the tier on:]
+59 killed: v_cvt_i32_f64: a value past the largest is the host's 0x80000000  [v_cvt_i32_f64; 725 of 1485 runs differ with the ti
+60 killed: v_cvt_u32_f64: 2^31 and above is the host's signed conversion  [v_cvt_u32_f64; 138 of 1485 runs differ with the tier 
+61 killed: v_cvt_u32_f64: a negative value is not zero  [v_cvt_u32_f64; 615 of 1485 runs differ with the tier on:]
+62 killed: v_cvt_u32_f64: a value past the largest is not the largest  [v_cvt_u32_f64; 716 of 1485 runs differ with the tier on:
+63 killed: a 32-bit result is written to lanes that are off  [_f64_e; 1475 of 46794 runs differ with the tier on:]
+64 killed: SDWA: a source's part is taken one byte up  [_sdwa; 39062 of 78111 runs differ with the tier on:]
+65 killed: SDWA: a signed part is taken without its sign  [_sdwa; 4284 of 78111 runs differ with the tier on:]
+66 killed: SDWA: the whole register is written to lanes that are off  [_sdwa; 4512 of 78111 runs differ with the tier on:]
+67 killed: SDWA: the sign's fill is left out  [_sdwa; 6200 of 78111 runs differ with the tier on:]
+68 killed: SDWA: the sign's fill whatever the sign  [_sdwa; 10125 of 78111 runs differ with the tier on:]
+69 killed: SDWA: the bits to keep are not kept  [_sdwa; 13797 of 78111 runs differ with the tier on:]
+70 killed: SDWA: the result is not moved to its part  [_sdwa; 38197 of 78111 runs differ with the tier on:]
+71 killed: SDWA: a part is written to lanes that are off  [_sdwa; 15975 of 78111 runs differ with the tier on:]
+67 of 72 killed
+
+== The five survivors again, with the test fixed (flavours 36 to 38 run) and the constants under a modifier in the corpora
+ 0 killed: min/max: two zeros of opposite sign are done by the row  [_f64 v; 90 of 20706 runs differ with the tier on:]
+ 6 killed: a constant's modifiers are dropped  [_f64; 1030 of 84462 runs differ with the tier on:]
+39 SURVIVED: v_add_f64, v_mul_f64, v_fma_f64 with lanes off: the NaN lanes are told from lane 0  [_f64 v]
+52 killed: v_ldexp_f64: zero gets an exponent  [v_ldexp_f64; 12 of 2100 runs differ with the tier on:]
+54 SURVIVED: v_ldexp_f64: the exponent is read without its sign  [v_ldexp_f64]
+3 of 5 killed
+
+== 39 again with 60 seeds a shape (VGPU_TIER_SEEDS=60; the default is 3): it needs a NaN in a lane of a wave whose first eight lanes
+== are off, with bits the host's add and the interpreter's rule choose differently
+39 killed: v_add_f64, v_mul_f64, v_fma_f64 with lanes off: the NaN lanes are told from lane 0  [_f64 v; 1 of 414120 runs differ with the tier on:]
+1 of 1 killed
+
+54 (v_ldexp_f64's exponent read without its sign) changes no result: a negative exponent is then a huge one, the row does not do the
+lane, and the handler the row replaced does the instruction.
