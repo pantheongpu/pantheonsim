@@ -540,4 +540,53 @@ VTEST(bound_integer_runs_give_the_handlers_bits) {
   VCHECK(bound * 6 > instructions);
 }
 
+// The row handlers of the 64-bit forms and of SDWA (Round sp74) in programs, inside blocks and out of them: doubles near 1 and zeros of both
+// signs with every lane on (flavour 36: the rows run whole), with a NaN, an infinity or a denormal here and there and half the lanes off
+// (37: some instructions go to the handlers the rows replaced, some to the interpreter, in the middle of a block), the floats with their
+// specials, any bits. The interpreter alone, the tier one instruction at a time and the tier in blocks must agree.
+VTEST(row_handlers_of_the_64_bit_forms_inside_blocks) {
+  const bool tier_was = amd::gcn::tier::enabled(), blocks_were = amd::gcn::tier::blocks();
+  uint64_t runs = 0, wrong_tier = 0, wrong_blocks = 0, instructions = 0, in_blocks = 0;
+  std::string first;
+  for (const Target& t : {kTargets[0], kTargets[1]}) {
+    const Pools pool = pools_of(t);
+    std::vector<amd::gcn::Inst> rows;
+    for (const amd::gcn::Inst& in : pool.blockable)
+      if (in.name.find("64") != std::string::npos || in.name.find("_sdwa") != std::string::npos) rows.push_back(in);
+    VCHECK(rows.size() > 200);
+    Rng r{0x5a74 + static_cast<uint64_t>(t.target)};
+    for (uint64_t pn = 0; pn < 120; ++pn) {
+      std::vector<amd::gcn::Inst> program;
+      const size_t len = 8 + r.below(24);
+      for (size_t i = 0; i < len; ++i) program.push_back(r.below(6) ? rows[r.below(rows.size())] : pool.blockable[r.below(pool.blockable.size())]);
+      program.push_back(pool.endpgm[0]);
+      for (const uint32_t flavour : {36u, 37u, 2u, 0u, 3u}) {
+        const uint64_t slice = r.below(2) ? 0 : 1 + r.below(7);
+        const uint32_t waves = 1 + static_cast<uint32_t>(r.below(2));
+        amd::ProgramRun on_run;
+        amd::gcn::tier::set_blocks(false);
+        amd::gcn::tier::set_enabled(false);
+        const uint64_t interpreter = amd::digest_program(program, t.target, pn, flavour, waves, slice);
+        amd::gcn::tier::set_enabled(true);
+        const uint64_t plain = amd::digest_program(program, t.target, pn, flavour, waves, slice);
+        amd::gcn::tier::set_blocks(true);
+        const uint64_t on = amd::digest_program(program, t.target, pn, flavour, waves, slice, &on_run);
+        ++runs, instructions += on_run.instructions, in_blocks += on_run.in_blocks;
+        wrong_tier += interpreter != plain, wrong_blocks += plain != on;
+        if ((interpreter != plain || plain != on) && first.empty())
+          first = "\n  first: program " + std::to_string(pn) + ", flavour " + std::to_string(flavour) + ", " + std::to_string(waves) + " wave(s), slice " +
+                  std::to_string(slice) + (interpreter != plain ? " (the tier against the interpreter)" : " (blocks)") + "\n" + listing(program);
+      }
+    }
+  }
+  amd::gcn::tier::set_blocks(blocks_were);
+  amd::gcn::tier::set_enabled(tier_was);
+  std::fprintf(stderr, "64-bit and SDWA rows: %llu runs each way, %llu instructions, %llu inside blocks\n", static_cast<unsigned long long>(runs),
+               static_cast<unsigned long long>(instructions), static_cast<unsigned long long>(in_blocks));
+  if (wrong_tier || wrong_blocks)
+    throw vtest::Failure(std::to_string(wrong_tier) + " of " + std::to_string(runs) + " runs differ between the interpreter and the tier, " +
+                         std::to_string(wrong_blocks) + " between the tier and blocks" + first);
+  VCHECK(in_blocks * 2 > instructions);
+}
+
 VTEST_MAIN
