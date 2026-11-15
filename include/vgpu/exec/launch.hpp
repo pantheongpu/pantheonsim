@@ -108,8 +108,9 @@ struct LaunchPart {
 // The limit of a bounded block (LaunchPart::block_limit_s), for a grid of `units` blocks that the launch would run on `threads` host threads.
 // 0: bounded blocks are off, or no stopped block could show that the launch lasts need_s (the cap is under what a block must last).
 // kPartBlockSlack: a block stopped at the limit gives an estimate of limit x units / threads, which must be over need_s, not at it, and the
-// second (timed) run of the same rounds is a little shorter than the first (0.95 of it on the tensor-core GEMMs, Round sp75).
-inline constexpr double kPartBlockSlack = 1.25;
+// second (timed) run of the same rounds is shorter than the first (0.88 to 0.96 of it on the tensor-core GEMMs, Round sp75: with a slack of 1.25
+// the estimate was within 9 % of the bar).
+inline constexpr double kPartBlockSlack = 1.4;
 inline double part_block_limit(const LaunchPart& p, uint64_t units, unsigned threads) {
   if (!(p.block_limit_s > 0)) return 0;
   if (!(p.need_s > 0)) return p.block_limit_s;

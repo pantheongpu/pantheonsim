@@ -2537,10 +2537,10 @@ VTEST(a_small_grid_is_sampled_by_bounded_blocks_when_a_stopped_block_can_show_en
   vgpu::exec::LaunchPart p;
   p.block_limit_s = kSampleBlockSeconds;
   p.block_cap_s = kSampleBlockCapSeconds;
-  // cudaTensorCoreGemm on the A10G rig: 80 blocks, 4 host threads, 192 MiB live: a block must last 47.8 ms
+  // cudaTensorCoreGemm on the A10G rig: 80 blocks, 4 host threads, 192 MiB live: a block must last 53.5 ms
   p.need_s = sample_need_seconds(201326592, 201326592, c, false);
   const double tc = vgpu::exec::part_block_limit(p, 80, 4);
-  VCHECK(tc > 0.047 && tc < 0.049 && tc <= kSampleBlockCapSeconds);
+  VCHECK(tc > 0.053 && tc < 0.054 && tc <= kSampleBlockCapSeconds);
   // ... and a block stopped there, whose timed run was 0.95 of the limit, sends the launch
   Sample s;
   s.seconds = 0.95 * tc;
@@ -2548,16 +2548,16 @@ VTEST(a_small_grid_is_sampled_by_bounded_blocks_when_a_stopped_block_can_show_en
   s.total = 80;
   s.threads = 4;
   VCHECK(sample_offload(s, 201326592, 201326592, c, false));
-  s.seconds = 0.79 * tc;                                          // (the slack is 1.25: under 0.8 of the limit it would not)
+  s.seconds = 0.70 * tc;                                          // (the slack is 1.4: under 0.71 of the limit it would not)
   VCHECK(!sample_offload(s, 201326592, 201326592, c, false));
   // tf32TensorCoreGemm: 160 blocks, 768 MiB
   p.need_s = sample_need_seconds(805306368, 805306368, c, false);
   const double tf = vgpu::exec::part_block_limit(p, 160, 4);
-  VCHECK(tf > 0.033 && tf < 0.034);
+  VCHECK(tf > 0.037 && tf < 0.038);
   // on 16 host threads a block of the 80 would have to be watched for 0.19 s: over the cap, so no block is run
   p.need_s = sample_need_seconds(201326592, 201326592, c, false);
   VCHECK(vgpu::exec::part_block_limit(p, 80, 16) == 0);
-  VCHECK(vgpu::exec::part_block_limit(p, 80, 5) > 0 && vgpu::exec::part_block_limit(p, 80, 6) == 0);
+  VCHECK(vgpu::exec::part_block_limit(p, 80, 4) > 0 && vgpu::exec::part_block_limit(p, 80, 5) == 0);
   // a grid whose blocks need little: the limit is never under the one of a sampled grid
   p.need_s = 0.5;
   VCHECK(vgpu::exec::part_block_limit(p, 255, 1) == kSampleBlockSeconds);
