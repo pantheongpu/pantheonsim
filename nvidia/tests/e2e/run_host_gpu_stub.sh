@@ -72,6 +72,16 @@
 #      must only be repaid within as many launches again, and the driver starts; with VGPU_HOST_GPU_START_REPEATS=0 (the rule before) it is never
 #      touched, nor is it by `manyfew`, the same program with 150 launches (which would repay the start as well, but are too few to say that as many
 #      follow); the output is the mode-off output in each.
+# Bounded blocks (Round sp75; include/vgpu/host_gpu.hpp kSampleBlockSeconds, vgpu/exec/launch.hpp part_block_limit):
+#  38. `slow` launches one kernel once on 256 blocks, each of which takes longer than the whole wait for a sample's copy (the rounds are set from a
+#      timed run so that a block takes about 80 ms): the copy stops its first block at the limit and answers (the sample's line says unfinished=1),
+#      the launch is sent, and against a stand-in that keeps memory and computes nothing the program prints what `slownone`, which launches nothing,
+#      prints;
+#  39. ... and with VGPU_HOST_GPU_SAMPLE_BLOCK=0 (the rule before) the copy does not answer, the driver is never touched and the output is the
+#      mode-off output;
+#  40. `slowfew`, the same work on 96 blocks in a kernel whose loop counts by a parameter (a grid the sample of whole blocks does not take, of
+#      a kernel with no loop the sample inside the blocks follows), is sampled by bounded blocks (small=1) and sent, the memory left as it was; with VGPU_HOST_GPU_SAMPLE_BLOCK=0 it is not
+#      sampled at all and the driver is never touched.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -488,5 +498,51 @@ if [[ -n "$many_us" ]] && (( many_us >= 300 )); then
 else
   echo "FAIL: the shortest launch of many took ${many_us:-?} us: too short for the test (under 300 us)"; fails=1
 fi
+# 38 to 40. (Round sp75) bounded blocks. The rounds: from a timed run of `slow` with 1,024, so that one block of 256 threads takes about 80 ms on
+# one host thread here (the wait for a copy is 50 ms, the limit of a block 15 ms).
+env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" HOST_GPU_LAZY_ROUNDS=1024 "$work/prog" slow > /dev/null 2> "$work/slow_cal.err" || { echo "FAIL: the timed run of slow failed"; tail -5 "$work/slow_cal.err"; exit 1; }
+slow_cal_ms="$(sed -n 's/^first_launch_ms=\([0-9]*\).*/\1/p' "$work/slow_cal.err" | head -1)"
+slow_rounds="$(awk -v ms="${slow_cal_ms:-0}" 'BEGIN { if (ms < 1) ms = 1; r = int(1024 * 80 * 256 / 4 / ms); if (r < 4096) r = 4096; if (r > 4000000) r = 4000000; print r }')"
+export HOST_GPU_LAZY_ROUNDS="$slow_rounds"
+for arg in slow slownone slowfew slowfewnone; do
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" "$arg" > "$work/off_$arg.out" 2> "$work/off_$arg.err" || { echo "FAIL: the $arg run with the mode off failed"; tail -5 "$work/off_$arg.err"; exit 1; }
+done
+slow_ms="$(sed -n 's/^first_launch_ms=\([0-9]*\).*/\1/p' "$work/off_slow.err" | head -1)"
+unfinished_of() { grep -E '^host_gpu_sample: ' "$work/$1.err" | grep -c ' unfinished=1 '; }
+small_of() { grep -E '^host_gpu_sample: ' "$work/$1.err" | grep -c ' small=1 '; }
+timeouts_of() { sed -n 's/^host_gpu_sampled: .* timeouts=\([0-9]*\) .*/\1/p' "$work/$1.err" | head -1; }
+if (( ${slow_ms:-0} * 4 / 256 >= 40 )); then   # (a block takes 40 ms or more: its two runs outlast the wait, and it is stopped at the limit)
+  # 38. sent on a block stopped at the limit; the memory the card gets is the memory before the launch.
+  # (the copy must be given 30 ms of processor within the 50 ms the process waits: on a busy machine it may not be, and the launch then stays, as
+  # before the round. Tried up to three times.)
+  for try in 1 2 3; do
+    run blk_nop slow "${smp[@]}" STUB_CARD_OK=1 STUB_KEEP_MEMORY=1 || { echo "FAIL: the run of slow on a card that computes nothing failed"; tail -5 "$work/blk_nop.err"; fails=1; }
+    [[ "$(timeouts_of blk_nop)" == 0 ]] && break
+  done
+  read -r smp_n smp_sent <<< "$(sampled_of blk_nop)"
+  (( ${smp_n:-0} == 1 && ${smp_sent:-0} == 1 && $(unfinished_of blk_nop) == 1 )) || { echo "FAIL: slow: expected one sample, of a block stopped at the limit, and the launch sent: $(grep -E 'host_gpu_sampled|host_gpu_sample:|sampled' "$work/blk_nop.err" | head -3)"; fails=1; }
+  [[ "$(timeouts_of blk_nop)" == 0 ]] || { echo "FAIL: slow: the copy did not answer although its blocks are bounded: $(grep host_gpu_sampled "$work/blk_nop.err")"; fails=1; }
+  diff -q "$work/off_slownone.out" "$work/blk_nop.out" > /dev/null || { echo "FAIL: a launch sent on a block stopped at the limit does not leave the memory as it was before the launch"; fails=1; }
+  diff -q "$work/off_slow.out" "$work/blk_nop.out" > /dev/null && { echo "FAIL: the run of slow on a card that computes nothing printed the simulator's result: nothing was sent"; fails=1; }
+  # 39. the rule before: the copy runs its first block whole, does not answer in time, and the launch is the simulator's.
+  run blk_old slow "${smp[@]}" VGPU_HOST_GPU_SAMPLE_BLOCK=0 || { echo "FAIL: the run of slow with VGPU_HOST_GPU_SAMPLE_BLOCK=0 failed"; tail -5 "$work/blk_old.err"; fails=1; }
+  read -r smp_n smp_sent <<< "$(sampled_of blk_old)"
+  (( ${smp_n:-0} == 1 && ${smp_sent:-1} == 0 )) && [[ "$(timeouts_of blk_old)" == 1 ]] || { echo "FAIL: slow with VGPU_HOST_GPU_SAMPLE_BLOCK=0: expected one sample whose copy did not answer: $(grep host_gpu_sampled "$work/blk_old.err")"; fails=1; }
+  [[ ! -s "$work/blk_old.log" ]] || { echo "FAIL: slow with VGPU_HOST_GPU_SAMPLE_BLOCK=0 reached the driver: $(calls blk_old)"; fails=1; }
+  diff -q "$work/off_slow.out" "$work/blk_old.out" > /dev/null || { echo "FAIL: VGPU_HOST_GPU_SAMPLE_BLOCK=0 changes the output of slow"; fails=1; }
+  # 40. a grid of 96 blocks with no followed loop: sampled by bounded blocks and sent; not sampled under the rule before.
+  run few_nop slowfew "${smp[@]}" VGPU_HOST_GPU_START_COST=0 STUB_CARD_OK=1 STUB_KEEP_MEMORY=1 || { echo "FAIL: the run of slowfew on a card that computes nothing failed"; tail -5 "$work/few_nop.err"; fails=1; }
+  read -r smp_n smp_sent <<< "$(sampled_of few_nop)"
+  (( ${smp_n:-0} == 1 && ${smp_sent:-0} == 1 && $(small_of few_nop) == 1 && $(unfinished_of few_nop) == 1 )) || { echo "FAIL: slowfew: expected one sample by bounded blocks of a small grid, and the launch sent: $(grep -E 'host_gpu_sampled|host_gpu_sample:|sampled' "$work/few_nop.err" | head -3)"; fails=1; }
+  diff -q "$work/off_slowfewnone.out" "$work/few_nop.out" > /dev/null || { echo "FAIL: a launch of a small grid sent on a stopped block does not leave the memory as it was before the launch"; fails=1; }
+  run few_old slowfew "${smp[@]}" VGPU_HOST_GPU_START_COST=0 VGPU_HOST_GPU_SAMPLE_BLOCK=0 || { echo "FAIL: the run of slowfew with VGPU_HOST_GPU_SAMPLE_BLOCK=0 failed"; tail -5 "$work/few_old.err"; fails=1; }
+  read -r smp_n smp_sent <<< "$(sampled_of few_old)"
+  [[ "${smp_n:-x}" == 0 ]] || { echo "FAIL: slowfew with VGPU_HOST_GPU_SAMPLE_BLOCK=0 was sampled: $(grep host_gpu_sampled "$work/few_old.err")"; fails=1; }
+  [[ ! -s "$work/few_old.log" ]] || { echo "FAIL: slowfew with VGPU_HOST_GPU_SAMPLE_BLOCK=0 reached the driver: $(calls few_old)"; fails=1; }
+  diff -q "$work/off_slowfew.out" "$work/few_old.out" > /dev/null || { echo "FAIL: VGPU_HOST_GPU_SAMPLE_BLOCK=0 changes the output of slowfew"; fails=1; }
+else
+  echo "FAIL: a block of slow took $(( ${slow_ms:-0} * 4 / 256 )) ms with $slow_rounds rounds (a timed run of 1,024 took ${slow_cal_ms:-?} ms): too short for the test (under 40 ms)"; fails=1
+fi
+unset HOST_GPU_LAZY_ROUNDS
 (( fails == 0 )) && { echo "PASS: first launch $first ms against a driver start of $init_ms ms; driver calls in the big run: $(calls on_big); many launches of ${many_us:-?} us started the driver after ${many_at:-?} of them"; exit 0; }
 exit 1

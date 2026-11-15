@@ -956,6 +956,49 @@ inline bool sample_offload(const Sample& s, uint64_t push_bytes, uint64_t live_b
   return sampled_offload(sampled_launch_seconds(s).value_or(0), push_bytes, live_bytes, c, driver_started, card_kernel_s);
 }
 
+// ---- bounded blocks (docs/perf-design/12-host-gpu-turbo.md section 12; Round sp75) ----------------------------------------------------
+// The copy ran each sampled block to its end, and the process waited sample_timeout_seconds for it: a launch whose blocks each take longer
+// than the wait gave no answer and stayed in the simulator, which is the launch that most needs the card (HeCBench aidw: 400 blocks of 0.6 s
+// each on server3, two launches of 78 s kept, 365 s of the program's time on the A10G rig). A block that has not ended after t seconds takes
+// more than t, so the copy now stops a run of a block at a limit and answers with what it has: the block counts for the time it ran, which is
+// under what it takes, and the estimate made from it (sampled_launch_seconds, unchanged) is under what whole blocks would have given. Nothing
+// else of the rule changes: the same margin against the same card path decides.
+//
+// The limit for a grid the sample of whole blocks takes (kSampleMinBlocks and up) is kSampleBlockSeconds: both runs of a block (the first,
+// and the timed one) fit the wait that was already given with 20 ms to spare (the copy is one more process on a machine that may be busy: on
+// server3 under load a limit of 18 ms left a copy unanswered now and then), so a sample costs no more than it did, and every block shorter than
+// the limit is run and timed exactly as before.
+inline constexpr double kSampleBlockSeconds = 0.015;
+// The same bound is what lets a grid of fewer than kSampleMinBlocks blocks be sampled by whole blocks when its kernel has no loop the sample
+// inside the blocks can follow (the CUDA Samples' tensor-core GEMMs: 80 or 160 blocks, one loop that counts by the grid's size and ends on a
+// mask; Rodinia lavaMD, 216 blocks). Round sp60b left such grids out because a copy would have to run a block to its end; now it runs one
+// for at most the limit. There the limit is what a block must last for the whole launch to repay the card path (sample_need_seconds, shared
+// among the launch's host threads; exec::part_block_limit), kSampleBlockSeconds at least and kSampleBlockCapSeconds at most: when a block
+// would have to be watched for longer than the cap, no block is run and the launch is the simulator's, as before.
+inline constexpr double kSampleBlockCapSeconds = 0.060;
+inline constexpr uint64_t kBoundedMinBlocks = 2;   // (a launch of one block has its own rules nowhere, as for the sample inside the blocks)
+inline uint64_t bounded_blocks(uint64_t blocks) {
+  if (blocks >= kSampleMinBlocks || blocks < kBoundedMinBlocks) return 0;
+  return std::min<uint64_t>(blocks, kSampleMaxBlocks);
+}
+inline uint64_t bounded_stride(uint64_t blocks) {
+  const uint64_t n = bounded_blocks(blocks);
+  return n ? blocks / n : 1;
+}
+// The wait for a copy that runs bounded blocks of a small grid: two runs of a block at the cap more than the wait of sample_timeout_seconds.
+inline double bounded_timeout_seconds(uint64_t live_bytes) { return sample_timeout_seconds(live_bytes) + 2 * kSampleBlockCapSeconds; }
+// The least simulator time a sampled launch must have for sampled_offload to send it: the card path with `push_bytes` going and `live_bytes`
+// coming back, the driver start if it is not up, and a card kernel time of 1/kSampleCardSpeedup of the simulator's (kernel_s_default at least).
+inline double sample_need_seconds(uint64_t push_bytes, uint64_t live_bytes, const Costs& c, bool driver_started) {
+  const Estimate e = sampled_estimate(0, push_bytes, live_bytes, c, driver_started);
+  const double fixed = card_path_seconds(e, c) - e.card_kernel_s.value_or(0);
+  const double short_kernel = c.margin * (fixed + c.kernel_s_default);                      // while sim / kSampleCardSpeedup is under kernel_s_default
+  if (short_kernel < kSampleCardSpeedup * c.kernel_s_default) return std::max(short_kernel, c.min_sim_s);
+  const double share = c.margin / kSampleCardSpeedup;
+  if (!(share < 1)) return 1e30;                                                             // (no simulator time repays a card that slow)
+  return std::max(c.margin * fixed / (1 - share), c.min_sim_s);
+}
+
 // ---- progress inside a block (docs/perf-design/12-host-gpu-turbo.md section 8, "Progress inside a block"; Round sp61) ---------------------
 // A grid of fewer than kSampleMinBlocks blocks gives no sample above: its blocks are few and each may run for seconds (PolyBench COVAR's
 // covar_kernel: 8 blocks of 256 threads, every thread looping over the matrix). Such a launch is sampled INSIDE its blocks: the copy runs each
@@ -1176,9 +1219,12 @@ struct SampleCandidate {
   double expected_s = kSampleCostGuessSeconds;
   bool followed = false;    // the kernel has a loop a sample inside its blocks can follow (find_probe_loops; Round sp61)
   double bound_turns = 1;   // ... and the most turns one of them has if it runs from 0 to its bound (bound_turns), when the launch gives the bound
+  bool bounded = false;     // bounded blocks are on (Round sp75; VGPU_HOST_GPU_SAMPLE_BLOCK): a small grid with no followed loop is sampled by whole blocks
 };
 // Whether the launch is sampled inside its blocks (Round sp61) rather than by whole blocks: a grid too small for the latter, of a kernel with a followed loop.
 inline bool sample_inside(const SampleCandidate& w) { return sample_blocks(w.blocks) == 0 && w.followed && inblock_blocks(w.blocks) != 0; }
+// Whether the launch is sampled by bounded whole blocks of a small grid (Round sp75): a grid neither of the two above takes.
+inline bool sample_bounded_small(const SampleCandidate& w) { return w.bounded && sample_blocks(w.blocks) == 0 && !sample_inside(w) && bounded_blocks(w.blocks) != 0; }
 // The static estimate the floor is asked about. For a launch sampled inside its blocks it is the static count times the turns of the followed loop as
 // the launch's own arguments bound it (bound_turns): the plain count sees a loop's body once, and the kernels this sample is for are the ones whose
 // threads loop for seconds (COVAR's covar_kernel: 87 us counted, 9.5 s taken on server3; its loop is bounded by the parameter m = 2048, which makes 0.18 s).
@@ -1193,11 +1239,36 @@ inline double bound_turns(int64_t bound, int64_t step) {
   const double b = static_cast<double>(bound < 0 ? -bound : bound), s = static_cast<double>(step < 0 ? -step : step);
   return std::floor(b / s);
 }
-inline bool worth_sampling(const SampleCandidate& w, const Costs& c, double card_path_s) {
-  if (!w.loop || (sample_blocks(w.blocks) == 0 && !sample_inside(w))) return false;
-  if (w.whole_s && *w.whole_s <= c.margin * card_path_s) return false;
-  return sample_static_estimate(w) >= sample_static_floor(w.live_bytes) || sample_affordable(w.age_s, w.spent_s, w.expected_s);
+// The floor asked of a launch's static estimate. For bounded whole blocks of a small grid (Round sp75) it is kSampleStaticFloorSeconds whatever
+// the live memory: a grid of under kSampleMinBlocks blocks whose static count reaches 30 ms has blocks of thousands of instructions (the
+// tensor-core GEMMs: 3,592 to 9,088 instructions, 80 or 160 blocks, 46 to 116 ms counted and 5 to 83 s taken on server3), the kernels that are
+// written to loop over their work inside each block; and the term for the page faults after the fork (sample_static_floor), which is fitted
+// to a program that writes all its memory again, asked 0.36 to 1.45 s of them (192 to 768 MiB live), which their one loop's body does not
+// count to. No other small grid of the corpus without a followed loop counts over 10 ms (data/sp75/), so none of them is sampled.
+inline double sample_floor(const SampleCandidate& w) {
+  return sample_bounded_small(w) ? kSampleStaticFloorSeconds : sample_static_floor(w.live_bytes);
 }
+// Why a launch with no estimate is not sampled (None: it is), in the order the rule asks; worth_sampling is `== None`. For the census of
+// VGPU_HOST_GPU_LOG (the host_gpu_kept reasons, Round sp75): "size rule" alone did not say which of these kept a launch.
+enum class NoSample : uint8_t { None, NoLoop, SmallGrid, ShortBefore, Floor };
+inline NoSample sample_refusal(const SampleCandidate& w, const Costs& c, double card_path_s) {
+  if (!w.loop) return NoSample::NoLoop;
+  if (sample_blocks(w.blocks) == 0 && !sample_inside(w) && !sample_bounded_small(w)) return NoSample::SmallGrid;
+  if (w.whole_s && *w.whole_s <= c.margin * card_path_s) return NoSample::ShortBefore;
+  if (!(sample_static_estimate(w) >= sample_floor(w) || sample_affordable(w.age_s, w.spent_s, w.expected_s))) return NoSample::Floor;
+  return NoSample::None;
+}
+inline const char* no_sample_text(NoSample r) {
+  switch (r) {
+    case NoSample::None: return "sampled";
+    case NoSample::NoLoop: return "the kernel has no loop";
+    case NoSample::SmallGrid: return "a grid under 256 blocks and no counted loop to follow";
+    case NoSample::ShortBefore: return "its earlier whole launch was short";
+    case NoSample::Floor: return "static estimate under the floor and the process too young";
+  }
+  return "?";
+}
+inline bool worth_sampling(const SampleCandidate& w, const Costs& c, double card_path_s) { return sample_refusal(w, c, card_path_s) == NoSample::None; }
 
 // A safety net for any estimate that turns out wrong: an offloaded launch that took longer on the card path (copies, launch, copy back)
 // than the simulator was expected to need ends the offloading of that kernel. One bad launch is the most it can cost.
