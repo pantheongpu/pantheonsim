@@ -30,6 +30,7 @@ struct Replaced {
 struct Names {
   const char* fastpath = std::getenv("VGPU_FASTPATH");
   const char* tc_exact = std::getenv("VGPU_TC_EXACT");
+  const char* mufu_exact = std::getenv("VGPU_MUFU_EXACT");
   const char* sass_trace = std::getenv("VGPU_SASS_TRACE");
   const char* tier_stats = std::getenv("VGPU_TIER_STATS");
   const char* tier_chain = std::getenv("VGPU_TIER_CHAIN");
@@ -52,6 +53,7 @@ void same_as_getenv(const char* what) {
   const Names n;
   if (e.fastpath != n.fastpath) throw vtest::Failure(std::string(what) + ": VGPU_FASTPATH differs");
   if (e.tc_exact != n.tc_exact) throw vtest::Failure(std::string(what) + ": VGPU_TC_EXACT differs");
+  if (e.mufu_exact != n.mufu_exact) throw vtest::Failure(std::string(what) + ": VGPU_MUFU_EXACT differs");
   if (e.sass_trace != n.sass_trace) throw vtest::Failure(std::string(what) + ": VGPU_SASS_TRACE differs");
   if (e.tier_stats != n.tier_stats) throw vtest::Failure(std::string(what) + ": VGPU_TIER_STATS differs");
   if (e.tier_chain != n.tier_chain) throw vtest::Failure(std::string(what) + ": VGPU_TIER_CHAIN differs");
@@ -72,9 +74,10 @@ void same_as_getenv(const char* what) {
 
 VTEST(every_variable_the_launch_reads_is_found_with_its_value) {
   Replaced env({"PATH=/usr/bin", "VGPU_FASTPATH=0", "VGPU_TC_EXACT=0", "VGPU_SASS_TRACE=1", "VGPU_TIER_STATS=2", "VGPU_TIER_CHAIN=0",
-                "VGPU_THREADS=4", "VGPU_LOCKSTEP=all", "HOME=/root"});
+                "VGPU_THREADS=4", "VGPU_LOCKSTEP=all", "VGPU_MUFU_EXACT=0", "HOME=/root"});
   const LaunchEnv e = vgpu::exec::read_launch_env();
   VCHECK(e.fastpath && std::string(e.fastpath) == "0");
+  VCHECK(e.mufu_exact && std::string(e.mufu_exact) == "0");
   VCHECK(e.tc_exact && std::string(e.tc_exact) == "0");
   VCHECK(e.sass_trace && std::string(e.sass_trace) == "1");
   VCHECK(e.tier_stats && std::string(e.tier_stats) == "2");

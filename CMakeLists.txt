@@ -1477,6 +1477,10 @@ vgpu_unit_test(test_ptx_int16)
 # The approximate math instructions as ptxas expands them (sin/cos scaling, ex2 and lg2 without .ftz, the double-precision
 # rcp/rsqrt forms): a kernel's PTX gives the bits its SASS gives.
 vgpu_unit_test(test_ptx_approx_forms)
+# The approximate-math instructions (MUFU) as an RTX 3060 computes them: the model on the card's vectors and hashes, the SASS
+# executor on the card probe's own kernel, the PTX interpreter on every approximate form, and VGPU_MUFU_EXACT=0.
+vgpu_unit_test(test_mufu_model)
+target_compile_definitions(test_mufu_model PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # Hopper (sm_90a): the warpgroup MMA, against the ISA's own layout examples.
 vgpu_unit_test(test_hopper)
 # Blackwell (sm_100a): Tensor Memory and tcgen05, against the ISA's figures.

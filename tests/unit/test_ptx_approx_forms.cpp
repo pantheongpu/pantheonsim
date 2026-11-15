@@ -14,8 +14,13 @@
 // The interpreter computed each of these as the function at host precision, and a program run from its PTX differed from
 // the same program run from its SASS: rsqrt(double) on 13 % of arguments, hypot(double) on 10 %, exp2f on subnormal results,
 // cbrtf on subnormal arguments, and sinf, cosf and tanf under -use_fast_math on most (tools/numerics, docs/numerics/
-// math-functions.md). The expected values are the SASS executor's on those kernels, and each is also what the sequence above
-// gives worked by hand in exact arithmetic.
+// math-functions.md). The expected values were the SASS executor's on those kernels while MUFU was the function at host
+// precision. Since the card's unit is modelled (include/vgpu/exec/mufu_model.hpp) the single-precision cases whose value
+// goes through MUFU.EX2, LG2, SIN or COS are an RTX 3060's results for the same instruction and operand (run on the card
+// 2026-11-15 with tools/numerics/mufu_forms.cu's kernels; nine values changed in their last bits, one -- the cosine of
+// 3e18 -- altogether; each line says what it was). The double-precision cases did not change: on these operands the card's
+// MUFU.RCP64H and MUFU.RSQ64H are the upper word of the correctly rounded value. tests/unit/test_mufu_model.cpp holds every
+// form to the card on more operands.
 #include <cstring>
 #include <string>
 #include <vector>
@@ -85,8 +90,8 @@ VTEST(rsqrt_approx_f64_is_the_expansion_ptxas_makes) {
 
 // ex2.approx.f32 below -126 is a product of two rounded halves; with .ftz it is MUFU.EX2 alone, which flushes.
 VTEST(ex2_approx_f32_gives_subnormals_by_squaring) {
-  VCHECK_EQ(run("ex2.approx.f32", 32, 0xC2FE686Eu), 0x00378FF7ull);   // 2^x rounded once: 0x00378FF6
-  VCHECK_EQ(run("ex2.approx.f32", 32, 0xC2FF2F30u), 0x002A744Aull);   // 2^x rounded once: 0x002A7449
+  VCHECK_EQ(run("ex2.approx.f32", 32, 0xC2FE686Eu), 0x00378FF6ull);   // the card's MUFU.EX2 of the half, squared (at host precision: 0x00378FF7)
+  VCHECK_EQ(run("ex2.approx.f32", 32, 0xC2FF2F30u), 0x002A7449ull);   // (at host precision: 0x002A744A)
   VCHECK_EQ(run("ex2.approx.f32", 32, 0xC2FC0000u), 0x00800000ull);   // -126: the smallest normal, MUFU.EX2 itself
   VCHECK_EQ(run("ex2.approx.f32", 32, 0xC3150000u), 0x00000001ull);   // -149
   VCHECK_EQ(run("ex2.approx.f32", 32, 0xC3160000u), 0x00000000ull);   // -150: 2^-75 squared rounds to zero
@@ -98,7 +103,7 @@ VTEST(ex2_approx_f32_gives_subnormals_by_squaring) {
 
 // lg2.approx.f32 of a subnormal is the logarithm of the scaled number rounded to float, less 24, rounded again.
 VTEST(lg2_approx_f32_scales_a_subnormal) {
-  VCHECK_EQ(run("lg2.approx.f32", 32, 0x000AE398u), 0xC3018E22ull);
+  VCHECK_EQ(run("lg2.approx.f32", 32, 0x000AE398u), 0xC3018E21ull);   // (at host precision: 0xC3018E22)
   VCHECK_EQ(run("lg2.approx.f32", 32, 0x00000001u), 0xC3150000ull);   // -149
   VCHECK_EQ(run("lg2.approx.f32", 32, 0x007FFFFFu), 0xC2FC0000ull);
   VCHECK_EQ(run("lg2.approx.f32", 32, 0x00000000u), 0xFF800000ull);
@@ -110,14 +115,14 @@ VTEST(lg2_approx_f32_scales_a_subnormal) {
 
 // sin.approx and cos.approx: the argument times 1/2pi, rounded toward zero, is what the sine is taken of.
 VTEST(sin_and_cos_approx_take_the_scaled_argument) {
-  VCHECK_EQ(run("sin.approx.ftz.f32", 32, 0x3F800000u), 0x3F576AA4ull);   // sin(1) rounded once: 0x3F576AA5
-  VCHECK_EQ(run("sin.approx.ftz.f32", 32, 0xBF800000u), 0xBF576AA4ull);
-  VCHECK_EQ(run("sin.approx.ftz.f32", 32, 0x4A47AE3Bu), 0xBE47C5C2ull);   // 3271566.75: sin of it is 0x3DFFA15D
-  VCHECK_EQ(run("sin.approx.ftz.f32", 32, 0x472B5407u), 0xBE7BDBA4ull);
-  VCHECK_EQ(run("sin.approx.f32", 32, 0x4A47AE3Bu), 0xBE47C5C2ull);
+  VCHECK_EQ(run("sin.approx.ftz.f32", 32, 0x3F800000u), 0x3F576AA3ull);   // sin(1) rounded once: 0x3F576AA5; the scaled argument at host precision: ...A4
+  VCHECK_EQ(run("sin.approx.ftz.f32", 32, 0xBF800000u), 0xBF576AA3ull);
+  VCHECK_EQ(run("sin.approx.ftz.f32", 32, 0x4A47AE3Bu), 0xBE47C5C0ull);   // 3271566.75: sin of it is 0x3DFFA15D; at host precision 0xBE47C5C2
+  VCHECK_EQ(run("sin.approx.ftz.f32", 32, 0x472B5407u), 0xBE7BDBA7ull);   // (at host precision: 0xBE7BDBA4)
+  VCHECK_EQ(run("sin.approx.f32", 32, 0x4A47AE3Bu), 0xBE47C5C0ull);
   VCHECK_EQ(run("cos.approx.ftz.f32", 32, 0x3F800000u), 0x3F0A5141ull);   // cos(1) rounded once: 0x3F0A5140
-  VCHECK_EQ(run("cos.approx.ftz.f32", 32, 0x5E29E84Eu), 0xBEE8BEC3ull);
-  VCHECK_EQ(run("cos.approx.ftz.f32", 32, 0x478B9A09u), 0x3DEE3876ull);
+  VCHECK_EQ(run("cos.approx.ftz.f32", 32, 0x5E29E84Eu), 0x3F800000ull);   // 3.06e18 turns x 2pi: the unit keeps 25 fraction bits of the turns, none are left (host precision: 0xBEE8BEC3)
+  VCHECK_EQ(run("cos.approx.ftz.f32", 32, 0x478B9A09u), 0x3DEE3866ull);   // (at host precision: 0x3DEE3876)
   VCHECK_EQ(run("sin.approx.ftz.f32", 32, 0x00000000u), 0x00000000ull);
   VCHECK_EQ(run("sin.approx.ftz.f32", 32, 0x80000000u), 0x80000000ull);
   VCHECK_EQ(run("cos.approx.ftz.f32", 32, 0x80000000u), 0x3F800000ull);

@@ -53,6 +53,7 @@ asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.skip 2816\n.popsection")
 #include "vgpu/exec/device_printf.hpp"
 #include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/local_layout.hpp"
+#include "vgpu/exec/mufu_model.hpp"
 #include "vgpu/exec/mem_counters.hpp"
 #include "vgpu/exec/f32x2.hpp"
 #include "vgpu/exec/numerics.hpp"
@@ -738,6 +739,7 @@ void refresh_modes(const LaunchEnv& env) {
   const char* fast = env.fastpath;
   g_fast_path.store(!(fast && fast[0] == '0'), std::memory_order_relaxed);
   vgpu::exec::tc86::refresh_exact(env.tc_exact);   // VGPU_TC_EXACT=0: the earlier sequential tensor sums (include/vgpu/exec/tc_ampere.hpp)
+  vgpu::mufu::refresh(env.mufu_exact);             // VGPU_MUFU_EXACT=0: the .approx forms at the host's precision (include/vgpu/exec/mufu_model.hpp)
 }
 
 // IEEE 754 binary16 <-> double, implemented in software so the engine needs no
@@ -6967,7 +6969,7 @@ class Interpreter {
   }
 
   bool fast_float_bin(Warp& w, const Instr& ins, const OpFloatBin& op, Mask m) {
-    if (op.round != FRound::Nearest || op.nan_propagate || op.sat || op.xorsign_abs || op.ftz || op.approx || op.ty.bits != 32 || !op.ty.is_float() ||
+    if (op.round != FRound::Nearest || op.nan_propagate || op.sat || op.xorsign_abs || op.ftz || op.approx || op.full || op.ty.bits != 32 || !op.ty.is_float() ||
         op.dst.wide || !narrow_operand(op.a) || !narrow_operand(op.b) || alu_armed())
       return false;
     Lanes32 sa, sb;
@@ -7384,6 +7386,8 @@ class Interpreter {
             uint64_t v = float_bin(op->op, op->ty, av & ~sign, bvv & ~sign, op->nan_propagate, op->nan_a_first);
             if (!float_is_nan(op->ty, v)) v = (v & ~sign) | ((av ^ bvv) & sign);
             r[lane] = v;
+          } else if ((op->approx || op->full) && vgpu::mufu::enabled()) {
+            r[lane] = div_unit32(static_cast<uint32_t>(av), static_cast<uint32_t>(bvv), op->full, op->ftz);
           } else if (op->approx) {
             r[lane] = div_approx32(static_cast<uint32_t>(av), static_cast<uint32_t>(bvv));
           } else {
@@ -8719,6 +8723,11 @@ class Interpreter {
             // rounded forms above -- so sqrt.approx.ftz of a negative
             // subnormal is -0, rsqrt's and lg2's are infinite, and a
             // reciprocal or ex2 too small to be normal is 0 (an RTX 3060's).
+            if (vgpu::mufu::enabled()) {
+              // The card's approximation, formed as ptxas forms it around the one instruction (approx32 below).
+              r[lane] = approx32(op->op, op->ftz, static_cast<uint32_t>(v[lane]));
+              continue;
+            }
             float x = f32(v[lane]);
             if (op->ftz && std::fpclassify(x) == FP_SUBNORMAL) x = std::copysign(0.0f, x);
             float y;
@@ -12474,6 +12483,59 @@ class Interpreter {
     if (!(ay >= 0x1p-126f) || std::isinf(y)) return canon32(x / y);
     return canon32(x * rcp_approx32(y));
   }
+  // The single-precision .approx forms as ptxas (CUDA 13.0, sm_75 to sm_90) expands them around one MUFU instruction, which is
+  // the card's unit (vgpu/exec/mufu_model.hpp). Read off the SASS of each form:
+  //   rcp.approx.ftz, rsqrt.approx.ftz, sqrt.approx.ftz, ex2.approx.ftz, lg2.approx.ftz, tanh.approx    the instruction alone
+  //   sin.approx, cos.approx (with or without .ftz)    FMUL.RZ x, 0.15915494 (1 / 2pi cut toward zero), then MUFU.SIN / COS (turns)
+  //   rcp.approx       s = 2^24 for |x| below the smallest normal number, 0.25 for |x| above 2^126, else 1:  s * MUFU.RCP(x * s)
+  //   rsqrt.approx     |x| below the smallest normal number: MUFU.RSQ(x * 2^24) * 4096
+  //   sqrt.approx      the same range: MUFU.SQRT(x * 2^24) * 2^-12
+  //   ex2.approx       x below -126: MUFU.EX2(x * 0.5) squared
+  //   lg2.approx       |x| below the smallest normal number: MUFU.LG2(x * 2^24) + -24
+  // The multiplies and the add outside the instruction are IEEE ones (to nearest, subnormals kept); a NaN is the canonical one.
+  static uint64_t approx32(MathOp op, bool ftz, uint32_t bits) {
+    namespace mu = vgpu::mufu;
+    const auto fb = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    const auto bf = [](uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; };
+    const auto unit = [&](unsigned fn, float x) { return bf(mu::eval(fn, fb(x))); };
+    const float x = bf(bits), ax = std::fabs(x);
+    const bool small = ax < std::numeric_limits<float>::min();   // (false for a NaN, as the SASS's unordered compare leaves it unscaled)
+    float y;
+    switch (op) {
+      case MathOp::Sin: y = unit(mu::OpSin, mul_rz32(x, 0x1.45f306p-3f)); break;
+      case MathOp::Cos: y = unit(mu::OpCos, mul_rz32(x, 0x1.45f306p-3f)); break;
+      case MathOp::Rcp:
+        if (ftz) y = unit(mu::OpRcp, x);
+        else {
+          const float s = ax > 0x1p126f ? 0.25f : small ? 0x1p24f : 1.0f;
+          y = s * unit(mu::OpRcp, x * s);
+        }
+        break;
+      case MathOp::Rsqrt: y = !ftz && small ? unit(mu::OpRsq, x * 0x1p24f) * 4096.0f : unit(mu::OpRsq, x); break;
+      case MathOp::Sqrt: y = !ftz && small ? unit(mu::OpSqrt, x * 0x1p24f) * 0x1p-12f : unit(mu::OpSqrt, x); break;
+      case MathOp::Ex2:
+        if (!ftz && x < -126.0f) { const float h = unit(mu::OpEx2, x * 0.5f); y = h * h; }
+        else y = unit(mu::OpEx2, x);
+        break;
+      case MathOp::Lg2: y = !ftz && small ? unit(mu::OpLg2, x * 0x1p24f) + -24.0f : unit(mu::OpLg2, x); break;
+      case MathOp::Tanh: return mu::eval(mu::OpTanh, bits);   // (keeps a subnormal, and a NaN is the unit's)
+      default: return 0;
+    }
+    return canon32(y);
+  }
+  // div.approx.f32 and div.full.f32 as ptxas expands them: a * MUFU.RCP(b), after scaling both operands by 2^24 where |b| is
+  // below the smallest normal number (the forms without .ftz) and by 0.25 where |b| is above 2^126 (div.full). The multiplies
+  // are .ftz ones in the .ftz forms: the caller flushes the operands and the result, and the scaled dividend here.
+  static uint64_t div_unit32(uint32_t a, uint32_t b, bool full, bool ftz) {
+    const auto fb = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    const auto bf = [](uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; };
+    const auto flush = [&](float f) { return ftz && std::fpclassify(f) == FP_SUBNORMAL ? std::copysign(0.0f, f) : f; };
+    float x = bf(a), y = bf(b);
+    const float ay = std::fabs(y);
+    if (full && ay > 0x1p126f) { y = flush(y * 0.25f); x = flush(x * 0.25f); }
+    else if (!ftz && ay < std::numeric_limits<float>::min()) { y *= 0x1p24f; x *= 0x1p24f; }
+    return canon32(bf(vgpu::mufu::eval(vgpu::mufu::OpRcp, fb(y))) * x);
+  }
   // rcp.approx.f32 at host precision: the correctly rounded reciprocal.
   static float rcp_approx32(float x) { return static_cast<float>(1.0 / static_cast<double>(x)); }
   // a * b rounded toward zero (FMUL.RZ): the product of two floats is exact in a double.
@@ -12488,6 +12550,8 @@ class Interpreter {
   // double whose upper word is the operand's and whose lower word is zero; the result's lower word is zero. Computed as the
   // SASS executor computes it (exec_ops.inc, Op::MUFU, forms 6 and 7), so a kernel's two forms agree to the bit.
   static uint64_t approx64h(bool rsqrt, uint64_t bits) {
+    if (vgpu::mufu::enabled())   // the card's unit: the upper word in, the upper word out
+      return static_cast<uint64_t>(vgpu::mufu::eval(rsqrt ? vgpu::mufu::OpRsq64h : vgpu::mufu::OpRcp64h, static_cast<uint32_t>(bits >> 32))) << 32;
     const double d = f64(bits & 0xFFFFFFFF00000000ull);
     return f64bits(rsqrt ? 1.0 / std::sqrt(d) : 1.0 / d) & 0xFFFFFFFF00000000ull;
   }

@@ -24,6 +24,8 @@
 # Cards wanted (nothing here launches one):
 #   RTX 3060 (local, sm_86), Tesla T4 (sm_75), A10G (sm_86), L4 (sm_89), H100 (sm_90); a Blackwell card (sm_100 / sm_120) if one is had
 #   RX 6800 and RX 6700 XT (the local AMD box; gfx1030 / gfx1031)
+# The approximate instructions themselves (MUFU, every sub-operation over all 2^32 operands, as hashes compared with an RTX 3060's)
+# are a separate, shorter run: tools/numerics/mufu-card-run.sh <out-dir>.
 # Environment: MATHFN_N (default 131072 results a random class), MATHFN_DUMP=0, VARITY=0, VARITY_PROGRAMS (default 150 of each
 # precision), JOBS (compiles and Varity programs at once, default 4), NVCC / HIPCC (the compiler to use).
 set -uo pipefail

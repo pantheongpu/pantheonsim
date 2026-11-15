@@ -61,7 +61,10 @@ LaunchEnv read_launch_env() {
         take(e.exact_pages, is(s, "EXACT_PAGES"));
         take(e.exact_stats, is(s, "EXACT_STATS"));
         break;
-      case 'M': take(e.max_steps, is(s, "MAX_STEPS")); break;
+      case 'M':
+        take(e.max_steps, is(s, "MAX_STEPS"));
+        take(e.mufu_exact, is(s, "MUFU_EXACT"));
+        break;
       case 'L': take(e.lockstep, is(s, "LOCKSTEP")); break;
       default: break;
     }
@@ -69,6 +72,7 @@ LaunchEnv read_launch_env() {
 #else
   e.fastpath = std::getenv("VGPU_FASTPATH");
   e.tc_exact = std::getenv("VGPU_TC_EXACT");
+  e.mufu_exact = std::getenv("VGPU_MUFU_EXACT");
   e.sass_trace = std::getenv("VGPU_SASS_TRACE");
   e.tier_stats = std::getenv("VGPU_TIER_STATS");
   e.tier_chain = std::getenv("VGPU_TIER_CHAIN");

@@ -1,6 +1,8 @@
 # The lines of tools/numerics/mathfn on which the PTX interpreter may differ from the SASS executor (run_numerics_mathfn.sh).
 # <program> <function> <precision> <class>, then why. Every other line is the same from both engines.
-# All three are NaN payloads, no number differs (docs/numerics/math-functions.md):
+# All three are NaN payloads, no number differs (docs/numerics/math-functions.md). On each the SASS executor's line is the one an
+# RTX 3060, a Tesla T4, an L4 and an A10G print (measured 2026-11-15: all 329 + 329 lines of the SASS runs are the cards'), so the
+# PTX interpreter's NaN is the one that is not a card's:
 mathfn erf f64 edges        erf(double) of a NaN: SASS returns 0x7fffffffe0000000 (the canonical f32 NaN widened), PTX the argument quieted. Not traced.
 mathfn erf f64 rand_bits    the same, the NaN arguments among the random bit patterns
 mathfn hypot f64 edges      hypot(double) with a signaling NaN and a zero: SASS quiets it, PTX returns it as it came (9 pairs)

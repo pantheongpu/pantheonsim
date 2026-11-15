@@ -4473,7 +4473,7 @@ class Parser {
       bool wide = false, lo = false, hi = false;
       FRound frnd = FRound::Nearest;
       bool frnd_explicit = false;
-      bool div_approx = false;
+      bool div_approx = false, div_full = false;
       Type ty{};
       bool have_ty = false;
       for (size_t i = 1; i < parts.size(); ++i) {
@@ -4494,7 +4494,7 @@ class Parser {
         // formula, a * (1/b), with its own rule for a huge divisor; it is
         // carried to execution, which follows both.
         else if (p == "approx") div_approx = true;
-        else if (p == "full") ;
+        else if (p == "full") div_full = true;
         // min.NaN/max.NaN propagate a NaN operand instead of returning the
         // other one. That is exactly what fmin/fmax do NOT do, so it cannot be
         // dropped -- it is handled at execution, and recorded here.
@@ -4625,6 +4625,7 @@ class Parser {
         op.xorsign_abs = xorsign_abs;
         op.ftz = ftz && ty.bits == 32;
         op.approx = div_approx && op.op == FloatBinOp::Div && ty.bits == 32;
+        op.full = div_full && op.op == FloatBinOp::Div && ty.bits == 32;
         op.ty = ty;
         op.dst = expect_reg_operand("destination");
         expect_punct(",");

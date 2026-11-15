@@ -31,3 +31,76 @@ mutant 7: gcn_exec.cpp: the private segment buffer's index stride is 64 lanes fo
     (A first form of the test kernel, whose address-taken locals were the kernel's own or were used before any call, passed under
     this mutant: the two addresses agree at stack pointer 0, and a slot is only read wrongly once a spilled value is reloaded
     after flat stores. The kernel was rewritten until the mutant failed it.)
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# Mutants of the model of the card's approximate-math unit (include/vgpu/exec/mufu_model.hpp) and of its use in the two engines,
+# run on the build machine 2026-11-15. One build with every mutant switchable at run time (VGPU_MUT=<n>; the switch is not in the
+# tree), so each line is the same binary with one rule of the model changed. Tests: test_mufu_model, test_ptx_approx_forms and
+# test_exec3 (unit; no card, no compiler). "killed by" names the test cases that fail. (There is no mutant 18.)
+
+mutant 0: no mutant (the control)
+    all three pass
+mutant 1: mufu_model.hpp, sq19: the partial products of weight 2^18 are kept (the array cut one column lower)
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, sq19_is_the_square_without_its_low_partial_products, the_model_hashes_as_the_card_over_whole_chunks, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_interpreter_gives_the_cards_result_for_the_lone_forms, the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card); test_ptx_approx_forms (sin_and_cos_approx_take_the_scaled_argument)
+mutant 2: mufu_model.hpp, sq19: the whole square shifted right by 19 (no partial product dropped)
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, sq19_is_the_square_without_its_low_partial_products, the_model_hashes_as_the_card_over_whole_chunks, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_interpreter_gives_the_cards_result_for_the_lone_forms, the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card); test_ptx_approx_forms (sin_and_cos_approx_take_the_scaled_argument)
+mutant 3: mufu_model.hpp, RCP: c0 one unit of 2^-40 smaller (the constant just outside the range the fit allows)
+    killed by test_mufu_model (the_model_hashes_as_the_card_over_whole_chunks)
+mutant 4: mufu_model.hpp, RSQ: 1/sqrt of an even power of two is the polynomial's value, not exact
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, the_model_hashes_as_the_card_over_whole_chunks, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_interpreter_gives_the_cards_result_for_the_lone_forms, the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card); test_ptx_approx_forms (the_ftz_double_approximations_are_the_upper_word_only); test_exec3 (bitfield_and_transcendental_ops)
+mutant 5: mufu_model.hpp, SQRT: the exponent's parity is not read (the even half of the table for every operand)
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, the_model_hashes_as_the_card_over_whole_chunks, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_interpreter_gives_the_cards_result_for_the_lone_forms, the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card)
+mutant 6: mufu_model.hpp, EX2: a negative argument is negated (two's complement), not complemented
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_interpreter_gives_the_cards_result_for_the_lone_forms, the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card); test_ptx_approx_forms (ex2_approx_f32_gives_subnormals_by_squaring)
+mutant 7: mufu_model.hpp, EX2: a negative argument is complemented also when its fraction is zero
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_interpreter_gives_the_cards_result_for_the_lone_forms, the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card); test_ptx_approx_forms (ex2_approx_f32_gives_subnormals_by_squaring)
+mutant 8: mufu_model.hpp, LG2: the value keeps its 40 fraction bits (not cut to 36 before the float is formed)
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, the_model_hashes_as_the_card_over_whole_chunks, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_interpreter_gives_the_cards_result_for_the_lone_forms)
+mutant 9: mufu_model.hpp, LG2: a negative value is negated exactly (-v, not -v - 1)
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, the_model_hashes_as_the_card_over_whole_chunks, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_interpreter_gives_the_cards_result_for_the_lone_forms)
+mutant 10: mufu_model.hpp, LG2: log2 of 1 is the polynomial's value, not 0
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, the_model_hashes_as_the_card_over_whole_chunks, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_interpreter_gives_the_cards_result_for_the_lone_forms, the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card)
+mutant 11: mufu_model.hpp, SIN/COS: the odd quadrants take 2^23 - z, not the complement of z
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, the_model_hashes_as_the_card_over_whole_chunks, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card); test_ptx_approx_forms (sin_and_cos_approx_take_the_scaled_argument)
+mutant 12: mufu_model.hpp, SIN/COS: the phase is cut to 24 fraction bits, not 25
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, the_model_hashes_as_the_card_over_whole_chunks, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card); test_ptx_approx_forms (sin_and_cos_approx_take_the_scaled_argument)
+mutant 13: mufu_model.hpp, from_fixed: the fixed-point result is rounded to nearest, not cut
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, the_model_hashes_as_the_card_over_whole_chunks, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_interpreter_gives_the_cards_result_for_the_lone_forms, the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card); test_ptx_approx_forms (lg2_approx_f32_scales_a_subnormal, sin_and_cos_approx_take_the_scaled_argument)
+mutant 14: mufu_model.hpp, RCP: the significand is rounded ((Y + 2^16) >> 17), not cut
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, the_model_hashes_as_the_card_over_whole_chunks, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_interpreter_gives_the_cards_result_for_the_lone_forms, the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card); test_exec3 (approximate_division_and_ftz_as_documented)
+mutant 15: mufu_model.hpp, RCP64H: the significand is rounded to 20 bits, not cut
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, the_model_hashes_as_the_card_over_whole_chunks, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_interpreter_gives_the_cards_result_for_the_lone_forms, the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card)
+mutant 16: mufu_model.hpp, TANH: the result is the argument below 2^-7, not below 2^-8
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_interpreter_gives_the_cards_result_for_the_lone_forms)
+mutant 17: mufu_model.hpp, TANH: x is rounded from the mantissa bits below it, not cut
+    killed by test_mufu_model (the_model_gives_the_cards_result_on_every_measured_vector, the_model_hashes_as_the_card_over_whole_chunks, the_sass_executor_gives_the_cards_result, the_sass_executor_general_path_gives_the_cards_result, the_ptx_interpreter_gives_the_cards_result_for_the_lone_forms, the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card)
+mutant 19: exec_ops.inc: the |x| and -x modifiers are not applied to the 64H forms, as before
+    killed by test_mufu_model (the_sass_operand_modifiers_are_applied_before_the_unit)
+mutant 20: exec_ops.inc: the general path (VGPU_FASTPATH=0) keeps the function at host precision
+    killed by test_mufu_model (the_sass_executor_general_path_gives_the_cards_result, the_sass_operand_modifiers_are_applied_before_the_unit)
+mutant 21: tier_ops.inc: the tier's handler keeps the SIMD kernel (host precision) for RCP, RSQ and SQRT
+    killed by test_mufu_model (the_sass_executor_gives_the_cards_result, the_sass_operand_modifiers_are_applied_before_the_unit, the_sass_executor_runs_the_probes_hash_kernel, the_switch_restores_the_host_precision_results)
+mutant 22: interpreter.cpp: rcp.approx.f32 without .ftz is MUFU.RCP alone (no scaling of a subnormal or of |x| above 2^126)
+    killed by test_mufu_model (the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card)
+mutant 23: interpreter.cpp: rsqrt.approx.f32 without .ftz does not scale a subnormal by 2^24
+    killed by test_mufu_model (the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card)
+mutant 24: interpreter.cpp: sqrt.approx.f32 without .ftz does not scale a subnormal by 2^24
+    killed by test_mufu_model (the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card); test_exec3 (approximate_division_and_ftz_as_documented)
+mutant 25: interpreter.cpp: ex2.approx.f32 below -126 is MUFU.EX2 alone (no half and square)
+    killed by test_mufu_model (the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card); test_ptx_approx_forms (ex2_approx_f32_gives_subnormals_by_squaring); test_exec3 (approximate_division_and_ftz_as_documented)
+mutant 26: interpreter.cpp: lg2.approx.f32 without .ftz does not scale a subnormal by 2^24
+    killed by test_mufu_model (the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card); test_ptx_approx_forms (lg2_approx_f32_scales_a_subnormal)
+mutant 27: interpreter.cpp: div.approx.f32 does not scale the operands for a subnormal divisor
+    killed by test_mufu_model (the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card); test_exec3 (approximate_division_and_ftz_as_documented)
+mutant 28: interpreter.cpp: div.full.f32 does not scale the operands by 0.25 for a divisor above 2^126
+    killed by test_mufu_model (the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card)
+mutant 29: interpreter.cpp: div.full.f32 is the exact quotient, as before
+    killed by test_mufu_model (the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card, the_switch_restores_the_host_precision_results); test_exec3 (approximate_division_and_ftz_as_documented)
+mutant 30: interpreter.cpp: rcp.approx.ftz.f64 and rsqrt.approx.ftz.f64 are the upper word of the correctly rounded value, as before
+    killed by test_mufu_model (the_ptx_interpreter_gives_the_cards_result_for_the_lone_forms, the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card)
+mutant 31: mufu_model.hpp: VGPU_MUFU_EXACT=0 is ignored (the model is always on)
+    killed by test_mufu_model (the_switch_restores_the_host_precision_results)
+mutant 32: ast.cpp: div.full.f32 is lowered to the plain f32 micro-op (the exact quotient on the fast path)
+    killed by test_mufu_model (the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card, the_switch_restores_the_host_precision_results); test_exec3 (approximate_division_and_ftz_as_documented)
+mutant 33: interpreter.cpp: sin.approx multiplies by 1/2pi to nearest, not toward zero
+    killed by test_mufu_model (the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card); test_ptx_approx_forms (sin_and_cos_approx_take_the_scaled_argument)

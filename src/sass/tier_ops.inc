@@ -507,7 +507,9 @@ TIER_HANDLER(h_fmnmx) {
 TIER_HANDLER(h_mufu) {
   TIER_PRELUDE
   const unsigned fn = op.a;
-  if (fn != 4 && fn != 5 && fn != 8) {   // the libm functions (SIN, COS, EX2, LG2, TANH): the interpreter's own code
+  // Every function while the card's unit is modelled (vgpu/exec/mufu_model.hpp), and with VGPU_MUFU_EXACT=0 the libm functions
+  // (SIN, COS, EX2, LG2, TANH): the interpreter's own code.
+  if ((fn != 4 && fn != 5 && fn != 8) || vgpu::mufu::enabled()) {
     c.r->tier_float_op(*c.blk, *c.w, *op.ins, ex);
     return;
   }

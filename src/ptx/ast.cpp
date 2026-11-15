@@ -498,7 +498,7 @@ void build_micro(EntryFn& fn) {
       }
     } else if (const auto* op = std::get_if<OpFloatBin>(&ins.op)) {
       ok = !(op->round != FRound::Nearest || op->nan_propagate || op->sat || op->xorsign_abs ||
-             op->approx || op->ty.bits != 32 || !op->ty.is_float()) &&
+             op->approx || op->full || op->ty.bits != 32 || !op->ty.is_float()) &&   // (div.approx and div.full: the general path's forms)
            narrow_dst(op->dst) && source(0, op->a) && source(1, op->b);
       if (ok) {
         u.kind = MicroOp::Float32;

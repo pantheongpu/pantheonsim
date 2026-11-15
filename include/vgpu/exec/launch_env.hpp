@@ -9,6 +9,7 @@ namespace vgpu::exec {
 struct LaunchEnv {
   const char* fastpath = nullptr;     // VGPU_FASTPATH
   const char* tc_exact = nullptr;     // VGPU_TC_EXACT
+  const char* mufu_exact = nullptr;   // VGPU_MUFU_EXACT
   const char* sass_trace = nullptr;   // VGPU_SASS_TRACE
   const char* tier_stats = nullptr;   // VGPU_TIER_STATS
   const char* tier_chain = nullptr;   // VGPU_TIER_CHAIN

@@ -4378,7 +4378,11 @@ VTEST(approximate_division_and_ftz_as_documented) {
       {"div.approx.f32 %r4, %r1, %r2", 0x3cae08fc, 0x41e66e7d, 0x3a415888},
       {"div.approx.ftz.f32 %r4, %r1, %r2", 0xbdbe23cc, 0xc0585d1d, 0x3ce0f8db},
       {"div.approx.f32 %r4, %r1, %r2", 0xbc8141ad, 0x439d254c, 0xb852911f},
-      {"div.full.f32 %r4, %r1, %r2", 0x3cae08fc, 0x41e66e7d, 0x3a415887},
+      // div.full.f32 is a * MUFU.RCP(b) too in what ptxas 13.0 makes of it (FMUL after MUFU.RCP, the operands scaled only where
+      // |b| is above 2^126 or subnormal): an RTX 3060 gives 0x3a415888 here (tools/numerics/mufu_forms.cu's kernel, run
+      // 2026-11-15), as for div.approx. The value pinned before, 0x3a415887, was the exact quotient, which the interpreter
+      // computed while it took div.full's documented error bound as licence to divide exactly (and computes with VGPU_MUFU_EXACT=0).
+      {"div.full.f32 %r4, %r1, %r2", 0x3cae08fc, 0x41e66e7d, 0x3a415888},
       // 2^126 < |b| < 2^128: a zero signed as the quotient, NaN for an infinite a.
       {"div.approx.f32 %r4, %r1, %r2", 0x3f800000, 0x7ec00000, 0},
       {"div.approx.f32 %r4, %r1, %r2", 0x3f800000, 0xff000000, 0x80000000},

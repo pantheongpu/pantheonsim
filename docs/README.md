@@ -21,7 +21,7 @@ One line per document. Start with the repository [README](../README.md); the des
 * [registers.md](registers.md): the PCI and MMIO register model.
 * [cooperative.md](cooperative.md): cooperative launch and the grid barrier.
 * [matrix-numerics.md](matrix-numerics.md): which sum each profile's tensor core or matrix core makes, and whether that is measured on a card, published, or unmeasured.
-* [numerics/math-functions.md](numerics/math-functions.md): the math functions against the published accuracy results (CUDA and ROCm), the test set of `tools/numerics/`, and the card run it prepares.
+* [numerics/math-functions.md](numerics/math-functions.md): the math functions against the published accuracy results (CUDA and ROCm) and against four cards, the test set of `tools/numerics/`, and the approximate-math unit (`MUFU`) of an RTX 3060: the probe over every input, the model that reproduces it bit for bit, `VGPU_MUFU_EXACT`.
 * [exact-threads.md](exact-threads.md): `VGPU_EXACT_THREADS`, blocks on several host threads with the bits of running them in order.
 * [pantheon-workloads.md](pantheon-workloads.md): running the pantheon workloads.
 
