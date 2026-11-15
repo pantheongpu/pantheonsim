@@ -175,7 +175,31 @@ int cmd_info(const std::string& gpu, bool json) {
       std::printf("%s\n    \"%s\": %s", first ? "" : ",", json_escape(k).c_str(), v ? "true" : "false");
       first = false;
     }
-    std::printf("\n  }\n}\n");
+    std::printf("\n  },\n");
+    // The numerics and what they rest on (nvidia/docs/profiles.md). Empty objects on a profile without the sections.
+    std::printf("  \"numerics\": {");
+    if (p.numerics.present) {
+      std::printf("\n    \"tensor_sum\": \"%s\"", vgpu::tensor_sum_name(p.numerics.tensor_sum));
+      if (vgpu::tensor_sum_rule(p.numerics.tensor_sum))
+        std::printf(",\n    \"tensor_sum_chunk\": %u,\n    \"tensor_sum_chunk_tf32\": %u,\n    \"tensor_sum_grid\": %d",
+                    p.numerics.tensor_sum_chunk, p.numerics.tensor_sum_chunk_tf32, p.numerics.tensor_sum_grid);
+      if (p.numerics.tensor_sum_published != vgpu::TensorSum::Sequential)
+        std::printf(",\n    \"tensor_sum_published\": \"%s\"", vgpu::tensor_sum_name(p.numerics.tensor_sum_published));
+      std::printf("\n  ");
+    }
+    std::printf("},\n  \"provenance\": {");
+    first = true;
+    for (auto& [k, c] : p.provenance) {
+      std::printf("%s\n    \"%s\": \"%s\"", first ? "" : ",", json_escape(k).c_str(), vgpu::provenance_name(c));
+      first = false;
+    }
+    std::printf("%s},\n  \"evidence\": {", first ? "" : "\n  ");
+    first = true;
+    for (auto& [k, text] : p.evidence) {
+      std::printf("%s\n    \"%s\": \"%s\"", first ? "" : ",", json_escape(k).c_str(), json_escape(text).c_str());
+      first = false;
+    }
+    std::printf("%s}\n}\n", first ? "" : "\n  ");
   } else {
     double gib = static_cast<double>(p.vram_bytes) / (1024.0 * 1024.0 * 1024.0);
     std::printf("VirtualGPU device: %s\n", p.id.c_str());
@@ -209,6 +233,35 @@ int cmd_info(const std::string& gpu, bool json) {
       }
     }
     std::printf("\n");
+    // The numerics, each with the class of evidence its value rests on, then every other key the profile tags, then the evidence
+    // itself. A key that is not listed carries no per-key class (nvidia/docs/profiles.md, "Numerics and provenance").
+    const auto tag_of = [&](const std::string& key) {
+      const auto c = p.provenance_of(key);
+      return c ? vgpu::provenance_name(*c) : "untagged";
+    };
+    if (p.numerics.present) {
+      std::printf("  numerics:\n");
+      std::printf("    tensor_sum:            %-10s [%s]\n", vgpu::tensor_sum_name(p.numerics.tensor_sum), tag_of("numerics.tensor_sum"));
+      if (vgpu::tensor_sum_rule(p.numerics.tensor_sum)) {
+        std::printf("    tensor_sum_chunk:      %-10u [%s]\n", p.numerics.tensor_sum_chunk, tag_of("numerics.tensor_sum_chunk"));
+        std::printf("    tensor_sum_chunk_tf32: %-10u [%s]\n", p.numerics.tensor_sum_chunk_tf32, tag_of("numerics.tensor_sum_chunk_tf32"));
+        std::printf("    tensor_sum_grid:       %-10d [%s]\n", p.numerics.tensor_sum_grid, tag_of("numerics.tensor_sum_grid"));
+      }
+      if (p.numerics.tensor_sum_published != vgpu::TensorSum::Sequential)
+        std::printf("    tensor_sum_published:  %-10s [%s]  (not in force: VGPU_TC_EXACT=published)\n",
+                    vgpu::tensor_sum_name(p.numerics.tensor_sum_published), tag_of("numerics.tensor_sum_published"));
+    }
+    bool other = false;
+    for (auto& [k, c] : p.provenance) {
+      if (k.rfind("numerics.", 0) == 0) continue;
+      if (!other) std::printf("  provenance:\n");
+      other = true;
+      std::printf("    %-40s [%s]\n", k.c_str(), vgpu::provenance_name(c));
+    }
+    if (!p.evidence.empty()) {
+      std::printf("  evidence:\n");
+      for (auto& [k, text] : p.evidence) std::printf("    %s: %s\n", k.c_str(), text.c_str());
+    }
     if (!p.verified)
       std::printf(
           "  NOTE: not confirmed by hardware characterization (verified: false).\n"

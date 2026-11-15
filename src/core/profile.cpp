@@ -71,7 +71,141 @@ std::array<uint32_t, 3> get_dim3(const Value& map, const char* key, const std::s
   return out;
 }
 
+// Whether the document has the key a provenance list or an evidence entry names: "section.key" for an entry of a section,
+// a bare name for a top-level scalar.
+bool has_key(const Value& doc, const std::string& key) {
+  const size_t dot = key.find('.');
+  if (dot == std::string::npos) {
+    auto it = doc.map.find(key);
+    return it != doc.map.end() && it->second.kind != Value::Kind::Map;
+  }
+  const std::string section = key.substr(0, dot);
+  if (section == "provenance" || section == "evidence") return false;
+  auto it = doc.map.find(section);
+  return it != doc.map.end() && it->second.kind == Value::Kind::Map && it->second.map.count(key.substr(dot + 1)) != 0;
+}
+
+bool parse_tensor_sum(const std::string& s, TensorSum& out) {
+  for (TensorSum m : {TensorSum::Sequential, TensorSum::Ampere, TensorSum::Hopper})
+    if (s == tensor_sum_name(m)) {
+      out = m;
+      return true;
+    }
+  return false;
+}
+
+// The `numerics:` section (Numerics in profile.hpp).
+void parse_numerics(const Value& doc, DeviceProfile& p, const std::string& origin) {
+  auto it = doc.map.find("numerics");
+  if (it == doc.map.end()) return;
+  const Value& n = it->second;
+  if (n.kind != Value::Kind::Map) fail(origin, "'numerics' must be a map");
+  for (const auto& [key, value] : n.map) {
+    (void)value;
+    if (key != "tensor_sum" && key != "tensor_sum_chunk" && key != "tensor_sum_chunk_tf32" && key != "tensor_sum_grid" &&
+        key != "tensor_sum_published")
+      fail(origin, "numerics: unknown key '" + key + "'");
+  }
+  // The tensor-core sum is read by the NVIDIA engines only. On another vendor's profile it would be a property nothing consults.
+  if (p.vendor != "nvidia")
+    fail(origin, "'numerics' holds NVIDIA tensor-core properties only; an " + p.vendor + " profile cannot carry it");
+  p.numerics.present = true;
+  if (!parse_tensor_sum(get_str(n, "tensor_sum", origin), p.numerics.tensor_sum))
+    fail(origin, "numerics.tensor_sum must be sequential, ampere or hopper, got: " + get_str(n, "tensor_sum", origin));
+  const TensorSumRule* rule = tensor_sum_rule(p.numerics.tensor_sum);
+  if (!rule) {
+    for (const char* key : {"tensor_sum_chunk", "tensor_sum_chunk_tf32", "tensor_sum_grid"})
+      if (n.map.count(key)) fail(origin, std::string("numerics.") + key + " has no meaning with tensor_sum: sequential");
+  } else {
+    const int64_t chunk = get_int(n, "tensor_sum_chunk", origin), chunk_tf32 = get_int(n, "tensor_sum_chunk_tf32", origin),
+                  grid = get_int(n, "tensor_sum_grid", origin);
+    // The engines implement the two rules of profile.hpp, not a sum of any chunk and grid: numbers that are not the named
+    // model's would be printed and hashed and would not be what runs.
+    if (chunk != rule->chunk || chunk_tf32 != rule->chunk_tf32 || grid != rule->grid)
+      fail(origin, std::string("numerics: tensor_sum ") + tensor_sum_name(p.numerics.tensor_sum) + " is chunks of " +
+                       std::to_string(rule->chunk) + " (tf32 " + std::to_string(rule->chunk_tf32) + "), grid " +
+                       std::to_string(rule->grid) + "; the profile says " + std::to_string(chunk) + ", " +
+                       std::to_string(chunk_tf32) + ", " + std::to_string(grid) + ", and the engines have no such sum");
+    p.numerics.tensor_sum_chunk = static_cast<uint32_t>(chunk);
+    p.numerics.tensor_sum_chunk_tf32 = static_cast<uint32_t>(chunk_tf32);
+    p.numerics.tensor_sum_grid = static_cast<int32_t>(grid);
+  }
+  if (n.map.count("tensor_sum_published")) {
+    const std::string pub = get_str(n, "tensor_sum_published", origin);
+    if (!parse_tensor_sum(pub, p.numerics.tensor_sum_published) || p.numerics.tensor_sum_published == TensorSum::Sequential)
+      fail(origin, "numerics.tensor_sum_published must be ampere or hopper, got: " + pub);
+    if (rule) fail(origin, "numerics.tensor_sum_published is for a device whose own sum is not known: it needs tensor_sum: sequential");
+  }
+}
+
+// The `provenance:` and `evidence:` sections (Provenance in profile.hpp), and the rule that every numerics key is tagged.
+void parse_provenance(const Value& doc, DeviceProfile& p, const std::string& origin) {
+  if (auto it = doc.map.find("provenance"); it != doc.map.end()) {
+    if (it->second.kind != Value::Kind::Map) fail(origin, "'provenance' must be a map of class: [keys]");
+    for (const auto& [tag, keys] : it->second.map) {
+      Provenance cls = Provenance::Unknown;
+      if (tag == "measured") cls = Provenance::Measured;
+      else if (tag == "documented") cls = Provenance::Documented;
+      else if (tag == "inferred") cls = Provenance::Inferred;
+      else if (tag == "unknown") cls = Provenance::Unknown;
+      else fail(origin, "provenance: unknown class '" + tag + "' (the classes are measured, documented, inferred, unknown)");
+      if (keys.kind != Value::Kind::List) fail(origin, "provenance." + tag + " must be a list of keys");
+      for (const Value& e : keys.list) {
+        if (e.kind != Value::Kind::Str) fail(origin, "provenance." + tag + " must be a list of keys");
+        if (!has_key(doc, e.str)) fail(origin, "provenance." + tag + " names '" + e.str + "', a key this profile does not have");
+        if (auto had = p.provenance.find(e.str); had != p.provenance.end())
+          fail(origin, "provenance: '" + e.str + "' is tagged twice (" + provenance_name(had->second) + " and " + tag +
+                           "); a key carries one class");
+        if (cls != Provenance::Unknown && p.is_placeholder(e.str))
+          fail(origin, "provenance: '" + e.str + "' is in placeholders, so it can only be unknown, not " + tag);
+        p.provenance.emplace(e.str, cls);
+      }
+    }
+  }
+  if (auto it = doc.map.find("evidence"); it != doc.map.end()) {
+    if (it->second.kind != Value::Kind::Map) fail(origin, "'evidence' must be a map of key: \"text\"");
+    for (const auto& [key, text] : it->second.map) {
+      if (text.kind != Value::Kind::Str || text.str.empty()) fail(origin, "evidence." + key + " must be a text");
+      // An entry is for a tagged key, or for a section ("numerics") at least one key of which is tagged.
+      bool used = p.provenance.count(key) != 0;
+      if (!used && key.find('.') == std::string::npos)
+        for (const auto& [tagged, cls] : p.provenance) {
+          (void)cls;
+          if (tagged.compare(0, key.size() + 1, key + ".") == 0) used = true;
+        }
+      if (!used) fail(origin, "evidence: '" + key + "' is neither a key that provenance tags nor a section with one");
+      p.evidence.emplace(key, text.str);
+    }
+  }
+  // A class other than unknown is a claim, and a claim says what it rests on.
+  for (const auto& [key, cls] : p.provenance)
+    if (cls != Provenance::Unknown && p.evidence_of(key).empty())
+      fail(origin, "provenance: '" + key + "' is " + provenance_name(cls) + " and has no evidence entry (its own or its section's)");
+  // Numerics decide result bits, so none goes without a class.
+  if (auto it = doc.map.find("numerics"); it != doc.map.end() && it->second.kind == Value::Kind::Map)
+    for (const auto& [key, value] : it->second.map) {
+      (void)value;
+      if (!p.provenance.count("numerics." + key))
+        fail(origin, "numerics." + key + " has no provenance class: every numerics key must be listed under provenance " +
+                         "(measured, documented, inferred or unknown)");
+    }
+}
+
 }  // namespace
+
+std::optional<Provenance> DeviceProfile::provenance_of(const std::string& key) const {
+  if (auto it = provenance.find(key); it != provenance.end()) return it->second;
+  if (is_placeholder(key)) return Provenance::Unknown;
+  return std::nullopt;
+}
+
+const std::string& DeviceProfile::evidence_of(const std::string& key) const {
+  static const std::string none;
+  if (auto it = evidence.find(key); it != evidence.end()) return it->second;
+  if (const auto dot = key.find('.'); dot != std::string::npos)
+    if (auto it = evidence.find(key.substr(0, dot)); it != evidence.end()) return it->second;
+  return none;
+}
 
 DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string& origin) {
   Value doc = yamlish::parse(src, origin);
@@ -292,6 +426,10 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
       p.features[k] = v.b;
     }
   }
+
+  // Optional: the numerics, and what each tagged value rests on.
+  parse_numerics(doc, p, origin);
+  parse_provenance(doc, p, origin);
   return p;
 }
 

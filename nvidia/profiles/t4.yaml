@@ -55,3 +55,18 @@ layout:
   gpcs: 5
   tpcs: 20
   sms_per_tpc: 2
+
+# Numerics: the sum this device's tensor core makes of f16, bf16 and tf32 products (wmma, mma.sync, HMMA). The engines read it
+# from here. `provenance` gives each value one class (measured | documented | inferred | unknown) and `evidence` what the class
+# rests on. Schema: nvidia/docs/profiles.md. The rule and every card run: docs/matrix-numerics.md.
+numerics:
+  tensor_sum: ampere               # sequential | ampere | hopper
+  tensor_sum_chunk: 8              # products to a chunk, f16 and bf16
+  tensor_sum_chunk_tf32: 4         # ... tf32
+  tensor_sum_grid: 25              # a chunk's terms are cut at 2^(top - 25)
+provenance:
+  measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_grid]
+  inferred: [numerics.tensor_sum_chunk_tf32]
+evidence:
+  numerics: "card: Tesla T4 (this model), AWS; driver: 595.112.07; toolkit: CUDA 13.0; date: 2026-11-15. simd_lane_forms built -DNO80 prints the 56 lines of the RTX 3060 that remain, the four wmma f16 lines among them (nvidia/tests/data/simd_lane_forms.t4.txt); FTTN fp16. f16 forms only; float_half_forms has not run on it. docs/matrix-numerics.md"
+  numerics.tensor_sum_chunk_tf32: "not measurable on this card: a Turing tensor core has no tf32 form. The number is the ampere model's, as measured on the 8.0, 8.6 and 8.9 cards, written so that the rule is complete. docs/matrix-numerics.md"

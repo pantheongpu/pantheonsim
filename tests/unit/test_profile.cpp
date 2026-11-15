@@ -1,5 +1,6 @@
 // Unit tests for device profiles and the built-in registry.
 #include <algorithm>
+#include <iterator>
 #include <string>
 #include <utility>
 #include "vgpu/profile.hpp"
@@ -341,3 +342,270 @@ VTEST(cluster_occupancy_follows_the_documented_rules) {
 }
 
 VTEST_MAIN
+
+// ---- numerics, provenance, evidence (nvidia/docs/profiles.md, "Numerics and provenance") -------------------------------------
+
+namespace {
+using vgpu::Provenance;
+using vgpu::TensorSum;
+
+const char* const kAmpereNumerics =
+    "numerics:\n  tensor_sum: ampere\n  tensor_sum_chunk: 8\n  tensor_sum_chunk_tf32: 4\n  tensor_sum_grid: 25\n";
+const char* const kAllFour = "[numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]";
+
+// The test card with these sections after its telemetry.
+DeviceProfile with_sections(const std::string& sections) {
+  return DeviceProfile::from_yaml(profile_with_telemetry("") + sections, "test-origin");
+}
+// The loader refuses it, and says `needle`.
+void refused(const std::string& sections, const char* needle) {
+  auto err = VCAPTURE(Error, with_sections(sections));
+  VCHECK(err.code() == Err::ProfileParse);
+  VCHECK_CONTAINS(err.what(), "test-origin");
+  VCHECK_CONTAINS(err.what(), needle);
+}
+}  // namespace
+
+VTEST(numerics_and_their_provenance_parse) {
+  const DeviceProfile p = with_sections(std::string(kAmpereNumerics) +
+                                        "provenance:\n"
+                                        "  measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_grid, limits.multiprocessors]\n"
+                                        "  inferred: [numerics.tensor_sum_chunk_tf32]\n"
+                                        "  documented: [vram_bytes]\n"
+                                        "  unknown: [telemetry.power_limit_w]\n"
+                                        "evidence:\n"
+                                        "  numerics: \"card: Test Card; driver: 1.2; toolkit: CUDA 13.0; date: 2026-11-15\"\n"
+                                        "  numerics.tensor_sum_chunk_tf32: \"the model's number\"\n"
+                                        "  limits.multiprocessors: \"read from the card\"\n"
+                                        "  vram_bytes: \"data sheet\"\n");
+  VCHECK(p.numerics.present);
+  VCHECK(p.numerics.tensor_sum == TensorSum::Ampere);
+  VCHECK_EQ(p.numerics.tensor_sum_chunk, 8u);
+  VCHECK_EQ(p.numerics.tensor_sum_chunk_tf32, 4u);
+  VCHECK_EQ(p.numerics.tensor_sum_grid, 25);
+  VCHECK(p.numerics.tensor_sum_published == TensorSum::Sequential);
+  VCHECK_EQ(p.provenance.size(), size_t{7});
+  VCHECK(p.provenance_of("numerics.tensor_sum") == Provenance::Measured);
+  VCHECK(p.provenance_of("numerics.tensor_sum_chunk_tf32") == Provenance::Inferred);
+  VCHECK(p.provenance_of("limits.multiprocessors") == Provenance::Measured);
+  VCHECK(p.provenance_of("vram_bytes") == Provenance::Documented);
+  VCHECK(p.provenance_of("telemetry.power_limit_w") == Provenance::Unknown);
+  // A key's own evidence, else its section's; none for a key nothing was said of.
+  VCHECK_EQ(p.evidence_of("numerics.tensor_sum"), "card: Test Card; driver: 1.2; toolkit: CUDA 13.0; date: 2026-11-15");
+  VCHECK_EQ(p.evidence_of("numerics.tensor_sum_chunk_tf32"), "the model's number");
+  VCHECK_EQ(p.evidence_of("vram_bytes"), "data sheet");
+  VCHECK_EQ(p.evidence_of("telemetry.power_limit_w"), "");
+  // An untagged key outside numerics has no per-key class: the verified flag is not turned into one.
+  VCHECK(p.verified);
+  VCHECK(!p.provenance_of("limits.registers_per_block").has_value());
+  VCHECK(!p.provenance_of("warp_size").has_value());
+
+  // The Hopper numbers, and a device with only a published model.
+  const DeviceProfile h = with_sections("numerics:\n  tensor_sum: hopper\n  tensor_sum_chunk: 16\n  tensor_sum_chunk_tf32: 8\n  tensor_sum_grid: 26\n"
+                                        "provenance:\n  inferred: " + std::string(kAllFour) + "\nevidence:\n  numerics: \"same capability\"\n");
+  VCHECK(h.numerics.tensor_sum == TensorSum::Hopper && h.numerics.tensor_sum_chunk == 16u && h.numerics.tensor_sum_chunk_tf32 == 8u &&
+         h.numerics.tensor_sum_grid == 26);
+  const DeviceProfile b = with_sections("numerics:\n  tensor_sum: sequential\n  tensor_sum_published: hopper\n"
+                                        "provenance:\n  unknown: [numerics.tensor_sum]\n  inferred: [numerics.tensor_sum_published]\n"
+                                        "evidence:\n  numerics.tensor_sum_published: \"two papers\"\n");
+  VCHECK(b.numerics.present && b.numerics.tensor_sum == TensorSum::Sequential && b.numerics.tensor_sum_published == TensorSum::Hopper);
+  VCHECK_EQ(b.numerics.tensor_sum_chunk, 0u);
+  VCHECK(b.provenance_of("numerics.tensor_sum") == Provenance::Unknown);   // (unknown needs no evidence)
+
+  // No numerics section: the sequential sum, nothing published, nothing tagged.
+  const DeviceProfile none = with_sections("");
+  VCHECK(!none.numerics.present && none.numerics.tensor_sum == TensorSum::Sequential && none.numerics.tensor_sum_published == TensorSum::Sequential);
+  VCHECK(none.provenance.empty() && none.evidence.empty());
+}
+
+VTEST(a_provenance_class_that_is_not_one_of_the_four_is_refused) {
+  const std::string ev = "evidence:\n  numerics: \"a card\"\n";
+  refused(std::string(kAmpereNumerics) + "provenance:\n  verified: " + kAllFour + "\n" + ev, "unknown class 'verified'");
+  refused(std::string(kAmpereNumerics) + "provenance:\n  Measured: " + kAllFour + "\n" + ev, "unknown class 'Measured'");
+  refused(std::string(kAmpereNumerics) + "provenance:\n  measured: " + kAllFour + "\n  guessed: [vram_bytes]\n" + ev, "unknown class 'guessed'");
+  // ... and each of the four is accepted.
+  for (const char* cls : {"measured", "documented", "inferred", "unknown"})
+    VCHECK(with_sections(std::string(kAmpereNumerics) + "provenance:\n  " + cls + ": " + kAllFour + "\n" + ev).provenance.size() == 4u);
+}
+
+VTEST(a_key_carries_one_provenance_class) {
+  const std::string ev = "evidence:\n  numerics: \"a card\"\n  vram_bytes: \"a sheet\"\n";
+  // In two classes.
+  refused(std::string(kAmpereNumerics) + "provenance:\n  measured: " + kAllFour + "\n  inferred: [numerics.tensor_sum_grid]\n" + ev, "'numerics.tensor_sum_grid' is tagged twice");
+  refused(std::string(kAmpereNumerics) + "provenance:\n  measured: " + kAllFour + "\n  documented: [vram_bytes]\n  unknown: [vram_bytes]\n" + ev,
+          "'vram_bytes' is tagged twice");
+  // Twice in one class.
+  refused(std::string(kAmpereNumerics) + "provenance:\n  measured: [numerics.tensor_sum, numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]\n" + ev,
+          "'numerics.tensor_sum' is tagged twice");
+  // A class written twice, a numerics key written twice: the YAML subset has no duplicate keys.
+  refused(std::string(kAmpereNumerics) + "provenance:\n  measured: " + kAllFour + "\n  measured: [vram_bytes]\n" + ev, "duplicate key: measured");
+  refused(std::string(kAmpereNumerics) + "  tensor_sum: hopper\nprovenance:\n  measured: " + kAllFour + "\n" + ev, "duplicate key: tensor_sum");
+}
+
+VTEST(every_numerics_key_must_have_a_provenance_class) {
+  const std::string ev = "evidence:\n  numerics: \"a card\"\n";
+  // No provenance at all; one key of four missing; the published model untagged.
+  refused(kAmpereNumerics, "numerics.tensor_sum has no provenance class");
+  refused(std::string(kAmpereNumerics) + "provenance:\n  measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32]\n" + ev,
+          "numerics.tensor_sum_grid has no provenance class");
+  refused("numerics:\n  tensor_sum: sequential\n  tensor_sum_published: hopper\nprovenance:\n  unknown: [numerics.tensor_sum]\n",
+          "numerics.tensor_sum_published has no provenance class");
+  refused("numerics:\n  tensor_sum: sequential\n", "numerics.tensor_sum has no provenance class");
+}
+
+VTEST(a_provenance_claim_names_a_real_key_and_its_evidence) {
+  const std::string tagged = std::string(kAmpereNumerics) + "provenance:\n  measured: " + kAllFour + "\n";
+  const std::string ev = "evidence:\n  numerics: \"a card\"\n";
+  // A key the profile does not have (a typing mistake would otherwise tag nothing).
+  refused(tagged + "  documented: [limits.multiprocesors]\n" + ev, "'limits.multiprocesors', a key this profile does not have");
+  refused(tagged + "  documented: [limits]\n" + ev, "'limits', a key this profile does not have");
+  // measured, documented and inferred are claims and say what they rest on; unknown need not.
+  refused(tagged, "'numerics.tensor_sum' is measured and has no evidence");
+  refused(tagged + "  documented: [vram_bytes]\n" + ev, "'vram_bytes' is documented and has no evidence");
+  VCHECK(with_sections(tagged + "  unknown: [vram_bytes]\n" + ev).provenance_of("vram_bytes") == Provenance::Unknown);
+  // Evidence for something nothing tags.
+  refused(tagged + ev + "  limits.multiprocessors: \"read\"\n", "'limits.multiprocessors' is neither a key that provenance tags");
+  refused(tagged + ev + "  telemetry: \"read\"\n", "'telemetry' is neither a key that provenance tags");
+}
+
+VTEST(numerics_the_engines_do_not_implement_are_refused) {
+  const std::string tail = std::string("provenance:\n  measured: ") + kAllFour + "\nevidence:\n  numerics: \"a card\"\n";
+  refused("numerics:\n  tensor_sum: volta\n  tensor_sum_chunk: 4\n  tensor_sum_chunk_tf32: 4\n  tensor_sum_grid: 24\n" + tail, "must be sequential, ampere or hopper");
+  // Numbers that are not the named model's: each of the three.
+  refused("numerics:\n  tensor_sum: ampere\n  tensor_sum_chunk: 16\n  tensor_sum_chunk_tf32: 4\n  tensor_sum_grid: 25\n" + tail, "the engines have no such sum");
+  refused("numerics:\n  tensor_sum: ampere\n  tensor_sum_chunk: 8\n  tensor_sum_chunk_tf32: 8\n  tensor_sum_grid: 25\n" + tail, "the engines have no such sum");
+  refused("numerics:\n  tensor_sum: hopper\n  tensor_sum_chunk: 16\n  tensor_sum_chunk_tf32: 8\n  tensor_sum_grid: 25\n" + tail, "the engines have no such sum");
+  refused("numerics:\n  tensor_sum: ampere\n  tensor_sum_chunk: 8\n  tensor_sum_grid: 25\n" + tail, "missing required key: tensor_sum_chunk_tf32");
+  // The sequential sum has no numbers; a published model is only for a device without one of its own, and is a model.
+  refused("numerics:\n  tensor_sum: sequential\n  tensor_sum_chunk: 1\nprovenance:\n  unknown: [numerics.tensor_sum, numerics.tensor_sum_chunk]\n",
+          "numerics.tensor_sum_chunk has no meaning with tensor_sum: sequential");
+  refused(std::string(kAmpereNumerics) + "  tensor_sum_published: hopper\n" + tail, "needs tensor_sum: sequential");
+  refused("numerics:\n  tensor_sum: sequential\n  tensor_sum_published: sequential\nprovenance:\n  unknown: [numerics.tensor_sum, numerics.tensor_sum_published]\n",
+          "tensor_sum_published must be ampere or hopper");
+  // A key the schema does not have, and a section that is not a map.
+  refused(std::string(kAmpereNumerics) + "  tensor_sum_rounding: nearest\n" + tail, "numerics: unknown key 'tensor_sum_rounding'");
+  refused("numerics: ampere\n", "'numerics' must be a map");
+}
+
+VTEST(the_tensor_sum_is_an_nvidia_property_and_a_placeholder_is_unknown) {
+  // An AMD profile cannot carry the NVIDIA numerics (nothing on the AMD side would read them).
+  const std::string amd = R"(
+id: amd/testcard
+vendor: amd
+model: "Test Card"
+architecture: cdna3
+gcn_arch: "gfx942"
+warp_size: 64
+vram_bytes: 1073741824
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 1024]
+  max_grid_dim: [2147483647, 65536, 65536]
+  shared_mem_per_block_bytes: 65536
+  shared_mem_per_block_optin_bytes: 65536
+  multiprocessors: 304
+)";
+  VCHECK(DeviceProfile::from_yaml(amd, "amd-origin").provenance.empty());
+  auto err = VCAPTURE(Error, DeviceProfile::from_yaml(amd + "numerics:\n  tensor_sum: sequential\nprovenance:\n  unknown: [numerics.tensor_sum]\n", "amd-origin"));
+  VCHECK(err.code() == Err::ProfileParse);
+  VCHECK_CONTAINS(err.what(), "an amd profile cannot carry it");
+  // ... and may tag its own keys.
+  const DeviceProfile a = DeviceProfile::from_yaml(amd + "provenance:\n  measured: [gcn_arch, limits.multiprocessors]\nevidence:\n  gcn_arch: \"rocminfo\"\n  limits: \"HIP\"\n", "amd-origin");
+  VCHECK(a.provenance_of("gcn_arch") == Provenance::Measured && a.evidence_of("limits.multiprocessors") == "HIP");
+
+  // A key in `placeholders` is unknown without being tagged, and cannot be tagged anything else.
+  const DeviceProfile ph = with_sections("placeholders: [limits.max_blocks_per_sm]\n");
+  VCHECK(ph.provenance_of("limits.max_blocks_per_sm") == Provenance::Unknown);
+  VCHECK(with_sections("placeholders: [limits.max_blocks_per_sm]\nprovenance:\n  unknown: [limits.max_blocks_per_sm]\n")
+             .provenance_of("limits.max_blocks_per_sm") == Provenance::Unknown);
+  refused("placeholders: [limits.max_blocks_per_sm]\nprovenance:\n  measured: [limits.max_blocks_per_sm]\nevidence:\n  limits: \"x\"\n",
+          "is in placeholders, so it can only be unknown, not measured");
+  const DeviceProfile intel = vgpu::load_gpu("intel/arc-b580");
+  VCHECK(!intel.placeholders.empty() && !intel.numerics.present);
+  for (const auto& key : intel.placeholders) VCHECK(intel.provenance_of(key) == Provenance::Unknown);
+}
+
+// Every profile in the binary: it loads (so every numerics key it has is tagged, and every claim has evidence: the loader refuses
+// the profile otherwise), every NVIDIA profile says which sum its tensor core makes, and the class of that statement is the one
+// the evidence held on 2026-11-15 supports. A card run that moves a profile from inferred or unknown to measured changes its
+// file and its row here together.
+VTEST(every_builtin_profile_tags_its_numerics) {
+  struct Row {
+    const char* id;
+    Provenance tensor_sum;
+  };
+  const Provenance M = Provenance::Measured, I = Provenance::Inferred, U = Provenance::Unknown;
+  // measured: the card of the profile's own model was run (docs/matrix-numerics.md, "Card runs behind the table").
+  // inferred: another model of the same compute capability was. unknown: no card of the compute capability was.
+  const Row rows[] = {
+      {"nvidia/rtx3060", M}, {"nvidia/a10g", M}, {"nvidia/t4", M}, {"nvidia/l4", M}, {"nvidia/l40s", M}, {"nvidia/a100-sxm4-40gb", M}, {"nvidia/h100-pcie", M},
+      {"nvidia/rtx2080ti", I},                                                                                                    // 7.5
+      {"nvidia/a100", I}, {"nvidia/a100-80gb-pcie", I}, {"nvidia/a30", I},                                                        // 8.0
+      {"nvidia/a10", I}, {"nvidia/a40", I}, {"nvidia/rtx-a5000", I}, {"nvidia/rtx-a6000", I}, {"nvidia/rtx3070", I}, {"nvidia/rtx3080ti", I}, {"nvidia/rtx3090", I},   // 8.6
+      {"nvidia/l40", I}, {"nvidia/rtx4080", I}, {"nvidia/rtx4090", I}, {"nvidia/rtx6000-ada", I},                                 // 8.9
+      {"nvidia/h100", I}, {"nvidia/h100-nvl", I}, {"nvidia/h200", I}, {"nvidia/h200-nvl", I}, {"nvidia/gh200-480gb", I},          // 9.0
+      {"nvidia/b200", U}, {"nvidia/gb200", U}, {"nvidia/b300", U}, {"nvidia/vr200", U}, {"nvidia/thor", U},                       // 10.x, 11.0
+      {"nvidia/rtx5090", U}, {"nvidia/rtx-pro-4500", U}, {"nvidia/rtx-pro-6000", U}, {"nvidia/rtx-pro-6000-server", U}, {"nvidia/rtx-pro-6000-max-q", U}, {"nvidia/gb10", U}};   // 12.x
+  int nvidia = 0, measured = 0, inferred = 0, unknown = 0;
+  auto ids = vgpu::available_gpus();
+  for (const auto& id : vgpu::available_engine_gpus()) ids.push_back(id);
+  for (const auto& id : ids) {
+    const DeviceProfile p = vgpu::load_gpu(id);
+    // Tagged numerics, on every vendor's profile.
+    for (const auto& [key, cls] : p.provenance) {
+      if (cls != Provenance::Unknown && p.evidence_of(key).empty()) throw vtest::Failure(id + ": " + key + " has a class and no evidence");
+    }
+    if (p.vendor != "nvidia") {
+      VCHECK(!p.numerics.present);   // no AMD or Intel arithmetic is in a profile (and none is measured)
+      for (const auto& [key, cls] : p.provenance) VCHECK(key.rfind("numerics.", 0) != 0);
+      continue;
+    }
+    ++nvidia;
+    if (!p.numerics.present) throw vtest::Failure(id + " has no numerics section");
+    const auto sum = p.provenance_of("numerics.tensor_sum");
+    if (!sum) throw vtest::Failure(id + ": numerics.tensor_sum is untagged");
+    const bool chunked = vgpu::tensor_sum_rule(p.numerics.tensor_sum) != nullptr;
+    for (const char* key : {"numerics.tensor_sum_chunk", "numerics.tensor_sum_chunk_tf32", "numerics.tensor_sum_grid"})
+      if (p.provenance_of(key).has_value() != chunked) throw vtest::Failure(id + ": " + key + " tagged or not against its model");
+    if ((p.numerics.tensor_sum_published != TensorSum::Sequential) != p.provenance_of("numerics.tensor_sum_published").has_value())
+      throw vtest::Failure(id + ": numerics.tensor_sum_published tagged or not against its value");
+    const Row* row = nullptr;
+    for (const Row& r : rows)
+      if (id == r.id) row = &r;
+    if (!row) throw vtest::Failure(id + " has no row in this test: say what its tensor sum rests on");
+    if (*sum != row->tensor_sum) throw vtest::Failure(id + ": numerics.tensor_sum is " + vgpu::provenance_name(*sum) + ", this test says " + vgpu::provenance_name(row->tensor_sum));
+    // A model in force by default is measured or inferred, never unknown; the sequential stand-in is unknown, never a claim.
+    VCHECK(chunked == (*sum != Provenance::Unknown));
+    // A published model is somebody else's: inferred, whatever the profile's own class.
+    if (p.numerics.tensor_sum_published != TensorSum::Sequential) VCHECK(p.provenance_of("numerics.tensor_sum_published") == Provenance::Inferred);
+    // Measured means this model's card: the evidence names it.
+    if (*sum == Provenance::Measured) {
+      VCHECK_CONTAINS(p.evidence_of("numerics.tensor_sum"), "card: " + p.model + " (this model)");
+      VCHECK_CONTAINS(p.evidence_of("numerics.tensor_sum"), "date: ");
+      VCHECK_CONTAINS(p.evidence_of("numerics.tensor_sum"), "driver: ");
+      VCHECK_CONTAINS(p.evidence_of("numerics.tensor_sum"), "toolkit: ");
+      VCHECK(p.verified);
+    }
+    measured += *sum == Provenance::Measured, inferred += *sum == Provenance::Inferred, unknown += *sum == Provenance::Unknown;
+  }
+  VCHECK_EQ(nvidia, 38);
+  VCHECK_EQ(static_cast<int>(std::size(rows)), 38);
+  VCHECK_EQ(measured, 7);
+  VCHECK_EQ(inferred, 20);
+  VCHECK_EQ(unknown, 11);
+  // A Turing card has no tf32 form, so the T4's tf32 chunk is the model's number and not its own measurement.
+  VCHECK(vgpu::load_gpu("nvidia/t4").provenance_of("numerics.tensor_sum_chunk_tf32") == Provenance::Inferred);
+  VCHECK(vgpu::load_gpu("nvidia/t4").provenance_of("numerics.tensor_sum_chunk") == Provenance::Measured);
+  // The two Radeon cards that were read: what HIP reported on the card is measured, what no tool reports is not.
+  for (const char* id : {"amd/rx6800", "amd/rx6700xt"}) {
+    const DeviceProfile p = vgpu::load_gpu(id);
+    VCHECK(p.provenance_of("limits.multiprocessors") == Provenance::Measured);
+    VCHECK(p.provenance_of("limits.max_blocks_per_sm") == Provenance::Inferred);
+    VCHECK_CONTAINS(p.evidence_of("limits.multiprocessors"), "amd/registers/measurements/");
+    VCHECK(!p.provenance_of("features.tensor_cores").has_value());
+  }
+  // No other AMD profile claims anything per key.
+  for (const char* id : {"amd/mi250x", "amd/mi300x", "amd/mi325x", "amd/mi350x", "amd/mi455x", "amd/rx7900xtx", "amd/rx9070xt", "amd/rx6900xt"})
+    VCHECK(vgpu::load_gpu(id).provenance.empty());
+}

@@ -82,3 +82,13 @@ telemetry:
 # and so is the persisting L2.
 cuda:
   memory_bus_width_bits: 16384
+
+# Numerics: the sum this device's tensor core makes of f16, bf16 and tf32 products (wmma, mma.sync, HMMA). The engines read it
+# from here. `provenance` gives each value one class (measured | documented | inferred | unknown) and `evidence` what the class
+# rests on. Schema: nvidia/docs/profiles.md. The rule and every card run: docs/matrix-numerics.md.
+numerics:
+  tensor_sum: sequential           # sequential | ampere | hopper
+provenance:
+  unknown: [numerics.tensor_sum]
+evidence:
+  numerics.tensor_sum: "no card of compute capability 10.7 has been run by us and no published model covers it. The sequential f32 sum is what the simulator does until one is, not a claim about the card. docs/matrix-numerics.md"
