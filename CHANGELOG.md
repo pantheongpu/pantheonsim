@@ -7,6 +7,13 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+## [0.2.1] - 2026-11-15
+
+Fixes and additions since 0.2.0. The two bugs that release shipped are fixed: `shfl.sync` returning 0 for a lane still in a long loop
+([#488](https://github.com/pantheongpu/pantheonsim/issues/488)) and a kernel that could not read another simulated GPU's memory after
+`cudaDeviceEnablePeerAccess` ([#598](https://github.com/pantheongpu/pantheonsim/issues/598)). The release carries the simulator prebuilt for the
+GitHub Action. The list below is every entry that was under Unreleased.
+
 - AMD counters: the `VGPU_DISPATCH_STATS` line now ends with the bytes the active lanes ask for (`vmem_bytes_rd`, `vmem_bytes_wr`, `lds_bytes_rd`, `lds_bytes_wr`),
   the vector instruction mix (`mix=`), the matrix work by type (`mops=`) and the kernel's name (`kernel=`). The mix and the matrix work were already counted
   and are now printed; the bytes are new. A reader that splits the line on `=` and converts every value to a number must skip the text fields
