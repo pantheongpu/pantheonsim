@@ -246,9 +246,11 @@ class `measured` and the run as its evidence, and into the other profiles of its
 ## The other place bits can differ: math functions
 
 The matrix instructions are not the only arithmetic a card does its own way. The math functions (`sinf`, `expf`, `powf`, ...)
-are library code over the `MUFU` instructions (NVIDIA) and `v_exp/v_log/v_sin/v_cos/v_rcp/v_rsq` (AMD), which the simulator
-computes at the host's precision and a card reads from tables. What was compared there, against which published results,
-what the simulator's own two engines disagreed on, and the card run that is prepared:
+are library code over the `MUFU` instructions (NVIDIA) and `v_exp/v_log/v_sin/v_cos/v_rcp/v_rsq` (AMD), which a card reads
+from tables. The simulator computes the NVIDIA ones as an RTX 3060 does, bit for bit over every operand (measured; a Tesla
+T4, an L4 and an A10G print the same math-library results; Hopper and Blackwell inferred; `VGPU_MUFU_EXACT=0` gives the
+function at host precision, as before), and the AMD ones at the host's precision. What was compared, against which
+published results and which cards, what the simulator's own two engines disagreed on, the probe and the model:
 [numerics/math-functions.md](numerics/math-functions.md).
 
 ## Sources

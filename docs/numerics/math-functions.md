@@ -3,18 +3,23 @@
 The tensor and matrix cores are one place where a simulated card's bits can differ from a real one's
 ([matrix-numerics.md](../matrix-numerics.md)). The math functions are the other, and the larger one: `sinf`, `expf`, `powf`
 and the rest are library code (NVIDIA's libdevice, AMD's OCML) built on a few hardware instructions that approximate a
-function (`MUFU.RCP/RSQ/EX2/LG2/SIN/COS/TANH` on NVIDIA; `v_rcp/v_rsq/v_exp/v_log/v_sin/v_cos` on AMD). The simulator computes
-those instructions at the host's precision; a card reads them from tables that are within an ulp or two of that, so a
-program that calls a math function can print other last bits on the simulator than on the card.
+function (`MUFU.RCP/RSQ/EX2/LG2/SIN/COS/TANH` on NVIDIA; `v_rcp/v_rsq/v_exp/v_log/v_sin/v_cos` on AMD). Until 2026-11-15 the
+simulator computed those instructions at the host's precision; a card reads them from tables that are within an ulp or two
+of that, so a program that calls a math function printed other last bits on the simulator than on the card. The NVIDIA
+instructions are now computed as an RTX 3060 computes them, bit for bit over every input ([The card's unit](#the-cards-unit-mufu-as-an-rtx-3060-computes-it));
+the AMD ones are still the function at host precision.
 
-This page records the second group of published work of issue #664: what was compared, how, what the simulator's side of
-the comparison found, and what a card run will add. **No card was run for this page.** Three words are used strictly, as in
-matrix-numerics.md: **measured** (a card of ours ran it), **published** (a paper or post gives it; no card of ours has
-checked it), **unmeasured** (neither). Everything about a card below is *published* or *unmeasured* unless it cites an
-earlier measurement of ours.
+This page records the second group of published work of issue #664, in the order it was done: what was compared, how, what
+the simulator's side of the comparison found and what the published sources said a card would give (written before any card
+was run, and kept as written, with the outcome noted where a card has since decided a question), then
+[the card runs](#the-card-runs-2026-11-15), the probe of the instructions themselves, the model fitted to it and its
+evidence. Three words are used strictly, as in matrix-numerics.md: **measured** (a card of ours ran it), **published** (a
+paper or post gives it; no card of ours has checked it), **unmeasured** (neither). A fourth is used for the model on
+architectures no card of ours ran: **inferred** (measured on Turing, Ampere and Ada, and given to the others unchanged).
 
-Nothing here changes what the simulator's `MUFU` or the AMD math instructions return. That needs the card data this page
-prepares for (a table per instruction and architecture) and is a later step.
+What changed in the simulator: `MUFU` (every one of its ten sub-operations) in the SASS executor, and the PTX
+interpreter's `.approx` and `div.full` forms, give the card's bits. `VGPU_MUFU_EXACT=0` gives the earlier results (the
+function at host precision, rounded once). The AMD math instructions are untouched.
 
 ## The test set (`tools/numerics/`)
 
@@ -30,6 +35,9 @@ Our own code; nothing is copied from the sources. The Varity generator (MIT) is 
 | `build.sh` | Builds the three programs for an architecture: the default build, `mathfn_fast` (`-use_fast_math` / `-ffast-math`), `fp_examples_nofma`, `varity_cases` at `-O0` and `-O3`. |
 | `run-sim.sh` | Runs everything on the simulator, one directory a configuration (profile, cubin architecture, engine). |
 | `card-run.sh` | Builds and runs everything on a real card with the machine's own compiler. No cloud call. |
+| `mufu_kernel.cu`, `mufu_probe.cu` | The probe of the approximate instructions themselves: one `MUFU` sub-operation over all 2^32 inputs on a card, as hashes, as a dump of a range, or checked against the simulator's model ([The probe](#the-probe-one-instruction-every-input)). |
+| `mufu-card-run.sh`, `mufu/rtx3060.hashes.txt` | The probe's hash pass for another card: ten operations, all inputs, about a second each, compared with the RTX 3060's hashes without shipping dumps. |
+| `mufu_forms.cu` | Every PTX approximate form (`rcp/rsqrt/sqrt/sin/cos/ex2/lg2/tanh.approx`, with and without `.ftz`, the double forms, `div.approx` and `div.full`) on a card, on the operands where ptxas puts more than one instruction around the form. |
 | `compare.py` | Compares two runs: per function, precision and class, how many results differ and by how many ulp; with `--truth`, each run's error against the true value beside the published figure. |
 
 `mathfn`'s classes:
@@ -183,6 +191,11 @@ the published figure:
 | `tanh` | 0x1.405748p-1 | 0x3f0e1874 (0.185 ulp) | 1.82 ulp | 0x3f0e1876 (+2) |
 | `tgamma` | -0x1.f77d32p+0 | 0x4178865f (2.337 ulp) | 4.34 ulp | 0x4178865d (-2) |
 
+**Outcome (measured, RTX 3060, CUDA 13.0, 2026-11-15):** the card returns the implied result for 15 of the 17. For `erf`
+(0x3f588f97) and `expm1` (0x3ed45ef1) it returns what the simulator returned, not the neighbour: the paper's library is
+13.3.1 and ours 13.0, the first caution below. With the card's unit modelled the simulator returns the card's result for
+all 17.
+
 The 13 that agree are `acosh`, `asin`, `atan2`, `cos`, `cospi`, `hypot`, `log`, `log10`, `log1p`, `log2`, `pow`, `sin` and
 `sinpi`; `lgamma`'s 1.35e7 ulp at -0x1.3a7fcap+1 is reproduced as well. For `exp`, `exp2`, `cbrt` and `tan` the code
 was traced in the kernel's SASS to `MUFU.EX2`, `MUFU.LG2` or `MUFU.RCP`, the approximate instructions the simulator computes at
@@ -224,12 +237,20 @@ gives the correct values where the paper reports an NVIDIA card giving others. E
 or the paper's nvcc (its version is not ours) compiled them differently. This is the first thing the card run answers
 (`varity_cases.O0.txt`, eight lines).
 
+**Outcome (measured):** an RTX 3060, a Tesla T4, an L4 and an A10G print the simulator's eight lines, at `-O0` and `-O3`
+(nvcc 13.0.88): 7.1923082856620736e-309, 9.3404611450291972e-306, 1 and 1.34887e-306. The values the paper reports for an
+NVIDIA card are not what these four cards give with this toolkit; the simulator's `fmod` and `ceil` are the cards'.
+
 ### The Varity generator run
 
 300 programs, four builds, three input sets: 3,600 results a configuration. On NVIDIA all 3,600 are the same on every
 profile and, but for the five results above, on both engines. On AMD the two architectures differ on 34 to 65 results a build, and the
 ten empty kernels above are not run. The paper's differences between vendors (Table IX: 13,877 of its FP32 `-O3`
 fast-math tests) are between a card and a card; simulator against card is what `card-run.sh` adds.
+
+**Outcome (measured, RTX 3060):** of the 3,600 results of the sm_86 programs, the SASS executor gave the card's on 3,598
+while `MUFU` was at host precision (one `-O0` and one `-O3` fast-math result differed) and gives the card's on all 3,600
+with the card's unit.
 
 ### Whitehead and Fit-Florea
 
@@ -259,6 +280,8 @@ run.
 
 ## The card run
 
+(Written before the runs; the runs are the next section.)
+
 `tools/numerics/card-run.sh <out-dir>` builds everything with the machine's compiler and runs it on the card (about a
 minute of GPU time; the compiles take longer). It makes no cloud call; with `VARITY=0` no network call at all. Cards:
 
@@ -279,24 +302,262 @@ decide: the 17 implied results above; the paper's `fmod` and `ceil`; whether dou
 how much of single precision differs in ordinary use (the `rand_mid` class) and by how much; whether two cards of
 different generations agree with each other.
 
+## The card runs (2026-11-15)
+
+`card-run.sh` ran on four cards, each with nvcc 13.0.88 programs for its own architecture and for sm_75:
+
+| Card | Architecture | Driver | Where |
+|---|---|---|---|
+| GeForce RTX 3060 | sm_86 (Ampere) | 610.88 | the local card |
+| Tesla T4 | sm_75 (Turing) | 595.112.07 | a rented card |
+| L4 | sm_89 (Ada) | 595.112.07 | a rented card |
+| A10G | sm_86 (Ampere) | 595.112.07 | a rented card |
+
+No Hopper card (H100) and no Blackwell card ran any of this: everything below about them is *inferred* or *unmeasured*.
+
+**The four cards print the same lines.** All 329 lines of `mathfn` and all 329 of `mathfn_fast` (131,072 results a random
+class) are identical on the four cards, and on each card the lines of its own architecture's build are the lines of the
+sm_75 build. `fp_examples`, `fp_examples_nofma` and `varity_cases` (`-O0` and `-O3`) are identical too, and are the
+simulator's lines. So, as far as these programs see it, Turing, Ampere and Ada have one math unit: its behaviour belongs
+in the executor, not in a device profile.
+
+**The simulator against the card** (the sm_86 build on the rtx3060 profile, SASS; the same counts for the sm_75 build on the
+t4 profile):
+
+| | Lines that are the card's, of 329 | The lines that are not |
+|---|---|---|
+| `mathfn`, before (MUFU at host precision; `VGPU_MUFU_EXACT=0` today) | 263 | 66: f32 `acos asin asinh atan atanh cbrt cosh erf erfc exp exp10 exp2 lgamma rsqrt sinh tan tanh tgamma`; f64 `cbrt` (worst), `hypot` and `rsqrt` (rand_mid) |
+| `mathfn_fast`, before | 225 | 104: those, and f32 `sin cos log log2 log10 pow hypot sqrt rcp div rsqrt_div` |
+| `mathfn`, with the card's unit, SASS executor | **329** | none |
+| `mathfn_fast`, with the card's unit, SASS executor | **329** | none |
+| `mathfn` and `mathfn_fast`, with the card's unit, PTX interpreter | 326 each | `erf f64 edges`, `erf f64 rand_bits`, `hypot f64 edges`: the NaN payloads of `nvidia/tests/data/numerics_engines.txt`, which are not `MUFU`'s (the SASS executor's NaN is the card's, the interpreter's is not) |
+
+The counts are the same at 4,096 results a class (the size the test pins) and at 131,072 (the size the four cards ran); at
+131,072 the simulator's two files, the first results of every line included, are byte for byte the RTX 3060's. Of the 3,600
+Varity results 3,598 were the card's before and all 3,600 are now. With `VGPU_MUFU_EXACT=0` the simulator prints, line for
+line, what it printed before (the pinned files as they were: 329 of 329 and 329 of 329).
+
+The double-precision lines that differed (`cbrt`, `hypot`, `rsqrt`) go through `MUFU.RCP64H` and `MUFU.RSQ64H`, which the
+card does not compute as the upper word of the correctly rounded value either (below).
+
+## The probe: one instruction, every input
+
+`tools/numerics/mufu_probe.cu` runs one `MUFU` sub-operation over all 2^32 operands on a card.
+
+- **The instruction is alone.** The kernels (`mufu_kernel.cu`) hold the PTX form `rcp.approx.ftz.f32`, which ptxas turns
+  into a lone `MUFU.RCP Rd, Rs`. The probe loads the compiled cubin, finds every `MUFU` in its code (128-bit instructions
+  whose opcode field, bits 0-8, is 0x108) and rewrites the sub-operation field (bits 74-77) to the one asked for: `COS`,
+  `SIN`, `EX2`, `LG2`, `RCP`, `RSQ`, `RCP64H`, `RSQ64H`, `SQRT`, `TANH`. PTX cannot produce most of them alone
+  (`sin.approx` is a multiply by 1/2pi and `MUFU.SIN`; the 64H forms are half of a double). `--cubin-out` writes the
+  rewritten code, and `nvdisasm` of it shows `MUFU.<OP> Rd, Rs` and no other `MUFU` (`mufu-card-run.sh` checks that on
+  every run and keeps the listing in `sass.txt`). `--abs` and `--neg` set the operand modifiers (`MUFU.RCP Rd, -|Rs|`).
+- **The operand** is the 32-bit pattern itself: a float's bits, or for the 64H forms the upper word of a double.
+- **`--hash`**: the results in blocks of 4,096 consecutive operands; a block's hash is FNV-1a 64 over its results (one
+  32-bit result a step), computed on the card; a chunk of 2^26 operands is hashed over its blocks' hashes. 64 chunks and
+  the whole, an operation: `tools/numerics/mufu/rtx3060.hashes.txt` (650 lines, 20 KB) is the RTX 3060's. About a second of
+  GPU time an operation.
+- **`--dump`**: the raw results of a range, for fitting.
+- **`--check`**: every result against the simulator's model, `include/vgpu/exec/mufu_model.hpp`, which the probe includes
+  as it is (the header is plain C++17 for that reason). It prints how many of the range differ and the first of them.
+  About a minute an operation on one host core.
+
+`tools/numerics/mufu-card-run.sh <out-dir>` builds both for the card in the machine, runs the hash pass of all ten
+operations, compares with the RTX 3060's file and says, per operation, "the same as the RTX 3060 on all 2^32 inputs" or
+which chunks differ; `MUFU_CHECK=1` adds the check against the model and `MUFU_DUMP="RCP:0x3f800000:0x800000"` a dump of a
+range of a card that differs. This is the run to make on an H100 and on a Blackwell card.
+
+## The card's unit: `MUFU` as an RTX 3060 computes it
+
+**Result.** For each of the ten sub-operations the model gives the RTX 3060's result on 4,294,967,296 of 4,294,967,296
+operands (`mufu_probe --check`, the final header, 2026-11-15):
+
+| Operation | Operands on which the model is the card | How the card differs from the function rounded to nearest (measured over the binades [0.5, 4) of the argument unless said) |
+|---|---|---|
+| `MUFU.RCP` | 4,294,967,296 of 4,294,967,296 | 13.2 % of mantissas by one ulp (4.5 % below, 8.7 % above); error within 0.975 ulp |
+| `MUFU.RSQ` | all | 21 to 22 % by one ulp, 8 mantissas of an even binade by two; error within 1.52 ulp |
+| `MUFU.SQRT` | all | 17 % by one ulp; error within 0.95 ulp |
+| `MUFU.EX2` | all | 31 to 39 % by one ulp; error -0.75 to +1.40 ulp (arguments in [1, 2)) |
+| `MUFU.LG2` | all | absolute error within 2.2e-7; near 1 that is far more than an ulp of the result (log2(1 + 2^-23) is 2.79e-7 on the card, 1.72e-7 in truth) |
+| `MUFU.SIN`, `MUFU.COS` | all, each | absolute error within 3.4e-7 (a quarter turn of arguments at full resolution); the argument (in turns) is cut to 25 fraction bits |
+| `MUFU.TANH` | all | absolute error within 8e-6 (about 130 ulp near 1); the result is the argument below 2^-8 |
+| `MUFU.RCP64H`, `MUFU.RSQ64H` | all, each | the single-precision unit on the upper 20 mantissa bits, cut to 20 bits: the result is not the upper word of the correctly rounded value on 6.9 % of upper words (`RCP64H`, one above) and 5.7 % (`RSQ64H`, one above, rarely one below) |
+
+With each operand modifier (`|Rs|`, `-Rs`, `-|Rs|`) the model was checked on 16,777,216 positive and 16,777,216 negative
+operands (from 0x3f000000 and from 0xbf000000) for `RCP`, `SIN`, `RCP64H`, `RSQ64H` and `TANH` and differs on none: the modifier is applied to the operand's sign bit before the unit,
+for the 64H forms too (the simulator did not apply it to those before).
+
+**Structure.** Every operation is one datapath: the leading bits of the argument select an interval, and the result is
+
+    Y = c0 + c1 * x + c2 * sq19(x)
+
+where `x` is the 17 argument bits below the interval index, `c0`, `c1`, `c2` are the interval's table row, and `Y` is a
+fixed-point number with 40 fraction bits that is *cut* (never rounded) to the result's format. `sq19(x)` is the square of
+`x` as a carry-save array forms it when its low columns are left out: with the partial products of the folded array (bit
+`i` alone at weight 2^(2i); bits `i < j` together at weight 2^(i+j+1)), the sum of those of weight 2^19 or more, shifted
+right by 19. It is not `x * x >> 19`: the products below 2^19 would carry into the kept columns and do not.
+
+The structure, a table of second-degree polynomials indexed by the leading bits of the argument with a truncated squarer
+and a fused accumulation, is the one published by Piñeiro, Oberman, Muller and Bruguera, "High-Speed Function
+Approximation Using a Minimax Quadratic Interpolator", IEEE Transactions on Computers 54(3), 2005. The paper was recalled
+as the hypothesis for the fit and was not re-read for this work; no coefficient, constant, bit width or line of code is
+taken from it or from any other source. Every number in the model (the interval boundaries, the 17 bits, the column 19,
+the 40 fraction bits, each table row, each constant, each special case) was determined from the RTX 3060's results as
+described next.
+
+**How it was fitted** (reproducible from dumps of a few binades an operation; the scripts are not in the tree):
+
+1. *Intervals.* The error against the true function, averaged over 1,024 consecutive mantissas, jumps where the table
+   row changes: at multiples of 2^16 mantissa units for `RCP` (128 intervals of the mantissa), of 2^17 for `RSQ`, `SQRT`,
+   `EX2` and `LG2` (64), with a second half of the table for the odd exponents of `RSQ` and `SQRT`.
+2. *The squarer.* In one interval, "is there a real (c0, c1, c2) with result = floor(c0 + c1 x + c2 T(x)) for every x" is a
+   linear program. It is infeasible for `T(x) = x^2` (by 0.09 ulp), for the square of `x` without its low 2 to 10 bits,
+   and for the folded array cut at every column but one: at column 19 (of a 17-bit `x`) it is feasible, in every interval
+   of every operation.
+3. *The row.* With that `T`, least squares gives c1 and c2 to within a fraction of a unit; they are integers at 2^-40, and
+   for the pair of integers nearest the estimate the set of c0 that reproduce *every* result of the interval is an
+   interval of integers, computed exactly (the largest lower bound and the smallest upper bound over the 2^17 results). It
+   is 2 to 128 units wide and never empty.
+4. *The constant.* The sets of c0 of all intervals of an operation share their low bits: c0 is a table entry with 26
+   significant bits plus one constant an operation, the same for every interval (`RCP` 0x1f9c, `RSQ` 0x7ffe, `SQRT`
+   0x7fff, `EX2` 0x5f88 in units of 2^-17 of the last place; `LG2` 0xd14 in units of 2^-40). Where several constants
+   reproduce everything (four for `RCP`, `EX2` and `LG2`, two for `RSQ`) the smallest is used. `TANH`'s c0 are multiples
+   of 2^-24 with no constant; `SIN`'s rows are multiples of 2^-37 throughout.
+5. *Everything else* (exponent handling, flushing, the special operands, the conversion of a fixed-point result to a float)
+   was read off `--check` runs over all 2^32 operands: each rule below was added because a run printed the operands on which
+   the model without it was not the card.
+
+**The operations.** `m` is the 23-bit mantissa, `e` the exponent. A subnormal operand is read as a zero of its sign and no
+result is subnormal (except in `TANH`); every NaN result is 0x7fffffff.
+
+| Operation | Index and x | Result | Rules found by the full runs |
+|---|---|---|---|
+| `RCP` | `m[22:16]` (128 rows); x = `m[15:0]` doubled | Y >> 17 is the 24-bit significand of 2/m; exponent -e - 1 | below the normal range: zero; a zero operand: infinity |
+| `RSQ` | the exponent's parity, then `m[22:17]` (2 x 64 rows); x = `m[16:0]` | significand of 2/sqrt(m) or 2/sqrt(2m) | 1/sqrt of an even power of two is exact (the polynomial alone gives one ulp less); a negative operand: NaN; -0: -infinity |
+| `SQRT` | as `RSQ` | significand of sqrt(m) or sqrt(2m) | a negative operand: NaN; -0: -0 |
+| `EX2` | the argument's magnitude as a fixed-point number with 23 fraction bits (lower bits dropped): fraction bits [22:17] (64 rows); x = fraction bits [16:0] | significand of 2^fraction; the integer part is the exponent | a negative argument is complemented, not negated: fraction 2^23 - 1 - f and integer -i - 1, unless f is zero (then -i); 128 and above: infinity; below the normal range: zero |
+| `LG2` | `m[22:17]` (64 rows); x = `m[16:0]` | e * 2^36 + (Y >> 4), a fixed-point number with 36 fraction bits, cut to 24 significant bits | a negative value is negated as a one's complement (one unit of 2^-36 short); log2 of exactly 1 is 0 (the polynomial gives 1.07e-7); zero: -infinity; negative: NaN |
+| `SIN`, `COS` | the argument's magnitude in turns, cut to 25 fraction bits; `COS` adds a quarter turn; the top two bits are the quadrant; the other 23 bits `z`, complemented (`2^23 - 1 - z`) in the odd quadrants: `z[22:17]` (64 rows), x = `z[16:0]` | Y (a multiple of 2^-37) cut to 24 significant bits; the sign from the quadrant and, for `SIN`, the argument | 2^24 turns and above: phase 0; sin(-0) is -0 and the sine of a half turn is -0; infinity: NaN |
+| `TANH` | by exponent, for 2^-8 <= abs(x) < 8: 1, 1, 1, 2, 2, 4, 4, 4, 8, 16, 8 rows a binade (51 rows); x = the next 17 mantissa bits; the mantissa bits below are not read | Y cut to 24 significant bits | below 2^-8 the result is the argument itself (a subnormal too); 8 and above: 1 |
+| `RCP64H`, `RSQ64H` | the upper word's 20 mantissa bits as the upper 20 of `m` | the single-precision significand cut to 20 bits, with the double's exponent | the same special operands as `RCP` and `RSQ`; the lower word of the double is not read |
+
+The tables are `include/vgpu/exec/mufu_tables.inc`: 627 rows (128 `RCP`, 128 `RSQ`, 128 `SQRT`, 64 `EX2`, 64 `LG2`, 64
+`SIN`/`COS`, 51 `TANH`), 22 KB of text, generated from the fits. The model is `include/vgpu/exec/mufu_model.hpp`, about 200
+lines with no dependency.
+
+**What a machine without a card holds it to.** `tests/unit/test_mufu_model.cpp` computes the probe's hashes from the model
+and compares them with the card's file: one chunk of 2^26 operands an operation in every run, all 64 chunks of all ten
+operations, which is every operand there is, with `VGPU_EXHAUSTIVE=1`. It also holds the model to the card's results on
+310 listed operands an operation (`nvidia/tests/data/mufu/rtx3060.vectors.txt`).
+
+## The PTX forms
+
+The PTX interpreter computes each approximate form as ptxas (CUDA 13.0; the same code for sm_75, sm_86 and sm_90) expands
+it around the one instruction, read off the SASS of `tools/numerics/mufu_forms.cu`:
+
+| PTX form | What ptxas makes |
+|---|---|
+| `rcp.approx.ftz.f32`, `rsqrt.approx.ftz.f32`, `sqrt.approx.ftz.f32`, `ex2.approx.ftz.f32`, `lg2.approx.ftz.f32`, `tanh.approx.f32` | the instruction alone |
+| `sin.approx.f32`, `cos.approx.f32` (with or without `.ftz`) | `FMUL.RZ x, 0.15915494`, then `MUFU.SIN` / `MUFU.COS` |
+| `rcp.approx.f32` | s = 2^24 where abs(x) is below the smallest normal number, 0.25 where it is above 2^126, else 1: `s * MUFU.RCP(x * s)` |
+| `rsqrt.approx.f32` | abs(x) below the smallest normal number: `MUFU.RSQ(x * 2^24) * 4096` |
+| `sqrt.approx.f32` | the same range: `MUFU.SQRT(x * 2^24) * 2^-12` |
+| `ex2.approx.f32` | x below -126: `MUFU.EX2(x * 0.5)` squared |
+| `lg2.approx.f32` | abs(x) below the smallest normal number: `MUFU.LG2(x * 2^24) + -24` |
+| `rcp.approx.ftz.f64`, `rsqrt.approx.ftz.f64` | `MUFU.RCP64H` / `MUFU.RSQ64H`: upper word in, upper word out |
+| `rsqrt.approx.f64` | `MUFU.RSQ64H` and one correction step; a subnormal scaled by 2^54 |
+| `div.approx.ftz.f32` | `a * MUFU.RCP(b)`, a `.ftz` multiply |
+| `div.approx.f32` | abs(b) below the smallest normal number: both operands times 2^24; then `a * MUFU.RCP(b)` |
+| `div.full.ftz.f32` | abs(b) above 2^126: both operands times 0.25 (`.ftz`); then `a * MUFU.RCP(b)` |
+| `div.full.f32` | both scalings, then `a * MUFU.RCP(b)` |
+
+`mufu_forms` ran on the RTX 3060 over 52 operands a single-precision form (subnormals, the smallest normal numbers, the
+values around 2^126 and -126, zeros, infinities, NaNs, a few ordinary values), 32 a double form and 144 operand pairs a
+division: 1,452 results in `nvidia/tests/data/mufu/rtx3060.forms.txt`. The interpreter gives the card's result on every one
+of them (`test_mufu_model`). `div.full.f32` used to be the exact quotient in the interpreter and `a * rcp(b)` in the SASS
+executor; both are now what the card computes. With `VGPU_MUFU_EXACT=0` it is the exact quotient again.
+
+Not covered: the half-precision forms (`MUFU` with the F16 bit, `*.approx.f16`, `.f16x2`, `.bf16x2`) are the function at
+host precision as before; no card was asked.
+
+## Which devices get the model, and on what evidence
+
+| Devices | Evidence | Word |
+|---|---|---|
+| RTX 3060 (sm_86) | the probe: every operand of every operation; `mathfn`, `mathfn_fast`, the PTX forms, Varity | measured |
+| Tesla T4 (sm_75), L4 (sm_89), A10G (sm_86) | `mathfn` and `mathfn_fast`: 329 + 329 lines of 131,072 results a class identical to the RTX 3060's, with the card's own build and the sm_75 build. The probe did not run on them | measured through the math library; the instruction-level run (`mufu-card-run.sh`) is still to make |
+| every other Turing, Ampere and Ada profile | the same architectures as the four | inferred from the four |
+| Hopper (h100, h200, gh200 and the other sm_90 profiles), Blackwell (sm_100, sm_103, sm_120 profiles) | none: no card of these ran `mathfn` or the probe | **inferred (measured on Turing, Ampere, Ada)** |
+
+The model is not in the profiles: every device gets it. If an H100 or a Blackwell card prints other hashes, the model
+becomes a profile property, as the tensor-core sum is (`numerics.tensor_sum`, matrix-numerics.md).
+
+## The switch
+
+`VGPU_MUFU_EXACT=0` turns the model off in both engines: `MUFU`, the `.approx` forms and `div.full` are then what they
+were in every earlier release (the function in double precision, rounded once; `div.full` the exact quotient), bit for
+bit: with it the simulator prints the 329 + 329 lines pinned before this change. It is read at every launch, like
+`VGPU_TC_EXACT`, and is part of the launch memo's key (as every `VGPU_*` variable that can change a result is). Cost of the
+model: `MUFU.RCP`, `RSQ` and `SQRT` run as scalar integer code a lane where they were an AVX2 kernel a warp; the others
+were scalar libm calls before and are a table lookup and three multiplies now. Counters do not change.
+
 ## What is not done
 
-- No card run. No change to `MUFU` or to the AMD math instructions.
-- The NaN an `erf(double)` of a NaN returns differs between the engines and was not traced.
-- The PTX interpreter mirrors ptxas for the forms listed above, from the SASS of nvcc 13.0 for sm_75 to sm_120. Forms that
-  do not occur in the test set (`rcp.approx.f64` without `.ftz`, `sqrt.approx.f64`, the half-precision forms) are as they
-  were: the function at host precision.
+- Hopper and Blackwell: no card ran `mathfn` or the probe. Their profiles get the model as *inferred*; an H100's
+  `mufu-card-run.sh` output decides it.
+- The probe ran on the RTX 3060 only. The T4, the L4 and the A10G are measured through the math library (329 + 329 lines),
+  not instruction by instruction.
+- The half-precision forms (`MUFU` with the F16 bit; `.approx.f16`, `.f16x2`, `.bf16x2`) are the function at host precision,
+  as they were. No card was asked.
+- The AMD math instructions (`v_rcp_f32`, `v_rsq_f32`, `v_exp_f32`, `v_log_f32`, `v_sin_f32`, `v_cos_f32`) are unchanged,
+  and no AMD card has run any of this.
+- The NaN an `erf(double)` of a NaN returns, and `hypot(double)` of a signaling NaN and a zero, still differ between the
+  engines (three lines of 329). The SASS executor's is the card's; the PTX interpreter's instruction was not traced.
+- The PTX interpreter mirrors ptxas for the forms listed under "The PTX forms", from the SASS of nvcc 13.0 for sm_75, sm_86
+  and sm_90 (the float instructions of the three are the same; sm_100 and sm_120 code was not compared for these forms).
+  `rcp.approx.f64` without `.ftz` and `sqrt.approx.f64` are not accepted by ptxas 13.0 and stay as they were.
+- How the card's own driver compiles a PTX module at run time (`cuModuleLoadData` of PTX text) was not compared with what
+  nvcc's ptxas makes; the expansions are nvcc's.
+- Speed: the cost of the model in a whole program was not measured.
 - Xscope was not run and its paper not read. The Bessel functions of the accuracy paper are not in `mathfn`.
 - The AMD lines have no test in CI (it has no hipcc); they were run by hand. The NVIDIA lines do (`e2e_numerics_mathfn`).
 
 ## Tests
 
-- `e2e_numerics_mathfn` (`nvidia/tests/e2e/run_numerics_mathfn.sh`): the simulator's lines pinned
-  (`nvidia/tests/data/numerics_*.txt`: its own bits, not a card's), PTX against SASS line by line with the listed
-  exceptions, four profiles and two cubin architectures against the same pins, `fp_examples`' documented answers,
-  `compare.py` on a doctored copy.
-- `test_ptx_approx_forms`: each expansion, on inputs where it differs from the function at host precision.
+- `test_mufu_model` (`tests/unit/test_mufu_model.cpp`; no card, no compiler): the model on the card's 3,100 vectors and on
+  the card's hashes (a chunk of 2^26 operands an operation; every operand with `VGPU_EXHAUSTIVE=1`); `sq19` against its
+  definition for every `x`; the SASS executor on the vectors, running the probe's own kernel (the cubin nvcc made, with
+  `MUFU` rewritten as the probe rewrites it) through the fast path, the general path and with the operand modifiers; the
+  probe's hash kernel on the SASS executor; the PTX interpreter on the vectors and on the card's 1,452 results of the PTX
+  forms; `VGPU_MUFU_EXACT=0` in both engines.
+- `e2e_numerics_mathfn` (`nvidia/tests/e2e/run_numerics_mathfn.sh`): the cards' lines pinned
+  (`nvidia/tests/data/numerics_mathfn.txt`, `numerics_mathfn_fast.txt`: an RTX 3060's since 2026-11-15, the simulator's own
+  bits before), from four SASS runs (two profiles of each of two architectures); PTX against SASS line by line with the
+  listed exceptions; `fp_examples`' documented answers; `compare.py` on a doctored copy; with `VGPU_MUFU_EXACT=0`, 66 and
+  104 lines are not the card's, as before the model.
+- `test_ptx_approx_forms`: each expansion, on inputs where it differs from the function at host precision; the
+  single-precision values are the card's now.
 - `test_amd_hipcc_scratch_flat`: the wave32 stack slot.
 - Mutants: [mathfn/mutants.txt](mathfn/mutants.txt). The before-and-after counts of the engines:
-  [mathfn/engines.txt](mathfn/engines.txt). The simulator against the published figures, every row:
+  [mathfn/engines.txt](mathfn/engines.txt). The simulator against the published figures, every row (before the model):
   [mathfn/published-vs-simulator.txt](mathfn/published-vs-simulator.txt).
+
+### Pinned files the model changed
+
+Every one was re-recorded from a card run, not from the simulator, and says so in its header:
+
+| File | What changed | Re-recorded from |
+|---|---|---|
+| `nvidia/tests/data/numerics_mathfn.txt` | 66 of 329 lines (the functions listed under "The card runs") | an RTX 3060's `mathfn --n 4096` (sm_86 build) |
+| `nvidia/tests/data/numerics_mathfn_fast.txt` | 104 of 329 lines | an RTX 3060's `mathfn_fast --n 4096` |
+| `tests/unit/test_ptx_approx_forms.cpp` | 10 expected values of `ex2.approx.f32` (2), `lg2.approx.f32` (1), `sin.approx` (5) and `cos.approx.ftz.f32` (2): nine in their last bits, the cosine of 3e18 altogether | the same instructions and operands on an RTX 3060 (`mufu_forms.cu`'s kernels) |
+| `tests/unit/test_exec3.cpp` | 1 expected value: `div.full.f32` of 0x3cae08fc by 0x41e66e7d is 0x3a415888 (`a * MUFU.RCP(b)`), was the exact quotient 0x3a415887 | the same instruction on an RTX 3060 |
+
+Run and unchanged (they pass as they are, with the model on): every other unit test of the PTX interpreter, the SASS executor,
+the tier, the JIT, the SIMD kernels, the memo and the host-GPU logic (129 test programs), and the e2e tests whose programs
+use these instructions: `e2e_simd_lane_forms`, `e2e_float_half_forms`, `e2e_round9_probe` (their card lines), `e2e_ptx_sweep`,
+`e2e_div_approx`, `e2e_sass_tier`, `e2e_sass_fastpath`, `e2e_host_gpu_stub`, and `e2e_sass_archs` (every e2e program built for
+ten architectures, each run from its SASS and from its PTX, which must print the same: 300 program and architecture pairs
+agree; its one failure on the build machine, `runtime_conformance` for sm_75, is two driver-entry checks of a partial build
+without the driver shim and fails the same way with `VGPU_MUFU_EXACT=0`). `numerics_cases.txt` did not change (the cards
+print it); `numerics_engines.txt` changed in its comment only. The rest of the e2e suite (it needs nvcc on the build machine)
+was not run for this change: CI is the check, and `VGPU_MUFU_EXACT=0` shows whether a difference is this change's.

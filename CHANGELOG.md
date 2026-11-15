@@ -7,12 +7,42 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **The approximate math instructions give a real card's bits** (issue #664). `MUFU` (SASS) and the PTX `.approx` forms
+  were the function at the host's precision, rounded once; a card computes them in a small fixed-point unit, and its
+  results differ in the last bit on 13 to 39 % of arguments (`RCP`, `RSQ`, `SQRT`, `EX2`), by an absolute error of a few
+  1e-7 (`LG2`, `SIN`, `COS`) or by up to about 130 ulp (`TANH`). The unit of an RTX 3060 was measured over all 2^32
+  operands of each of the ten sub-operations (`tools/numerics/mufu_probe.cu`) and a model fitted that reproduces every one
+  of them: 4,294,967,296 of 4,294,967,296 for `COS`, `SIN`, `EX2`, `LG2`, `RCP`, `RSQ`, `RCP64H`, `RSQ64H`, `SQRT` and `TANH`
+  (`include/vgpu/exec/mufu_model.hpp`; [docs/numerics/math-functions.md](docs/numerics/math-functions.md) has the
+  measurements, the model and its evidence). Both engines use it; the PTX interpreter forms each `.approx` instruction and
+  `div.full.f32` as ptxas expands it around the one instruction.
+  - **This changes the results of existing programs**, which is the point: any kernel that calls `expf`, `powf`, `tanhf`,
+    `rsqrtf`, `cbrt` and the other library functions built on these instructions, or is built with `-use_fast_math`, now
+    prints the card's last bits. On the math-function test set (`tools/numerics/mathfn`, 329 lines a build) the SASS executor
+    printed the card's line on 263 lines of the default build and 225 of the `-use_fast_math` build; it prints it on all
+    329 and all 329 (an RTX 3060, a Tesla T4, an L4 and an A10G print identical lines). Programs that only add, multiply,
+    divide (`/` without fast math) and take `sqrtf` are unchanged: those are IEEE operations on the card and here.
+    Counters do not change.
+  - **`VGPU_MUFU_EXACT=0` gives the earlier results**, bit for bit (the function at host precision; `div.full` the exact
+    quotient). Read at every launch.
+  - Measured: RTX 3060 (every operand), and through the math library a Tesla T4, an L4 and an A10G. **Hopper and Blackwell
+    cards were not measured**: their profiles get the same model, inferred (measured on Turing, Ampere, Ada).
+    `tools/numerics/mufu-card-run.sh` is the run to make on one: all ten operations over all inputs as hashes, compared with
+    the RTX 3060's (`tools/numerics/mufu/rtx3060.hashes.txt`), in seconds.
+  - Also measured and now followed: the `|x|` and `-x` operand modifiers of `MUFU.RCP64H` and `MUFU.RSQ64H` apply to the
+    upper word's sign (the SASS executor ignored them on those two forms).
+  - Pinned test files that changed, each re-recorded from a card and saying so in its header:
+    `nvidia/tests/data/numerics_mathfn.txt` and `numerics_mathfn_fast.txt` (now an RTX 3060's lines; 66 and 104 lines
+    changed), ten expected values of `tests/unit/test_ptx_approx_forms.cpp` and one of `tests/unit/test_exec3.cpp`
+    (`div.full.f32`, which was the exact quotient in the PTX interpreter and is `a * MUFU.RCP(b)` on the card). The card
+    lines of `e2e_simd_lane_forms`, `e2e_float_half_forms` and `e2e_round9_probe` did not change.
+  - Not modelled: the half-precision forms (`MUFU` with the F16 bit, `.approx.f16`), and AMD's math instructions.
 - Math functions (issue #664, second group): a test set that compares a run of the math library with another run line by
   line, simulator against simulator or against a card (`tools/numerics/`: 44 functions in both precisions over published
   worst cases, edges and random arguments; the worked examples of NVIDIA's floating-point paper; the Varity GPU paper's
   cases and generator), a card script (`tools/numerics/card-run.sh`) and what the published results say a card gives where
   the simulator gives something else ([docs/numerics/math-functions.md](docs/numerics/math-functions.md)). No card was run
-  and `MUFU` is unchanged. Two things it found change results:
+  for this step and it left `MUFU` unchanged (the entry above is the card runs and the change). Two things it found change results:
   - **A program run from its PTX now gives the bits it gives from its SASS** in the math library. The PTX interpreter
     computed `sin.approx`, `cos.approx`, `ex2.approx` and `lg2.approx` without `.ftz`, `rcp.approx.ftz.f64`,
     `rsqrt.approx.ftz.f64` and `rsqrt.approx.f64` as the function at host precision; ptxas makes other code of each, and
