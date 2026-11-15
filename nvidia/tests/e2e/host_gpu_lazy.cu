@@ -25,6 +25,11 @@
 // which only a block stopped at a limit can time, and on the 96 blocks a grid too small for the sample of whole blocks whose kernel has no
 // loop the sample inside the blocks follows. `slownone` and `slowfewnone` are the two with no launch. They print a hash of the memory and, on
 // stderr, how long the launch took ("first_launch_ms=").
+// `two` (Round sp76, steps 41 to 44) launches `scramble` and then `scrambles`, once each on 256 blocks with the rounds of `slow`, beside 64 MiB
+// that no kernel touches: the second kernel's first launch comes when the first has started the driver, and its blocks outlast the wait as the
+// first's do. `twoshort` gives the second kernel two rounds (a launch far too short for the card path of 64 MiB), `twob` and `twoshortb`
+// launch the second kernel alone and `twonone` launches nothing: what a card that computes nothing must leave when it is sent both launches, the
+// first only, or the first with the short second in the simulator. They print a hash of the memory.
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -232,8 +237,39 @@ static int slow_program(int blocks, bool launch, bool stepped) {
   return 0;
 }
 
+static int two_program(bool first, bool second, bool second_short) {
+  const char* r = std::getenv("HOST_GPU_LAZY_ROUNDS");
+  const int rounds = r && *r ? std::atoi(r) : 1 << 17;
+  const int blocks = 256, n = blocks * 256;
+  void *d = nullptr, *side = nullptr;
+  cudaMalloc(&d, n * 4);
+  cudaMemset(d, 1, n * 4);
+  cudaMalloc(&side, 64 << 20);
+  cudaMemset(side, 2, 64 << 20);
+  if (first) scramble<<<blocks, 256>>>(static_cast<uint32_t*>(d), n, rounds);
+  cudaDeviceSynchronize();
+  if (second) scrambles<<<blocks, 256>>>(static_cast<uint32_t*>(d), n, second_short ? 2 : rounds, 1);
+  cudaDeviceSynchronize();
+  std::vector<unsigned char> back(n * 4);
+  cudaMemcpy(back.data(), d, n * 4, cudaMemcpyDeviceToHost);
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char b : back) h = (h ^ b) * 0x100000001b3ull;
+  std::vector<unsigned char> s(64 << 20);
+  cudaMemcpy(s.data(), side, s.size(), cudaMemcpyDeviceToHost);
+  for (size_t i = 0; i < s.size(); i += 4096) h = (h ^ s[i]) * 0x100000001b3ull;
+  std::printf("two kernels: %016llx\n", static_cast<unsigned long long>(h));
+  cudaFree(side);
+  cudaFree(d);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "big";
+  if (!std::strcmp(mode, "two")) return two_program(true, true, false);
+  if (!std::strcmp(mode, "twoshort")) return two_program(true, true, true);
+  if (!std::strcmp(mode, "twob")) return two_program(false, true, false);
+  if (!std::strcmp(mode, "twoshortb")) return two_program(false, true, true);
+  if (!std::strcmp(mode, "twonone")) return two_program(false, false, false);
   if (!std::strcmp(mode, "slow") || !std::strcmp(mode, "slownone")) return slow_program(256, !std::strcmp(mode, "slow"), false);
   if (!std::strcmp(mode, "slowfew") || !std::strcmp(mode, "slowfewnone")) return slow_program(96, !std::strcmp(mode, "slowfew"), true);
   if (!std::strcmp(mode, "many")) return many_program(400);

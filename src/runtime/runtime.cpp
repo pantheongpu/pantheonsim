@@ -1272,7 +1272,8 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
       run.part.block_limit_s = plan.block_limit_s;   // (bounded blocks, Round sp75: the copy's LaunchPart takes these three from here)
       run.part.block_cap_s = plan.block_cap_s;
       run.part.need_s = plan.need_s;
-      run.answered = sample_in_copy(fn, cfg, args, syms, plan.limit, plan.stride, plan.budget_s, plan.timeout_s, plan.probe, &run.part, &run.wall_s, &run.fork_s);
+      run.answered = sample_in_copy(fn, cfg, args, syms, plan.limit, plan.stride, plan.budget_s, plan.timeout_s, plan.probe, &run.part, &run.wall_s, &run.fork_s,
+                                    run.driver_started_at_fork ? hg : nullptr);
       if (hg->sample_decide(fn, cfg, args, mem_, run)) {
         if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(physical_), 0.0);
         digest_launch(mem_, fn.name, args);
@@ -1393,7 +1394,7 @@ size_t reap_sample_copies(bool wait) {
 
 bool Device::sample_in_copy(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, const std::vector<std::vector<uint8_t>>& args,
                             const exec::SymbolTable* syms, uint64_t limit, uint64_t stride, double budget_s, double timeout_s, const exec::BlockProbe* probe,
-                            exec::LaunchPart* out, double* wall_s, double* fork_s) {
+                            exec::LaunchPart* out, double* wall_s, double* fork_s, hostgpu::Runtime* driver_up) {
   *wall_s = *fork_s = 0;
   // Copies that answered are not waited for (a process takes a millisecond to be torn down): they are reaped at the next sample, and the mode's
   // exit handler waits for the ones still there (reap_sample_copies), so the process leaves no child behind.
@@ -1423,6 +1424,9 @@ bool Device::sample_in_copy(const ptx::EntryFn& fn, const exec::LaunchConfig& cf
   }
   if (pid == 0) {
     exec::g_sample_copy.store(true, std::memory_order_relaxed);
+    // The driver is up in the process this is a copy of (Round sp76): the copy takes every chunk as its own before it runs a block, and ends
+    // here, with no answer, if it cannot (vgpu/host_gpu_rt.hpp sample_copy_begin). It never calls the driver.
+    if (driver_up && !driver_up->sample_copy_begin()) _exit(5);
     int status = 3;
     try {
       exec::LaunchPart part;
@@ -1480,7 +1484,8 @@ bool Device::sample_in_copy(const ptx::EntryFn& fn, const exec::LaunchConfig& cf
     kill(pid, SIGKILL);
     int st = 0;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-    // (what became of it, for the log: 3 is a launch that threw in the copy, 9 a copy that was ended for not answering)
+    // (what became of it, for the log: 3 is a launch that threw in the copy, 9 a copy that was ended for not answering, 5 a copy of a process
+    // with the driver up that found a chunk only the card held)
     out->next = WIFEXITED(st) ? static_cast<uint64_t>(WEXITSTATUS(st)) : WIFSIGNALED(st) ? static_cast<uint64_t>(WTERMSIG(st)) : 0;
   } else if (waitpid(pid, nullptr, WNOHANG) == 0) {
     std::lock_guard<std::mutex> g(g_copies_mu);

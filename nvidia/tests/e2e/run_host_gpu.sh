@@ -25,6 +25,13 @@
 # The idioms of exact mode (Round sp68):
 #  12. with VGPU_HOST_GPU_SQRT=1 (and VGPU_HOST_GPU_DIV=1) the sqrtf kernel and the sqrtf-then-division kernel of host_gpu_lazy.cu (inputs on both paths of
 #      sqrtf, negatives among them) run on the card, verify finds every launch identical, and the output is the mode-off output to the byte.
+# A sample once the driver is up (Round sp76; the fork of a process that holds the real driver, which no stand-in can show):
+#  13. `two` of host_gpu_lazy.cu launches two kernels once each, on blocks that outlast the wait, beside 64 MiB no kernel touches. Both are
+#      sampled and sent, the second with the driver up (after_driver=1: what only the card held is pulled, the process is forked, the copy
+#      answers), the card runs both, no copy is left, and the output is the mode-off output to the byte; `twoshort`, whose second kernel
+#      is short, is sampled with the driver up and kept, and the simulator runs it on what the card computed; with
+#      VGPU_HOST_GPU_SAMPLE_STARTED=0 the second kernel is not sampled. Each run ends with the driver still usable (the launches after
+#      the fork ran, the memory came back).
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -166,5 +173,31 @@ for arg in sqrt sqrtdiv; do
   grep -q '^host_gpu_verify: in_set_identical=[1-9][0-9]* in_set_different=0 ' "$work/sq_${arg}_1.err" \
     || { echo "FAIL: verify of $arg: $(grep '^host_gpu_verify' "$work/sq_${arg}_1.err")"; fails=1; }
 done
-(( fails == 0 )) && { echo "PASS: $sum; turbo: $rline; turbo verify: $vline; module variables, printf, textures and calls into another section on the card; the square root idiom on the card"; exit 0; }
+# 13. a sample once the driver is up (Round sp76): the process is forked while it holds the real driver.
+up=(VGPU_HOST_GPU=exact VGPU_HOST_GPU_SAMPLE=always VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=0)
+up_field() { sed -n "s/^host_gpu_sampled:.* $2=\\([0-9]*\\).*/\\1/p" "$work/$1.err" | head -1; }
+up_card() { sed -n 's/^host_gpu: \([0-9]*\) launches ran on the card.*/\1/p' "$work/$1.err" | tail -1; }
+for arg in two twoshort; do
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/lazy" "$arg" > "$work/up_off_$arg.out" 2> /dev/null || { echo "FAIL: the $arg run with the mode off failed"; fails=1; }
+done
+for try in 1 2 3; do   # (a copy that is not given its 30 ms of processor in time does not answer: tried again, as in the stand-in test)
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "${up[@]}" "$work/lazy" two > "$work/up_two.out" 2> "$work/up_two.err" || { echo "FAIL: the run of two failed"; tail -5 "$work/up_two.err"; fails=1; }
+  [[ "$(up_field up_two timeouts)" == 0 ]] && break
+done
+[[ "$(up_field up_two sampled)" == 2 && "$(up_field up_two sent)" == 2 && "$(up_field up_two after_driver)" == 1 && "$(up_card up_two)" == 2 ]] \
+  || { echo "FAIL: two: expected two samples, the second with the driver up, and both launches on the card: $(grep -E '^host_gpu_sampled|^host_gpu: [0-9]* launches|host_gpu_nosample' "$work/up_two.err" | head -3)"; fails=1; }
+[[ "$(up_field up_two copies_left)" == 0 ]] || { echo "FAIL: two: a sample's copy was left: $(grep '^host_gpu_sampled' "$work/up_two.err")"; fails=1; }
+cmp -s "$work/up_off_two.out" "$work/up_two.out" || { echo "FAIL: a sample taken with the driver up changes the output of two on the card"; fails=1; }
+for try in 1 2 3; do
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "${up[@]}" "$work/lazy" twoshort > "$work/up_short.out" 2> "$work/up_short.err" || { echo "FAIL: the run of twoshort failed"; tail -5 "$work/up_short.err"; fails=1; }
+  [[ "$(up_field up_short timeouts)" == 0 ]] && break
+done
+[[ "$(up_field up_short sampled)" == 2 && "$(up_field up_short sent)" == 1 && "$(up_field up_short after_driver)" == 1 && "$(up_card up_short)" == 1 ]] \
+  || { echo "FAIL: twoshort: expected two samples, the second with the driver up and kept: $(grep -E '^host_gpu_sampled|^host_gpu: [0-9]* launches' "$work/up_short.err" | head -2)"; fails=1; }
+cmp -s "$work/up_off_twoshort.out" "$work/up_short.out" || { echo "FAIL: a launch sampled with the driver up and kept changes the output of twoshort on the card"; fails=1; }
+env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "${up[@]}" VGPU_HOST_GPU_SAMPLE_STARTED=0 "$work/lazy" two > "$work/up_old.out" 2> "$work/up_old.err" || { echo "FAIL: the run of two with VGPU_HOST_GPU_SAMPLE_STARTED=0 failed"; fails=1; }
+[[ "$(up_field up_old after_driver)" == 0 ]] && grep -q '^host_gpu_nosample: .*reason=the driver has been started' "$work/up_old.err" \
+  || { echo "FAIL: two with VGPU_HOST_GPU_SAMPLE_STARTED=0 was sampled with the driver up: $(grep '^host_gpu_sampled' "$work/up_old.err")"; fails=1; }
+cmp -s "$work/up_off_two.out" "$work/up_old.out" || { echo "FAIL: VGPU_HOST_GPU_SAMPLE_STARTED=0 changes the output of two on the card"; fails=1; }
+(( fails == 0 )) && { echo "PASS: $sum; turbo: $rline; turbo verify: $vline; module variables, printf, textures and calls into another section on the card; the square root idiom on the card; a sample with the driver up: $(grep '^host_gpu_sampled' "$work/up_two.err")"; exit 0; }
 exit 1
