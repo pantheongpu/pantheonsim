@@ -1659,7 +1659,7 @@ vgpu_unit_test(test_launch_fp_traps)
 vgpu_unit_test(test_simd)
 # An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.
 vgpu_unit_test(test_tc_ampere)
-# The vector kernels of that sum against a frozen copy of the earlier form, bit for bit, over random and adversarial operands.
+# The vector kernels of that sum against its scalar form, bit for bit, over random and adversarial operands (on the tiles the dispatcher gives them).
 vgpu_unit_test(test_tc_ampere_fast)
 # IMMA.16816 / 16832 (8-bit operands) straight from the registers (include/vgpu/exec/imma_frag.hpp) against the definition, every sign combination.
 vgpu_unit_test(test_imma_frag)

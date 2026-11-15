@@ -1,6 +1,7 @@
 // The tensor-core sum's vector kernels (include/vgpu/exec/tc_ampere.hpp) against the scalar form of the rule in the same header
-// (mma_scalar; until the four corners of the subnormal range were added to the rule, the oracle was the FROZEN earlier header,
-// tests/unit/tc86_v0.hpp, which this file still includes for the kernels' layout checks; the scalar rule is held to cards and to an
+// (mma_scalar). Until the four corners of the subnormal range were added to the rule the oracle was the FROZEN earlier header,
+// tests/unit/tc86_v0.hpp, which has the rule without them; it is still compiled here (so that it keeps building) but no check uses
+// it, and "the frozen form" in the comments and test names below now reads "the scalar rule" (held to cards and to an
 // independent form by test_tc_ampere): bit for bit, on every tile the dispatcher hands a vector kernel, over every shape and type the engines use, with
 // random operands over wide and narrow exponent ranges and a set of adversarial ones (zeros of both signs, subnormals, infinities and
 // NaNs, the largest finite values, powers of two, cancelling pairs, one huge term among tiny ones, accumulators at, above and below the
