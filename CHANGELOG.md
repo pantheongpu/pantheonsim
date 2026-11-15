@@ -7,6 +7,18 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- AMD engine, the tier's handlers for double-precision and 64-bit integer instructions ([round sp74](docs/perf-design/rounds/11-rounds-sp36-sp41.md),
+  [design](docs/perf-design/13-amd-compiled-tier.md), section 13). On hosts with AVX2, with `VGPU_AMD_BLOCKS` off or on:
+  - `v_min_f64` and `v_max_f64`, `v_rcp_f64`, `v_sqrt_f64` and the rounding instructions, the 64-bit comparisons (`v_cmp_*_f64`, `_i64`,
+    `_u64`), `v_lshlrev_b64`, `v_lshrrev_b64`, `v_lshl_add_u64`, the conversions between doubles and 32-bit values, `v_frexp_*_f64` and
+    `v_ldexp_f64` work on the register pairs' rows instead of gathering them into 64-bit lanes; the SDWA forms of the integer instructions
+    work on whole rows. Results are the same bits, a NaN's, a signed zero's and a denormal's included: a lane the row form does not do
+    sends the instruction to the handler it had.
+  - `v_add_f64`, `v_mul_f64` and `v_fma_f64` in a wave with lanes off run only the groups of lanes that are on.
+  - The AMD benchmark's double-precision probe (p_f64x) runs 2.4 times (MI300X) and 2.1 times (RX 6800) as fast, p_sdwa 1.8 and 1.5,
+    its 62 kernel rows 1.06 in the geometric mean (1.18 with `VGPU_AMD_BLOCKS=1`); no row is more than 3 % slower beyond a control with
+    no change. inq's unit tests on a simulated MI300X: eigensolvers::steepest_descent uses 18 % less CPU, ground_state::initial_guess
+    12 %, systems::electrons 7 %, solvers::poisson 4 to 5 %; none is slower.
 - AMD engine, blocks (`VGPU_AMD_BLOCKS=1`, still off by default), second round ([round sp73](docs/perf-design/rounds/11-rounds-sp36-sp41.md),
   [design](docs/perf-design/13-amd-compiled-tier.md)):
   - **Fixed**: the first form of blocks made the interpreter slower with the knob off. `v_fma_f64` loops (the bench's valu_f64) ran 13 %
