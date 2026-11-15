@@ -76,6 +76,7 @@ jobs:
           VGPU_ROCBLAS_FROM_WHEEL: "1"
           VGPU_LIBRARIES_FROM_WHEEL: "1"
         run: |
+          set -o pipefail
           ctest --test-dir build --output-on-failure --timeout 1800 \
             -R '^amd_(pytorch.*|rocblas|hipsparselt.*|libraries)$' 2>&1 | tee ctest.log
           if grep -q 'Skipped' ctest.log; then echo "a test skipped: something it needs is missing"; exit 1; fi
@@ -113,12 +114,14 @@ jobs:
       - name: OpenMP target offloading
         # A skip fails the job: an LLVM that did not unpack is a red job.
         run: |
+          set -o pipefail
           VGPU_ROCM_PATH="$HOME/rocm-llvm/opt/rocm-7.1.0" \
             ctest --test-dir build --output-on-failure --timeout 1800 -R '^amd_openmp$' 2>&1 | tee ctest.log
           if grep -q 'Skipped' ctest.log; then echo "the test skipped: something it needs is missing"; exit 1; fi
 
       - name: OpenCL
         run: |
+          set -o pipefail
           VGPU_ROCM_PATH="$HOME/rocm-opencl/opt/rocm-7.1.0" \
             ctest --test-dir build --output-on-failure --timeout 1800 -R '^amd_opencl$' 2>&1 | tee ctest.log
           if grep -q 'Skipped' ctest.log; then echo "the test skipped: something it needs is missing"; exit 1; fi

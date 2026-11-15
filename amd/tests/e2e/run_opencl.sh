@@ -43,7 +43,9 @@ if command -v objdump >/dev/null; then
   preload=$(objdump -p "$shim/libhsa-runtime64.so.1" 2>/dev/null | awk '/NEEDED/ && /lib(asan|tsan)\.so/ {print $2}')
 fi
 
-cases="amd/mi300x amd/mi250x amd/mi350x amd/mi455x amd/rx7900xtx amd/rx9070xt amd/rx6900xt amd/rx6800 amd/rx6700xt"
+# amd/mi455x (gfx1250) is not here: the installed ROCm OpenCL runtime (7.1.0) answers "Unsupported HSA device gfx1250"
+# and drops it, whatever the simulator offers (#651). Set VGPU_OPENCL_GPUS=amd/mi455x to see it.
+cases="amd/mi300x amd/mi250x amd/mi350x amd/rx7900xtx amd/rx9070xt amd/rx6900xt amd/rx6800 amd/rx6700xt"
 [[ -n "${VGPU_OPENCL_GPUS:-}" ]] && cases="$VGPU_OPENCL_GPUS"
 for gpu in $cases; do
   out=$(LD_PRELOAD="$preload" VGPU_QUIET=1 VGPU_GPU="$gpu" VGPU_DEVICE_COUNT=2 OCL_ICD_VENDORS="$tmp/vendors" \
