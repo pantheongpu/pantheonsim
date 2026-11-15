@@ -1244,7 +1244,9 @@ inline double bound_turns(int64_t bound, int64_t step) {
 // tensor-core GEMMs: 3,592 to 9,088 instructions, 80 or 160 blocks, 46 to 116 ms counted and 5 to 83 s taken on server3), the kernels that are
 // written to loop over their work inside each block; and the term for the page faults after the fork (sample_static_floor), which is fitted
 // to a program that writes all its memory again, asked 0.36 to 1.45 s of them (192 to 768 MiB live), which their one loop's body does not
-// count to. No other small grid of the corpus without a followed loop counts over 10 ms (data/sp75/), so none of them is sampled.
+// count to. In the corpus (data/sp75/census.md) the small grids without a followed loop that count 30 ms are the four tensor GEMMs of the CUDA
+// Samples and one sort pass of radixSortThrust (161 blocks, 83 ms; its blocks take turns, so the copy runs none of them and the sample is the
+// fork alone); the next counts 19 ms (HeCBench aop) and the 89 others under 10 ms, so none of those is sampled by the floor.
 inline double sample_floor(const SampleCandidate& w) {
   return sample_bounded_small(w) ? kSampleStaticFloorSeconds : sample_static_floor(w.live_bytes);
 }
