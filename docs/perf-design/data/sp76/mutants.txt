@@ -1,0 +1,39 @@
+Round sp76: mutants (server3)
+
+== mutants.py: one header changed, tests/unit/test_host_gpu_logic.cpp must fail (the test named is the first that failed); the round's final tree
+ 0 killed by a_launch_is_sampled_with_the_driver_up_and_never_under_the_rule_before: allowed: a driver that failed is not asked
+ 1 killed by a_launch_is_sampled_with_the_driver_up_and_never_under_the_rule_before: allowed: before the start by the switch
+ 2 killed by a_launch_is_sampled_with_the_driver_up_and_never_under_the_rule_before: allowed: never with the driver up (the rule before)
+ 3 killed by a_launch_is_sampled_with_the_driver_up_and_never_under_the_rule_before: allowed: the switch not asked
+ 4 killed by a_launch_is_sampled_with_the_driver_up_and_never_under_the_rule_before: allowed: a start that is not ready
+ 5 killed by a_launch_is_sampled_with_the_driver_up_and_never_under_the_rule_before: allowed: always
+ 6 killed by with_the_driver_up_a_launch_that_may_be_sampled_has_no_start_to_repay (and others): card path: the start charged with the driver up
+ 7 killed by with_the_driver_up_a_launch_that_may_be_sampled_has_no_start_to_repay (and others): card path: the start never charged
+ 8 killed by with_the_driver_up_a_launch_that_may_be_sampled_has_no_start_to_repay: card path: a negative start cost is a credit
+ 9 killed by with_the_driver_up_a_launch_that_may_be_sampled_has_no_start_to_repay (and others): card path: the memory one way
+10 killed by with_the_driver_up_a_kernel_is_sampled_again_only_if_its_whole_launch_reached_the_floor (and others): short before: the floor never asked
+11 killed by with_the_driver_up_a_kernel_is_sampled_again_only_if_its_whole_launch_reached_the_floor: short before: the floor asked before the start too
+12 killed by with_the_driver_up_a_kernel_is_sampled_again_only_if_its_whole_launch_reached_the_floor: short before: the floor alone with the driver up
+13 killed by sampling_is_not_repeated_for_a_kernel_whose_whole_launch_was_short (and others): short before: the margin not applied
+14 killed by with_the_driver_up_a_kernel_is_sampled_again_only_if_its_whole_launch_reached_the_floor (and others): short before: 30 ms whatever the live memory
+15 killed by sampling_is_not_repeated_for_a_kernel_whose_whole_launch_was_short (and others): short before: a launch at the bar is sampled
+16 killed by with_the_driver_up_a_whole_launch_over_the_floor_stands_in_for_the_static_count: floor: the whole launch never stands in
+17 killed by the_reasons_a_launch_is_not_sampled_are_the_rule_itself (and others): floor: the whole launch stands in before the start too
+18 killed by with_the_driver_up_a_whole_launch_over_the_floor_stands_in_for_the_static_count: floor: the whole launch in the count's place even when it is under it
+19 killed by with_the_driver_up_a_whole_launch_over_the_floor_stands_in_for_the_static_count: floor: the rule asks the count alone
+20 killed by sampling_is_not_repeated_for_a_kernel_whose_whole_launch_was_short (and others): short before: not asked
+21 of 21 killed
+
+== e2e-mutants.sh: one file of the runtime changed, nvidia/tests/e2e/run_host_gpu_stub.sh (profile nvidia/a10g) must fail; each mutant in a copy of the tree with a build of its own (the first on the tree before the measured launch stood in for the count at the floor, which none of the five touches; the other four on the final tree)
+0 killed by e2e_host_gpu_stub (first: FAIL: two: expected two samples, the second with the driver up, and both lau ...): mode: no launch is a candidate for a sample once the driver has been started (the rule before)
+1 killed by e2e_host_gpu_stub (first: FAIL: two: expected two samples, the second with the driver up, and both lau ...): mode: the fork is refused once the driver has been started
+2 killed by e2e_host_gpu_stub (first: FAIL: two with VGPU_HOST_GPU_SAMPLE_STARTED=0: expected one sample and one l ...): mode: VGPU_HOST_GPU_SAMPLE_STARTED=0 not read
+3 killed by e2e_host_gpu_stub (first: FAIL: two: expected two samples, the second with the driver up, and both lau ...): mode: nothing is pulled before the fork
+4 killed by e2e_host_gpu_stub (first: FAIL: two: expected two samples, the second with the driver up, and both lau ...): mode: the pull before the fork leaves the chunks the card's alone
+5 of 5 killed
+
+== the stand-in test on the round's final build
+nvidia/a10g:    PASS: first launch 10 ms against a driver start of 2000 ms; many launches of 2132 us started the driver after 200 of them
+nvidia/rtx3060 (the build before the last header change): PASS: first launch 15 ms against a driver start of 2000 ms; many launches of 2709 us started the driver after 200 of them
+
+== test_host_gpu_logic on the final build: 119/119 tests passed; hostgpu_bench_selftest (run.py --dry-run): PASS: 0 checks failed

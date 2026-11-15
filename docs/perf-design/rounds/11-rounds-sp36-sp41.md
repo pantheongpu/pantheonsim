@@ -5398,3 +5398,210 @@ script that runs the stand-in test against mutants kept the object of the mutant
 **Cleanup.** The round's directory on server3 (`/tmp/sp75-turbo`: three builds, the corpus, the copied compiler part of the toolkit, the
 mutant trees, logs; 2.0 GB) and one scratch directory a stopped run left (`/tmp/same-j22z2l1o`) were removed by exact path; the disk is back
 at 8.2 GB free. Round sp69's directory was read (how it built) and not changed.
+
+## Round sp76 (host-GPU: a kernel's first launch once the driver is up)
+
+Branch `sp76-turbo-driver-up`, on the head of PR #669 (Round sp75 and its card run). Tracking: pantheonsim #657 (HeCBench aidw: one launch of
+four still simulated, 149 s of 193 s) and #659 (the first launches of kernels a program launches after its driver start), with Rodinia
+particlefilter_float (unsettled in Round sp75's card run), #662 (HeCBench silu: the start bought late) and the rest of #656 (the launches
+under the sampling floor in a young process) measured and not changed. Design: [12-host-gpu-turbo.md](../12-host-gpu-turbo.md), section 13.
+Data and commands: [`data/sp76/`](../data/sp76/README.md). **Everything below is server3 with the stand-in driver. The round had no card:
+no win is measured, and whether a process that holds the real driver can be forked is the first thing `data/sp76/card-run.sh` asks a card.**
+
+**The question.** Round sp75's card run sent aidw's first kernel on a block stopped at its limit and left the first launch of its second
+kernel, `AIDW_Kernel_Tiled`, in the simulator: `host_gpu_nosample: ... blocks=400 threads_per_block=256 instrs=2624 loop=1 reason=the driver
+has been started`, 149 s of the program's 193 s. The same line keeps the first one or two launches of every kernel a program first launches
+after its start (Round sp75's census: 68 launches in 8 programs, 2.0 s on server3; segmentationTreeThrust 34, histogram 4, mergeSort 2).
+Why is nothing sampled once the driver is up, and does the reason still hold?
+
+**The reason, and what is left of it.** The refusal is Round sp60b's (section D of that round, "Never after the driver's start"): a sample
+forks the process, a forked copy of a CUDA process must not call the driver, and the round had never forked a process that held the real
+driver, so it did not; its tests say so ("not covered by a test: the fork itself against a real driver"). Read against the code as it is
+now: (1) the copy can reach the driver in one way only, the gate's pull when a block reads a chunk only the card holds, and that way can be
+closed; (2) the copy's life is bounded since Round sp75 (a block's run is stopped at a limit), so it never outlives the wait, with or
+without an answer; (3) what a fork does to the process that holds the driver is the one thing a stand-in cannot show. A forked child that
+never calls the driver is what any CUDA program makes that calls `system()` after its first launch; it is still not measured here.
+
+**The rule** (section 13 of the design; `VGPU_HOST_GPU_SAMPLE_STARTED=0` is the rule before; both modes). A launch nothing is known of is
+sampled with the driver up as before the start: the same candidates, the same floor or affordable share of the process's age, the same copy
+and estimate. It is held against the card path alone: with the driver up there is no start to repay. Three things make it so:
+
+* *`sample_allowed`* (vgpu/host_gpu.hpp) replaces the two tests of "has the start begun" (when the launch is considered, and again at the
+  fork under the lock that guards the start): a driver that is up allows a sample, one that failed to start never does, and the switch
+  restores the refusal.
+* *The copy cannot call the driver.* `sample_plan` pulls every chunk only the card holds before the fork and leaves it shared (the pull the
+  simulator makes before it runs the launch anyway; the card's copy stays valid, so a launch the sample sends pushes nothing more).
+  `sample_copy_begin` runs in the copy before any block: it takes no lock, ends the copy if a chunk is the card's alone or the gate's table
+  was being changed at the fork, and makes every chunk the copy's own, so that its blocks run as the simulator's launch would, with no
+  access through the gate. `pull_chunks` throws in a copy. A copy that ends for any of these gives no answer and the launch stays.
+* *The card path without the start*, where the start was assumed: the least a block of a small grid must show
+  (`sample_need_seconds(..., driver_up)`), and the bar under which an earlier whole launch says "short, not sampled again"
+  (`sample_card_path_seconds`). That bar was 0.5 s with the start and would be 0.2 ms without it, which would sample the second launch of
+  every kernel whose first took a millisecond; so with the driver up the measured launch is asked what the static count is asked, the
+  floor (`sample_short_before_seconds`: 30 ms, more with much live memory).
+* *The measured launch in the count's place.* The census of the first form of the rule showed what was left of #659's first launches: the
+  CUDA Samples' `histogram256Kernel` (240 blocks, 2.8 ms counted, 0.19 s taken, twice) was no longer refused for the driver's start and
+  was refused by the floor instead, at both launches, although the second came with the first one's 0.19 s on record. So with the driver
+  up the floor is asked of the kernel's earlier whole launch where that is over its static count (`sample_floor_estimate`): the second
+  launch is sampled. The first still is not: nothing known before it tells it from a short one.
+
+`sampled_offload` already priced a sample without the start when the driver is up; nothing there changed. The mode's decision line reads
+`sampled with the driver up: ... against a card path of ... ms without a start`, and `host_gpu_sampled:`'s `after_driver=`, which was
+printed to show a zero, counts.
+
+**What it decides** (server3, the stand-in driver; `data/sp76/launches.md`):
+
+| program | launch | rule before (`VGPU_HOST_GPU_SAMPLE_STARTED=0`) | this round |
+|---|---|---|---|
+| hecbench/aidw-cuda, against a stand-in card that keeps memory and computes nothing | `AIDW_Kernel_Tiled`, its first (400 x 256, 84 ms counted) | `not sampled: the driver has been started`: simulated | 2.3 MiB pulled in 0.4 ms; sampled with the driver up, the first block stopped at 15 ms: 2.0 s at the least against a card path of 0.25 s: **sent**; the sample 32 ms (the fork 0.5 ms). Four launches of four on the card |
+| the stand-in test's `two` (two kernels on 256 blocks that outlast the wait, beside 64 MiB) | the second kernel's | not sampled; simulated on the memory the card left | 64 MiB pulled, sampled with the driver up, **sent** (step 41; step 42 is the switch off); with two rounds a thread instead: sampled and kept (step 43) |
+| samples/alignedTypes | 22 first and second launches of eleven kernels after the start (0.89 s) | not sampled | ten first launches sampled inside their blocks and **sent** (94 to 592 ms estimated), one sampled and kept, the eleven second launches not sampled (the first, sent, refused by the stand-in and simulated, took 71 ms: under the floor of 0.18 s that 100 MiB live ask; on a card a launch that is sent leaves its estimate and the second goes by it); the eleven samples cost 64 ms |
+| samples/histogram | `histogram256Kernel`, twice 0.19 s; `mergeHistogram256Kernel`, twice 1.5 ms | not sampled | `histogram256Kernel`: the first under the floor (2.8 ms counted, 240 blocks), the second sampled on the strength of the first and **sent** (0.11 s estimated); `mergeHistogram256Kernel` sampled once and kept (1.4 ms against a card path of 12.5 ms); the two samples cost 12 ms |
+| samples/mergeSort | two first launches after the start | not sampled | one sampled and **sent** (85 ms estimated against a card path of 29 ms), the sample 3 ms |
+| hecbench/atomicReduction-cuda (cut at 40 s), samples/jacobiCudaGraphs | first launches after the start | not sampled | sampled and kept (atomicReduction: 0.10 s estimated against twice a card path of 51 ms; jacobiCudaGraphs: 0.04 ms), 2 to 7 ms a sample |
+| samples/segmentationTreeThrust, sortingNetworks, simpleHyperQ | 16 first launches after the start (0.28 s) | not sampled | not sampled either: the kernel has no loop (15), or its static estimate is under the floor in a process that cannot afford a sample (290 MiB live: a floor of 0.52 s) |
+
+On the stand-in every launch the mode sends is refused and simulated, so the table is decisions, not time.
+
+**The corpus** (`data/sp76/census.md`: every program once with the switch off and once with it on, one build, the stand-in driver).
+Two passes. The first, with the rule as first built (without the measured launch in the count's place): 89 programs, of which 24 start the
+driver in a form; it is what showed histogram's second launch refused by the floor. The second, on the round's final build: the 29
+programs that start the driver in a form and the 14 the first pass had not reached, 43 in all (`census.md`). Of them 35 have no launch the
+rule touches; the other eight are the table above: 49 `not sampled: the driver has been started` lines with the switch off, 17 samples
+with it on, 12 sent, 5 kept, no copy that did not answer. A program that never starts the driver cannot differ (the rule's three functions
+answer as before until the driver is up), and none of the first pass's 65 such programs did.
+Between two runs of one form some decisions differ by timing alone, with or without the rule: when the account fills (asyncAllocation
+sends 61 or 68 of 800 launches, gaussian 470 or 472, lud 51 or 52), whether a process is old enough to afford a sample (atomicPerf: one
+or two samples before the start), and particlefilter's race. `census.md` lists them with the rest.
+Not in either pass: 2MM, GRAMSCHM, babelstream, base64e, bh, binomial, fpdc, zerocopy and the tf32 and bf16 tensor GEMMs (minutes each
+against the stand-in); aidw was run by hand (above); CORR, COVAR and aligned-types (52 to 100 s each) were in the first pass only.
+
+**Timing** (`data/sp76/rerun.md`: the switch off against on, interleaved, the stand-in driver, so every launch is simulated in both forms
+and a difference is what the rule's samples cost, not what the card saves). Medians,
+the switch on over off. Thirteen programs under 8 s, 7 runs a form: 0.990 to 1.012 (3MM 0.991, JACOBI2D 1.007, gaussian 0.990, lud 0.990,
+hotspot 0.997, asyncAllocation 1.008, atomicAggregate 0.998, atomicPerf 1.004, radixsort2 0.995, shmembench 1.012, silu 1.003,
+convolutionSeparable 1.007, interval 0.997). The longer ones, 3 runs: LU 1.017, SYR2K 1.003, SYRK 1.003, black-scholes 1.000, mergeSort
+1.002 (one sample, 3 ms), histogram 0.996 (two, 12 ms), jacobiCudaGraphs 0.993 (one, 1.7 ms), alignedTypes 1.004 (eleven, 64 ms of 25 s).
+FDTD-2D and segmentationTreeThrust read 1.276 and 1.074 in that pass, each with a run of the switch-off form as slow as the slowest of
+the other (48.7 to 62.5 s; 18.9 to 21.2 s): neither takes a sample with the driver up and both decide the same in the two forms. Run
+again: FDTD-2D, 4 runs, 0.997; segmentationTreeThrust, 5 runs, 0.997. No program over 3 %. Not timed: atomicReduction (57 s a run here; two
+samples of 2 to 7 ms).
+
+**particlefilter_float** (`data/sp76/pf.md`; Round sp75's card run: turbo 0.947 s against 0.818 s with `VGPU_HOST_GPU_SAMPLE_BLOCK=0`,
+medians of 30, "a launch of 34 or 178 ms by the seed"). It is not the seed and it is not the rule.
+
+* *The two forms do the same.* One logged run a form with the clock fixed (`fixtime.c`: a `time()` that answers `FIXTIME`, in
+  `LD_PRELOAD`; the program's binary is untouched): 82 and 80 lines, the same decisions in the same order. The only differences are the
+  text of the reason for a first launch that is not sampled (with the switch on a grid of 20 blocks is a candidate for bounded blocks and
+  is refused by the floor, with it off it is refused as a small grid; neither is sampled) and, from that, how `host_gpu_kept` groups two
+  launches. One sample in both (`find_index_kernel`, inside its blocks, `block_limit_s=0`), the start bought by the same launch.
+* *One host thread, the clock fixed*: six seeds, five runs a form interleaved, `off`, `turbo`, `turbob0`: turbo over turbob0 0.964 to 1.009 (0.991 to 1.006 in a pass made when the machine was quieter), and one answer (`XE: 48.562348`, `YE: 72.892182`).
+* *Four host threads, the clock fixed at one value*: the program prints five to nine different answers in thirty runs a form, and the
+  first launch of `find_index_kernel` takes 7 to 44 ms in 25 runs of 90 and 82 to 235 ms in 65: the two groups of the card run, with
+  no seed in play. The cause is in the program: `normalize_weights_kernel`'s block 0 computes the CDF and writes `u[0]`, and thread 0 of
+  every other block reads `u[0]` with nothing but a `__syncthreads()` of its own block before it ("do this to allow all threads in all
+  blocks to use the same u1", the source says). Which blocks read it before block 0 wrote it is decided by the host threads' timing, and
+  `find_index_kernel` then searches the CDF for the values it was given. With one host thread block 0 runs first, always.
+* *How the runs fell*: short first launch in 6 of 30 turbo runs, 10 of 30 runs of `turbo1` (the rule on, and
+  `VGPU_HOST_GPU_SAMPLE_BLOCK=1` in the environment: the size of turbob0's) and 9 of 30 turbob0 runs. On the card it was 12 and 19 of 30.
+  Neither split is outside what chance gives (Fisher's exact test: p = 0.55 here for turbo against turbob0, 0.12 there), and three medians of seven runs of one seed at three host
+  threads gave 1.044, 0.884 and 1.092 for the same pair of forms. If anything tilts the race it is the process's environment, not the
+  rule: `turbo1` falls with turbob0. The card script's `pf` stage runs the three forms thirty times and the one-thread forms beside them.
+
+So Round sp75's rule costs this program nothing that can be measured: where the program is deterministic the forms agree to 1 %, and
+where they differed the program was not computing the same thing twice.
+
+**#662, the start bought late** (`data/sp76/start-model.md`). HeCBench silu launches five kernels five times each on shrinking grids,
+twice over; on the card the account of simulated time reached the start (0.276 s) at the 31st launch, the start was bought, and the 20
+launches left held 0.20 s: 0.470 s in the simulator, 0.541 s in turbo mode. `start_model.py` replays the launches of the corpus (114
+programs, every launch's kernel, grid and simulator time from `VGPU_HOST_GPU_TRACE` with a start that is never bought) under the history
+estimate, the size rule, the account and the share, and prices each program: kept launches at the simulator's time, the start at 0.25 s,
+a card launch at its path. At the simulator's times scaled by 2.75 (the rig) it buys silu's start at the 26th launch, hotspot's at the
+297th and FDTD-2D's at the 7th, as the card did (31st, about 300th, 7th). Rules tried in the account's place:
+
+| rule: the start is bought when | silu | hotspot | FDTD-2D | LU | gaussian | lud | JACOBI2D | radixsort2 | asyncAllocation | the corpus, x 2.75 | x 1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| all launches simulated | 0.516 | 1.001 | 135.8 | 45.2 | 5.64 | 1.46 | 0.815 | 3.45 | 4.48 | | |
+| `cur`: the account has reached the start, and the launch saves its share (the rule as it is) | 0.522 (26) | 0.575 (297) | 0.807 (7) | 0.658 (8) | 0.556 (26) | 0.547 (18) | 0.522 (16) | 0.588 (55) | 1.106 (49) | 43.18 | 26.98 |
+| `regret`: what the launches the size rule would have sent with the driver up would have saved has reached the start | 0.516 (never) | 0.575 (297) | 1.144 (11) | 0.941 (14) | 0.638 (32) | 0.649 (24) | 0.656 (22) | 0.687 (73) | 1.205 (72) | 47.18 | 31.07 |
+| `acct1.5`: the account at 1.5 times the start | 0.637 (37) | 0.647 (373) | 0.807 (7) | 0.848 (12) | 0.662 (34) | 0.649 (24) | 0.630 (21) | 0.687 (73) | 1.217 (74) | 44.49 | 28.56 |
+| `acct2`: the account at twice the start | 0.516 (never) | 0.767 (493) | 0.807 (7) | 0.941 (14) | 0.787 (44) | 0.789 (33) | 0.769 (27) | 0.817 (97) | 1.327 (95) | 46.35 | 29.87 |
+| `kcount`: as many launches again of this kernel as it has had, each saving what this one saves, repay the start | 0.516 (never) | 0.575 (297) | 1.220 (12) | 0.753 (10) | 0.583 (28) | 0.598 (21) | 0.856 (31) | 1.079 (145) | 1.145 (58) | 45.34 | 28.69 |
+| `pcount`: the same with the program's admitted launches so far | 0.522 (26) | 0.575 (297) | 0.807 (7) | 0.658 (8) | 0.556 (26) | 0.547 (18) | 0.542 (17) | 0.588 (55) | 1.145 (58) | 43.23 | 27.21 |
+
+Seconds of the launches and the start (not of the program) at the rig's scale, with the launch that buys the start; the last two columns
+sum every program for which some rule buys it. `regret` and `kcount` are the two shapes of "do not count on more than was seen": the first
+counts only what the card would really have taken (a kernel's first two launches teach its estimate and are the simulator's whatever the
+driver's state), the second bounds a kernel's future by its own past. `acct1.5` and `acct2` are "not before the simulated time is a multiple
+of the start".
+
+No rule separates silu from the programs that repay the start: at the launch where it is bought silu looks like JACOBI2D, lud or
+atomicReduction at theirs (an account just filled, launches of 5 to 15 ms, a few of each kernel so far), and what tells them apart is
+what follows. The rules that never buy silu's start keep 0.006 s of it by the model (0.07 s on the card, whose
+start and first card launches cost more than the model's 0.25 s) and cost FDTD-2D, LU, gaussian, lud,
+hotspot, JACOBI2D or radixsort2 0.1 to 0.5 s each; `pcount` costs nearly nothing and does not help silu. Nothing was changed: the account's worst
+case is the start itself, once, and silu is that case.
+
+**The rest of #656, under the floor in a young process** (`data/sp76/launches.md`, "What a sample would say"): each program was run with
+`VGPU_HOST_GPU_SAMPLE=always`, which asks neither the floor nor the process's age.
+
+| program | kernel | by default | sampled, the estimate | it must pass | here | on the rig (2.5 times slower) |
+|---|---|---|---:|---:|---|---|
+| MC_SingleAsianOptionP | `initRNG` (9.5 ms counted, 1.35 s taken) | under the floor (72 ms), the process 5 ms old | 0.79 s | 0.71 s | sent, by 11 % | sent |
+| MC_EstimatePiInlineP | `initRNG` (9.5 ms, 1.46 s) | under the floor (30 ms), 4 ms old | 0.56 s | 0.64 s | kept: one block timed, 2.6 times under the launch | sent |
+| warpAggregatedAtomicsCG | `mapToBuckets`, `calculateMaxInEachBuckets` (0.30 and 0.325 s counted, 0.26 to 0.35 s taken) | under the floor (0.50 and 0.58 s: 267 and 305 MiB live) | 0.22, 0.25 s | 0.66, 0.68 s | kept | at or under the bar |
+| Rodinia lavaMD | `kernel_gpu_cuda` (3.4 ms, 0.63 s) | under the floor of a small grid (30 ms), 3 ms old | 0.20 s | 0.55 s | kept: the one block timed is a corner box, 3 times under the launch | at the bar |
+
+So the floor is all that is in the way only for `initRNG`. What tells it from the kernels the floor is there for is the turns of its loops
+(32 in 5, immediate bounds: its 9.5 ms count for 1.5 s), which the count does not weigh and the flow scan does not see (the loops are left
+through `CALL.REL.NOINC` to the kernel's `EXIT`, and any call makes a kernel's loops "not followed"). A rule for it needs the scan to
+follow such a loop, loops inside loops, the weighted count for a sample by whole blocks, and a census of every kernel whose count the
+weights lift over the floor, each of which would be sampled 5 ms into its process. That is not small and was not built. For
+warpAggregatedAtomicsCG the floor is not the cause (its launches do not repay a start with 0.3 GiB to move), and for lavaMD the estimate
+would have to come from blocks spread over the grid within a budget that its first block uses up. With this round's rule in, the two
+kernels after `initRNG` are sampled with the driver up once it is sent (`generatePaths`: 0.117 s against a card path of 0.022 s, sent).
+
+**Tests.** `test_host_gpu_logic`: 119 tests, 4 new: `sample_allowed`'s table; the card path a launch that may be sampled is held
+against, with aidw's second kernel as the case (and what a sampled launch must take: 1.4 ms with the driver up against 0.67 s before the
+start); the bar an earlier whole launch is held against with the driver up; the whole launch in the count's place, with
+`histogram256Kernel` as the case. Mutants of the header (`data/sp76/mutants.py`): 21 of 21 killed. `e2e_host_gpu_stub`: steps 41 to 44
+(the modes `two`, `twoshort`, `twob`, `twoshortb` and `twonone` of `host_gpu_lazy.cu`: the second kernel sampled with the driver up and
+sent, what the card held pulled before the fork; not sampled with the switch off; a short second kernel sampled and kept; and against a
+driver that refuses every module the output unchanged), PASS on server3 with the profiles a10g and rtx3060, steps 1 to 44. Mutants of
+the mode's part (`data/sp76/e2e-mutants.sh`): 5 of 5 killed, each by steps 41 to 44: no launch a candidate once the driver is started,
+the fork refused, the switch not read, nothing pulled before the fork, the pull leaving the chunks the card's alone (the last two through
+the copy's own check: a copy that finds a chunk only the card holds ends without an answer). No mutant reaches three things: the copy's
+checks themselves and the refusal of the gate's pull in a copy (they act only when another thread of the program sends a launch between
+the pull and the fork, and the stand-in card computes nothing, so a copy that read stale memory would answer the same); that the copy's
+chunks become its own (its blocks run the same through the gate, more slowly: the estimate's accuracy, not a decision the test sees); and
+the measured launch in the count's place where the mode calls it (the stand-in test samples with `VGPU_HOST_GPU_SAMPLE=always`, which
+asks no floor: the unit test and histogram's second launch in the census are its evidence). `hostgpu_bench_selftest`: the forms
+`exactd0` and `turbod0`. `e2e_host_gpu`, the card test: a new step 13 (the same program on the card: both launches sent, the second on a
+sample taken with the driver up, the output the mode-off output; a short second kernel kept; the switch off), wired where the test is
+(the card CI), **written and not run**.
+
+**Same bits.** `data/sp76/same-output.py` ran 18 programs (3MM, GEMM, SYRK, gaussian, lud, hotspot, lavaMD, backprop, nn, silu, s3d,
+radixsort2, atomicPerf, mergeSort, histogram, segmentationTreeThrust, MC_EstimatePiInlineP, dct8x8) under the build of PR #669 and this
+round's, with the mode off, in exact mode and in turbo mode against the stand-in driver: stdout the same in every form and the same as the
+mode-off output of the old build (lines that carry timings left out). And the plain simulator under both builds with `VGPU_COUNTERS_FILE`
+and `VGPU_MEMO_FINAL_HASH`: the memory at exit the same in all, the counters of every launch the same (the process id in each line taken
+out) in all but two programs: radixsort2, whose counters differ as much between two runs of one build (389 of 600 launches, old against old; 391, old
+against new: its keys are random). segmentationTreeThrust's counters differ between two runs of one build as well (50 of 514 launches; 48 old against new). The digests were not compared; the simulator's own code is untouched but for
+`sample_in_copy`, which only the mode calls.
+
+**What the card must show** (`data/sp76/card-run.sh`, stages `build fork decisions changed keep pf rest`; the table of expected outcomes
+is in `data/sp76/README.md`). In order: the card test's step 13 passes (the process forked while it holds the real driver, the second
+launch on the card after it, the output the mode-off output) and twenty runs in each mode leave no line in the kernel log; aidw runs its
+four launches on the card, 193 s to about 45 s; segmentationTreeThrust, histogram and mergeSort send the first launches they kept; no
+program of the keep list is more than 3 % slower than with the switch off; particlefilter's forms agree at one host thread and fall in
+the same two groups at four.
+
+**Not run.** A card. The full ctest set (the round built the runtime, the driver shim and `test_host_gpu_logic`, and ran the unit test,
+the stand-in test and the harness's self-test). The card test's step 13 (it needs a card; its script was written and not executed). The stand-in test's new steps and the rule itself against memory
+the card really changed (the stand-in keeps what it is sent and computes nothing). `card-run.sh` itself and the card test's script: written, parsed on server3
+(`bash -n`), not executed. The census's programs of minutes (above).
+
+**Cleanup.** The round's directory on server3 (`/tmp/sp76-turbo`: two builds, the mutants' tree and build, the corpus, the copied
+compiler part of the toolkit, traces, logs; 1.8 GB) and twelve scratch directories that `start_model.py collect` had left in `/tmp`
+(`trace-cwd-*`: it did not remove the directory it gives a program that wants one of its own; it does now) were removed by exact path. No
+process was left; the disk is back at 8.2 GB free (26 GB, 16 GB used), as at the start. Nothing of another session was touched.

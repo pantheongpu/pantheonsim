@@ -7,6 +7,25 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Host-GPU modes (`VGPU_HOST_GPU=exact|turbo`, experimental): a kernel's first launch is sampled when the driver is up, as it is before the
+  start ([round sp76](docs/perf-design/rounds/11-rounds-sp36-sp41.md#round-sp76-host-gpu-a-kernels-first-launch-once-the-driver-is-up),
+  [design](docs/perf-design/12-host-gpu-turbo.md), section 13; pantheonsim #657, #659). Until now no launch was sampled once the driver's
+  start had begun (a sample forks the process, and a process that held the real driver was not forked), so a kernel first launched after
+  the start was simulated however long its launch was: the second kernel of HeCBench aidw, 149 s of the program's 193 s on an A10G. Before
+  the fork the process now pulls what only the card holds, the forked copy takes every chunk as its own and cannot call the driver, and the
+  launch is held against a card path with no start in it; a kernel whose earlier whole launch was under the sampling floor is not sampled
+  again, and one whose earlier whole launch was over it is sampled at its next launch whatever its static count. Against the stand-in driver all four launches of aidw are sent (three before), and over the corpus twelve more first launches go (CUDA Samples alignedTypes ten,
+  histogram and mergeSort one each) for seventeen samples; with the switch off against on no program that starts the driver is more than
+  2 % apart in wall time. **Not run on a card**: that a process holding
+  the real driver can be forked is what the card test's new step 13 and `docs/perf-design/data/sp76/card-run.sh` ask first.
+  `VGPU_HOST_GPU_SAMPLE_STARTED=0` is the rule before (the benchmark's forms `exactd0` and `turbod0`). The plain simulator and the bits of
+  exact mode are unchanged.
+- Host-GPU modes, measured and not changed (round sp76): Rodinia particlefilter_float, which the card run of round sp75 left unsettled, is
+  not slower by that round's rule: with one host thread and its clock seed fixed the two forms agree to 1 %, and with several host threads
+  the program itself computes one of several answers per run (a race between the blocks of its `normalize_weights_kernel`), which is what
+  splits its run times in two groups. And no rule was found that keeps the driver start from HeCBench silu (bought at the 31st of 50
+  launches, pantheonsim #662) without taking it from programs that repay it: replayed over the launches of the corpus, each candidate costs
+  the keep list more than silu loses.
 - Host-GPU modes (`VGPU_HOST_GPU=exact|turbo`, experimental): a launch whose blocks each take longer than the wait for its sample is no longer
   kept in the simulator for want of an answer ([round sp75](docs/perf-design/rounds/11-rounds-sp36-sp41.md#round-sp75-host-gpu-a-block-that-outlasts-the-wait),
   [design](docs/perf-design/12-host-gpu-turbo.md), section 12; pantheonsim #656, #657). The forked copy that times a launch's first blocks now stops
