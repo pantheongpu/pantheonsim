@@ -1769,7 +1769,8 @@ std::string short_name_of(const Inst& in) {
   // (The VOP3 spellings of three 16-bit integer instructions on RDNA2 and RDNA3, which run as their short forms do.)
   const bool rdna2_i16 = (in.arch == Target::Gfx1030 || in.arch == Target::Gfx1100) &&
                          (in.name.rfind("v_ashrrev_i16", 0) == 0 || in.name.rfind("v_max_i16", 0) == 0 || in.name.rfind("v_min_i16", 0) == 0);
-  return in.sdwa   ? in.name.substr(0, in.name.size() - 5) + "_e32"
+  // (An SDWA instruction gfx9 knows only in its long form, gfx1030's v_mul_legacy_f32, keeps that name: it runs as it.)
+  return in.sdwa   ? (in.name.ends_with("_sdwa") ? in.name.substr(0, in.name.size() - 5) + "_e32" : std::string())
          : (in.dpp || in.dpp8) ? (in.name.ends_with("_dpp") ? in.name.substr(0, in.name.size() - 4) + "_e32" : std::string())
          : in.promoted ? in.name.substr(0, in.name.size() - 4) + "_e32"
          : in.name.size() > 4 && in.name.compare(in.name.size() - 4, 4, "_e64") == 0 &&

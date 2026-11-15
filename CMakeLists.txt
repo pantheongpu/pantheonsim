@@ -2184,6 +2184,9 @@ target_compile_definitions(test_amd_gcn_hi16 PRIVATE VGPU_SOURCE_DIR="${CMAKE_SO
 # Which NaN a gfx1030 float instruction gives (sign, payload, quieting, the invalid-operation NaN), against an RX 6800.
 vgpu_unit_test(test_amd_gcn_nan amd/tests/unit/test_gcn_nan.cpp)
 target_compile_definitions(test_amd_gcn_nan PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# gfx1030 NaNs in the SDWA, DPP, fmamk/fmaak, packed, double and dot-product forms, against an RX 6800 and an RX 6700 XT.
+vgpu_unit_test(test_amd_gcn_nan2 amd/tests/unit/test_gcn_nan2.cpp)
+target_compile_definitions(test_amd_gcn_nan2 PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn_abandon amd/tests/unit/test_gcn_abandon.cpp)
 target_compile_definitions(test_amd_gcn_abandon PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_hostcall amd/tests/unit/test_hostcall.cpp)
@@ -4621,11 +4624,14 @@ if(TARGET vgpucudart AND TARGET vgpucublas)
   endforeach()
 endif()
 if(TARGET vgpucudart AND TARGET vgpucuda)
-  add_test(NAME e2e_card_edges_context COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh context -lcuda)
-  set_tests_properties(e2e_card_edges_context PROPERTIES
-    DEPENDS "vgpucudart;vgpucuda"
-    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-    TIMEOUT 300)
+  # (card_edges_module_arch.cu: the module loaders handed code for another GPU.)
+  foreach(_drv context module_arch)
+    add_test(NAME e2e_card_edges_${_drv} COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_card_edges.sh ${_drv} -lcuda)
+    set_tests_properties(e2e_card_edges_${_drv} PROPERTIES
+      DEPENDS "vgpucudart;vgpucuda"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      TIMEOUT 300)
+  endforeach()
 endif()
 
 # The session's ncu: Nsight Compute's command line answered from the simulator's

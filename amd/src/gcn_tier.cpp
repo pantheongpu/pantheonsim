@@ -2992,6 +2992,7 @@ void tier_classify(Inst& in) {
       else if (e.k == DMUL) f.nan = kNanMul;
       else if (e.k == DFMA && !(e.flags & kFmac)) f.nan = kNanFma;   // (v_fmac_f64 is a plain std::fma: the interpreter's)
       else if (e.k != DFMA && e.k != DRNDNE && e.k != DMIN && e.k != DMAX) f.nan = kNanPass;      // (a one-input function of the host's: no second payload to choose; nearbyint's quieting is the compiler's)
+      if (in.arch == gcn::Target::Gfx1030) f.nan = kNanHandBack;   // (gfx1030's double NaNs are the card's: the interpreter's rdna2_nan)
       if ((e.k == DADD || e.k == DMUL || e.k == DFMA) && !f.omod && !f.clamp) {   // (the pairs' rows, no 64-bit arrays)
         const uint32_t op = e.k == DADD ? 0 : e.k == DMUL ? 1 : 2;
         uint32_t uniform = 0;   // (the operands that are one value in every lane)
@@ -3019,6 +3020,7 @@ void tier_classify(Inst& in) {
       if (!vector_enc || in.dst.size() != 1 || in.src.size() < static_cast<size_t>(e.arity)) return;
       if (!vgpr_dst(in.dst[0], f.dst, e.cat == Cat::L64 ? 2 : 1)) return fail();
       if (((e.flags & kFloatOut) && (in.omod || in.clamp)) || ((e.flags & kFloatSrc) && (in.omod || in.clamp))) return fail();
+      if ((e.flags & kFloatOut) && in.arch == gcn::Target::Gfx1030) return fail();   // (gfx1030's NaNs: the interpreter's rdna2_nan)
       for (int k = 0; k < e.arity; ++k)
         if ((e.flags & kFloatSrc) && (in.src[k].neg || in.src[k].abs)) return fail();
       for (int k = 0; k < e.arity; ++k)
@@ -3346,7 +3348,7 @@ void tier_classify(Inst& in) {
       if (!vgpr_dst(in.dst.empty() ? Operand() : in.dst[0], f.dst, dbl ? 2 : 1)) return fail();
       if (scale ? (in.dst.size() != 2 || !scalar_dst(in.dst[1], f.dst2)) : in.dst.size() != 1) return fail();
       if (in.clamp || in.omod) return fail();   // (the interpreter's write_float / write_double: issue #613, and v_div_scale's on an RX 6800)
-      if (in.arch == gcn::Target::Gfx1030 && e.k == 2) return fail();   // (gfx1030's v_div_fixup_f32 NaNs: the interpreter's rdna2_nan)
+      if (in.arch == gcn::Target::Gfx1030 && (e.k & 3) == 2) return fail();   // (gfx1030's v_div_fixup_f32 and _f64 NaNs: the interpreter's rdna2_nan)
       for (int k = 0; k < 3; ++k)
         if (!(dbl ? lane_src64(in.src[k], f.src[k], true) : lane_src32(in.src[k], f.src[k], true))) return fail();
       f.sub = static_cast<uint32_t>(e.k);

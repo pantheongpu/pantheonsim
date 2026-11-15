@@ -1398,7 +1398,7 @@ struct Machine {
   // scalar register or a constant, a MODE other than the default, gfx1250's overflow rule, a part-register
   // destination), with nothing written; the per-lane code then runs it.
   bool packed_f16_wave(Wave& w, const Inst& in, packed::Op kind) {
-    if (!packed_plain(w, in)) return false;
+    if (in.arch == gcn::Target::Gfx1030 || !packed_plain(w, in)) return false;   // (gfx1030: the lane loop, for its NaNs, rdna2_pk_nan)
     packed::WaveArgs a;
     a.op = kind;
     a.clamp = in.clamp;
@@ -1512,65 +1512,80 @@ struct Machine {
   static bool omod_ignored(const Wave& w, const Inst& in, uint32_t denorm_bit) {
     return omod_rules(in) && (((w.mode >> 9) & 1) || ((w.mode >> denorm_bit) & 1));
   }
-  // gfx1030's NaN (an RX 6800 and an RX 6700 XT, test_amd_gcn_nan): where a float result of the e32 or e64 form of an instruction below
-  // is a NaN, it is the first NaN source in operand order, after the source's abs and neg (v_sub negates its second source, v_subrev its
-  // first: their NaN comes out with the sign flipped), quieted with IEEE mode on and as it is with IEEE mode off (a signalling NaN goes
-  // through); with no NaN source (inf - inf, 0 * inf, sqrt(-1), fract(inf), sin(inf)) it is the negative default NaN, 0xfe00 or 0xffc00000.
-  // Conversions carry the payload's top bits across (quieted where none is left). v_fma and v_fmac: a product of 0 and an infinity is
-  // the default NaN even beside a NaN addend. v_min and v_max with IEEE mode on: a signalling NaN before a quiet one. v_div_fixup: S2,
-  // then S1; a NaN quotient (S0) where the pseudocode's last case would keep it is an infinity of the result's sign. Not established, left
-  // as they were: v_med3, v_min3 and v_max3, v_fmamk/v_fmaak, the SDWA and DPP forms, doubles. Returns the result's bits, out16 a half.
-  uint32_t rdna2_nan(const Wave& w, const Inst& in, uint32_t lane, bool out16, uint32_t bits) const {
-    if (in.sdwa || in.dpp || in.dpp8) return bits;
+  // gfx1030's NaN (an RX 6800 and an RX 6700 XT, test_amd_gcn_nan and test_amd_gcn_nan2): where a float result of an instruction below
+  // is a NaN, in any of its forms (e32, e64, SDWA, DPP, DPP8), it is the first NaN source in operand order, after the source's abs and neg
+  // (v_sub negates its second source, v_subrev its first: their NaN comes out with the sign flipped), quieted with IEEE mode on and as it is
+  // with IEEE mode off (a signalling NaN goes through); with no NaN source (inf - inf, 0 * inf, sqrt(-1), fract(inf), sin(inf)) it is the
+  // negative default NaN, 0xfe00, 0xffc00000 or 0xfff8000000000000. Halves, singles and doubles alike.
+  // Conversions carry the payload's top bits across (quieted where none is left). v_fma, v_fmac, v_fmamk and v_fmaak: a product of 0 and
+  // an infinity is the default NaN even beside a NaN addend (v_fmamk's constant is its second factor, v_fmaak's its addend). The legacy
+  // v_fma and v_fmac: a zero factor makes the product +0 whatever the other is, so only the addend's NaN counts. v_min and v_max with
+  // IEEE mode on: a signalling NaN before a quiet one. v_div_fixup: S2, then S1; a NaN quotient (S0) where the pseudocode's last case
+  // would keep it is an infinity of the result's sign. Returns the result's bits; out_bits is the result's width (16, 32 or 64).
+  uint64_t rdna2_nan(const Wave& w, const Inst& in, uint32_t lane, uint32_t out_bits, uint64_t bits) const {
     std::string_view name = in.name;
-    for (std::string_view suffix : {"_e32", "_e64"})
+    for (std::string_view suffix : {"_e32", "_e64", "_sdwa", "_dpp"})
       if (name.ends_with(suffix)) name.remove_suffix(suffix.size());
     static const std::set<std::string_view> kRule = {
         "v_add_f16", "v_sub_f16", "v_subrev_f16", "v_mul_f16", "v_max_f16", "v_min_f16", "v_fmac_f16", "v_fma_f16", "v_div_fixup_f16",
         "v_fract_f16", "v_floor_f16", "v_ceil_f16", "v_trunc_f16", "v_rndne_f16", "v_sqrt_f16", "v_rcp_f16", "v_rsq_f16", "v_log_f16",
         "v_exp_f16", "v_sin_f16", "v_cos_f16", "v_frexp_mant_f16", "v_ldexp_f16", "v_cvt_f16_f32", "v_cvt_f32_f16",
+        "v_fmamk_f16", "v_fmaak_f16",
         "v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_mul_legacy_f32", "v_max_f32", "v_min_f32", "v_fmac_f32", "v_fma_f32",
         "v_div_fixup_f32", "v_fract_f32", "v_floor_f32", "v_ceil_f32", "v_trunc_f32", "v_rndne_f32", "v_sqrt_f32", "v_rcp_f32",
-        "v_rsq_f32", "v_log_f32", "v_exp_f32", "v_sin_f32", "v_cos_f32", "v_frexp_mant_f32", "v_ldexp_f32"};
+        "v_rsq_f32", "v_log_f32", "v_exp_f32", "v_sin_f32", "v_cos_f32", "v_frexp_mant_f32", "v_ldexp_f32",
+        "v_fmamk_f32", "v_fmaak_f32", "v_fma_dx9_zero_f32", "v_fmac_dx9_zero_f32",
+        "v_add_f64", "v_mul_f64", "v_fma_f64", "v_max_f64", "v_min_f64", "v_div_fixup_f64", "v_ldexp_f64", "v_frexp_mant_f64",
+        "v_fract_f64", "v_floor_f64", "v_ceil_f64", "v_trunc_f64", "v_rndne_f64", "v_sqrt_f64", "v_rcp_f64", "v_rsq_f64",
+        "v_cvt_f32_f64", "v_cvt_f64_f32"};
     if (!kRule.count(name)) return bits;
     const bool ieee = (w.mode >> 9) & 1;
-    const bool in16 = name == "v_cvt_f32_f16" || (out16 && name != "v_cvt_f16_f32");
-    const uint32_t sign = in16 ? 0x8000u : 0x80000000u, mag = ~sign & (in16 ? 0xFFFFu : ~0u), inf = in16 ? 0x7C00u : 0x7F800000u;
-    const auto nan_of = [&](uint32_t v) { return (v & mag) > inf; };
-    const auto signalling = [&](uint32_t v) { return nan_of(v) && !(v & (in16 ? 0x200u : 0x400000u)); };
+    // The sources' width: the result's, but for the conversions.
+    const uint32_t in_bits = name == "v_cvt_f32_f16" ? 16 : name == "v_cvt_f16_f32" || name == "v_cvt_f64_f32" ? 32
+                             : name == "v_cvt_f32_f64" ? 64 : out_bits;
+    const auto mant_bits = [](uint32_t b) { return b == 16 ? 10u : b == 32 ? 23u : 52u; };
+    const uint32_t im = mant_bits(in_bits), om = mant_bits(out_bits);
+    const uint64_t sign = uint64_t{1} << (in_bits - 1), mag = sign - 1, inf = mag & ~((uint64_t{1} << im) - 1);
+    const auto nan_of = [&](uint64_t v) { return (v & mag) > inf; };
+    const auto signalling = [&](uint64_t v) { return nan_of(v) && !(v >> (im - 1) & 1); };
     // The float sources as the instruction sees them (v_fmac's addend is its destination; v_ldexp's second source is an integer).
     const bool fmac = name.starts_with("v_fmac");
     const size_t n = name.starts_with("v_ldexp") ? 1 : fmac ? 3 : std::min<size_t>(in.src.size(), 3);
-    uint32_t s[3] = {0, 0, 0};
+    uint64_t s[3] = {0, 0, 0};
     for (size_t k = 0; k < n; ++k) {
       const Operand& o = fmac && k == 2 ? in.dst[0] : in.src[k];
-      uint32_t v = lane_src(w, o, lane);
-      if (in16) v &= 0xFFFFu;
+      uint64_t v = in_bits == 64 ? lane_src64(w, o, lane) : lane_src(w, o, lane);
+      if (in_bits == 16) v &= 0xFFFFu;
       if (o.abs) v &= ~sign;
       if (o.neg) v ^= sign;
       s[k] = v;
     }
     if (name.starts_with("v_sub_")) s[1] ^= sign;
     if (name.starts_with("v_subrev_")) s[0] ^= sign;
-    const uint32_t out_quiet = out16 ? 0x200u : 0x400000u, out_mant = out16 ? 0x3FFu : 0x7FFFFFu;
-    const uint32_t out_sign = out16 ? 0x8000u : 0x80000000u, out_inf = out16 ? 0x7C00u : 0x7F800000u;
-    const auto pass = [&](uint32_t v) {   // a NaN source as the result: converted, then quieted where IEEE mode says
-      if (in16 && !out16) v = (v & 0x8000u) << 16 | 0x7F800000u | (v & 0x3FFu) << 13;
-      if (!in16 && out16) v = (v >> 16 & 0x8000u) | 0x7C00u | (v & 0x7FFFFFu) >> 13;
-      if (ieee || !(v & out_mant)) v |= out_quiet;
-      return v;
+    const uint64_t out_sign = uint64_t{1} << (out_bits - 1), out_quiet = uint64_t{1} << (om - 1), out_mant = (uint64_t{1} << om) - 1;
+    const uint64_t out_inf = (out_sign - 1) & ~out_mant;
+    const auto pass = [&](uint64_t v) {   // a NaN source as the result: converted, then quieted where IEEE mode says
+      const uint64_t m = v & ((uint64_t{1} << im) - 1);
+      uint64_t r = (v & sign ? out_sign : 0) | out_inf | (om >= im ? m << (om - im) : m >> (im - om));
+      if (ieee || om < im || !(r & out_mant)) r |= out_quiet;   // (a narrowing conversion quiets it whatever IEEE mode says)
+      return r;
     };
-    const uint32_t dflt = out16 ? 0xFE00u : 0xFFC00000u;
+    const uint64_t dflt = out_sign | out_inf | out_quiet;
+    const auto zero = [&](uint64_t v) { return !(v & mag); };
+    const auto infinite = [&](uint64_t v) { return (v & mag) == inf; };
     if (name.starts_with("v_div_fixup")) {
       if (nan_of(s[2])) return pass(s[2]);
       if (nan_of(s[1])) return pass(s[1]);
-      const bool z1 = !(s[1] & mag), z2 = !(s[2] & mag), i1 = (s[1] & mag) == inf, i2 = (s[2] & mag) == inf;
-      if (nan_of(s[0]) && !z1 && !z2 && !i1 && !i2) return ((s[1] ^ s[2]) & sign ? out_sign : 0u) | out_inf;
+      if (nan_of(s[0]) && !zero(s[1]) && !zero(s[2]) && !infinite(s[1]) && !infinite(s[2]))
+        return ((s[1] ^ s[2]) & sign ? out_sign : 0u) | out_inf;
       return dflt;
     }
-    if (name.starts_with("v_fma") && !nan_of(s[0]) && !nan_of(s[1]) &&
-        ((!(s[0] & mag) && (s[1] & mag) == inf) || ((s[0] & mag) == inf && !(s[1] & mag))))
+    if (name.ends_with("_dx9_zero_f32")) {
+      if (zero(s[0]) || zero(s[1])) return nan_of(s[2]) ? pass(s[2]) : dflt;
+    } else if (name.starts_with("v_fma") && !nan_of(s[0]) && !nan_of(s[1]) &&
+               ((zero(s[0]) && infinite(s[1])) || (infinite(s[0]) && zero(s[1])))) {
       return dflt;
+    }
     if (ieee && (name.starts_with("v_max_") || name.starts_with("v_min_")))
       for (size_t k = 0; k < n; ++k)
         if (signalling(s[k])) return pass(s[k]);
@@ -1578,11 +1593,57 @@ struct Machine {
       if (nan_of(s[k])) return pass(s[k]);
     return dflt;
   }
+  // gfx1030's v_dot2_f32_f16 and v_dot2c_f32_f16 where the sum is a NaN (test_amd_gcn_nan2): the first NaN of the low halves' pair, the
+  // high halves' pair and the addend (a.lo, b.lo, a.hi, b.hi, c), after neg, widened as v_cvt_f32_f16 widens it and quieted with IEEE
+  // mode on; with none (0 * inf, inf - inf), the negative default NaN.
+  uint32_t rdna2_dot2_nan(const Wave& w, const Inst& in, uint32_t lane, bool dot2c) const {
+    const bool ieee = (w.mode >> 9) & 1;
+    uint32_t h[4];
+    for (uint32_t k = 0; k < 4; ++k) {
+      const uint32_t src = k & 1, half = k >> 1;
+      uint32_t v = dot2c ? lane_src(w, in.src[src], lane) >> (16 * half) & 0xFFFFu : packed_bits(w, in, src, half, lane);
+      if (!dot2c && (((half ? in.neg_hi : in.neg_lo) >> src) & 1)) v ^= 0x8000u;
+      h[k] = v;
+    }
+    for (uint32_t v : h)
+      if ((v & 0x7FFFu) > 0x7C00u) return (v & 0x8000u) << 16 | 0x7F800000u | (v & 0x3FFu) << 13 | (ieee || !(v & 0x3FFu) ? 0x400000u : 0u);
+    uint32_t c = dot2c ? w.vgpr[in.dst[0].index][lane] : lane_src(w, in.src[2], lane);
+    if (!dot2c && ((in.neg_lo >> 2) & 1)) c ^= 0x80000000u;
+    if ((c & 0x7FFFFFFFu) > 0x7F800000u) return ieee ? c | 0x400000u : c;
+    return 0xFFC00000u;
+  }
+  // gfx1030's v_pk_add_f16, v_pk_mul_f16, v_pk_fma_f16, v_pk_min_f16 and v_pk_max_f16, a half whose result is a NaN (test_amd_gcn_nan2):
+  // rdna2_nan's rule over that half's sources (op_sel, op_sel_hi and neg_lo or neg_hi applied).
+  uint16_t rdna2_pk_nan(const Wave& w, const Inst& in, uint32_t lane, uint32_t half, bool fma, bool minmax) const {
+    const bool ieee = (w.mode >> 9) & 1;
+    const uint32_t n = fma ? 3 : 2;
+    uint16_t s[3] = {0, 0, 0};
+    for (uint32_t k = 0; k < n; ++k) {
+      uint16_t v = half_in(w, packed_bits(w, in, k, half, lane));
+      if (((half ? in.neg_hi : in.neg_lo) >> k) & 1) v ^= 0x8000u;
+      s[k] = v;
+    }
+    const auto nan = [](uint16_t v) { return (v & 0x7FFFu) > 0x7C00u; };
+    const auto pass = [&](uint16_t v) { return static_cast<uint16_t>(ieee || !(v & 0x3FFu) ? v | 0x200u : v); };
+    if (fma && !nan(s[0]) && !nan(s[1]) &&
+        ((!(s[0] & 0x7FFFu) && (s[1] & 0x7FFFu) == 0x7C00u) || ((s[0] & 0x7FFFu) == 0x7C00u && !(s[1] & 0x7FFFu))))
+      return 0xFE00u;
+    if (ieee && minmax)
+      for (uint32_t k = 0; k < n; ++k)
+        if (nan(s[k]) && !(s[k] & 0x200u)) return pass(s[k]);
+    for (uint32_t k = 0; k < n; ++k)
+      if (nan(s[k])) return pass(s[k]);
+    return 0xFE00u;
+  }
+  uint32_t rdna2_nan(const Wave& w, const Inst& in, uint32_t lane, bool out16, uint32_t bits) const {
+    return static_cast<uint32_t>(rdna2_nan(w, in, lane, out16 ? 16u : 32u, uint64_t{bits}));
+  }
   // gfx1030's v_min3, v_max3 and v_med3 (f16, f32), as the RX 6800 gives them (test_amd_gcn_nan): the guides'
   // pseudocode (V_MED3: with a NaN source, V_MIN3) over the card's two-input min and max, which order -0 below +0 and, with IEEE mode on,
   // let a signalling NaN win, quieted, a quiet NaN lose to a number and two quiet NaNs give the first, quieted; with IEEE mode off a NaN
-  // loses to a number and two NaNs give the first as it is. Every lane where no source is a denormal (whose flushing MODE decides, and the
-  // instruction's own arithmetic does); false, and that arithmetic, for the others.
+  // loses to a number and two NaNs give the first as it is. A denormal source where MODE flushes the type's input denormals is the zero of
+  // its sign (test_amd_gcn_nan2: v_med3_f32(NaN, 2^-149ish, -denormal) is -0). Every lane but those with a denormal source that MODE
+  // keeps (the instruction's own arithmetic, which matches the cards there); false, and that arithmetic, for those.
   bool rdna2_minmax3_nan(const Wave& w, const Inst& in, uint32_t lane, bool h, uint32_t* out) const {
     if (in.sdwa || in.dpp || in.dpp8) return false;
     const uint32_t sign = h ? 0x8000u : 0x80000000u, mag = sign - 1, inf = h ? 0x7C00u : 0x7F800000u, quiet = h ? 0x200u : 0x400000u;
@@ -1594,8 +1655,11 @@ struct Machine {
       if (h) v &= 0xFFFFu;
       if (o.abs) v &= ~sign;
       if (o.neg) v ^= sign;
+      if ((v & mag) != 0 && (v & mag) < (h ? 0x400u : 0x800000u)) {
+        if (w.mode & (h ? 0x40u : 0x10u)) denormal = true;
+        else v &= sign;   // (flushed, keeping its sign)
+      }
       s[k] = v;
-      denormal = denormal || ((v & mag) != 0 && (v & mag) < (h ? 0x400u : 0x800000u));
     }
     if (denormal) return false;
     const bool ieee = (w.mode >> 9) & 1;
@@ -1634,6 +1698,7 @@ struct Machine {
     write_lane(w, in.dst[0], lane, as_bits(v));
   }
   void write_double(Wave& w, const Inst& in, uint32_t lane, double v) {
+    if (in.arch == gcn::Target::Gfx1030 && v != v) v = as_double(rdna2_nan(w, in, lane, 64u, as_bits(v)));
     if (in.omod && !omod_ignored(w, in, 7)) {
       if (omod_rules(in) && v == 0) v = 0.0;
       v *= in.omod == 1 ? 2.0 : in.omod == 2 ? 4.0 : 0.5;
@@ -4037,6 +4102,20 @@ struct Machine {
     const auto f32 = [&](uint32_t k, uint32_t lane) { return lane_float(w, in.src[k], lane); };
     const auto i32 = [&](uint32_t k, uint32_t lane) { return static_cast<int32_t>(src(k, lane)); };
     switch (op.hash()) {
+  case "v_fma_dx9_zero_f32"_op.hash: case "v_fmac_dx9_zero_f32"_op.hash:
+    if (!(op == "v_fma_dx9_zero_f32"_op || op == "v_fmac_dx9_zero_f32"_op)) goto L_ladder_14;
+    {
+      // gfx1030's v_fma_legacy_f32 and v_fmac_legacy_f32 (the decoder knows them by gfx11's names; gfx11 and gfx1250 are left as they were):
+      // "0.0 * x = 0.0" (RDNA2 guide), the product of a zero and anything, an infinity or a NaN included, a +0, then the addend added (an
+      // RX 6800 and an RX 6700 XT, test_amd_gcn_nan2: 0 * NaN + -0 is +0, a NaN addend the NaN rule's, rdna2_nan).
+      if (in.arch != gcn::Target::Gfx1030) goto L_ladder_14;   // (as before: the other targets do not run them here)
+      each([&](uint32_t lane) {
+        const float x = f32(0, lane), y = f32(1, lane);
+        const float z = op == "v_fmac_dx9_zero_f32"_op ? as_float(lane_src(w, in.dst[0], lane)) : f32(2, lane);
+        write_float(w, in, lane, x == 0.0f || y == 0.0f ? 0.0f + z : std::fma(x, y, z));
+      });
+    }
+    break;
   case "v_and_b16"_op.hash: case "v_or_b16"_op.hash: case "v_xor_b16"_op.hash:
     if (!(op == "v_and_b16"_op || op == "v_or_b16"_op || op == "v_xor_b16"_op)) goto L_ladder_14;
     {
@@ -5913,19 +5992,25 @@ struct Machine {
                     // (an RX 6800 flushes a denormal addend, whatever MODE says, and keeps denormal halves)
                     if (in.arch == gcn::Target::Gfx1030 && std::fpclassify(c) == FP_SUBNORMAL) c = std::copysign(0.0f, c);
                     double sum = dot_flush_float(in, (in.neg_lo >> 2) & 1 ? -double(c) : double(c));
+                    const double addend = sum;
+                    double p[2];
                     for (uint32_t h = 0; h < 2; ++h) {
                       _Float16 a, b;
                       const uint16_t ab = packed_bits(w, in, 0, h, lane), bb = packed_bits(w, in, 1, h, lane);
                       std::memcpy(&a, &ab, 2);
                       std::memcpy(&b, &bb, 2);
                       const uint8_t neg = h ? in.neg_hi : in.neg_lo;
-                      { const double X = dot_flush_half(in, neg & 1 ? -double(a) : double(a)), Y = dot_flush_half(in, neg & 2 ? -double(b) : double(b)); sum = first_add(first_mul(X, Y), sum); }
+                      { const double X = dot_flush_half(in, neg & 1 ? -double(a) : double(a)), Y = dot_flush_half(in, neg & 2 ? -double(b) : double(b)); p[h] = first_mul(X, Y); sum = first_add(p[h], sum); }
                     }
+                    // gfx1030: the two products' sum, then the addend, as its v_dot2c_f32_f16 (an RX 6800: 1 * 2^-14ish + 1 * -2^-14ish + c
+                    // is c, where adding c first lost it)
+                    if (in.arch == gcn::Target::Gfx1030) sum = first_add(first_add(p[0], p[1]), addend);
                     // Its clamp bit does not hold the result to [0, 1], as other float
                     // results' does: hip-tests' amd_mixed_dot({1, 3}, {3, 3}, 2, true)
                     // is 14 on a card, and the compiler takes the clamped form for the
                     // unclamped one.
-                    write_lane(w, in.dst[0], lane, as_bits(dot_flush_out(in, sum)));
+                    const float r = dot_flush_out(in, sum);
+                    write_lane(w, in.dst[0], lane, in.arch == gcn::Target::Gfx1030 && r != r ? rdna2_dot2_nan(w, in, lane, false) : as_bits(r));
                   });
                 }
                 break;
@@ -7192,7 +7277,8 @@ struct Machine {
           const double p0 = first_mul(X0, Y0), p1 = first_mul(Y1, X1);
           sum = first_add(first_add(p0, p1), c);
         }
-        write_lane(w, in.dst[0], lane, as_bits(dot_flush_out(in, sum)));
+        const float r = dot_flush_out(in, sum);
+        write_lane(w, in.dst[0], lane, in.arch == gcn::Target::Gfx1030 && r != r ? rdna2_dot2_nan(w, in, lane, true) : as_bits(r));
       });
     }
     break;
@@ -7298,7 +7384,8 @@ struct Machine {
     if (!(op == "v_cvt_f32_f64_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, static_cast<float>(as_double(lane_src64(w, in.src[0], lane))));
+        // (lane_double: the source's abs and neg, which an RX 6800 applies, test_amd_gcn_nan2's -v[26:27])
+        write_float(w, in, lane, static_cast<float>(lane_double(w, in.src[0], lane)));
       });
     }
     break;
@@ -7341,9 +7428,10 @@ struct Machine {
     {
       each([&](uint32_t lane) {
         // The middle source is the constant the instruction carries.
-        write_lane(w, in.dst[0], lane,
-                   as_bits(nan_fma<2>(lane_float(w, in.src[0], lane), as_float(static_cast<uint32_t>(in.src[1].value)),
-                                    lane_float(w, in.src[2], lane))));
+        // (write_float: gfx1030's NaN, rdna2_nan; the short form has no clamp or output modifier)
+        write_float(w, in, lane,
+                    nan_fma<2>(lane_float(w, in.src[0], lane), as_float(static_cast<uint32_t>(in.src[1].value)),
+                               lane_float(w, in.src[2], lane)));
       });
     }
     break;
@@ -7654,6 +7742,7 @@ struct Machine {
       if (packed_f16_wave(w, in, op == "v_pk_fma_f16"_op ? packed::Op::Fma : op == "v_pk_add_f16"_op ? packed::Op::Add
                                  : op == "v_pk_mul_f16"_op ? packed::Op::Mul : op == "v_pk_min_f16"_op ? packed::Op::Min : packed::Op::Max))
         break;
+      const bool rdna2 = in.arch == gcn::Target::Gfx1030, pk_minmax = op == "v_pk_min_f16"_op || op == "v_pk_max_f16"_op;
       each([&](uint32_t lane) {
         // Two halves in one register, each its own arithmetic, done in float
         // -- which holds a product of two halves exactly -- and rounded once
@@ -7666,6 +7755,7 @@ struct Machine {
               return static_cast<uint16_t>(((half ? in.neg_hi : in.neg_lo) >> k) & 1 ? b ^ 0x8000 : b);
             };
             uint16_t rb = gfx9_minmax_half(bits_of(0), bits_of(1), op == "v_pk_min_f16"_op, (w.mode >> 9) & 1);
+            if (rdna2 && (rb & 0x7FFFu) > 0x7C00u) rb = rdna2_pk_nan(w, in, lane, half, false, true);
             if (in.clamp) rb = as_bits(static_cast<_Float16>(clamp01(static_cast<float>(as_half(rb)))));
             r |= static_cast<uint32_t>(rb) << (16 * half);
             continue;
@@ -7677,6 +7767,7 @@ struct Machine {
                           : op == "v_pk_max_f16"_op ? (ieee_minmax(in) || in.arch == gcn::Target::Gfx1250 ? hw_max(in, w.mode, x, y) : packed::pk_fmaxf(x, y))
                                                  : std::fma(x, y, packed_half(w, in, 2, half, lane));
           _Float16 h = half_out(w, static_cast<_Float16>(in.clamp ? clamp01(v) : v));
+          if (rdna2 && h != h) h = as_half(rdna2_pk_nan(w, in, lane, half, op == "v_pk_fma_f16"_op, pk_minmax));
           if (std::isinf(static_cast<float>(h)) && fp16_ovfl(w, in) && std::isfinite(x) && std::isfinite(y) &&
               (op != "v_pk_fma_f16"_op || std::isfinite(packed_half(w, in, 2, half, lane))) && op != "v_pk_min_f16"_op && op != "v_pk_max_f16"_op)
             h = static_cast<_Float16>(std::signbit(static_cast<float>(h)) ? -65504.0f : 65504.0f);
