@@ -7,9 +7,11 @@
 # F2FP.PACK_AB of a NaN, F2FP.RELU of -0 and the NaN of DADD/DMUL/DFMA given a negated NaN; the PTX engine on
 # cvt.rmi.ftz.s32.f32 of a negative subnormal.)
 #
-# Other architectures (docs/matrix-numerics.md): an A10G (sm_86), an L4 and an L40S (sm_86 and sm_89 builds) print the RTX 3060's 169
-# lines, measured 2026-11-15. So an sm_89 build on the l4 and l40s profiles, an sm_86 build on a10g and an sm_80 build on a100 (no card:
-# the FTTN paper's A100 row, for the tensor lines) must print them too, on both engines. An sm_75 build (-DNO80: the program without what
+# Other architectures (docs/matrix-numerics.md): an A10G (sm_86), an A100 (sm_80), an L4 and an L40S (sm_86 and sm_89 builds) print the
+# RTX 3060's 169 lines, measured 2026-11-15. So an sm_89 build on the l4 and l40s profiles, an sm_86 build on a10g and an sm_80 build on
+# a100 must print them too, on both engines. An H100 PCIe prints its own file (nvidia/tests/data/float_half_forms.h100.txt): the 14
+# mma_ lines of random operands differ from the RTX 3060's (its tensor core sums in chunks of 16 and cuts one bit lower), the 30 mma_edge
+# cases and every other line are the same; an sm_90 build on the h100 profile must print that file. An sm_75 build (-DNO80: the program without what
 # sm_75 lacks) on the t4 profile must print the lines that remain. No Turing card has run this program yet: its sm_75 lines are the
 # simulator's two engines against the RTX 3060's file, and one line is known to be open -- half_form_30, where ptxas for sm_75 folds
 # __hmul2 and __half2float into one HMUL2.F32 and the SASS executor's answer differs from the PTX engine's and the RTX 3060's line. It
@@ -52,10 +54,11 @@ if [[ "${1:-}" == --card ]]; then
     (( cap == 86 )) || { echo "--update rewrites the RTX 3060's file: run it on an sm_86 card (this one is sm_$cap)"; exit 1; }
     cp "$out/card.txt" "$data/float_half_forms.rtx3060.txt"; echo "wrote float_half_forms.rtx3060.txt"; exit 0
   fi
-  lines_for "$cap" "$data/float_half_forms.rtx3060.txt" > "$out/want.txt"
+  card_file="$data/float_half_forms.rtx3060.txt"; (( cap == 90 )) && card_file="$data/float_half_forms.h100.txt"
+  lines_for "$cap" "$card_file" > "$out/want.txt"
   lines_for "$cap" "$out/card.txt" > "$out/card1.txt"
-  diff "$out/want.txt" "$out/card1.txt" && { echo "PASS (card, sm_$cap, $(wc -l < "$out/card1.txt") lines)"; exit 0; }
-  echo "FAIL: the card (sm_$cap) disagrees with float_half_forms.rtx3060.txt"; exit 1
+  diff "$out/want.txt" "$out/card1.txt" && { echo "PASS (card, sm_$cap, $(wc -l < "$out/card1.txt") lines, $(basename "$card_file"))"; exit 0; }
+  echo "FAIL: the card (sm_$cap) disagrees with $(basename "$card_file")"; exit 1
 fi
 shopt -s nullglob
 cudart_libs=("$shim"/libcudart.so.[0-9]*)
@@ -90,8 +93,10 @@ for engine in sass ptx; do
   done
 done
 # The other architectures whose cards print these lines (sm_80: the paper), default SIMD level, both engines.
-for pair in 75:t4 80:a100 86:a10g 89:l4 89:l40s; do
+for pair in 75:t4 80:a100 86:a10g 89:l4 89:l40s 90:h100; do
   a="${pair%%:*}"; gpu="${pair##*:}"
+  card="$data/float_half_forms.rtx3060.txt"
+  [[ $gpu == h100 ]] && card="$data/float_half_forms.h100.txt"
   if ! build_arch "$a" "$out/app$a" $(shim_sanitizer_nvcc_flags "$shim") 2> "$out/build$a.txt"; then
     echo "SKIP sm_$a: this toolkit does not build it ($(head -1 "$out/build$a.txt"))"; continue
   fi
@@ -104,7 +109,7 @@ for pair in 75:t4 80:a100 86:a10g 89:l4 89:l40s; do
     drop=(-e '^\[vgpu\]')
     [[ $engine == ptx ]] && drop+=(-e 'sassonly_')
     [[ $a == 75 && $engine == sass ]] && drop+=(-e '^half_form_30 ')   # (open: HMUL2.F32 on sm_75, see the head of this file)
-    lines_for "$a" "$data/float_half_forms.rtx3060.txt" | grep -v "${drop[@]}" > "$out/want.txt"
+    lines_for "$a" "$card" | grep -v "${drop[@]}" > "$out/want.txt"
     lines_for "$a" "$out/sim.txt" | grep -v "${drop[@]}" > "$out/sim1.txt" || true
     if diff "$out/want.txt" "$out/sim1.txt" > "$out/d.txt"; then
       echo "ok   sm_$a $gpu $engine ($(wc -l < "$out/sim1.txt") lines)"
@@ -113,4 +118,8 @@ for pair in 75:t4 80:a100 86:a10g 89:l4 89:l40s; do
     fi
   done
 done
+# The H100's file differs from the RTX 3060's on the mma_ lines of random operands and on nothing else.
+if { diff "$data/float_half_forms.rtx3060.txt" "$data/float_half_forms.h100.txt" || true; } | grep '^>' | grep -v -E '^> mma_(f16|f16acc|bf16|tf32)_k(4|8|16) ' > "$out/d.txt"; then
+  echo "FAIL: float_half_forms.h100.txt differs from the RTX 3060's on lines that are not tensor-core sums:"; head -5 "$out/d.txt"; fails=1
+fi
 (( fails == 0 )) && echo PASS || { echo FAIL; exit 1; }

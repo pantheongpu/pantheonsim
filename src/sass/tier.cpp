@@ -347,7 +347,7 @@ const FormImpl& form_impl(Form f) {
       {Impl::Own, "USHF: uniform datapath, shift"},
       {Impl::Own, "UFLO, UPOPC: uniform datapath, bit counts"},
       {Impl::Own, "USEL: uniform datapath, a select"},
-      {Impl::Kernel, "hmma, with the kind from Runner::hmma_kernel_kind (VGPU_TC_EXACT and the sm_86 tensor-core model), as exec_mma calls it"},
+      {Impl::Kernel, "hmma, with the kind from Runner::hmma_kernel_kind (VGPU_TC_EXACT and the device's tensor-core sum model), as exec_mma calls it"},
       {Impl::Own, "MATCH: lane-value equality classes of 32- or 64-bit integers, no format"},
       {Impl::Own, "LDSM: 32-bit words of the block's shared memory moved into the fragment registers; faults and the slow cases go to exec_mem"},
       {Impl::Own, "IMMA: integer products summed in 64 bits and cut to 32 (or clamped per 128 bits under .SAT), no number format"},

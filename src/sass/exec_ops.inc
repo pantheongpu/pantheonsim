@@ -5310,7 +5310,8 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
     }
   double D[16 * kN] = {};
   // On those devices the f16, bf16 and tf32 products sum as an RTX 3060's tensor core does (vgpu/exec/tc_ampere.hpp): the whole tile first.
-  const bool tc86_sum = vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) && ins.op == Op::HMMA && !sparse && (at == MmaT::F16 || at == MmaT::BF16 || at == MmaT::TF32) && bt == at &&
+  const vgpu::exec::tc86::SumRule* const tc_rule = vgpu::exec::tc86::sum_rule(profile_.cc_major, profile_.cc_minor);
+  const bool tc86_sum = tc_rule && ins.op == Op::HMMA && !sparse && (at == MmaT::F16 || at == MmaT::BF16 || at == MmaT::TF32) && bt == at &&
                         (acc == AccF32 || acc == AccF16) && K <= 16 && K % (at == MmaT::TF32 ? 4 : 8) == 0;
   float Dtc[16 * kN] = {};
   if (tc86_sum) {
@@ -5318,7 +5319,7 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
     for (unsigned x = 0; x < M * K; ++x) Af[x] = static_cast<float>(A[x]);
     for (unsigned x = 0; x < K * kN; ++x) Bf[x] = static_cast<float>(B[x]);
     for (unsigned x = 0; x < M * kN; ++x) Cf[x] = static_cast<float>(C[x]);
-    vgpu::exec::tc86::mma(M, kN, K, at == MmaT::TF32 ? 4 : 8, at == MmaT::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide,
+    vgpu::exec::tc86::mma(*tc_rule, at == MmaT::TF32, M, kN, K, at == MmaT::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide,
                           acc == AccF16, Af, K, Bf, kN, Cf, kN, Dtc, kN);
   }
   const auto narrow_elem = [](MmaT t) {

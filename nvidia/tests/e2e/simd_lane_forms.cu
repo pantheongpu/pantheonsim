@@ -7,6 +7,8 @@
 //
 // -DNO80 leaves out the bf16 and tf32 tensor forms (four lines: wmma_bf16_f32acc and wmma_tf32_f32acc, random and edges), which
 // mma.h does not define below sm_80: the form a Turing card (sm_75) can build. Its other 56 lines are the same lines.
+// -DTC_DUMP also writes the tensor-core part's inputs and results to ./dump/ (with -DTILES=4096: 1,048,576 results a form), the
+// data a sum rule is fitted to and checked against (tools/fttn/fit_tc_model.py, tools/fttn/tc_dump_check.cpp).
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -207,7 +209,10 @@ int main() {
       if (run(dn[f], [&] { k_double<<<kN / 128, 128>>>(da, db, dc, dout, f); }, 2 * kN)) return 1;
     // tensor core: 64 tiles
     {
-      const int tiles = 64;
+#ifndef TILES
+#define TILES 64   // (the pinned lines are for 64; -DTILES=4096 with -DTC_DUMP is the million-result dump a model is fitted to)
+#endif
+      const int tiles = TILES;
       const auto ha = half_pairs(61 + style, tiles * 128), hb = half_pairs(71 + style, tiles * 128), hc = half_pairs(81 + style, tiles * 128);
       std::vector<uint32_t> bfa(tiles * 128), bfb(tiles * 128);
       for (int i = 0; i < tiles * 128; ++i) {
@@ -218,6 +223,16 @@ int main() {
       }
       const auto fc = words(111 + style, tiles * 512, style);
       uint32_t *pa = upload(ha), *pb = upload(hb), *pc = upload(hc), *pfc = upload(fc), *pba = upload(bfa), *pbb = upload(bfb);
+#ifdef TC_DUMP   // the tensor-core inputs and every result word, into ./dump/ (which must exist): tools/fttn/fit_tc_model.py reads them
+      {
+        const auto dumpv = [&](const char* n, const std::vector<uint32_t>& v) {
+          char p[256];
+          std::snprintf(p, sizeof p, "dump/in.%s.%s.bin", n, sn);
+          if (FILE* f = std::fopen(p, "wb")) { std::fwrite(v.data(), 4, v.size(), f); std::fclose(f); }
+        };
+        dumpv("ha", ha); dumpv("hb", hb); dumpv("hc", hc); dumpv("fc", fc); dumpv("bfa", bfa); dumpv("bfb", bfb);
+      }
+#endif
       uint32_t* pd;
       CK(cudaMalloc(&pd, tiles * 256 * 4));
       std::vector<uint32_t> d(tiles * 256);
@@ -227,6 +242,11 @@ int main() {
         cudaDeviceSynchronize();
         cudaMemcpy(d.data(), pd, n * 4, cudaMemcpyDeviceToHost);
         std::printf("%-22s %s %016llx\n", name, sn, (unsigned long long)fnv(d.data(), n * 4));
+#ifdef TC_DUMP
+        char p[256];
+        std::snprintf(p, sizeof p, "dump/out.%s.%s.bin", name, sn);
+        if (FILE* f = std::fopen(p, "wb")) { std::fwrite(d.data(), 4, n, f); std::fclose(f); }
+#endif
       };
       k_wmma<__half, float><<<tiles, 32>>>((const __half*)pa, (const __half*)pb, (const float*)pfc, (float*)pd);
       CK(cudaGetLastError());

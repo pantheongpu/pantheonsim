@@ -23,17 +23,23 @@
 #   nvidia/tests/data/simd_lane_forms.t4.txt               a Tesla T4's lines (sm_75, built with -DNO80: 56 lines, no bf16 or tf32 tensor form).
 #                                                           They are the RTX 3060's lines, which this script checks.
 #
-# The other architectures (docs/matrix-numerics.md): an A10G (sm_86), an L4 and an L40S (sm_86 and sm_89 builds) print the RTX 3060's
-# 60 lines and a Tesla T4 its 56, measured 2026-11-15. So the same program built for sm_75 (-DNO80), sm_80 and sm_89 must print the
-# card's lines on the t4 / rtx2080ti, a100 and l4 / l40s profiles on both engines, and the sequential pins with VGPU_TC_EXACT=0 (sm_80
-# has no card behind it: the FTTN paper's A100 row). On the profiles that keep the sequential sum (h100, b200, rtx-pro-6000: not
-# measured) an sm_90, sm_100 or sm_120 build prints the sequential pins by default and the card's lines with VGPU_TC_EXACT=force. An
-# sm_86 build on the h100 profile prints the sequential pins on both engines: the device chooses the sum, not what the cubin was built for.
+#   nvidia/tests/data/simd_lane_forms.h100.txt             an H100 PCIe's lines (sm_90; the same from sm_80, sm_86 and sm_89 builds run on it).
+#                                                           The 53 lines that are not tensor-core sums are the RTX 3060's, and so is
+#                                                           wmma_f16_f32acc edges; the other seven wmma lines are its own: an H100
+#                                                           sums in chunks of 16 products and cuts one bit lower (tc_ampere.hpp).
+#
+# The other architectures (docs/matrix-numerics.md): an A10G (sm_86), an A100 (sm_80), an L4 and an L40S (sm_86 and sm_89 builds) print
+# the RTX 3060's 60 lines and a Tesla T4 its 56, measured 2026-11-15. So the same program built for sm_75 (-DNO80), sm_80 and sm_89 must
+# print the card's lines on the t4 / rtx2080ti, a100 and l4 / l40s profiles on both engines, and the sequential pins with
+# VGPU_TC_EXACT=0. An sm_90 build on the h100 profile must print the H100's lines, and so must an sm_86 build there: the device chooses
+# the sum, not what the cubin was built for. On the profiles that keep the sequential sum (b200, rtx-pro-6000: not measured) an sm_100
+# or sm_120 build prints the sequential pins by default and the RTX 3060's lines with VGPU_TC_EXACT=force.
 #
 #   run_simd_lane_forms.sh                  simulator vs the pinned files, with the tensor-core model on (the default) and off
 #   run_simd_lane_forms.sh --card [--update]   NVIDIA's runtime on a real GPU vs the card file (or rewrite it). The program is built for
 #                                              the card's own architecture (nvidia-smi's compute_cap; VGPU_CARD_ARCH=86 overrides), with
-#                                              -DNO80 below sm_80, where the four bf16 and tf32 lines are left out of the comparison.
+#                                              -DNO80 below sm_80, where the four bf16 and tf32 lines are left out of the comparison;
+#                                              an sm_90 card is held to the H100's file. $VGPU_CARD_OUT, if set, receives the card's lines.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -64,9 +70,11 @@ if [[ "${1:-}" == --card ]]; then
     (( cap == 86 )) || { echo "--update rewrites the RTX 3060's file: run it on an sm_86 card (this one is sm_$cap)"; exit 1; }
     cp "$out/card.txt" "$data/simd_lane_forms.rtx3060.txt"; echo "wrote simd_lane_forms.rtx3060.txt"; exit 0
   fi
-  want_for "$cap" "$data/simd_lane_forms.rtx3060.txt" > "$out/want.txt"
-  diff "$out/want.txt" "$out/card.txt" && { echo "PASS (card, sm_$cap, $(wc -l < "$out/card.txt") lines)"; exit 0; }
-  echo "FAIL: the card (sm_$cap) disagrees with simd_lane_forms.rtx3060.txt"; exit 1
+  [[ -n "${VGPU_CARD_OUT:-}" ]] && cp "$out/card.txt" "$VGPU_CARD_OUT"
+  card_file="$data/simd_lane_forms.rtx3060.txt"; (( cap == 90 )) && card_file="$data/simd_lane_forms.h100.txt"
+  want_for "$cap" "$card_file" > "$out/want.txt"
+  diff "$out/want.txt" "$out/card.txt" && { echo "PASS (card, sm_$cap, $(wc -l < "$out/card.txt") lines, $(basename "$card_file"))"; exit 0; }
+  echo "FAIL: the card (sm_$cap) disagrees with $(basename "$card_file")"; exit 1
 fi
 shopt -s nullglob
 cudart_libs=("$shim"/libcudart.so.[0-9]*)
@@ -143,17 +151,24 @@ for a in 75 80 89 90 100 120; do
     echo "SKIP sm_$a: this toolkit does not build it ($(head -1 "$out/build$a.txt"))"; rm -f "$out/app$a"
   fi
 done
-# Measured on a card (sm_80: the FTTN paper): the card's lines by default, the sequential pins with the model off.
-for pair in 75:t4 75:rtx2080ti 80:a100 86:a10g 89:l4 89:l40s 80:rtx3060 86:l4; do
+# Measured on a card: the card's lines by default, the sequential pins with the model off.
+for pair in 75:t4 75:rtx2080ti 80:a100 86:a10g 89:l4 89:l40s 80:rtx3060 86:l4 90:h100 86:h100 89:h100; do
   a="${pair%%:*}"; gpu="${pair##*:}"
   [[ -x "$out/app$a" ]] || continue
+  card="$data/simd_lane_forms.rtx3060.txt"
+  [[ $gpu == h100 ]] && card="$data/simd_lane_forms.h100.txt"
   for engine in sass ptx; do
-    run_case "card lines" "$out/app$a" "$a" "$gpu" "$engine" "$data/simd_lane_forms.rtx3060.txt"
+    run_case "card lines" "$out/app$a" "$a" "$gpu" "$engine" "$card"
     run_case "VGPU_TC_EXACT=0" "$out/app$a" "$a" "$gpu" "$engine" "$data/simd_lane_forms.$engine.tcseq.txt" VGPU_TC_EXACT=0
+    [[ $gpu == h100 ]] && run_case "VGPU_TC_EXACT=force (the H100's own rule still)" "$out/app$a" "$a" "$gpu" "$engine" "$card" VGPU_TC_EXACT=force
   done
 done
-# Not measured: the sequential sum by default, the card's rule only when forced. (86:h100: the device decides, not the cubin.)
-for pair in 90:h100 100:b200 120:rtx-pro-6000 86:h100; do
+# The H100's lines differ from the RTX 3060's on seven tensor-core lines and on no other line.
+changed="$( { diff "$data/simd_lane_forms.rtx3060.txt" "$data/simd_lane_forms.h100.txt" || true; } | { grep '^>' || true; } | awk '{print $2 "." $3}' | tr '\n' ' ')"
+want_changed="wmma_f16_f32acc.random wmma_f16_f16acc.random wmma_bf16_f32acc.random wmma_tf32_f32acc.random wmma_f16_f16acc.edges wmma_bf16_f32acc.edges wmma_tf32_f32acc.edges "
+if [[ "$changed" != "$want_changed" ]]; then echo "FAIL: simd_lane_forms.h100.txt differs from the RTX 3060's on: $changed"; fails=1; fi
+# Not measured: the sequential sum by default, the RTX 3060's rule only when forced.
+for pair in 100:b200 120:rtx-pro-6000 86:b200; do
   a="${pair%%:*}"; gpu="${pair##*:}"
   [[ -x "$out/app$a" ]] || continue
   for engine in sass ptx; do

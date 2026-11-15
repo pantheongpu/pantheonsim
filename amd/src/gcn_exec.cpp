@@ -699,6 +699,11 @@ struct Machine {
   };
   // Whether the matrix instructions take the tile path (set_matrix_fast_path); read once, as the machine is made.
   bool matrix_fast = matrix_fast_path();
+  // Whether gfx90a's binary16 and bfloat16 MFMA forms sum as the FTTN paper reports of an MI250X (cdna2_matrix_model; mfma_math.hpp): opt-in.
+  const bool cdna2_seq = cdna2_matrix_model();
+  bool cdna2_sum(char in, char in_b, char out) const {
+    return cdna2_seq && out == 'f' && (in == 'h' || in == 'b') && (in_b == 0 || in_b == in) && target() == gcn::Target::Gfx90a;
+  }
   // Across threads, an atomic on an ordinary word of device memory is a compare-and-swap on the word, not a lock.
   const bool lock_free = atomics_lock_free(), runs_on = memory_runs();
   // The pre-decoded tier (gcn_tier.cpp) runs when it is on and nothing watches instructions one at a time (VGPU_TRACE_WAVE, the debugger).
@@ -12247,6 +12252,12 @@ struct Machine {
       if (ta == 'f' && std::any_of(plan.fa.begin(), plan.fa.end(), denormal)) return false;
       if (tb == 'f' && std::any_of(plan.fbk.begin(), plan.fbk.end(), denormal)) return false;
     }
+    const bool seq32 = !sparse && !in.scaled && cdna2_sum(s.in, s.in_b, s.out);
+    if (seq32) {   // (an MI250X reads a subnormal binary16 or bfloat16 as zero)
+      const double min_normal = s.in == 'h' ? 0x1p-14 : 0x1p-126;
+      cdna2_flush_inputs(plan.fa.data(), plan.fa.size(), min_normal);
+      cdna2_flush_inputs(plan.fbk.data(), plan.fbk.size(), min_normal);
+    }
     if (plan.runs_ok) {
       // (C by runs of consecutive columns: the lanes of a run are one slice of the tile's row)
       for (const MatrixPlan::Run& u : plan.runs) {
@@ -12273,12 +12284,14 @@ struct Machine {
         for (uint32_t r = 0; r < outs; ++r) plan.fc[place[r]] = static_cast<double>(as_float(c_reg ? crows[r][lane] : cconst));
       }
     }
+    if (seq32) cdna2_flush_inputs(plan.fc.data(), plan.fc.size(), 0x1p-126);   // (and a subnormal accumulator)
     for (uint32_t ob = 0; ob < s.blocks; ++ob) {
       const double* const a = plan.fa.data() + size_t{ob} * s.m * s.k;
       const double* const b = plan.fbk.data() + size_t{ob} * s.k * s.n;
       const double* const c = plan.fc.data() + size_t{ob} * s.m * s.n;
       double* const o = plan.fo.data() + size_t{ob} * s.m * s.n;
       if (s.out == 'd') mfma_tile_fma(s.m, s.n, s.k, a, b, c, o);
+      else if (seq32) cdna2_tile_seq32<kMfmaOrder>(s.m, s.n, s.k, a, b, c, o);
       else mfma_tile_f(s.m, s.n, s.k, a, b, c, o);
     }
     for (uint32_t k = 0; k < cwords; ++k) drows[k] = row_of(dst, k);
@@ -12498,11 +12511,30 @@ struct Machine {
         for (uint32_t r = 0; r < outs; ++r) cp[place[r]] = value(sparse ? in.dst[0] : in.src[2], s.out, r, lane) * sign_c;
       }
     }
+    // gfx90a's binary16 and bfloat16 forms as the FTTN paper reports of an MI250X (mfma_math.hpp): subnormals read as zero, then
+    // one binary32 rounding a product.
+    const bool seq32 = !sparse && !in.scaled && cdna2_sum(s.in, s.in_b, s.out);
+    if (seq32) {
+      const double min_normal = s.in == 'h' ? 0x1p-14 : 0x1p-126;
+      cdna2_flush_inputs(ap, plan.a.size(), min_normal);
+      cdna2_flush_inputs(bp, plan.b.size(), min_normal);
+      cdna2_flush_inputs(cp, plan.c.size(), 0x1p-126);
+    }
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const uint32_t* const cs = &plan.c_off[size_t{lane} * outs];
       const uint32_t* const as = &plan.a_off[size_t{lane} * outs];
       const uint32_t* const bs = &plan.b_off[size_t{lane} * outs];
       uint32_t r = 0;
+      if (seq32) {
+        for (; r < outs; ++r) {
+          double sum = cdna2_dot_seq32(ap + as[r], bp + bs[r], 1, s.k, cp[cs[r]]);
+          if (sum != sum) {
+            const double d = mfma_dot_ordered(ap + as[r], bp + bs[r], s.k, cp[cs[r]]);
+            if (d != d) sum = d;
+          }
+          set_word(w, in.dst[0], r, lane, as_bits(static_cast<float>(sum)));
+        }
+      }
       // Float results four at a time: four sums with nothing between them, each taken in the order it always was.
       if (s.out == 'f' && !sparse) {   // (the sparse forms sum only the products A's indices keep: below)
         for (; r + 4 <= outs; r += 4) {
@@ -14392,6 +14424,19 @@ uint64_t matrix_tile_count() { return g_matrix_tiles; }
 uint64_t vgpr_files_made() { return g_vgpr_files_made.load(std::memory_order_relaxed); }
 unsigned default_workers() { return worker_count(~uint64_t{0}); }
 void set_matrix_fast_path(bool on) { g_matrix_fast.store(on); }
+namespace {
+std::atomic<int> g_cdna2_model{-1};   // -1: as the environment says
+}
+bool cdna2_matrix_model() {
+  const int v = g_cdna2_model.load(std::memory_order_relaxed);
+  if (v >= 0) return v != 0;
+  static const bool from_env = [] {
+    const char* e = std::getenv("VGPU_MFMA_CDNA2");
+    return e && (e[0] == 'f' || e[0] == 'F');   // "fttn": off unless asked for
+  }();
+  return from_env;
+}
+void set_cdna2_matrix_model(int on) { g_cdna2_model.store(on); }
 
 void abandon_dispatches() { g_abandoned.store(true); }
 bool dispatches_abandoned() { return g_abandoned.load(); }

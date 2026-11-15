@@ -2444,6 +2444,13 @@ target_compile_definitions(test_amd_hipcc_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_S
 
 vgpu_unit_test(test_amd_hipcc_mfma amd/tests/unit/test_hipcc_mfma.cpp)
 target_compile_definitions(test_amd_hipcc_mfma PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The opt-in rule for gfx90a's binary16 and bfloat16 matrix instructions, what the FTTN paper's summary of an MI250X reads as
+# (subnormals as zero, a binary32 rounding after every product): the paper's ten tests as fixed vectors and its motivating GEMM, on
+# and off; gfx942 unchanged; and once more with VGPU_MFMA_CDNA2=fttn in the environment, the switch a user has (docs/matrix-numerics.md).
+vgpu_unit_test(test_amd_cdna2_matrix amd/tests/unit/test_cdna2_matrix.cpp)
+target_compile_definitions(test_amd_cdna2_matrix PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME test_amd_cdna2_matrix_switched_on COMMAND test_amd_cdna2_matrix)
+set_tests_properties(test_amd_cdna2_matrix_switched_on PROPERTIES ENVIRONMENT "VGPU_MFMA_CDNA2=fttn")
 
 vgpu_unit_test(test_amd_gcn_globals amd/tests/unit/test_gcn_globals.cpp)
 target_compile_definitions(test_amd_gcn_globals PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

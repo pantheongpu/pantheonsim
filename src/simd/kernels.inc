@@ -115,7 +115,8 @@ inline void transpose8x8(float* dst, const float* src) {
 void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const uint32_t* b, const uint32_t* c,
             uint32_t* out) {
   // Bit 4 of `kind` asks for an RTX 3060's tensor-core sum (vgpu/exec/tc_ampere.hpp) in place of the sequential f32 one.
-  const bool ampere = (kind & 16) != 0;
+  // Bit 5 asks for an H100's (the same rule in chunks of 16, tf32 8, cut one bit lower: tc86::kHopperRule), which has the general form only.
+  const bool ampere = (kind & vgpu::exec::tc86::kKindAmpere) != 0, hopper = (kind & vgpu::exec::tc86::kKindHopper) != 0;
   kind &= 3;
 #if VGPU_SIMD_AVX2 && defined(VGPU_TC86_AVX2)
   // f16 and bf16 operands, f32 accumulator, at the AVX-512 level: the 512-bit float-product kernel straight from the registers (no row-major copies of
@@ -169,6 +170,9 @@ void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const ui
   if (ampere) {
     vgpu::exec::tc86::mma(16, 8, K, kind == 2 ? 4 : 8, kind == 0 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide, acc_f16, A, K, Bm, 8, Cm, 8,
                           Dm, 8);
+  } else if (hopper) {
+    vgpu::exec::tc86::mma(vgpu::exec::tc86::kHopperRule, kind == 2, 16, 8, K, kind == 0 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide, acc_f16,
+                          A, K, Bm, 8, Cm, 8, Dm, 8);
   } else
   for (unsigned i0 = 0; i0 < 16; i0 += 4) {
     V8f acc0, acc1, acc2, acc3;
