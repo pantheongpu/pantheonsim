@@ -7,6 +7,7 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- NVIDIA runtime: `cudaStreamWaitEvent` on an event that is still pending keeps the stream waiting after `cudaEventDestroy` of that event, as on a card. A wait (and a queued record) used to look the event up by its handle when the stream's worker reached it, found it destroyed and took it for complete, so the waiting stream ran early. This is what made Ta-Cuda's batch tests (tacuda#5) fail now and then under the default asynchronous launches and pass with `VGPU_ASYNC_LAUNCH=0`. The queued item now holds the event's state itself.
 - AMD counters: the `VGPU_DISPATCH_STATS` line now ends with the bytes the active lanes ask for (`vmem_bytes_rd`, `vmem_bytes_wr`, `lds_bytes_rd`, `lds_bytes_wr`),
   the vector instruction mix (`mix=`), the matrix work by type (`mops=`) and the kernel's name (`kernel=`). The mix and the matrix work were already counted
   and are now printed; the bytes are new. A reader that splits the line on `=` and converts every value to a number must skip the text fields
