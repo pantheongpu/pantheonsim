@@ -47,12 +47,12 @@ what, how changes get in, and how that will change as more people contribute.
   - Programs run unmodified. A test that passes on a real GPU should pass on the
     simulator without being edited.
   - Anything the simulator does not support fails with an error that names what
-    is missing. It never silently does the wrong thing. Known violations:
-    `shfl.sync` returned 0 without an error for a lane still in a long loop
-    ([#488](https://github.com/pantheongpu/pantheonsim/issues/488); fixed on
-    `main` by #527, still in the v0.2.0 release), and `cudaDeviceCanAccessPeer`
-    reports peer access that a kernel then cannot use
-    ([#598](https://github.com/pantheongpu/pantheonsim/issues/598)). Each one
+    is missing. It never silently does the wrong thing. There is no known open
+    violation. The v0.2.0 release had two, fixed in v0.2.1: `shfl.sync` returned 0
+    without an error for a lane still in a long loop
+    ([#488](https://github.com/pantheongpu/pantheonsim/issues/488)), and
+    `cudaDeviceCanAccessPeer` reported peer access that a kernel then could not use
+    ([#598](https://github.com/pantheongpu/pantheonsim/issues/598)). A violation
     is listed in [docs/status.md](docs/status.md) until it is fixed in a release.
   - Runs are reproducible: with `VGPU_THREADS=1`, the same program and inputs
     give bit-identical results (see ARCHITECTURE.md).
