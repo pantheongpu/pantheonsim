@@ -22,11 +22,25 @@ struct Expected {
   // The instruction mix (SQ_INSTS_VALU_ADD_F32, _CVT, _INT32, _INT64), matrix
   // work in 512-operation units, and vector memory reads and writes.
   uint64_t add_f32 = 0, cvt = 0, int32 = 0, int64 = 0, mops_f16 = 0, vmem_rd = 0, vmem_wr = 0;
+  // Bytes a lane moves, summed over the listing: vector memory read and written (an atomic counts as written), and LDS.
+  uint64_t vmem_lane_bytes_rd = 0, vmem_lane_bytes_wr = 0, lds_lane_bytes_rd = 0, lds_lane_bytes_wr = 0;
 };
 
 inline bool ends(const std::string& s, const char* p) {
   const size_t n = std::string(p).size();
   return s.size() >= n && s.compare(s.size() - n, n, p) == 0;
+}
+
+// What a memory instruction moves a lane, from the assembler's mnemonic ("global_load_dwordx4", "ds_write_b64"): the suffix says it, so
+// this is worked out apart from the decoder's own tables.
+inline uint64_t mnemonic_lane_bytes(const std::string& m) {
+  const auto has = [&](const char* p) { return m.find(p) != std::string::npos; };
+  if (has("dwordx4") || ends(m, "_b128")) return 16;
+  if (has("dwordx3") || ends(m, "_b96")) return 12;
+  if (has("dwordx2") || ends(m, "_b64") || ends(m, "_x2") || ends(m, "_u64")) return 8;
+  if (has("ubyte") || has("sbyte") || ends(m, "_u8") || ends(m, "_i8") || ends(m, "_b8")) return 1;
+  if (has("ushort") || has("sshort") || ends(m, "_u16") || ends(m, "_i16") || ends(m, "_b16")) return 2;
+  return 4;   // dword, b32, and the 32-bit atomics (global_atomic_add)
 }
 
 inline Expected from_listing(const std::string& dir) {
@@ -55,17 +69,19 @@ inline Expected from_listing(const std::string& dir) {
         e.int64 += ends(base, "_u64") || ends(base, "_i64") || ends(base, "_b64");
     } else if (starts(m, "ds_")) {
       ++e.lds;
+      (m.find("_write") != std::string::npos ? e.lds_lane_bytes_wr : e.lds_lane_bytes_rd) += mnemonic_lane_bytes(m);
     } else if (starts(m, "global_") || starts(m, "flat_") || starts(m, "scratch_")) {
       ++e.vmem;
       ++e.flat;
       e.generic += starts(m, "flat_");
-      if (m.find("_atomic") != std::string::npos) ++e.atomics, ++e.vmem_wr;
-      else if (m.find("_store") != std::string::npos) ++e.writes, ++e.vmem_wr;
-      else ++e.reads, ++e.vmem_rd;
+      if (m.find("_atomic") != std::string::npos) ++e.atomics, ++e.vmem_wr, e.vmem_lane_bytes_wr += mnemonic_lane_bytes(m);
+      else if (m.find("_store") != std::string::npos) ++e.writes, ++e.vmem_wr, e.vmem_lane_bytes_wr += mnemonic_lane_bytes(m);
+      else ++e.reads, ++e.vmem_rd, e.vmem_lane_bytes_rd += mnemonic_lane_bytes(m);
     } else if (starts(m, "buffer_")) {
       ++e.vmem;
-      if (m.find("_store") != std::string::npos || m.find("_atomic") != std::string::npos) ++e.vmem_wr;
-      else ++e.vmem_rd;
+      if (m.find("_store") != std::string::npos || m.find("_atomic") != std::string::npos)
+        ++e.vmem_wr, e.vmem_lane_bytes_wr += mnemonic_lane_bytes(m);
+      else ++e.vmem_rd, e.vmem_lane_bytes_rd += mnemonic_lane_bytes(m);
     } else if (starts(m, "s_load") || starts(m, "s_buffer_load") || starts(m, "s_store") || starts(m, "s_dcache") ||
                starts(m, "s_memtime") || starts(m, "s_memrealtime")) {
       ++e.smem;

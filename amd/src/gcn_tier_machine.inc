@@ -73,6 +73,8 @@ int tier_global(Wave& w, Group& g, const Inst& in) {
   ++n.flat;
   if (is_store) ++n.flat_write, ++n.vmem_wr;
   else ++n.flat_read, ++n.vmem_rd, issued_load(w);
+  // The bytes the active lanes ask for, as step() counts them (flat_lane_bytes): a byte or a short, or whole dwords.
+  count_bytes(n, w.exec, sub_dword ? in.fast.words : 4 * in.fast.words, is_store, false);
   if (!w.exec) return 1;
   if (sub_dword) return tier_narrow(w, in, is_store);
   const uint32_t words = in.fast.words;

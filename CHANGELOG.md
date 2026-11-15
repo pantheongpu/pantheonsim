@@ -7,6 +7,14 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- AMD counters: the `VGPU_DISPATCH_STATS` line now ends with the bytes the active lanes ask for (`vmem_bytes_rd`, `vmem_bytes_wr`, `lds_bytes_rd`, `lds_bytes_wr`),
+  the vector instruction mix (`mix=`), the matrix work by type (`mops=`) and the kernel's name (`kernel=`). The mix and the matrix work were already counted
+  and are now printed; the bytes are new. A reader that splits the line on `=` and converts every value to a number must skip the text fields
+  (`tools/bench-amd/bench.py` does). Requested in [discussion 631](https://github.com/pantheongpu/pantheonsim/discussions/631), issues #648 and #649.
+- AMD counters: LDS bank conflicts. `VGPU_DISPATCH_STATS` also prints `lds_bank_conflicts`, the passes through LDS's 32 banks beyond the first.
+  The rule was measured on an RX 6800 (`SQC_LDS_BANK_CONFLICT`, 906 combinations of instruction, stride and active lanes,
+  all reproduced; data in `amd/tests/data/lds_bank_conflicts.tsv`, probe in `amd/tools/lds-bank-probe`) and is applied unchecked to the other targets.
+  It is counted only when `VGPU_DISPATCH_STATS` is set. Sectors and cache lines are not counted yet (issue #650).
 - AMD engine, blocks (`VGPU_AMD_BLOCKS=1`, still off by default), second round ([round sp73](docs/perf-design/rounds/11-rounds-sp36-sp41.md),
   [design](docs/perf-design/13-amd-compiled-tier.md)):
   - **Fixed**: the first form of blocks made the interpreter slower with the knob off. `v_fma_f64` loops (the bench's valu_f64) ran 13 %

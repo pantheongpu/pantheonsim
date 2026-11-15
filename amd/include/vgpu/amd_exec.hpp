@@ -64,6 +64,9 @@ struct Dispatch {
   uint32_t groups[3] = {1, 1, 1};    // work-groups
   uint32_t group_size[3] = {1, 1, 1};   // work-items in each
   uint32_t wave_size = 64;
+  // Count LDS bank conflicts (InstructionCounts::lds_bank_conflicts): set where something reads them, because it costs a pass over every
+  // lane's address on each LDS instruction.
+  bool count_lds_banks = false;
   // The grid in work-items, where it is not a whole number of work-groups
   // (an HSA dispatch packet may ask for that; HIP never does): the last
   // work-group in a dimension then has only what is left over. Zero is a
@@ -153,6 +156,12 @@ struct InstructionCounts {
   uint64_t mix[static_cast<int>(gcn::Mix::Count)] = {};
   uint64_t mops[static_cast<int>(gcn::MopsType::Count)] = {};
   uint64_t vmem_rd = 0, vmem_wr = 0;
+  // The bytes the active lanes of vector memory instructions ask for, read and written (an atomic counts as written), and the
+  // same for LDS: active lanes times the bytes a lane moves (vgpu/amd_memtraffic.hpp says what is and is not counted).
+  uint64_t vmem_bytes_rd = 0, vmem_bytes_wr = 0, lds_bytes_rd = 0, lds_bytes_wr = 0;
+  // The passes through LDS's banks beyond the first an access needed (SQC_LDS_BANK_CONFLICT on RDNA2: vgpu/amd_memtraffic.hpp says
+  // how and what was checked). Counted only when Dispatch::count_lds_banks is set, since it reads every lane's address: 0 otherwise.
+  uint64_t lds_bank_conflicts = 0;
 };
 
 // What a dispatch did, which is what a launch reports and what the tests
@@ -179,6 +188,8 @@ struct DispatchStats {
     for (size_t i = 0; i < std::size(c.mix); ++i) c.mix[i] += a.mix[i];
     for (size_t i = 0; i < std::size(c.mops); ++i) c.mops[i] += a.mops[i];
     c.vmem_rd += a.vmem_rd, c.vmem_wr += a.vmem_wr;
+    c.vmem_bytes_rd += a.vmem_bytes_rd, c.vmem_bytes_wr += a.vmem_bytes_wr;
+    c.lds_bytes_rd += a.lds_bytes_rd, c.lds_bytes_wr += a.lds_bytes_wr, c.lds_bank_conflicts += a.lds_bank_conflicts;
     waves_lt16 += o.waves_lt16, waves_lt32 += o.waves_lt32, waves_lt48 += o.waves_lt48;
     waves_lt64 += o.waves_lt64, waves_eq64 += o.waves_eq64;
   }
@@ -192,6 +203,7 @@ struct DispatchStats {
     for (uint64_t& v : c.mix) v *= n;
     for (uint64_t& v : c.mops) v *= n;
     c.vmem_rd *= n, c.vmem_wr *= n;
+    c.vmem_bytes_rd *= n, c.vmem_bytes_wr *= n, c.lds_bytes_rd *= n, c.lds_bytes_wr *= n, c.lds_bank_conflicts *= n;
     waves_lt16 *= n, waves_lt32 *= n, waves_lt48 *= n, waves_lt64 *= n, waves_eq64 *= n;
   }
 };

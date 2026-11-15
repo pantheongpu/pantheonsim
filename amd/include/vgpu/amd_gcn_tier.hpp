@@ -90,6 +90,7 @@ struct Op {
   uint8_t words = 0;           // ... and how many registers it moves
   uint8_t mach = 0;            // the Machine runs it: 1 a global load, 2 a global store (name work done at decode), 3 s_barrier, 6 s_endpgm, 7 scalar memory
   bool store = false;          // a plain store (it takes Wave::store_gate)
+  uint8_t lds_rd = 0, lds_wr = 0;   // an LDS instruction's bytes a lane reads and writes (vgpu/amd_memtraffic.hpp), counted by the interpreter's tier_step
 };
 
 // Whether the tier is on (VGPU_AMD_TIER; set_enabled for tests, which must not call it while another thread runs a
