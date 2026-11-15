@@ -783,9 +783,9 @@ class Runner {
   void tier_float_op(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     if (!fast_alu(w, ins, ex)) exec_float(blk, w, ins, ex);
   }
-  // The `kind` argument of simd::Kernels::hmma for an f16 (0), bf16 (1) or tf32 (2) HMMA: an sm_86 cubin's sum is the RTX 3060 tensor core's
+  // The `kind` argument of simd::Kernels::hmma for an f16 (0), bf16 (1) or tf32 (2) HMMA: a Turing, Ampere or Ada device sums as the RTX 3060 tensor core does
   // (bit 4) unless VGPU_TC_EXACT=0. exec_mma (exec_ops.inc) and the tier's HMMA handler both call this, so that the choice is made in one place.
-  unsigned hmma_kernel_kind(unsigned kind) const { return kind | (m_.sm == 86 && vgpu::exec::tc86::exact_enabled() ? 16u : 0u); }
+  unsigned hmma_kernel_kind(unsigned kind) const { return kind | (vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) ? 16u : 0u); }
   ~Runner() {
     if (coop_ws_) {
       try {

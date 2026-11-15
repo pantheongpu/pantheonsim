@@ -9,6 +9,11 @@
 // from the host's libm (by one ulp for rcp, sqrt, rsqrt and ex2, by more for the others), in a way this simulator does not
 // reproduce (nvidia/docs/libraries.md, "What is not implemented"). For those forms only the inputs whose answers are not
 // approximations are hashed: zeros, subnormals, infinities and NaNs, and the negative numbers whose root or logarithm is a NaN.
+//
+// -DNO80 is the form a Turing card (sm_75) can build: without what ptxas or mma.h has only from sm_80 on. The lines that then mean
+// nothing or are absent, and that run_float_half_forms.sh leaves out of the comparison below sm_80: float_form_09 and _10 (min/max
+// .NaN), half_form_32 and _33 (cvt .relu to f16x2 and bf16x2), wmma_tf32_truncated, and every mma_ line but mma_f16_k8 and the
+// mma_edge cases (m16n8k8 in f16 with an f32 accumulator is the only one of these forms sm_75 has).
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -39,8 +44,10 @@ __global__ void float_forms(const float* in, uint32_t* out, int n, int shape) {
     asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(-a), "f"(fabsf(b)), "f"(-fabsf(c))); o[6] = fbits_(r);
     asm("min.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); o[7] = fbits_(r);
     asm("max.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); o[8] = fbits_(r);
+#ifndef NO80   // (ptxas: sm_80 or higher)
     asm("min.ftz.NaN.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); o[9] = fbits_(r);
     asm("max.NaN.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(-b)); o[10] = fbits_(r);
+#endif
     asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a)); o[11] = fbits_(r);
     asm("sqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a)); o[12] = fbits_(r);
     asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a)); o[13] = fbits_(r);
@@ -135,8 +142,10 @@ __global__ void half_forms(const uint32_t* in, uint32_t* out, const uint64_t* di
     o[29] = bits(__float22half2_rn(make_float2(fmaxf(__uint_as_float(z), 0.0f), fabsf(__uint_as_float(x)))));
     o[30] = __float_as_uint(__half2float(__low2half(__hmul2(a, b))) * __half2float(__high2half(c)));
     o[31] = bits(__hfma2(a, b, c)) ^ bits(__hadd2(__hneg2(a), c));
+#ifndef NO80   // (ptxas: sm_80 or higher)
     asm("cvt.rn.relu.f16x2.f32 %0, %1, %2;" : "=r"(o[32]) : "f"(__uint_as_float(x)), "f"(-f1));
     asm("cvt.rn.relu.bf16x2.f32 %0, %1, %2;" : "=r"(o[33]) : "f"(f0), "f"(__uint_as_float(y)));
+#endif
     // The 32-bit multiply-add with carries.
     const unsigned long long wide = (static_cast<unsigned long long>(x) << 32 | y) * 0x9E3779B1ull + z;
     o[20] = static_cast<uint32_t>(wide >> 32) ^ static_cast<uint32_t>(wide);
@@ -172,6 +181,7 @@ __global__ void half_forms(const uint32_t* in, uint32_t* out, const uint64_t* di
 // only the top 19 bits of each, so the products and sums are those of the truncated numbers. The values are multiples of 1/4 with
 // garbage in the low 13 bits, so every sum of truncated products is exact and its order cannot matter; the PTX engine used to
 // round the operands when it loaded them (and an RTX 3060, like the SASS executor, truncates).
+#ifndef NO80
 __global__ void k_wmma_tf32(const float* a, const float* b, const float* c, float* d) {
   using namespace nvcuda;
   wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> fa;
@@ -184,6 +194,7 @@ __global__ void k_wmma_tf32(const float* a, const float* b, const float* c, floa
   wmma::mma_sync(fc, fa, fb, fc);
   wmma::store_matrix_sync(d + t * 256, fc, 16, wmma::mem_row_major);
 }
+#endif
 static __host__ __device__ __forceinline__ uint32_t mix32(uint32_t x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; }
 
 // Double arithmetic on NaNs with distinct signs and payloads (the answer is a NaN that is one of the operands', quieted: b's if b is
@@ -324,13 +335,15 @@ __device__ __forceinline__ uint32_t rc(int style, uint32_t seed, uint32_t lane, 
 #define MMA_ASM_k_mma_bf16_k8 asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};" : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(b[0]), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]))
 #define MMA_ASM_k_mma_tf32_k8 asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};" : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]))
 #define MMA_ASM_k_mma_tf32_k4 asm volatile("mma.sync.aligned.m16n8k4.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};" : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(b[0]), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]))
-MMA_FORM(k_mma_f16_k16, 0, 0, 'h', 4, 2, 4, false)
 MMA_FORM(k_mma_f16_k8, 0, 0, 'h', 2, 1, 4, false)
+#ifndef NO80   // (sm_75 has m16n8k8 in f16 with an f32 accumulator and nothing else of these)
+MMA_FORM(k_mma_f16_k16, 0, 0, 'h', 4, 2, 4, false)
 MMA_FORM(k_mma_f16acc_k16, 0, 0, 'h', 4, 2, 2, true)
 MMA_FORM(k_mma_bf16_k16, 0, 0, 'b', 4, 2, 4, false)
 MMA_FORM(k_mma_bf16_k8, 0, 0, 'b', 2, 1, 4, false)
 MMA_FORM(k_mma_tf32_k8, 0, 0, 't', 4, 2, 4, false)
 MMA_FORM(k_mma_tf32_k4, 0, 0, 't', 2, 1, 4, false)
+#endif
 
 // Hand-picked cases of the tensor core's rule (signs of zero, cancellation, subnormal and overflowing terms, infinities, NaNs, terms
 // below the alignment grid), one m16n8k8 f16 mma each: only element (0,0) is read. A row 0 = a[0..7], B column 0 = b[0..7], C(0,0) = c.
@@ -444,6 +457,7 @@ int main() {
     }
     CK(cudaFree(din)); CK(cudaFree(dout)); CK(cudaFree(ddin)); CK(cudaFree(ddout));
   }
+#ifndef NO80
   {
     const int tiles = 16;
     std::vector<float> a(tiles * 128), b(tiles * 128), c(tiles * 256), d(tiles * 256);
@@ -472,6 +486,7 @@ int main() {
     std::printf("wmma_tf32_truncated %016llx\n", static_cast<unsigned long long>(hh));
     CK(cudaFree(da)); CK(cudaFree(db)); CK(cudaFree(dc)); CK(cudaFree(dd));
   }
+#endif
   {
     const unsigned long long dv[kNV] = {0x7ff8000000000000ull, 0xfff8000000000000ull, 0x7ff8000000000123ull, 0xfff8000000000456ull,
                                         0x7ff0000000000001ull, 0xfff0000000000002ull, 0x3ff0000000000000ull, 0xc000000000000000ull,
@@ -545,9 +560,13 @@ int main() {
     CK(cudaMalloc(&d, 32 * 4 * 4));
     uint32_t h[128];
     struct Form { const char* name; void (*fn)(int, uint32_t, uint32_t*); int words; };
+#ifndef NO80
     const Form forms[] = {{"mma_f16_k16", k_mma_f16_k16, 128}, {"mma_f16_k8", k_mma_f16_k8, 128}, {"mma_f16acc_k16", k_mma_f16acc_k16, 64},
                           {"mma_bf16_k16", k_mma_bf16_k16, 128}, {"mma_bf16_k8", k_mma_bf16_k8, 128}, {"mma_tf32_k8", k_mma_tf32_k8, 128},
                           {"mma_tf32_k4", k_mma_tf32_k4, 128}};
+#else
+    const Form forms[] = {{"mma_f16_k8", k_mma_f16_k8, 128}};
+#endif
     for (const Form& f : forms)
       for (int style = 0; style < 2; ++style) {
         uint64_t hh = 1469598103934665603ull;

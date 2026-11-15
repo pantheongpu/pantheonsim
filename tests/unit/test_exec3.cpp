@@ -5,6 +5,7 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
+#include "vgpu/exec/tc_ampere.hpp"
 #include "vgpu/exec/texture.hpp"
 #include "vgpu/exec/scheduler.hpp"
 #include "vgpu/memory.hpp"
@@ -12,6 +13,7 @@
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
 #include <array>
+#include <utility>
 #include <cmath>
 #include "vtest.hpp"
 
@@ -770,8 +772,10 @@ VTEST(wmma_accumulator_is_added) {
 }
 
 // VGPU_TC_EXACT=0 returns the tensor cores' sums to the earlier sequential f32 one, and changes nothing else: the f16 wmma of random
-// operands with spread exponents (so that the chunked, truncating sum of an sm_86 tensor core and the sequential one differ) prints
-// different words on the sm_86 profiles in the two modes, and the same words on every other profile; and an f32 loop is the same in both.
+// operands with spread exponents (so that the chunked, truncating sum of a Turing, Ampere or Ada tensor core and the sequential one
+// differ) prints different words in the two modes on the profiles whose cards sum that way (compute capability 7.5, 8.0, 8.6, 8.9:
+// tc86::device_sums_chunked), and the same words on every other profile; and an f32 loop is the same in both. VGPU_TC_EXACT=force
+// puts the chunked sum on every profile: an H100 profile then prints an RTX 3060's words.
 VTEST(tc_exact_switch_changes_only_sm86_tensor_sums) {
   const std::string ptx = std::string(kHeader) + R"(
 .visible .entry mma(.param .u64 out)
@@ -822,8 +826,8 @@ VTEST(tc_exact_switch_changes_only_sm86_tensor_sums) {
 }
 )";
   const auto m = ptx::parse(ptx);
-  const auto run = [&](const char* gpu, bool exact, bool plain_only) {
-    if (exact) unsetenv("VGPU_TC_EXACT"); else setenv("VGPU_TC_EXACT", "0", 1);
+  const auto run_mode = [&](const char* gpu, const char* mode, bool plain_only) {
+    if (mode) setenv("VGPU_TC_EXACT", mode, 1); else unsetenv("VGPU_TC_EXACT");
     MemoryManager mem{1 << 20};
     DeviceProfile prof = load_gpu(gpu);
     const uint64_t out = mem.alloc(32 * 36);
@@ -836,15 +840,41 @@ VTEST(tc_exact_switch_changes_only_sm86_tensor_sums) {
     unsetenv("VGPU_TC_EXACT");
     return words;
   };
-  for (const char* gpu : {"nvidia/rtx3060", "nvidia/a10", "nvidia/a100", "nvidia/l4", "nvidia/h100", "nvidia/t4"}) {
-    const bool sm86 = std::string(gpu) == "nvidia/rtx3060" || std::string(gpu) == "nvidia/a10";
-    const auto on = run(gpu, true, false), off = run(gpu, false, false);
-    if (sm86) VCHECK(on != off);   // the model is on by default, and the switch really turns it off
-    else VCHECK(on == off);        // other profiles never used the model
-    VCHECK(run(gpu, true, true) == run(gpu, false, true));   // and no other arithmetic moves
+  const auto run = [&](const char* gpu, bool exact, bool plain_only) { return run_mode(gpu, exact ? nullptr : "0", plain_only); };
+  const auto card = run("nvidia/rtx3060", true, false), sequential = run("nvidia/rtx3060", false, false);
+  VCHECK(card != sequential);
+  struct Case {
+    const char* gpu;
+    bool chunked;
+  };
+  // (t4 and rtx2080ti 7.5, a100 and a30 8.0, rtx3060 / a10 / a10g 8.6, l4 / l40s / rtx4090 8.9; h100 9.0, b200 10.0, rtx5090 and rtx-pro-6000 12.0)
+  const Case cases[] = {{"nvidia/rtx3060", true},  {"nvidia/a10", true},  {"nvidia/a10g", true},    {"nvidia/a100", true},    {"nvidia/a30", true},
+                        {"nvidia/l4", true},       {"nvidia/l40s", true}, {"nvidia/rtx4090", true}, {"nvidia/t4", true},      {"nvidia/rtx2080ti", true},
+                        {"nvidia/h100", false},    {"nvidia/h200", false}, {"nvidia/b200", false},  {"nvidia/rtx5090", false}, {"nvidia/rtx-pro-6000", false}};
+  for (const Case& c : cases) {
+    const auto on = run(c.gpu, true, false), off = run(c.gpu, false, false);
+    VCHECK(off == sequential);                // off, every profile prints the sequential sum
+    if (c.chunked) VCHECK(on == card);        // the model is on by default on these, and it is the RTX 3060's sum
+    else VCHECK(on == sequential);            // the others keep the sequential sum
+    VCHECK(run_mode(c.gpu, "force", false) == card);   // forced, every profile sums as the card does
+    VCHECK(run(c.gpu, true, true) == run(c.gpu, false, true));   // and no other arithmetic moves
+    VCHECK(run_mode(c.gpu, "force", true) == run(c.gpu, false, true));
   }
-  // Off, an sm_86 profile prints what a profile without the model does: the sequential sum (sm_80's words).
-  VCHECK(run("nvidia/rtx3060", false, false) == run("nvidia/a100", true, false));
+}
+
+// The table itself: which compute capabilities take the model. (A capability added here needs a card, or a paper, that says so:
+// docs/matrix-numerics.md.)
+VTEST(tc_model_devices) {
+  using vgpu::exec::tc86::device_sums_chunked;
+  VCHECK(device_sums_chunked(7, 5) && device_sums_chunked(8, 0) && device_sums_chunked(8, 6) && device_sums_chunked(8, 9));
+  for (const auto& cc : {std::pair{7, 0}, std::pair{7, 2}, std::pair{8, 7}, std::pair{9, 0}, std::pair{10, 0}, std::pair{10, 3}, std::pair{11, 0}, std::pair{12, 0}, std::pair{12, 1}, std::pair{6, 1}})
+    VCHECK(!device_sums_chunked(cc.first, cc.second));
+  using namespace vgpu::exec::tc86;
+  VCHECK_EQ(parse_mode(nullptr), static_cast<int>(kModeDevice));
+  VCHECK_EQ(parse_mode("1"), static_cast<int>(kModeDevice));
+  VCHECK_EQ(parse_mode(""), static_cast<int>(kModeDevice));
+  VCHECK_EQ(parse_mode("0"), static_cast<int>(kModeOff));
+  VCHECK_EQ(parse_mode("force"), static_cast<int>(kModeForce));
 }
 
 // Blocks run on several host threads by default, so an atomic that is only

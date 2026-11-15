@@ -10080,7 +10080,7 @@ class Interpreter {
     for (uint32_t r = 0; r < a_regs; ++r) gather(op.a[r], fa + r * 32);
     for (uint32_t r = 0; r < b_regs; ++r) gather(op.b[r], fb + r * 32);
     for (uint32_t r = 0; r < c_regs; ++r) gather(op.c[r], fc + r * 32);
-    // (An sm_86 device sums as an RTX 3060's tensor core does: chunked and truncated, see vgpu/exec/tc_ampere.hpp.)
+    // (A Turing, Ampere or Ada device sums as an RTX 3060's tensor core does: chunked and truncated, see vgpu/exec/tc_ampere.hpp.)
     simd::kernels().hmma(kind | (vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) ? 16u : 0u), K, op.acc_f16, fa, fb, fc, out);
     for (uint32_t reg = 0; reg < c_regs; ++reg) scatter_words(w, op.d[reg], m, out + reg * 32, true);
     return true;

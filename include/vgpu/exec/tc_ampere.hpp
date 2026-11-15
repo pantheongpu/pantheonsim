@@ -1,4 +1,4 @@
-// The sum a GA10x (sm_86) tensor core makes of an f16, bf16 or tf32 matrix product with an f32 or f16 accumulator.
+// The sum a Turing, Ampere or Ada (sm_75, sm_80, sm_86, sm_89) tensor core makes of an f16, bf16 or tf32 matrix product with an f32 or f16 accumulator.
 //
 // An RTX 3060 does not add the products one at a time in f32. Measured on the card by black-box probing (mma.sync m16n8k8 and
 // wmma 16x16x16 and 16x16x8 in f16, bf16 and tf32, random finite operands over narrow and wide exponent ranges, special values,
@@ -23,8 +23,11 @@
 // otherwise the infinity there is, and the finite terms do not matter. A chunk whose finite sum overflows the format is an infinity
 // for the next chunk (checked against the card, element by element, on random bf16 and tf32 data whose products reach 2^254).
 //
+// The same rule holds on Turing and Ada cards (a Tesla T4, an L4 and an L40S print the RTX 3060's lines of the probes that pin it),
+// and is taken for GA100 on the FTTN paper's evidence: device_sums_chunked below.
+//
 // Not covered, and left as they were (the sequential sum): the m8n8k4 form, the sparse forms, and other architectures (Hopper and
-// Blackwell tensor cores are not this unit; sm_80 and sm_89 are not measured). Not probed: results in the f32 subnormal range (here
+// Blackwell tensor cores are not this unit, by the FTTN paper's H100 row; not measured). Not probed: results in the f32 subnormal range (here
 // ldexp's), and the sign of a zero f16 accumulator (+0 by analogy with f32).
 #pragma once
 
@@ -59,22 +62,46 @@
 
 namespace vgpu::exec::tc86 {
 
-// VGPU_TC_EXACT=0 turns this model off: the tensor sums are then the sequential f32 ones of the earlier releases, bit for bit, on
-// every device. Read from the environment when the process starts and again at each launch (as VGPU_FASTPATH is), so a test can
-// set it between launches. (Function-local statics of inline functions: no external-linkage global of the shared code.)
-inline std::atomic<bool>& exact_flag() {
-  static std::atomic<bool> f{[] {
-    const char* v = std::getenv("VGPU_TC_EXACT");
-    return !(v && v[0] == '0');
-  }()};
+// VGPU_TC_EXACT chooses where this model is used. Unset (or anything else): on the devices listed in device_sums_chunked below. `0`:
+// nowhere -- the tensor sums are then the sequential f32 ones of the earlier releases, bit for bit, on every device. `force`: on every
+// device, whatever its compute capability (what the SASS engine did for an sm_86 cubin on any profile before the choice followed the
+// device; also the way to try the rule on a profile that keeps the sequential sum). Read from the environment when the process starts
+// and again at each launch (as VGPU_FASTPATH is), so a test can set it between launches. (Function-local statics of inline functions:
+// no external-linkage global of the shared code.)
+enum : int { kModeOff = 0, kModeDevice = 1, kModeForce = 2 };
+inline int parse_mode(const char* v) {
+  if (!v) return kModeDevice;
+  if (v[0] == '0') return kModeOff;
+  if (v[0] == 'f' || v[0] == 'F') return kModeForce;   // "force"
+  return kModeDevice;
+}
+inline std::atomic<int>& mode_flag() {
+  static std::atomic<int> f{parse_mode(std::getenv("VGPU_TC_EXACT"))};
   return f;
 }
-inline void refresh_exact(const char* v) { exact_flag().store(!(v && v[0] == '0'), std::memory_order_relaxed); }
+inline void refresh_exact(const char* v) { mode_flag().store(parse_mode(v), std::memory_order_relaxed); }
 inline void refresh_exact() { refresh_exact(std::getenv("VGPU_TC_EXACT")); }
-inline bool exact_enabled() { return exact_flag().load(std::memory_order_relaxed); }
+inline int exact_mode() { return mode_flag().load(std::memory_order_relaxed); }
+inline bool exact_enabled() { return exact_mode() != kModeOff; }
 
-// Whether a device of this compute capability sums as an RTX 3060 does (only the part that was measured), and the switch is on.
-inline bool applies(int cc_major, int cc_minor) { return cc_major == 8 && cc_minor == 6 && exact_enabled(); }
+// The devices whose tensor cores sum this way, by compute capability, and what says so (docs/matrix-numerics.md has the cards, the
+// driver and the lines compared):
+//   8.6  GA10x   measured: RTX 3060 (the 106,496 results above), A10G (the same probe files, line for line)
+//   8.9  AD10x   measured: L4 and L40S print the RTX 3060's lines of simd_lane_forms and float_half_forms (f16, bf16, tf32; f32 and f16 accumulators)
+//   7.5  TU10x   measured: a Tesla T4 prints the RTX 3060's f16 lines (a Turing card has no bf16 or tf32 form)
+//   8.0  GA100   NOT measured on a card: the FTTN paper's A100 row (one extra bit, truncation, blocks of 8, tf32 blocks of 4; its
+//                authors' repository names the RTX 3060 beside the A100) is this rule's row, and that is the only evidence
+// Every other capability (7.0, 8.7, 9.0, 10.x, 12.x) keeps the sequential f32 sum: not measured, and the paper's rows for the V100
+// (no extra bit, blocks of 4) and the H100 (two or more extra bits, blocks of 16 or more) say they are other units.
+inline bool device_sums_chunked(int cc_major, int cc_minor) {
+  return (cc_major == 7 && cc_minor == 5) || (cc_major == 8 && (cc_minor == 0 || cc_minor == 6 || cc_minor == 9));
+}
+
+// Whether a device of this compute capability sums by this rule now: the switch, then the device.
+inline bool applies(int cc_major, int cc_minor) {
+  const int mode = exact_mode();
+  return mode == kModeForce || (mode == kModeDevice && device_sums_chunked(cc_major, cc_minor));
+}
 
 // The format of the multiplicands: the smallest normal exponent, for the frame positions.
 inline constexpr int kEminF16 = -14;

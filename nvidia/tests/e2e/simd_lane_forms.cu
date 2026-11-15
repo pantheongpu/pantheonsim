@@ -4,6 +4,9 @@
 // NaNs, rounding edges). One line per form: an FNV hash of every result's bits. The expected file is an RTX 3060's
 // (nvidia/tests/data/simd_lane_forms.rtx3060.txt); run_simd_lane_forms.sh runs this on the simulator's two engines
 // at every SIMD level and compares, or on a real GPU with --card.
+//
+// -DNO80 leaves out the bf16 and tf32 tensor forms (four lines: wmma_bf16_f32acc and wmma_tf32_f32acc, random and edges), which
+// mma.h does not define below sm_80: the form a Turing card (sm_75) can build. Its other 56 lines are the same lines.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -118,6 +121,7 @@ __global__ void k_wmma(const T* a, const T* b, const AccT* c, AccT* d) {
   wmma::mma_sync(fc, fa, fb, fc);
   wmma::store_matrix_sync(d + t * 256, fc, 16, wmma::mem_row_major);
 }
+#ifndef NO80
 __global__ void k_wmma_tf32(const float* a, const float* b, const float* c, float* d) {
   wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> fa;
   wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> fb;
@@ -129,6 +133,7 @@ __global__ void k_wmma_tf32(const float* a, const float* b, const float* c, floa
   wmma::mma_sync(fc, fa, fb, fc);
   wmma::store_matrix_sync(d + t * 256, fc, 16, wmma::mem_row_major);
 }
+#endif
 
 static uint64_t fnv(const void* p, size_t bytes) {
   uint64_t h = 1469598103934665603ull;
@@ -229,12 +234,14 @@ int main() {
       k_wmma<__half, __half><<<tiles, 32>>>((const __half*)pa, (const __half*)pb, (const __half*)pc, (__half*)pd);
       CK(cudaGetLastError());
       show("wmma_f16_f16acc", tiles * 128);
+#ifndef NO80
       k_wmma<__nv_bfloat16, float><<<tiles, 32>>>((const __nv_bfloat16*)pba, (const __nv_bfloat16*)pbb, (const float*)pfc, (float*)pd);
       CK(cudaGetLastError());
       show("wmma_bf16_f32acc", tiles * 256);
       k_wmma_tf32<<<tiles, 32>>>((const float*)pfc, (const float*)(pfc + 1024), (const float*)(pfc + 2048), (float*)pd);
       CK(cudaGetLastError());
       show("wmma_tf32_f32acc", tiles * 256);
+#endif
     }
   }
   return fails;
