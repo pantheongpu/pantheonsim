@@ -184,8 +184,10 @@ the published figure:
 | `tgamma` | -0x1.f77d32p+0 | 0x4178865f (2.337 ulp) | 4.34 ulp | 0x4178865d (-2) |
 
 The 13 that agree are `acosh`, `asin`, `atan2`, `cos`, `cospi`, `hypot`, `log`, `log10`, `log1p`, `log2`, `pow`, `sin` and
-`sinpi`; `lgamma`'s 1.35e7 ulp at -0x1.3a7fcap+1 is reproduced as well. The 17 are the functions whose code goes through
-`MUFU.EX2`, `MUFU.RCP` or `MUFU.RSQ` (read off the SASS of the kernel); the 13 are polynomial code and IEEE arithmetic.
+`sinpi`; `lgamma`'s 1.35e7 ulp at -0x1.3a7fcap+1 is reproduced as well. For `exp`, `exp2`, `cbrt` and `tan` the code
+was traced in the kernel's SASS to `MUFU.EX2`, `MUFU.LG2` or `MUFU.RCP`, the approximate instructions the simulator computes at
+host precision; that the other 13 of the 17 go through such an instruction, and that the 13 that agree do not, is the likely
+explanation and was not checked function by function. The card run decides it.
 
 Two cautions. The paper's library is CUDA 13.3.1 and ours 13.0: a function whose code changed between them would show here
 as a difference that is not the hardware's (the paper's own older runs differ from its newer ones for `acos`, `asin`,
