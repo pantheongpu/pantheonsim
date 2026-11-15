@@ -778,6 +778,9 @@ struct OpShf { bool left = false; bool wrap = false; Reg dst; Operand a, b, c; }
 // approximate one rcp.approx gives -- for |b| in [2^-126, 2^126], and 0 (NaN
 // for an infinite a) for 2^126 < |b| < 2^128.
 struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; bool nan_propagate = false; Type ty; Reg dst; Operand a, b; bool sat = false; bool xorsign_abs = false; bool ftz = false; bool round_explicit = false; bool approx = false;
+  // full: div.full.f32. ptxas makes it a * MUFU.RCP(b) with both operands scaled out of the ranges where the reciprocal would
+  // overflow or flush; the engine follows that while the card's unit is modelled (VGPU_MUFU_EXACT), and divides exactly otherwise.
+  bool full = false;
   // f64 only (set by mark_nan_order, src/ptx/contract.cpp): the card's choice among two NaN operands follows ptxas's operand order, not the
   // text's -- the operand defined LATER wins. True when `a` is the later one (the engines' rule is otherwise b's NaN first, then a's).
   bool nan_a_first = false; };

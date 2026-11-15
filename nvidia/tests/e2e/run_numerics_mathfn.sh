@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
 # The math-function numerics programs (tools/numerics: mathfn, fp_examples, varity_cases) on the simulator: what the
-# simulator prints is pinned, its two engines are held to each other, and two profiles of one architecture to each other.
-# docs/numerics/math-functions.md says what the programs are and what a card is expected to print instead.
+# simulator prints is held to what real cards print, its two engines are held to each other, and two profiles of one
+# architecture to each other. docs/numerics/math-functions.md says what the programs are and how the cards were run.
 #
-#   nvidia/tests/data/numerics_mathfn.txt        mathfn's lines (function, precision, class, count, hash), --n 4096, from the SASS of an
-#   nvidia/tests/data/numerics_mathfn_fast.txt   sm_86 build on the rtx3060 profile: the default build and the -use_fast_math one.
-#                                                The simulator's own bits, NOT a card's: the MUFU instructions are computed at host
-#                                                precision here and from tables on a card, so a card differs on most lines. They are
-#                                                pinned so that a change of any math result is seen and decided, not so that it is forbidden.
-#   nvidia/tests/data/numerics_cases.txt         fp_examples', fp_examples_nofma's and varity_cases' lines (the same for -O0 and -O3)
+#   nvidia/tests/data/numerics_mathfn.txt        mathfn's lines (function, precision, class, count, hash), --n 4096: the default build and
+#   nvidia/tests/data/numerics_mathfn_fast.txt   the -use_fast_math one. CARD-MEASURED since 2026-11-15: they are what an RTX 3060 (sm_86,
+#                                                driver 610.88, nvcc 13.0.88) prints for the sm_86 build at --n 4096. The same programs at
+#                                                --n 131072 print identical lines on an RTX 3060, a Tesla T4 (sm_75), an L4 (sm_89) and an
+#                                                A10G (sm_86), each with its own architecture's build and with the sm_75 build. Until then
+#                                                the two files held the simulator's own bits, with MUFU at host precision: 66 of the 329
+#                                                default-build lines and 104 of the fast-math lines were not the card's. They changed
+#                                                because the simulator's MUFU is now the card's unit (include/vgpu/exec/mufu_model.hpp);
+#                                                with VGPU_MUFU_EXACT=0 the simulator prints the earlier lines again.
+#   nvidia/tests/data/numerics_cases.txt         fp_examples', fp_examples_nofma's and varity_cases' lines (the same for -O0 and -O3). The
+#                                                four cards print the same lines; the file did not change.
 #   nvidia/tests/data/numerics_engines.txt       the lines on which the PTX interpreter may differ from the SASS executor, each with its
 #                                                reason. Every other line must be the same from both engines.
 #
-# Checked: the pinned lines (sm_86 on rtx3060, SASS); PTX against SASS line by line; an sm_75 build on t4 and on rtx2080ti, and the
-# sm_86 build on a10g, against the same pins (the results do not depend on the profile or on the cubin's architecture); fp_examples
-# exits 0 (every answer the paper documents); compare.py says "0 differ" for a run against itself and counts one result of one ulp
-# in a doctored copy.
+# Checked: the pinned (card) lines from every SASS run (sm_86 on rtx3060 and a10g, sm_75 on t4 and rtx2080ti: all 329 + 329); PTX
+# against SASS line by line; fp_examples exits 0 (every answer the paper documents); compare.py says "0 differ" for a run against
+# itself and counts one result of one ulp in a doctored copy; VGPU_MUFU_EXACT=0 gives other lines (the switch reaches a program).
 #
 #   run_numerics_mathfn.sh             the checks above
-#   run_numerics_mathfn.sh --update    rewrite the pinned files from this build's SASS run (numerics_engines.txt is edited by hand)
+#   run_numerics_mathfn.sh --update    rewrite the pinned files from this build's SASS run. The mathfn files are a card's: rewrite them
+#                                      from a card run instead (tools/numerics/card-run.sh with MATHFN_N=4096, then the first five
+#                                      fields of each line), and use --update only for numerics_cases.txt or to see what a change does.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -71,6 +77,15 @@ for a in rtx3060.86 t4.75; do
   done
   if diff <(cases "$out/run/nvidia.$a.sass") <(cases "$out/run/nvidia.$a.ptx") > "$out/d.txt"; then echo "ok   $a fp_examples, varity_cases: PTX is SASS"
   else echo "FAIL $a: fp_examples or varity_cases differ between the engines"; head -6 "$out/d.txt"; fails=1; fi
+done
+# 2b. The switch: with VGPU_MUFU_EXACT=0 the approximate instructions are the function at host precision again, and the lines
+# that go through them are not the card's (exp f32 rand_mid is one in the default build, sin f32 rand_mid in the fast-math one).
+MATHFN_N=4096 VARITY=0 VGPU_MUFU_EXACT=0 "$num/run-sim.sh" "$out/bin" "${VGPU_BUILD_DIR:-$root/build}" "$out/run0" nvidia/rtx3060:86:sass > "$out/run0.txt" 2>&1
+for p in mathfn mathfn_fast; do
+  n="$(diff "$data/numerics_$p.txt" <(keys "$out/run0/nvidia.rtx3060.86.sass/$p.txt") | grep -c '^<')"
+  want=66; [[ $p == mathfn_fast ]] && want=104
+  if (( n == want )); then echo "ok   VGPU_MUFU_EXACT=0 $p: $n lines are not the card's, as before the model"
+  else echo "FAIL VGPU_MUFU_EXACT=0 $p: $n lines differ from the card's, $want did before the model"; fails=1; fi
 done
 # 3. compare.py: a run against itself, and against a copy with one result moved by one ulp.
 if command -v python3 >/dev/null 2>&1; then

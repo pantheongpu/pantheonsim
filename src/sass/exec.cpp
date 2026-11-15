@@ -61,6 +61,7 @@ asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.popsection");
 #include "vgpu/exec/sass_lea.hpp"
 #include "vgpu/exec/imma_frag.hpp"
 #include "vgpu/exec/ldsm.hpp"
+#include "vgpu/exec/mufu_model.hpp"
 #include "vgpu/exec/window_check.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
@@ -749,6 +750,7 @@ class Runner {
     else env_ = exec::read_launch_env();
     if (const char* f = env_.fastpath; f && f[0] == '0') fast_ = false;
     vgpu::exec::tc86::refresh_exact(env_.tc_exact);   // VGPU_TC_EXACT=0: the earlier sequential tensor sums
+    vgpu::mufu::refresh(env_.mufu_exact);             // VGPU_MUFU_EXACT=0: MUFU at the host's precision, as before the card's unit was modelled
     if (tier::requested()) {
       const char* tr = env_.sass_trace;
       tier_ = fast_ && simd::enabled() && !(tr && *tr);

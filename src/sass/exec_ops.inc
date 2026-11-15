@@ -2073,7 +2073,12 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       const unsigned op = ins.f[0];
       if (op > 9 || ins.src.empty() || !plain(ins.src[0]) || ins.src[0].bnot || ins.dst[0].kind != Kind::Reg)
         return false;
-      if (op == 6 || op == 7) {
+      if (!ins.f[1] && vgpu::mufu::has(op) && vgpu::mufu::enabled()) {
+        // The card's unit (vgpu/exec/mufu_model.hpp), unless VGPU_MUFU_EXACT=0: the operand's bits with |x| and -x applied (to the
+        // upper word's sign in the 64H forms too: an RTX 3060's MUFU.RCP64H R, -|R|), the result's bits as the unit gives them.
+        const uint32_t* a = lanes(0, ins.src[0], true);
+        for (unsigned l = 0; l < 32; ++l) r[l] = vgpu::mufu::eval(op, a[l]);
+      } else if (op == 6 || op == 7) {
         // RCP64H / RSQ64H: the high word of the reciprocal (root) of the double whose high word is the source (the low word zero);
         // the source's modifiers, the flush and the result's flush do not apply.
         const uint32_t* raw = lanes(0, ins.src[0], false);
@@ -2623,9 +2628,17 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
       return;
     case Op::MUFU: {
       const unsigned op = ins.f[0];
+      // The card's unit (vgpu/exec/mufu_model.hpp: measured on an RTX 3060, every input), which the PTX engine's .approx forms
+      // go through too. VGPU_MUFU_EXACT=0 and the half-precision forms: the function at the host's precision, below.
+      const bool model = !ins.f[1] && vgpu::mufu::has(op) && vgpu::mufu::enabled();
       each_lane(ex, [&](unsigned l) {
-        // Computed in double and rounded once, as the PTX engine computes
-        // the .approx functions, so the two engines agree to the bit.
+        if (model) {
+          const uint32_t raw = read32(w, ins.src[0], l);
+          const uint32_t bits = (ins.src[0].abs ? raw & 0x7fffffffu : raw) ^ (ins.src[0].neg ? 0x80000000u : 0u);   // (the 64H forms too, on the card)
+          write32(w, ins.dst[0], l, vgpu::mufu::eval(op, bits));
+          return;
+        }
+        // Computed in double and rounded once.
         const double x = op == 9 ? f32src(ins.src[0], l, false) : ftz(f32src(ins.src[0], l, true));   // (TANH does not flush)
         float r;
         switch (op) {

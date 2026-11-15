@@ -1,4 +1,6 @@
-// The simulator's special-function (MUFU) results, as scalar host code, for deciding whether a MUFU instruction may join the host-GPU exact set
+// The special-function (MUFU) results at the host's precision -- what the simulator computed before it modelled the card's unit, and
+// computes with VGPU_MUFU_EXACT=0 (include/vgpu/exec/mufu_model.hpp is the model, docs/numerics/math-functions.md its evidence) -- as
+// scalar host code, written for deciding whether a MUFU instruction may join the host-GPU exact set
 // (docs/perf-design/09-host-gpu-spike.md section 6, step 4). The card side is tools/probes/hostgpu_sfu_exhaustive.cu, which runs every one of the 2^32 float
 // patterns through the card's instruction and compares the bits with these functions; tests/unit/test_host_gpu_logic.cpp pins these functions to the
 // simulator's own SIMD kernels (src/simd/kernels.inc mufu_k) and to the interpreter's libm forms (src/sass/exec_ops.inc, case Op::MUFU), so that what the
