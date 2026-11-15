@@ -2530,6 +2530,8 @@ class Parser {
         // .approx/.full select a hardware approximation, computed here at host
         // precision (documented divergence). .rn/.rz/.rm/.rp on sqrt and rcp
         // are the IEEE forms: correctly rounded in that mode, so applied.
+        // (Where ptxas makes more than one MUFU of an approximate form -- sin, cos, ex2 and lg2 without .ftz, the
+        // double-precision rcp and rsqrt -- the interpreter forms what ptxas makes: interpreter.cpp, OpMath.)
         if (p == "approx" || p == "full") ;
         else if (p == "ftz") mftz = true;
         else if (p == "rn" || p == "rz" || p == "rm" || p == "rp") {
@@ -2552,7 +2554,9 @@ class Parser {
       op.packed = packed_half;
       op.round = mround;
       op.exact = exact && (op.op == MathOp::Sqrt || op.op == MathOp::Rcp) && ty.bits >= 32;
-      op.ftz = mftz && ty.bits == 32;
+      // (.ftz on a double form flushes nothing; it tells rcp.approx.ftz.f64 and rsqrt.approx.ftz.f64, the upper-word
+      // approximations, from the forms without it.)
+      op.ftz = mftz && ty.bits >= 32;
       op.dst = expect_reg_operand("destination");
       expect_punct(",");
       op.src = parse_operand();

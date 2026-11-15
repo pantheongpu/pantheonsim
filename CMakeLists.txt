@@ -1474,6 +1474,9 @@ vgpu_unit_test(test_ptx_issue_batch_2026_11_06)
 vgpu_unit_test(test_ptx_forms)
 # 16-bit signed integer forms on registers with zero upper bits (abs.s16 and its siblings).
 vgpu_unit_test(test_ptx_int16)
+# The approximate math instructions as ptxas expands them (sin/cos scaling, ex2 and lg2 without .ftz, the double-precision
+# rcp/rsqrt forms): a kernel's PTX gives the bits its SASS gives.
+vgpu_unit_test(test_ptx_approx_forms)
 # Hopper (sm_90a): the warpgroup MMA, against the ISA's own layout examples.
 vgpu_unit_test(test_hopper)
 # Blackwell (sm_100a): Tensor Memory and tcgen05, against the ISA's figures.
@@ -2447,6 +2450,10 @@ target_compile_definitions(test_amd_hipcc_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_S
 
 vgpu_unit_test(test_amd_hipcc_mfma amd/tests/unit/test_hipcc_mfma.cpp)
 target_compile_definitions(test_amd_hipcc_mfma PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# A stack slot an unoptimized wave32 kernel stores through the private segment buffer and loads through a flat pointer
+# (amd/tests/hipcc/scratch_flat.cpp, -O0, gfx1030): the buffer's index stride is the wave's size.
+vgpu_unit_test(test_amd_hipcc_scratch_flat amd/tests/unit/test_hipcc_scratch_flat.cpp)
+target_compile_definitions(test_amd_hipcc_scratch_flat PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # The opt-in rule for gfx90a's binary16 and bfloat16 matrix instructions, what the FTTN paper's summary of an MI250X reads as
 # (subnormals as zero, a binary32 rounding after every product): the paper's ten tests as fixed vectors and its motivating GEMM, on
 # and off; gfx942 unchanged; and once more with VGPU_MFMA_CDNA2=fttn in the environment, the switch a user has (docs/matrix-numerics.md).
@@ -3211,6 +3218,16 @@ if(TARGET vgpucublas)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
+
+  # The math functions a program calls (tools/numerics: every libdevice function over published worst cases, edges and random
+  # arguments; the worked examples of NVIDIA's floating-point paper; the Varity paper's two cases): the simulator's lines pinned,
+  # its two engines held to each other, two profiles and two cubin architectures to each other (docs/numerics/math-functions.md).
+  add_test(NAME e2e_numerics_mathfn
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_numerics_mathfn.sh)
+  set_tests_properties(e2e_numerics_mathfn PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 900)
 
   # The error each refused launch configuration reports, runtime and driver, against an RTX 3060's CUDA 13.0.
   add_test(NAME e2e_launch_refusals
