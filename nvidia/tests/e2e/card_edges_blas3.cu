@@ -13,8 +13,16 @@
 //     cublasSgemmEx, cublasCgemmEx and cublasCgemm3mEx print "SGEMM_EX ", "CGEMM_EX " and "CGEMM " at ?GEMM's
 //     positions, the Ex herk/syrk forms "CHERK ", "CSYRK ", "CSYRK3M " at ?HERK's.
 //   - a transpose of T or C is taken by every herk/syrk form; only an unknown operation (CONJG among them) is refused.
-// Not imitated, so not checked: the card's answers for an unknown data or compute type in the Ex routines (7 for some,
-// 15 for others), GemmBatchedEx with a negative batch count (13), and strides that reach outside the buffers.
+//   - the Ex routines' types: A and B of two types are NOT_SUPPORTED before a bad argument; after it a data type outside
+//     0..15 is INVALID_VALUE with no line in GemmEx, its batched forms and the herk/syrk forms (NOT_SUPPORTED in
+//     SgemmEx), and so is a compute type from 64 up that names none in the batched forms (NOT_SUPPORTED in GemmEx); a
+//     CUDA 10 compute type (CUDA_R_32F, C_32F, R_64F, C_64F, R_16F, R_32I) is taken. The simulator answered
+//     NOT_SUPPORTED for all of these, before the arguments. GemmBatchedEx then succeeds with no batch or an empty C,
+//     then checks the combination, then refuses a null C array (7) and a negative count (EXECUTION_FAILED; the simulator
+//     7 first of all); GemmStridedBatchedEx succeeds with no batch, then checks the combination, and takes a negative
+//     count. The herk/syrk forms succeed with n 0 whatever the types.
+// Not imitated, so not checked: strides that reach outside the buffers, and a null alpha or beta with a negative batch
+// count (the card's process crashes).
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -792,6 +800,90 @@ int main() {
   CASE("cublasGemmEx algo 1000", 7, "GEMM_EX ", 18, cublasGemmEx(h,N,N,4,4,4,sal,vA,CUDA_R_32F,4,vB,CUDA_R_32F,4,sal,vC,CUDA_R_32F,4,CUBLAS_COMPUTE_32F,(cublasGemmAlgo_t)1000));
   // The sizes are checked before the algorithm.
   CASE("cublasGemmEx m -1 and algo -5", 7, "GEMM_EX ", 3, cublasGemmEx(h,N,N,-1,4,4,sal,vA,CUDA_R_32F,4,vB,CUDA_R_32F,4,sal,vC,CUDA_R_32F,4,CUBLAS_COMPUTE_32F,BadAlgo));
+
+  // The Ex routines' type checks.
+  {
+    const auto dt = [](int v) { return static_cast<cudaDataType>(v); };
+    const auto R32 = CUDA_R_32F, R64 = CUDA_R_64F, C32 = CUDA_C_32F;
+    const auto c32 = CUBLAS_COMPUTE_32F;
+    const auto D = CUBLAS_GEMM_DEFAULT;
+    const int32_t i32al = 1;   // alpha and beta of the int32 compute type
+    CASE("GemmEx AB 99", 7, kNone, 0, cublasGemmEx(h,N,N,4,4,4,sal,vA,dt(99),4,vB,dt(99),4,sal,vC,R32,4,c32,D));
+    CASE("GemmEx AB -1", 7, kNone, 0, cublasGemmEx(h,N,N,4,4,4,sal,vA,dt(-1),4,vB,dt(-1),4,sal,vC,R32,4,c32,D));
+    CASE("GemmEx AB 16", 7, kNone, 0, cublasGemmEx(h,N,N,4,4,4,sal,vA,dt(16),4,vB,dt(16),4,sal,vC,R32,4,c32,D));
+    CASE("GemmEx AB 15", 15, kNone, 0, cublasGemmEx(h,N,N,4,4,4,sal,vA,dt(15),4,vB,dt(15),4,sal,vC,R32,4,c32,D));
+    CASE("GemmEx C 99", 7, kNone, 0, cublasGemmEx(h,N,N,4,4,4,sal,vA,R32,4,vB,R32,4,sal,vC,dt(99),4,c32,D));
+    CASE("GemmEx C 28", 7, kNone, 0, cublasGemmEx(h,N,N,4,4,4,sal,vA,R32,4,vB,R32,4,sal,vC,dt(28),4,c32,D));
+    CASE("GemmEx A 99 B R32", 15, kNone, 0, cublasGemmEx(h,N,N,4,4,4,sal,vA,dt(99),4,vB,R32,4,sal,vC,R32,4,c32,D));
+    CASE("GemmEx A R32 B R64 m -1", 15, kNone, 0, cublasGemmEx(h,N,N,-1,4,4,sal,vA,R32,4,vB,R64,4,sal,vC,R32,4,c32,D));
+    CASE("GemmEx C R64 m -1", 7, "GEMM_EX ", 3, cublasGemmEx(h,N,N,-1,4,4,sal,vA,R32,4,vB,R32,4,sal,vC,R64,4,c32,D));
+    CASE("GemmEx C 99 m -1", 7, "GEMM_EX ", 3, cublasGemmEx(h,N,N,-1,4,4,sal,vA,R32,4,vB,R32,4,sal,vC,dt(99),4,c32,D));
+    CASE("GemmEx C 99 algo -5", 7, "GEMM_EX ", 18, cublasGemmEx(h,N,N,4,4,4,sal,vA,R32,4,vB,R32,4,sal,vC,dt(99),4,c32,BadAlgo));
+    CASE("GemmEx compute 99", 15, kNone, 0, cublasGemmEx(h,N,N,4,4,4,sal,vA,R32,4,vB,R32,4,sal,vC,R32,4,static_cast<cublasComputeType_t>(99),D));
+    CASE("GemmEx compute 66 C 99", 7, kNone, 0, cublasGemmEx(h,N,N,4,4,4,sal,vA,R32,4,vB,R32,4,sal,vC,dt(99),4,static_cast<cublasComputeType_t>(66),D));
+    CASE("GemmEx m 0 C 99", 7, kNone, 0, cublasGemmEx(h,N,N,0,4,4,sal,vA,R32,4,vB,R32,4,sal,vC,dt(99),4,c32,D));
+    CASE("GemmEx m 0 C R64", 15, kNone, 0, cublasGemmEx(h,N,N,0,4,4,sal,vA,R32,4,vB,R32,4,sal,vC,R64,4,c32,D));
+    for (int legacy : {0, 4})
+      CASE("GemmEx R32 compute CUDA 10 32F", 0, kNone, 0, cublasGemmEx(h,N,N,4,4,4,sal,vA,R32,4,vB,R32,4,sal,vC,R32,4,static_cast<cublasComputeType_t>(legacy),D));
+    for (int legacy : {1, 5})
+      CASE("GemmEx R64 compute CUDA 10 64F", 0, kNone, 0, cublasGemmEx(h,N,N,4,4,4,dal,vA,R64,4,vB,R64,4,dal,vC,R64,4,static_cast<cublasComputeType_t>(legacy),D));
+    CASE("GemmEx R16F compute CUDA_R_16F", 0, kNone, 0, cublasGemmEx(h,N,N,4,4,4,hal,vA,CUDA_R_16F,4,vB,CUDA_R_16F,4,hal,vC,CUDA_R_16F,4,static_cast<cublasComputeType_t>(2),D));
+    CASE("GemmEx R8I to R32I compute CUDA_R_32I", 0, kNone, 0, cublasGemmEx(h,N,N,4,4,4,&i32al,vA,CUDA_R_8I,4,vB,CUDA_R_8I,4,&i32al,vC,CUDA_R_32I,4,static_cast<cublasComputeType_t>(10),D));
+    for (int legacy : {3, 6})
+      CASE("GemmEx compute CUDA 10 other", 15, kNone, 0, cublasGemmEx(h,N,N,4,4,4,sal,vA,R32,4,vB,R32,4,sal,vC,R32,4,static_cast<cublasComputeType_t>(legacy),D));
+    for (int ct : {66, 99})
+      CASE("GemmBatchedEx compute unknown", 7, kNone, 0, cublasGemmBatchedEx(h,N,N,4,4,4,sal,vAa,R32,4,vBa,R32,4,sal,vCa,R32,4,2,static_cast<cublasComputeType_t>(ct),D));
+    for (int ct : {1, 3})
+      CASE("GemmBatchedEx compute CUDA 10 not for R32", 15, kNone, 0, cublasGemmBatchedEx(h,N,N,4,4,4,sal,vAa,R32,4,vBa,R32,4,sal,vCa,R32,4,2,static_cast<cublasComputeType_t>(ct),D));
+    CASE("GemmBatchedEx compute CUDA_R_32F", 0, kNone, 0, cublasGemmBatchedEx(h,N,N,4,4,4,sal,vAa,R32,4,vBa,R32,4,sal,vCa,R32,4,2,static_cast<cublasComputeType_t>(0),D));
+    CASE("GemmBatchedEx C 99", 7, kNone, 0, cublasGemmBatchedEx(h,N,N,4,4,4,sal,vAa,R32,4,vBa,R32,4,sal,vCa,dt(99),4,2,c32,D));
+    CASE("GemmBatchedEx AB 99", 7, kNone, 0, cublasGemmBatchedEx(h,N,N,4,4,4,sal,vAa,dt(99),4,vBa,dt(99),4,sal,vCa,R32,4,2,c32,D));
+    CASE("GemmBatchedEx batch -1", 13, kNone, 0, cublasGemmBatchedEx(h,N,N,4,4,4,sal,vAa,R32,4,vBa,R32,4,sal,vCa,R32,4,-1,c32,D));
+    CASE("GemmBatchedEx_64 batch -1", 13, kNone, 0, cublasGemmBatchedEx_64(h,N,N,4,4,4,sal,vAa,R32,4,vBa,R32,4,sal,vCa,R32,4,-1,c32,D));
+    CASE("GemmBatchedEx batch -1 m -1", 7, "GEMM_EX ", 3, cublasGemmBatchedEx(h,N,N,-1,4,4,sal,vAa,R32,4,vBa,R32,4,sal,vCa,R32,4,-1,c32,D));
+    CASE("GemmBatchedEx batch -1 C R64", 15, kNone, 0, cublasGemmBatchedEx(h,N,N,4,4,4,sal,vAa,R32,4,vBa,R32,4,sal,vCa,R64,4,-1,c32,D));
+    CASE("GemmBatchedEx batch -1 A!=B", 15, kNone, 0, cublasGemmBatchedEx(h,N,N,4,4,4,sal,vAa,R32,4,vBa,R64,4,sal,vCa,R32,4,-1,c32,D));
+    CASE("GemmBatchedEx batch -1 null C", 7, kNone, 0, cublasGemmBatchedEx(h,N,N,4,4,4,sal,vAa,R32,4,vBa,R32,4,sal,nullptr,R32,4,-1,c32,D));
+    CASE("GemmBatchedEx batch -1 null A", 13, kNone, 0, cublasGemmBatchedEx(h,N,N,4,4,4,sal,nullptr,R32,4,vBa,R32,4,sal,vCa,R32,4,-1,c32,D));
+    CASE("GemmBatchedEx batch -1 m 0", 0, kNone, 0, cublasGemmBatchedEx(h,N,N,0,4,4,sal,vAa,R32,4,vBa,R32,4,sal,vCa,R32,4,-1,c32,D));
+    CASE("GemmBatchedEx batch -1 k 0", 13, kNone, 0, cublasGemmBatchedEx(h,N,N,4,4,0,sal,vAa,R32,4,vBa,R32,4,sal,vCa,R32,4,-1,c32,D));
+    CASE("GemmBatchedEx batch 0 m -1", 7, "GEMM_EX ", 3, cublasGemmBatchedEx(h,N,N,-1,4,4,sal,vAa,R32,4,vBa,R32,4,sal,vCa,R32,4,0,c32,D));
+    CASE("GemmBatchedEx batch 0 C 99", 7, kNone, 0, cublasGemmBatchedEx(h,N,N,4,4,4,sal,vAa,R32,4,vBa,R32,4,sal,vCa,dt(99),4,0,c32,D));
+    CASE("GemmBatchedEx batch 0 compute 66", 7, kNone, 0, cublasGemmBatchedEx(h,N,N,4,4,4,sal,vAa,R32,4,vBa,R32,4,sal,vCa,R32,4,0,static_cast<cublasComputeType_t>(66),D));
+    CASE("GemmBatchedEx batch 0 A!=B", 15, kNone, 0, cublasGemmBatchedEx(h,N,N,4,4,4,sal,vAa,R32,4,vBa,R64,4,sal,vCa,R32,4,0,c32,D));
+    CASE("GemmBatchedEx batch 0 C R64", 0, kNone, 0, cublasGemmBatchedEx(h,N,N,4,4,4,sal,vAa,R32,4,vBa,R32,4,sal,vCa,R64,4,0,c32,D));
+    CASE("GemmBatchedEx batch 1 m 0 C R64", 0, kNone, 0, cublasGemmBatchedEx(h,N,N,0,4,4,sal,vAa,R32,4,vBa,R32,4,sal,vCa,R64,4,1,c32,D));
+    CASE("GemmStridedBatchedEx compute 99", 7, kNone, 0, cublasGemmStridedBatchedEx(h,N,N,4,4,4,sal,vA,R32,4,16,vB,R32,4,16,sal,vC,R32,4,16,2,static_cast<cublasComputeType_t>(99),D));
+    CASE("GemmStridedBatchedEx C 99", 7, kNone, 0, cublasGemmStridedBatchedEx(h,N,N,4,4,4,sal,vA,R32,4,16,vB,R32,4,16,sal,vC,dt(99),4,16,2,c32,D));
+    CASE("GemmStridedBatchedEx batch -1", 0, kNone, 0, cublasGemmStridedBatchedEx(h,N,N,4,4,4,sal,vA,R32,4,16,vB,R32,4,16,sal,vC,R32,4,16,-1,c32,D));
+    CASE("GemmStridedBatchedEx_64 batch -1", 0, kNone, 0, cublasGemmStridedBatchedEx_64(h,N,N,4,4,4,sal,vA,R32,4,16,vB,R32,4,16,sal,vC,R32,4,16,-1,c32,D));
+    CASE("GemmStridedBatchedEx batch -1 C R64", 15, kNone, 0, cublasGemmStridedBatchedEx(h,N,N,4,4,4,sal,vA,R32,4,16,vB,R32,4,16,sal,vC,R64,4,16,-1,c32,D));
+    CASE("GemmStridedBatchedEx batch 0 C 99", 7, kNone, 0, cublasGemmStridedBatchedEx(h,N,N,4,4,4,sal,vA,R32,4,16,vB,R32,4,16,sal,vC,dt(99),4,16,0,c32,D));
+    CASE("GemmStridedBatchedEx batch 0 A!=B", 15, kNone, 0, cublasGemmStridedBatchedEx(h,N,N,4,4,4,sal,vA,R32,4,16,vB,R64,4,16,sal,vC,R32,4,16,0,c32,D));
+    CASE("GemmStridedBatchedEx batch 0 C R64", 0, kNone, 0, cublasGemmStridedBatchedEx(h,N,N,4,4,4,sal,vA,R32,4,16,vB,R32,4,16,sal,vC,R64,4,16,0,c32,D));
+    CASE("GemmStridedBatchedEx batch 0 m -1", 7, "GEMM_EX ", 3, cublasGemmStridedBatchedEx(h,N,N,-1,4,4,sal,vA,R32,4,16,vB,R32,4,16,sal,vC,R32,4,16,0,c32,D));
+    CASE("SgemmEx A 99", 15, kNone, 0, cublasSgemmEx(h,N,N,4,4,4,sal,vA,dt(99),4,vB,dt(99),4,sal,vC,R32,4));
+    CASE("SgemmEx C 99", 15, kNone, 0, cublasSgemmEx(h,N,N,4,4,4,sal,vA,R32,4,vB,R32,4,sal,vC,dt(99),4));
+    CASE("CsyrkEx A 99", 7, kNone, 0, cublasCsyrkEx(h,LO,N,4,4,cal,vA,dt(99),4,cal,vC,C32,4));
+    CASE("CsyrkEx A -1", 7, kNone, 0, cublasCsyrkEx(h,LO,N,4,4,cal,vA,dt(-1),4,cal,vC,C32,4));
+    CASE("CsyrkEx C 99", 7, kNone, 0, cublasCsyrkEx(h,LO,N,4,4,cal,vA,C32,4,cal,vC,dt(99),4));
+    CASE("CsyrkEx A R32 C 99", 7, kNone, 0, cublasCsyrkEx(h,LO,N,4,4,cal,vA,R32,4,cal,vC,dt(99),4));
+    CASE("CsyrkEx A R32", 15, kNone, 0, cublasCsyrkEx(h,LO,N,4,4,cal,vA,R32,4,cal,vC,C32,4));
+    CASE("CsyrkEx A 99 n -1", 7, "CSYRK ", 3, cublasCsyrkEx(h,LO,N,-1,4,cal,vA,dt(99),4,cal,vC,C32,4));
+    CASE("CsyrkEx A R32 n -1", 7, "CSYRK ", 3, cublasCsyrkEx(h,LO,N,-1,4,cal,vA,R32,4,cal,vC,C32,4));
+    CASE("CsyrkEx uplo 99 A 99", 7, "CSYRK ", 1, cublasCsyrkEx(h,BadFill,N,4,4,cal,vA,dt(99),4,cal,vC,C32,4));
+    CASE("CsyrkEx A R32 n 0", 0, kNone, 0, cublasCsyrkEx(h,LO,N,0,4,cal,vA,R32,4,cal,vC,C32,4));
+    CASE("CsyrkEx A 99 n 0", 0, kNone, 0, cublasCsyrkEx(h,LO,N,0,4,cal,vA,dt(99),4,cal,vC,C32,4));
+    CASE("Csyrk3mEx A 99", 7, kNone, 0, cublasCsyrk3mEx(h,LO,N,4,4,cal,vA,dt(99),4,cal,vC,C32,4));
+    CASE("Csyrk3mEx A 99 n -1", 7, "CSYRK3M ", 3, cublasCsyrk3mEx(h,LO,N,-1,4,cal,vA,dt(99),4,cal,vC,C32,4));
+    CASE("CherkEx A 99", 7, kNone, 0, cublasCherkEx(h,LO,N,4,4,sal,vA,dt(99),4,sal,vC,C32,4));
+    CASE("CherkEx C 99", 7, kNone, 0, cublasCherkEx(h,LO,N,4,4,sal,vA,C32,4,sal,vC,dt(99),4));
+    CASE("CherkEx A 99 lda 1", 7, "CHERK ", 7, cublasCherkEx(h,LO,N,4,4,sal,vA,dt(99),1,sal,vC,C32,4));
+    CASE("CherkEx A R32 n -1", 7, "CHERK ", 3, cublasCherkEx(h,LO,N,-1,4,sal,vA,R32,4,sal,vC,C32,4));
+    CASE("Cherk3mEx A 99", 7, kNone, 0, cublasCherk3mEx(h,LO,N,4,4,sal,vA,dt(99),4,sal,vC,C32,4));
+    CASE("Cherk3mEx A R32 n -1", 7, "CHERK ", 3, cublasCherk3mEx(h,LO,N,-1,4,sal,vA,R32,4,sal,vC,C32,4));
+  }
+  WANT(cudaDeviceSynchronize(), cudaSuccess);
 
   for (void** a : arrays) WANT(cudaFree(a), cudaSuccess);
   for (void* p : {vA, vB, vC, vX}) WANT(cudaFree(p), cudaSuccess);

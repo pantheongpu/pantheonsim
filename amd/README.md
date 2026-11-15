@@ -230,7 +230,10 @@ match a GEMM done on the host. A double's accumulator does not hold its rows
 as a float's does -- each lane group every fourth row, not four together --
 and moving any part of either arrangement makes them fail. Sums are formed in
 double (fused, for doubles) and rounded once; where a sum is not exact, a card
-may round it differently. The reduced-precision xf32 forms (`v_mfma_f32_16x16x8_xf32`
+may round it differently. (No AMD matrix-core card has been measured: which sum
+each profile makes, what the FTTN and MMA-Sim papers report of MI100, MI250X and
+MI300X instead, and the opt-in MI250X rule `VGPU_MFMA_CDNA2=fttn`, are in
+[docs/matrix-numerics.md](../docs/matrix-numerics.md).) The reduced-precision xf32 forms (`v_mfma_f32_16x16x8_xf32`
 and `32x32x4`, gfx940 to gfx942) multiply floats whose mantissa is cut to 10 bits,
 as the MI300 ISA guide describes them: the guide says "round" once and
 "truncated" in each instruction's own text, and the instruction's is taken --

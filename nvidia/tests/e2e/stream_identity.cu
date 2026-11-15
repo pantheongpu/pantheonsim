@@ -36,7 +36,9 @@ int main() {
   set<<<1, 1, 0, b>>>(x, 7);            // runs now: b is not capturing
   CK(cudaStreamSynchronize(b));
   int h = -1;
-  CK(cudaMemcpy(&h, x, sizeof h, cudaMemcpyDeviceToHost));
+  // (On b: a cudaMemcpy, on the legacy stream, is cudaErrorStreamCaptureImplicit while the blocking a captures.)
+  CK(cudaMemcpyAsync(&h, x, sizeof h, cudaMemcpyDeviceToHost, b));
+  CK(cudaStreamSynchronize(b));
   CHECK(h == 7);
   set<<<1, 1, 0, a>>>(x, 9);            // recorded: a is
   cudaGraph_t g = nullptr;

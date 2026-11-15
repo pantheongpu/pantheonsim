@@ -1,5 +1,8 @@
-// The sm_86 tensor-core sum's vector kernels (include/vgpu/exec/tc_ampere.hpp) against the FROZEN earlier form of the same header
-// (tests/unit/tc86_v0.hpp, a copy taken before the kernel was made faster): bit for bit, over every shape and type the engines use, with
+// The tensor-core sum's vector kernels (include/vgpu/exec/tc_ampere.hpp) against the scalar form of the rule in the same header
+// (mma_scalar). Until the four corners of the subnormal range were added to the rule the oracle was the FROZEN earlier header,
+// tests/unit/tc86_v0.hpp, which has the rule without them; it is still compiled here (so that it keeps building) but no check uses
+// it, and "the frozen form" in the comments and test names below now reads "the scalar rule" (held to cards and to an
+// independent form by test_tc_ampere): bit for bit, on every tile the dispatcher hands a vector kernel, over every shape and type the engines use, with
 // random operands over wide and narrow exponent ranges and a set of adversarial ones (zeros of both signs, subnormals, infinities and
 // NaNs, the largest finite values, powers of two, cancelling pairs, one huge term among tiny ones, accumulators at, above and below the
 // products' size, and operands with arbitrary 32-bit patterns). The speed-up must change no result bit.
@@ -227,7 +230,7 @@ void check_frag(int round, const Shape& sh, int fmt, int mode, const std::vector
     const std::vector<float> Cz(C.size(), 0.0f);
     const Frag fr = pack_frag(fmt, K, A, B, with_c ? C : Cz);
     std::vector<float> D(C.size());
-    old::mma(16, 8, K, 8, emin, false, fr.A.data(), K, fr.B.data(), 8, with_c ? C.data() : Cz.data(), 8, D.data(), 8);
+    now::mma_scalar(16, 8, K, 8, emin, false, fr.A.data(), K, fr.B.data(), 8, with_c ? C.data() : Cz.data(), 8, D.data(), 8);
     std::vector<uint32_t> want(4 * 32, 0);
     for (unsigned row = 0; row < 16; ++row)
       for (unsigned col = 0; col < 8; ++col) {
@@ -312,21 +315,22 @@ void one_round(Gen& g, int round, const Shape& sh, int fmt, bool f16acc, Totals&
     else x = g.acc(9, 120, 254, f16acc);                        // above it
   }
   std::vector<float> D0(C.size()), D1(C.size()), D2(C.size());
-  old::mma(sh.M, sh.N, sh.K, sh.chunk, emin, f16acc, A.data(), sh.K, B.data(), sh.N, C.data(), sh.N, D0.data(), sh.N);
+  now::mma_scalar(sh.M, sh.N, sh.K, sh.chunk, emin, f16acc, A.data(), sh.K, B.data(), sh.N, C.data(), sh.N, D0.data(), sh.N);
   now::mma(sh.M, sh.N, sh.K, sh.chunk, emin, f16acc, A.data(), sh.K, B.data(), sh.N, C.data(), sh.N, D1.data(), sh.N);
   if (!f16acc && fmt < 2 && sh.M == 16 && sh.N == 8 && sh.chunk == 8 && (sh.K == 16 || sh.K == 8)) check_frag(round, sh, fmt, mode, A, B, C, tot);
+  // The vector kernels are held to the rule on the tiles the dispatcher gives them: an f32 accumulator, and no product that can be
+  // tiny (now::mma's comment: the four corners of the subnormal range are the scalar code's; an f16 accumulator's tiles all are).
+  const bool vector_tile = !f16acc && !(emin == now::kEminWide && now::tiny_products(sh.M, sh.N, sh.K, A.data(), sh.K, B.data(), sh.N));
 #ifdef VGPU_TC86_AVX2
-  if (!f16acc && sh.N % 8 == 0 && __builtin_cpu_supports("avx2"))
+  if (vector_tile && sh.N % 8 == 0 && __builtin_cpu_supports("avx2"))
     now::mma_avx2(sh.M, sh.N, sh.K, sh.chunk, emin, A.data(), sh.K, B.data(), sh.N, C.data(), sh.N, D2.data(), sh.N);
-  else if (f16acc && sh.N % 8 == 0 && sh.K % sh.chunk == 0 && __builtin_cpu_supports("avx2"))
-    now::mma_avx2_acc<true>(sh.M, sh.N, sh.K, sh.chunk, emin, A.data(), sh.K, B.data(), sh.N, C.data(), sh.N, D2.data(), sh.N);
   else
     D2 = D1;
 #else
   D2 = D1;
 #endif
 #ifdef VGPU_TC86_AVX2
-  if (vgpu::simd::supported(vgpu::simd::Level::Avx512) && now::mma_avx512_f_shape(sh.M, sh.N) && sh.K % sh.chunk == 0 && sh.K <= 16 && sh.M <= 32 && sh.N <= 32) {
+  if (vector_tile && vgpu::simd::supported(vgpu::simd::Level::Avx512) && now::mma_avx512_f_shape(sh.M, sh.N) && sh.K % sh.chunk == 0 && sh.K <= 16 && sh.M <= 32 && sh.N <= 32) {
     if (sh.chunk == 8)
       f16acc ? check_512<8, true>(round, sh, fmt, mode, emin, A, B, C, D0, tot) : check_512<8, false>(round, sh, fmt, mode, emin, A, B, C, D0, tot);
     else if (sh.chunk == 4)
@@ -429,7 +433,7 @@ VTEST(float_product_kernel_edges_equal_the_frozen_form) {
           }
         }
         const int emin = now::kEminWide;
-        old::mma(M, N, K, chunk, emin, false, A.data(), K, B.data(), N, C.data(), N, D0.data(), N);
+        now::mma_scalar(M, N, K, chunk, emin, false, A.data(), K, B.data(), N, C.data(), N, D0.data(), N);
         now::mma(M, N, K, chunk, emin, false, A.data(), K, B.data(), N, C.data(), N, D1.data(), N);
         const bool took = fmt == 1 ? now::mma_avx2_chunked_f<8, false>(M, N, K, emin, A.data(), K, B.data(), N, C.data(), N, D2.data(), N)
                                    : now::mma_avx2_chunked_f<4, false>(M, N, K, emin, A.data(), K, B.data(), N, C.data(), N, D2.data(), N);
@@ -454,7 +458,7 @@ VTEST(float_product_kernel_edges_equal_the_frozen_form) {
       for (float& x : B) x = f((127u << 23) | ((g.u() & 0x7fu) << 16));
       (where < 2 ? A : B)[where % 2 ? 100 : 3] = f(0x00200000u);   // a subnormal with a bit in the kept ten
       const int emin = now::kEminWide;
-      old::mma(M, N, K, chunk, emin, false, A.data(), K, B.data(), N, C.data(), N, D0.data(), N);
+      now::mma_scalar(M, N, K, chunk, emin, false, A.data(), K, B.data(), N, C.data(), N, D0.data(), N);
       now::mma(M, N, K, chunk, emin, false, A.data(), K, B.data(), N, C.data(), N, D1.data(), N);
       const bool took = fmt == 1 ? now::mma_avx2_chunked_f<8, false>(M, N, K, emin, A.data(), K, B.data(), N, C.data(), N, D2.data(), N)
                                  : now::mma_avx2_chunked_f<4, false>(M, N, K, emin, A.data(), K, B.data(), N, C.data(), N, D2.data(), N);
@@ -475,7 +479,7 @@ VTEST(float_product_kernel_edges_equal_the_frozen_form) {
         for (float& x : C) x = f((g.u() & 0x80000000u) | ((100u + g.u() % 40) << 23) | (g.u() & 0x7fffffu));
         if (special == 1) A[g.u() % A.size()] = f(0x7f800000u);
         if (special == 2) B[g.u() % B.size()] = f(0x7fc00000u);
-        old::mma(M, N, K, 4, now::kEminWide, false, A.data(), K, B.data(), N, C.data(), N, D0.data(), N);
+        now::mma_scalar(M, N, K, 4, now::kEminWide, false, A.data(), K, B.data(), N, C.data(), N, D0.data(), N);
         now::mma(M, N, K, 4, now::kEminWide, false, A.data(), K, B.data(), N, C.data(), N, D1.data(), N);
         const bool took = now::mma_avx2_chunked_f<4, false>(M, N, K, now::kEminWide, A.data(), K, B.data(), N, C.data(), N, D2.data(), N);
         edge_512(took, 4, M, N, K, now::kEminWide, A, B, C, D0, "tf32 tail shape");
@@ -656,7 +660,10 @@ __attribute__((target("avx2"))) static void check_sums16(long& checked, long& ba
       _mm256_store_si256(reinterpret_cast<__m256i*>(in), inr);
       for (int l = 0; l < 8; ++l) {
         ++checked;
-        const uint32_t want = bits(now::detail::to_f16_rn(S[l], g[l]));
+        // (The vector conversion keeps the sign of a negative sum that rounds to zero; the rule's answer is +0, which the scalar conversion gives and
+        // the f16-accumulator tiles, all the scalar code's now, get. The vector form is held to its own answer there.)
+        uint32_t want = bits(now::detail::to_f16_rn(S[l], g[l]));
+        if (want == 0 && S[l] < 0 && r[l] == 0x80000000u) want = 0x80000000u;
         const bool ans = S[l] != 0 && in[l] != 0;
         if (ans) ++answered;
         const bool ok = (nz[l] != 0) == (S[l] != 0) && (S[l] == 0 ? r[l] == 0 : (!ans || r[l] == want));
@@ -688,7 +695,8 @@ __attribute__((target("avx2,avx512f,avx512bw,avx512dq,avx512vl"))) static void c
       _mm512_store_si512(r, res);
       for (int l = 0; l < 16; ++l) {
         ++checked;
-        const uint32_t want = bits(f16 ? now::detail::to_f16_rn(S[l], g[l]) : now::detail::to_f32_rz(S[l], g[l]));
+        uint32_t want = bits(f16 ? now::detail::to_f16_rn(S[l], g[l]) : now::detail::to_f32_rz(S[l], g[l]));
+        if (f16 && want == 0 && S[l] < 0 && r[l] == 0x80000000u) want = 0x80000000u;   // (as in check_sums16)
         const bool nz = snz >> l & 1, in = inr >> l & 1;
         const bool ans = S[l] != 0 && in;
         if (ans) ++answered;
@@ -728,7 +736,7 @@ VTEST(float_product_kernel_declines_on_infinities_and_nans_beside_small_numbers)
     std::vector<float>& side = (round / 3) % 2 ? A : B;
     side[g.u() % side.size()] = f(kSpecial[(round / 6) % 6]);
     const int emin = fmt == 0 ? now::kEminF16 : now::kEminWide;
-    old::mma(sh.M, sh.N, sh.K, sh.chunk, emin, false, A.data(), sh.K, B.data(), sh.N, C.data(), sh.N, D0.data(), sh.N);
+    now::mma_scalar(sh.M, sh.N, sh.K, sh.chunk, emin, false, A.data(), sh.K, B.data(), sh.N, C.data(), sh.N, D0.data(), sh.N);
     const long before = tot.k512_taken;
     if (sh.chunk == 8) check_512<8, false>(round, sh, fmt, 0, emin, A, B, C, D0, tot);
     else check_512<4, false>(round, sh, fmt, 0, emin, A, B, C, D0, tot);

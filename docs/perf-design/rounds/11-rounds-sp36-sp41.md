@@ -4939,3 +4939,260 @@ do not suit runs the plain loop after 64 runs or 256 turns. The variant of the s
 * Not run here: `bench_amd_counters_blocks` (hipcc 6.4.4 has no expected file), the e2e tests that need ROCm's full install, ASan and
   TSan, gfx1250 kernels. The knob stays off by default in this branch.
 * Cleanup: this round's directory on server3 (`/tmp/sp72-amd-tier`: ten trees and builds, the bench cache, logs) was removed by exact path; round sp70's inq directory was read and not changed.
+
+## Round sp74 (the time inq spends: row handlers for the 64-bit forms and SDWA in the AMD tier; what is left, by share)
+
+Branch `sp72-amd-tier` after the merge of `origin/sp69-hotspot-start` a33ead36 (main's #644 in it: gfx1030's 16-bit and NaN results),
+which is the base of every number here. Design: [study 13](../13-amd-compiled-tier.md), section 13. Data, scripts and commands:
+[`data/sp74/`](../data/sp74/README.md). server3 as in round sp73 (Release, LTO), quiet for every table: one job of this round at a time.
+These are changes of the tier itself (`amd/src/gcn_tier.cpp`), so they run with `VGPU_AMD_BLOCKS` off as well as on.
+
+### The merge of #644, checked first
+
+#644 changed the interpreter's instruction bodies (gfx1030's NaN rule `rdna2_nan`, the high half kept under a 16-bit result, v_min3,
+v_max3 and v_med3) and three lines of the tier's classifier (gfx1030's binary32 NaNs handed back, v_div_fixup_f32 and the sine of a whole
+number of turns left to the interpreter). Nothing in the step loop changed, so blocks skip nothing new: `run_block`, `run_round_blocks` and
+the bound integer runs call the handlers `tier_step` calls and hand back as it does. At the merged head, before anything of this round:
+the AMD ctest set (with `test_amd_gcn_tier_same_bits` and `test_amd_gcn_blocks_same_bits` in it) is 328 tests, 240 pass, 88 skip, none
+fails, with the knob off and with `VGPU_AMD_BLOCKS=1` in every test's environment, test by test the same.
+
+### Where the handlers' time was: one table per test
+
+Round sp73 said that `h_f64`, the general binary64 handler, was 13 to 15 % of the library's samples in two inq tests, and guessed at the
+forms. A diagnostic build (`scripts/diagpatch.py`, never committed: `tier_step` reads the host's time-stamp counter around each handler
+and adds it up by instruction form) says which, for the base (`data/sp74/forms.md`; ticks a call include about 25 of the measurement's own):
+
+| form | steepest_descent: share of the handlers' ticks | ticks a call | initial_guess | ticks a call |
+|---|---:|---:|---:|---:|
+| `v_max_f64` of two register pairs | 15.2 % | 331 | 13.6 % | 331 |
+| `v_max_f64` of two pairs with `\|x\|` | 5.0 % | 352 | 4.3 % | 345 |
+| `v_max_f64` of a pair and a constant | 1.2 % | 327 | 1.0 % | 326 |
+| `v_or_b32_sdwa`, a byte of one source | 5.0 % | 236 | 4.5 % | 233 |
+| `ds_bpermute_b32` | 5.1 % | 79 | 4.5 % | 78 |
+| `v_cmp_lt_i64` of a scalar pair and a register pair | 2.9 % | 75 | 2.6 % | 74 |
+| `v_cmp_neq_f64` of a constant and a pair | 2.4 % | 166 | 2.2 % | 179 |
+| `v_frexp_exp_i32_f64` | 2.0 % | 562 | 1.7 % | 539 |
+| `v_lshlrev_b64`, `v_lshrrev_b64`, `v_lshl_add_u64` | 3.1 % | 102 to 151 | 2.7 % (`v_lshl_add_u64`) | 139 to 179 |
+
+It was one instruction: **`v_max_f64` took 331 ticks a call where `v_add_f64`, which has row kernels since round sp27, takes 83**, and it
+is 41 million of steepest_descent's 1.19 billion instructions. The general handler packs each register pair into an array of 64-bit
+lanes, looks for two zeros of opposite sign one lane at a time, runs the kernel, scans the result for NaNs and unpacks it. poisson and
+ks_hamiltonian do not have it: their handlers' time is `v_add_f64`, `v_mul_f64` and `v_fmac_f64` (30 and 40 % of the handlers' ticks),
+already rows, with 12 to 38 of a wave's 64 lanes on.
+
+### Step 1: row handlers for the 64-bit forms that had none (commit a9dbf7e8)
+
+At the end of `gcn_tier.cpp`, for AMD64 hosts with AVX2 (the tier has no 512-bit path; other hosts keep the handlers they had): the
+register pairs' rows read eight lanes at a time into two vectors of four 64-bit lanes, one host instruction a lane, a pair of rows
+written. What a lane kernel leaves to the C library or to the interpreter is not done here: where a lane that is on is such a case,
+nothing is written and the handler that was there before does the whole instruction, so the bits of such a lane are decided where they
+were.
+
+| forms | the row handler does | left to the handler above it |
+|---|---|---|
+| `v_min_f64`, `v_max_f64` | the host's minimum or maximum | a lane with a NaN operand; two zeros of opposite sign (the interpreter's, as before) |
+| `v_rcp_f64`, `v_sqrt_f64`, `v_floor_f64`, `v_ceil_f64`, `v_trunc_f64`, `v_rndne_f64` | the host's division, root and rounding (the rounding mode's for rndne) | a lane whose result is a NaN |
+| `v_cmp_*_f64`, `v_cmp_*_i64`, `v_cmp_*_u64` and their `v_cmpx` forms | every lane: the host's comparison, a NaN's included | one register read as 64 bits |
+| `v_lshlrev_b64`, `v_lshrrev_b64`, `v_lshl_add_u64` (both count rules) | every lane | `v_ashrrev_i64` and `v_mov_b64` keep their handlers |
+| `v_cvt_f64_i32`, `v_cvt_f64_u32`, `v_cvt_f64_f32`, `v_cvt_f32_f64`, `v_cvt_i32_f64`, `v_cvt_u32_f64` | every lane: the host's conversion, with the interpreter's limits for the integers and a NaN's bits as the host's scalar conversion gives them | |
+| `v_frexp_mant_f64`, `v_frexp_exp_i32_f64` | the exponent field read or replaced; zero, infinity and NaN as libm has them | a denormal |
+| `v_ldexp_f64` | a normal number whose exponent stays one: the exponent field moved; zero is itself | anything else (libm rounds) |
+| the SDWA forms of the 32-bit integer instructions | the same as `h_int_sdwa`, its two per-lane loops as loops of whole rows | |
+
+| | base | step 1 |
+|---|---:|---:|
+| p_f64x (doubles beyond fma), MI300X / RX 6800 | 1 | **2.32 / 2.06** |
+| p_sdwa | 1 | **1.85 / 1.54** |
+| p_i64 | 1 | 1.06 / 1.01 |
+| p_cmp | 1 | 1.02 / 1.02 |
+| valu_f64, valu_int, lds, mfma_f64 (nothing of theirs changed) | 1 | 0.99 to 1.03, as the control |
+| steepest_descent, one host thread, CPU s | 26.0 | **21.7** (0.834) |
+| initial_guess | 65.4 | **58.8** (0.899) |
+| poisson | 115.1 | 113.0 (0.981) |
+| ks_hamiltonian | 26.3 | 26.1 (0.992) |
+
+### Step 2, not kept: bound binary64 runs inside blocks
+
+As round sp73's bound integer runs: a run of `v_add_f64`, `v_mul_f64` and `v_fma_f64` on register pairs and constants bound in a block
+to its row kernels, called one after the other with no handler between, with any lane on (the result merged by EXEC), and an operation
+whose result has a NaN in a lane that is on handed to its handler from there. Built, tested (a ninth case of the blocks' test: 1,200 runs
+each way, 11,084 instructions as bound operations, 6,252 of them with lanes off) and measured with the knob on against step 1 with the
+knob on: **valu_f64 1.093 and 1.083 before, 1.099 and 1.072 after; p_f64x, p_cmp, wave the same; steepest_descent 20.4 s before, 20.6 s
+after.** What a bound operation saves of `h_f64r` is the reading of three operand kinds; the kernel, its NaN mask and the copy of two rows
+stay, and they are the handler's time. Round sp73 said so for the float families in advance. Not committed; the patch is
+`data/sp74/bound-f64-not-kept.patch`.
+
+### Step 3: a comparison as the one test it is; lanes that are off (commit 05a898c7)
+
+The diagnostic build on step 1 showed the two compare forms no faster than before: the first row form worked out less-than, equal,
+greater-than and unordered for every lane and picked the test afterwards.
+
+* **A comparison of doubles is the host's one comparison for its test** (sixteen loops, one a test); **a comparison of 64-bit integers is
+  done on the two rows of words**, eight lanes at a time: the high words decide, the low words (unsigned) where they are equal, and a test
+  is less-than, equal, greater-than or the opposite of one.
+* **`v_add_f64`, `v_mul_f64`, `v_fma_f64` with a lane off** run their kernel on the groups of eight lanes from the first to the last
+  that hold a lane of EXEC, and merge those. With every lane on the handler is what it was.
+
+| | step 1 | step 3 |
+|---|---:|---:|
+| p_cmp, MI300X / RX 6800, against the base | 1.03 / 1.03 | **1.09 / 1.07** |
+| p_i64 | 1.08 / 1.01 | 1.08 / 1.04 |
+| valu_f64, p_f64x | 1.00 / 1.00, 2.29 / 2.06 | 1.03 / 0.99, 2.30 / 2.08 |
+| steepest_descent, CPU s | 21.8 | 21.2 (0.975) |
+| initial_guess | 58.6 | 57.6 (0.982) |
+| poisson | 113.0 | 110.4 (0.977) |
+| ks_hamiltonian | 26.1 | 25.9 (0.996) |
+
+**Three things tried with it were measured and thrown out** (`data/sp74/bench.md`, the variants): (1) the same groups-of-lanes rule
+with every lane on cost valu_f64 3 % (it only adds work there); (2) keeping a pair's lanes in the order the words interleave (0, 1, 4, 5
+and 2, 3, 6, 7), which saves the two moves across the halves of a vector that a load and a store undo for each other, cost valu_f64
+4 % more in the kernel of add, multiply and fma, where it should have saved a fifth of the kernel's instructions; why was not found;
+(3) the same order, a pair's modifiers applied in the vectors and the groups rule in the new handlers together cost p_f64x 6 to 9 %.
+
+### The final library
+
+`data/sp74/bench.md`, `inq.md`. One host thread unless a line says otherwise; the control is the base plus one function nothing calls in
+`gcn_tier.cpp`.
+
+**The bench's 62 kernel rows against the base**: control 1.004; **knob off 1.060**; the base with the knob on 1.115; **this round with
+the knob on 1.184**.
+
+| row, MI300X / RX 6800 | control | knob off | knob on | the base with the knob on |
+|---|---:|---:|---:|---:|
+| p_f64x | 1.01 / 1.02 | **2.40 / 2.08** | 2.68 / 2.43 | 1.04 / 1.08 |
+| p_sdwa | 1.02 / 1.02 | **1.83 / 1.51** | 2.54 / 2.21 | 1.20 / 1.31 |
+| mem | 1.02 / 1.01 | **1.21** / 1.04 | 1.22 / 1.05 | 1.03 / 1.03 |
+| narrow | 1.00 / 1.02 | **1.12 / 1.06** | 1.12 / 1.06 | 1.03 / 1.03 |
+| p_cmp | 0.99 / 0.98 | **1.09** / 1.04 | 1.31 / 1.35 | 1.24 / 1.27 |
+| p_i64 | 1.02 / 1.00 | **1.09** / 1.03 | 1.44 / 1.36 | 1.31 / 1.33 |
+| flat | 1.01 / 1.00 | **1.06** / 1.01 | 1.07 / 1.02 | 1.03 / 1.01 |
+| divergent | 0.99 / 0.98 | 1.05 / 1.02 | 1.22 / 1.26 | 1.12 / 1.20 |
+| valu_f64 | 1.00 / 1.01 | 1.03 / 1.00 | 1.12 / 1.13 | 1.09 / 1.10 |
+
+* **One row is more than 3 % slower than the base in every table, and it runs none of the changed code: p_dpp_arch on the MI300X**,
+  0.979 here, 0.958 in the second table of the 62 rows (taken after the test fix, below), 0.955 and 0.951 in two passes of 15 runs. It
+  is 80 % `h_int_dpp`, a handler this round did not touch, in a different place in the library; aligning that function to 64 bytes
+  did not bring it back (0.972, 0.956) and was not kept. The control does not show this row moving (1.00), so by the bar's wording it
+  is a miss on one row, by placement.
+* The other rows below 0.98 with the knob off are the control's kind: atomics on the RX 6800 0.954 (control 0.965 in the same pass; 0.978
+  and 1.007 in the second table), p_dpp on the MI300X 0.973 with the control at 1.103: that row runs in 0.082 s or in 0.092 s in one and
+  the same binary, the control is 10 % faster than the base on it in three tables of four, and this round's library is at 0.98 of the
+  base's usual time and never has the fast runs (0.876 in the one table where the base had them; `bench.md`, the DPP rows). Knob on, no
+  row is below 0.98 of the base in the first table; p_dpp on the MI300X is 0.934 in the second, for the same reason.
+* mem, narrow and flat gain because their address arithmetic is `v_lshl_add_u64` and 64-bit compares.
+* Counters: identical in all 82 counted rows (62 kernel rows and the API rows) between the base and this round with the knob off,
+  and between this round with the knob off and on (`bench.py`'s counting runs of both sides).
+
+**inq, CPU seconds of the whole process (the best of two runs a side; every run passes with the same output checksum):**
+
+| test | one thread, knob off: base | final | final / base | knob on: base | final | final / base | default threads (8), knob off: base, wall / CPU | final | CPU final / base |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| eigensolvers::steepest_descent | 26.0 | 21.2 | **0.815** | 25.0 | 19.9 | **0.797** | 15.4 / 41.5 | 13.2 / 34.0 | **0.821** |
+| ground_state::initial_guess | 65.4 | 57.2 | **0.876** | 63.6 | 55.3 | **0.869** | 35.3 / 126.9 | 33.7 / 114.3 | **0.901** |
+| solvers::poisson | 116.2 | 110.8 | 0.954 | 111.8 | 107.1 | 0.958 | 63.6 / 189.9 | 62.9 / 182.3 | 0.960 |
+| hamiltonian::ks_hamiltonian | 26.4 | 25.9 | 0.984 | 25.9 | 25.5 | 0.985 | 20.8 / 41.4 | 20.8 / 41.8 | 1.008 |
+| systems::electrons | | | | | | | 47.4 / 79.7 | 47.4 / 73.8 | **0.926** |
+| operations::transform | | | | | | | 42.7 / 57.4 | 41.9 / 56.2 | 0.980 |
+| operations::laplacian | | | | | | | 5.9 / 5.6 | 5.7 / 5.5 | 0.986 |
+| operations::gradient | | | | | | | 9.9 / 9.0 | 9.8 / 8.9 | 0.986 |
+
+* The control against the base, one thread, one run a side: 1.003 to 1.009 on the four tests.
+* With `VGPU_AMD_BLOCKS=1` on both sides at the default threads the eight tests are 0.820 to 0.999 (`inq.md`).
+* **The bar** (5 % or more on three double-precision bench rows or inq tests, no row more than 3 % slower beyond the control, counters
+  identical): p_f64x on both targets, steepest_descent, initial_guess and electrons are past it; p_cmp and p_i64 on the MI300X are at 9 %.
+* The knob and the tier add up: steepest_descent is 26.0 s on the base with the knob off and 19.9 s here with it on (0.765),
+  initial_guess 65.4 and 55.3 (0.846), poisson 116.2 and 107.1 (0.922).
+
+### What is left, by share
+
+`data/sp74/profile.md`: samples of the four tests on the final library, one host thread, knob off, as shares of the whole process.
+The per-form table of the final sources (`data/sp74/forms.md`): `v_max_f64` 94 ticks a call where it was 331 (121 with `|x|`, was 352),
+`v_or_b32_sdwa` 65 (236), `v_cmp_lt_i64` 48 (75), `v_cmp_neq_f64` 52 (166); the handlers' ticks of steepest_descent 4.81e10 where they
+were 6.44e10, of initial_guess 8.87e10 (11.5e10), of poisson 13.2e10 (14.6e10), of ks_hamiltonian 1.71e10 (1.86e10).
+
+
+| test | outside the library | loop | decode | rows | lanes | mem | interp | other |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| steepest_descent (20.3 s) | 7 % | 29 % | 24 % | 8 % | 14 % | 7 % | 4 % | 5 % |
+| initial_guess (58.3 s) | 37 % | 18 % | 16 % | 5 % | 10 % | 7 % | 5 % | 2 % |
+| poisson (111.6 s) | 43 % | 14 % | 14 % | 3 % | 8 % | 10 % | 4 % | 5 % |
+| ks_hamiltonian (26.0 s) | 61 % | 6 % | 8 % | 2 % | 6 % | 11 % | 3 % | 4 % |
+
+What this round took out of steepest_descent, in CPU milliseconds: decode 7,053 to 4,832, lanes 5,099 to 2,907, rows 2,192 to 1,718; the
+loop (6,100 and 5,984) and the rest are what they were.
+
+* **More closure-tier work has no target of this size left.** The handlers with the most samples in steepest_descent are now `h_ds` (7.0 %
+  of the library: `ds_bpermute_b32`, already a gather of rows), the new `h_dminmax_rows` (6.1 %), `h_cmp64_rows` (3.9 %), `h_int` (3.4 %),
+  `h_l64_rows` (2.4 %); in poisson `h_f64r` (7.3 %) and its kernels (4 %). Halving any one of them is 1 to 3 % of a test. Bound runs gave
+  nothing for doubles (step 2).
+* **The loop is now the largest class**: 6.0 s of steepest_descent's 20.3 s, 10.5 of initial_guess's 58.3, 15.1 of poisson's 111.6.
+  Blocks take 1.3 s, 1.5 s and 4.6 s of that (the *blocks on* lines of `profile.md`) and cannot take much more: a block still calls a
+  handler through a pointer for each instruction, 4.0 ns an instruction in steepest_descent.
+* **Loop, decode and rows together are 61 % of steepest_descent, 39 % of initial_guess, 30 % of poisson and 16 % of ks_hamiltonian**; the
+  guest's own arithmetic (*lanes*) is 14, 10, 8 and 6 %. That is the room of generated fused runs (study 13, milestone 4), which remove
+  the three inside a run, and it is large only in the first: with 76 % of steepest_descent's instructions inside blocks and half of the
+  three classes gone there, the test is 1.3 times as fast; all of it gone, 1.9 times. For initial_guess the same arithmetic gives 1.04 to
+  1.08 until its reductions run in blocks (19 % of its instructions do; the rest are work-groups of 16 waves with barriers, whose machines
+  go back to the plain loop); for poisson (72 % in blocks) 1.12 to 1.28; for ks_hamiltonian 1.07 to 1.15.
+* **So: generated fused runs next, for the kernels that are arithmetic** (steepest_descent's kind, and the bench's ALU rows, whose
+  ceiling is 13x to 22x), started with the hottest blocks only and a cache that outlives the process: inq's tests run 20 to 110 s with
+  860 to 3,650 blocks each, and a host compile a block would be longer than the test. **For the other three tests neither route moves the
+  test by more than a fifth**: 37 to 61 % of their CPU is outside the simulator (the test's own host code and the ROCm runtime), and
+  memory instructions are 10 and 11 % of the process in poisson and ks_hamiltonian, where the loop is 14 and 6 %. What would move initial_guess is blocks for
+  work-groups with barriers; what would move poisson and ks_hamiltonian is the memory path.
+
+### Tests and mutants
+
+* **`test_amd_gcn_tier_same_bits`** takes every form with a handler from the ISA corpora and runs it with the tier off and on over
+  flavours of state. New here: **296 lines in the hand-written corpora** of gfx942, gfx950 and gfx90a (`amd/tools/tier-corpus.py`:
+  minimum and maximum with every operand kind, modifier and overlapping register pairs; all sixteen comparisons of doubles and the eight
+  of signed and unsigned integers, with scalar, constant and overlapping operands and their `v_cmpx` forms; the shifts and
+  `v_lshl_add_u64` with counts past the rule's 4; ldexp, frexp and the conversions with a destination that is one of the source's
+  registers; constants under a modifier), and **three flavours for the instructions with "64" in their name**: 36, register pairs that
+  are doubles near 1 and zeros of both signs with every lane on, so that the rows run whole (the older flavours make a NaN, an infinity
+  or a denormal in nearly every wave, and a row of doubles rarely ran whole there); 37, the same with one word in 64 the high word of a
+  NaN, an infinity, a denormal or the largest or smallest normal number, and half the lanes off, so that some runs go to the handlers
+  the rows replaced and some to the interpreter; 38, as 37 with one run of consecutive lanes on from a random lane, so that the first
+  groups of eight lanes are off. `v_ldexp_f64`'s exponent is small in the three (in 37 and 38 one in 64 is past either end). The whole
+  test in the LTO build: 26,696
+  shapes with a handler of 36,119, **1,032,279 runs each way, none differs**; 99,376 handed back to the interpreter.
+* **The three flavours did not run at first, and the mutants said so.** The test's loop skips flavours from 25 up for everything but
+  LDS accesses (they were the LDS address shapes), and 36 and 37 were added above that line: the first whole run of the test (969,900
+  runs each way, none differing) had none of them. Five of the first 72 mutants survived, among them "zero gets an exponent in
+  `v_ldexp_f64`" and "two zeros of opposite sign are done by the row", which only those flavours can reach. With the line fixed and
+  flavour 38 and the constants under a modifier added, the test passes and the five were run again (below). Every timing of this round
+  was taken before that fix on the library of commit 05a898c7; the fix changes test state that is compiled into the library
+  (`digest_instruction` in `gcn_exec.cpp`), so the 62 rows and the four inq tests were taken again on the library after it: control 1.006,
+  knob off 1.058, knob on 1.179; steepest_descent 0.805 of the base's CPU, initial_guess 0.885, poisson 0.954, ks_hamiltonian 0.981
+  (`bench.md`, `inq.md`: the tables of the section above again, within a percent of them but for the DPP rows named there). The ctest set
+  and the two same-bits tests in the LTO build were run again on it too.
+* **`test_amd_gcn_blocks_same_bits`** has an eighth case: programs of the 64-bit and SDWA forms mixed with the other instructions that
+  can be in a block, on flavours 36, 37, the floats with their specials, any bits and half the lanes off; the interpreter alone, the
+  tier one instruction at a time and the tier in blocks must agree (1,200 runs each way, 37,956 instructions, 29,387 inside blocks).
+  All eight cases pass in the LTO build and the build without LTO.
+* **Mutants** (`data/sp74/scripts/mutants.py`, `mutants.txt`): 72 edits, one at a time, of the row handlers and of `h_f64r`'s
+  lanes-off path: a check dropped (a NaN, the opposite zeros, a denormal, the ends of the normal numbers in ldexp), a test swapped for
+  its neighbour, signed for unsigned, a modifier or a scalar pair's high word dropped, lanes that are off written, the last group of
+  lanes left out, the SDWA parts and fills. **71 of 72 are killed.** 67 by the test as first written; of the five that survived it,
+  three are killed by the fixed test (the opposite zeros in a minimum, zero in ldexp, a constant's modifier), one with 60 seeds a shape
+  where the default is 3 (the NaN lanes of a wave whose first eight lanes are off: 1 run of 414,120 differs), and one changes no result
+  (ldexp's exponent read without its sign: the row then leaves the lane to the handler it replaced).
+* **The AMD ctest set** on the final sources (`data/sp74/ctest.txt`): 328 tests, 240 pass, 88 skip, none fails, with the knob off and
+  with `VGPU_AMD_BLOCKS=1`, test by test the same as at the merged head.
+* inq: every run of every test in the tables passes with the base's output checksum.
+
+### Caveats and what is not solid
+
+* One host, quiet. A row moves 1 to 3 % from pass to pass and up to 4 % from build to build with nothing changed that it runs (the
+  control: 0.965 to 1.103 over the 62 rows, with atomics on the RX 6800 and mfma_f64_4b at 0.965). A claim of less than 3 % on one row is
+  not made; the inq tables' third decimal is one run's.
+* The row handlers are for hosts with AVX2. A host without it runs the handlers it had, which the base-level twin of the tier's test
+  (`test_amd_gcn_tier_same_bits_simd_base`) holds to the interpreter; nothing was timed there.
+* The per-form tables are time-stamp ticks around each handler in a build made for that, with the measurement's own 25 ticks in every
+  call; they order the forms, they are not a profile. The table of the final sources was taken while builds ran beside it.
+* The class shares are instruction-pointer samples at 1 kHz; the split between decode, rows and lanes is approximate (`classify.py`).
+  The estimates of what generated fused runs would give are arithmetic on those shares, not a prototype.
+* Why the interleaved lane order was slower in the kernel of add, multiply and fma was not found (no `perf` on the host).
+* Not run here: `bench_amd_counters_blocks` and `bench_amd_counters` (hipcc 6.4.4 has no expected file), the e2e tests that need ROCm's
+  full install, ASan and TSan, gfx1250 kernels. `VGPU_AMD_BLOCKS` stays off by default in this branch.
+* Cleanup: this round's directory on server3 (`/tmp/sp72-amd-tier`: the trees and builds named in `data/sp74/README.md`, the bench cache, logs) was removed by exact path; round sp70's inq directory was read and not changed.

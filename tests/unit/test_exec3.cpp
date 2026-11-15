@@ -5,6 +5,7 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
+#include "vgpu/exec/tc_ampere.hpp"
 #include "vgpu/exec/texture.hpp"
 #include "vgpu/exec/scheduler.hpp"
 #include "vgpu/memory.hpp"
@@ -12,6 +13,7 @@
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
 #include <array>
+#include <utility>
 #include <cmath>
 #include "vtest.hpp"
 
@@ -770,8 +772,10 @@ VTEST(wmma_accumulator_is_added) {
 }
 
 // VGPU_TC_EXACT=0 returns the tensor cores' sums to the earlier sequential f32 one, and changes nothing else: the f16 wmma of random
-// operands with spread exponents (so that the chunked, truncating sum of an sm_86 tensor core and the sequential one differ) prints
-// different words on the sm_86 profiles in the two modes, and the same words on every other profile; and an f32 loop is the same in both.
+// operands with spread exponents (so that the chunked, truncating sum of a Turing, Ampere or Ada tensor core and the sequential one
+// differ) prints different words in the two modes on the profiles whose cards sum that way (compute capability 7.5, 8.0, 8.6, 8.9;
+// 9.0 by an H100's numbers: tc86::device_sum_model), and the same words on every other profile; and an f32 loop is the same in both.
+// VGPU_TC_EXACT=force puts the RTX 3060's sum on the profiles without a measured model: a B200 profile then prints its words.
 VTEST(tc_exact_switch_changes_only_sm86_tensor_sums) {
   const std::string ptx = std::string(kHeader) + R"(
 .visible .entry mma(.param .u64 out)
@@ -822,8 +826,8 @@ VTEST(tc_exact_switch_changes_only_sm86_tensor_sums) {
 }
 )";
   const auto m = ptx::parse(ptx);
-  const auto run = [&](const char* gpu, bool exact, bool plain_only) {
-    if (exact) unsetenv("VGPU_TC_EXACT"); else setenv("VGPU_TC_EXACT", "0", 1);
+  const auto run_mode = [&](const char* gpu, const char* mode, bool plain_only) {
+    if (mode) setenv("VGPU_TC_EXACT", mode, 1); else unsetenv("VGPU_TC_EXACT");
     MemoryManager mem{1 << 20};
     DeviceProfile prof = load_gpu(gpu);
     const uint64_t out = mem.alloc(32 * 36);
@@ -836,15 +840,56 @@ VTEST(tc_exact_switch_changes_only_sm86_tensor_sums) {
     unsetenv("VGPU_TC_EXACT");
     return words;
   };
-  for (const char* gpu : {"nvidia/rtx3060", "nvidia/a10", "nvidia/a100", "nvidia/l4", "nvidia/h100", "nvidia/t4"}) {
-    const bool sm86 = std::string(gpu) == "nvidia/rtx3060" || std::string(gpu) == "nvidia/a10";
-    const auto on = run(gpu, true, false), off = run(gpu, false, false);
-    if (sm86) VCHECK(on != off);   // the model is on by default, and the switch really turns it off
-    else VCHECK(on == off);        // other profiles never used the model
-    VCHECK(run(gpu, true, true) == run(gpu, false, true));   // and no other arithmetic moves
+  const auto run = [&](const char* gpu, bool exact, bool plain_only) { return run_mode(gpu, exact ? nullptr : "0", plain_only); };
+  const auto card = run("nvidia/rtx3060", true, false), sequential = run("nvidia/rtx3060", false, false), hopper = run("nvidia/h100", true, false);
+  VCHECK(card != sequential);
+  VCHECK(hopper != sequential);
+  VCHECK(hopper != card);
+  using vgpu::exec::tc86::SumModel;
+  struct Case {
+    const char* gpu;
+    SumModel model;
+  };
+  // (t4 and rtx2080ti 7.5, a100 and a30 8.0, rtx3060 / a10 / a10g 8.6, l4 / l40s / rtx4090 8.9; h100 and h200 9.0; b200 10.0, rtx5090 and rtx-pro-6000 12.0)
+  const Case cases[] = {{"nvidia/rtx3060", SumModel::Ampere}, {"nvidia/a10", SumModel::Ampere},     {"nvidia/a10g", SumModel::Ampere},
+                        {"nvidia/a100", SumModel::Ampere},    {"nvidia/a30", SumModel::Ampere},     {"nvidia/l4", SumModel::Ampere},
+                        {"nvidia/l40s", SumModel::Ampere},    {"nvidia/rtx4090", SumModel::Ampere}, {"nvidia/t4", SumModel::Ampere},
+                        {"nvidia/rtx2080ti", SumModel::Ampere}, {"nvidia/h100", SumModel::Hopper},  {"nvidia/h200", SumModel::Hopper},
+                        {"nvidia/b200", SumModel::Sequential}, {"nvidia/rtx5090", SumModel::Sequential}, {"nvidia/rtx-pro-6000", SumModel::Sequential}};
+  for (const Case& c : cases) {
+    const auto on = run(c.gpu, true, false), off = run(c.gpu, false, false), forced = run_mode(c.gpu, "force", false);
+    VCHECK(off == sequential);   // off, every profile prints the sequential sum
+    // By default each profile sums as its cards do; forced, a profile without a measured model takes the RTX 3060's.
+    VCHECK(on == (c.model == SumModel::Ampere ? card : c.model == SumModel::Hopper ? hopper : sequential));
+    VCHECK(forced == (c.model == SumModel::Hopper ? hopper : card));
+    // `published`: a Blackwell profile takes the published model (the Hopper numbers); nothing else moves.
+    const bool blackwell = std::string(c.gpu) == "nvidia/b200" || std::string(c.gpu) == "nvidia/rtx5090" || std::string(c.gpu) == "nvidia/rtx-pro-6000";
+    VCHECK(run_mode(c.gpu, "published", false) == (blackwell ? hopper : on));
+    VCHECK(run(c.gpu, true, true) == run(c.gpu, false, true));   // and no other arithmetic moves
+    VCHECK(run_mode(c.gpu, "force", true) == run(c.gpu, false, true));
   }
-  // Off, an sm_86 profile prints what a profile without the model does: the sequential sum (sm_80's words).
-  VCHECK(run("nvidia/rtx3060", false, false) == run("nvidia/a100", true, false));
+}
+
+// The table itself: which compute capabilities take which model. (A row added here needs a card that says so: docs/matrix-numerics.md.)
+VTEST(tc_model_devices) {
+  using namespace vgpu::exec::tc86;
+  for (const auto& cc : {std::pair{7, 5}, std::pair{8, 0}, std::pair{8, 6}, std::pair{8, 9}}) VCHECK(device_sum_model(cc.first, cc.second) == SumModel::Ampere);
+  VCHECK(device_sum_model(9, 0) == SumModel::Hopper);
+  for (const auto& cc : {std::pair{7, 0}, std::pair{7, 2}, std::pair{8, 7}, std::pair{10, 0}, std::pair{10, 3}, std::pair{11, 0}, std::pair{12, 0}, std::pair{12, 1}, std::pair{6, 1}})
+    VCHECK(device_sum_model(cc.first, cc.second) == SumModel::Sequential);
+  VCHECK(rule_of(SumModel::Sequential) == nullptr);
+  VCHECK(rule_of(SumModel::Ampere)->chunk == 8 && rule_of(SumModel::Ampere)->chunk_tf32 == 4 && rule_of(SumModel::Ampere)->grid == 25);
+  VCHECK(rule_of(SumModel::Hopper)->chunk == 16 && rule_of(SumModel::Hopper)->chunk_tf32 == 8 && rule_of(SumModel::Hopper)->grid == 26);
+  VCHECK_EQ(parse_mode(nullptr), static_cast<int>(kModeDevice));
+  VCHECK_EQ(parse_mode("1"), static_cast<int>(kModeDevice));
+  VCHECK_EQ(parse_mode(""), static_cast<int>(kModeDevice));
+  VCHECK_EQ(parse_mode("0"), static_cast<int>(kModeOff));
+  VCHECK_EQ(parse_mode("force"), static_cast<int>(kModeForce));
+  VCHECK_EQ(parse_mode("published"), static_cast<int>(kModePublished));
+  // What the literature gives the devices we have not measured: Blackwell the Hopper numbers, nothing for the rest.
+  VCHECK(published_sum_model(10, 0) == SumModel::Hopper && published_sum_model(12, 0) == SumModel::Hopper);
+  for (const auto& cc : {std::pair{7, 0}, std::pair{8, 7}, std::pair{10, 3}, std::pair{10, 7}, std::pair{11, 0}, std::pair{12, 1}})
+    VCHECK(published_sum_model(cc.first, cc.second) == SumModel::Sequential);
 }
 
 // Blocks run on several host threads by default, so an atomic that is only

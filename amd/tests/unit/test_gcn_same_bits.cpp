@@ -34,6 +34,10 @@
 // 12637-12638), whose 0/y case now gives the guides' signed zero where the baseline gave the quotient's magnitude.
 // Seven more after gfx1100 ran its VOP3 v_ashrrev_i16, v_max_i16 and v_min_i16 as gfx1030 does (lines 6229, 7083-7085, 7116-7118), whose
 // baseline digest was the text of "decoded but not implemented".
+// Nineteen more after the gfx1030 NaN rules reached the remaining forms (test_amd_gcn_nan2), from the tree that has them: 17 gfx1030 lines in
+// 14871-16054 whose result is a NaN (SDWA v_add/v_sub/v_min_f16, v_dot2c_f32_f16, and the doubles v_ceil, v_trunc, v_fract, v_frexp_mant, v_mul,
+// v_fma and v_div_fixup x4: now the cards' NaN), and v_cvt_f32_f64_e64 with a negated source on gfx950 and gfx90a (lines 3017 and 4906), which
+// the baseline converted without its neg.
 // Every other digest is the baseline's.
 #include <cstdint>
 #include <cstdio>

@@ -11,11 +11,17 @@
 //     nothing. cusparseSpMV_bufferSize refuses a null alpha or beta, an unknown operation, an algorithm of another
 //     format and x or y of the wrong size, which it took, and an unknown compute type is INVALID_VALUE, not
 //     NOT_SUPPORTED. With COO and A^T, cusparseSpMV takes a null buffer.
-// Not checked: x or y of another real type than A (the card refuses most, the simulator takes them).
+//   - The types: of every combination of the ten types SpMV computes in for A, x, y and the compute type, the card
+//     takes fifteen (the same for CSR, CSC and COO, each operation): one type throughout (half and bfloat16, and their
+//     complex forms, computed in single, half and bfloat16 also with a single y; int8 into single or int32), and a
+//     single or double A with x and y (and the compute type) of double, or of the complex type of A's precision. Every
+//     other is NOT_SUPPORTED with " ** On entry to ...(): type combination of matA (...), ... is not supported"; the
+//     simulator took 1257 of them (a real A with x or y of another real type, int8 into double, ...).
 #include <cuda_runtime.h>
 #include <cusparse.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -40,6 +46,8 @@ static std::string printed(F f, int* status) {
   char buf[4096];
   for (ssize_t n; (n = read(p[0], buf, sizeof buf)) > 0;) out.append(buf, static_cast<size_t>(n));
   close(p[0]);
+  // The card's cuSPARSE writes each line from a fixed buffer, NUL padding and all (279 bytes); the text is what counts.
+  out.erase(std::remove(out.begin(), out.end(), '\0'), out.end());
   return out;
 }
 #define CASE(label, want_status, want_text, call) do { int st_ = -1; \
@@ -722,6 +730,70 @@ int main() {
   CASE("op 3", 3, " ** On entry to cusparseSpMV_bufferSize() parameter number 2 (opA) had an illegal value: (cusparseOperation_t) 3\n\n", cusparseSpMV_bufferSize(h,(cusparseOperation_t)3,&al,A,X,&be,Y,CUDA_R_32F,D,&sz));
   CASE("alg 7", 3, " ** On entry to cusparseSpMV_bufferSize() parameter number 9 (alg) had an illegal value: (cusparseSpMVAlg_t) 7\n\n", cusparseSpMV_bufferSize(h,N,&al,A,X,&be,Y,CUDA_R_32F,(cusparseSpMVAlg_t)7,&sz));
   CASE("alg -1", 3, " ** On entry to cusparseSpMV_bufferSize() parameter number 9 (alg) had an illegal value: (cusparseSpMVAlg_t) -1\n\n", cusparseSpMV_bufferSize(h,N,&al,A,X,&be,Y,CUDA_R_32F,(cusparseSpMVAlg_t)-1,&sz));
+
+  // Every combination of the types, for each format and for A and A^T.
+  {
+    struct TypeName { cudaDataType t; const char* name; };
+    const TypeName types[] = {{CUDA_R_32F, "CUDA_R_32F"}, {CUDA_R_64F, "CUDA_R_64F"}, {CUDA_R_16F, "CUDA_R_16F"},
+                              {CUDA_R_16BF, "CUDA_R_16BF"}, {CUDA_C_32F, "CUDA_C_32F"}, {CUDA_C_64F, "CUDA_C_64F"},
+                              {CUDA_C_16F, "CUDA_C_16F"}, {CUDA_C_16BF, "CUDA_C_16BF"}, {CUDA_R_8I, "CUDA_R_8I"},
+                              {CUDA_R_32I, "CUDA_R_32I"}};
+    struct Combo { cudaDataType a, x, y, ct; };
+    const Combo taken[] = {
+        {CUDA_R_32F, CUDA_R_32F, CUDA_R_32F, CUDA_R_32F},   {CUDA_R_32F, CUDA_R_64F, CUDA_R_64F, CUDA_R_64F},
+        {CUDA_R_32F, CUDA_C_32F, CUDA_C_32F, CUDA_C_32F},   {CUDA_R_64F, CUDA_R_64F, CUDA_R_64F, CUDA_R_64F},
+        {CUDA_R_64F, CUDA_C_64F, CUDA_C_64F, CUDA_C_64F},   {CUDA_R_16F, CUDA_R_16F, CUDA_R_32F, CUDA_R_32F},
+        {CUDA_R_16F, CUDA_R_16F, CUDA_R_16F, CUDA_R_32F},   {CUDA_R_16BF, CUDA_R_16BF, CUDA_R_32F, CUDA_R_32F},
+        {CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_32F}, {CUDA_C_32F, CUDA_C_32F, CUDA_C_32F, CUDA_C_32F},
+        {CUDA_C_64F, CUDA_C_64F, CUDA_C_64F, CUDA_C_64F},   {CUDA_C_16F, CUDA_C_16F, CUDA_C_16F, CUDA_C_32F},
+        {CUDA_C_16BF, CUDA_C_16BF, CUDA_C_16BF, CUDA_C_32F}, {CUDA_R_8I, CUDA_R_8I, CUDA_R_32F, CUDA_R_32F},
+        {CUDA_R_8I, CUDA_R_8I, CUDA_R_32I, CUDA_R_32I},
+    };
+    cudaMemset(v, 0, 256);
+    cudaMemset(x, 0, 256);
+    cudaMemset(y, 0, 256);
+    const double z4[4] = {0, 0, 0, 0};   // alpha and beta, of any type
+    int wrong = 0;
+    for (int fmt = 0; fmt < 3; ++fmt)
+      for (const auto op : {N, T})
+        for (const TypeName& a : types)
+          for (const TypeName& xt : types)
+            for (const TypeName& yt : types)
+              for (const TypeName& ct : types) {
+                cusparseSpMatDescr_t M = nullptr;
+                if (fmt == 0)
+                  cusparseCreateCsr(&M, 4, 4, 4, rp, ci, v, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                    CUSPARSE_INDEX_BASE_ZERO, a.t);
+                else if (fmt == 1)
+                  cusparseCreateCoo(&M, 4, 4, 4, ci, ci, v, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, a.t);
+                else
+                  cusparseCreateCsc(&M, 4, 4, 4, rp, ci, v, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                    CUSPARSE_INDEX_BASE_ZERO, a.t);
+                cusparseDnVecDescr_t VX = nullptr, VY = nullptr;
+                cusparseCreateDnVec(&VX, 4, x, xt.t);
+                cusparseCreateDnVec(&VY, 4, y, yt.t);
+                bool ok = false;
+                for (const Combo& c : taken) ok |= c.a == a.t && c.x == xt.t && c.y == yt.t && c.ct == ct.t;
+                const std::string what = std::string("type combination of matA (") + a.name + "), vecX (" + xt.name +
+                                         "), vecY (" + yt.name + "), compute (" + ct.name + ") is not supported\n\n";
+                int st_size = -1, st_mv = -1;
+                const std::string got_size = printed([&] { return cusparseSpMV_bufferSize(h, op, z4, M, VX, z4, VY, ct.t, D, &sz); }, &st_size);
+                const std::string got_mv = printed([&] { return cusparseSpMV(h, op, z4, M, VX, z4, VY, ct.t, D, buf); }, &st_mv);
+                const std::string want_size = ok ? "" : " ** On entry to cusparseSpMV_bufferSize(): " + what;
+                const std::string want_mv = ok ? "" : " ** On entry to cusparseSpMV(): " + what;
+                if (st_size != (ok ? 0 : 10) || st_mv != (ok ? 0 : 10) || got_size != want_size || got_mv != want_mv) {
+                  ++fails;
+                  if (++wrong <= 20)
+                    std::printf("FAIL types format %d op %d A %s x %s y %s compute %s: status %d %d, expected %d; printed \"%s%s\"\n",
+                                fmt, static_cast<int>(op), a.name, xt.name, yt.name, ct.name, st_size, st_mv, ok ? 0 : 10,
+                                got_size.c_str(), got_mv.c_str());
+                }
+                cusparseDestroyDnVec(VX);
+                cusparseDestroyDnVec(VY);
+                cusparseDestroySpMat(M);
+              }
+    if (wrong > 20) std::printf("FAIL types: %d combinations in all\n", wrong);
+  }
   cudaDeviceSynchronize();
 
   cusparseDestroySpMat(A);

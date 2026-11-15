@@ -10080,8 +10080,8 @@ class Interpreter {
     for (uint32_t r = 0; r < a_regs; ++r) gather(op.a[r], fa + r * 32);
     for (uint32_t r = 0; r < b_regs; ++r) gather(op.b[r], fb + r * 32);
     for (uint32_t r = 0; r < c_regs; ++r) gather(op.c[r], fc + r * 32);
-    // (An sm_86 device sums as an RTX 3060's tensor core does: chunked and truncated, see vgpu/exec/tc_ampere.hpp.)
-    simd::kernels().hmma(kind | (vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) ? 16u : 0u), K, op.acc_f16, fa, fb, fc, out);
+    // (A Turing, Ampere or Ada device sums as an RTX 3060's tensor core does: chunked and truncated, see vgpu/exec/tc_ampere.hpp.)
+    simd::kernels().hmma(kind | vgpu::exec::tc86::kernel_kind_bits(profile_.cc_major, profile_.cc_minor), K, op.acc_f16, fa, fb, fc, out);
     for (uint32_t reg = 0; reg < c_regs; ++reg) scatter_words(w, op.d[reg], m, out + reg * 32, true);
     return true;
   }
@@ -10475,7 +10475,8 @@ class Interpreter {
                                     !op.acc_int && !op.acc_f64 && !op.acc_f16;
     // An RTX 3060's tensor core (sm_86) sums f16, bf16 and tf32 products in chunks (include/vgpu/exec/tc_ampere.hpp), not one at a time
     // in f32: D for the whole tile first, then taken instead of the sequential sum below. Not the sparse, block-scaled or narrow forms.
-    const bool tc86_sum = vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) && !op.sparse && !op.block_scale &&
+    const vgpu::exec::tc86::SumRule* const tc_rule = vgpu::exec::tc86::sum_rule(profile_.cc_major, profile_.cc_minor);
+    const bool tc86_sum = tc_rule && !op.sparse && !op.block_scale &&
                           (op.ab_type == MmaElem::F16 || op.ab_type == MmaElem::BF16 || op.ab_type == MmaElem::TF32) &&
                           op.b_type == op.ab_type && !op.acc_int && !op.acc_f64 && K % (op.ab_type == MmaElem::TF32 ? 4 : 8) == 0;
     std::array<float, 16 * kN> Dtc{};
@@ -10485,7 +10486,7 @@ class Interpreter {
       for (uint32_t x = 0; x < M * K; ++x) Af[x] = static_cast<float>(A[x]);
       for (uint32_t x = 0; x < K * kN; ++x) Bf[x] = static_cast<float>(B[x]);
       for (uint32_t x = 0; x < M * kN; ++x) Cf[x] = static_cast<float>(C[x]);
-      vgpu::exec::tc86::mma(M, kN, K, op.ab_type == MmaElem::TF32 ? 4 : 8,
+      vgpu::exec::tc86::mma(*tc_rule, op.ab_type == MmaElem::TF32, M, kN, K,
                             op.ab_type == MmaElem::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide, op.acc_f16, Af.data(), K,
                             Bf.data(), kN, Cf.data(), kN, Dtc.data(), kN);
     }
@@ -11803,10 +11804,12 @@ class Interpreter {
       decode_n(op.ctype, rawC, C, M * N);
       // On an RTX 3060 (sm_86) the tensor core's chunked truncating sum (include/vgpu/exec/tc_ampere.hpp); elsewhere products and sums in f32, k in
       // order. An f16 result is that rounded once.
-      const bool tc = vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) && M <= 32 && N <= 32 && K <= 16 && K % (at == WmmaType::TF32 ? 4 : 8) == 0;
+      const vgpu::exec::tc86::SumRule* const tc_rule = vgpu::exec::tc86::sum_rule(profile_.cc_major, profile_.cc_minor);
+      const bool tc = tc_rule && M <= 32 && N <= 32 && K <= 16 && K % (at == WmmaType::TF32 ? 4 : 8) == 0;
       if (tc) {
         const bool acc16 = op.ctype == WmmaType::F16 && op.dtype == WmmaType::F16;
-        vgpu::exec::tc86::mma(M, N, K, at == WmmaType::TF32 ? 4 : 8, at == WmmaType::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide, acc16, A, K, B, N, C, N, D, N);
+        vgpu::exec::tc86::mma(*tc_rule, at == WmmaType::TF32, M, N, K, at == WmmaType::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide, acc16, A, K, B, N, C, N, D, N,
+                              at == WmmaType::TF32 ? 4u : 16u);   // (a tf32 wmma fragment is two m16n8k4 on a card)
       } else {
         simd::kernels().tile_f32(M, N, K, A, B, C, N, D, N);
       }
@@ -11854,16 +11857,16 @@ class Interpreter {
     if (at == WmmaType::F16 || at == WmmaType::BF16 || at == WmmaType::TF32) {
       // On an RTX 3060 (sm_86) the tensor core's chunked truncating sum (include/vgpu/exec/tc_ampere.hpp); elsewhere products and sums in
       // f32, k in order, as the f32-accumulator path does. An f16 result is that rounded once.
-      const bool tc = vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) && M <= 32 && N <= 32 && K <= 16 &&
-                      K % (at == WmmaType::TF32 ? 4 : 8) == 0;
+      const vgpu::exec::tc86::SumRule* const tc_rule = vgpu::exec::tc86::sum_rule(profile_.cc_major, profile_.cc_minor);
+      const bool tc = tc_rule && M <= 32 && N <= 32 && K <= 16 && K % (at == WmmaType::TF32 ? 4 : 8) == 0;
       std::vector<float> Dtc;
       if (tc) {
         std::vector<float> Af(A.begin(), A.end()), Bf(B.begin(), B.end()), Cf(C.begin(), C.end());
         Dtc.resize(size_t{M} * N);
         // A tensor core with an f16 accumulator when both the accumulator and the result are f16; otherwise the f32 sum, then converted.
         const bool acc16 = op.ctype == WmmaType::F16 && op.dtype == WmmaType::F16;
-        vgpu::exec::tc86::mma(M, N, K, at == WmmaType::TF32 ? 4 : 8, at == WmmaType::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide,
-                              acc16, Af.data(), K, Bf.data(), N, Cf.data(), N, Dtc.data(), N);
+        vgpu::exec::tc86::mma(*tc_rule, at == WmmaType::TF32, M, N, K, at == WmmaType::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide,
+                              acc16, Af.data(), K, Bf.data(), N, Cf.data(), N, Dtc.data(), N, at == WmmaType::TF32 ? 4u : 16u);
       }
       for (uint32_t i = 0; i < M; ++i)
         for (uint32_t j = 0; j < N; ++j) {

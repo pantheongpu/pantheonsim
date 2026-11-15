@@ -278,6 +278,14 @@ void set_fast_paths(bool lock_free_atomics, bool memory_runs);
 // it off. Read as a machine is made (a dispatch), not per instruction.
 bool matrix_fast_path();
 void set_matrix_fast_path(bool on);
+// Whether gfx90a's (an MI250X's) binary16 and bfloat16 MFMA forms sum as the FTTN paper's summary of that card reads: subnormal
+// inputs and outputs as zero, and one binary32 rounding to nearest even after every product, in the order of K
+// (amd/src/mfma_math.hpp, docs/matrix-numerics.md). OFF by default: it rests on that paper alone (no card of ours, and the published
+// bit-level model of the same card, MMA-Sim's, is a different sum). VGPU_MFMA_CDNA2=fttn turns it on. Off, the sum is what every
+// release has had: the instruction's K products and the accumulator summed in double and rounded once, subnormals kept. Read as a
+// machine is made (a dispatch). set_cdna2_matrix_model(1 / 0) overrides the environment for the tests, -1 gives it back.
+bool cdna2_matrix_model();
+void set_cdna2_matrix_model(int on);
 // How many matrix instructions the tile path has done on the calling thread since it began (those it does not do go to the reference path).
 uint64_t matrix_tile_count();
 // How many vector register files (64 KB each) the process has made new -- allocated and zeroed whole -- rather than taken from a
