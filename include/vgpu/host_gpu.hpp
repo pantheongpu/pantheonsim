@@ -1220,6 +1220,7 @@ struct SampleCandidate {
   bool followed = false;    // the kernel has a loop a sample inside its blocks can follow (find_probe_loops; Round sp61)
   double bound_turns = 1;   // ... and the most turns one of them has if it runs from 0 to its bound (bound_turns), when the launch gives the bound
   bool bounded = false;     // bounded blocks are on (Round sp75; VGPU_HOST_GPU_SAMPLE_BLOCK): a small grid with no followed loop is sampled by whole blocks
+  bool driver_up = false;   // the driver is up (Round sp76): the launch has no start to repay, and a whole launch of its kernel that the simulator has run is asked the floor
 };
 // Whether the launch is sampled inside its blocks (Round sp61) rather than by whole blocks: a grid too small for the latter, of a kernel with a followed loop.
 inline bool sample_inside(const SampleCandidate& w) { return sample_blocks(w.blocks) == 0 && w.followed && inblock_blocks(w.blocks) != 0; }
@@ -1260,11 +1261,28 @@ inline double sample_expected_seconds(const SampleCandidate& w) {
 // Why a launch with no estimate is not sampled (None: it is), in the order the rule asks; worth_sampling is `== None`. For the census of
 // VGPU_HOST_GPU_LOG (the host_gpu_kept reasons, Round sp75): "size rule" alone did not say which of these kept a launch.
 enum class NoSample : uint8_t { None, NoLoop, SmallGrid, ShortBefore, Floor };
+// What an earlier whole launch of the kernel must have taken for its next launch to be sampled: more than the margin over the card path, and,
+// once the driver is up (Round sp76), the floor as well. Before the start the card path holds the start (0.5 s with the margin), which is over
+// any floor; with the driver up it is a tenth of a millisecond for a program with little memory, and a kernel whose whole launch took a
+// millisecond would be sampled at its second launch for three (the history rule has its two launches at the third, whatever the sample says):
+// the floor, which asks of a static count that it be ten samples long, is asked of the measured launch instead.
+inline double sample_short_before_seconds(const SampleCandidate& w, const Costs& c, double card_path_s) {
+  return std::max(c.margin * card_path_s, w.driver_up ? sample_floor(w) : 0.0);
+}
+// What the floor is asked of. A static count says little (0.2 to 80 times off); with the driver up (Round sp76) a kernel's earlier whole
+// launch, when the simulator has run one, says what a launch takes, set-up and all, and stands in for the count when it is the larger: a
+// kernel that counted 3 ms and took 0.19 s (the CUDA Samples' histogram256Kernel, 240 blocks) is worth a sample at its second launch, which
+// its count would refuse in a process that cannot afford one. Before the start nothing changes: a whole launch long enough to matter there
+// (0.25 s) gives the kernel an estimate by itself (kOneSampleMinSeconds) and the launch is never a candidate for a sample.
+inline double sample_floor_estimate(const SampleCandidate& w) {
+  const double counted = sample_static_estimate(w);
+  return w.driver_up && w.whole_s ? std::max(counted, *w.whole_s) : counted;
+}
 inline NoSample sample_refusal(const SampleCandidate& w, const Costs& c, double card_path_s) {
   if (!w.loop) return NoSample::NoLoop;
   if (sample_blocks(w.blocks) == 0 && !sample_inside(w) && !sample_bounded_small(w)) return NoSample::SmallGrid;
-  if (w.whole_s && *w.whole_s <= c.margin * card_path_s) return NoSample::ShortBefore;
-  if (!(sample_static_estimate(w) >= sample_floor(w) || sample_affordable(w.age_s, w.spent_s, sample_expected_seconds(w)))) return NoSample::Floor;
+  if (w.whole_s && *w.whole_s <= sample_short_before_seconds(w, c, card_path_s)) return NoSample::ShortBefore;
+  if (!(sample_floor_estimate(w) >= sample_floor(w) || sample_affordable(w.age_s, w.spent_s, sample_expected_seconds(w)))) return NoSample::Floor;
   return NoSample::None;
 }
 inline const char* no_sample_text(NoSample r) {
@@ -1278,6 +1296,42 @@ inline const char* no_sample_text(NoSample r) {
   return "?";
 }
 inline bool worth_sampling(const SampleCandidate& w, const Costs& c, double card_path_s) { return sample_refusal(w, c, card_path_s) == NoSample::None; }
+
+// ---- a sample once the driver is up (docs/perf-design/12-host-gpu-turbo.md section 13; Round sp76) ------------------------------------
+// From Round sp60b to Round sp75 no launch was sampled once the driver's start had begun: the sample is taken in a forked copy of the process,
+// and a copy that held the real driver's context was a thing nobody had tried. So a kernel first launched after the start had the static
+// first-launch rule and its history, and no measure: HeCBench aidw's second kernel (400 blocks of over a second each) was simulated once,
+// 149 s of the program's 193 s on an A10G (Round sp75's card run), and so was every kernel a program first launches after its start
+// (segmentationTreeThrust 34 launches, histogram 4, mergeSort 2).
+// What the refusal guarded against, and what holds instead:
+//  * the copy calling the driver. It runs blocks of the launch in the simulator and ends with _exit; the one way from there into the driver is
+//    the gate, when a block reads a chunk only the card holds. So before the fork the process pulls every such chunk (they become Both: the
+//    pull a simulated launch makes anyway, and nothing is pushed again if the launch then goes), the copy makes every chunk the simulator's
+//    in its own memory before it runs a block (so no access of its blocks reaches the gate at all), and the gate's pull refuses to run in a
+//    copy: a copy that would have called the driver ends without an answer and the launch stays, a lost sample and not a wrong one;
+//  * the copy's lifetime: a block's run is bounded since Round sp75, so a copy lives for the wait at most (50 ms and what the live memory adds),
+//    as before the start; it never outlives a launch on the card that its process makes;
+//  * what a fork does to a process that holds a driver context is the driver's and the kernel's business (the copy shares the driver's open
+//    files and has none of its threads; it closes its descriptors when it ends, which releases nothing while the process holds them). It is
+//    what a program does that calls system() or popen() after its first CUDA call. Not measured before the round's card run.
+// With the driver up a sampled launch has no start to repay: sampled_offload already prices it without one (`driver_started`), the card
+// path a block of a small grid must reach (sample_need_seconds) is the one without the start, and so is the bar an earlier whole launch is
+// held against (sample_short_before_seconds). The floor and what a process affords are the ones before the start; what the floor is asked
+// of is the kernel's earlier whole launch when there is one and it is over its static count (sample_floor_estimate).
+// `after_start` false is the rule before (VGPU_HOST_GPU_SAMPLE_STARTED=0). A driver that could not be started ends the mode: nothing is sampled.
+inline bool sample_allowed(bool start_begun, bool start_ready, bool start_failed, bool after_start) {
+  if (start_failed) return false;
+  if (!start_begun) return true;
+  return after_start && start_ready;
+}
+// The card path a launch that may be sampled is held against before anything is measured: the whole live memory each way, and the driver
+// start while it is not up.
+inline double sample_card_path_seconds(uint64_t live_bytes, const Costs& c, bool driver_up) {
+  Estimate e;
+  e.push_bytes = e.pull_bytes = live_bytes;
+  e.start_s = driver_up ? 0.0 : std::max(c.start_cost_s, 0.0);
+  return card_path_seconds(e, c);
+}
 
 // A safety net for any estimate that turns out wrong: an offloaded launch that took longer on the card path (copies, launch, copy back)
 // than the simulator was expected to need ends the offloading of that kernel. One bad launch is the most it can cost.

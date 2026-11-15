@@ -353,6 +353,7 @@ struct Runtime::Impl : CardGate {
   enum class SampleMode : uint8_t { On, Off, Log, Always, Whole } sample_mode = SampleMode::On;
   size_t copies_running_at_exit = 0;   // sampled copies that had answered and not yet ended when the process came to its end (they were waited for)
   bool sample_block = true;       // bounded blocks (Round sp75); VGPU_HOST_GPU_SAMPLE_BLOCK=0: the copy runs whole blocks, however long (the rule before)
+  bool sample_started = true;     // a launch is sampled with the driver up too (Round sp76; sample_allowed); VGPU_HOST_GPU_SAMPLE_STARTED=0: never once the start has begun (the rule before)
   double sample_spent_s = 0;      // what the samples of this process have cost
   double sample_dearest_s = 0;    // the dearest of them
   struct Decision;
@@ -402,6 +403,9 @@ struct Runtime::Impl : CardGate {
   // Copies chunks the card alone holds into the simulator's memory (not in a verify run, where the simulator's memory is the truth already).
   void pull_chunks(Res& a, const std::vector<uint64_t>& idx) {
     if (idx.empty() || verify) return;
+    // A sample's copy of the process never calls the driver (Round sp76: its process pulled these chunks before the fork, and the copy made
+    // them its own; one that comes here all the same ends without an answer).
+    if (exec::g_sample_copy.load(std::memory_order_relaxed)) throw Error(Err::Internal, "host_gpu: a sample's copy of the process does not call the driver");
     api.cuCtxSetCurrent(ctx);
     std::vector<uint8_t>& buf = pull_buf;
     for (const auto& [first, count] : chunk_runs(idx)) {
@@ -448,6 +452,22 @@ struct Runtime::Impl : CardGate {
       pull_chunks(a, a.r.sim_launch());
       update_slot(a);
     }
+  }
+
+  // A sample is about to fork the process while the driver is up (Round sp76; mu held by the caller): every chunk the card alone holds comes
+  // back and is then shared (Where::Both), so that the copy's blocks read the launch's real input and never ask the card for it. It is the
+  // pull the simulator makes before it runs the launch itself (reset_for_simulator), made earlier; the card's copy stays valid, so a launch
+  // the sample then sends pushes nothing it would not have pushed. Returns the bytes pulled.
+  uint64_t pull_for_copy() {
+    if (!resident || !gate_mem) return 0;
+    InternalScope internal;
+    const uint64_t before = stats.pulled_bytes;
+    for (auto& [b, a] : res) {
+      if (a.r.count(Where::Card) == 0) continue;
+      pull_chunks(a, a.r.sim_read(0, a.r.chunks() - 1));
+      update_slot(a);
+    }
+    return stats.pulled_bytes - before;
   }
 
   // The tracked allocations are the live ones: new ones start Host (nothing of them is on the card), the ones that went are dropped (sync_tracked).
@@ -1182,6 +1202,7 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
       r->impl_->sample_mode = std::string(v) == "0" ? Impl::SampleMode::Off : std::string(v) == "log" ? Impl::SampleMode::Log :
                               std::string(v) == "always" ? Impl::SampleMode::Always : std::string(v) == "whole" ? Impl::SampleMode::Whole : Impl::SampleMode::On;
     if (const char* v = std::getenv("VGPU_HOST_GPU_SAMPLE_BLOCK"); v && std::string(v) == "0") r->impl_->sample_block = false;   // the copy runs whole blocks (the rule before Round sp75)
+    if (const char* v = std::getenv("VGPU_HOST_GPU_SAMPLE_STARTED"); v && std::string(v) == "0") r->impl_->sample_started = false;   // no sample once the driver's start has begun (the rule before Round sp76)
     if (const char* v = std::getenv("VGPU_HOST_GPU_STATIC"); v && *v && *v != '0') r->impl_->static_estimate = true;
     if (const char* v = std::getenv("VGPU_HOST_GPU_START_COST"); v && *v) {   // seconds; 0: do not charge the driver start (the rule before sp43)
       char* end = nullptr;
@@ -1679,6 +1700,8 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
 // Called by launch() for a launch that goes to the simulator because nothing is known of its kernel (mu held): leaves a hint for sample_plan.
 // Not once the driver has been started: the process is forked for a sample, and a process that holds the real driver's context is not forked
 // (the first-launch and history rules, which then find the start paid, are what is left).
+// Since Round sp76 that is the rule of VGPU_HOST_GPU_SAMPLE_STARTED=0 only: with the driver up the launch is sampled as before the start, held
+// against a card path with no start in it (sample_allowed, vgpu/host_gpu.hpp; what makes the fork safe is in sample_plan and sample_copy_begin).
 const char* Runtime::Impl::consider_sample(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, const std::vector<std::vector<uint8_t>>& args, const Decision& dec,
                                             uint64_t blocks, MemoryManager& mem) {
   // (what keeps a launch from being sampled before the rule is asked: said for the kernel's first two launches, as the rule's own refusals are)
@@ -1690,15 +1713,15 @@ const char* Runtime::Impl::consider_sample(const ptx::EntryFn& fn, const exec::L
   };
   if (sample_mode == SampleMode::Off) return early("sampling is off");
   if (verify || !dec.ok) return early("not a candidate");
-  if (start_sh || start_failed) return early("the driver has been started");
+  if (!sample_allowed(start_sh != nullptr, start_ready, start_failed, sample_started)) return early("the driver has been started");
+  const bool driver_up = start_ready;
   if (banned.count(fn.name)) return early("the kernel is banned");
   uint64_t live = 0;
   for (const auto& r : mem.live_ranges()) live += r.second;
   if (live > max_bytes) return early("live memory over VGPU_HOST_GPU_MAX_MIB");
-  Estimate e;
-  e.push_bytes = e.pull_bytes = live;
-  e.start_s = std::max(costs.start_cost_s, 0.0);
+  const double card_path_s = sample_card_path_seconds(live, costs, driver_up);
   SampleCandidate c;
+  c.driver_up = driver_up;
   c.blocks = blocks;
   c.loop = dec.loop;
   c.live_bytes = live;
@@ -1731,12 +1754,12 @@ const char* Runtime::Impl::consider_sample(const ptx::EntryFn& fn, const exec::L
       if (b) c.bound_turns = std::max(c.bound_turns, bound_turns(*b, l.step));
     }
   }
-  const bool affordable = c.loop && (sample_static_estimate(c) >= sample_floor(c) || sample_affordable(c.age_s, c.spent_s, sample_expected_seconds(c)));
+  const bool affordable = c.loop && (sample_floor_estimate(c) >= sample_floor(c) || sample_affordable(c.age_s, c.spent_s, sample_expected_seconds(c)));
   if (sample_mode != SampleMode::On && sample_mode != SampleMode::Whole) {   // (log, always: neither the loop, nor the floor, nor the process's age is asked)
     c.age_s = 1e18;
     c.loop = true;
   }
-  if (const NoSample why = sample_refusal(c, costs, card_path_seconds(e, costs)); why != NoSample::None) {
+  if (const NoSample why = sample_refusal(c, costs, card_path_s); why != NoSample::None) {
     if (logging() && nosample_said[fn.name]++ < 2)
       std::fprintf(stderr, "host_gpu_nosample: kernel=%s blocks=%llu threads_per_block=%u instrs=%llu loop=%d followed=%d bound_turns=%.0f live_bytes=%llu static_s=%.6f floor_s=%.6f whole_s=%.6f age_s=%.6f reason=%s\n",
                    fn.name.c_str(), static_cast<unsigned long long>(blocks), cfg.block[0] * cfg.block[1] * cfg.block[2], static_cast<unsigned long long>(dec.instrs), dec.loop ? 1 : 0,
@@ -1758,7 +1781,7 @@ const char* Runtime::Impl::consider_sample(const ptx::EntryFn& fn, const exec::L
   h.inside = sample_inside(c);
   h.bounded = sample_block && !h.inside;
   h.small = sample_bounded_small(c);
-  if (h.small) h.need_s = sample_need_seconds(live, live, costs, false);
+  if (h.small) h.need_s = sample_need_seconds(live, live, costs, driver_up);
   h.bound_turns = c.bound_turns;
   if (h.inside) h.probe = *dec.probe;
   t_sample_hint = h;
@@ -1768,11 +1791,20 @@ const char* Runtime::Impl::consider_sample(const ptx::EntryFn& fn, const exec::L
 bool Runtime::sample_plan(const ptx::EntryFn&, SamplePlan* plan) {
   if (!t_sample_hint.set) return false;
   {
-    // A process that holds, or is loading, the real driver is never forked: asked again here, at the fork, under the lock that guards the start.
+    // Whether the process may be forked is asked again here, at the fork, under the lock that guards the start (sample_allowed: until Round
+    // sp76, and with VGPU_HOST_GPU_SAMPLE_STARTED=0, never once the start has begun).
     std::lock_guard<GateLock> g(impl_->mu);
-    if (impl_->start_sh || impl_->start_failed) {
+    if (!sample_allowed(impl_->start_sh != nullptr, impl_->start_ready, impl_->start_failed, impl_->sample_started)) {
       t_sample_hint = {};
       return false;
+    }
+    // With the driver up: what only the card holds comes back before the fork, so the copy has the launch's input and no reason to call the driver.
+    if (impl_->start_ready) {
+      const auto t0 = std::chrono::steady_clock::now();
+      const uint64_t pulled = impl_->pull_for_copy();
+      if (logging() && pulled)
+        std::fprintf(stderr, "host_gpu: %.2f MiB only the card held pulled before a sample (%.3f ms)\n", pulled / 1048576.0,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
   }
   const bool inside = t_sample_hint.inside;
@@ -1793,6 +1825,20 @@ bool Runtime::sample_plan(const ptx::EntryFn&, SamplePlan* plan) {
 bool Runtime::driver_start_begun() const {
   std::lock_guard<GateLock> g(impl_->mu);
   return impl_->start_sh != nullptr;
+}
+
+// In the copy (one thread, its own memory): no lock is taken, for a lock another thread of the process held when it was forked is held for ever
+// here. An odd generation says that such a thread was changing the gate's table at that moment.
+bool Runtime::sample_copy_begin() {
+  Impl& im = *impl_;
+  if (im.mu.generation() & 1) return false;
+  for (auto& [b, a] : im.res) {
+    if (a.slot->load(std::memory_order_relaxed) == 0) continue;
+    if (a.r.count(Where::Card) != 0) return false;   // (a launch of another thread went to the card between the pull and the fork)
+    a.r.sim_launch();
+    im.update_slot(a);
+  }
+  return true;
 }
 
 bool Runtime::sample_decide(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
@@ -1849,9 +1895,11 @@ bool Runtime::sample_decide(const ptx::EntryFn& fn, const exec::LaunchConfig& cf
   l.would_send = want;
   l.part = run.part;
   if (logging())   // (said at the decision, before the launch runs: host_gpu_sample comes when the simulator has finished it)
-    std::fprintf(stderr, "host_gpu: %s sampled%s: answered=%d ran=%llu%s estimate %.3f ms against a card path of %.3f ms with the start: %s\n", fn.name.c_str(), hint.inside ? " inside its blocks" : "",
+    std::fprintf(stderr, "host_gpu: %s sampled%s%s: answered=%d ran=%llu%s estimate %.3f ms against a card path of %.3f ms %s: %s\n", fn.name.c_str(), hint.inside ? " inside its blocks" : "",
+                 run.driver_started_at_fork ? " with the driver up" : "",
                  run.answered ? 1 : 0, static_cast<unsigned long long>(run.part.next), run.part.unfinished ? " (the last block stopped at the limit: at least)" : "", whole.value_or(0) * 1e3,
-                 card_path_seconds(sampled_estimate(whole.value_or(0), push, live, im.costs, im.start_sh != nullptr, card_kernel), im.costs) * 1e3, want ? "sent" : "kept");
+                 card_path_seconds(sampled_estimate(whole.value_or(0), push, live, im.costs, im.start_sh != nullptr, card_kernel), im.costs) * 1e3,
+                 im.start_sh ? "without a start" : "with the start", want ? "sent" : "kept");
   if (logging() && !want)
     im.last.kept = !run.answered ? "size rule: no estimate, the sampling copy did not answer" : !whole ? "size rule: no estimate, the sample gave none"
                                                                                                : "size rule: the sampled estimate does not repay the card path and the driver start";

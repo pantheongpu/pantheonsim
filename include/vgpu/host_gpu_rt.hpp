@@ -31,7 +31,7 @@ struct Stats {
   // Sampled launches (vgpu/host_gpu.hpp "The first blocks of a launch, timed"): how many, how many of them the card then ran (`sample_sent`, also
   // in `offloaded`), how many copies did not answer in time, and what the samples cost the process in wall seconds (the fork and the wait).
   uint64_t sampled = 0, sample_sent = 0, sample_timeouts = 0;
-  uint64_t sample_after_driver = 0;   // samples made although the driver's start had begun: always 0 (sample_plan refuses), printed to show it
+  uint64_t sample_after_driver = 0;   // samples made with the driver up (Round sp76; 0 with VGPU_HOST_GPU_SAMPLE_STARTED=0, where sample_plan refuses them)
   double sample_seconds = 0;
   // Launches the card ran because the card held the live memory (vgpu/host_gpu.hpp streak_offload, Round sp65; also in `offloaded`), and the bytes
   // only the card held at those launches: what the simulator would have pulled back first had it run them.
@@ -69,10 +69,14 @@ class Runtime {
   };
   bool sample_plan(const ptx::EntryFn& fn, SamplePlan* plan);
   bool driver_start_begun() const;
+  // In a sample's copy of a process whose driver is up (Round sp76), before it runs a block: every chunk becomes the simulator's in the copy's
+  // own memory, so that no access of its blocks reaches the gate. False: a chunk is the card's alone, or the gate's table was being changed
+  // when the process was forked (the copy must end without an answer). Touches the copy's memory only, never the driver.
+  bool sample_copy_begin();
   // What the copy reported (`answered` false: it did not, in time, and was ended), and what the sample cost the process in wall seconds.
   struct SampleRun {
     bool answered = false;
-    bool driver_started_at_fork = false;   // whether the driver's start had begun when the process was forked (never: sample_plan refuses)
+    bool driver_started_at_fork = false;   // whether the driver was up when the process was forked (Round sp76; before it: never)
     exec::LaunchPart part;
     double wall_s = 0, fork_s = 0;
   };

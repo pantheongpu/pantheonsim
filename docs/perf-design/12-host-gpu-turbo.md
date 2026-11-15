@@ -265,7 +265,8 @@ What the copy can do outside its memory, and why it does not:
   or destructor of the program runs. A kernel that prints is not admitted to the card in either mode (its module has an external call), so it is
   never sampled.
 * *The real driver.* A process whose driver start has begun is not sampled: the copy never holds a driver context. (After the start, the rules of
-  sp43 and the static first-launch rule find the start paid and decide as before.)
+  sp43 and the static first-launch rule find the start paid and decide as before.) (Since Round sp76 a launch is sampled with the driver up
+  too, by a copy that cannot call the driver: section 13. This paragraph is the rule of `VGPU_HOST_GPU_SAMPLE_STARTED=0`.)
 * *Files and shared memory.* Device memory shared with another process, or mapped by `cuMemMap`, keeps the launch off the card and so is not sampled;
   pinned and managed host memory is the process's own (copy-on-write in the copy) unless the program mapped it shared itself. The diagnostics that
   write files per launch (counters, traces, digests) switch the mode off.
@@ -494,7 +495,7 @@ only ever called "size rule". There were three causes, and this round removes tw
 | no sample was possible: a grid under 256 blocks, and no loop the sample inside the blocks follows | the tensor GEMMs (80 or 160 blocks; their one loop counts by the grid's size and ends on a mask), Rodinia lavaMD (216 blocks) |
 | no sample was taken: the static estimate is under the floor and the process too young to afford one | `initRNG` of MC_SingleAsianOptionP and MC_EstimatePiInlineP (1.6 s of each program's 1.8 s; 9.5 ms counted), two kernels of warpAggregatedAtomicsCG, lavaMD again (3.4 ms counted) |
 | it was sampled and the estimate does not repay the driver start | the other launches of the two Monte Carlo programs and of warpAggregatedAtomicsCG: kept rightly |
-| no sample is possible once the driver is up | aidw's second kernel, on the card (below) |
+| no sample is possible once the driver is up (until Round sp76: section 13) | aidw's second kernel, on the card (below) |
 
 **The rule: a sampled block is bounded.** The copy ran each block to its end, and the process waited 50 ms for it (`sample_timeout_seconds`). A
 block that has not ended after *t* seconds takes more than *t*. So the copy now stops the first run of a block once it has lasted a limit, runs
@@ -546,7 +547,7 @@ and in the corpus those are the four GEMMs, which do not stay.
   multiprocessor): it is simulated, and its second launch goes by its history. Expected on the card: 3 of 4 launches, about half of the
   365 s left (measured: 3 of 4, 193 s of 360 s). What would take it: a trial in the simulator that the card can undo. With the driver up the card holds the memory before the
   launch once the simulator's chunks are pushed, so a launch the simulator has run for a while can be given up and run on the card from that
-  copy. Not built.
+  copy. Not built. (Round sp76 took it another way: the launch is sampled with the driver up, section 13.)
 * *`initRNG` and the other launches under the floor in a young process.* The first launch comes 5 ms into the process and counts 9.5 ms; a
   sample costs 3 to 7 ms and the faults. Nothing known before the launch tells it from HeCBench silu's or s3d's kernels (5 to 14 ms counted,
   under 4 ms taken), and a sample for each of those is 5 % of such a program. Its loops have immediate bounds (32 x 5 turns), which a count
@@ -577,7 +578,114 @@ first launch (their estimates: 0.95, 1.37, 1.42 and 1.9 s at the least, against 
 1.15 and 0.5 s of them), so is immaTensorCoreGemm's (which the summary run did not hold), and the stand-in test's steps 38 to 40 pin it. What the card made of them is above ([data/sp75/card-run.sh](data/sp75/card-run.sh) is the run); the numbers, the census over the corpus
 and the tests are in [Round sp75](rounds/11-rounds-sp36-sp41.md#round-sp75-host-gpu-a-block-that-outlasts-the-wait).
 
-## 13. What is next
+## 13. A kernel's first launch once the driver is up (Round sp76; both modes)
+
+Round sp75's card run left one launch of HeCBench aidw in the simulator: the first launch of its second kernel, `AIDW_Kernel_Tiled`, 149 s of
+the program's 193 s. The mode's line for it was `host_gpu_nosample: ... reason=the driver has been started`. The same reason keeps the first
+one or two launches of every kernel a program first launches after its driver start (pantheonsim #657, #659: segmentationTreeThrust 34
+launches, histogram 4, mergeSort 2; over the corpus on server3, 68 launches in 8 programs).
+
+**Where the refusal came from.** It is Round sp60b's, and deliberate: a sample is taken in a forked copy of the process, and the round had
+never forked a process that held the real driver's context, so it did not ("the copy never holds a driver context", section 8; its text lists
+"the fork itself against a real driver" under what no test covers). Three things stood behind that caution, and this is what each is worth
+now:
+
+| what could go wrong | what holds |
+|---|---|
+| the copy calls the driver. A forked copy of a CUDA process must not: the driver's threads are not in it, and its context is the process's | the copy runs blocks of the launch in the simulator and ends with `_exit`; the one way from there into the driver is the gate, when a block reads a chunk only the card holds (section 3). Before the fork the process pulls every such chunk; the copy then makes every chunk its own, in its own memory, before it runs a block, so that no access of its blocks reaches the gate; and the gate's pull refuses to run in a copy at all |
+| the copy lives long, holding the driver's files and mappings, while the process goes on to launch on the card | since Round sp75 a block's run in the copy is bounded: a copy lives for the wait at most (50 ms and 0.2 ms per MiB of live memory, 120 ms more for a small grid), with or without an answer, as before the start, and the thread that launched waits for it |
+| the fork itself harms the process that holds the driver | nothing in the mode can show this without a card. A forked child that never calls the driver is what every program makes that calls `system()` or `popen()` after its first CUDA call; the copy shares the driver's open files, closes its own descriptors when it ends (which releases nothing while the process holds them) and maps nothing new. **Not measured before the round's card run**: the card test's step 13 and the `fork` stage of `data/sp76/card-run.sh` are there for it |
+
+So the reason no longer holds for the first two, and the third is the card's to confirm.
+
+**The rule** (`sample_allowed`, `sample_card_path_seconds`, `sample_short_before_seconds`, `sample_floor_estimate`, vgpu/host_gpu.hpp). A launch nothing is known of
+is sampled with the driver up as it is before the start: the same candidates (an admitted kernel with a loop; a grid of 256 blocks and up, or
+a small one sampled inside its blocks or by bounded blocks), the same floor (a static estimate of 30 ms, more with much live memory) or a
+process that can afford it (its samples within 2 % of its age), the same copy, the same estimate. What differs is what the launch is held
+against: with the driver up it has no start to repay, only the card path's own cost. `sampled_offload` already priced a sample that way
+(`driver_started`); the round gives the same card path to the two places that assumed the start: the least a block of a small grid must
+show (`sample_need_seconds`), and the bar under which an earlier whole launch of the kernel says "short, do not sample again".
+
+That second bar needed a rule of its own. Before the start it is twice the card path with the start, 0.5 s: over any floor. With the driver
+up it is twice 0.1 ms for a program with little memory, and a kernel whose first launch took a millisecond would be sampled at its second
+launch for three (the history rule has its two launches at the third whatever the sample says). So with the driver up a kernel is sampled
+again only if its whole launch reached the floor: what is asked of a static count, that it be ten samples long, is asked of the measured
+launch instead (`sample_short_before_seconds`).
+
+And the other way round: once the simulator has run a kernel's whole launch with the driver up, that launch says more than the static
+count does, so where it is the larger it is what the floor is asked of (`sample_floor_estimate`). The CUDA Samples' `histogram256Kernel`
+(240 blocks, 2.8 ms counted, 64 MiB live, 4 s into the process) takes 0.19 s here: its first launch is refused by the floor, as before the
+round it was refused for the driver's start, and its second launch, which the history rule would also give to the simulator, is now
+sampled on the strength of the first. Before the start nothing of this applies: a whole launch long enough to matter there (0.25 s) gives
+its kernel an estimate by itself, and the launch is not a candidate for a sample.
+
+**Before the fork.** With the driver up the card may hold chunks the simulator does not (every launch on the card leaves all of them so).
+`sample_plan` pulls them, under the lock that guards the card, and leaves them shared (`Where::Both`): it is the pull the simulator makes
+before it runs the launch itself, made a moment earlier, and because the card's copy stays valid a launch the sample then sends pushes
+nothing it would not have pushed. What it can waste is that pull, when the launch is sent after all: the live memory once, at 10 GB/s, which
+the estimate already charges (`sampled_estimate` counts the whole live memory coming back).
+
+**Why it is sound.** As in section 8, the copy changes nothing in the process that goes on, and the decision is between two things the
+process could already do. The copy's memory is the launch's real input (pulled before the fork), so its blocks time what the simulator would
+run. The copy cannot reach the driver: `sample_copy_begin` runs in it before any block, takes no lock (a lock another thread held at the
+fork is held for ever in the copy), ends the copy if a chunk is the card's alone (another thread of the program sent a launch between the
+pull and the fork) or if the gate's table was being changed at the fork (the lock's generation is odd), and otherwise makes every chunk the
+simulator's; and `pull_chunks` throws in a copy. A copy that ends that way gives no answer and the launch is the simulator's: a lost sample,
+not a wrong one. Exact mode's bits are the simulator's for any admitted kernel wherever it runs, so more launches on the card change no
+output; the plain simulator has no part in any of it.
+
+**What it costs.** A sample, as before the start: the fork, the copy's decode and set-up, the sampled blocks (1 to 12 ms for short blocks,
+30 ms for a block stopped at its limit, up to 120 ms for a small grid), and the page faults afterwards. The floor and the 2 % of the process's
+age bound it as they do before the start, and a process whose driver is up has run for a quarter of a second at the least. What is new: the
+pull before the fork when the launch is then sent (above), and whatever a fork costs a process with the driver loaded (the driver's own
+memory is copied on write like any other): the `host_gpu_sample:` line's `fork_s` of a sample taken with the driver up, against one taken
+before the start, is the card run's to read (0.5 ms against 0.5 ms with the stand-in driver, which holds nothing).
+
+**What it decides** (server3, the stand-in driver; [data/sp76/](data/sp76/README.md)). HeCBench aidw against a stand-in card that keeps memory
+and computes nothing: `AIDW_Kernel` is sampled and sent as in Round sp75, and `AIDW_Kernel_Tiled`, which was `not sampled: the driver has
+been started`, is sampled with the driver up: 2.3 MiB pulled in 0.4 ms, the first block stopped at 15 ms, 2.0 s at the least against a card
+path of 0.25 s (its assumed card time, an eighth of the estimate; no start), sent; the sample cost 32 ms. All four launches go, where three
+did. Over the corpus the rule touches eight programs
+([data/sp76/census.md](data/sp76/census.md): 43 programs on the final build, the 29 that start the driver among them): of 49 lines of
+`not sampled: the driver has been started`, 17 launches are now sampled, 12 sent and 5 kept. alignedTypes sends ten first launches (94 to
+592 ms estimated), histogram the second launch of `histogram256Kernel` (0.11 s), mergeSort one (85 ms); the rest stay for the reasons the
+rule keeps (no loop; under the floor of a process with 290 MiB live; an earlier launch that was short). With the switch off against on,
+22 programs that start the driver are within 0.990 to 1.017 of each other in wall time (the stand-in simulates what is sent: this is what
+the samples cost).
+
+**What it does not reach.** A kernel with no loop, a launch under the floor in a process too young to afford a sample, a grid of one block:
+the reasons of sections 8 and 12 stand with the driver up as before it. A kernel whose first launch after the start is short and under the
+floor is simulated twice, as ever, and goes by its history at the third launch. And the rule changes nothing for a program that never starts
+the driver: the four programs of pantheonsim #656 that are under the floor in a young process (`initRNG` of the two Monte Carlo Samples,
+warpAggregatedAtomicsCG, Rodinia lavaMD) are where they were ([Round sp76](rounds/11-rounds-sp36-sp41.md#round-sp76-host-gpu-a-kernels-first-launch-once-the-driver-is-up)
+says what a safe rule for each would need).
+
+`VGPU_HOST_GPU_SAMPLE_STARTED=0` is the rule before: no launch is sampled once the driver's start has begun (the benchmark's forms `exactd0`
+and `turbod0`). The `host_gpu_sampled:` line's `after_driver=` counts the samples taken with the driver up, the decision line of such a
+sample reads `sampled with the driver up: ... against a card path of ... ms without a start`, and with `VGPU_HOST_GPU_LOG` the pull before a
+sample is said (`... MiB only the card held pulled before a sample`).
+
+**On a card: not run.** The round had no card. What only a card can show, in the order `data/sp76/card-run.sh` asks it: that a process
+which holds the real driver can be forked and goes on to use the card (the card test's step 13, `e2e_host_gpu`: the two-kernel program
+sampled with the driver up, both launches on the card, the output the mode-off output; then twenty runs in each mode and the kernel log);
+that aidw's four launches go (193 s to about 45 s: what Round sp75's card run left after its 149 s launch); what the kernels first launched
+after the start gain in segmentationTreeThrust, histogram and mergeSort; and that no program of the keep list is more than 3 % slower than
+with the switch off. If the fork does harm on the card, `sample_started` in `src/runtime/host_gpu.cpp` is the default to turn off.
+
+**Two things the round measured and did not change** (numbers in the round's text):
+
+* *Rodinia particlefilter_float*, which Round sp75's card run left unsettled (turbo mode 5 to 8 % slower than with
+  `VGPU_HOST_GPU_SAMPLE_BLOCK=0`). The rule of section 12 does nothing to it: the two forms take the same decisions launch by launch and differ
+  in the text of a reason. What moves its time is the program: `normalize_weights_kernel` has a race between blocks (block 0 writes `u[0]`,
+  every other block reads it, nothing orders them), so with several host threads the program computes one of several answers per run, clock
+  seed fixed or not, and the next kernel's first launch takes 7 to 44 ms or 82 to 235 ms by which it was (server3, four host threads, the
+  clock fixed: 90 runs). With one host thread and the clock fixed the two forms are within 1 % of each other at six seeds.
+* *The driver start bought late* (pantheonsim #662, HeCBench silu: the start bought at the 31st of 50 launches, with 0.20 s of simulation
+  left). Replayed over the launches of the corpus, every rule that keeps the start from silu without knowing what follows (the account at
+  1.5 or 2 times the start; an account of what the card would have saved; this kernel's launches so far as the bound on what remains)
+  takes more from programs that repay the start than silu loses. Section 11's rule stands.
+
+## 14. What is next
 
 From Round sp59, less what section 8 does: a start-cost account that weighs the gain for programs of many short launches (they lose 0.1 to 0.2 s
 or gain nothing; section 11 is a first step: it counts the launches a kernel has had, not yet what the card saved on them); the card's fixed-point `MUFU.SIN` / `MUFU.COS` in the simulator; `BMMA` in the tensor class and a tensor probe whose sums round;
@@ -587,3 +695,10 @@ From Round sp75: a first launch while the driver is up (a trial in the simulator
 kernel a program first launches after its start was bought); a static count that weighs a loop's body by its turns where the bound is an
 immediate (the floor of section 8 for `initRNG`); the bounded blocks as the fallback of a sample inside the blocks that finds no warp in a
 followed loop.
+
+From Round sp76 (which took the first of those another way: the launch is sampled with the driver up, section 13): the card run of
+`data/sp76/card-run.sh`, first of all the fork of a process that holds the real driver; a static count that weighs a loop's body by its
+turns, which needs the flow scan to follow a loop that is left through a call to the kernel's `EXIT` and the census of every kernel it would
+newly have sampled; what the page faults after a fork cost a program with hundreds of MiB live on the rig (the floor of
+warpAggregatedAtomicsCG's two kernels); whether the size of a process's environment tilts particlefilter's race (the `pf` stage of the card
+script runs the rule under an environment of the size of the rule-before form).
