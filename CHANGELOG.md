@@ -7,6 +7,23 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Host-GPU modes (`VGPU_HOST_GPU=exact|turbo`, experimental): a launch whose blocks each take longer than the wait for its sample is no longer
+  kept in the simulator for want of an answer ([round sp75](docs/perf-design/rounds/11-rounds-sp36-sp41.md#round-sp75-host-gpu-a-block-that-outlasts-the-wait),
+  [design](docs/perf-design/12-host-gpu-turbo.md), section 12; pantheonsim #656, #657). The forked copy that times a launch's first blocks now stops
+  a block at a limit and answers with the time it ran, which is under what the block takes; the estimate and the rule that decides are
+  unchanged. A grid of 2 to 255 blocks whose kernel has no loop the sample inside the blocks follows is sampled the same way when its static
+  estimate reaches 30 ms. Against the stand-in driver the first launch of HeCBench aidw (78 s in the simulator on the build machine) and the
+  single launches of the CUDA Samples cudaTensorCoreGemm, tf32TensorCoreGemm and bf16TensorCoreGemm (5 to 83 s) are sent to the card;
+  **no card run has measured it yet** (`docs/perf-design/data/sp75/card-run.sh` is the run). aidw's second kernel is still simulated once (no
+  sample is taken while the driver is up), and launches under the sampling floor in a young process (MC_SingleAsianOptionP,
+  MC_EstimatePiInlineP, warpAggregatedAtomicsCG, Rodinia lavaMD) are not reached. `VGPU_HOST_GPU_SAMPLE_BLOCK=0` is the rule before. The
+  plain simulator and the bits of exact mode are unchanged.
+- Host-GPU modes: `VGPU_HOST_GPU_LOG=1` says why each launch stayed in the simulator. The `host_gpu_kept:` reasons, which read `size rule`
+  for every launch the size rule, the first-launch rule or a sample kept, now name the cause (`size rule: no estimate, not sampled: <why>`,
+  `size rule: the sampled estimate does not repay the card path and the driver start`, `size rule: the estimate does not beat the card path`,
+  `size rule: the estimate does not repay the driver start`, `size rule: the kernel is banned ...`), a `host_gpu_nosample:` line gives the
+  numbers behind an unsampled launch (the kernel's first two), and a sampled launch's decision is printed when it is made. A script that
+  matches the reason `size rule` exactly must match its prefix instead.
 - AMD counters: the `VGPU_DISPATCH_STATS` line now ends with the bytes the active lanes ask for (`vmem_bytes_rd`, `vmem_bytes_wr`, `lds_bytes_rd`, `lds_bytes_wr`),
   the vector instruction mix (`mix=`), the matrix work by type (`mops=`) and the kernel's name (`kernel=`). The mix and the matrix work were already counted
   and are now printed; the bytes are new. A reader that splits the line on `=` and converts every value to a number must skip the text fields

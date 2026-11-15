@@ -4939,3 +4939,169 @@ do not suit runs the plain loop after 64 runs or 256 turns. The variant of the s
 * Not run here: `bench_amd_counters_blocks` (hipcc 6.4.4 has no expected file), the e2e tests that need ROCm's full install, ASan and
   TSan, gfx1250 kernels. The knob stays off by default in this branch.
 * Cleanup: this round's directory on server3 (`/tmp/sp72-amd-tier`: ten trees and builds, the bench cache, logs) was removed by exact path; round sp70's inq directory was read and not changed.
+
+## Round sp75 (host-GPU: a block that outlasts the wait)
+
+Branch `sp75-turbo-first-launch`, on `sp69-hotspot-start` (6cf503d3, the head of PR #645). Tracking: pantheonsim #656 (a single long launch is
+not sent on its first run), #657 (HeCBench aidw: two of four launches kept, 365 s), and the diagnoses of #659 and #662. Design:
+[12-host-gpu-turbo.md](../12-host-gpu-turbo.md), section 12. Data and commands: [`data/sp75/`](../data/sp75/README.md). **No card: everything
+below is server3 with the stand-in driver, and the win itself is `data/sp75/card-run.sh`'s to show.**
+
+**The question.** The summary run of 2026-11-13 (one A10G) left eight programs whose launches the card never got: tf32TensorCoreGemm (208 s),
+bf16TensorCoreGemm (159 s), cudaTensorCoreGemm (16 s), each one launch; MC_SingleAsianOptionP, MC_EstimatePiInlineP, warpAggregatedAtomicsCG,
+Rodinia lavaMD (1.5 to 3.4 s); and HeCBench aidw, which sends two of its four launches and takes 365 s. Round sp66 had said of the tensor
+programs "one long launch each, now admitted, that no rule yet sends on its first launch"; what kept each launch had not been read, because
+the mode called every such launch "size rule".
+
+**Reading the reasons.** The mode now says why a launch stays (`VGPU_HOST_GPU_LOG=1`): the `host_gpu_kept:` reasons name the rule
+(`size rule: no estimate, not sampled: <why>`, `size rule: the sampled estimate does not repay the card path and the driver start`,
+`size rule: the estimate does not beat the card path`, `size rule: the estimate does not repay the driver start`, ...), a `host_gpu_nosample:`
+line gives the numbers of an unsampled launch (blocks, the static estimate against its floor, the process's age, whether a loop is followed),
+a sampled launch's decision is printed when it is made (so a long run can be cut there), and a `host_gpu_overhead:` line says what the mode's
+own work cost a program whose launches stay. `sample_refusal` (vgpu/host_gpu.hpp) is the sampling rule as a reason; `worth_sampling` is
+"no reason". The logged runs of the programs (`data/sp75/launches.md`; server3's simulator runs them 2.5 to 3 times as fast as the rig's):
+
+| what kept the launch | launches | simulator s here |
+|---|---|---:|
+| sampled, and the copy did not answer in 50 ms (a block takes 0.58 s) | aidw `AIDW_Kernel` and `AIDW_Kernel_Tiled`, first launch of each | 77.6 for the first |
+| no sample possible: under 256 blocks and no loop the sample inside the blocks follows | tf32 and bf16 (160 blocks), cudaTensorCoreGemm (80), lavaMD (216) | 83.3, 56.6, 5.3, 0.6 |
+| not sampled: static estimate under the floor, process too young | `initRNG` of the two Monte Carlo programs (9.5 ms counted, 5 ms into the process), two kernels of warpAggregatedAtomicsCG (0.3 s counted against a floor of 0.5 s for 270 MiB live) | 1.6, 1.6, 0.3, 0.4 |
+| sampled, and the estimate does not repay the driver start | `generatePaths`, `computeValue`, `filter_arr` | 0.15, 0.02, 0.22 (kept rightly) |
+
+So there is no single cause. The tensor programs would also have failed the floor had their grid been sampled (46 to 116 ms counted against
+0.36 to 1.45 s for 192 to 768 MiB live). Their kernels have one loop, of 3,592 to 9,088 straight-line instructions, that adds the grid's size
+to its counter and ends on a mask of it, which the sample inside the blocks (Round sp61) does not follow; lavaMD's and `initRNG`'s loops are
+left through a `CALL.REL.NOINC` to the kernel's `EXIT`, which the flow scan takes for a jump it cannot see.
+
+**The rule** (section 12 of the design; `VGPU_HOST_GPU_SAMPLE_BLOCK=0` is the rule before; both modes). A sampled block is bounded: the copy
+stops the first run of a block once it has lasted a limit, runs the block again from its start for as many rounds, times that run, and
+answers; a block that has not ended counts for the time it ran, which is under what it takes, and the estimate and the margin that decide are
+unchanged. On a grid of 256 blocks and up the limit is 15 ms, inside the 50 ms the process already waited. A grid of 2 to 255 blocks with no
+followed loop is sampled the same way, with the limit a block must reach for the launch to repay the card path (15 ms at least, 60 ms at
+most, with a slack of 1.4, else no block is run), when its static estimate reaches 30 ms (not the floor of the live memory) or the process
+has run long enough to afford two runs at the cap (6 s).
+
+* The engine (`src/sass/exec.cpp`, `bounded_part_block`) runs a bounded block by the launch's own rounds (`block_round`), in turns of 64
+  steps a warp so that the clock is read every few milliseconds: a round of 4,096 steps, `run_block`'s, lasted over 50 ms in aidw's blocks,
+  which is what the first form of this change found. A block that ends in its first run is then run and timed whole, as before. The change
+  is behind `LaunchPart`, which only a sample's copy has: the launch loop of the simulator is the code it was.
+* The limit is 15 ms and not the 25 ms the wait would allow: two runs leave 20 ms of the 50 ms for the fork, the copy's set-up and a busy
+  machine. A copy that does not answer is the rule before: the launch stays.
+* The slack of a small grid's limit was 1.25 at first. The timed second run of a stopped block came out at 0.88 to 0.96 of the first, which
+  left tf32's estimate 7 % over the bar (1.16 s against 1.09 s); with 1.4 the three GEMMs are 17 to 23 % over.
+
+**What it decides** (server3, the stand-in driver; the launch is "sent", refused by the stand-in and simulated):
+
+| program | launch | before | now | the sample |
+|---|---|---|---|---|
+| aidw | `AIDW_Kernel`, first | kept (78 s) | sent: 1.8 to 1.9 s at least, against 0.5 s needed | 30 to 34 ms (50 ms before, for no answer) |
+| aidw | `AIDW_Kernel_Tiled`, first | kept | kept: the driver is up, no sample | - |
+| tf32TensorCoreGemm | its one launch | kept (83 s) | sent: 1.37 s at least, against 1.14 s needed | about 80 ms |
+| bf16TensorCoreGemm | its one launch | kept (57 s) | sent: 1.42 s at least, against 1.15 s | about 80 ms |
+| cudaTensorCoreGemm | its one launch | kept (5.3 s) | sent: 0.95 s at least, against 0.81 s | 80 ms (the fork 3 ms; limit 40.2 ms, timed 35.7 ms) |
+| immaTensorCoreGemm (not in the summary run) | its one launch | kept (0.95 s) | sent: 0.77 s (its block ends in 29 ms, under the limit), against 0.755 s | 67 ms |
+| MC_SingleAsianOptionP, MC_EstimatePiInlineP, warpAggregatedAtomicsCG, lavaMD | all | kept | kept (the floor; lavaMD is now a candidate and counts 3.4 ms) | as before |
+
+With `VGPU_HOST_GPU_SAMPLE_BLOCK=0` each is as before (aidw's copy does not answer; the three GEMMs are not sampled).
+
+**What is not reached, and why it was left.**
+
+* *aidw's second kernel* (about 180 s of the 365 s on the rig): after the first launch the driver is up, a process that holds it is not
+  forked, and the static first-launch rule refuses a grid of 400 blocks. Expected on the card: 3 of 4 launches. A rule for a first launch
+  while the driver is up needs something to undo a trial with; the card's own copy of the memory can be that (push what the simulator holds,
+  let the simulator run the launch for a while, and if it is long give up the simulator's partial result and run the launch on the card
+  from its copy). That is a mechanism, not a rule change, and it cannot be tried without a card. It is also what the first launches after
+  the start need in the programs of #659.
+* *`initRNG` (two programs, 1.6 s of 1.8 s each here)*: 9.5 ms counted, 5 ms into the process. Lowering the floor to reach it samples
+  HeCBench silu's five kernels and s3d's (5 to 14 ms counted, launches of under 4 ms): 3 to 7 ms a sample in programs of 0.2 to 0.5 s.
+  Its loops have immediate bounds (32 x 5 turns); a static count that weighs a loop's body by its turns would put it at 1.5 s. Not built:
+  it needs the flow scan to see through the `CALL` to `EXIT`, and a corpus pass of its own for the kernels it would newly sample.
+* *warpAggregatedAtomicsCG's two kernels and lavaMD*: under their floors; the two kernels would be kept by their samples here (0.3 s
+  against 0.6 s needed).
+
+**The corpus** (`data/sp75/census.md`: every program once under the old build and the new, the stand-in driver). All 124 programs once under the old build
+(6cf503d3) and the new, 45 s a run (13 cut there; a cut run's decisions are the lines it logged); then the 31 programs that differed, were
+cut or hold a sampled launch, again under the new build with and without `VGPU_HOST_GPU_SAMPLE_BLOCK=0`, so that both sides log the same lines.
+
+* **The rule changes the decisions of six programs.** aidw's first launch, cudaTensorCoreGemm, tf32TensorCoreGemm, bf16TensorCoreGemm and
+  immaTensorCoreGemm are sent; radixSortThrust takes one sample more, which runs no block (a sort pass on 161 blocks that counts 83 ms; its
+  blocks take turns, which a copy does not run): 1.3 ms in a program of 14 s.
+* **Every other sampled launch answers as it did**: the launches sent on their samples before (SYRK, SYR2K, 2MM, COVAR, CORR, binomial,
+  black-scholes, shmembench) are sent, the ones kept are kept. No copy but aidw's failed to answer for a long block (srad_v2's launch throws
+  in the copy, with the switch on or off).
+* **Four programs differ between any two runs** in how many launches the size rule sends (asyncAllocation, LU, gaussian, lud: launches at
+  the edge of the card path, by their measured times), with the switch on or off; they take no sample.
+* **The small grids.** 90 kernels of the corpus are launched on 2 to 255 blocks with a loop and none followed. Five count 30 ms (the four
+  GEMMs and radixSortThrust's pass); the next counts 19 ms (HeCBench aop), the rest under 10 ms (s3d's fourteen, lavaMD, bilateral, ...), and
+  none of those is sampled. A first form of the rule let a process afford such a sample by the 3 ms a sample of short blocks is expected to
+  cost: HeCBench bilateral's third kernel (128 blocks, 6 ms counted, 0.2 s into the process) was sampled for 13 ms, 2.5 % of the program,
+  and kept. The two runs at the cap are now counted (`sample_expected_seconds`), so only a process 6 s old affords one by its age.
+* **Wall time** (`data/sp75/rerun.md`: 7 runs a form, interleaved, the new rule against the switch off and against the old build; the
+  machine was shared, and single runs of the first census differed by up to 2.5 times). Of the 33
+  programs with a sampled launch, a small grid or a time that stood out in the first pass (9 runs a form), 30 are between 0.947 and 1.021
+  of their time with the switch off (lavaMD +2.1 %, nn +2.0 %, gaussian +1.8 %, none of which takes a sample in either form; dct8x8's runs
+  spread from 1.4 to 3.6 s in both). The stand-in simulates a launch the rule sends, so the two GEMMs it can run to the end show the
+  sample alone: cudaTensorCoreGemm +1.3 % (74 ms of 5.65 s), immaTensorCoreGemm +5.2 % (67 ms of 1.29 s). That is what a sample costs a
+  launch of a small grid that stays, and no program of the corpus is in that case.
+* **immaTensorCoreGemm is at the bar here**: 0.77 s estimated against 0.755 s needed (the launch takes 0.95 s). It was sent in every run
+  made; a run in which its estimate falls short keeps the launch and has paid 67 ms for the sample, 5 % of the program. On the rig the
+  launch is about 2.5 times as long.
+
+**#659, the programs that send part of their launches** (`data/sp75/launches.md`): the kept launches are, by simulator time, launches whose
+estimate does not beat the card path (segmentationTreeThrust: 438 of 514, 2.2 s; on the stand-in every launch pushes its whole memory, so
+the card's own number is lower), the launches before the start was bought (radixsort2: 287 of 600; lud: 21), and each kernel's first one or
+two launches: under the floor in a young process (mergeSort 0.62 s, 3MM's first two kernels 0.32 s) or, once the driver is up, with no
+sample at all (segmentationTreeThrust 34 launches, histogram 4, mergeSort 2: 0.2 to 0.45 s each program). No ban fired in any of them.
+Nothing was changed for them: the first launches after the start are the case of aidw's second kernel.
+
+**#662, slower than the simulator.** Neither program starts the driver, takes a sample or sends a launch, so what they pay is the mode's
+own work.
+
+* **silu-cuda** (0.48 s to 0.55 s in turbo mode on the rig). The rig's record has 20 of its 50 launches on the card, so the driver was
+  started. Run here on one host thread, which gives the rig's launch times (0.49 s of launches), the log names it: `silu_forward_kernel
+  starts the driver: size rule (sim 14.7 ms, ..., 0.251 s of eligible launches simulated so far, 5 of this kernel)`, at the program's 31st
+  launch, and the 20 launches after it hold 0.20 s of simulator time, less than the start costs. The account bought a start (the program
+  had simulated as long as a start takes) that the rest of the program could not repay: the launch that bought it saves 14 ms, over the
+  5 ms share that stands for 50 launches like it, and 20 follow. It is the account's worst case, a program that ends just after the start;
+  exact mode does not show it because silu's kernels are not in the exact set. With 3 host threads the launches are shorter, the account
+  never fills and turbo is the simulator's time (0.250 s off, 0.256 s turbo, medians of 15). Not changed: the share was fitted between
+  dct8x8 and asyncAllocation (Round sp64-sp68), and silu's launch is on asyncAllocation's side of it.
+* **s3d-cuda** (0.33 s to 0.355 s in exact and turbo mode, 0.385 s with the idioms, on the rig). It sends nothing in any form; it launches
+  54 different kernels once each (216 to 4,864 instructions), so all the mode does is scan 54 kernels and decide 54 launches. Not
+  reproduced here: 0.2316 s off, 0.2336 s exact, 0.2343 s turbo (medians of 15 runs): 2 to 3 ms. With the log on `host_gpu_overhead` gives
+  `decide_s` 0.052 s (exact) and 0.070 s (turbo), all but 1 ms of it `scan_s`, but the log's own printing for each kernel is in that
+  number. The rig's 27 ms (and 30 ms more with the idioms, whose check is per kernel) is 0.5 ms a kernel; whether it is the scan is for
+  the card run's logged s3d run to say (`card-run.sh decisions` prints the line). Nothing changed.
+
+**Tests.** `test_host_gpu_logic`: 115 tests (6 new: the limit of a sampled grid and of a small one, the cap, a stopped block's estimate with
+aidw's numbers, the least time a sample sends found against `sampled_offload`, which small grids are sampled and by which floor, the
+reasons against the rule written out). `e2e_host_gpu_stub` steps 38 to 40 (`slow`, `slowfew`: one launch whose every block takes about 80 ms,
+the rounds set from a timed run): sent on a stopped block, the card given the memory as it was; with the switch off the copy does not answer;
+a grid of 96 blocks whose loop counts by a parameter is sampled by bounded blocks and not with the switch off. PASS on server3 (steps 1 to
+40, built with the dev machine's nvcc copied there), profiles `nvidia/a10g` and `nvidia/rtx3060`. Mutants (`data/sp75/mutants.txt`):
+42 of 42 mutants of the two headers are killed by the unit test (one, a floor in `sample_need_seconds`, survived the first pass and got a
+case), and 6 of 6 mutants of the engine's part loop, the copy's answer and the mode's plan and switch by the stand-in test, each in the
+steps it should fail. (The first two passes of the second set are not counted: the runner kept the object of the mutant before.) Both tests were already in CI (`test_host_gpu_logic` in every job, `e2e_host_gpu_stub` in the jobs with nvcc), and the harness
+self-test covers the new forms `exactb0` and `turbob0`.
+
+**Same bits.** `data/sp75/same-output.py` ran 18 programs (3MM, GEMM, SYRK, COVAR, lud, gaussian, hotspot, lavaMD, silu, s3d, radixsort2,
+mergeSort, histogram, the two Monte Carlo programs, warpAggregatedAtomicsCG, cudaTensorCoreGemm, segmentationTreeThrust) with the mode off,
+in exact mode and in turbo mode against the stand-in driver, under the old build and the new: every stdout, without the lines that carry
+timings, is byte for byte the same in both builds and the same as the mode-off output (`same-output.md`; against the stand-in every launch
+is simulated, the sampled ones after their sample, of which nothing shows). The engine's launch loop gains one branch,
+`if (part && part_block_limit_s_ > 0)`, and `part` is null in every launch that is not a sample's copy. The set of kernels exact mode
+admits is not touched (the unit test's frozen copy passes). The counters and digests of the plain simulator were not compared: the mode
+is off under them.
+
+**Not run.** A card (the whole of `card-run.sh`); the full ctest set (the round built the runtime and driver shims and the host-GPU tests;
+the engine's change is one branch taken only in a sample's copy); ASan and TSan; a host with more than 3 threads (the limit of a small grid
+grows with the launch's host threads: on the rig's 4, cudaTensorCoreGemm's is 53.5 ms of the 60 ms cap, and on 5 threads or more its grid
+is not sampled; tf32's and bf16's are 37 ms on 4 threads and stay under the cap up to 6).
+
+**Seen on the way.** hecbench/bh-cuda did not end within 30 s in 4 of 6 runs under the old build and in 1 of 6 under the new, with the
+switch on and with it off (turbo mode, the stand-in driver): it was there before the round and was not looked into. The first form of the
+script that runs the stand-in test against mutants kept the object of the mutant before; its first two passes are not counted.
+
+**Cleanup.** The round's directory on server3 (`/tmp/sp75-turbo`: three builds, the corpus, the copied compiler part of the toolkit, the
+mutant trees, logs; 2.0 GB) and one scratch directory a stopped run left (`/tmp/same-j22z2l1o`) were removed by exact path; the disk is back
+at 8.2 GB free. Round sp69's directory was read (how it built) and not changed.
