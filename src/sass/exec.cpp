@@ -816,6 +816,10 @@ class Runner {
   // Progress inside a block (exec::LaunchPart::probe, Round sp61): the block run until its warps stand in a followed loop, read there, and in the first
   // block (`measure`) one warp run alone to time a turn of its loop. The block is left where it stands: the run is a copy's, thrown away.
   void probe_block(Block& blk, exec::LaunchPart& part, bool measure);
+  // A block of a sample with bounded blocks (exec::LaunchPart::block_limit_s, Round sp75): true when the block was stopped at the limit (the
+  // sample ends there).
+  bool bounded_part_block(Block& blk, uint64_t unit, unsigned t, exec::LaunchPart& part, std::chrono::steady_clock::time_point part_t0);
+  double part_block_limit_s_ = 0;
   int probe_loop_at(const exec::BlockProbe& p, uint64_t pc) const;
   bool probe_value(const Warp& w, const exec::ProbeOperand& o, unsigned lane, uint32_t* v) const;
   // A warp's turn: up to `limit` calls of step_warp, ending early when it cannot run or yields. With the tier, a call may do the work
@@ -1590,6 +1594,10 @@ exec::LaunchStats Runner::run() {
           probe_block(blk, *part, part->next == 0);
           continue;
         }
+        if (part && part_block_limit_s_ > 0) {   // bounded blocks (exec::LaunchPart::block_limit_s, Round sp75): only in a sample's copy
+          if (bounded_part_block(blk, i, t, *part, part_t0)) return;
+          continue;
+        }
         init_block(blk, i);
         blk.worker = t;
         run_block(blk);
@@ -1652,6 +1660,9 @@ exec::LaunchStats Runner::run() {
   }
   if (part) {   // a part runs on the calling thread alone
     part->threads = threads;
+    part_block_limit_s_ = exec::part_block_limit(*part, units, threads);
+    part->block_limit_used_s = part_block_limit_s_;
+    if (part->block_limit_s > 0 && part->need_s > 0 && !(part_block_limit_s_ > 0)) part->limit = 0;   // (no stopped block could show the launch is long: none is run)
     threads = 1;
   }
   // Blocks that may wait on one another (vgpu/exec/lockstep.hpp): a kernel with a loop that polls
@@ -2438,6 +2449,45 @@ bool Runner::probe_value(const Warp& w, const exec::ProbeOperand& o, unsigned la
     default:
       return false;
   }
+}
+
+// A whole block as the part loop of run() runs it (twice, the second run timed), but its first run is stopped once it has lasted the limit.
+// The clock is read between rounds of short turns (kBoundedSlice steps a warp: a round of 4096, run_block's, can last longer than the limit
+// itself in a block of many warps). A block that ended in its first run is then run again whole and timed, exactly as an unbounded sample
+// times it. One that was stopped is run again from its start for as many rounds, and that run is the timed one: what the block did before it
+// was stopped, without what a launch pays once (decode, set-up, the copy's page faults), which is less than the block takes.
+bool Runner::bounded_part_block(Block& blk, uint64_t unit, unsigned t, exec::LaunchPart& part, std::chrono::steady_clock::time_point part_t0) {
+  constexpr int kBoundedSlice = 64;
+  const auto since = [](std::chrono::steady_clock::time_point a) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count(); };
+  init_block(blk, unit);
+  blk.worker = t;
+  uint64_t rounds = 0;
+  bool ended = true;
+  const auto first = std::chrono::steady_clock::now();
+  while (block_round(blk, kBoundedSlice)) {
+    ++rounds;
+    if (since(first) >= part_block_limit_s_) {
+      ended = false;
+      break;
+    }
+  }
+  stats_.add(blk.st);
+  const auto again = std::chrono::steady_clock::now();
+  if (part.first_block_s < 0) part.first_block_s = std::chrono::duration<double>(again - part_t0).count();
+  init_block(blk, unit);
+  blk.worker = t;
+  if (ended) {
+    run_block(blk);
+  } else {
+    for (uint64_t made = 0; made < rounds && block_round(blk, kBoundedSlice); ++made) {
+    }
+  }
+  const auto end = std::chrono::steady_clock::now();
+  part.timed_s += std::chrono::duration<double>(end - again).count();
+  part.run_s = std::chrono::duration<double>(end - part_t0).count();
+  ++part.next;
+  part.unfinished = !ended;
+  return !ended;
 }
 
 void Runner::probe_block(Block& blk, exec::LaunchPart& part, bool measure) {

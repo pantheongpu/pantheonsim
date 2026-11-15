@@ -74,6 +74,15 @@ struct LaunchPart {
   uint64_t limit = 0;               // how many blocks are run at most
   uint64_t stride = 1;              // the blocks run are 0, stride, 2 x stride, ...: spread over the grid, whose blocks need not be alike
   double budget_s = 0;              // above 0: no further block is taken once the timed runs have lasted this long, or the whole run five times it
+  // Bounded blocks (Round sp75; docs/perf-design/12-host-gpu-turbo.md section 12): above 0, a run of a block is stopped once it has lasted
+  // part_block_limit() seconds, and the sample ends there. A block stopped in its first run is run again from its start for as many rounds as
+  // the first run made, and that second run is the timed one, as for a whole block: `timed_s` then holds the time of a part of the block,
+  // which is less than the block takes, `next` counts the block, and `unfinished` is set. With `need_s` above 0 the limit is what one block
+  // must last for the whole launch to last need_s on the launch's host threads (and a little over), at least block_limit_s; when that is more
+  // than block_cap_s no stopped block could show it, and no block is run at all.
+  double block_limit_s = 0;
+  double block_cap_s = 0;
+  double need_s = 0;
   // Out, written by the run before it returns:
   uint64_t next = 0;                // how many blocks were run and timed, on the calling thread
   double timed_s = 0;               // the sum of their timed runs: each block is run twice and its second run is the timed one (the first pays
@@ -82,6 +91,8 @@ struct LaunchPart {
   unsigned threads = 0;             // the host threads the whole launch would run on
   double first_block_s = -1;        // when the first run of the first block ended, in seconds from the run's start
   double run_s = 0;                 // when the last block ended, on the same clock
+  bool unfinished = false;          // bounded blocks: the last block counted was stopped at the limit (its time is a lower bound of the block's)
+  double block_limit_used_s = 0;    // bounded blocks: the limit the run used (part_block_limit)
   // Progress inside a block (Round sp61; vgpu/exec/block_progress.hpp): not null, the blocks are not run whole. Each block taken is run until its
   // warps stand in one of the probe's loops (or have ended, or BlockProbe::enter_s has passed) and is read there; in the first, the warp with the most
   // turns left then runs alone for BlockProbe::measure_s. `next` counts the blocks read, `timed_s` the time they took (the budget applies to it), and
@@ -93,6 +104,19 @@ struct LaunchPart {
   uint64_t warps_followed = 0;        // warps read in a followed loop
   uint64_t warps_unfollowed = 0;      // warps read neither in one nor ended (they add no turns)
 };
+
+// The limit of a bounded block (LaunchPart::block_limit_s), for a grid of `units` blocks that the launch would run on `threads` host threads.
+// 0: bounded blocks are off, or no stopped block could show that the launch lasts need_s (the cap is under what a block must last).
+// kPartBlockSlack: a block stopped at the limit gives an estimate of limit x units / threads, which must be over need_s, not at it, and the
+// second (timed) run of the same rounds is a little shorter than the first (0.95 of it on the tensor-core GEMMs, Round sp75).
+inline constexpr double kPartBlockSlack = 1.25;
+inline double part_block_limit(const LaunchPart& p, uint64_t units, unsigned threads) {
+  if (!(p.block_limit_s > 0)) return 0;
+  if (!(p.need_s > 0)) return p.block_limit_s;
+  const double want = kPartBlockSlack * p.need_s * static_cast<double>(threads ? threads : 1) / static_cast<double>(units ? units : 1);
+  if (want > p.block_cap_s) return 0;
+  return want > p.block_limit_s ? want : p.block_limit_s;
+}
 
 struct LaunchConfig {
   std::array<uint32_t, 3> grid{1, 1, 1};

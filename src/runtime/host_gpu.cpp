@@ -143,6 +143,9 @@ struct SampleHint {
   double age_s = 0;
   bool affordable = true;    // whether the kernel's loop and the static floor or the process's age allow the sample (log and always sample without asking)
   bool inside = false;       // sampled inside its blocks (Round sp61): `probe` is what the copy follows
+  bool bounded = false;      // bounded blocks (Round sp75): a run of a block is stopped at a limit
+  bool small = false;        // ... of a grid under kSampleMinBlocks with no followed loop (sample_bounded_small)
+  double need_s = 0;         // ... for which a block must last long enough for the launch to last this (sample_need_seconds)
   double bound_turns = 1;    // SampleCandidate::bound_turns
   exec::BlockProbe probe;
 };
@@ -167,11 +170,11 @@ std::string inside_fields(const SampleHint& h, const exec::LaunchPart& p) {
     steps += p.readings[i].steps;
     turns += p.readings[i].turns;
   }
-  char b[480];
-  std::snprintf(b, sizeof b, " inside=%d bound_turns=%.0f followed=%llu unfollowed=%llu read_steps=%.0f read_turns=%.0f measure_steps=%llu measure_turns=%.0f measure_s=%.6f left=%d per_turn=%.1f step_ns=%.3f",
+  char b[560];
+  std::snprintf(b, sizeof b, " inside=%d bound_turns=%.0f followed=%llu unfollowed=%llu read_steps=%.0f read_turns=%.0f measure_steps=%llu measure_turns=%.0f measure_s=%.6f left=%d per_turn=%.1f step_ns=%.3f small=%d unfinished=%d block_limit_s=%.6f",
                 h.inside ? 1 : 0, h.inside ? h.bound_turns : 0.0, static_cast<unsigned long long>(h.inside ? p.warps_followed : 0), static_cast<unsigned long long>(h.inside ? p.warps_unfollowed : 0), steps, turns,
                 static_cast<unsigned long long>(h.inside ? p.measure.steps : 0), h.inside ? p.measure.turns : 0.0, h.inside ? p.measure.seconds : 0.0, h.inside && p.measure.left ? 1 : 0,
-                h.inside ? exec::steps_per_turn(p.measure) : 0.0, h.inside ? 1e9 * exec::seconds_per_step(p.measure) : 0.0);
+                h.inside ? exec::steps_per_turn(p.measure) : 0.0, h.inside ? 1e9 * exec::seconds_per_step(p.measure) : 0.0, h.small ? 1 : 0, p.unfinished ? 1 : 0, p.block_limit_used_s);
   return b;
 }
 const std::chrono::steady_clock::time_point g_loaded = std::chrono::steady_clock::now();   // (the library's load: the process's age is counted from it)
@@ -349,11 +352,18 @@ struct Runtime::Impl : CardGate {
   // `whole` samples by whole blocks only, never inside them (the rule of Round sp60b, for A/B runs of Round sp61).
   enum class SampleMode : uint8_t { On, Off, Log, Always, Whole } sample_mode = SampleMode::On;
   size_t copies_running_at_exit = 0;   // sampled copies that had answered and not yet ended when the process came to its end (they were waited for)
+  bool sample_block = true;       // bounded blocks (Round sp75); VGPU_HOST_GPU_SAMPLE_BLOCK=0: the copy runs whole blocks, however long (the rule before)
   double sample_spent_s = 0;      // what the samples of this process have cost
   double sample_dearest_s = 0;    // the dearest of them
   struct Decision;
   bool launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem, const double* forced_sim_s);
-  void consider_sample(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, const std::vector<std::vector<uint8_t>>& args, const Decision& dec, uint64_t blocks, MemoryManager& mem);
+  // (returns why the launch is not sampled, for the census; null when it is)
+  const char* consider_sample(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, const std::vector<std::vector<uint8_t>>& args, const Decision& dec, uint64_t blocks, MemoryManager& mem);
+  std::map<std::string, unsigned> nosample_said;   // VGPU_HOST_GPU_LOG: host_gpu_nosample lines printed per kernel (the first two launches of each)
+  // VGPU_HOST_GPU_LOG: what the mode itself costs a program whose launches stay in the simulator (the host_gpu_overhead line; pantheonsim #662):
+  // the seconds spent deciding the launches that stayed, of which in the scan of each kernel's code (kernel_eligible), and after them (note_simulated).
+  double log_decide_s = 0, log_scan_s = 0, log_note_s = 0;
+  uint64_t log_kept = 0;
 
   struct Pending {
     bool active = false, in_exact_set = false;
@@ -1089,6 +1099,9 @@ void print_summary(Runtime::Impl* im) {
                  ull(s.sample_sent), ull(s.sample_timeouts), s.sample_seconds, ull(s.sample_after_driver), im->copies_running_at_exit, sample_copies_reap(false));
     std::fprintf(stderr, "host_gpu_streak: sent=%llu card_only_mib=%.1f rule=%d\n", ull(s.streak_sent), s.streak_card_only_bytes / 1048576.0, im->streak_rule ? 1 : 0);
     if (logging())
+      std::fprintf(stderr, "host_gpu_overhead: kept_launches=%llu decide_s=%.6f scan_s=%.6f after_s=%.6f kernels=%zu\n", ull(im->log_kept), im->log_decide_s, im->log_scan_s, im->log_note_s,
+                   im->eligible.size());
+    if (logging())
       for (const auto& [kr, k] : im->kept)
         std::fprintf(stderr, "host_gpu_kept: kernel=%s launches=%llu sim_s=%.6f reason=%s\n", kr.first.c_str(), ull(k.launches), k.sim_s, kr.second.c_str());
     if (turbo && im->verify)
@@ -1168,6 +1181,7 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
     if (const char* v = std::getenv("VGPU_HOST_GPU_SAMPLE"); v && *v)   // 0: no launch is sampled (the rule before sp60b); log: see SampleMode
       r->impl_->sample_mode = std::string(v) == "0" ? Impl::SampleMode::Off : std::string(v) == "log" ? Impl::SampleMode::Log :
                               std::string(v) == "always" ? Impl::SampleMode::Always : std::string(v) == "whole" ? Impl::SampleMode::Whole : Impl::SampleMode::On;
+    if (const char* v = std::getenv("VGPU_HOST_GPU_SAMPLE_BLOCK"); v && std::string(v) == "0") r->impl_->sample_block = false;   // the copy runs whole blocks (the rule before Round sp75)
     if (const char* v = std::getenv("VGPU_HOST_GPU_STATIC"); v && *v && *v != '0') r->impl_->static_estimate = true;
     if (const char* v = std::getenv("VGPU_HOST_GPU_START_COST"); v && *v) {   // seconds; 0: do not charge the driver start (the rule before sp43)
       char* end = nullptr;
@@ -1226,6 +1240,12 @@ void Runtime::note_simulated(const ptx::EntryFn& fn, const exec::LaunchConfig& c
   impl_->stats.sim_seconds += sim_seconds;
   if (impl_->start_failed) return;   // the driver could not be used: nothing to learn for
   InternalScope internal;
+  struct NoteClock {   // (VGPU_HOST_GPU_LOG: the host_gpu_overhead line)
+    double& sum;
+    const bool on;
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~NoteClock() { if (on) sum += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
+  } note_clock{impl_->log_note_s, logging()};
   if (g_trace_file) {
     std::string bases;
     if (mem && args)
@@ -1318,7 +1338,12 @@ bool Runtime::try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, 
   t_last_sample = {};
   const bool was_dead = im.dead;
   const uint64_t failed_before = im.stats.failed;
+  const auto decide_t0 = std::chrono::steady_clock::now();
   const bool sent = im.launch(fn, cfg, args, mem, nullptr);
+  if (!sent && logging()) {
+    im.log_decide_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - decide_t0).count();
+    ++im.log_kept;
+  }
   if (!sent && logging() && im.last.kept.empty())   // (the census: refusals said their reason in launch(); what is left is the size rule's)
     im.last.kept = was_dead ? "mode off" : im.stats.failed != failed_before ? "failed on the card" : im.verify_card_ran ? "verify" : "size rule";
   return sent;
@@ -1353,7 +1378,9 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     }
     return false;
   }
+  const auto scan_t0 = std::chrono::steady_clock::now();
   const Impl::Decision dec = im.kernel_eligible(fn, cfg, args, mem);
+  if (logging()) im.log_scan_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - scan_t0).count();
   const char* const why = dec.why;
   const uint64_t static_instrs = dec.instrs;
   const bool runnable = dec.runnable, back_edge = dec.back_edge;
@@ -1395,7 +1422,8 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     }
   }
   if (!sim_s) {   // the first launches of a kernel are the simulator's: they teach the estimate (VGPU_HOST_GPU_STATIC=1 is the exception, and is not sound)
-    im.consider_sample(fn, cfg, args, dec, blocks, mem);   // ... unless the time of its first blocks sends this one to the card (sample_plan, sample_decide)
+    const char* const unsampled = im.consider_sample(fn, cfg, args, dec, blocks, mem);   // ... unless the time of its first blocks sends this one to the card (sample_plan, sample_decide)
+    if (logging()) im.last.kept = unsampled ? std::string("size rule: no estimate, not sampled: ") + unsampled : std::string("size rule: no estimate, the sample kept it");
     ++im.stats.simulated;
     return false;
   }
@@ -1422,6 +1450,7 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   if (!forced && !im.verify && im.banned.count(fn.name)) {
     ++im.stats.refused_size;
     ++im.stats.simulated;
+    if (logging()) im.last.kept = "size rule: the kernel is banned (a card launch of it did not pay)";
     return false;
   }
   const uint64_t kept_before = im.sim_times.samples(fn.name);   // this kernel's launches the simulator has run so far (start_share_launches, host_gpu.hpp)
@@ -1439,6 +1468,9 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   if (total > im.max_bytes || (!by_size && !streak)) {
     ++im.stats.refused_size;
     ++im.stats.simulated;
+    if (logging())
+      im.last.kept = total > im.max_bytes ? "size rule: live memory over VGPU_HOST_GPU_MAX_MIB"
+                     : !should_offload(e, im.costs) ? "size rule: the estimate does not beat the card path" : "size rule: the estimate does not repay the driver start";
     if (logging()) std::fprintf(stderr, "host_gpu: %s stays in the simulator (sim %.3f ms, card path %.3f ms%s, %.1f MiB, %.1f MiB only on the card)\n", fn.name.c_str(), e.sim_s * 1e3, card_path_seconds(e, im.costs) * 1e3, im.start_sh ? "" : " without the driver start", total / 1048576.0, card_only_bytes / 1048576.0);
     return false;
   }
@@ -1647,12 +1679,22 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
 // Called by launch() for a launch that goes to the simulator because nothing is known of its kernel (mu held): leaves a hint for sample_plan.
 // Not once the driver has been started: the process is forked for a sample, and a process that holds the real driver's context is not forked
 // (the first-launch and history rules, which then find the start paid, are what is left).
-void Runtime::Impl::consider_sample(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, const std::vector<std::vector<uint8_t>>& args, const Decision& dec,
-                                     uint64_t blocks, MemoryManager& mem) {
-  if (sample_mode == SampleMode::Off || verify || !dec.ok || start_sh || start_failed || banned.count(fn.name)) return;
+const char* Runtime::Impl::consider_sample(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, const std::vector<std::vector<uint8_t>>& args, const Decision& dec,
+                                            uint64_t blocks, MemoryManager& mem) {
+  // (what keeps a launch from being sampled before the rule is asked: said for the kernel's first two launches, as the rule's own refusals are)
+  const auto early = [&](const char* why) {
+    if (logging() && nosample_said[fn.name]++ < 2)
+      std::fprintf(stderr, "host_gpu_nosample: kernel=%s blocks=%llu threads_per_block=%u instrs=%llu loop=%d reason=%s\n", fn.name.c_str(), static_cast<unsigned long long>(blocks),
+                   cfg.block[0] * cfg.block[1] * cfg.block[2], static_cast<unsigned long long>(dec.instrs), dec.loop ? 1 : 0, why);
+    return why;
+  };
+  if (sample_mode == SampleMode::Off) return early("sampling is off");
+  if (verify || !dec.ok) return early("not a candidate");
+  if (start_sh || start_failed) return early("the driver has been started");
+  if (banned.count(fn.name)) return early("the kernel is banned");
   uint64_t live = 0;
   for (const auto& r : mem.live_ranges()) live += r.second;
-  if (live > max_bytes) return;
+  if (live > max_bytes) return early("live memory over VGPU_HOST_GPU_MAX_MIB");
   Estimate e;
   e.push_bytes = e.pull_bytes = live;
   e.start_s = std::max(costs.start_cost_s, 0.0);
@@ -1666,6 +1708,7 @@ void Runtime::Impl::consider_sample(const ptx::EntryFn& fn, const exec::LaunchCo
   c.expected_s = std::max(sample_dearest_s, kSampleCostGuessSeconds + kSampleSecondsPerLiveByte * static_cast<double>(live));
   c.static_s = static_sim_seconds(blocks, cfg.block[0] * cfg.block[1] * cfg.block[2], dec.instrs, costs);
   c.followed = dec.probe != nullptr && sample_mode != SampleMode::Whole;
+  c.bounded = sample_block && sample_mode != SampleMode::Whole;   // (`whole` is the rule of sp60b: no small grid is sampled)
   if (c.followed) {   // the turns of the followed loops as the launch's arguments bound them (an immediate bound, or a parameter's word)
     const sass::CubinKernel* k = nullptr;
     if (fn.sass)
@@ -1688,12 +1731,18 @@ void Runtime::Impl::consider_sample(const ptx::EntryFn& fn, const exec::LaunchCo
       if (b) c.bound_turns = std::max(c.bound_turns, bound_turns(*b, l.step));
     }
   }
-  const bool affordable = c.loop && (sample_static_estimate(c) >= sample_static_floor(live) || sample_affordable(c.age_s, c.spent_s, c.expected_s));
+  const bool affordable = c.loop && (sample_static_estimate(c) >= sample_floor(c) || sample_affordable(c.age_s, c.spent_s, c.expected_s));
   if (sample_mode != SampleMode::On && sample_mode != SampleMode::Whole) {   // (log, always: neither the loop, nor the floor, nor the process's age is asked)
     c.age_s = 1e18;
     c.loop = true;
   }
-  if (!worth_sampling(c, costs, card_path_seconds(e, costs))) return;
+  if (const NoSample why = sample_refusal(c, costs, card_path_seconds(e, costs)); why != NoSample::None) {
+    if (logging() && nosample_said[fn.name]++ < 2)
+      std::fprintf(stderr, "host_gpu_nosample: kernel=%s blocks=%llu threads_per_block=%u instrs=%llu loop=%d followed=%d bound_turns=%.0f live_bytes=%llu static_s=%.6f floor_s=%.6f whole_s=%.6f age_s=%.6f reason=%s\n",
+                   fn.name.c_str(), static_cast<unsigned long long>(blocks), cfg.block[0] * cfg.block[1] * cfg.block[2], static_cast<unsigned long long>(dec.instrs), dec.loop ? 1 : 0,
+                   c.followed ? 1 : 0, c.bound_turns, static_cast<unsigned long long>(live), sample_static_estimate(c), sample_floor(c), c.whole_s.value_or(-1), c.age_s, no_sample_text(why));
+    return no_sample_text(why);
+  }
   SampleHint h;
   h.affordable = affordable;
   h.set = true;
@@ -1707,9 +1756,13 @@ void Runtime::Impl::consider_sample(const ptx::EntryFn& fn, const exec::LaunchCo
   h.samples = sim_times.samples(fn.name);
   h.age_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_loaded).count();
   h.inside = sample_inside(c);
+  h.bounded = sample_block && !h.inside;
+  h.small = sample_bounded_small(c);
+  if (h.small) h.need_s = sample_need_seconds(live, live, costs, false);
   h.bound_turns = c.bound_turns;
   if (h.inside) h.probe = *dec.probe;
   t_sample_hint = h;
+  return nullptr;
 }
 
 bool Runtime::sample_plan(const ptx::EntryFn&, SamplePlan* plan) {
@@ -1723,10 +1776,16 @@ bool Runtime::sample_plan(const ptx::EntryFn&, SamplePlan* plan) {
     }
   }
   const bool inside = t_sample_hint.inside;
-  plan->limit = inside ? inblock_blocks(t_sample_hint.blocks) : sample_blocks(t_sample_hint.blocks);
-  plan->stride = inside ? inblock_stride(t_sample_hint.blocks) : sample_stride(t_sample_hint.blocks);
+  const bool small = t_sample_hint.small;   // bounded whole blocks of a small grid (Round sp75)
+  plan->limit = inside ? inblock_blocks(t_sample_hint.blocks) : small ? bounded_blocks(t_sample_hint.blocks) : sample_blocks(t_sample_hint.blocks);
+  plan->stride = inside ? inblock_stride(t_sample_hint.blocks) : small ? bounded_stride(t_sample_hint.blocks) : sample_stride(t_sample_hint.blocks);
   plan->budget_s = inside ? kInBlockBudgetSeconds : kSampleBudgetSeconds;
-  plan->timeout_s = sample_timeout_seconds(t_sample_hint.live);
+  plan->timeout_s = small ? bounded_timeout_seconds(t_sample_hint.live) : sample_timeout_seconds(t_sample_hint.live);
+  if (t_sample_hint.bounded) {
+    plan->block_limit_s = kSampleBlockSeconds;
+    plan->block_cap_s = small ? kSampleBlockCapSeconds : kSampleBlockSeconds;
+    plan->need_s = small ? t_sample_hint.need_s : 0;
+  }
   plan->probe = inside ? &t_sample_hint.probe : nullptr;
   return plan->limit != 0;
 }
@@ -1789,9 +1848,19 @@ bool Runtime::sample_decide(const ptx::EntryFn& fn, const exec::LaunchConfig& cf
   l.answered = run.answered;
   l.would_send = want;
   l.part = run.part;
+  if (logging())   // (said at the decision, before the launch runs: host_gpu_sample comes when the simulator has finished it)
+    std::fprintf(stderr, "host_gpu: %s sampled%s: answered=%d ran=%llu%s estimate %.3f ms against a card path of %.3f ms with the start: %s\n", fn.name.c_str(), hint.inside ? " inside its blocks" : "",
+                 run.answered ? 1 : 0, static_cast<unsigned long long>(run.part.next), run.part.unfinished ? " (the last block stopped at the limit: at least)" : "", whole.value_or(0) * 1e3,
+                 card_path_seconds(sampled_estimate(whole.value_or(0), push, live, im.costs, im.start_sh != nullptr, card_kernel), im.costs) * 1e3, want ? "sent" : "kept");
+  if (logging() && !want)
+    im.last.kept = !run.answered ? "size rule: no estimate, the sampling copy did not answer" : !whole ? "size rule: no estimate, the sample gave none"
+                                                                                               : "size rule: the sampled estimate does not repay the card path and the driver start";
   if (im.sample_mode == Impl::SampleMode::Log || !want || im.dead) return false;
   const double sim_s = *whole;
-  if (!im.launch(fn, cfg, args, mem, &sim_s)) return false;   // the card could not (said by launch()): the simulator runs the launch
+  if (!im.launch(fn, cfg, args, mem, &sim_s)) {   // the card could not (said by launch()): the simulator runs the launch
+    if (logging() && im.last.kept.empty()) im.last.kept = "failed on the card (sent by its sample)";
+    return false;
+  }
   ++im.stats.sample_sent;
   if (im.stats.simulated) --im.stats.simulated;   // (counted when the launch was first left to the simulator)
   im.sim_times.record_extrapolated(fn.name, hint.blocks, sim_s);

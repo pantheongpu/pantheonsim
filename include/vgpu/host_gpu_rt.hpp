@@ -64,6 +64,8 @@ class Runtime {
     uint64_t limit = 0, stride = 1;
     double budget_s = 0, timeout_s = 0;
     const exec::BlockProbe* probe = nullptr;   // not null: progress inside the blocks (Round sp61), good until sample_decide
+    // Bounded blocks (Round sp75; exec::LaunchPart::block_limit_s, block_cap_s, need_s): all 0 when the rule is off (VGPU_HOST_GPU_SAMPLE_BLOCK=0).
+    double block_limit_s = 0, block_cap_s = 0, need_s = 0;
   };
   bool sample_plan(const ptx::EntryFn& fn, SamplePlan* plan);
   bool driver_start_begun() const;

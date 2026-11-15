@@ -16,6 +16,7 @@
 #include <tuple>
 #include <vector>
 
+#include "vgpu/exec/launch.hpp"
 #include "vgpu/host_gpu.hpp"
 #include "vgpu/host_gpu_image.hpp"
 #include "vtest.hpp"
@@ -2460,6 +2461,203 @@ VTEST(code_relocations_write_the_bits_the_loader_writes) {
   VCHECK((lo() & 0xffff) == (lo0 & 0xffff) && ((lo() >> 24) & 0x3ff) == ((lo0 >> 24) & 0x3ff) && (hi() >> 17) == (hi0 >> 17));
   for (uint32_t t : {56u, 57u, 58u, 62u, 63u, 75u}) VCHECK(vgpu::sass::code_reloc_type(t));
   for (uint32_t t : {0u, 1u, 2u, 4u, 35u, 55u, 59u, 64u, 74u, 76u}) VCHECK(!vgpu::sass::code_reloc_type(t));
+}
+
+// ---- bounded blocks (Round sp75) ------------------------------------------------------------------------------------------------
+
+VTEST(a_bounded_block_of_a_sampled_grid_has_a_fixed_limit_that_fits_the_wait) {
+  vgpu::exec::LaunchPart p;
+  VCHECK(vgpu::exec::part_block_limit(p, 400, 3) == 0);          // off: whole blocks, as before the round
+  p.block_limit_s = kSampleBlockSeconds;
+  p.block_cap_s = kSampleBlockSeconds;
+  for (uint64_t units : {uint64_t{256}, uint64_t{400}, uint64_t{1} << 20})
+    for (unsigned threads : {1u, 3u, 4u, 64u}) VCHECK(vgpu::exec::part_block_limit(p, units, threads) == kSampleBlockSeconds);
+  // both runs of a block (the first, and the timed one) fit the wait the process already gave a copy
+  VCHECK(2 * kSampleBlockSeconds + 0.020 <= kSampleTimeoutSeconds);   // ... with 20 ms to spare
+  VCHECK(kSampleBlockSeconds > 5 * kSampleBudgetSeconds);        // ... and a block the budget would have let run whole still does
+}
+
+VTEST(a_block_stopped_at_the_limit_counts_for_the_time_it_ran) {
+  // HeCBench aidw on server3: 400 blocks of 0.58 s each, 3 host threads, 2.7 MiB live. The copy did not answer in 50 ms and the launch (78 s) stayed.
+  const Costs c;
+  const uint64_t live = 2867200;
+  Sample none;                                                    // the copy that did not answer: no block timed
+  none.total = 400;
+  none.threads = 3;
+  VCHECK(!sampled_launch_seconds(none).has_value());
+  VCHECK(!sample_offload(none, live, live, c, false));
+  Sample stopped;                                                 // the first block, stopped at the limit: its timed run of the same rounds
+  stopped.seconds = 0.0138;
+  stopped.timed = 1;
+  stopped.total = 400;
+  stopped.threads = 3;
+  const double est = *sampled_launch_seconds(stopped);
+  VCHECK(est > 1.83 && est < 1.85);                               // under the 78 s the launch took, and over what the card path needs
+  VCHECK(sample_offload(stopped, live, live, c, false));
+  // the same block on a host with 64 threads says 0.09 s: not enough, and the launch stays (a lost chance, not a loss)
+  stopped.threads = 64;
+  VCHECK(!sample_offload(stopped, live, live, c, false));
+  // a block that ran the limit of a grid of 256 blocks on 4 threads: 0.96 s, which repays the start; on 8 threads it does not
+  Sample least;
+  least.seconds = kSampleBlockSeconds;
+  least.timed = 1;
+  least.total = kSampleMinBlocks;
+  least.threads = 4;
+  VCHECK(sample_offload(least, 0, 0, c, false));
+  least.threads = 8;
+  VCHECK(!sample_offload(least, 0, 0, c, false));
+}
+
+VTEST(sample_need_is_the_least_time_the_sample_rule_sends) {
+  const Costs c;
+  for (bool started : {false, true})
+    for (uint64_t live : {uint64_t{0}, uint64_t{2867200}, uint64_t{201326592}, uint64_t{805306368}, uint64_t{4} << 30}) {
+      const double need = sample_need_seconds(live, live, c, started);
+      VCHECK(need > 0);
+      VCHECK(!sampled_offload(need * 0.999, live, live, c, started));
+      VCHECK(sampled_offload(need * 1.001, live, live, c, started));
+    }
+  // the CUDA Samples' tensor-core GEMMs: 192 MiB live asks 0.765 s of the launch, 768 MiB 1.06 s
+  const double tc = sample_need_seconds(201326592, 201326592, c, false), tf = sample_need_seconds(805306368, 805306368, c, false);
+  VCHECK(tc > 0.76 && tc < 0.77);
+  VCHECK(tf > 1.06 && tf < 1.07);
+  // with the driver up and nothing to move, the floor of the size rule
+  VCHECK(sample_need_seconds(0, 0, c, true) >= c.min_sim_s && sample_need_seconds(0, 0, c, true) < 0.001);
+  Costs floor = c;
+  floor.min_sim_s = 0.010;                                        // the size rule's floor is the least, whatever the card path
+  VCHECK(sample_need_seconds(0, 0, floor, true) == 0.010);
+  VCHECK(!sampled_offload(0.0099, 0, 0, floor, true) && sampled_offload(0.0101, 0, 0, floor, true));
+  Costs slow = c;
+  slow.margin = 8.0;                                              // a margin no card time of 1/8 passes
+  VCHECK(sample_need_seconds(1 << 20, 1 << 20, slow, false) > 1e20);
+}
+
+VTEST(a_small_grid_is_sampled_by_bounded_blocks_when_a_stopped_block_can_show_enough) {
+  const Costs c;
+  vgpu::exec::LaunchPart p;
+  p.block_limit_s = kSampleBlockSeconds;
+  p.block_cap_s = kSampleBlockCapSeconds;
+  // cudaTensorCoreGemm on the A10G rig: 80 blocks, 4 host threads, 192 MiB live: a block must last 47.8 ms
+  p.need_s = sample_need_seconds(201326592, 201326592, c, false);
+  const double tc = vgpu::exec::part_block_limit(p, 80, 4);
+  VCHECK(tc > 0.047 && tc < 0.049 && tc <= kSampleBlockCapSeconds);
+  // ... and a block stopped there, whose timed run was 0.95 of the limit, sends the launch
+  Sample s;
+  s.seconds = 0.95 * tc;
+  s.timed = 1;
+  s.total = 80;
+  s.threads = 4;
+  VCHECK(sample_offload(s, 201326592, 201326592, c, false));
+  s.seconds = 0.79 * tc;                                          // (the slack is 1.25: under 0.8 of the limit it would not)
+  VCHECK(!sample_offload(s, 201326592, 201326592, c, false));
+  // tf32TensorCoreGemm: 160 blocks, 768 MiB
+  p.need_s = sample_need_seconds(805306368, 805306368, c, false);
+  const double tf = vgpu::exec::part_block_limit(p, 160, 4);
+  VCHECK(tf > 0.033 && tf < 0.034);
+  // on 16 host threads a block of the 80 would have to be watched for 0.19 s: over the cap, so no block is run
+  p.need_s = sample_need_seconds(201326592, 201326592, c, false);
+  VCHECK(vgpu::exec::part_block_limit(p, 80, 16) == 0);
+  VCHECK(vgpu::exec::part_block_limit(p, 80, 5) > 0 && vgpu::exec::part_block_limit(p, 80, 6) == 0);
+  // a grid whose blocks need little: the limit is never under the one of a sampled grid
+  p.need_s = 0.5;
+  VCHECK(vgpu::exec::part_block_limit(p, 255, 1) == kSampleBlockSeconds);
+  // the blocks taken and the wait
+  VCHECK(bounded_blocks(1) == 0 && bounded_blocks(2) == 2 && bounded_blocks(80) == 32 && bounded_blocks(255) == 32 && bounded_blocks(256) == 0);
+  VCHECK(bounded_stride(80) == 2 && bounded_stride(160) == 5 && bounded_stride(2) == 1 && bounded_stride(256) == 1);
+  VCHECK(bounded_timeout_seconds(0) == kSampleTimeoutSeconds + 2 * kSampleBlockCapSeconds);
+  VCHECK(bounded_timeout_seconds(1ull << 30) == sample_timeout_seconds(1ull << 30) + 2 * kSampleBlockCapSeconds);
+}
+
+VTEST(a_small_grid_without_a_followed_loop_is_sampled_only_with_bounded_blocks_and_a_counted_30_ms) {
+  const Costs c;
+  // cudaTensorCoreGemm on server3: 80 blocks of 256 threads, 7,248 instructions (46 ms counted), 192 MiB live, the process 0.44 s old
+  SampleCandidate w;
+  w.blocks = 80;
+  w.loop = true;
+  w.live_bytes = 201326592;
+  w.static_s = 0.046387;
+  w.age_s = 0.444;
+  w.expected_s = kSampleCostGuessSeconds + kSampleSecondsPerLiveByte * 201326592.0;
+  VCHECK(!w.bounded);                                             // the rule before the round (VGPU_HOST_GPU_SAMPLE_BLOCK=0): not sampled
+  VCHECK(!worth_sampling(w, c, 0.29) && sample_refusal(w, c, 0.29) == NoSample::SmallGrid && !sample_bounded_small(w));
+  w.bounded = true;
+  VCHECK(sample_bounded_small(w) && !sample_inside(w));
+  VCHECK(worth_sampling(w, c, 0.29) && sample_refusal(w, c, 0.29) == NoSample::None);
+  VCHECK(sample_floor(w) == kSampleStaticFloorSeconds);          // not the 0.36 s the live memory asks of a sampled grid
+  VCHECK(sample_static_floor(w.live_bytes) > 0.36);
+  // tf32 (160 blocks, 9,088 instructions: 116 ms; 768 MiB) and bf16 (3,592: 46 ms)
+  w.blocks = 160;
+  w.live_bytes = 805306368;
+  w.static_s = 0.116326;
+  VCHECK(worth_sampling(w, c, 0.39));
+  w.static_s = 0.045978;
+  VCHECK(worth_sampling(w, c, 0.39));
+  // under 30 ms counted the grid is not sampled, in a young process: Rodinia lavaMD (216 blocks, 3.4 ms), HeCBench s3d (108 blocks, 1.4 to 9.7 ms)
+  w.blocks = 216;
+  w.live_bytes = 1696984;
+  w.static_s = 0.003387;
+  w.age_s = 0.004;
+  w.expected_s = kSampleCostGuessSeconds;
+  VCHECK(!worth_sampling(w, c, 0.26) && sample_refusal(w, c, 0.26) == NoSample::Floor);
+  w.static_s = kSampleStaticFloorSeconds * 0.999;
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.static_s = kSampleStaticFloorSeconds;
+  VCHECK(worth_sampling(w, c, 0.26));
+  // the other conditions stand: a loop, no short whole launch before, at least two blocks
+  w.loop = false;
+  VCHECK(sample_refusal(w, c, 0.26) == NoSample::NoLoop);
+  w.loop = true;
+  w.whole_s = 0.003;
+  VCHECK(sample_refusal(w, c, 0.26) == NoSample::ShortBefore);
+  w.whole_s.reset();
+  w.blocks = 1;
+  VCHECK(sample_refusal(w, c, 0.26) == NoSample::SmallGrid);
+  // a small grid with a followed loop is still sampled inside its blocks (Round sp61), by that rule's floor
+  w.blocks = 8;
+  w.followed = true;
+  VCHECK(sample_inside(w) && !sample_bounded_small(w));
+  w.live_bytes = 1ull << 30;
+  VCHECK(sample_floor(w) == sample_static_floor(1ull << 30));
+  // a grid the sample of whole blocks takes keeps its floor, bounded blocks or not (warpAggregatedAtomicsCG: 0.325 s counted, 280 MiB live)
+  SampleCandidate big;
+  big.blocks = 19531;
+  big.loop = true;
+  big.bounded = true;
+  big.live_bytes = 280000034;
+  big.static_s = 0.324996;
+  big.age_s = 0.34;
+  big.expected_s = kSampleCostGuessSeconds + kSampleSecondsPerLiveByte * 280000034.0;
+  VCHECK(!sample_bounded_small(big) && sample_floor(big) > 0.5 && sample_refusal(big, c, 0.3) == NoSample::Floor);
+}
+
+VTEST(the_reasons_a_launch_is_not_sampled_are_the_rule_itself) {
+  const Costs c;
+  std::set<std::string> texts;
+  for (NoSample r : {NoSample::None, NoSample::NoLoop, NoSample::SmallGrid, NoSample::ShortBefore, NoSample::Floor}) texts.insert(no_sample_text(r));
+  VCHECK(texts.size() == 5);
+  for (uint64_t blocks : {uint64_t{1}, uint64_t{8}, uint64_t{80}, uint64_t{255}, uint64_t{256}, uint64_t{4096}})
+    for (bool loop : {false, true})
+      for (bool followed : {false, true})
+        for (bool bounded : {false, true})
+          for (double static_s : {0.001, 0.03, 1.0})
+            for (double age : {0.004, 10.0})
+              for (int whole = 0; whole < 3; ++whole) {
+                SampleCandidate w;
+                w.blocks = blocks;
+                w.loop = loop;
+                w.followed = followed;
+                w.bounded = bounded;
+                w.static_s = static_s;
+                w.age_s = age;
+                if (whole) w.whole_s = whole == 1 ? 0.003 : 5.0;
+                VCHECK(worth_sampling(w, c, 0.26) == (sample_refusal(w, c, 0.26) == NoSample::None));
+                if (!bounded) {   // without bounded blocks: the rule of Round sp61, written out
+                  const bool takes = sample_blocks(blocks) != 0 || (followed && inblock_blocks(blocks) != 0);
+                  const bool was = loop && takes && !(w.whole_s && *w.whole_s <= c.margin * 0.26) &&
+                                   (sample_static_estimate(w) >= sample_static_floor(0) || sample_affordable(age, 0, w.expected_s));
+                  VCHECK(worth_sampling(w, c, 0.26) == was);
+                }
+              }
 }
 
 VTEST_MAIN
