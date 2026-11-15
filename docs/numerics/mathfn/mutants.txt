@@ -1,0 +1,33 @@
+# Mutants of the fixes of the math-function work (issue #664), run on the build machine 2026-11-15.
+# One build with every mutant switchable at run time (VGPU_MUT=<n>; the switch is not in the tree), so each line is the same binary
+# with one fix turned off. Tests: test_ptx_approx_forms and test_amd_hipcc_scratch_flat (unit), and
+# nvidia/tests/e2e/run_numerics_mathfn.sh (e2e_numerics_mathfn; nvcc 13.0.88 programs). "killed by" names the test cases that fail.
+
+mutant 0: no mutant (the control)
+    all three pass
+mutant 1: interpreter.cpp: sin.approx / cos.approx take the sine of the argument itself (no FMUL.RZ by 1/2pi)
+    killed by test_ptx_approx_forms (sin_and_cos_approx_take_the_scaled_argument); e2e_numerics_mathfn (PTX against SASS: rtx3060.86 mathfn_fast, t4.75 mathfn_fast)
+mutant 2: interpreter.cpp: ex2.approx.f32 without .ftz is 2^x rounded once (no squaring below -126)
+    killed by test_ptx_approx_forms (ex2_approx_f32_gives_subnormals_by_squaring); e2e_numerics_mathfn (PTX against SASS: rtx3060.86 mathfn, t4.75 mathfn)
+mutant 3: interpreter.cpp: lg2.approx.f32 without .ftz is the logarithm of the subnormal itself (no scaling by 2^24)
+    killed by test_ptx_approx_forms (lg2_approx_f32_scales_a_subnormal); e2e_numerics_mathfn (PTX against SASS: rtx3060.86 mathfn, t4.75 mathfn)
+mutant 4: interpreter.cpp: rcp.approx.ftz.f64 / rsqrt.approx.ftz.f64 are not the upper-word forms
+    killed by test_ptx_approx_forms (the_ftz_double_approximations_are_the_upper_word_only); e2e_numerics_mathfn (PTX against SASS: rtx3060.86 mathfn, rtx3060.86 mathfn_fast, t4.75 mathfn, t4.75 mathfn_fast)
+mutant 5: interpreter.cpp: rsqrt.approx.f64 is the correctly rounded value (no MUFU.RSQ64H and correction step)
+    killed by test_ptx_approx_forms (rsqrt_approx_f64_is_the_expansion_ptxas_makes); e2e_numerics_mathfn (PTX against SASS: rtx3060.86 mathfn, rtx3060.86 mathfn_fast, t4.75 mathfn, t4.75 mathfn_fast)
+mutant 6: parser.cpp: .ftz is dropped from a double form, as it was (the ftz forms then take the non-ftz path)
+    killed by test_ptx_approx_forms (the_ftz_double_approximations_are_the_upper_word_only); e2e_numerics_mathfn (PTX against SASS: rtx3060.86 mathfn, rtx3060.86 mathfn_fast, t4.75 mathfn, t4.75 mathfn_fast)
+mutant 8: interpreter.cpp: the 1/2pi product is rounded to nearest, not toward zero
+    killed by test_ptx_approx_forms (sin_and_cos_approx_take_the_scaled_argument); e2e_numerics_mathfn (PTX against SASS: rtx3060.86 mathfn_fast, t4.75 mathfn_fast)
+mutant 9: interpreter.cpp: rsqrt.approx.f64 of a subnormal is not scaled by 2^54 first
+    killed by test_ptx_approx_forms (rsqrt_approx_f64_is_the_expansion_ptxas_makes); e2e_numerics_mathfn (PTX against SASS: rtx3060.86 mathfn, rtx3060.86 mathfn_fast, t4.75 mathfn, t4.75 mathfn_fast)
+mutant 11: interpreter.cpp: lg2.approx.f32 subtracts 24 in double and rounds once (no second rounding)
+    killed by test_ptx_approx_forms (lg2_approx_f32_scales_a_subnormal); e2e_numerics_mathfn (PTX against SASS: rtx3060.86 mathfn, t4.75 mathfn)
+mutant 12: interpreter.cpp: the upper-word forms read all 64 bits of the operand
+    killed by test_ptx_approx_forms (the_ftz_double_approximations_are_the_upper_word_only); e2e_numerics_mathfn (PTX against SASS: rtx3060.86 mathfn, rtx3060.86 mathfn_fast, t4.75 mathfn, t4.75 mathfn_fast)
+mutant 7: gcn_exec.cpp: the private segment buffer's index stride is 64 lanes for a wave32 kernel, as it was
+    killed by test_amd_hipcc_scratch_flat (a_wave32_kernel_reads_its_stack_slots_through_a_flat_pointer: "a scratch access at
+    1113063424 is past the 384 bytes a work-item reserved ... flat_load_dword v2, v[2:3]": the reloaded pointer is another slot's value)
+    (A first form of the test kernel, whose address-taken locals were the kernel's own or were used before any call, passed under
+    this mutant: the two addresses agree at stack pointer 0, and a slot is only read wrongly once a spilled value is reloaded
+    after flat stores. The kernel was rewritten until the mutant failed it.)

@@ -11,6 +11,11 @@
 // (VGPU_MEM_SAME_BITS_UPDATE=<file> writes it: only ever from the commit before the change under test).
 // Re-recorded on purpose once (issue #579): the 13 scalar loads whose destination is VCC (s_load_dword vcc_lo, vcc_hi, vcc; s_load_b32/b64
 // likewise) used to write the loaded words to s0 and s1; they fill VCC now. Every other digest is as it was.
+// Re-recorded on purpose a second time (issue #664, tools/numerics): the four instructions that go through the private segment buffer
+// in a wave32 kernel (gfx1030's buffer_store_byte, buffer_store_dword and buffer_store_short off, s[0:3], s33, and gfx1250's
+// buffer_load_d16_hi_u8 off, s[0:3], s32). The buffer's index stride was 64 lanes for every kernel and is the wave's size now, so a
+// wave32 kernel's dword lands at the offset a flat pointer to the same stack slot names (test_hipcc_scratch_flat.cpp); the bytes
+// are the same bytes, at twice the offset in the lane's scratch. The other 16,064 digests are as they were.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>

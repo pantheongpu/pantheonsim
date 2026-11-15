@@ -243,6 +243,14 @@ class `measured` and the run as its evidence, and into the other profiles of its
 | V100 (sm_70) | block 4 and no extra bit are published; needs a CUDA 12 toolkit and a new profile |
 | MI250X, MI300X, MI100 | everything AMD |
 
+## The other place bits can differ: math functions
+
+The matrix instructions are not the only arithmetic a card does its own way. The math functions (`sinf`, `expf`, `powf`, ...)
+are library code over the `MUFU` instructions (NVIDIA) and `v_exp/v_log/v_sin/v_cos/v_rcp/v_rsq` (AMD), which the simulator
+computes at the host's precision and a card reads from tables. What was compared there, against which published results,
+what the simulator's own two engines disagreed on, and the card run that is prepared:
+[numerics/math-functions.md](numerics/math-functions.md).
+
 ## Sources
 
 - FTTN: arXiv 2403.00232, github.com/LLNL/FTTN (MIT).

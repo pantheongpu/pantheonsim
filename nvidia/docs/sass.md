@@ -254,6 +254,15 @@ more, `sin` of a tiny or huge argument is 0), and the simulator computes the cor
 subnormal, infinity, NaN, a negative root or logarithm) agree and are what the test hashes. Reproducing the card's tables needs a
 measurement of every mantissa (2^23 per function) and a compact form to keep them: not done.
 
+What that means for a program that calls a math function, against the published accuracy figures of the CUDA math library
+(17 of 30 single-precision functions return, at the library's published worst case, a neighbour of the result the published error
+implies; all 31 double-precision ones have the published error), the test set that compares a run with a card's line by line
+(`tools/numerics/`), and the card run it is prepared for: [docs/numerics/math-functions.md](../../docs/numerics/math-functions.md).
+The same test set holds the PTX interpreter to this executor: the interpreter forms `sin.approx` and `cos.approx` (the argument
+times 1/2pi, rounded toward zero, in turns), `ex2.approx` and `lg2.approx` without `.ftz`, `rcp.approx.ftz.f64` and
+`rsqrt.approx.ftz.f64` (`MUFU.RCP64H`, `MUFU.RSQ64H`: the upper word only) and `rsqrt.approx.f64` the way ptxas expands them, so
+a kernel's PTX gives the bits its SASS gives (`test_ptx_approx_forms`, `e2e_numerics_mathfn`); `MUFU` itself is as it was.
+
 ## Member masks of the `*.sync` warp instructions
 
 ptxas compiles `__ballot_sync`, `__shfl_sync`, `__match_any_sync`,

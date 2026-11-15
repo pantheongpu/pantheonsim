@@ -1,0 +1,70 @@
+# SASS executor against PTX interpreter, tools/numerics/mathfn, sm_86 build (nvcc 13.0.88), rtx3060 profile, 131072 results a random class.
+# compare.py <sass> <ptx> over mathfn --dump: every result counted. a / b in the examples: SASS / PTX.
+
+## Before (c5b0dadd): default build
+  exp2       f32 rand_bits 3 of 131072 differ: 1 ulp 3, 2 ulp 0, more 0 (max 1 ulp); e.g. x=c2fe686e: 00378ff7 / 00378ff6 [every result]
+  exp2       f32 rand_mid  18 of 131072 differ: 1 ulp 18, 2 ulp 0, more 0 (max 1 ulp); e.g. x=c2ff2f30: 002a744a / 002a7449 [every result]
+  cbrt       f32 edges     2 of 284 differ: 1 ulp 2, 2 ulp 0, more 0 (max 1 ulp); e.g. x=000ae398: 29e12e15 / 29e12e14 [every result]
+  cbrt       f32 rand_bits 5 of 131072 differ: 1 ulp 5, 2 ulp 0, more 0 (max 1 ulp); e.g. x=801b9eda: aa198c90 / aa198c91 [every result]
+  atan       f64 rand_mid  1 of 131072 differ: 1 ulp 1, 2 ulp 0, more 0 (max 1 ulp); e.g. x=400feba1bc9ec8a1: 3ff53425b371d642 / 3ff53425b371d643 [every result]
+  cosh       f64 rand_mid  13 of 131072 differ: 1 ulp 13, 2 ulp 0, more 0 (max 1 ulp); e.g. x=3f487892b0a2464e: 3ff000004ada899a / 3ff000004ada8999 [every result]
+  tanh       f64 rand_mid  1 of 131072 differ: 1 ulp 1, 2 ulp 0, more 0 (max 1 ulp); e.g. x=3ffa8db99c5c0222: 3fedc3e607aab504 / 3fedc3e607aab503 [every result]
+  asinh      f64 worst     1 of 4 differ: 1 ulp 0, 2 ulp 1, more 0 (max 2 ulp); e.g. x=bfe8190e51c77d16: bfe6424aaf68243f / bfe6424aaf682441 [every result]
+  asinh      f64 rand_bits 17 of 131072 differ: 1 ulp 17, 2 ulp 0, more 0 (max 1 ulp); e.g. x=c1eb9bcee507f03e: c036b9eb79774bdc / c036b9eb79774bdd [every result]
+  asinh      f64 rand_mid  959 of 131072 differ: 1 ulp 910, 2 ulp 49, more 0 (max 2 ulp); e.g. x=3fed3ab7b23448c4: 3fea33aabcaf0a83 / 3fea33aabcaf0a85 [every result]
+  rsqrt      f64 edges     46 of 284 differ: 1 ulp 46, 2 ulp 0, more 0 (max 1 ulp); e.g. x=3fe0000000000000: 3ff6a09e667f3bcd / 3ff6a09e667f3bcc [every result]
+  rsqrt      f64 rand_bits 17171 of 131072 differ: 1 ulp 17171, 2 ulp 0, more 0 (max 1 ulp); e.g. x=6e73e372e2338aca: 28acb3a9b9d8209f / 28acb3a9b9d8209e [every result]
+  rsqrt      f64 rand_mid  17164 of 131072 differ: 1 ulp 17164, 2 ulp 0, more 0 (max 1 ulp); e.g. x=40416e2c8b133996: 3fc5addafcabddb4 / 3fc5addafcabddb3 [every result]
+  erf        f64 edges     8 of 284 differ; NaN payload 8; e.g. x=7ff8000000000000: 7fffffffe0000000 / 7ff8000000000000 [every result]
+  erf        f64 rand_bits 72 of 131072 differ; NaN payload 72; e.g. x=7ff4d6e9a1e3af72: 7fffffffe0000000 / 7ffcd6e9a1e3af72 [every result]
+  erfc       f64 rand_mid  1 of 131072 differ: 1 ulp 1, 2 ulp 0, more 0 (max 1 ulp); e.g. x=bfa349df0f1157c6: 3ff0ae0940286b48 / 3ff0ae0940286b47 [every result]
+  hypot      f64 edges     125 of 3844 differ: 1 ulp 92, 2 ulp 24, more 0 (max 2 ulp); NaN payload 9; e.g. x=4008000000000000,401c000000000000: 401e768d399dc46f / 401e768d399dc471 [every result]
+  hypot      f64 rand_bits 12131 of 131072 differ: 1 ulp 7022, 2 ulp 5109, more 0 (max 2 ulp); e.g. x=b24ce50ea345fe83,03ef5b87efea98e8: 324ce50ea345fe84 / 324ce50ea345fe82 [every result]
+  hypot      f64 rand_mid  14387 of 131072 differ: 1 ulp 10341, 2 ulp 4046, more 0 (max 2 ulp); e.g. x=3fb4471d34120f76,405e237372af2ee4: 405e2373dfd4afc4 / 405e2373dfd4afc2 [every result]
+  310 lines agree, 19 differ
+
+## Before: -use_fast_math build
+  sin        f32 worst     2 of 2 differ: 1 ulp 0, 2 ulp 0, more 2 (max 2085054238 ulp); e.g. x=4a47ae3b: be47c5c2 / 3dffa15c [every result]
+  sin        f32 edges     211 of 284 differ: 1 ulp 40, 2 ulp 6, more 165 (max 2124745774 ulp); e.g. x=5f000000: bf2510be / 3f7ffb70 [every result]
+  sin        f32 rand_bits 126065 of 131072 differ: 1 ulp 47885, 2 ulp 11882, more 66298 (max 2130705866 ulp); e.g. x=7103fd1d: 3f7fffaf / bf7ffe1b [every result]
+  sin        f32 rand_mid  115645 of 131072 differ: 1 ulp 57571, 2 ulp 16765, more 41309 (max 1498802 ulp); e.g. x=c37e7804: b96231d6 / b94b5324 [every result]
+  cos        f32 worst     2 of 2 differ: 1 ulp 0, 2 ulp 0, more 2 (max 6940722 ulp); e.g. x=5e29e84e: bee8bec3 / be7ed691 [every result]
+  cos        f32 edges     200 of 284 differ: 1 ulp 28, 2 ulp 10, more 162 (max 2128808709 ulp); e.g. x=4f800000: 3f800000 / bf630b05 [every result]
+  cos        f32 rand_bits 66211 of 131072 differ: 1 ulp 648, 2 ulp 304, more 65259 (max 2130706432 ulp); e.g. x=d4671828: 3f800000 / bf800000 [every result]
+  cos        f32 rand_mid  57104 of 131072 differ: 1 ulp 8780, 2 ulp 4013, more 44311 (max 267272 ulp); e.g. x=c34aa185: 3aeec2cb / 3aeaaec3 [every result]
+  tan        f32 worst     2 of 2 differ: 1 ulp 0, 2 ulp 0, more 2 (max 2149885214 ulp); e.g. x=7dfc9d63: 3fac6a93 / c0783a8b [every result]
+  tan        f32 edges     229 of 284 differ: 1 ulp 30, 2 ulp 10, more 189 (max 2530313166 ulp); e.g. x=3fc90fdb: 4b22f983 / cbae8a4b [every result]
+  tan        f32 rand_bits 126445 of 131072 differ: 1 ulp 47282, 2 ulp 11888, more 67275 (max 2519543199 ulp); e.g. x=c8a4770a: d418bed2 / 42146ecd [every result]
+  tan        f32 rand_mid  120064 of 131072 differ: 1 ulp 49968, 2 ulp 16509, more 53587 (max 1498802 ulp); e.g. x=c37e7804: 396231d6 / 394b5324 [every result]
+  atan       f64 rand_mid  1 of 131072 differ: 1 ulp 1, 2 ulp 0, more 0 (max 1 ulp); e.g. x=400feba1bc9ec8a1: 3ff53425b371d642 / 3ff53425b371d643 [every result]
+  cosh       f64 rand_mid  13 of 131072 differ: 1 ulp 13, 2 ulp 0, more 0 (max 1 ulp); e.g. x=3f487892b0a2464e: 3ff000004ada899a / 3ff000004ada8999 [every result]
+  tanh       f64 rand_mid  1 of 131072 differ: 1 ulp 1, 2 ulp 0, more 0 (max 1 ulp); e.g. x=3ffa8db99c5c0222: 3fedc3e607aab504 / 3fedc3e607aab503 [every result]
+  asinh      f64 worst     1 of 4 differ: 1 ulp 0, 2 ulp 1, more 0 (max 2 ulp); e.g. x=bfe8190e51c77d16: bfe6424aaf68243f / bfe6424aaf682441 [every result]
+  asinh      f64 rand_bits 17 of 131072 differ: 1 ulp 17, 2 ulp 0, more 0 (max 1 ulp); e.g. x=c1eb9bcee507f03e: c036b9eb79774bdc / c036b9eb79774bdd [every result]
+  asinh      f64 rand_mid  959 of 131072 differ: 1 ulp 910, 2 ulp 49, more 0 (max 2 ulp); e.g. x=3fed3ab7b23448c4: 3fea33aabcaf0a83 / 3fea33aabcaf0a85 [every result]
+  rsqrt      f64 edges     46 of 284 differ: 1 ulp 46, 2 ulp 0, more 0 (max 1 ulp); e.g. x=3fe0000000000000: 3ff6a09e667f3bcd / 3ff6a09e667f3bcc [every result]
+  rsqrt      f64 rand_bits 17171 of 131072 differ: 1 ulp 17171, 2 ulp 0, more 0 (max 1 ulp); e.g. x=6e73e372e2338aca: 28acb3a9b9d8209f / 28acb3a9b9d8209e [every result]
+  rsqrt      f64 rand_mid  17164 of 131072 differ: 1 ulp 17164, 2 ulp 0, more 0 (max 1 ulp); e.g. x=40416e2c8b133996: 3fc5addafcabddb4 / 3fc5addafcabddb3 [every result]
+  erf        f64 edges     8 of 284 differ; NaN payload 8; e.g. x=7ff8000000000000: 7fffffffe0000000 / 7ff8000000000000 [every result]
+  erf        f64 rand_bits 72 of 131072 differ; NaN payload 72; e.g. x=7ff4d6e9a1e3af72: 7fffffffe0000000 / 7ffcd6e9a1e3af72 [every result]
+  erfc       f64 rand_mid  1 of 131072 differ: 1 ulp 1, 2 ulp 0, more 0 (max 1 ulp); e.g. x=bfa349df0f1157c6: 3ff0ae0940286b48 / 3ff0ae0940286b47 [every result]
+  hypot      f64 edges     125 of 3844 differ: 1 ulp 92, 2 ulp 24, more 0 (max 2 ulp); NaN payload 9; e.g. x=4008000000000000,401c000000000000: 401e768d399dc46f / 401e768d399dc471 [every result]
+  hypot      f64 rand_bits 12131 of 131072 differ: 1 ulp 7022, 2 ulp 5109, more 0 (max 2 ulp); e.g. x=b24ce50ea345fe83,03ef5b87efea98e8: 324ce50ea345fe84 / 324ce50ea345fe82 [every result]
+  hypot      f64 rand_mid  14387 of 131072 differ: 1 ulp 10341, 2 ulp 4046, more 0 (max 2 ulp); e.g. x=3fb4471d34120f76,405e237372af2ee4: 405e2373dfd4afc4 / 405e2373dfd4afc2 [every result]
+  302 lines agree, 27 differ
+
+## After: default build
+  erf        f64 edges     8 of 284 differ; NaN payload 8; e.g. x=7ff8000000000000: 7fffffffe0000000 / 7ff8000000000000 [every result]
+  erf        f64 rand_bits 72 of 131072 differ; NaN payload 72; e.g. x=7ff4d6e9a1e3af72: 7fffffffe0000000 / 7ffcd6e9a1e3af72 [every result]
+  hypot      f64 edges     9 of 3844 differ; NaN payload 9; e.g. x=0000000000000000,7ff0000000000001: 7ff8000000000001 / 7ff0000000000001 [every result]
+  326 lines agree, 3 differ
+
+## After: -use_fast_math build
+  erf        f64 edges     8 of 284 differ; NaN payload 8; e.g. x=7ff8000000000000: 7fffffffe0000000 / 7ff8000000000000 [every result]
+  erf        f64 rand_bits 72 of 131072 differ; NaN payload 72; e.g. x=7ff4d6e9a1e3af72: 7fffffffe0000000 / 7ffcd6e9a1e3af72 [every result]
+  hypot      f64 edges     9 of 3844 differ; NaN payload 9; e.g. x=0000000000000000,7ff0000000000001: 7ff8000000000001 / 7ff0000000000001 [every result]
+  326 lines agree, 3 differ
+
+## The SASS executor before against after (its results are unchanged)
+  329 lines agree, 0 differ
+  329 lines agree, 0 differ

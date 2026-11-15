@@ -8721,12 +8721,44 @@ class Interpreter {
             // reciprocal or ex2 too small to be normal is 0 (an RTX 3060's).
             float x = f32(v[lane]);
             if (op->ftz && std::fpclassify(x) == FP_SUBNORMAL) x = std::copysign(0.0f, x);
-            float y = static_cast<float>(apply(static_cast<double>(x)));
+            float y;
+            if (op->op == MathOp::Sin || op->op == MathOp::Cos) {
+              // sin.approx and cos.approx take radians; the instruction ptxas makes of them (MUFU.SIN, MUFU.COS) takes turns, and
+              // ptxas puts `FMUL.RZ x, 0.15915494` (1 / 2pi as a float, rounded toward zero) in front of it. That product is what
+              // the SASS executor's MUFU sees, so it is formed here too: for an argument of many turns the rounding of the
+              // product decides the answer, and computing sin(x) itself gave another one than the same kernel's SASS.
+              float turns = mul_rz32(x, 0x1.45f306p-3f);
+              if (std::fpclassify(turns) == FP_SUBNORMAL) turns = std::copysign(0.0f, turns);   // (MUFU flushes its input)
+              const double angle = static_cast<double>(turns) * 6.28318530717958647692;
+              y = static_cast<float>(op->op == MathOp::Sin ? std::sin(angle) : std::cos(angle));
+            } else if (op->op == MathOp::Ex2 && !op->ftz && x < -126.0f) {
+              // ex2.approx.f32 without .ftz may give a subnormal, which MUFU.EX2 cannot (it flushes): ptxas makes it
+              // `MUFU.EX2(x * 0.5)` squared for x below -126, so the subnormal is the rounding of a product of two rounded
+              // halves and not the rounding of 2^x.
+              float half = static_cast<float>(std::exp2(static_cast<double>(x * 0.5f)));
+              if (std::fpclassify(half) == FP_SUBNORMAL) half = 0.0f;
+              y = half * half;
+            } else if (op->op == MathOp::Lg2 && !op->ftz && !(x >= std::numeric_limits<float>::min())) {
+              // lg2.approx.f32 without .ftz takes a subnormal, which MUFU.LG2 flushes to zero: ptxas makes it
+              // `MUFU.LG2(x * 2^24) + -24` for an x that is not at least the smallest normal number (a zero and a negative
+              // number go the same way and come out as they would have).
+              float scaled = x * 16777216.0f;
+              if (std::fpclassify(scaled) == FP_SUBNORMAL) scaled = std::copysign(0.0f, scaled);
+              y = static_cast<float>(std::log2(static_cast<double>(scaled))) + -24.0f;
+            } else {
+              y = static_cast<float>(apply(static_cast<double>(x)));
+            }
             if (op->ftz && std::fpclassify(y) == FP_SUBNORMAL) y = std::copysign(0.0f, y);
             r[lane] = canon32(y);
             continue;
           }
-          r[lane] = f64bits(apply(f64(v[lane])));
+          // The double-precision approximations are not the function at double precision. rcp.approx.ftz.f64 and
+          // rsqrt.approx.ftz.f64 are, as the PTX ISA documents them, a function of the upper 32 bits of the operand that leaves
+          // the lower 32 bits of the result zero (SASS: MUFU.RCP64H, MUFU.RSQ64H); the CUDA math library divides and takes roots
+          // by refining that value, and its last bits depend on it. rsqrt.approx.f64 is what ptxas expands it to.
+          if ((op->op == MathOp::Rcp || op->op == MathOp::Rsqrt) && op->ftz) r[lane] = approx64h(op->op == MathOp::Rsqrt, v[lane]);
+          else if (op->op == MathOp::Rsqrt) r[lane] = rsqrt_approx64(v[lane]);
+          else r[lane] = f64bits(apply(f64(v[lane])));
         }
       // A half result still occupies a 32-bit register, packed or not.
       alu_fault(r, m, op->ty.bits == 16 ? 16u : op->ty.bits);
@@ -12444,6 +12476,41 @@ class Interpreter {
   }
   // rcp.approx.f32 at host precision: the correctly rounded reciprocal.
   static float rcp_approx32(float x) { return static_cast<float>(1.0 / static_cast<double>(x)); }
+  // a * b rounded toward zero (FMUL.RZ): the product of two floats is exact in a double.
+  static float mul_rz32(float a, float b) {
+    const double p = static_cast<double>(a) * static_cast<double>(b);
+    float f = static_cast<float>(p);
+    if (std::isinf(f) && std::isfinite(p)) return std::copysign(std::numeric_limits<float>::max(), f);
+    if (std::isfinite(f) && std::fabs(static_cast<double>(f)) > std::fabs(p)) f = std::nextafterf(f, 0.0f);
+    return f;
+  }
+  // rcp.approx.ftz.f64 and rsqrt.approx.ftz.f64 (MUFU.RCP64H, MUFU.RSQ64H): the upper word of the reciprocal (root) of the
+  // double whose upper word is the operand's and whose lower word is zero; the result's lower word is zero. Computed as the
+  // SASS executor computes it (exec_ops.inc, Op::MUFU, forms 6 and 7), so a kernel's two forms agree to the bit.
+  static uint64_t approx64h(bool rsqrt, uint64_t bits) {
+    const double d = f64(bits & 0xFFFFFFFF00000000ull);
+    return f64bits(rsqrt ? 1.0 / std::sqrt(d) : 1.0 / d) & 0xFFFFFFFF00000000ull;
+  }
+  // rsqrt.approx.f64, as ptxas (CUDA 13.0, sm_75 to sm_120) expands it: MUFU.RSQ64H and one correction step,
+  //   y0 = rsqrt64h(x);  e = fma(x, -(y0 * y0), 1);  y = fma(fma(e, 0.375, 0.5), y0 * e, y0)
+  // for a positive normal x; a subnormal is scaled by 2^54 first and the result by 2^27; a zero gives the infinity of its
+  // sign, a NaN x + x, a negative number the NaN 0xFFF8000000000000 and +infinity 0. The result is within an ulp of the
+  // root's reciprocal and not always the nearest double (which is what this used to return): it is what the SASS executor
+  // gives for the same instruction, MUFU.RSQ64H being computed as above in both. No card was asked.
+  static uint64_t rsqrt_approx64(uint64_t bits) {
+    const auto refine = [](double x) {
+      const double y0 = f64(approx64h(true, f64bits(x)));
+      const double e = std::fma(x, -(y0 * y0), 1.0);
+      return std::fma(std::fma(e, 0.375, 0.5), y0 * e, y0);
+    };
+    const double x = f64(bits);
+    if (static_cast<uint32_t>(bits >> 32) - 0x100000u < 0x7FE00000u) return f64bits(refine(x));
+    if (x == 0.0) return (bits & 0x8000000000000000ull) | 0x7FF0000000000000ull;
+    if (std::isnan(x)) return f64bits(x + x);
+    if (bits >> 63) return 0xFFF8000000000000ull;
+    if (std::isinf(x)) return 0;
+    return f64bits(refine(x * 0x1p54) * 0x1p27);
+  }
 
   uint64_t float_bin(FloatBinOp op, Type ty, uint64_t a, uint64_t b,
                      bool nan_propagate = false, bool a_first = false) {
