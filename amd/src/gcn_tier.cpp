@@ -834,16 +834,24 @@ template <bool Avx2>
       u[k] ^= s.kind == kConst || s.kind == kSgpr ? flip : 0;   // (anything else reads as zero, whatever the modifiers: load64's)
     }
   }
-  const uint64_t nan = reinterpret_cast<F64RowsFn>(o.kern)(rl, rh, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], u, n);
-  if (nan & ex) return f64_general(o, R, Avx2);
   uint32_t* dlo = R.vgpr[o.dst.index];
   uint32_t* dhi = R.vgpr[o.dst.index + 1];
   if (full(ex, n)) {
+    const uint64_t nan = reinterpret_cast<F64RowsFn>(o.kern)(rl, rh, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], u, n);
+    if (nan & ex) return f64_general(o, R, Avx2);
     copy_row(dlo, rl, n);
     copy_row(dhi, rh, n);
-  } else if (__builtin_popcountll(ex) > 8) {
-    merge(dlo, rl, ex, n);
-    merge(dhi, rh, ex, n);
+    return true;
+  }
+  // (Some lanes off: only the groups of eight lanes from the first to the last that hold a lane of EXEC -- a kernel's work is by the
+  // group, and in inq's kernels a wave has 12 to 38 lanes on in these instructions. The rest of rl and rh holds nothing. Round sp74.)
+  const unsigned first = static_cast<unsigned>(__builtin_ctzll(ex)) & ~7u, span = ((71u - static_cast<unsigned>(__builtin_clzll(ex))) & ~7u) - first;
+  const uint64_t nan = reinterpret_cast<F64RowsFn>(o.kern)(rl + first, rh + first, lo[0] + first, hi[0] + first, lo[1] + first, hi[1] + first,
+                                                           lo[2] + first, hi[2] + first, u, span) << first;
+  if (nan & ex) return f64_general(o, R, Avx2);
+  if (__builtin_popcountll(ex) > 8) {
+    merge(dlo + first, rl + first, ex >> first, span);
+    merge(dhi + first, rh + first, ex >> first, span);
   } else {
     for (uint64_t m = ex; m; m &= m - 1) {
       const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
@@ -3682,7 +3690,9 @@ int h_d1_rows(const Op& o, Regs& R) {
 }
 
 // The 64-bit comparisons. Op::off0: the test (bits 0-3, the ISA's order) and what is compared (bits 4-5: 0 doubles, 1 signed, 2 unsigned).
-// Every lane is done here: a comparison with a NaN is the host's, as the lane kernel's is.
+// Every lane is done here: a comparison with a NaN is the host's, as the lane kernel's is. Doubles: the host's one comparison for the test,
+// four lanes at a time. Integers: on the two rows of words, eight lanes at a time -- the high words decide, and the low words (unsigned)
+// where they are equal; a test is less-than, equal or greater-than, or the opposite of one.
 int h_cmp64_rows(const Op& o, Regs& R) {
   using namespace rows64;
   const uint64_t ex = *R.exec;
@@ -3693,36 +3703,68 @@ int h_cmp64_rows(const Op& o, Regs& R) {
     Wide w[2];
     if (!wide_of(o.src[0], R, th[0], n, w[0]) || !wide_of(o.src[1], R, th[1], n, w[1])) return h_cmp64_avx2(o, R);
     const unsigned test = static_cast<unsigned>(o.off0) & 15, kind = static_cast<unsigned>(o.off0) >> 4 & 3;
-    const __m256i ua = set64(w[0].u), ub = set64(w[1].u);
-    uint64_t lt = 0, eq = 0, gt = 0, un = 0;
+    uint64_t m = 0;
     if (kind == 0) {
-      for (unsigned i = 0; i < n; i += 8) {
-        __m256i a0, a1, b0, b1;
-        fetch(w[0], ua, i, a0, a1);
-        fetch(w[1], ub, i, b0, b1);
-        const __m256d x0 = _mm256_castsi256_pd(a0), x1 = _mm256_castsi256_pd(a1), y0 = _mm256_castsi256_pd(b0), y1 = _mm256_castsi256_pd(b1);
-        lt |= (mask4(_mm256_cmp_pd(x0, y0, _CMP_LT_OQ)) | mask4(_mm256_cmp_pd(x1, y1, _CMP_LT_OQ)) << 4) << i;
-        eq |= (mask4(_mm256_cmp_pd(x0, y0, _CMP_EQ_OQ)) | mask4(_mm256_cmp_pd(x1, y1, _CMP_EQ_OQ)) << 4) << i;
-        gt |= (mask4(_mm256_cmp_pd(x0, y0, _CMP_GT_OQ)) | mask4(_mm256_cmp_pd(x1, y1, _CMP_GT_OQ)) << 4) << i;
-        un |= (mask4(_mm256_cmp_pd(x0, y0, _CMP_UNORD_Q)) | mask4(_mm256_cmp_pd(x1, y1, _CMP_UNORD_Q)) << 4) << i;
+      const __m256i ua = set64(w[0].u), ub = set64(w[1].u);
+#define TIER_CMPD(pred)                                                                                                                   \
+  for (unsigned i = 0; i < n; i += 8) {                                                                                                   \
+    __m256i a0, a1, b0, b1;                                                                                                               \
+    fetch(w[0], ua, i, a0, a1);                                                                                                           \
+    fetch(w[1], ub, i, b0, b1);                                                                                                           \
+    m |= (mask4(_mm256_cmp_pd(_mm256_castsi256_pd(a0), _mm256_castsi256_pd(b0), pred)) |                                                  \
+          mask4(_mm256_cmp_pd(_mm256_castsi256_pd(a1), _mm256_castsi256_pd(b1), pred)) << 4) << i;                                        \
+  }                                                                                                                                       \
+  break
+      switch (test) {   // F LT EQ LE GT LG GE O U NGE NLG NGT NLE NEQ NLT TRU (cmp_f64's expressions)
+        case 0: break;
+        case 1: TIER_CMPD(_CMP_LT_OQ);
+        case 2: TIER_CMPD(_CMP_EQ_OQ);
+        case 3: TIER_CMPD(_CMP_LE_OQ);
+        case 4: TIER_CMPD(_CMP_GT_OQ);
+        case 5: TIER_CMPD(_CMP_NEQ_OQ);
+        case 6: TIER_CMPD(_CMP_GE_OQ);
+        case 7: TIER_CMPD(_CMP_ORD_Q);
+        case 8: TIER_CMPD(_CMP_UNORD_Q);
+        case 9: TIER_CMPD(_CMP_NGE_UQ);
+        case 10: TIER_CMPD(_CMP_EQ_UQ);
+        case 11: TIER_CMPD(_CMP_NGT_UQ);
+        case 12: TIER_CMPD(_CMP_NLE_UQ);
+        case 13: TIER_CMPD(_CMP_NEQ_UQ);
+        case 14: TIER_CMPD(_CMP_NLT_UQ);
+        default: m = ~uint64_t{0}; break;
       }
+#undef TIER_CMPD
     } else {
-      const __m256i bias = set64(kind == 2 ? kSign : 0);   // (unsigned: the signed comparison of both with the top bit flipped)
-      for (unsigned i = 0; i < n; i += 8) {
-        __m256i a0, a1, b0, b1;
-        fetch(w[0], ua, i, a0, a1);
-        fetch(w[1], ub, i, b0, b1);
-        a0 = _mm256_xor_si256(a0, bias), a1 = _mm256_xor_si256(a1, bias), b0 = _mm256_xor_si256(b0, bias), b1 = _mm256_xor_si256(b1, bias);
-        lt |= (mask4(_mm256_cmpgt_epi64(b0, a0)) | mask4(_mm256_cmpgt_epi64(b1, a1)) << 4) << i;
-        eq |= (mask4(_mm256_cmpeq_epi64(a0, b0)) | mask4(_mm256_cmpeq_epi64(a1, b1)) << 4) << i;
-        gt |= (mask4(_mm256_cmpgt_epi64(a0, b0)) | mask4(_mm256_cmpgt_epi64(a1, b1)) << 4) << i;
+      // F LT EQ LE GT NE GE T: less-than (1), equal (2), greater-than (4), or the opposite of greater-than (3), equal (5), less-than (6).
+      const unsigned base = test == 3 ? 4 : test == 5 ? 2 : test == 6 ? 1 : test;
+      if (base == 1 || base == 2 || base == 4) {
+        const Wide& x = base == 4 ? w[1] : w[0];   // (a > b is b < a)
+        const Wide& y = base == 4 ? w[0] : w[1];
+        const __m256i xhu = _mm256_set1_epi32(static_cast<int>(x.u >> 32)), xlu = _mm256_set1_epi32(static_cast<int>(x.u));
+        const __m256i yhu = _mm256_set1_epi32(static_cast<int>(y.u >> 32)), ylu = _mm256_set1_epi32(static_cast<int>(y.u));
+        const __m256i top = _mm256_set1_epi32(static_cast<int>(0x80000000u)), high_bias = kind == 2 ? top : _mm256_setzero_si256();
+        for (unsigned i = 0; i < n; i += 8) {
+          const __m256i xh = x.uniform ? xhu : _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.hi + i));
+          const __m256i xl = x.uniform ? xlu : _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.lo + i));
+          const __m256i yh = y.uniform ? yhu : _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y.hi + i));
+          const __m256i yl = y.uniform ? ylu : _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y.lo + i));
+          const __m256i same_high = _mm256_cmpeq_epi32(xh, yh);
+          __m256i lanes;
+          if (base == 2) {
+            lanes = _mm256_and_si256(same_high, _mm256_cmpeq_epi32(xl, yl));
+          } else {   // (x < y: the high words as the kind has them, signed or not; the low words unsigned)
+            const __m256i high = _mm256_cmpgt_epi32(_mm256_xor_si256(yh, high_bias), _mm256_xor_si256(xh, high_bias));
+            const __m256i low = _mm256_cmpgt_epi32(_mm256_xor_si256(yl, top), _mm256_xor_si256(xl, top));
+            lanes = _mm256_or_si256(high, _mm256_and_si256(same_high, low));
+          }
+          m |= static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_ps(_mm256_castsi256_ps(lanes)))) << i;
+        }
+        if (base != test) m = ~m;
+      } else {
+        m = test == 7 ? ~uint64_t{0} : 0;
       }
     }
-    const uint64_t all = ~uint64_t{0};
-    // F LT EQ LE GT LG GE O U NGE NLG NGT NLE NEQ NLT TRU; the integers' eight are F LT EQ LE GT NE GE T.
-    const uint64_t by_test[16] = {0, lt, eq, lt | eq, gt, lt | gt, gt | eq, kind == 0 ? ~un : all,
-                                  un, lt | un, eq | un, lt | eq | un, gt | un, lt | gt | un, eq | gt | un, all};
-    result = by_test[test] & ex;
+    result = m & ex;
   }
   if (o.dst.kind) wr(R, o.dst, result);
   if (o.sub) *R.exec = result;
