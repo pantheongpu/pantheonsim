@@ -17,6 +17,9 @@
 // get the simulator's own answer (cudaErrorInvalidValue with the CUDA 13.0 runtime, as the A10G answers), as with the mode off, and never reach the card.
 // `sqrt`, `rsqrt`, `sqrtdiv` (Round sp68, step 29): an IEEE sqrtf on inputs that take both of its paths (tiny floats the slow path, negatives a NaN), a bare
 // rsqrtf, and sqrtf followed by a division (the square root idiom: in the set only with VGPU_HOST_GPU_SQRT=1; the last also needs VGPU_HOST_GPU_DIV=1).
+// `many` and `manyfew` (Round sp69, step 37) launch `scramble` on 64 blocks 400 and 150 times, a launch of a millisecond or so, and read the memory
+// back once at the end: no launch saves a 50th of a driver start that costs 100 launches, but 200 launches and more of one kernel say that as many
+// are still to come (start_share_launches). They print a hash of the memory and, on stderr, the shortest launch in microseconds ("min_launch_us=").
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -164,8 +167,33 @@ static int zerogrid_program() {
   return 0;
 }
 
+static int many_program(int launches) {
+  const int n = 1 << 14;
+  void* d = nullptr;
+  cudaMalloc(&d, n * 4);
+  cudaMemset(d, 1, n * 4);
+  double shortest = 1e30;
+  for (int launch = 0; launch < launches; ++launch) {
+    const auto t0 = std::chrono::steady_clock::now();
+    scramble<<<n / 256, 256>>>(static_cast<uint32_t*>(d), n, 256);
+    cudaDeviceSynchronize();
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    shortest = us < shortest ? us : shortest;
+  }
+  std::fprintf(stderr, "min_launch_us=%.0f\n", shortest);
+  std::vector<unsigned char> back(n * 4);
+  cudaMemcpy(back.data(), d, n * 4, cudaMemcpyDeviceToHost);
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char b : back) h = (h ^ b) * 0x100000001b3ull;
+  std::printf("%d launches: %016llx\n", launches, static_cast<unsigned long long>(h));
+  cudaFree(d);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "big";
+  if (!std::strcmp(mode, "many")) return many_program(400);
+  if (!std::strcmp(mode, "manyfew")) return many_program(150);
   if (!std::strcmp(mode, "zerogrid")) return zerogrid_program();
   if (!std::strcmp(mode, "streak") || !std::strcmp(mode, "streakread")) return streak_program(!std::strcmp(mode, "streakread"));
   const bool small = !std::strcmp(mode, "small"), mufu = !std::strcmp(mode, "mufu");

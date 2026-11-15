@@ -244,6 +244,7 @@ add_library(vgpu STATIC
   amd/src/gcn_exec.cpp
   amd/src/gcn_tier.cpp
   amd/src/gcn_tier_ds.cpp
+  amd/src/gcn_blocks.cpp
   amd/src/gcn_matrix_kernels.cpp
   amd/src/image.cpp
   amd/src/hostcall.cpp
@@ -433,6 +434,20 @@ add_custom_command(TARGET vgpurocprof POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocprofiler-sdk.so.1.0.0" "${CMAKE_BINARY_DIR}/shim/librocprofiler-sdk.so.1"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocprofiler-sdk.so.1.0.0" "${CMAKE_BINARY_DIR}/shim/librocprofiler-sdk.so"
   COMMENT "Creating rocprofiler-sdk shim symlinks (build/shim/librocprofiler-sdk.so.1)")
+
+# libhiprtc: ROCm's run-time compiler front, forwarded to the real library behind a cache of its compile results
+# (amd/src/hiprtc_cache.cpp, Round sp71). A program that compiles kernels at run time (VkFFT, CuPy) finds it first on
+# the library path under the name ROCm 6 or ROCm 7 gives the library; it loads the real one, which run-time
+# compilation still needs. Standalone: none of the simulator is linked in.
+add_library(vgpuhiprtc SHARED amd/src/hiprtc_cache.cpp)
+target_link_libraries(vgpuhiprtc PRIVATE ${CMAKE_DL_LIBS})
+set_target_properties(vgpuhiprtc PROPERTIES OUTPUT_NAME hiprtc SOVERSION 6 VERSION 6.4 CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+add_custom_command(TARGET vgpuhiprtc POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libhiprtc.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhiprtc.so.6"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libhiprtc.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhiprtc.so.7"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libhiprtc.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhiprtc.so"
+  COMMENT "Creating hiprtc shim symlinks (build/shim/libhiprtc.so.6 and .so.7)")
 
 # librocm_smi64: what RCCL asks ROCm SMI about the GPUs it connects (their
 # count, PCI addresses and links), answered from the HIP shim, so RCCL starts
@@ -1791,6 +1806,40 @@ target_include_directories(test_nvcomp_codecs PRIVATE nvidia/src)
 add_executable(print_host_cpus tests/host_cpus/print_host_cpus.cpp)
 target_include_directories(print_host_cpus PRIVATE include)
 add_test(NAME host_cpus COMMAND ${CMAKE_SOURCE_DIR}/tests/host_cpus/run_host_cpus.sh $<TARGET_FILE:print_host_cpus>)
+# ... and the physical cores among them, which is what the AMD engine spreads a dispatch over (vgpu/host_cores.hpp): topology trees
+# made by the test, so it says the same on any host.
+# The hiprtc compile cache against a stand-in for ROCm's libhiprtc (tests/hiprtc): what a program gets back is what the real
+# library returns, a compile is done once for the same inputs and again when anything it depends on changes, damaged entries
+# and racing processes. No ROCm needed. The stand-ins go to a directory of their own (the test copies them into an
+# installation it makes), built with a build id as ROCm's libraries are.
+foreach(_fake comgr_a comgr_b builtins_a builtins_b)
+  string(REGEX REPLACE "_[ab]$" "" _fake_src "${_fake}")
+  add_library(fake_${_fake} SHARED tests/hiprtc/fake_${_fake_src}.c)
+  set_target_properties(fake_${_fake} PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/hiprtc-fakes" C_VISIBILITY_PRESET hidden)
+  target_link_options(fake_${_fake} PRIVATE "LINKER:--build-id")
+endforeach()
+target_compile_definitions(fake_comgr_b PRIVATE "FAKE_COMGR_VERSION=\"fake comgr 3.0.2\"")
+target_compile_definitions(fake_builtins_b PRIVATE FAKE_BUILTINS_PLAIN)
+add_library(fake_hiprtc_real SHARED tests/hiprtc/fake_hiprtc.cpp)
+target_link_libraries(fake_hiprtc_real PRIVATE ${CMAKE_DL_LIBS})
+set_target_properties(fake_hiprtc_real PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/hiprtc-fakes" CXX_VISIBILITY_PRESET hidden
+  BUILD_RPATH "\$ORIGIN")
+target_link_options(fake_hiprtc_real PRIVATE "LINKER:--build-id")
+add_executable(test_hiprtc_cache tests/hiprtc/test_hiprtc_cache.cpp)
+target_link_libraries(test_hiprtc_cache PRIVATE vgpuhiprtc ${CMAKE_DL_LIBS})
+set_target_properties(test_hiprtc_cache PROPERTIES ENABLE_EXPORTS ON)   # (hipGetDevice and its properties, for the cache and the stand-in to find)
+add_dependencies(test_hiprtc_cache fake_hiprtc_real fake_comgr_a fake_comgr_b fake_builtins_a fake_builtins_b)
+add_test(NAME hiprtc_cache COMMAND test_hiprtc_cache "${CMAKE_BINARY_DIR}/hiprtc-fakes")
+# ... and against ROCm's own libhiprtc, where there is one (amd/tests/e2e/run_hiprtc_cache.sh; skips elsewhere).
+add_executable(hiprtc_probe tests/hiprtc/hiprtc_probe.cpp)
+target_link_libraries(hiprtc_probe PRIVATE vgpuhiprtc)
+add_test(NAME amd_hiprtc_cache COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hiprtc_cache.sh $<TARGET_FILE:hiprtc_probe>)
+set_tests_properties(amd_hiprtc_cache PROPERTIES DEPENDS vgpuhip ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 900
+  SKIP_REGULAR_EXPRESSION "^SKIP")
+set_tests_properties(hiprtc_cache PROPERTIES TIMEOUT 600)
+add_executable(test_host_cores tests/host_cores/test_host_cores.cpp)
+target_include_directories(test_host_cores PRIVATE include)
+add_test(NAME host_cores COMMAND test_host_cores)
 # AMD code objects: what a HIP program hands the driver to run.
 vgpu_unit_test(test_amd_codeobject amd/tests/unit/test_codeobject.cpp)
 target_compile_definitions(test_amd_codeobject PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -1914,6 +1963,10 @@ set(VGPU_UNIT_TEST_NO_ADD_TEST OFF)
 target_compile_definitions(test_amd_gcn_tier_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_shard_tests(test_amd_gcn_tier_same_bits ENV_VAR VGPU_TIER_SHARD LIST_ENV VGPU_TIER_LIST SPECS ${VGPU_TIER_SHARD_SPECS}
                  COMMAND test_amd_gcn_tier_same_bits)
+# Blocks (VGPU_AMD_BLOCKS: runs of tier instructions called back to back, amd/src/gcn_exec.cpp Machine::run_block) against the tier's
+# one-instruction-at-a-time loop: programs of the corpora's shapes run both ways by the executor's loop over rounds, everything they leave compared.
+vgpu_unit_test(test_amd_gcn_blocks_same_bits amd/tests/unit/test_gcn_blocks_same_bits.cpp)
+target_compile_definitions(test_amd_gcn_blocks_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # The forms the AMD probe workloads found missing (RDNA2's VOP3 16-bit integer spellings), against the interpreter.
 vgpu_unit_test(test_amd_gcn_probe_forms amd/tests/unit/test_gcn_probe_forms.cpp)
 target_compile_definitions(test_amd_gcn_probe_forms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -2302,6 +2355,11 @@ set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
 add_test(NAME bench_amd_counters COMMAND ${CMAKE_SOURCE_DIR}/tools/bench-amd/run_bench_check.sh)
 set_tests_properties(bench_amd_counters PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "SKIP:" TIMEOUT 600)
+# The same with runs of tier instructions run as blocks (VGPU_AMD_BLOCKS=1): every workload still checks its own results, and the counts
+# are the ones of the expected file.
+add_test(NAME bench_amd_counters_blocks COMMAND ${CMAKE_SOURCE_DIR}/tools/bench-amd/run_bench_check.sh)
+set_tests_properties(bench_amd_counters_blocks PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_BENCH_AMD_ENV=VGPU_AMD_BLOCKS=1" SKIP_REGULAR_EXPRESSION "SKIP:" TIMEOUT 600)
 
 vgpu_unit_test(test_amd_hip_abi amd/tests/unit/test_hip_abi.cpp)
 # HIP's grid sizes for every AMD profile, one process each (the runtime takes

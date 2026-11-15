@@ -226,6 +226,26 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem);
 uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t flavour,
                             std::string* error = nullptr);
 
+// For tests (amd/tests/unit/test_gcn_blocks_same_bits.cpp): a program -- the decoded instructions laid one after another from address 0
+// (each one's `pc` set to where it lands; a branch's `target` is the caller's to aim) -- run by the executor's own loop over rounds
+// (turns of `slice` instructions a wave; 0: no limit, for programs that end) on a work-group of `waves` waves whose registers, masks,
+// LDS and a memory region are drawn from `seed` as digest_instruction's flavours draw them. The digest holds everything the run left:
+// every wave's registers, masks and program counter, LDS, scratch, the region, the counters, how many rounds it took, the error's text if it
+// threw, and after each round where every wave was and how many steps its turn had counted. `run` says what happened, for a test to see that it tested something.
+struct ProgramRun {
+  std::string error;
+  uint64_t instructions = 0;   // DispatchStats::instructions
+  uint64_t in_blocks = 0;      // ... of which ran inside blocks (VGPU_AMD_BLOCKS)
+  uint64_t machine_in_blocks = 0;   // ... and of those, the Machine's instructions (memory accesses and the like)
+  uint64_t bound_in_blocks = 0;     // ... and the integer instructions that ran as bound operations
+  bool ended = false;          // every wave reached the end of the program
+};
+// `wave_state`: bits that put every wave in a state the tier leaves to the interpreter before the first instruction runs.
+// kProgramAddresses is not such a state: it aims the address registers of the program's flat and global accesses at the memory region.
+inline constexpr uint32_t kProgramVskip = 1, kProgramGprIdx = 2, kProgramRoundToZero = 4, kProgramAddresses = 8;
+uint64_t digest_program(const std::vector<gcn::Inst>& program, gcn::Target target, uint64_t seed, uint32_t flavour, uint32_t waves,
+                        uint64_t slice, ProgramRun* run = nullptr, uint32_t wave_state = 0);
+
 // For tools/benchmarks (amd/tools/matrix-bench.cpp): the nanoseconds one execution of the instruction takes on a wave
 // set up as digest_instruction's is (all lanes on), averaged over `iterations` runs of it. Throws what it throws.
 double time_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t flavour, uint32_t iterations);
@@ -260,5 +280,11 @@ bool matrix_fast_path();
 void set_matrix_fast_path(bool on);
 // How many matrix instructions the tile path has done on the calling thread since it began (those it does not do go to the reference path).
 uint64_t matrix_tile_count();
+// How many vector register files (64 KB each) the process has made new -- allocated and zeroed whole -- rather than taken from a
+// host thread's pool of the files earlier waves gave back. For the test that holds the pool to what a thread keeps resident.
+uint64_t vgpr_files_made();
+// How many host threads a dispatch with more work-groups than threads is spread over: VGPU_THREADS, or without it one a physical
+// core the process may use (vgpu/host_cores.hpp), not one a hardware thread. Read from the environment at each call, as a dispatch does.
+unsigned default_workers();
 
 }  // namespace vgpu::amd

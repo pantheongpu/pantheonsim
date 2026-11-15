@@ -142,7 +142,50 @@ void many_groups(uint32_t groups, uint32_t size) {
   for (uint32_t g = 0; g < groups; ++g) VCHECK_EQ(read_word(mem, out + 4ull * g), g);
 }
 
+// A kernel with barriers, as a reduction has: run_groups keeps several of its work-groups resident on a host thread at once (a
+// group whose barrier was just released is taken for one that waits, and the next is started beside it), up to 256 waves, and they
+// end close together. Every group is 16 waves. Returns how many register files the launch made new.
+const std::vector<uint32_t> kBarrier = {0xBF8A0000};   // s_barrier
+uint64_t files_made_by_a_barrier_launch(uint32_t groups) {
+  ::setenv("VGPU_THREADS", "1", 1);
+  MemoryManager mem(16ull << 20);
+  const uint64_t out = mem.alloc(groups * 4);
+  const std::vector<uint32_t> poison(groups, 0x5A5A5A5Au);
+  mem.write(out, poison.data(), groups * 4);
+  // (24 barriers: a group is admitted beside the others at each release, until 256 waves are resident)
+  std::vector<uint32_t> code;
+  for (int i = 0; i < 24; ++i) code.insert(code.end(), kBarrier.begin(), kBarrier.end());
+  code.insert(code.end(), kStoreGroupId.begin(), kStoreGroupId.end());
+  code.insert(code.end(), kEnd.begin(), kEnd.end());
+  amd::CodeObject o = object(code);
+  o.kernels[0].max_flat_workgroup_size = 1024;
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = amd::find_kernel(o, "k");
+  d.kernarg = mem.alloc(8);
+  mem.write(d.kernarg, &out, 8);
+  d.groups[0] = groups;
+  d.group_size[0] = 1024;
+  const uint64_t before = amd::vgpr_files_made();
+  amd::execute(d, mem);
+  const uint64_t made = amd::vgpr_files_made() - before;
+  ::unsetenv("VGPU_THREADS");
+  for (uint32_t g = 0; g < groups; ++g) VCHECK_EQ(read_word(mem, out + 4ull * g), g);
+  return made;
+}
+
 }  // namespace
+
+// The pool holds as many files as a thread keeps resident: the first launch makes those, and no launch after it makes any. (With
+// room for 32 files the groups that ended together overflowed the pool, and every later burst of groups took fresh files, each
+// zeroed whole: the work-group set-up of inq's reductions, Round sp70.)
+VTEST(a_barrier_kernels_work_groups_take_their_register_files_from_the_pool) {
+  const uint64_t first = files_made_by_a_barrier_launch(64);
+  VCHECK(first > 128);     // (the kernel does keep many groups resident: half the pool would not hold them)
+  VCHECK(first <= 288);    // (never more than a thread holds at once, however many groups the launch has)
+  VCHECK_EQ(files_made_by_a_barrier_launch(64), 0u);
+  VCHECK_EQ(files_made_by_a_barrier_launch(200), 0u);
+}
 
 VTEST(every_work_group_of_a_launch_runs_when_the_groups_are_set_up_again) {
   many_groups(9, 64);

@@ -1,0 +1,165 @@
+VGPU_AMD_BLOCKS_STATS=2 with VGPU_AMD_BLOCKS=1 (scripts/stats.sh; the final library of round sp72), one host thread: how many instructions ran
+in blocks, how long a run was (and how long the blocks it ran in are: a run shorter than its block stopped early, at a gated store, a wait
+or an instruction handed back), and the two blocks that ran most. Listings (the first 30 instructions) are kept for five of them.
+
+== bench valu_int (MI300X)
+AMD blocks: 8195328 of 8196608 instructions ran in blocks (100.0%), 512512 block runs, 16.0 instructions a run (16.0 a whole block), 4 blocks
+   99.9%  511744 runs of 16 instructions, _Z10k_valu_intPjj +0x8f48
+             v_mul_lo_u32 v1, v2, s5
+             v_add_u32_e32 v1, 0x3c6ef35f, v1
+             v_lshrrev_b32_e32 v2, 13, v1
+             v_xor_b32_e32 v1, v2, v1
+             v_alignbit_b32 v2, v1, v1, 25
+             v_and_b32_e32 v1, 0xff00ff, v1
+             v_add_u32_e32 v1, v2, v1
+             v_lshlrev_b32_e32 v2, 3, v1
+             v_lshrrev_b32_e32 v1, 5, v1
+             v_xor_b32_e32 v1, v2, v1
+             v_xor_b32_e32 v2, s2, v1
+             v_bcnt_u32_b32 v1, v2, 0
+             s_add_i32 s2, s2, 1
+             s_cmp_eq_u32 s3, s2
+             v_mad_u64_u32 v[2:3], s[6:7], v1, s4, v[2:3]
+             s_cbranch_scc0 65514
+    0.1%  256 runs of 17 instructions, _Z10k_valu_intPjj +0x8f40
+
+== bench valu_f32 (MI300X)
+AMD blocks: 5636864 of 5638400 instructions ran in blocks (100.0%), 512512 block runs, 11.0 instructions a run (11.0 a whole block), 4 blocks
+   99.8%  511744 runs of 11 instructions, _Z10k_valu_f32Pfj +0x9068
+    0.1%  256 runs of 18 instructions, _Z10k_valu_f32Pfj +0x9040
+
+== bench valu_f64 (MI300X)
+AMD blocks: 8198912 of 8200192 instructions ran in blocks (100.0%), 1024512 block runs, 8.0 instructions a run (8.0 a whole block), 4 blocks
+   99.9%  1023744 runs of 8 instructions, _Z10k_valu_f64Pdj +0x91a0
+             v_mov_b64_e32 v[8:9], v[4:5]
+             v_fma_f64 v[2:3], s[2:3], v[2:3], v[8:9]
+             v_mul_f64 v[4:5], v[2:3], s[4:5]
+             s_add_i32 s6, s6, -1
+             v_fmac_f64_e32 v[4:5], 0.5, v[8:9]
+             s_cmp_eq_u32 s6, 0
+             v_fma_f64 v[2:3], 0.5, v[2:3], v[6:7]
+             s_cbranch_scc0 65525
+    0.1%  256 runs of 17 instructions, _Z10k_valu_f64Pdj +0x9110
+
+== bench p_i64 (MI300X)
+AMD blocks: 8258048 of 8258944 instructions ran in blocks (100.0%), 192128 block runs, 43.0 instructions a run (43.0 a whole block), 3 blocks
+   99.9%  191872 runs of 43 instructions, _Z5k_i64Pmj +0x7368
+    0.1%  128 runs of 48 instructions, _Z5k_i64Pmj +0x734c
+
+== bench p_cmp (MI300X)
+AMD blocks: 13572736 of 13573632 instructions ran in blocks (100.0%), 256256 block runs, 53.0 instructions a run (53.0 a whole block), 4 blocks
+   99.9%  255872 runs of 53 instructions, _Z5k_cmpPjj +0x70bc
+
+== bench divergent (MI300X)
+AMD blocks: 16223604 of 17905518 instructions ran in blocks (90.6%), 1805012 block runs, 9.0 instructions a run (9.0 a whole block), 27 blocks
+   13.8%  224087 runs of 11 instructions, _Z11k_divergentPjjj +0xb74c
+   13.7%  223426 runs of 11 instructions, _Z11k_divergentPjjj +0xb574
+
+== bench wave (MI300X)
+AMD blocks: 7939968 of 7940608 instructions ran in blocks (100.0%), 256384 block runs, 31.0 instructions a run (31.0 a whole block), 5 blocks
+   99.9%  255872 runs of 31 instructions, _Z6k_wavePjj +0xb984
+    0.1%  128 runs of 45 instructions, _Z6k_wavePjj +0xb944
+
+== bench mem (MI300X)
+AMD blocks: 2436096 of 5501952 instructions ran in blocks (44.3%), 472576 block runs, 5.2 instructions a run (6.2 a whole block), 16 blocks
+   17.9%  163840 runs of 7 instructions, _Z12k_mem_gatherPKjS0_Pjjj +0xa394
+   14.9%  163840 runs of 6 instructions, _Z12k_mem_scalarPKjPjjj +0xa290
+
+== bench narrow (MI300X)
+AMD blocks: 4099072 of 9527808 instructions ran in blocks (43.0%), 922112 block runs, 4.4 instructions a run (5.3 a whole block), 5 blocks
+   21.5%  409600 runs of 6 instructions, _Z8k_narrowPKhPKaPKtPhPtPijj +0xa9d0
+   17.2%  409600 runs of 5 instructions, _Z8k_narrowPKhPKaPKtPhPtPijj +0xa984
+
+== bench lds (MI300X)
+AMD blocks: 1243136 of 4752960 instructions ran in blocks (26.2%), 474688 block runs, 2.6 instructions a run (6.7 a whole block), 20 blocks
+    5.4%  51200 runs of 5 instructions, _Z15k_lds_transposePKjPjj +0xa848
+             ds_read2_b32 v[18:19], v16 offset1:8
+             ds_read2_b32 v[20:21], v16 offset0:16 offset1:24
+             s_add_i32 s0, s0, 1
+             s_cmp_lg_u32 s3, s0
+             s_waitcnt lgkmcnt(1)
+    4.3%  51200 runs of 4 instructions, _Z12k_lds_reducePKjPjj +0xa494
+
+== bench smem (MI300X)
+AMD blocks: 29516032 of 32477056 instructions ran in blocks (90.9%), 2953152 block runs, 10.0 instructions a run (10.0 a whole block), 8 blocks
+   39.3%  983040 runs of 13 instructions, _Z6k_smemPKjPjjj +0xabc4
+   27.2%  983040 runs of 9 instructions, _Z6k_smemPKjPjjj +0xac08
+
+== inq steepest_descent (MI300X, one host thread)
+AMD blocks: 1127864237 of 1227200583 instructions ran in blocks (91.9%), 133092286 block runs, 8.5 instructions a run (8.7 a whole block), 892 blocks
+    4.2%  616800 runs of 84 instructions, _ZN3gpu16reduce_kernel_vrILi4EZNS_3runIN6thrust7complexIdEEZ...
+             v_sub_u32_e32 v26, 0x49, v20
+             v_sub_u32_e32 v28, 64, v26
+             v_lshrrev_b64 v[6:7], v26, v[2:3]
+             v_lshlrev_b64 v[28:29], v28, v[10:11]
+             v_sub_u32_e32 v33, 9, v20
+             v_or_b32_e32 v29, v7, v29
+             v_or_b32_e32 v28, v6, v28
+             v_lshrrev_b64 v[6:7], v33, v[10:11]
+             v_cmp_gt_u32_e32 vcc, 64, v26
+             v_cmp_eq_u32_e64 s[0:1], 0, v26
+             v_lshrrev_b64 v[34:35], v33, v[2:3]
+             v_cndmask_b32_e32 v7, v7, v29, vcc
+             v_cndmask_b32_e32 v6, v6, v28, vcc
+             v_lshrrev_b64 v[28:29], v26, v[10:11]
+             v_add_u32_e32 v26, 55, v20
+             v_lshlrev_b64 v[36:37], v26, v[10:11]
+             v_add_u32_e32 v20, -9, v20
+             v_cndmask_b32_e32 v29, 0, v29, vcc
+             v_cndmask_b32_e32 v28, 0, v28, vcc
+             v_or_b32_e32 v33, v37, v35
+             v_or_b32_e32 v36, v36, v34
+             v_lshlrev_b64 v[34:35], v20, v[2:3]
+             v_cmp_gt_u32_e32 vcc, 64, v26
+             v_cndmask_b32_e64 v7, v7, v3, s[0:1]
+             v_cndmask_b32_e64 v6, v6, v2, s[0:1]
+             v_cndmask_b32_e32 v20, v35, v33, vcc
+             v_cmp_eq_u32_e64 s[0:1], 0, v26
+             v_lshlrev_b64 v[2:3], v26, v[2:3]
+             v_cndmask_b32_e32 v3, 0, v3, vcc
+             v_cndmask_b32_e64 v11, v20, v11, s[0:1]
+             ...
+    3.6%  526288 runs of 84 instructions, _ZN3gpu16reduce_kernel_vrILi4EZN3inq10operations21gramian_di...
+
+== inq ks_hamiltonian (MI300X, one host thread)
+AMD blocks: 287801173 of 332970525 instructions ran in blocks (86.4%), 19207942 block runs, 15.0 instructions a run (18.5 a whole block), 3714 blocks
+    3.5%  238152 runs of 53 instructions, VkFFT_main +0x1618
+    3.2%  136000 runs of 78 instructions, _ZN3inq6matrix31multiplication_hu_skinny_kernelIN6thrust7com... +0x4ae48
+
+== inq initial_guess (MI300X, one host thread)
+AMD blocks: 2071910937 of 2273257402 instructions ran in blocks (91.1%), 252501957 block runs, 8.2 instructions a run (8.5 a whole block), 3831 blocks
+    9.0%  7077888 runs of 29 instructions, _ZN3gpu16reduce_kernel_vrILi4EZN3inq11observables7density13c...
+    8.6%  38928384 runs of 5 instructions, _ZN3gpu16reduce_kernel_vrILi4EZN3inq11observables7density13c...
+
+== inq poisson (MI300X, one host thread)
+AMD blocks: 2624733701 of 3213335074 instructions ran in blocks (81.7%), 178549205 block runs, 14.7 instructions a run (15.2 a whole block), 2222 bloc
+    9.6%  11016000 runs of 28 instructions, _ZN3gpu14apply_kernel_4IZNK3inq7solvers7poisson20poisson_app...
+             v_lshlrev_b32_e32 v0, 3, v9
+             ds_read_b64 v[0:1], v0
+             s_waitcnt lgkmcnt(0)
+             s_mul_i32 s0, s11, s4
+             s_mul_hi_u32 s1, s10, s4
+             s_add_i32 s1, s1, s0
+             s_mul_i32 s0, s10, s4
+             s_lshl_b64 s[0:1], s[0:1], 4
+             s_add_u32 s4, s6, s0
+             s_addc_u32 s5, s7, s1
+             s_mul_i32 s0, s9, s3
+             s_mul_hi_u32 s1, s8, s3
+             s_add_i32 s1, s1, s0
+             s_mul_i32 s0, s8, s3
+             s_lshl_b64 s[0:1], s[0:1], 4
+             s_add_u32 s0, s4, s0
+             s_addc_u32 s1, s5, s1
+             v_mad_u64_u32 v[4:5], s[4:5], s22, v2, 0
+             v_mov_b32_e32 v6, v5
+             v_mad_u64_u32 v[2:3], s[4:5], s23, v2, v[6:7]
+             v_mov_b32_e32 v5, v2
+             v_lshl_add_u64 v[2:3], v[4:5], 4, s[0:1]
+             s_mov_b64 s[0:1], 0
+             v_mad_u64_u32 v[4:5], s[4:5], s20, v8, 0
+             v_mov_b32_e32 v6, v5
+             v_mad_u64_u32 v[6:7], s[4:5], s21, v8, v[6:7]
+             v_mov_b32_e32 v5, v6
+             v_lshl_add_u64 v[10:11], v[4:5], 4, v[2:3]
+    5.1%  5832000 runs of 28 instructions, _ZN3gpu14apply_kernel_4IZNK3inq7solvers7poisson20poisson_app...

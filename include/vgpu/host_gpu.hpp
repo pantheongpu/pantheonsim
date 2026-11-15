@@ -555,6 +555,13 @@ struct Costs {
   double start_launches = 50;
   // ... and the first-launch rule's launch, whose estimate is static (0.2 to 80 times off), a larger share: start_cost_s / start_launches_static.
   double start_launches_static = 20;
+  // A kernel the simulator has already run this many times is taken to be launched as many times again, so its launch must repay the start within the
+  // launches of that kernel seen so far instead of within start_launches, when those are more (start_share_launches; Round sp69: Rodinia hotspot,
+  // 1,000 launches of 1 ms). 0: start_launches whatever the kernel's history (the rule of the integration of sp64-sp68; VGPU_HOST_GPU_START_REPEATS).
+  double start_repeats = 200;
+  // ... of which at most this many count: the launch must save start_cost_s / start_repeats_max (0.5 ms) however often its kernel has run. A smaller
+  // saving is within the error of the card path's estimate (LargeKernelParameter: 0.1 to 0.2 ms saved by the estimate, none of the start repaid on the card).
+  double start_repeats_max = 500;
 };
 
 struct Estimate {
@@ -601,17 +608,34 @@ inline bool should_offload(const Estimate& e, const Costs& c) {
 // in HeCBench atomicPerf (1.43x in turbo mode on the rig, Round sp66) and 19 ms in 3MM (1.25x).
 // Launches that repay the start alone (the sampled ones of SYRK, SYR2K, 2MM, COVAR, CORR and black-scholes among them) are not affected, and
 // neither is any launch once the driver is up.
-inline bool start_share_saved(const Estimate& e, const Costs& c) {
-  if (!(c.start_launches > 0)) return true;
-  return e.sim_s - card_path_seconds(e, c) >= c.start_cost_s / c.start_launches;
+//
+// The share alone kept the start from a program of many short launches that would repay it many times over (Round sp69): Rodinia hotspot, 1,000
+// launches of one kernel of about 1 ms each on the A10G rig, each saving 0.9 ms, was 2.27x faster in turbo mode under the account alone (Round sp66)
+// and 1.00x under the share (998 launches "too small", the driver never started). What tells it from the four is how often its kernel has already
+// been launched: threadFenceReduction launches its kernel 101 times and dct8x8 has 118 launches in all, and they end before the start is repaid. So
+// the number of launches the start must be repaid within (start_share_launches) is start_launches, or, for a kernel the simulator has already run
+// start_repeats (200) times or more, the number of times it has run it when that is more: the kernel is taken to be launched as many times again
+// as it has been so far, and the start is bought when those launches would repay it. hotspot buys it at about its 300th launch (0.25 s over the
+// 0.8 to 0.9 ms a launch saves), where the account alone bought it at the 210th. At most start_repeats_max (500) launches count, so a launch must save 0.5 ms whatever its kernel's
+// history: LargeKernelParameter's two kernels are launched 1,001 times each and save 0.1 to 0.2 ms a launch by the estimate (0.2 to 0.3 ms in the
+// simulator against a card path of 0.107 ms), and on the card they repaid none of the start (Round sp66: 0.22 s lost with 134 to 163 launches sent).
+// `kept_launches`: how many launches of the launch's kernel the simulator has run so far in this process.
+inline double start_share_launches(const Costs& c, uint64_t kept_launches) {
+  const double kept = static_cast<double>(kept_launches);
+  if (c.start_repeats > 0 && kept >= c.start_repeats) return std::max(c.start_launches, std::min(kept, c.start_repeats_max));
+  return c.start_launches;
 }
-inline bool should_offload_with_start(const Estimate& e, const Costs& c, bool driver_started, double eligible_sim_spent_s) {
+inline bool start_share_saved(const Estimate& e, const Costs& c, uint64_t kept_launches = 0) {
+  if (!(c.start_launches > 0)) return true;
+  return e.sim_s - card_path_seconds(e, c) >= c.start_cost_s / start_share_launches(c, kept_launches);
+}
+inline bool should_offload_with_start(const Estimate& e, const Costs& c, bool driver_started, double eligible_sim_spent_s, uint64_t kept_launches = 0) {
   if (!should_offload(e, c)) return false;                      // not worth a card even with the driver up
   if (driver_started || c.start_cost_s <= 0) return true;
   Estimate cold = e;
   cold.start_s = c.start_cost_s;
   if (should_offload(cold, c)) return true;                     // the launch repays the start by itself
-  return eligible_sim_spent_s >= c.start_cost_s && start_share_saved(e, c);   // (`e`: the card path with the driver up)
+  return eligible_sim_spent_s >= c.start_cost_s && start_share_saved(e, c, kept_launches);   // (`e`: the card path with the driver up)
 }
 
 // ---- a launch while the card holds the live memory (Round sp65) ---------------------------------------------------------------------

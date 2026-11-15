@@ -35,4 +35,7 @@ fi
 cache="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-bench-amd.XXXXXX")"
 trap 'rm -rf "$cache"' EXIT
 export ROCM_PATH="$rocm"
-python3 -I "$root/tools/bench-amd/bench.py" --check-counters --build "$build" --hipcc "$rocm/bin/hipcc" --cache "$cache" --counts-via "$via" --quiet
+# VGPU_BENCH_AMD_ENV="K=V": the workloads run with that in their environment (ctest's bench_amd_counters_blocks: VGPU_AMD_BLOCKS=1, whose
+# counts must be the same ones).
+python3 -I "$root/tools/bench-amd/bench.py" --check-counters --build "$build" --hipcc "$rocm/bin/hipcc" --cache "$cache" --counts-via "$via" --quiet \
+  ${VGPU_BENCH_AMD_ENV:+--env "$VGPU_BENCH_AMD_ENV"}

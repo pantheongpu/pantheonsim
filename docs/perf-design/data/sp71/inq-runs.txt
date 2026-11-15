@@ -1,0 +1,114 @@
+# pass 1, off
+laplacian 5.83 5.27 0.22 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=0 real=24 real_s=3.96 nocache=0
+gradient 11.75 8.82 0.24 rc=0 pass=1 out=cada440c c=48 mem=0 disk=0 real=48 real_s=10.03 nocache=0
+transform 46.21 59.95 0.92 rc=0 pass=1 out=9116dd42 c=224 mem=0 disk=0 real=224 real_s=40.76 nocache=0
+ks_hamiltonian 23.64 44.34 1.55 rc=0 pass=1 out=4918124d c=68 mem=0 disk=0 real=68 real_s=12.72 nocache=0
+initial_guess 38.00 129.87 2.00 rc=0 pass=1 out=def4f106 c=98 mem=0 disk=0 real=98 real_s=17.58 nocache=0
+electrons 51.20 82.98 0.96 rc=0 pass=1 out=ce3cf4a9 c=200 mem=0 disk=0 real=200 real_s=36.82 nocache=0
+# pass 1, cold
+laplacian 6.66 6.32 0.22 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=0 real=24 real_s=4.69 nocache=0
+gradient 6.65 5.69 0.21 rc=0 pass=1 out=cada440c c=48 mem=0 disk=24 real=24 real_s=4.86 nocache=0
+transform 30.42 46.25 0.78 rc=0 pass=1 out=9116dd42 c=224 mem=94 disk=0 real=130 real_s=24.88 nocache=0
+ks_hamiltonian 18.88 39.87 1.59 rc=0 pass=1 out=4918124d c=68 mem=24 disk=0 real=44 real_s=8.09 nocache=0
+initial_guess 35.48 132.74 1.96 rc=0 pass=1 out=def4f106 c=98 mem=27 disk=0 real=71 real_s=13.38 nocache=0
+electrons 40.41 73.00 0.82 rc=0 pass=1 out=ce3cf4a9 c=200 mem=74 disk=0 real=126 real_s=25.31 nocache=0
+# pass 1, warm
+laplacian 1.90 1.76 0.16 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=24 real=0 real_s=0.00 nocache=0
+gradient 1.74 1.02 0.16 rc=0 pass=1 out=cada440c c=48 mem=0 disk=48 real=0 real_s=0.00 nocache=0
+transform 5.56 21.65 0.50 rc=0 pass=1 out=9116dd42 c=224 mem=94 disk=130 real=0 real_s=0.00 nocache=0
+ks_hamiltonian 11.09 33.45 1.46 rc=0 pass=1 out=4918124d c=68 mem=24 disk=44 real=0 real_s=0.00 nocache=0
+initial_guess 21.70 119.28 1.87 rc=0 pass=1 out=def4f106 c=98 mem=27 disk=71 real=0 real_s=0.00 nocache=0
+electrons 14.65 48.41 0.58 rc=0 pass=1 out=ce3cf4a9 c=200 mem=74 disk=126 real=0 real_s=0.00 nocache=0
+# pass 2, off
+laplacian 6.65 6.21 0.22 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=0 real=24 real_s=4.74 nocache=0
+gradient 11.50 9.59 0.25 rc=0 pass=1 out=cada440c c=48 mem=0 disk=0 real=48 real_s=9.75 nocache=0
+transform 43.05 55.71 0.85 rc=0 pass=1 out=9116dd42 c=224 mem=0 disk=0 real=224 real_s=38.42 nocache=0
+ks_hamiltonian 24.85 47.02 1.66 rc=0 pass=1 out=4918124d c=68 mem=0 disk=0 real=68 real_s=13.47 nocache=0
+initial_guess 61.14 200.53 2.62 rc=0 pass=1 out=def4f106 c=98 mem=0 disk=0 real=98 real_s=30.85 nocache=0
+electrons 86.49 129.89 1.24 rc=0 pass=1 out=ce3cf4a9 c=200 mem=0 disk=0 real=200 real_s=67.17 nocache=0
+# pass 2, cold
+laplacian 8.84 8.99 0.26 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=0 real=24 real_s=6.62 nocache=0
+gradient 8.53 7.73 0.24 rc=0 pass=1 out=cada440c c=48 mem=0 disk=24 real=24 real_s=6.42 nocache=0
+transform 46.42 55.03 0.86 rc=0 pass=1 out=9116dd42 c=224 mem=94 disk=0 real=130 real_s=40.09 nocache=0
+ks_hamiltonian 21.80 46.60 1.70 rc=0 pass=1 out=4918124d c=68 mem=24 disk=0 real=44 real_s=9.63 nocache=0
+initial_guess 40.79 152.41 2.21 rc=0 pass=1 out=def4f106 c=98 mem=27 disk=0 real=71 real_s=15.39 nocache=0
+electrons 46.77 91.11 0.93 rc=0 pass=1 out=ce3cf4a9 c=200 mem=74 disk=0 real=126 real_s=29.43 nocache=0
+# pass 2, warm
+laplacian 2.11 2.51 0.20 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=24 real=0 real_s=0.00 nocache=0
+gradient 1.85 1.39 0.15 rc=0 pass=1 out=cada440c c=48 mem=0 disk=48 real=0 real_s=0.00 nocache=0
+transform 6.58 29.14 0.50 rc=0 pass=1 out=9116dd42 c=224 mem=94 disk=130 real=0 real_s=0.00 nocache=0
+ks_hamiltonian 13.13 41.35 1.61 rc=0 pass=1 out=4918124d c=68 mem=24 disk=44 real=0 real_s=0.00 nocache=0
+initial_guess 25.51 118.97 1.83 rc=0 pass=1 out=def4f106 c=98 mem=27 disk=71 real=0 real_s=0.00 nocache=0
+electrons 16.04 53.16 0.60 rc=0 pass=1 out=ce3cf4a9 c=200 mem=74 disk=126 real=0 real_s=0.00 nocache=0
+# pass 3, off
+laplacian 12.27 6.55 0.21 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=0 real=24 real_s=10.35 nocache=0
+gradient 14.38 11.01 0.29 rc=0 pass=1 out=cada440c c=48 mem=0 disk=0 real=48 real_s=10.42 nocache=0
+transform 62.49 69.01 0.98 rc=0 pass=1 out=9116dd42 c=224 mem=0 disk=0 real=224 real_s=56.43 nocache=0
+ks_hamiltonian 35.73 57.09 1.73 rc=0 pass=1 out=4918124d c=68 mem=0 disk=0 real=68 real_s=22.96 nocache=0
+initial_guess 54.36 174.43 2.22 rc=0 pass=1 out=def4f106 c=98 mem=0 disk=0 real=98 real_s=26.61 nocache=0
+electrons 73.57 106.31 1.08 rc=0 pass=1 out=ce3cf4a9 c=200 mem=0 disk=0 real=200 real_s=55.42 nocache=0
+# pass 3, cold
+laplacian 10.61 7.39 0.24 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=0 real=24 real_s=8.56 nocache=0
+gradient 7.97 6.94 0.22 rc=0 pass=1 out=cada440c c=48 mem=0 disk=24 real=24 real_s=6.14 nocache=0
+transform 48.08 61.31 0.90 rc=0 pass=1 out=9116dd42 c=224 mem=94 disk=0 real=130 real_s=41.64 nocache=0
+ks_hamiltonian 23.85 52.73 1.74 rc=0 pass=1 out=4918124d c=68 mem=24 disk=0 real=44 real_s=10.40 nocache=0
+initial_guess 49.10 148.96 2.21 rc=0 pass=1 out=def4f106 c=98 mem=27 disk=0 real=71 real_s=23.12 nocache=0
+electrons 46.01 73.53 0.92 rc=0 pass=1 out=ce3cf4a9 c=200 mem=74 disk=0 real=126 real_s=29.14 nocache=0
+# pass 3, warm
+laplacian 2.03 1.78 0.16 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=24 real=0 real_s=0.00 nocache=0
+gradient 1.71 0.84 0.17 rc=0 pass=1 out=cada440c c=48 mem=0 disk=48 real=0 real_s=0.00 nocache=0
+transform 7.49 21.03 0.45 rc=0 pass=1 out=9116dd42 c=224 mem=94 disk=130 real=0 real_s=0.00 nocache=0
+ks_hamiltonian 12.41 39.90 1.48 rc=0 pass=1 out=4918124d c=68 mem=24 disk=44 real=0 real_s=0.00 nocache=0
+initial_guess 25.38 138.72 1.89 rc=0 pass=1 out=def4f106 c=98 mem=27 disk=71 real=0 real_s=0.00 nocache=0
+electrons 16.35 46.90 0.60 rc=0 pass=1 out=ce3cf4a9 c=200 mem=74 disk=126 real=0 real_s=0.00 nocache=0
+# four at once, off1
+gradient 19.42 15.44 0.31 rc=0 pass=1 out=cada440c c=48 mem=0 disk=0 real=48 real_s=16.81 nocache=0
+ks_hamiltonian 31.81 60.63 1.59 rc=0 pass=1 out=4918124d c=68 mem=0 disk=0 real=68 real_s=16.92 nocache=0
+laplacian 11.19 9.46 0.25 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=0 real=24 real_s=8.13 nocache=0
+transform 69.61 76.83 1.06 rc=0 pass=1 out=9116dd42 c=224 mem=0 disk=0 real=224 real_s=60.41 nocache=0
+# four at once, cold1
+gradient 12.64 11.73 0.32 rc=0 pass=1 out=cada440c c=48 mem=0 disk=15 real=33 real_s=10.24 nocache=0
+ks_hamiltonian 24.91 53.67 1.63 rc=0 pass=1 out=4918124d c=68 mem=24 disk=0 real=44 real_s=11.06 nocache=0
+laplacian 9.34 9.55 0.27 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=0 real=24 real_s=7.14 nocache=0
+transform 39.24 58.68 0.85 rc=0 pass=1 out=9116dd42 c=224 mem=94 disk=0 real=130 real_s=32.54 nocache=0
+# four at once, warm1
+gradient 2.28 1.87 0.18 rc=0 pass=1 out=cada440c c=48 mem=0 disk=48 real=0 real_s=0.00 nocache=0
+ks_hamiltonian 29.45 37.17 1.55 rc=0 pass=1 out=4918124d c=68 mem=24 disk=44 real=0 real_s=0.00 nocache=0
+laplacian 2.61 3.17 0.21 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=24 real=0 real_s=0.00 nocache=0
+transform 21.23 28.33 0.57 rc=0 pass=1 out=9116dd42 c=224 mem=94 disk=130 real=0 real_s=0.00 nocache=0
+# four at once, off2
+gradient 17.70 16.03 0.29 rc=0 pass=1 out=cada440c c=48 mem=0 disk=0 real=48 real_s=15.74 nocache=0
+ks_hamiltonian 32.40 62.31 1.68 rc=0 pass=1 out=4918124d c=68 mem=0 disk=0 real=68 real_s=18.08 nocache=0
+laplacian 9.52 9.49 0.26 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=0 real=24 real_s=7.39 nocache=0
+transform 63.44 75.57 1.08 rc=0 pass=1 out=9116dd42 c=224 mem=0 disk=0 real=224 real_s=57.33 nocache=0
+# four at once, cold2
+gradient 11.59 10.95 0.28 rc=0 pass=1 out=cada440c c=48 mem=0 disk=16 real=32 real_s=9.42 nocache=0
+ks_hamiltonian 23.31 49.64 1.75 rc=0 pass=1 out=4918124d c=68 mem=24 disk=0 real=44 real_s=10.16 nocache=0
+laplacian 8.56 8.86 0.24 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=0 real=24 real_s=6.34 nocache=0
+transform 42.69 52.09 0.79 rc=0 pass=1 out=9116dd42 c=224 mem=94 disk=0 real=130 real_s=32.68 nocache=0
+# four at once, warm2
+gradient 5.19 1.26 0.14 rc=0 pass=1 out=cada440c c=48 mem=0 disk=48 real=0 real_s=0.00 nocache=0
+ks_hamiltonian 16.48 41.54 1.73 rc=0 pass=1 out=4918124d c=68 mem=24 disk=44 real=0 real_s=0.00 nocache=0
+laplacian 5.48 2.19 0.19 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=24 real=0 real_s=0.00 nocache=0
+transform 9.62 27.72 0.52 rc=0 pass=1 out=9116dd42 c=224 mem=94 disk=130 real=0 real_s=0.00 nocache=0
+# four at once: seconds until all four are done
+four-at-once off1: 70.033100221 s until all are done
+four-at-once cold1: 39.260914229 s until all are done
+four-at-once warm1: 29.470268675 s until all are done
+four-at-once off2: 63.462109116 s until all are done
+four-at-once cold2: 42.733507750 s until all are done
+four-at-once warm2: 16.642541609 s until all are done
+# the last commit, cold (the passes above ran the library before its destroy call stopped clearing the handle)
+laplacian 8.33 7.23 0.24 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=0 real=24 real_s=5.65 nocache=0
+gradient 8.04 7.13 0.24 rc=0 pass=1 out=cada440c c=48 mem=0 disk=24 real=24 real_s=6.24 nocache=0
+transform 44.08 51.75 0.81 rc=0 pass=1 out=9116dd42 c=224 mem=94 disk=0 real=130 real_s=38.08 nocache=0
+ks_hamiltonian 28.13 55.63 1.84 rc=0 pass=1 out=4918124d c=68 mem=24 disk=0 real=44 real_s=14.40 nocache=0
+initial_guess 48.87 187.31 2.54 rc=0 pass=1 out=def4f106 c=98 mem=27 disk=0 real=71 real_s=19.31 nocache=0
+electrons 53.33 95.64 1.02 rc=0 pass=1 out=ce3cf4a9 c=200 mem=74 disk=0 real=126 real_s=32.70 nocache=0
+# the last commit, warm (the passes above ran the library before its destroy call stopped clearing the handle)
+laplacian 2.14 2.38 0.20 rc=0 pass=1 out=fb35b478 c=24 mem=0 disk=24 real=0 real_s=0.00 nocache=0
+gradient 2.00 1.45 0.17 rc=0 pass=1 out=cada440c c=48 mem=0 disk=48 real=0 real_s=0.00 nocache=0
+transform 6.22 24.51 0.54 rc=0 pass=1 out=9116dd42 c=224 mem=94 disk=130 real=0 real_s=0.00 nocache=0
+ks_hamiltonian 11.47 35.28 1.50 rc=0 pass=1 out=4918124d c=68 mem=24 disk=44 real=0 real_s=0.00 nocache=0
+initial_guess 26.38 126.04 1.84 rc=0 pass=1 out=def4f106 c=98 mem=27 disk=71 real=0 real_s=0.00 nocache=0
+electrons 18.15 48.13 0.59 rc=0 pass=1 out=ce3cf4a9 c=200 mem=74 disk=126 real=0 real_s=0.00 nocache=0

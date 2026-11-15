@@ -1,0 +1,44 @@
+t1_sd_c3 34.10 33.33 0.51 rc=0 pass=1
+t1_ksh_c3 40.13 37.57 1.10 rc=0 pass=1
+t1_sd_c4 31.80 31.00 0.46 rc=0 pass=1
+t1_ksh_c4 28.29 25.16 0.81 rc=0 pass=1
+t1_sd_c3 26.50 25.64 0.39 rc=0 pass=1
+t1_ksh_c3 31.00 28.56 0.83 rc=0 pass=1
+t1_sd_c4 26.21 25.36 0.36 rc=0 pass=1
+t1_ksh_c4 28.06 25.33 0.82 rc=0 pass=1
+par4 sd c1 all done in 34.561661340 s: mean wall 34.5 s, total CPU 338 s, 4 ok
+par4 sd c2 all done in 34.550456082 s: mean wall 34.5 s, total CPU 337 s, 4 ok
+par4 sd c1 all done in 36.842442603 s: mean wall 36.7 s, total CPU 341 s, 4 ok
+par4 sd c2 all done in 34.531614640 s: mean wall 34.4 s, total CPU 334 s, 4 ok
+par4 ig c1 all done in 98.012726553 s: mean wall 97.8 s, total CPU 1218 s, 4 ok
+par4 ig c2 all done in 93.658313633 s: mean wall 93.1 s, total CPU 1129 s, 4 ok
+par4 ig c1 all done in 97.528239276 s: mean wall 97.1 s, total CPU 1217 s, 4 ok
+par4 ig c2 all done in 93.989971154 s: mean wall 93.2 s, total CPU 1124 s, 4 ok
+par4 poi c1 all done in 144.335422809 s: mean wall 144.1 s, total CPU 1610 s, 4 ok
+par4 poi c2 all done in 139.410401187 s: mean wall 138.8 s, total CPU 1494 s, 4 ok
+par4 poi c1 all done in 146.043589007 s: mean wall 145.6 s, total CPU 1624 s, 4 ok
+par4 poi c2 all done in 141.203823988 s: mean wall 140.5 s, total CPU 1494 s, 4 ok
+t1_ksh_base 30.50 28.28 0.84 rc=0 pass=1
+t1_ksh_c3 30.67 28.53 0.81 rc=0 pass=1
+t1_ksh_c4 27.38 25.19 0.86 rc=0 pass=1
+t1_ksh_base 30.93 28.53 0.85 rc=0 pass=1
+t1_ksh_c3 30.80 28.49 0.83 rc=0 pass=1
+t1_ksh_c4 27.48 25.24 0.80 rc=0 pass=1
+t1_ksh_base 31.45 29.08 0.81 rc=0 pass=1
+t1_ksh_c3 30.74 28.56 0.85 rc=0 pass=1
+t1_ksh_c4 27.49 25.32 0.85 rc=0 pass=1
+t1_sd_base 30.67 29.84 0.39 rc=0 pass=1
+t1_tr_base 49.87 47.40 0.70 rc=0 pass=1
+t1_sd_c3 26.61 25.78 0.37 rc=0 pass=1
+t1_tr_c3 49.65 47.10 0.75 rc=0 pass=1
+t1_sd_c4 26.18 25.34 0.37 rc=0 pass=1
+t1_tr_c4 49.59 46.90 0.73 rc=0 pass=1
+t1_sd_base 30.33 29.50 0.38 rc=0 pass=1
+t1_tr_base 50.13 47.51 0.74 rc=0 pass=1
+t1_sd_c3 26.45 25.57 0.39 rc=0 pass=1
+t1_tr_c3 49.38 46.91 0.74 rc=0 pass=1
+t1_sd_c4 26.31 25.47 0.38 rc=0 pass=1
+t1_tr_c4 49.10 46.88 0.72 rc=0 pass=1
+t1_poi_base 122.46 119.85 1.12 rc=0 pass=1
+t1_poi_c3 122.60 119.53 1.15 rc=0 pass=1
+t1_poi_c4 115.10 112.19 1.16 rc=0 pass=1

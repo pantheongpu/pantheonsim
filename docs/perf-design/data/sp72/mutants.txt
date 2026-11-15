@@ -1,0 +1,39 @@
+scripts/mutants.py on the committed block runner (amd/src/gcn_exec.cpp), a tree without LTO, test_amd_gcn_blocks_same_bits rebuilt and run
+for each. Mutants 0 to 14 were run against the test before its last two cases were added (the runner's code was the same); 10, 11 and 15
+to 20 against the final test.
+
+ 0 killed: a whole block counts nothing  [7457 of 14400 runs differ with blocks on]
+ 1 killed: a whole block does not count its instructions  [7457 of 14400 runs differ]
+ 2 killed: a whole block does not count by unit  [7457 of 14400 runs differ]
+ 3 killed: a whole block does not count the mix  [7457 of 14400 runs differ]
+ 4 killed: a whole block does not count the matrix operations  [1814 of 14400 runs differ]
+ 5 killed: a whole block counts each unit one too many  [7457 of 14400 runs differ]
+ 6 killed: a block runs past the turn's room  [7898 of 14400 runs differ]
+ 7 killed: the room is one instruction too long  [9740 of 14400 runs differ]
+ 8 killed: a handed-back instruction leaves the program counter past it  [894 of 14400 runs differ]
+ 9 killed: a handed-back instruction is counted  [896 of 14400 runs differ]
+10 killed: an instruction that gives up the turn after it is done is a step  [14 of 14400 runs differ]
+11 killed: an instruction that gives up the turn after it is done does not end the turn  [8 of 14400 runs differ]
+12 killed: a gated store goes to the interpreter instead of ending the turn  [88 of 14400 runs differ]
+13 killed: a handed-back instruction ends the turn  [812 of 14400 runs differ]
+14 killed: a block goes on past a branch  [5494 of 14400 runs differ]
+15 killed: the wave's state is not asked  [a_wave_the_tier_leaves_to_the_interpreter_runs_no_block: VCHECK(on_run.in_blocks == 0)]
+16 survived, and cannot be killed by a result: the Machine's instructions are taken into a block (their handler in the tier is h_never,
+   which hands the instruction back: the block stops there and the plain step sends it to the Machine, as without the mutant; the test
+   in in_block only saves entering a block that is left at once)
+17 killed: the steps of a block are not counted in the turn  [the test does not end: stopped after 300 s; a turn never completes]
+18 killed: the branch target is not handed to the handler  [the test does not end: stopped after 300 s; branches go to a stale target]
+19 killed: the room's end counts nothing  [7913 of 14400 runs differ]
+20 killed: the last instruction of a block is run twice when the room ends on it  [2719 of 14400 runs differ]
+20 of 21 killed.
+
+What the mutants changed in the test:
+* 10 and 11 were killed by 1 run and by none at first: the digest was taken only when a run ended, and a round that finishes a program
+  starts every wave's turn count again. The digest now takes each wave's count and place after every round (14 and 8 runs differ) and
+  a case of its own holds a wait inside a block.
+* 15 survived the random programs (a mode change, VSKIP or VGPR indexing is one shape in thousands): the case that starts waves in those
+  states kills it.
+* A mutant of an earlier form ("the room is one instruction too short") is not in the list: it changes no result, only how long a block
+  runs. Two mutants of a `catch` around the handlers survived because no handler of a block throws; the `catch` was removed.
+* "a whole block does not count the matrix operations" survived until the test planted matrix-operation counts on some instructions (no
+  instruction with a tier handler has any today).

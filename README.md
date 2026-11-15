@@ -67,6 +67,7 @@ All settings:
 | `simd` | `auto`, `base`, `avx2` or `off` | `auto` | Caps the vector instruction set; `off` is scalar code |
 | `scheduler` | `deterministic`, `random` or `adversarial` | `deterministic` | Warp scheduling order, to find order-dependent bugs (set `sass: off` with the last two) |
 | `scheduler_seed` | 0 or more | 0 | Seed for `random` and `adversarial`; the same seed replays the same run |
+| `hiprtc_cache` | `disk`, `mem` or `off` | `disk` | What is kept of AMD run-time compiles (hiprtc, done by ROCm's compiler): in memory and files, in memory, or nothing |
 | `strict` | `true` or `false` | `false` | Refuse undefined behaviour, such as integer division by zero |
 | `race` | `off`, `on` or `all` | `off` | Report unordered shared-memory access between warps |
 | `counters` | `true` or `false` | `false` | Print exact per-launch performance counters |

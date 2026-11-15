@@ -15,6 +15,64 @@ release says what runs and what it produces, never how fast a real GPU would run
   The rule was measured on an RX 6800 (`SQC_LDS_BANK_CONFLICT`, 906 combinations of instruction, stride and active lanes,
   all reproduced; data in `amd/tests/data/lds_bank_conflicts.tsv`, probe in `amd/tools/lds-bank-probe`) and is applied unchecked to the other targets.
   It is counted only when `VGPU_DISPATCH_STATS` is set. Sectors and cache lines are not counted yet (issue #650).
+- AMD engine, blocks (`VGPU_AMD_BLOCKS=1`, still off by default), second round ([round sp73](docs/perf-design/rounds/11-rounds-sp36-sp41.md),
+  [design](docs/perf-design/13-amd-compiled-tier.md)):
+  - **Fixed**: the first form of blocks made the interpreter slower with the knob off. `v_fma_f64` loops (the bench's valu_f64) ran 13 %
+    slower on the simulated MI300X and 23 % on the RX 6800, other rows 2 to 5 %. With the knob off the interpreter's loop is again the
+    code it was: 0.993 to 1.001 of the rate before blocks over the bench's 62 kernel rows in two builds (a control with no change:
+    0.999 to 1.001). Single rows still move 3 to 5 % from one link of the library to the next (smem on the RX 6800 is 5 % low in this one).
+  - The three functions of the blocks' loop keep frame pointers: a profiler that walks the stack in its signal handler crashed one run in
+    four of an inq test with the knob on, and no longer does (12 of 12 runs).
+  - Memory instructions, scalar loads and waits are inside blocks, and a wave whose turn ends inside a block goes on in it. The rows
+    that lost with the knob on in the first form no longer do (`lds` 0.92 to 0.96 before, 0.99 to 1.01 now; `mem` 1.00 to 1.02): where
+    waves give up their turn every few instructions blocks turn themselves off.
+  - Runs of 32-bit integer instructions on vector registers and constants call their lane kernels directly (`VGPU_AMD_BLOCKS_BOUND=0`
+    turns that off): valu_int 1.33 times the rate without blocks (1.16 to 1.21 without the binding), p_sdwa 1.20 to 1.30.
+  - With the knob on, one host thread: geometric mean of the bench's 62 kernel rows 1.11, arithmetic rows 1.09 to 1.35, no row more than
+    2 % slower than with it off; inq's unit tests use 1 to 4 % less CPU (round sp72's 16 % for one of them was a loaded host's number). Results, counters and errors are those of one instruction at a time.
+- AMD engine, the first piece of a compiled tier for AMD kernels ([design](docs/perf-design/13-amd-compiled-tier.md),
+  [round sp72](docs/perf-design/rounds/11-rounds-sp36-sp41.md)): with `VGPU_AMD_BLOCKS=1` (off by default) a straight-line run of
+  instructions the pre-decoded tier has handlers for goes as one *block*: the handlers are called back to back, what was asked before each
+  instruction is asked once, and the run's counters are added once. Results, counters, errors, the order waves and work-groups take turns in
+  and lockstep are those of one instruction at a time (`test_amd_gcn_blocks_same_bits`, `bench_amd_counters_blocks`). On one
+  host thread the AMD benchmark's arithmetic rows run 6 to 49 % faster with it (valu_int 1.06 to 1.26, valu_f32 1.13 to 1.25, valu_f64 1.10
+  to 1.32, p_i64 1.19 to 1.30, wave 1.30 to 1.43; geometric mean of all 82 rows 1.07) and inq's unit tests use 0 to 16 % less CPU; the
+  memory rows do not gain and the LDS row is 4 to 6 % slower, which is why it is opt-in.
+  `VGPU_AMD_BLOCKS_STATS=1` lists the blocks that ran most. Measured first: the dispatch loop is 18 to 35 % of an arithmetic-bound kernel on
+  this engine and operand decode 17 to 32 %, and the same arithmetic written as one host loop over a wave's lanes costs 13 to 22 times less
+  than the tier, which is what the design's later layers are for.
+- AMD run-time compilation (hiprtc) is cached ([round sp71](docs/perf-design/rounds/11-rounds-sp36-sp41.md)). A program that compiles kernels at
+  run time (VkFFT's plans, CuPy's and PyTorch's kernels) calls ROCm's own `libhiprtc`, about 150 ms a kernel on any GPU; `build/shim` now has a
+  `libhiprtc` (`.so.6` and `.so.7`) that loads ROCm's, forwards every entry point, and keeps what a compile returned -- the code, the log, the
+  lowered names -- in memory and in a file under `~/.cache/pantheonsim/hiprtc-v1`, keyed by everything the compile reads (source, name, headers,
+  options, name expressions, the device's architecture, the compiler's environment, and the toolchain's libraries and files). The same compile, in
+  the process or a later one, gets the bytes ROCm's library returned. Whatever the key cannot name completely is compiled by ROCm every time, as
+  before: includes that were not given (except the guarded `<hip/hip_runtime.h>`), `__DATE__`/`__FILE__`, options such as `-g` and `-include`,
+  failures, the bitcode and the link API. Six of inq's unit tests on the simulated MI300X: 217 s with the cache off, 172 s cold, 64 s warm (410, 345
+  and 237 CPU-s), the same outputs. On by default; `VGPU_HIPRTC_CACHE=0` or `mem` (settings key `hiprtc_cache`), `VGPU_HIPRTC_CACHE_DIR`,
+  `VGPU_HIPRTC_CACHE_MAX_MB` (256), `VGPU_HIPRTC_CACHE_STATS=1`, `VGPU_HIPRTC_REAL` ([cli.md](docs/cli.md)). Run-time compilation still needs
+  ROCm's compiler installed, as it did.
+
+- Host-GPU mode (experimental, opt-in), both modes: the share of the driver start that a launch must save by itself (the entry below) kept the
+  start from programs of many short launches that repay it many times over: Rodinia hotspot, 1,000 launches of about 1 ms, was 2.27x faster in
+  turbo mode before the share and 1.00x with it. A kernel the simulator has already run 200 times is now taken to be launched as many times
+  again, and its launch must repay the start within the launches of that kernel run so far (at most 500) instead of within 50, when those
+  are more (`VGPU_HOST_GPU_START_REPEATS`, `0` for the rule before). The four short CUDA Samples the share protects still do not start the
+  driver: two launch a kernel about 100 times, one has two launches in all, and the launches of the fourth save under 0.5 ms each. On an
+  A10G hotspot's turbo run is 1.85x faster than the simulator again (1.05 s to 0.57 s) and the four run at the simulator's time.
+- AMD engine, speed on a program of doubles, reductions and managed memory (inq's unit tests on the simulated MI300X,
+  [round sp70](docs/perf-design/rounds/11-rounds-sp36-sp41.md)); results, counters and the order work-groups run in are unchanged:
+  - **A default changes**: without `VGPU_THREADS` a dispatch is spread over one host thread for each physical core the process may use
+    (`include/vgpu/host_cores.hpp`), not one for each hardware thread. On an 8-core, 16-thread host the second thread of a core bought no wall
+    time: the default now uses 17 to 52 % less CPU time for the same wall time (ground_state::initial_guess 280 to 134 CPU-s, solvers::poisson
+    327 to 189, wall time within 3 %), and four tests with large grids run at once finish 3 to 4 % sooner. `VGPU_THREADS` still takes any number. The NVIDIA engines are unchanged.
+  - The per-thread pool of vector register files holds 288 files instead of 32: the work-groups of a kernel with barriers (a reduction) are
+    held several at a time and end together, and each burst took fresh 64 KB files zeroed whole (initial_guess 44.3 s to 38.3 s, 374 to 280
+    CPU-s; systems::electrons 162 to 122 CPU-s).
+  - `v_min_f64` and `v_max_f64` are four lanes at a time where the host has AVX2, with the C library's fmin/fmax bits
+    (eigensolvers::steepest_descent 45 to 41 CPU-s).
+  - A wave's three- and four-word loads and stores of managed or host memory (`hipMallocManaged`, `hipHostMalloc`) go to memory as one batch
+    on one host thread, as its one- and two-word ones did (hamiltonian::ks_hamiltonian with `VGPU_THREADS=1`: 30.7 s to 27.4 s).
 - NVIDIA driver: a call made after `exit()` has torn the driver down, from the destructor of a library that loaded libcuda itself, now
   answers `CUDA_ERROR_DEINITIALIZED` (4), as NVIDIA's driver does (#646). NVHPC's OpenACC runtime (26.9) dlopens libcuda, retains the primary
   context once and releases it from its destructor, after the driver's own teardown; the simulator answered that release from its destroyed

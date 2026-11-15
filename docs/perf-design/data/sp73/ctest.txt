@@ -1,0 +1,19 @@
+The AMD ctest set on server3: `ctest -R "amd|host_cores" -j3` in a build without LTO of the AMD targets (test_amd_*, the AMD tools and
+benches, vgpu, vgpuhip, vgpurocprof, vgpuamdsmi, vgpursmi, vgpu-rocminfo), the final sources of round sp73 but for the frame pointers of
+run_round_blocks and run_round_live, which came after.
+
+knob off:                              325 tests, 237 passed, 88 skipped by their own checks, 0 failed    750 s
+VGPU_AMD_BLOCKS=1 in every test's environment:  325 tests, 237 passed, 88 skipped, 0 failed               702 s
+
+Skipped here as in round sp72: the tests that need ROCm's full install or a container (bench_amd_counters and bench_amd_counters_blocks
+among them: the expected counts are hipcc 7.2's, the host has 6.4.4; `bench.py`'s counting runs of the final build have the same counters
+in all 62 counted rows, knob off against on), PyTorch, vLLM, rocprofv3, RVS, Ollama.
+
+test_amd_gcn_blocks_same_bits: seven cases pass in the LTO build (the final library, frame pointers included), in the build without LTO
+and under ctest. The tree as it was before bound runs (its own commit) was built without LTO and passes its six cases.
+
+The sampler of round sp69 (a stack walk in a SIGPROF handler) on inq's steepest_descent, one host thread, knob on: 12 of 12 runs crash
+with a frame pointer in run_wave_blocks alone; 12 of 12 pass with frame pointers in run_wave_blocks, run_round_blocks and run_round_live
+(the final library). Knob off and the base: pass.
+
+Bench at all host threads with the knob on (`bench.py --threads all`, 82 rows, 7 runs): every workload's own check passes.
