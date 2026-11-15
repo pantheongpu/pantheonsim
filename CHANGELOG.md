@@ -7,6 +7,28 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Math functions (issue #664, second group): a test set that compares a run of the math library with another run line by
+  line, simulator against simulator or against a card (`tools/numerics/`: 44 functions in both precisions over published
+  worst cases, edges and random arguments; the worked examples of NVIDIA's floating-point paper; the Varity GPU paper's
+  cases and generator), a card script (`tools/numerics/card-run.sh`) and what the published results say a card gives where
+  the simulator gives something else ([docs/numerics/math-functions.md](docs/numerics/math-functions.md)). No card was run
+  and `MUFU` is unchanged. Two things it found change results:
+  - **A program run from its PTX now gives the bits it gives from its SASS** in the math library. The PTX interpreter
+    computed `sin.approx`, `cos.approx`, `ex2.approx` and `lg2.approx` without `.ftz`, `rcp.approx.ftz.f64`,
+    `rsqrt.approx.ftz.f64` and `rsqrt.approx.f64` as the function at host precision; ptxas makes other code of each, and
+    the same kernel differed between the engines: `rsqrt(double)` on 13 % of arguments and `hypot(double)` on 10 % (by 1 or
+    2 ulp), `asinh(double)` on 0.7 %, `exp2f` on subnormal results, `cbrtf` on subnormal arguments, and `sinf`, `cosf` and
+    `tanf` under `-use_fast_math` on most arguments. The interpreter now forms them as ptxas does. A program that runs from
+    SASS (the default wherever the binary carries SASS the device can run) is unchanged, bit for bit; a program that runs
+    from PTX and calls these functions changes in its last bits, or, for the fast-math sine and cosine of a large argument,
+    altogether, to what its SASS gives. Left as they were: the NaN `erf(double)` returns for a NaN and `hypot(double)` for a
+    signaling one (payloads only).
+  - **AMD, wave32 (RDNA) kernels built `-O0`**: a stack slot stored through the private segment buffer and loaded through a
+    flat pointer was not the same slot (the buffer's index stride was 64 lanes for every kernel; it is the wave's size), so
+    unoptimized code that passes the address of a local to a function read another slot or stopped on an invalid address:
+    on the rx6800 profile 441 of 900 results of the Varity programs did not run and 10 were wrong. Optimized code and
+    wave64 kernels are unchanged.
+
 - Host-GPU modes (`VGPU_HOST_GPU=exact|turbo`, experimental): a launch whose blocks each take longer than the wait for its sample is no longer
   kept in the simulator for want of an answer ([round sp75](docs/perf-design/rounds/11-rounds-sp36-sp41.md#round-sp75-host-gpu-a-block-that-outlasts-the-wait),
   [design](docs/perf-design/12-host-gpu-turbo.md), section 12; pantheonsim #656, #657). The forked copy that times a launch's first blocks now stops
