@@ -5139,6 +5139,12 @@ set_tests_properties(e2e_async_launch_events PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 600)
+# cudaEventDestroy right after cudaStreamWaitEvent must not release the waiting stream early (Ta-Cuda/tacuda#5).
+add_test(NAME e2e_async_wait_destroyed_event COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_async_wait_destroyed_event.sh)
+set_tests_properties(e2e_async_wait_destroyed_event PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 600)
 add_test(NAME e2e_runtime_conformance COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_runtime_conformance.sh)
 set_tests_properties(e2e_runtime_conformance PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"

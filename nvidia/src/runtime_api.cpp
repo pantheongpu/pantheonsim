@@ -7019,7 +7019,9 @@ struct RtEvent {
   std::vector<void*> capture_deps;   // the capture's nodes, as opaque pointers here
 };
 std::mutex g_event_mu;
-std::unordered_map<cudaEvent_t, std::unique_ptr<RtEvent>> g_events;
+// Shared, so a record or wait queued on a stream keeps the event's state after cudaEventDestroy took its handle out of this map:
+// destroying an event right after cudaStreamWaitEvent is legal, and the wait still holds the stream back until the event's work is done.
+std::unordered_map<cudaEvent_t, std::shared_ptr<RtEvent>> g_events;
 }  // namespace
 // The capture side of events, defined with the graph machinery at file scope --
 // declared outside this anonymous namespace so the declarations and the
@@ -7036,6 +7038,10 @@ namespace {
 RtEvent* find_event(cudaEvent_t e) {  // caller holds g_event_mu
   auto it = g_events.find(e);
   return it == g_events.end() ? nullptr : it->second.get();
+}
+std::shared_ptr<RtEvent> find_event_ref(cudaEvent_t e) {  // caller holds g_event_mu
+  auto it = g_events.find(e);
+  return it == g_events.end() ? nullptr : it->second;
 }
 }  // namespace
 
@@ -7092,6 +7098,7 @@ struct LaneItem {
   cudaHostFn_t fn = nullptr;
   void* user = nullptr;
   cudaEvent_t ev = nullptr;
+  std::shared_ptr<RtEvent> ref;            // Record, Wait: the event's state, held from the queueing call (the handle may be destroyed first)
   std::vector<std::pair<Lane*, uint64_t>> deps;   // Barrier: lanes and the position each had to reach
 };
 std::condition_variable g_async_cv;
@@ -7215,16 +7222,13 @@ void lane_worker(Lane* l) {
         g_deferred_pending.fetch_sub(1);
         break;
       case LaneItem::Record:
-        if (RtEvent* r = find_event(it.ev)) {
+        if (RtEvent* r = it.ref.get()) {
           r->when = std::chrono::steady_clock::now();
           if (r->outstanding) --r->outstanding;
         }
         break;
       case LaneItem::Wait:
-        g_async_cv.wait(lk, [&] {
-          const RtEvent* r = find_event(it.ev);
-          return !r || r->outstanding == 0;
-        });
+        g_async_cv.wait(lk, [&] { return !it.ref || it.ref->outstanding == 0; });
         break;
       case LaneItem::Barrier:
         g_async_cv.wait(lk, [&] {
@@ -7465,6 +7469,7 @@ static bool async_record_locked(RtEvent* r, cudaEvent_t e, cudaStream_t stream, 
   LaneItem it;
   it.kind = LaneItem::Record;
   it.ev = e;
+  it.ref = find_event_ref(e);
   ++r->outstanding;
   lane_push(stream, blocking, std::move(it));
   return true;
@@ -7475,11 +7480,12 @@ static void async_wait_event_on_stream(cudaStream_t stream, cudaEvent_t e) {
   if (!g_async_used.load(std::memory_order_relaxed)) return;
   const bool blocking = stream_is_blocking(stream);
   std::lock_guard<std::mutex> lock(g_event_mu);
-  const RtEvent* r = find_event(e);
+  std::shared_ptr<RtEvent> r = find_event_ref(e);
   if (!r || r->outstanding == 0) return;
   LaneItem it;
   it.kind = LaneItem::Wait;
   it.ev = e;
+  it.ref = std::move(r);
   lane_push(stream, blocking, std::move(it));
 }
 
