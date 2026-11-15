@@ -207,6 +207,45 @@ for ops in ['v[2:3], v[4:5], v[6:7], v[8:9]', 'v[2:3], -v[4:5], v[6:7], |v[8:9]|
     add('v_fma_f64 ' + ops)
 add('v_fmac_f64_e32 v[2:3], v[4:5], v[6:7]')
 
+# ---- the 64-bit forms with row handlers (Round sp74): operand kinds, modifiers, register pairs that overlap, every comparison
+# (in the committed files these lines are at the end, after the two-address LDS forms, which were appended there too: the order of a file
+# decides only which shard of the test runs a shape)
+for op in ['v_min_f64', 'v_max_f64']:
+    for ops in ['v[2:3], v[2:3], v[4:5]', 'v[2:3], v[1:2], v[3:4]', 'v[0:1], v[2:3], 0.5', 'v[0:1], |v[2:3]|, |v[4:5]|', 'v[0:1], v[2:3], -v[2:3]',
+                'v[0:1], v[2:3], v[2:3]', 'v[0:1], 0, v[4:5]', 'v[0:1], -s[2:3], v[4:5]', 'v[254:255], v[252:253], v[250:251]']:
+        add('%s %s' % (op, ops))
+for op in ['v_rcp_f64', 'v_sqrt_f64', 'v_floor_f64', 'v_ceil_f64', 'v_trunc_f64', 'v_rndne_f64']:
+    for ops in ['v[2:3], v[2:3]', 'v[2:3], v[1:2]', 'v[2:3], v[3:4]']:
+        add('%s_e32 %s' % (op, ops))
+for ops in ['v[0:1], v[2:3], 3, v[4:5]', 'v[0:1], v[2:3], 2, s[4:5]', 'v[0:1], s[2:3], 4, v[4:5]', 'v[0:1], v[2:3], v4, v[4:5]', 'v[0:1], v[2:3], s4, 100',
+            'v[0:1], v[2:3], 5, v[4:5]', 'v[0:1], v[2:3], 7, v[4:5]', 'v[2:3], v[2:3], 1, v[2:3]', 'v[2:3], v[1:2], 1, v[3:4]', 'v[0:1], v[2:3], 0, -1']:
+    add('v_lshl_add_u64 ' + ops)
+for op in ['v_lshlrev_b64', 'v_lshrrev_b64', 'v_ashrrev_i64']:
+    for ops in ['v[0:1], v2, v[4:5]', 'v[0:1], 13, v[4:5]', 'v[0:1], s2, v[4:5]', 'v[0:1], v2, s[4:5]', 'v[2:3], v3, v[2:3]', 'v[2:3], v2, v[3:4]',
+                'v[0:1], 63, v[4:5]', 'v[0:1], v2, 0x12345']:
+        add('%s %s' % (op, ops))
+for t in ['f', 'lt', 'eq', 'le', 'gt', 'lg', 'ge', 'o', 'u', 'nge', 'nlg', 'ngt', 'nle', 'neq', 'nlt', 'tru']:
+    for ops in ['vcc, v[2:3], v[4:5]', 's[10:11], -v[2:3], |v[4:5]|', 'vcc, 1.0, v[4:5]', 'vcc, s[2:3], v[4:5]', 'vcc, v[2:3], v[2:3]', 'vcc, v[2:3], 0',
+                'vcc, v[2:3], v[3:4]']:
+        add('v_cmp_%s_f64 %s' % (t, ops))
+    add('v_cmpx_%s_f64 vcc, v[2:3], v[4:5]' % t)
+for t in ['f', 'lt', 'eq', 'le', 'gt', 'ne', 'ge', 't']:
+    for ty in ['i64', 'u64']:
+        for ops in ['vcc, v[2:3], v[4:5]', 'vcc, s[2:3], v[4:5]', 'vcc, 5, v[4:5]', 'vcc, -1, v[4:5]', 's[10:11], v[2:3], s[4:5]', 'vcc, v[2:3], v[3:4]',
+                    'vcc, v[2:3], v[2:3]']:
+            add('v_cmp_%s_%s %s' % (t, ty, ops))
+        add('v_cmpx_%s_%s vcc, v[2:3], v[4:5]' % (t, ty))
+for ops in ['v[2:3], v[2:3], v3', 'v[0:1], v[2:3], -3', 'v[0:1], 1.5, v4', 'v[0:1], v[2:3], 0']:
+    add('v_ldexp_f64 ' + ops)
+for op in ['v_cvt_f64_i32', 'v_cvt_f64_u32']:
+    for ops in ['v[0:1], v1', 'v[0:1], s1', 'v[0:1], 7', 'v[1:2], v1', 'v[0:1], -1', 'v[1:2], v2']:
+        add('%s_e32 %s' % (op, ops))
+for op in ['v_frexp_exp_i32_f64', 'v_cvt_f32_f64', 'v_cvt_i32_f64', 'v_cvt_u32_f64']:
+    for ops in ['v2, v[2:3]', 'v3, v[2:3]', 'v1, 0']:
+        add('%s_e32 %s' % (op, ops))
+add('v_frexp_mant_f64_e32 v[2:3], v[2:3]')
+add('v_frexp_mant_f64_e32 v[2:3], v[1:2]')
+
 for ops in ['v1, a2', 'v255, a255', 'v1, a0']:
     add('v_accvgpr_read_b32 ' + ops)
 for ops in ['a1, v2', 'a255, v255', 'a1, s2', 'a1, 7', 'a1, 1.0', 'a1, 0x12345678', 'a1, exec_lo']:
