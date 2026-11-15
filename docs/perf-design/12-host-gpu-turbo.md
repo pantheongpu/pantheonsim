@@ -18,6 +18,13 @@ Turbo mode sends those kernels to the card as well. What the program then gets i
 real hardware, and which is close to the simulator's but not its bits. That is a different promise from exact mode's, so it is a different
 mode, and exact mode is byte for byte what it was: the same set, defaults, decisions and summary text (a unit test holds a copy of the set).
 
+Since 2026-11-15 the simulator models the approximate-math unit itself ([numerics/math-functions.md](../numerics/math-functions.md)): each of
+the ten `MUFU` sub-operations gives the card's bits on all 2^32 inputs, measured on an RTX 3060 and an A10G, unless `VGPU_MUFU_EXACT=0`.
+The 4% to 25% above is therefore the distance to the simulator of before the model (and of `VGPU_MUFU_EXACT=0`). Nothing in either mode
+changed with it: exact mode still refuses a kernel with a `MUFU` outside the division and square root idioms, and turbo mode's `mufu` class
+is what it was. Widening the exact set to `MUFU` kernels is open: it needs a card run with `VGPU_HOST_GPU_VERIFY=all` on the cards the model
+was measured on, and a rule for the cards where it is only inferred.
+
 ## 2. The classes
 
 Every instruction of a kernel is put in one class, once per kernel (`turbo_class` in `include/vgpu/host_gpu.hpp`), and a kernel is
@@ -688,7 +695,7 @@ with the switch off. If the fork does harm on the card, `sample_started` in `src
 ## 14. What is next
 
 From Round sp59, less what section 8 does: a start-cost account that weighs the gain for programs of many short launches (they lose 0.1 to 0.2 s
-or gain nothing; section 11 is a first step: it counts the launches a kernel has had, not yet what the card saved on them); the card's fixed-point `MUFU.SIN` / `MUFU.COS` in the simulator; `BMMA` in the tensor class and a tensor probe whose sums round;
+or gain nothing; section 11 is a first step: it counts the launches a kernel has had, not yet what the card saved on them); the card's fixed-point `MUFU.SIN` / `MUFU.COS` in the simulator (done 2026-11-15 for every `MUFU` sub-operation, section 1); `BMMA` in the tensor class and a tensor probe whose sums round;
 other cards and toolkits.
 
 From Round sp75: a first launch while the driver is up (a trial in the simulator that the card's copy undoes: aidw's second kernel, and every

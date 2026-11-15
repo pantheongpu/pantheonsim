@@ -429,7 +429,8 @@ Still open, each with the reason:
 
 - `tex.grad` on cube textures (the model is in `nvidia/docs/textures.md` and matches the card on 31,083 of
   31,083 fetches with the card's own `MUFU.RCP`, but the simulator's reciprocal is the correctly rounded one and the
-  card's differs by an ulp on 13% of inputs: a table with a quadratic interpolation, not reproduced) and with
+  card's differs by an ulp on 13% of inputs: a table with a quadratic interpolation, not reproduced when this was
+  written; the table is modelled since 2026-11-15, `numerics/math-functions.md`, and `tex.grad` has not been re-measured with it) and with
   `maxAnisotropy` above 1; `tex.2dms`/`tex.a2dms`: CUDA cannot make a multi-sample texture; BC6H and BC7 texture
   objects (the arrays work; see the runtime and driver section).
 - `cvt.rs` to the x4 types: figures 41 and 42 do not say how a and b split their shared random bits;
