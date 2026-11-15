@@ -5200,8 +5200,9 @@ loop (6,100 and 5,984) and the rest are what they were.
 
 Branch `sp75-turbo-first-launch`, on `sp69-hotspot-start` (6cf503d3, the head of PR #645). Tracking: pantheonsim #656 (a single long launch is
 not sent on its first run), #657 (HeCBench aidw: two of four launches kept, 365 s), and the diagnoses of #659 and #662. Design:
-[12-host-gpu-turbo.md](../12-host-gpu-turbo.md), section 12. Data and commands: [`data/sp75/`](../data/sp75/README.md). **No card: everything
-below is server3 with the stand-in driver, and the win itself is `data/sp75/card-run.sh`'s to show.**
+[12-host-gpu-turbo.md](../12-host-gpu-turbo.md), section 12. Data and commands: [`data/sp75/`](../data/sp75/README.md). **Everything
+below but *The card run* is server3 with the stand-in driver; the card run (2026-11-15, one A10G) is
+[`data/sp75/card.md`](../data/sp75/card.md), made with `data/sp75/card-run.sh`.**
 
 **The question.** The summary run of 2026-11-13 (one A10G) left eight programs whose launches the card never got: tf32TensorCoreGemm (208 s),
 bf16TensorCoreGemm (159 s), cudaTensorCoreGemm (16 s), each one launch; MC_SingleAsianOptionP, MC_EstimatePiInlineP, warpAggregatedAtomicsCG,
@@ -5260,10 +5261,46 @@ has run long enough to afford two runs at the cap (6 s).
 
 With `VGPU_HOST_GPU_SAMPLE_BLOCK=0` each is as before (aidw's copy does not answer; the three GEMMs are not sampled).
 
+**The card run** (2026-11-15, one A10G, the rig and the build of the summary run; [`data/sp75/card.md`](../data/sp75/card.md)). The rule
+does on the card what the stand-in said it would.
+
+* **The GEMMs.** In turbo mode tf32TensorCoreGemm goes from 208.97 s to 2.97 s, bf16TensorCoreGemm from 157.15 s to 3.80 s,
+  cudaTensorCoreGemm from 16.05 s to 1.30 s and immaTensorCoreGemm from 3.52 s to 1.19 s (70x, 41x, 12x and 3.0x the simulator), each with
+  its one launch on the card; with the switch off, and in exact mode, each is at the simulator's time. Each launch is sampled by a block
+  stopped at its limit (37 ms for the grids of 160 blocks, 52 and 54 ms for those of 80, under the 60 ms cap on the rig's 4 threads) and sent
+  on an estimate of 0.96 to 1.40 s, 2.4 times what the card path with the start needs: none is near the bar there, immaTensorCoreGemm
+  included. The samples cost 0.09 to 0.11 s.
+* **What the card computed.** Verify runs compared every word the four kernels wrote (42 to 201 million words a program): none differs.
+  The card's tensor GEMMs are the simulator's bit for bit. The harness calls the four turbo outputs `different` for one number, the
+  programs' `TFLOPS:` line, a timing; the programs print nothing of their result.
+* **aidw.** 359.63 s with the switch off (2 of 4 launches on the card) to 193.23 s (3 of 4); over 600 s in the simulator. `AIDW_Kernel` is
+  sent on a block stopped at 15 ms (1.27 s estimated at least, 0.41 s needed); `AIDW_Kernel_Tiled`'s first launch has no sample (`the
+  driver has been started`) and is simulated, 149 s of the 193 s, as expected. Its outputs were not compared (no simulator run to hold
+  them against).
+* **No program slower by the rule was found.** The keep list (17 programs, 3 runs), the six programs with small grids that are not sampled
+  (10 runs: within 0.8 % of their time with the switch off) and the rest of the corpus (115 programs, one run a form: 297.5 s in all
+  against 297.7 s). The differences over 3 % that are not of programs under 0.04 s were measured again: lud (+4.3 % exact, +3.1 % turbo in
+  3 runs) is +1.5 % and -1.9 % in 10, binomial (+4.5 % in one run) -0.1 % in 7, radixSortThrust (+5.0 % in one run; the one sample more
+  that runs no block, 1.7 ms) +1.4 % in 10. **particlefilter_float is not settled**: +5.9 %, +5.6 %, +8.0 % and, over 30 runs, a median
+  of 0.947 s against 0.818 s (means 0.895 s and 0.849 s). Its runs fall in two groups by its clock seed (a launch of 34 or 178 ms), 12 of
+  30 turbo runs and 19 of 30 with the switch off in the fast one, and its logged runs do the same in both forms (one sample, inside the
+  blocks, not bounded; the same launches sent), so no cause in the rule was found.
+* **Launches and outputs.** No program's launches on the card change but by launches at the size rule's edge (hotspot, asyncAllocation,
+  jacobiCudaGraphs, transpose: 1 to 5 launches, as between any two runs); no output differs between the rule and the switch off; no zombie
+  and no process left.
+* **Card CI** passes; `e2e_host_gpu_stub`'s steps 38 to 40 ran under a real nvcc for the first time and pass.
+* **#662.** silu: `silu_forward_kernel2 starts the driver: size rule (sim 7.443 ms, card path with the start 250.457 ms, 0.276 s of
+  eligible launches simulated so far, 5 of this kernel)`, 20 of 50 launches on the card, 0.470 s in the simulator and 0.541 s in turbo
+  mode: the diagnosis above. s3d: `host_gpu_overhead: kept_launches=54 decide_s=0.078120 scan_s=0.077414 after_s=0.000124 kernels=54`
+  with the log on, and 0.327 s in the simulator against 0.357 s in turbo mode without it (10 runs). The scan is all of the deciding, but
+  the line holds the log's own printing (it read 0.070 s on server3, where the program loses 2 ms), so the rig's 30 ms is not placed yet.
+* **The script** ran as written but for time: the four programs over 300 s in the simulator ran apart with a 90 s timeout, and the verify
+  run got a line for the three GEMMs it did not hold. No stage was cut.
+
 **What is not reached, and why it was left.**
 
 * *aidw's second kernel* (about 180 s of the 365 s on the rig): after the first launch the driver is up, a process that holds it is not
-  forked, and the static first-launch rule refuses a grid of 400 blocks. Expected on the card: 3 of 4 launches. A rule for a first launch
+  forked, and the static first-launch rule refuses a grid of 400 blocks. Expected on the card: 3 of 4 launches (measured: 3 of 4, 193 s). A rule for a first launch
   while the driver is up needs something to undo a trial with; the card's own copy of the memory can be that (push what the simulator holds,
   let the simulator run the launch for a while, and if it is long give up the simulator's partial result and run the launch on the card
   from its copy). That is a mechanism, not a rule change, and it cannot be tried without a card. It is also what the first launches after
@@ -5349,7 +5386,7 @@ is simulated, the sampled ones after their sample, of which nothing shows). The 
 admits is not touched (the unit test's frozen copy passes). The counters and digests of the plain simulator were not compared: the mode
 is off under them.
 
-**Not run.** A card (the whole of `card-run.sh`); the full ctest set (the round built the runtime and driver shims and the host-GPU tests;
+**Not run.** A card, on server3 (the whole of `card-run.sh` was run afterwards: *The card run* above); the full ctest set (the round built the runtime and driver shims and the host-GPU tests;
 the engine's change is one branch taken only in a sample's copy); ASan and TSan; a host with more than 3 threads (the limit of a small grid
 grows with the launch's host threads: on the rig's 4, cudaTensorCoreGemm's is 53.5 ms of the 60 ms cap, and on 5 threads or more its grid
 is not sampled; tf32's and bf16's are 37 ms on 4 threads and stay under the cap up to 6).

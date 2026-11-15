@@ -544,7 +544,7 @@ and in the corpus those are the four GEMMs, which do not stay.
 * *aidw's second kernel.* Once the first launch has gone to the card the driver is up, and a process that holds the driver is not forked
   (section 8), so `AIDW_Kernel_Tiled`'s first launch has no sample and the static first-launch rule refuses its grid (400 blocks, under 8 a
   multiprocessor): it is simulated, and its second launch goes by its history. Expected on the card: 3 of 4 launches, about half of the
-  365 s left. What would take it: a trial in the simulator that the card can undo. With the driver up the card holds the memory before the
+  365 s left (measured: 3 of 4, 193 s of 360 s). What would take it: a trial in the simulator that the card can undo. With the driver up the card holds the memory before the
   launch once the simulator's chunks are pushed, so a launch the simulator has run for a while can be given up and run on the card from that
   copy. Not built.
 * *`initRNG` and the other launches under the floor in a young process.* The first launch comes 5 ms into the process and counts 9.5 ms; a
@@ -564,9 +564,17 @@ estimate does not repay the card path and the driver start`, `size rule: the est
 after_s=.. kernels=..` what the mode's own work cost for the launches that stayed (deciding them, of which scanning each kernel's code once,
 and learning from them afterwards).
 
-**Not run on a card.** The round had none. On server3, against the stand-in driver, the three GEMMs and aidw's first launch are sent at their
+**On a card** (2026-11-15, one A10G, the summary run's rig and build: [data/sp75/card.md](data/sp75/card.md)). In turbo mode
+tf32TensorCoreGemm goes from 209 s to 3.0 s, bf16TensorCoreGemm from 157 s to 3.8 s, cudaTensorCoreGemm from 16.1 s to 1.3 s and
+immaTensorCoreGemm from 3.5 s to 1.2 s, each launch sent on a block stopped at its limit (37 to 54 ms) with an estimate 2.4 times what the
+card path needs, and aidw from 360 s to 193 s with 3 of 4 launches on the card. Verify runs found no word of the four GEMMs' results that
+differs between the card and the simulator. The keep list, the small grids and the rest of the corpus (115 programs) show no program
+slower by the rule; Rodinia particlefilter_float, whose time depends on its clock seed, is not settled (0.947 s against 0.818 s, medians
+of 30 runs, with the same decisions in both forms).
+
+**On server3** the round had no card. There, against the stand-in driver, the three GEMMs and aidw's first launch are sent at their
 first launch (their estimates: 0.95, 1.37, 1.42 and 1.9 s at the least, against 5.3, 83, 57 and 78 s taken; the card path needs 0.81, 1.14,
-1.15 and 0.5 s of them), so is immaTensorCoreGemm's (which the summary run did not hold), and the stand-in test's steps 38 to 40 pin it. What the card makes of them is [data/sp75/card-run.sh](data/sp75/card-run.sh)'s to show; the numbers, the census over the corpus
+1.15 and 0.5 s of them), so is immaTensorCoreGemm's (which the summary run did not hold), and the stand-in test's steps 38 to 40 pin it. What the card made of them is above ([data/sp75/card-run.sh](data/sp75/card-run.sh) is the run); the numbers, the census over the corpus
 and the tests are in [Round sp75](rounds/11-rounds-sp36-sp41.md#round-sp75-host-gpu-a-block-that-outlasts-the-wait).
 
 ## 13. What is next

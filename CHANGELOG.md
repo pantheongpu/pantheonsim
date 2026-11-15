@@ -14,7 +14,10 @@ release says what runs and what it produces, never how fast a real GPU would run
   unchanged. A grid of 2 to 255 blocks whose kernel has no loop the sample inside the blocks follows is sampled the same way when its static
   estimate reaches 30 ms. Against the stand-in driver the first launch of HeCBench aidw (78 s in the simulator on the build machine) and the
   single launches of the CUDA Samples cudaTensorCoreGemm, tf32TensorCoreGemm and bf16TensorCoreGemm (5 to 83 s) are sent to the card;
-  **no card run has measured it yet** (`docs/perf-design/data/sp75/card-run.sh` is the run). aidw's second kernel is still simulated once (no
+  on one A10G (`docs/perf-design/data/sp75/card.md`, the run of `card-run.sh`) turbo mode takes tf32TensorCoreGemm from 209 s to 3.0 s,
+  bf16TensorCoreGemm from 157 s to 3.8 s, cudaTensorCoreGemm from 16.1 s to 1.3 s and immaTensorCoreGemm from 3.5 s to 1.2 s, the card's
+  results bit for bit the simulator's in verify runs, and aidw from 360 s to 193 s with 3 of its 4 launches on the card; no program of the
+  corpus was found slower by the rule (Rodinia particlefilter_float, whose time depends on its clock seed, is not settled). aidw's second kernel is still simulated once (no
   sample is taken while the driver is up), and launches under the sampling floor in a young process (MC_SingleAsianOptionP,
   MC_EstimatePiInlineP, warpAggregatedAtomicsCG, Rodinia lavaMD) are not reached. `VGPU_HOST_GPU_SAMPLE_BLOCK=0` is the rule before. The
   plain simulator and the bits of exact mode are unchanged.

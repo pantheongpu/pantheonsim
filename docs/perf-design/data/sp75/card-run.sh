@@ -2,6 +2,7 @@
 # Round sp75, the card part: run on the rig (one A10G), from the root of the source tree, with the corpora in ~/corp
 # (tools/bench/real/pack_corpora.sh's layout: the sm_86 binaries built with nvcc 13.0 and -cudart shared, the CUDA Samples under ~/corp/samples).
 # Nothing of this was run when the round was written: the round had no card. What each stage should show is in README.md, "The card run".
+# Run on 2026-11-15 (card.md), the stages after `build` with SP75_BUILD set to the summary run's Release build.
 #   docs/perf-design/data/sp75/card-run.sh <stage> [out dir]        stages: build decisions changed keep small rest, and all (in that order)
 # Forms: turbo and exact are this round's rule; turbob0 and exactb0 the same build with VGPU_HOST_GPU_SAMPLE_BLOCK=0, the rule before it (a sample's
 # copy runs whole blocks however long, and a grid under 256 blocks with no followed loop is not sampled). The harness interleaves them, run by run.
@@ -14,6 +15,9 @@ mkdir -p "$out"
 export PATH=/usr/local/cuda-13.0/bin:$PATH NVCC=/usr/local/cuda-13.0/bin/nvcc
 H="python3 tools/bench/hostgpu/run.py --build $build --corp $corp --gpu nvidia/a10g"
 S=$corp/samples/Samples
+# The programs whose simulator run passes 300 s on the rig, and the seconds their runs get (half an hour of timeouts otherwise).
+slow=aligned-types-cuda,babelstream-cuda,base64e-cuda,binomial-cuda
+slow_timeout=${SP75_SLOW_TIMEOUT:-90}
 # One logged turbo run of a program, cut when it has run `cut` seconds: the mode's lines (the decisions are made before a launch runs).
 logged() {   # <tag> <seconds> <cwd> <program and arguments...>
   local tag=$1 secs=$2 cwd=$3
@@ -59,14 +63,21 @@ changed|all)
       tail -1 "$out/aidw-$f.err" | tee -a "$out/aidw.txt"
     done
   fi
-  # a verify run of the three tensor programs (every launch on both sides: what the card's GEMM is against the simulator's)
+  # a verify run of the tensor programs (every launch on both sides: what the card's GEMM is against the simulator's). The programs print
+  # nothing of their result (the Samples' own check is compiled out), and their TFLOPS line, a timing, makes every card output "different".
   $H --corpora samples --programs cudaTensorCoreGemm --runs 1 --forms sim,verify --timeout 600 --json "$out/tensor-verify.json" --md "$out/tensor-verify.md" 2>&1 | tail -4
+  # the other three: the harness wants a sim form, which is killed after a second here (the verify run simulates the launch itself: 3.5 to 210 s)
+  $H --corpora samples --programs immaTensorCoreGemm,bf16TensorCoreGemm,tf32TensorCoreGemm --runs 1 --forms sim,verify --timeout 1 --verify-timeout 600 \
+     --json "$out/tensor-verify3.json" --md "$out/tensor-verify3.md" 2>&1 | tail -6
   ;;&
 keep|all)
   # The keep list of the integration of sp64-sp68 (data/sp69/README.md, run 3) and the other programs with a sampled launch (data/sp75/census.md):
   # their samples are now of bounded blocks. No program more than 3 % slower than its b0 form; outputs as they were.
-  $H --corpora polybench,rodinia,hecbench --programs 2MM,3MM,CORR,COVAR,FDTD-2D,LU,SYR2K,SYRK,JACOBI2D,gaussian,lud,particlefilter_float,atomicAggregate-cuda,atomicPerf-cuda,black-scholes-cuda,binomial-cuda,shmembench-cuda \
+  $H --corpora polybench,rodinia,hecbench --programs 2MM,3MM,CORR,COVAR,FDTD-2D,LU,SYR2K,SYRK,JACOBI2D,gaussian,lud,particlefilter_float,atomicAggregate-cuda,atomicPerf-cuda,black-scholes-cuda,shmembench-cuda \
      --forms sim,exact,exactb0,turbo,turbob0 --runs 3 --long-secs 20 --json "$out/keep.json" --md "$out/keep.md" 2>&1 | tee "$out/keep.txt" | tail -24
+  # binomial apart, its runs killed at $slow_timeout seconds: the simulator and exact mode take over 600 s, turbo 1.4 s
+  $H --corpora hecbench --programs binomial-cuda --forms sim,exact,exactb0,turbo,turbob0 --runs 1 --long-secs 20 --timeout "$slow_timeout" \
+     --json "$out/keep-binomial.json" --md "$out/keep-binomial.md" 2>&1 | tee "$out/keep-binomial.txt" | tail -6
   ;;&
 small|all)
   # The programs of the corpus with a launch on a grid under 256 blocks of a kernel with a loop and no followed loop (census.md): none but the
@@ -76,8 +87,11 @@ small|all)
   ;;&
 rest|all)
   # The rest of the corpus, one run a form, turbo against turbob0.
-  $H --corpora polybench,rodinia,hecbench,samples --skip tf32TensorCoreGemm,bf16TensorCoreGemm,cudaTensorCoreGemm,immaTensorCoreGemm,aidw-cuda,atomicCost-cuda,fpdc-cuda,zerocopy-cuda,GRAMSCHM \
+  $H --corpora polybench,rodinia,hecbench,samples --skip tf32TensorCoreGemm,bf16TensorCoreGemm,cudaTensorCoreGemm,immaTensorCoreGemm,aidw-cuda,atomicCost-cuda,fpdc-cuda,zerocopy-cuda,GRAMSCHM,$slow \
      --runs 1 --forms sim,turbo,turbob0 --timeout 300 --json "$out/rest.json" --md "$out/rest.md" 2>&1 | tee "$out/rest.txt" | tail -30
+  # the four slow programs (turbo: 1.4 to 13 s) apart, their runs killed at $slow_timeout seconds
+  $H --corpora hecbench --programs "$slow" --runs 1 --forms sim,turbo,turbob0 --timeout "$slow_timeout" \
+     --json "$out/rest-slow.json" --md "$out/rest-slow.md" 2>&1 | tee "$out/rest-slow.txt" | tail -8
   { echo "zombies: $(ps -eo stat= | grep -c '^Z')"; echo "processes of the corpus left: $(ps -eo args= | grep -c "^$corp/")"; } | tee "$out/leftover.txt"
   ;;
 esac

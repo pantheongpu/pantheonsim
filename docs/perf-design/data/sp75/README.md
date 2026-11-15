@@ -5,7 +5,7 @@ The design is section 12 of [../../12-host-gpu-turbo.md](../../12-host-gpu-turbo
 
 Everything here was built and run on server3 (Ryzen 7 PRO 8840U, GCC 13.3, `Release`, `-Werror`, no LTO, `VGPU_THREADS=3`, profile
 `nvidia/a10g`), against the stand-in driver (`nvidia/tests/e2e/host_gpu_stub_driver.c`). **server3 has no card: nothing in this directory is a
-card result.** Builds and runs held the machine's build lock, `nice -n 19`, `-j3`; another session used the machine at the same time, so wall
+card result but [card.md](card.md), the card run of 2026-11-15 (one A10G).** Builds and runs held the machine's build lock, `nice -n 19`, `-j3`; another session used the machine at the same time, so wall
 times here are to within a few percent at best. The corpus is the sm_86 binaries of `tools/bench/real/pack_corpora.sh` (nvcc 13.0). For the
 stand-in test the compiler part of the dev machine's CUDA 13.0 toolkit was copied into the round's scratch directory, named with `VGPU_NVCC`,
 and deleted with it (as in Round sp69).
@@ -20,7 +20,8 @@ and deleted with it (as in Round sp69).
 | `mutants.py`, `mutants.txt` | mutants of the rule in the two headers, against `tests/unit/test_host_gpu_logic.cpp` |
 | `e2e-mutants.sh`, `mutants.txt` | mutants of the engine's part loop, the copy's answer, the mode's plan and switch, against `nvidia/tests/e2e/run_host_gpu_stub.sh` |
 | `same-output.py`, `same-output.md` | stdout of programs with the mode off, in exact mode and in turbo mode (stand-in driver), old build against new |
-| `card-run.sh` | **the card run, not yet made**: stages `build`, `decisions`, `changed`, `keep`, `small`, `rest` |
+| `card-run.sh` | the card run: stages `build`, `decisions`, `changed`, `keep`, `small`, `rest` |
+| `card.md` | **the card run, made on 2026-11-15**: what each stage measured on one A10G |
 
 ## Tests on server3
 
@@ -33,9 +34,10 @@ bash docs/perf-design/data/sp75/e2e-mutants.sh src mut-e2e cuda/bin/nvcc    # 6 
 python3 docs/perf-design/data/sp75/same-output.py --corp corp --stub libstubcuda.so --old build-old --new build --programs ...   # 0 different (same-output.md)
 ```
 
-## The card run (`card-run.sh`; one A10G, not yet made)
+## The card run (`card-run.sh`; one A10G; made on 2026-11-15: the results are in [card.md](card.md))
 
-From the root of the tree on the rig, corpora in `~/corp`, build as in `../summary-2026-11-13/README.md`:
+From the root of the tree on the rig, corpora in `~/corp`, build as in `../summary-2026-11-13/README.md` (for the stages after
+`build`: `SP75_BUILD`). The table is what the round expected before the run:
 
 ```
 docs/perf-design/data/sp75/card-run.sh all ~/sp75-out        # or stage by stage: build decisions changed keep small rest
