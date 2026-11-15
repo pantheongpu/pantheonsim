@@ -1,11 +1,13 @@
 # Study 13: a compiled tier for AMD kernels
 
 Status: design, 2026-11-14, with its closure layers partly built behind `VGPU_AMD_BLOCKS=1` (off by default): **blocks** (section 9,
-round sp72), then **memory instructions and waits inside blocks** and **bound integer runs** (section 12, round sp73). Measurements, tests and
-mutants are in *Round sp72* and *Round sp73* ([rounds/11-rounds-sp36-sp41.md](rounds/11-rounds-sp36-sp41.md)); scripts and data in
-`data/sp72/` and `data/sp73/`. Everything was measured on server3 (Ryzen 7 PRO 8840U, 8 cores / 16 threads, g++ 13.3, Release with LTO), one
+round sp72), then **memory instructions and waits inside blocks** and **bound integer runs** (section 12, round sp73); and, in the tier
+itself and so with the knob off too, **row handlers for the 64-bit forms** (section 13, round sp74). Measurements, tests and
+mutants are in *Round sp72*, *Round sp73* and *Round sp74* ([rounds/11-rounds-sp36-sp41.md](rounds/11-rounds-sp36-sp41.md)); scripts and data in
+`data/sp72/`, `data/sp73/` and `data/sp74/`. Everything was measured on server3 (Ryzen 7 PRO 8840U, 8 cores / 16 threads, g++ 13.3, Release with LTO), one
 host thread unless a line says otherwise. Sections 1 to 11 are the design as written in round sp72, on a host shared with other sessions;
-section 12 says what round sp73 built, measured on a quiet host, and where the design's estimates were wrong.
+section 12 says what round sp73 built, measured on a quiet host, and where the design's estimates were wrong; section 13 what round sp74
+did to the tier's handlers for inq, what is left by class, and what that says about milestone 4.
 
 **What "compiled tier" means here.** The AMD engine has two levels today: the interpreter (`amd/src/gcn_exec.cpp`) and the pre-decoded tier
 (`amd/src/gcn_tier.cpp`, on by default: each instruction's handler and operand classes are worked out when it is decoded, and a handler works on
@@ -307,8 +309,9 @@ bench's valu, probe and control rows, "inq" the eight tests of round sp70.
 | 1 | **blocks** (built, round sp72) | loop, inside straight-line runs | measured: 1.06 to 1.36 on arithmetic rows (section 12's table, column *blocks*) | done: same-bits test, mutants, bench counters |
 | 2 | **bound operations**: a block holds an array of `{kernel, row offsets, constant rows}` beside the instruction list; EXEC looked at once per run; the all-lanes forms call the lane kernel on the destination row | decode | **built for the 32-bit integer family (round sp73)**: valu_int 1.14 and 1.11 over blocks alone, p_sdwa 1.09 and 1.10, p_i64 1.07 and 1.04; nothing on inq. Estimated here at 1.15x to 1.35x on arithmetic rows and 1.05x to 1.10x on inq for all families; the float, double, compare and select families are not bound, and section 12 says why binding is the wrong tool for them | same-bits test with every operand kind; a handler family is bound only when its shapes pass |
 | 3 | **longer blocks**: global loads and stores, scalar memory, waits and plain stores as members; a wave goes on in the block it left | the loop around memory instructions | **built (round sp73)**: the `lds` and `mem` rows no longer lose with the knob on (0.99 to 1.02 against the base), smem and p_smem_wide 1.18 to 1.32; inq 1 to 4 % less CPU with the knob on (estimated 1.05x to 1.15x). A taken branch going on into the next block inside the runner was not built: the hint `Inst::next` already makes that step a load and a compare | faults in the middle of a block, the store gate inside a block, turns that end inside a block |
+| 2c | **row handlers for the forms a real program runs most** (the tier's own work, with the knob off too) | decode, rows and lanes of one handler at a time | **built for the 64-bit forms and SDWA (round sp74, section 13)**: p_f64x 2.4x and 2.1x, p_sdwa 1.8x and 1.5x, the bench's 62 rows 1.06 with the knob off; inq's steepest_descent 0.82 of its CPU, initial_guess 0.88, poisson 0.95. Bound binary64 runs (milestone 2 for doubles): measured, nothing, not kept. No handler above 7 % of the library's samples is left | the tier's same-bits test over the forms, mutants |
 | 2b | **fused pairs** written by hand for the hottest adjacent pairs that `VGPU_AMD_BLOCKS_STATS` shows (compare + select, 64-bit shift + or, multiply + add of doubles): lanes outermost for two instructions | one row store and load and one call per pair | 1.05x to 1.15x where the pairs are; only if layer 4 is not started | per pair, against the two handlers |
-| 4 | **generated fused runs** (`VGPU_AMD_JIT`, opt-in): C++ per fused run, lanes outermost, EXEC as a blend, NaN staging, compiled by the host compiler with the NVIDIA JIT's compile, cache and promotion machinery; the closure tier runs until the object is there | rows and most of lanes inside fused runs | 3x to 8x on ALU rows warm (ceiling 13x to 22x); inq warm 1.2x to 1.5x, cold a loss | a generated run against the same digest as the handlers; mutants per generated form; cold and warm timings at 1 and 8 threads; never on by default |
+| 4 | **generated fused runs** (`VGPU_AMD_JIT`, opt-in; **the next step for kernels that are arithmetic**, section 13): C++ per fused run, lanes outermost, EXEC as a blend, NaN staging, compiled by the host compiler with the NVIDIA JIT's compile, cache and promotion machinery; the closure tier runs until the object is there | rows and most of lanes inside fused runs | 3x to 8x on ALU rows warm (ceiling 13x to 22x); inq warm 1.2x to 1.5x, cold a loss | a generated run against the same digest as the handlers; mutants per generated form; cold and warm timings at 1 and 8 threads; never on by default |
 | 5 | the default flip of layers 1 to 3 | | | the test plan's last line |
 
 Layers 2 and 3 are independent; 3 matters more for inq (its execute time is 11 to 53 % memory instructions and its blocks are short), 2 more
@@ -391,3 +394,57 @@ row below 0.97 of the base with the knob on.
   block lookup (a load); a chain would save the lookup. Not built.
 * *The trials* were not in the design: it assumed a block always pays once entered. A block entered for one or two instructions costs
   more than the plain steps; the turn-length trial is what makes the knob safe on barrier- and store-heavy kernels.
+
+## 13. Round sp74: the tier's handlers for inq, and what is left
+
+**What was wrong with section 12's reading.** It named `h_f64`, the general binary64 handler, at 13 to 15 % of two tests, and guessed at
+several forms. A build that times each handler by instruction form (round sp74, `data/sp74/forms.md`) found one: `v_max_f64`, 331
+time-stamp ticks a call against 83 for `v_add_f64`, 41 million calls in steepest_descent. The general handler packs each register pair
+into 64-bit lanes, tests for two zeros of opposite sign a lane at a time, runs the kernel, scans for NaNs and unpacks.
+
+**What was built** (`amd/src/gcn_tier.cpp`, its last section; AVX2 hosts): row handlers for `v_min_f64` and `v_max_f64`, the one-input
+functions, every 64-bit comparison (a comparison of doubles is the host's one comparison for its test; of integers, the two rows of words
+eight lanes at a time), `v_lshlrev_b64`, `v_lshrrev_b64` and `v_lshl_add_u64`, the conversions between doubles and 32-bit values,
+`v_frexp_*` and `v_ldexp_f64`, and the SDWA forms of the integer instructions on whole rows; and `v_add_f64`, `v_mul_f64`, `v_fma_f64`
+run only the groups of eight lanes that hold a lane of EXEC where some are off. The rule that keeps the bits: **a row handler does only
+the lanes whose answer is one host instruction's; where a lane that is on is anything else (a NaN, two zeros of opposite sign, a denormal
+in frexp, a result of ldexp that is not a normal number) it writes nothing and calls the handler it replaced.**
+
+| | base | round sp74, knob off | knob on |
+|---|---:|---:|---:|
+| the bench's 62 kernel rows (geometric mean; control 1.004) | 1 | 1.060 | 1.184 (the base with the knob on: 1.115) |
+| p_f64x, MI300X / RX 6800 | 1 | 2.40 / 2.08 | 2.68 / 2.43 |
+| p_sdwa | 1 | 1.83 / 1.51 | 2.54 / 2.21 |
+| steepest_descent, one host thread, CPU s | 26.0 | 21.2 | 19.9 |
+| initial_guess | 65.4 | 57.2 | 55.3 |
+| poisson | 116.2 | 110.8 | 107.1 |
+| ks_hamiltonian | 26.4 | 25.9 | 25.5 |
+
+**Measured and not kept.** Bound binary64 runs inside blocks (milestone 2 for doubles): valu_f64 1.09 before and after, steepest_descent
+the same; what binding removes of `h_f64r` is the operand kinds, and the kernel, its NaN mask and the copy of two rows are its time. A
+pair's lanes kept in the order the words interleave, without the moves across the halves of a vector: 4 % slower in the kernel of add,
+multiply and fma, for a reason not found. The groups-of-lanes rule with every lane on: 3 % slower on valu_f64.
+
+**What is left** (samples of the final library, knob off, shares of the whole process; `data/sp74/profile.md`):
+
+| test | outside the library | loop | decode | rows | lanes | mem | interp | other |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| steepest_descent | 7 % | 29 % | 24 % | 8 % | 14 % | 7 % | 4 % | 5 % |
+| initial_guess | 37 % | 18 % | 16 % | 5 % | 10 % | 7 % | 5 % | 2 % |
+| poisson | 43 % | 14 % | 14 % | 3 % | 8 % | 10 % | 4 % | 5 % |
+| ks_hamiltonian | 61 % | 6 % | 8 % | 2 % | 6 % | 11 % | 3 % | 4 % |
+
+* No handler is above 7 % of the library's samples any more (`h_ds` 7.0 %, `h_dminmax_rows` 6.1 %, `h_cmp64_rows` 3.9 % in
+  steepest_descent; `h_f64r` 7.3 % in poisson). More closure-tier work is worth 1 to 3 % of a test a handler.
+* The loop is the largest class, and blocks take a fifth to a third of it (1.3 of 6.0 s in steepest_descent, 4.6 of 15.1 s in poisson):
+  a block still calls a handler through a pointer for each instruction, 4.0 ns an instruction.
+* Loop, decode and rows, which a generated fused run removes inside the run, are 61 % of steepest_descent and 39, 30 and 16 % of the
+  others; the guest's arithmetic is 14, 10, 8 and 6 %. With the share of instructions that run in blocks today (76, 19, 72, 80 %) and
+  half of the three classes gone there, the tests are 1.3, 1.04, 1.12 and 1.07 times as fast; all of it gone, 1.9, 1.08, 1.28 and 1.15.
+
+**So milestone 4 is next, and what it is good for is narrower than section 10 says.** Generated fused runs are the lever for kernels
+that are arithmetic: steepest_descent's kind and the bench's ALU rows. They should start with the hottest blocks only and need a cache
+that outlives the process (inq's tests run 20 to 110 s with 860 to 3,650 blocks each). For initial_guess the lever is blocks for
+work-groups with barriers (a fifth of its instructions run in blocks); for poisson and ks_hamiltonian it is the memory path, and 43 and
+61 % of their CPU is not the simulator's. Section 10's "inq warm 1.2x to 1.5x" holds for one test of the four measured.
+

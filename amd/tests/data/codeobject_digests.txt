@@ -71,6 +71,7 @@ data/asm_mods.gfx90a.o	4699c994e9b729f1
 data/asm_mods.gfx942.o	e907be3cabedda36
 data/asm_mulhi.gfx942.o	43ad510470faf4ad
 data/asm_nan.gfx1030.o	d69615257b221843
+data/asm_nan2.gfx1030.o	aa65b9bf41c31dbe
 data/asm_permlane.gfx1100.o	6768595450bd87c
 data/asm_permute_exec.gfx942.o	6ebd1555fdb9b13c
 data/asm_quad.gfx942.o	b7ea0876449944cd
@@ -262,6 +263,8 @@ hipcc/mfma_broadcast.gfx942#0:gfx942	d7ce841439ee510b
 hipcc/mfma_broadcast.gfx950#0:gfx950	2bfbfe5aa648364e
 hipcc/mfma_modes.gfx942#0:gfx942	db22328cbe51e32d
 hipcc/mfma_modes.gfx950#0:gfx950	9d264e22a2743fa5
+hipcc/mfma_numerics.gfx90a.o	b57868c4d0985804
+hipcc/mfma_numerics.gfx942.o	86ea9a4160b5094a
 hipcc/modules_kernel.generic.co:gfx9-4-generic	51bb7a02b7aa4e2
 hipcc/numerics.flush.gfx942#0:gfx942	57dd41e43336221c
 hipcc/numerics.gfx942#0:gfx942	a9c9f5611a7ea449

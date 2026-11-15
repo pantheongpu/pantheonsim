@@ -187,6 +187,13 @@ echo "wrote $(pwd)/ops.gfx942.o and its listing ($(wc -l < ops.gfx942.dis) instr
 "$rocm/lib/llvm/bin/llvm-objdump" -d --mcpu=gfx942 wmma.gfx942.o |
   sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > wmma.gfx942.dis
 echo "wrote $(pwd)/wmma.gfx942.o and its listing ($(wc -l < wmma.gfx942.dis) instructions)"
+# The binary16 and bfloat16 forms with the accumulator read from memory, and the FTTN paper's GEMM, for gfx90a (an MI250X, whose
+# sums of these forms the paper describes) and gfx942 (which keeps the earlier sum): amd/tests/unit/test_cdna2_matrix.cpp.
+for arch in gfx90a gfx942; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch --offload-device-only --no-gpu-bundle-output ${ROCWMMA_INCLUDE:+-I"$ROCWMMA_INCLUDE"} \
+    -c mfma_numerics.cpp -o mfma_numerics.$arch.o
+done
+echo "wrote $(pwd)/mfma_numerics.gfx90a.o and mfma_numerics.gfx942.o"
 
 # Memory-test patterns (walking bits, address in address, checkerboard, moving
 # inversions, seeded random, block copies, strides) for each architecture the

@@ -8,6 +8,41 @@ release says what runs and what it produces, never how fast a real GPU would run
 ## Unreleased
 
 - NVIDIA runtime: `cudaStreamWaitEvent` on an event that is still pending keeps the stream waiting after `cudaEventDestroy` of that event, as on a card. A wait (and a queued record) used to look the event up by its handle when the stream's worker reached it, found it destroyed and took it for complete, so the waiting stream ran early. This is what made Ta-Cuda's batch tests (tacuda#5) fail now and then under the default asynchronous launches and pass with `VGPU_ASYNC_LAUNCH=0`. The queued item now holds the event's state itself.
+- AMD engine, the tier's handlers for double-precision and 64-bit integer instructions ([round sp74](docs/perf-design/rounds/11-rounds-sp36-sp41.md),
+  [design](docs/perf-design/13-amd-compiled-tier.md), section 13). On hosts with AVX2, with `VGPU_AMD_BLOCKS` off or on:
+  - `v_min_f64` and `v_max_f64`, `v_rcp_f64`, `v_sqrt_f64` and the rounding instructions, the 64-bit comparisons (`v_cmp_*_f64`, `_i64`,
+    `_u64`), `v_lshlrev_b64`, `v_lshrrev_b64`, `v_lshl_add_u64`, the conversions between doubles and 32-bit values, `v_frexp_*_f64` and
+    `v_ldexp_f64` work on the register pairs' rows instead of gathering them into 64-bit lanes; the SDWA forms of the integer instructions
+    work on whole rows. Results are the same bits, a NaN's, a signed zero's and a denormal's included: a lane the row form does not do
+    sends the instruction to the handler it had.
+  - `v_add_f64`, `v_mul_f64` and `v_fma_f64` in a wave with lanes off run only the groups of lanes that are on.
+  - The AMD benchmark's double-precision probe (p_f64x) runs 2.4 times (MI300X) and 2.1 times (RX 6800) as fast, p_sdwa 1.8 and 1.5,
+    its 62 kernel rows 1.06 in the geometric mean (1.18 with `VGPU_AMD_BLOCKS=1`); no row is more than 3 % slower beyond a control with
+    no change. inq's unit tests on a simulated MI300X: eigensolvers::steepest_descent uses 18 % less CPU, ground_state::initial_guess
+    12 %, systems::electrons 7 %, solvers::poisson 4 to 5 %; none is slower.
+- Tensor cores: the sum now follows the device, and more devices have a measured one ([docs/matrix-numerics.md](docs/matrix-numerics.md),
+  issue #664). **Results of f16, bf16 and tf32 `wmma`, `mma.sync` and `HMMA` change on these profiles**; nothing else changes.
+  - Compute capability 7.5 (t4, rtx2080ti), 8.0 (a100*, a30) and 8.9 (l4, l40, l40s, rtx4080, rtx4090, rtx6000-ada) take the RTX 3060's
+    rule (chunks of 8 products, tf32 4, truncating). Measured 2026-11-15: a Tesla T4, an A100-SXM4-40GB, an A10G, an L4 and an L40S print
+    the RTX 3060's probe lines; the A100 also 8,388,608 of 8,388,608 dumped results.
+  - Compute capability 9.0 (h100*, h200*, gh200-480gb) takes an H100's: the same rule in chunks of 16 (tf32 8), cut one bit lower.
+    Measured on an H100 PCIe: 8,388,608 of 8,388,608 dumped results and the card's own probe lines on both engines. The FTTN paper's
+    motivating example now gives 191.875 on the h100 profile, as on the card and in the paper (it gave 0).
+  - The SASS engine chose the sum by the cubin's architecture and the PTX engine by the profile, so the two disagreed for an sm_86
+    binary on the default (h100) profile, and an sm_80 binary on an rtx3060 profile did not sum as the card does. Both ask the device.
+  - Four corners of the rule in the subnormal range are fixed (two confirmed on an RTX 3060, two from the published models): a
+    subnormal f32 result is cut, not rounded; a chunk starting from a zero accumulator has an alignment floor; a subnormal accumulator
+    counts at the smallest normal exponent; a negative sum that rounds to zero is +0.
+  - `VGPU_TC_EXACT=0` still gives the sequential sums everywhere. New values: `force` (the RTX 3060's rule on devices without a measured
+    one) and `published` (Blackwell profiles take the published model, the H100's numbers: no card of ours has run it, so it is off by
+    default). Blackwell and the other unmeasured capabilities keep the sequential sum.
+  - Cost: the H100 rule and every tile with an f16 accumulator run in scalar code; their speed was not measured.
+- AMD: `VGPU_MFMA_CDNA2=fttn` (off by default) makes the mi250x profile's f16 and bf16 matrix instructions sum as the FTTN paper's
+  MI250X row reads (subnormals as zero, one f32 rounding after every product). Paper only: no AMD matrix-core card has been measured,
+  and the default sums of every AMD profile are unchanged.
+- `tools/fttn/`: fetches, builds and runs the FTTN test suite (arXiv 2403.00232) on the simulator and on a card, with the paper's
+  motivating example, a card script, a fitter for tensor-core dumps and a checker that holds the simulator's code to a card's dump.
+
 ## [0.2.1] - 2026-11-15
 
 Fixes and additions since 0.2.0. The two bugs that release shipped are fixed: `shfl.sync` returning 0 for a lane still in a long loop
@@ -81,6 +116,37 @@ GitHub Action. The list below is every entry that was under Unreleased.
     (eigensolvers::steepest_descent 45 to 41 CPU-s).
   - A wave's three- and four-word loads and stores of managed or host memory (`hipMallocManaged`, `hipHostMalloc`) go to memory as one batch
     on one host thread, as its one- and two-word ones did (hamiltonian::ks_hamiltonian with `VGPU_THREADS=1`: 30.7 s to 27.4 s).
+- NVIDIA driver: `cuModuleLoadData`, `cuModuleLoadDataEx`, `cuModuleLoadFatBinary` and `cuModuleLoad` of a fatbin with nothing the
+  GPU runs (SASS only for other architectures, PTX only for newer ones) answer `CUDA_ERROR_NO_BINARY_FOR_GPU` (209), as an RTX 3060
+  does for sm_90-, sm_89- and sm_75-only fatbins and a compute_90 PTX-only one; the simulator answered `CUDA_ERROR_NOT_SUPPORTED` with
+  "fatbin contains no PTX image" (or `CUDA_ERROR_INVALID_PTX`). NVHPC's first load of its SASS-only fatbin (before it links the code
+  with `cuLink*`) now fails as on a real GPU, silently.
+- cuBLAS Ex routines, the type checks in the card's order: in `cublasGemmEx`, its batched and strided forms, A and B of two types
+  are `NOT_SUPPORTED` before a bad argument, and an unknown data type (outside 0..15) is `INVALID_VALUE` after it, as is an unknown
+  compute type in the batched forms; `cublasCsyrkEx`, `cublasCherkEx` and their 3m forms check their arguments first, take n = 0 whatever
+  the types, and answer an unknown type `INVALID_VALUE`. A CUDA 10 compute type (`CUDA_R_32F`, `CUDA_C_32F`, `CUDA_R_64F`, `CUDA_C_64F`,
+  `CUDA_R_16F`, `CUDA_R_32I`) is taken as the card takes it. `cublasGemmBatchedEx` with a negative batch count is
+  `CUBLAS_STATUS_EXECUTION_FAILED` once its other checks pass, success with an empty C, and `INVALID_VALUE` for a null C array;
+  `cublasGemmStridedBatchedEx` with no batch, or a negative count, succeeds once its checks pass. The simulator answered
+  `NOT_SUPPORTED` for every type problem before the arguments, and `INVALID_VALUE` for any negative count.
+- cuSPARSE: `cusparseSpMV` and `cusparseSpMV_bufferSize` take only the fifteen (A, x, y, compute) type combinations an RTX 3060's
+  cuSPARSE 13.0 takes, measured over all 10,000 combinations of the ten types for CSR, CSC and COO and each operation; the others are
+  `CUSPARSE_STATUS_NOT_SUPPORTED` with the card's "type combination ... is not supported" line. The simulator computed 1257 more (a
+  single A with half or double vectors of mixed kinds, int8 into double, ...).
+- NVIDIA runtime: `cudaGetDeviceFlags` answers the current context's flags, or the device's primary context's with
+  `cudaDeviceMapHost` when no context is current, as an RTX 3060 (CUDA 13.0) does (after `cudaSetDeviceFlags`, `cudaInitDevice` with
+  `cudaInitDeviceFlagsAreValid`, or `cuDevicePrimaryCtxSetFlags`); it answered 0, and success for a null pointer. `cudaSetDeviceFlags`
+  now sets the primary context's flags (on an active context too) and makes the context active and current, and refuses a value above
+  0xff or two scheduling modes with `cudaErrorInvalidValue`; it took any value and did nothing.
+- NVIDIA runtime, stream capture: anything a program does on the legacy stream while a blocking stream takes part in a capture is
+  now `cudaErrorStreamCaptureImplicit` (906), is not done, and invalidates every capture a blocking stream takes part in, in every
+  capture mode, as an RTX 3060 (CUDA 13.0) answers: a launch, a copy or fill (the synchronous `cudaMemcpy` and `cudaMemset` too), an
+  event record, `cudaStreamQuery` and `cudaStreamSynchronize`, a host function, a stream-ordered allocation or free, a prefetch, a graph
+  launch or upload, and the stream's flags, priority, id, device and attributes; `cudaStreamIsCapturing(0)` and
+  `cudaStreamGetCaptureInfo(0)` answer it without invalidating. A copy or fill of nothing, an unknown copy kind and a null result
+  pointer are answered first, as on the card. The simulator did all of them (only `cudaStreamWaitEvent` was refused) and built a graph
+  that lacked the work. The simulator's own libraries' runtime calls are not counted. `cudaStreamIsCapturing` with a null status is
+  `cudaErrorInvalidValue` (it answered success). Driver API calls on the legacy stream are not covered yet.
 - NVIDIA driver: a call made after `exit()` has torn the driver down, from the destructor of a library that loaded libcuda itself, now
   answers `CUDA_ERROR_DEINITIALIZED` (4), as NVIDIA's driver does (#646). NVHPC's OpenACC runtime (26.9) dlopens libcuda, retains the primary
   context once and releases it from its destructor, after the driver's own teardown; the simulator answered that release from its destroyed
@@ -316,6 +382,21 @@ GitHub Action. The list below is every entry that was under Unreleased.
   card does. The tier hands gfx1030's NaN results, its `v_div_fixup_f32` and its `v_sin_f32` to the interpreter. New test
   `test_amd_gcn_nan` (`amd/tests/data/asm_nan.s`: 65 f16 and f32 instructions over pairs of 11 special values, IEEE mode on and off,
   every dword against the cards'). test_amd_gcn_same_bits: 31 lines re-recorded (its header lists them).
+- AMD: gfx1030's NaN rule now covers the forms the first measurement left out (an RX 6800 and an RX 6700 XT, which agree; follow-up to
+  pantheonsim #613): the SDWA, DPP and DPP8 forms, `v_fmamk`/`v_fmaak` (f16, f32), the legacy `v_fma_legacy_f32`/`v_fmac_legacy_f32`,
+  the packed `v_pk_add/mul/fma/min/max_f16` (per half), the doubles (`v_add/mul/fma/min/max/div_fixup/ldexp/frexp_mant_f64`, the
+  rounding and reciprocal instructions, `v_cvt_f32_f64`, `v_cvt_f64_f32`) and `v_dot2_f32_f16`/`v_dot2c_f32_f16` (the first NaN of
+  a.lo, b.lo, a.hi, b.hi, c). A narrowing conversion quiets a signalling NaN with IEEE mode off too. `v_med3`/`v_min3`/`v_max3` with
+  a denormal source where MODE flushes input denormals take it as the zero of its sign (the executor kept the denormal). gfx1030's
+  `v_dot2_f32_f16` adds the two products before the addend, as its `v_dot2c_f32_f16` already did (1 * d + 1 * -d + c is c on the
+  card; adding c first lost it). gfx1030 refused `v_mul_legacy_f32_sdwa` (its executor name came out as "v_mul_legac_e32"),
+  `v_fma_legacy_f32` and `v_fmac_legacy_f32`; they run now (a zero factor makes the product +0, the cards' 0 * NaN + -0 is +0).
+  `v_cvt_f32_f64_e64` ignored its source's abs and neg on every target; it applies them (the card does; the guides' VOP3 NEG and ABS
+  fields act on every float source). The tier hands gfx1030's double NaNs back to the interpreter and leaves its float 64-bit
+  conversions, `v_div_fixup_f64` and its packed f16 arithmetic to it. Not modelled: gfx1030's `v_sqrt_f64` of a positive number is
+  an approximation on the card (sqrt(1) is 0x3ff0000004000000). New test `test_amd_gcn_nan2` (`amd/tests/data/asm_nan2.s`: 117
+  slots over pairs of 12 special values, IEEE mode on, off, and on with denormals flushed; every result, the high half of the 16-bit
+  ones included, against the cards'). test_amd_gcn_same_bits: 19 lines re-recorded (its header lists them).
 - AMD: gfx1100 refused eleven instructions as "decoded but not implemented": `v_frexp_mant_f16`, `v_frexp_exp_i16_f16`, `v_sin_f16`,
   `v_cos_f16`, `v_ldexp_f16`, `v_sat_pk_u8_i16`, `v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16`, and the VOP3 `v_ashrrev_i16`, `v_max_i16`
   and `v_min_i16`. They run now, through the code gfx1030 uses (AMD's machine-readable RDNA3 ISA describes each in the same words as its

@@ -4,6 +4,11 @@
 // NaNs, rounding edges). One line per form: an FNV hash of every result's bits. The expected file is an RTX 3060's
 // (nvidia/tests/data/simd_lane_forms.rtx3060.txt); run_simd_lane_forms.sh runs this on the simulator's two engines
 // at every SIMD level and compares, or on a real GPU with --card.
+//
+// -DNO80 leaves out the bf16 and tf32 tensor forms (four lines: wmma_bf16_f32acc and wmma_tf32_f32acc, random and edges), which
+// mma.h does not define below sm_80: the form a Turing card (sm_75) can build. Its other 56 lines are the same lines.
+// -DTC_DUMP also writes the tensor-core part's inputs and results to ./dump/ (with -DTILES=4096: 1,048,576 results a form), the
+// data a sum rule is fitted to and checked against (tools/fttn/fit_tc_model.py, tools/fttn/tc_dump_check.cpp).
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -118,6 +123,7 @@ __global__ void k_wmma(const T* a, const T* b, const AccT* c, AccT* d) {
   wmma::mma_sync(fc, fa, fb, fc);
   wmma::store_matrix_sync(d + t * 256, fc, 16, wmma::mem_row_major);
 }
+#ifndef NO80
 __global__ void k_wmma_tf32(const float* a, const float* b, const float* c, float* d) {
   wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> fa;
   wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> fb;
@@ -129,6 +135,7 @@ __global__ void k_wmma_tf32(const float* a, const float* b, const float* c, floa
   wmma::mma_sync(fc, fa, fb, fc);
   wmma::store_matrix_sync(d + t * 256, fc, 16, wmma::mem_row_major);
 }
+#endif
 
 static uint64_t fnv(const void* p, size_t bytes) {
   uint64_t h = 1469598103934665603ull;
@@ -202,7 +209,10 @@ int main() {
       if (run(dn[f], [&] { k_double<<<kN / 128, 128>>>(da, db, dc, dout, f); }, 2 * kN)) return 1;
     // tensor core: 64 tiles
     {
-      const int tiles = 64;
+#ifndef TILES
+#define TILES 64   // (the pinned lines are for 64; -DTILES=4096 with -DTC_DUMP is the million-result dump a model is fitted to)
+#endif
+      const int tiles = TILES;
       const auto ha = half_pairs(61 + style, tiles * 128), hb = half_pairs(71 + style, tiles * 128), hc = half_pairs(81 + style, tiles * 128);
       std::vector<uint32_t> bfa(tiles * 128), bfb(tiles * 128);
       for (int i = 0; i < tiles * 128; ++i) {
@@ -213,6 +223,16 @@ int main() {
       }
       const auto fc = words(111 + style, tiles * 512, style);
       uint32_t *pa = upload(ha), *pb = upload(hb), *pc = upload(hc), *pfc = upload(fc), *pba = upload(bfa), *pbb = upload(bfb);
+#ifdef TC_DUMP   // the tensor-core inputs and every result word, into ./dump/ (which must exist): tools/fttn/fit_tc_model.py reads them
+      {
+        const auto dumpv = [&](const char* n, const std::vector<uint32_t>& v) {
+          char p[256];
+          std::snprintf(p, sizeof p, "dump/in.%s.%s.bin", n, sn);
+          if (FILE* f = std::fopen(p, "wb")) { std::fwrite(v.data(), 4, v.size(), f); std::fclose(f); }
+        };
+        dumpv("ha", ha); dumpv("hb", hb); dumpv("hc", hc); dumpv("fc", fc); dumpv("bfa", bfa); dumpv("bfb", bfb);
+      }
+#endif
       uint32_t* pd;
       CK(cudaMalloc(&pd, tiles * 256 * 4));
       std::vector<uint32_t> d(tiles * 256);
@@ -222,6 +242,11 @@ int main() {
         cudaDeviceSynchronize();
         cudaMemcpy(d.data(), pd, n * 4, cudaMemcpyDeviceToHost);
         std::printf("%-22s %s %016llx\n", name, sn, (unsigned long long)fnv(d.data(), n * 4));
+#ifdef TC_DUMP
+        char p[256];
+        std::snprintf(p, sizeof p, "dump/out.%s.%s.bin", name, sn);
+        if (FILE* f = std::fopen(p, "wb")) { std::fwrite(d.data(), 4, n, f); std::fclose(f); }
+#endif
       };
       k_wmma<__half, float><<<tiles, 32>>>((const __half*)pa, (const __half*)pb, (const float*)pfc, (float*)pd);
       CK(cudaGetLastError());
@@ -229,12 +254,14 @@ int main() {
       k_wmma<__half, __half><<<tiles, 32>>>((const __half*)pa, (const __half*)pb, (const __half*)pc, (__half*)pd);
       CK(cudaGetLastError());
       show("wmma_f16_f16acc", tiles * 128);
+#ifndef NO80
       k_wmma<__nv_bfloat16, float><<<tiles, 32>>>((const __nv_bfloat16*)pba, (const __nv_bfloat16*)pbb, (const float*)pfc, (float*)pd);
       CK(cudaGetLastError());
       show("wmma_bf16_f32acc", tiles * 256);
       k_wmma_tf32<<<tiles, 32>>>((const float*)pfc, (const float*)(pfc + 1024), (const float*)(pfc + 2048), (float*)pd);
       CK(cudaGetLastError());
       show("wmma_tf32_f32acc", tiles * 256);
+#endif
     }
   }
   return fails;

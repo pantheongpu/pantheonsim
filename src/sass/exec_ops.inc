@@ -5101,7 +5101,7 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
       const uint32_t* pa = ra == kRZ ? kZero : &w.reg(ra, 0);
       const uint32_t* pb = rb == kRZ ? kZero : &w.reg(rb, 0);
       uint32_t out[4 * 32];
-      // (An sm_86 cubin sums as an RTX 3060's tensor core does: chunked and truncated, see vgpu/exec/tc_ampere.hpp.)
+      // (A Turing, Ampere or Ada device sums as an RTX 3060's tensor core does, whatever the cubin was built for: chunked and truncated, see vgpu/exec/tc_ampere.hpp.)
       simd::kernels().hmma(hmma_kernel_kind(at == MmaT::F16 ? 0u : at == MmaT::BF16 ? 1u : 2u), K, acc == AccF16, pa, pb,
                            rc == kRZ ? nullptr : &w.reg(rc, 0), out);
       if (rd != kRZ)
@@ -5141,7 +5141,7 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
     if (ok && !f64 && !b1 && acc != AccS32) {
       const auto sum86 = [](MmaT t) { return t == MmaT::F16 || t == MmaT::BF16 || t == MmaT::TF32; };
       const auto narrow = [](MmaT t) { return t == MmaT::E4M3 || t == MmaT::E5M2; };
-      if (m_.sm == 86 && vgpu::exec::tc86::exact_enabled() && ins.op == Op::HMMA && !is_sparse && sum86(at) && bt == at && K <= 16 &&
+      if (vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) && ins.op == Op::HMMA && !is_sparse && sum86(at) && bt == at && K <= 16 &&
           K % (at == MmaT::TF32 ? 4 : 8) == 0)
         ok = false;   // the chunked sum of an RTX 3060
       if (m_.sm / 10 == 12 && narrow(at) && narrow(bt) && acc == AccF32) ok = false;   // sm_120's narrow-float sum
@@ -5309,8 +5309,9 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
       C[cd(l, s)] = v;
     }
   double D[16 * kN] = {};
-  // An sm_86 cubin's f16, bf16 and tf32 products sum as an RTX 3060's tensor core does (vgpu/exec/tc_ampere.hpp): the whole tile first.
-  const bool tc86_sum = m_.sm == 86 && vgpu::exec::tc86::exact_enabled() && ins.op == Op::HMMA && !sparse && (at == MmaT::F16 || at == MmaT::BF16 || at == MmaT::TF32) && bt == at &&
+  // On those devices the f16, bf16 and tf32 products sum as an RTX 3060's tensor core does (vgpu/exec/tc_ampere.hpp): the whole tile first.
+  const vgpu::exec::tc86::SumRule* const tc_rule = vgpu::exec::tc86::sum_rule(profile_.cc_major, profile_.cc_minor);
+  const bool tc86_sum = tc_rule && ins.op == Op::HMMA && !sparse && (at == MmaT::F16 || at == MmaT::BF16 || at == MmaT::TF32) && bt == at &&
                         (acc == AccF32 || acc == AccF16) && K <= 16 && K % (at == MmaT::TF32 ? 4 : 8) == 0;
   float Dtc[16 * kN] = {};
   if (tc86_sum) {
@@ -5318,7 +5319,7 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
     for (unsigned x = 0; x < M * K; ++x) Af[x] = static_cast<float>(A[x]);
     for (unsigned x = 0; x < K * kN; ++x) Bf[x] = static_cast<float>(B[x]);
     for (unsigned x = 0; x < M * kN; ++x) Cf[x] = static_cast<float>(C[x]);
-    vgpu::exec::tc86::mma(M, kN, K, at == MmaT::TF32 ? 4 : 8, at == MmaT::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide,
+    vgpu::exec::tc86::mma(*tc_rule, at == MmaT::TF32, M, kN, K, at == MmaT::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide,
                           acc == AccF16, Af, K, Bf, kN, Cf, kN, Dtc, kN);
   }
   const auto narrow_elem = [](MmaT t) {

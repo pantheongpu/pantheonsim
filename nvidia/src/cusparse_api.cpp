@@ -1084,6 +1084,29 @@ const char* sp_spmv_alg_name(cusparseSpMVAlg_t alg) {
   }
 }
 
+// The (A, x, y, compute) types cusparseSpMV and its buffer size take: these fifteen, measured on an RTX 3060's cuSPARSE
+// 13.0 over every combination of the ten types SpMV computes in, for CSR, CSC and COO, each operation and algorithm
+// (the same fifteen for all); any other is NOT_SUPPORTED, "type combination ... is not supported". The simulator took
+// a real A with x, y or the compute type of another precision (single A with half vectors, double y with single x).
+bool spmv_types_ok(cudaDataType a, cudaDataType x, cudaDataType y, cudaDataType ct) {
+  struct Combo { int a, x, y, ct; };
+  static constexpr Combo kTaken[] = {
+      {CUDA_R_32F, CUDA_R_32F, CUDA_R_32F, CUDA_R_32F},   {CUDA_R_32F, CUDA_R_64F, CUDA_R_64F, CUDA_R_64F},
+      {CUDA_R_32F, CUDA_C_32F, CUDA_C_32F, CUDA_C_32F},   {CUDA_R_64F, CUDA_R_64F, CUDA_R_64F, CUDA_R_64F},
+      {CUDA_R_64F, CUDA_C_64F, CUDA_C_64F, CUDA_C_64F},   {CUDA_R_16F, CUDA_R_16F, CUDA_R_32F, CUDA_R_32F},
+      {CUDA_R_16F, CUDA_R_16F, CUDA_R_16F, CUDA_R_32F},   {CUDA_R_16BF, CUDA_R_16BF, CUDA_R_32F, CUDA_R_32F},
+      {CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_32F}, {CUDA_C_32F, CUDA_C_32F, CUDA_C_32F, CUDA_C_32F},
+      {CUDA_C_64F, CUDA_C_64F, CUDA_C_64F, CUDA_C_64F},   {CUDA_C_16F, CUDA_C_16F, CUDA_C_16F, CUDA_C_32F},
+      {CUDA_C_16BF, CUDA_C_16BF, CUDA_C_16BF, CUDA_C_32F}, {CUDA_R_8I, CUDA_R_8I, CUDA_R_32F, CUDA_R_32F},
+      {CUDA_R_8I, CUDA_R_8I, CUDA_R_32I, CUDA_R_32I},
+  };
+  for (const Combo& c : kTaken)
+    if (c.a == static_cast<int>(a) && c.x == static_cast<int>(x) && c.y == static_cast<int>(y) &&
+        c.ct == static_cast<int>(ct))
+      return true;
+  return false;
+}
+
 // SpMV's arguments in the card's order, the descriptors' contents aside: the handle (1), the operation (2), alpha (3),
 // A (4), x (5), beta (6), y (7), the compute type (8: the ten types cuSPARSE computes in pass, any other is refused
 // here, by name), the algorithm (9: 0 to 6), and for cusparseSpMV_bufferSize the size (10). Measured on an RTX 3060.
@@ -1142,15 +1165,8 @@ cusparseStatus_t spmv_check(const char* api, cusparseOperation_t op, const SpMat
     return sp_refuse(api, CUSPARSE_STATUS_INVALID_VALUE,
                      "type of " + types + " is not valid when opA is CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE");
   const std::string unsupported = "type combination of " + types + " is not supported";
-  if (!complex_combo_ok(A.value_type, X.type, Y.type, ct, true))
+  if (!spmv_types_ok(A.value_type, X.type, Y.type, ct))
     return sp_refuse(api, CUSPARSE_STATUS_NOT_SUPPORTED, unsupported);
-  // A, x and y of one real type compute in that type, half and bfloat16 in single (an RTX 3060's cuSPARSE 13.0
-  // refuses single data computed in double or half, and half computed in half).
-  if (!is_complex(A.value_type) && A.value_type == X.type && A.value_type == Y.type && !is_complex(ct)) {
-    const cudaDataType want =
-        A.value_type == CUDA_R_16F || A.value_type == CUDA_R_16BF ? CUDA_R_32F : A.value_type;
-    if (ct != want) return sp_refuse(api, CUSPARSE_STATUS_NOT_SUPPORTED, unsupported);
-  }
   // CSR and CSC take the default, CSR_ALG1 and CSR_ALG2 (0, 2, 3), COO the default, COO_ALG1 and COO_ALG2 (0, 1, 4);
   // the others are refused with the format's name (CSC's is CSR's).
   {

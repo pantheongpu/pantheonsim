@@ -834,16 +834,24 @@ template <bool Avx2>
       u[k] ^= s.kind == kConst || s.kind == kSgpr ? flip : 0;   // (anything else reads as zero, whatever the modifiers: load64's)
     }
   }
-  const uint64_t nan = reinterpret_cast<F64RowsFn>(o.kern)(rl, rh, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], u, n);
-  if (nan & ex) return f64_general(o, R, Avx2);
   uint32_t* dlo = R.vgpr[o.dst.index];
   uint32_t* dhi = R.vgpr[o.dst.index + 1];
   if (full(ex, n)) {
+    const uint64_t nan = reinterpret_cast<F64RowsFn>(o.kern)(rl, rh, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], u, n);
+    if (nan & ex) return f64_general(o, R, Avx2);
     copy_row(dlo, rl, n);
     copy_row(dhi, rh, n);
-  } else if (__builtin_popcountll(ex) > 8) {
-    merge(dlo, rl, ex, n);
-    merge(dhi, rh, ex, n);
+    return true;
+  }
+  // (Some lanes off: only the groups of eight lanes from the first to the last that hold a lane of EXEC -- a kernel's work is by the
+  // group, and in inq's kernels a wave has 12 to 38 lanes on in these instructions. The rest of rl and rh holds nothing. Round sp74.)
+  const unsigned first = static_cast<unsigned>(__builtin_ctzll(ex)) & ~7u, span = ((71u - static_cast<unsigned>(__builtin_clzll(ex))) & ~7u) - first;
+  const uint64_t nan = reinterpret_cast<F64RowsFn>(o.kern)(rl + first, rh + first, lo[0] + first, hi[0] + first, lo[1] + first, hi[1] + first,
+                                                           lo[2] + first, hi[2] + first, u, span) << first;
+  if (nan & ex) return f64_general(o, R, Avx2);
+  if (__builtin_popcountll(ex) > 8) {
+    merge(dlo + first, rl + first, ex >> first, span);
+    merge(dhi + first, rh + first, ex >> first, span);
   } else {
     for (uint64_t m = ex; m; m &= m - 1) {
       const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
@@ -2697,6 +2705,16 @@ int h_div64_rows_base(const Op& o, Regs& R);
 [[gnu::target("avx2,fma,popcnt")]] void k_dmin_avx2(uint64_t* d, const uint64_t* ua, const uint64_t* ub, const uint64_t*, unsigned n);
 [[gnu::target("avx2,fma,popcnt")]] void k_dmax_avx2(uint64_t* d, const uint64_t* ua, const uint64_t* ub, const uint64_t*, unsigned n);   // (v_min_f64, v_max_f64: the same)
 
+// (Round sp74's row handlers for the 64-bit forms, AVX2 hosts: defined at the end of the file)
+#define TIER_ROWS64 [[gnu::target("avx2,fma,popcnt")]]
+TIER_ROWS64 int h_dmin_rows(const Op& o, Regs& R);
+TIER_ROWS64 int h_dmax_rows(const Op& o, Regs& R);
+TIER_ROWS64 int h_d1_rows(const Op& o, Regs& R);
+TIER_ROWS64 int h_cmp64_rows(const Op& o, Regs& R);
+TIER_ROWS64 int h_l64_rows(const Op& o, Regs& R);
+TIER_ROWS64 int h_l64n_rows(const Op& o, Regs& R);
+TIER_ROWS64 int h_int_sdwa_rows(const Op& o, Regs& R);
+
 bool cdna(const Inst& in) { return in.arch == gcn::Target::Gfx90a || in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950; }
 
 // A comparison: named by its opcode, as compare() reads it. False for a type or test the tier does not model.
@@ -2734,6 +2752,7 @@ void classify_cmp(Inst& in, const Tables& T) {
     f.sub = writes_exec;
     f.unit = kUnitValu;
     f.run = TIER_RUN(h_cmp64);
+    if (T.avx2) f.off0 = static_cast<int32_t>((op & (is_f ? 0xFu : 7u)) | (is_f ? 0u : op < 0xE8 ? 1u : 2u) << 4), f.run = h_cmp64_rows;   // (Round sp74)
     return;
   } else return;
   // (a 16-bit integer compare ignores the modifiers a VOP3 form could carry; a half's act on its sign bit)
@@ -2773,7 +2792,7 @@ bool classify_sdwa(Inst& in) {
     if (!lane_src32_sdwa(in.src[k], f.src[k])) return f = Op(), false;
   f.dsel = in.dst_sel, f.dunused = in.dst_unused;
   f.kern = reinterpret_cast<AnyFn>(tables().ints[e.k]);
-  f.run = h_int_sdwa;
+  f.run = tables().avx2 ? h_int_sdwa_rows : h_int_sdwa;   // (Round sp74: the same on whole rows)
   f.unit = kUnitValu;
   return true;
 }
@@ -2973,6 +2992,7 @@ void tier_classify(Inst& in) {
       else if (e.k == DMUL) f.nan = kNanMul;
       else if (e.k == DFMA && !(e.flags & kFmac)) f.nan = kNanFma;   // (v_fmac_f64 is a plain std::fma: the interpreter's)
       else if (e.k != DFMA && e.k != DRNDNE && e.k != DMIN && e.k != DMAX) f.nan = kNanPass;      // (a one-input function of the host's: no second payload to choose; nearbyint's quieting is the compiler's)
+      if (in.arch == gcn::Target::Gfx1030) f.nan = kNanHandBack;   // (gfx1030's double NaNs are the card's: the interpreter's rdna2_nan)
       if ((e.k == DADD || e.k == DMUL || e.k == DFMA) && !f.omod && !f.clamp) {   // (the pairs' rows, no 64-bit arrays)
         const uint32_t op = e.k == DADD ? 0 : e.k == DMUL ? 1 : 2;
         uint32_t uniform = 0;   // (the operands that are one value in every lane)
@@ -2987,6 +3007,10 @@ void tier_classify(Inst& in) {
         // (fmin and fmax four lanes at a time where the host has AVX2, with the C library's bits: the end of the file)
         if (T.avx2 && (e.k == DMIN || e.k == DMAX)) f.kern = reinterpret_cast<AnyFn>(e.k == DMIN ? k_dmin_avx2 : k_dmax_avx2);
         f.run = TIER_RUN(h_f64);
+        if (T.avx2 && !f.omod && !f.clamp) {   // (the pairs' rows: Round sp74, the end of the file)
+          if (e.k == DMIN || e.k == DMAX) f.run = e.k == DMIN ? h_dmin_rows : h_dmax_rows;
+          else if (e.k == DRCP || e.k == DSQRT || e.k == DFLOOR || e.k == DCEIL || e.k == DTRUNC || e.k == DRNDNE) f.off0 = e.k, f.run = h_d1_rows;
+        }
       }
       f.unit = kUnitValu;
       return;
@@ -2996,6 +3020,7 @@ void tier_classify(Inst& in) {
       if (!vector_enc || in.dst.size() != 1 || in.src.size() < static_cast<size_t>(e.arity)) return;
       if (!vgpr_dst(in.dst[0], f.dst, e.cat == Cat::L64 ? 2 : 1)) return fail();
       if (((e.flags & kFloatOut) && (in.omod || in.clamp)) || ((e.flags & kFloatSrc) && (in.omod || in.clamp))) return fail();
+      if ((e.flags & kFloatOut) && in.arch == gcn::Target::Gfx1030) return fail();   // (gfx1030's NaNs: the interpreter's rdna2_nan)
       for (int k = 0; k < e.arity; ++k)
         if ((e.flags & kFloatSrc) && (in.src[k].neg || in.src[k].abs)) return fail();
       for (int k = 0; k < e.arity; ++k)
@@ -3003,6 +3028,7 @@ void tier_classify(Inst& in) {
       f.sub = e.sub;
       f.kern = reinterpret_cast<AnyFn>(T.l64[e.k]);
       f.run = e.cat == Cat::L64N ? TIER_RUN(h_l64n) : e.k == L_MOV && (e.sub & 1) ? TIER_RUN(h_mov64) : TIER_RUN(h_l64);
+      if (T.avx2 && e.k != L_MOV && e.k != L_ASHRREV) f.off0 = e.k, f.run = e.cat == Cat::L64N ? h_l64n_rows : h_l64_rows;   // (Round sp74)
       f.unit = kUnitValu;
       return;
     }
@@ -3322,7 +3348,7 @@ void tier_classify(Inst& in) {
       if (!vgpr_dst(in.dst.empty() ? Operand() : in.dst[0], f.dst, dbl ? 2 : 1)) return fail();
       if (scale ? (in.dst.size() != 2 || !scalar_dst(in.dst[1], f.dst2)) : in.dst.size() != 1) return fail();
       if (in.clamp || in.omod) return fail();   // (the interpreter's write_float / write_double: issue #613, and v_div_scale's on an RX 6800)
-      if (in.arch == gcn::Target::Gfx1030 && e.k == 2) return fail();   // (gfx1030's v_div_fixup_f32 NaNs: the interpreter's rdna2_nan)
+      if (in.arch == gcn::Target::Gfx1030 && (e.k & 3) == 2) return fail();   // (gfx1030's v_div_fixup_f32 and _f64 NaNs: the interpreter's rdna2_nan)
       for (int k = 0; k < 3; ++k)
         if (!(dbl ? lane_src64(in.src[k], f.src[k], true) : lane_src32(in.src[k], f.src[k], true))) return fail();
       f.sub = static_cast<uint32_t>(e.k);
@@ -3485,6 +3511,471 @@ template <bool Max>
 }
 [[gnu::target("avx2,fma,popcnt")]] void k_dmin_avx2(uint64_t* d, const uint64_t* ua, const uint64_t* ub, const uint64_t*, unsigned n) { k_dminmax_avx2<false>(d, ua, ub, n); }
 [[gnu::target("avx2,fma,popcnt")]] void k_dmax_avx2(uint64_t* d, const uint64_t* ua, const uint64_t* ub, const uint64_t*, unsigned n) { k_dminmax_avx2<true>(d, ua, ub, n); }
+
+// ---- Round sp74: after everything else, so that it moves none of it.
+// Row handlers for the 64-bit forms that had none (AVX2 hosts; elsewhere the handlers above run them as before): binary64 minimum and
+// maximum, the one-input functions, the 64-bit comparisons (doubles and integers), the shifts and v_lshl_add_u64, the conversions between
+// doubles and 32-bit values, frexp and ldexp. The handlers above gather each register pair into an array of 64-bit lanes, run a lane
+// kernel and unpack the result; these read the pairs' rows four lanes at a time and write a pair of rows (the same arithmetic, one
+// instruction of the host a lane). Where an active lane is a case the lane kernels leave to the C library or to the interpreter -- a NaN,
+// two zeros of opposite sign in a minimum, a denormal in frexp, a result of ldexp that is not a normal number -- nothing is written and
+// the handler above does the whole instruction, so which bits such a lane gets is decided where it was. inq's kernels spent 15 % of a
+// test's time in v_max_f64 alone (Round sp74).
+#pragma GCC push_options
+#pragma GCC target("avx2,fma,popcnt")
+namespace rows64 {
+
+// Eight 64-bit lanes from their low and high words, as two vectors of four (lanes 0 to 3 and 4 to 7), and back.
+[[gnu::always_inline]] inline void pairs_in(const uint32_t* lo, const uint32_t* hi, __m256i& x0, __m256i& x1) {
+  const __m256i l = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(lo)), h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hi));
+  const __m256i t0 = _mm256_unpacklo_epi32(l, h), t1 = _mm256_unpackhi_epi32(l, h);
+  x0 = _mm256_permute2x128_si256(t0, t1, 0x20);
+  x1 = _mm256_permute2x128_si256(t0, t1, 0x31);
+}
+[[gnu::always_inline]] inline void pairs_out(uint32_t* lo, uint32_t* hi, __m256i r0, __m256i r1) {
+  const __m256 a = _mm256_castsi256_ps(r0), b = _mm256_castsi256_ps(r1);
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(lo), _mm256_permute4x64_epi64(_mm256_castps_si256(_mm256_shuffle_ps(a, b, 0x88)), 0xD8));
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(hi), _mm256_permute4x64_epi64(_mm256_castps_si256(_mm256_shuffle_ps(a, b, 0xDD)), 0xD8));
+}
+// The low words of four 64-bit lanes.
+[[gnu::always_inline]] inline __m128i low_words(__m256i x) {
+  return _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(x, _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6)));
+}
+
+// A source as the handlers above read it (load64, load32_to64): a register pair's rows, one register's row (zero-extended), or one value
+// for every lane.
+struct Wide {
+  const uint32_t* lo = nullptr;
+  const uint32_t* hi = nullptr;   // (null with `lo` set: a 32-bit row)
+  uint64_t u = 0;
+  bool uniform = true;
+};
+// A 64-bit source (load64's cases; the modifiers act on bit 63, into the row `th` for a pair). False: one register read as 64 bits, which
+// stays the general handler's.
+[[gnu::always_inline]] inline bool wide_of(const Src& s, const Regs& R, uint32_t* th, unsigned n, Wide& w) {
+  if (s.kind == kVgpr) {
+    if (!s.wide) return false;
+    w.uniform = false;
+    w.lo = R.vgpr[s.index];
+    w.hi = R.vgpr[s.index + 1];
+    if (s.neg | s.abs) {
+      const uint32_t keep = s.abs ? 0x7FFFFFFFu : ~0u, flip = s.neg ? 0x80000000u : 0u;
+      for (unsigned i = 0; i < n; ++i) th[i] = (w.hi[i] & keep) ^ flip;
+      w.hi = th;
+    }
+    return true;
+  }
+  const uint64_t keep = s.abs ? 0x7FFFFFFFFFFFFFFFull : ~uint64_t{0}, flip = s.neg ? 0x8000000000000000ull : 0;
+  if (s.kind == kConst) w.u = (s.value64 & keep) ^ flip;
+  else if (s.kind == kSgpr) w.u = ((s.wide ? static_cast<uint64_t>(R.sgpr[s.index + 1]) << 32 | R.sgpr[s.index] : R.sgpr[s.index]) & keep) ^ flip;
+  else w.u = 0;   // (load64's default)
+  return true;
+}
+// A 32-bit source read as a 64-bit lane (load32_to64). False: a modifier on a register's row, the general handler's.
+[[gnu::always_inline]] inline bool narrow_of(const Src& s, const Regs& R, Wide& w) {
+  if (s.kind == kVgpr) {
+    if (s.neg | s.abs) return false;
+    w.uniform = false;
+    w.lo = R.vgpr[s.index];
+    w.hi = nullptr;
+    return true;
+  }
+  w.u = mods32(s, s.kind == kConst ? s.value : s.kind == kSgpr ? R.sgpr[s.index] : static_cast<uint32_t>(rd(R, s)));
+  return true;
+}
+[[gnu::always_inline]] inline void fetch(const Wide& w, __m256i uni, unsigned i, __m256i& x0, __m256i& x1) {
+  if (w.uniform) x0 = x1 = uni;
+  else if (w.hi) pairs_in(w.lo + i, w.hi + i, x0, x1);
+  else {
+    x0 = _mm256_cvtepu32_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w.lo + i)));
+    x1 = _mm256_cvtepu32_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w.lo + i + 4)));
+  }
+}
+// The rows of a result into the destination pair, for the lanes of EXEC (h_f64r's).
+[[gnu::always_inline]] inline void put_pair(const Op& o, Regs& R, const uint32_t* rl, const uint32_t* rh, uint64_t ex, unsigned n) {
+  uint32_t* dlo = R.vgpr[o.dst.index];
+  uint32_t* dhi = R.vgpr[o.dst.index + 1];
+  if (full(ex, n)) {
+    copy_row(dlo, rl, n);
+    copy_row(dhi, rh, n);
+  } else if (__builtin_popcountll(ex) > 8) {
+    merge(dlo, rl, ex, n);
+    merge(dhi, rh, ex, n);
+  } else {
+    for (uint64_t m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+      dlo[l] = rl[l], dhi[l] = rh[l];
+    }
+  }
+}
+[[gnu::always_inline]] inline __m256i set64(uint64_t v) { return _mm256_set1_epi64x(static_cast<long long>(v)); }
+[[gnu::always_inline]] inline uint64_t mask4(__m256i m) { return static_cast<uint64_t>(_mm256_movemask_pd(_mm256_castsi256_pd(m))); }
+[[gnu::always_inline]] inline uint64_t mask4(__m256d m) { return static_cast<uint64_t>(_mm256_movemask_pd(m)); }
+
+// Up to three sources through `f`, four lanes at a time: f(a, b, c, &r) gives the lanes' results and returns the lanes (a mask of four)
+// it does not do. The results go to the rows rl and rh; the return value is the lanes not done.
+template <class F>
+[[gnu::always_inline]] inline uint64_t each4(const Wide* w, unsigned n, uint32_t* rl, uint32_t* rh, F&& f) {
+  const __m256i ua = set64(w[0].u), ub = set64(w[1].u), uc = set64(w[2].u);
+  uint64_t bad = 0;
+  for (unsigned i = 0; i < n; i += 8) {
+    __m256i a0, a1, b0, b1, c0, c1, r0, r1;
+    fetch(w[0], ua, i, a0, a1);
+    fetch(w[1], ub, i, b0, b1);
+    fetch(w[2], uc, i, c0, c1);
+    bad |= (f(a0, b0, c0, &r0) | f(a1, b1, c1, &r1) << 4) << i;
+    pairs_out(rl + i, rh + i, r0, r1);
+  }
+  return bad;
+}
+
+const uint64_t kSign = 0x8000000000000000ull, kExp = 0x7FF0000000000000ull;
+
+}  // namespace rows64
+
+// v_min_f64 and v_max_f64. Not done here: a lane with a NaN operand, and two zeros of opposite sign (h_f64's test, the interpreter's).
+template <bool Max>
+int h_dminmax_rows(const Op& o, Regs& R) {
+  using namespace rows64;
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const unsigned n = lanes_of(ex);
+  alignas(32) uint32_t th[2][64], rl[64], rh[64];
+  Wide w[3];
+  if (!wide_of(o.src[0], R, th[0], n, w[0]) || !wide_of(o.src[1], R, th[1], n, w[1])) return h_f64_avx2(o, R);
+  const __m256i sign = set64(kSign);
+  const uint64_t bad = each4(w, n, rl, rh, [&](__m256i a, __m256i b, __m256i, __m256i* r) {
+    const __m256d x = _mm256_castsi256_pd(a), y = _mm256_castsi256_pd(b);
+    *r = _mm256_castpd_si256(Max ? _mm256_max_pd(x, y) : _mm256_min_pd(x, y));
+    const __m256i opposite = _mm256_and_si256(_mm256_cmpeq_epi64(_mm256_xor_si256(a, b), sign), _mm256_cmpeq_epi64(_mm256_or_si256(a, b), sign));
+    return mask4(_mm256_cmp_pd(x, y, _CMP_UNORD_Q)) | mask4(opposite);
+  });
+  if (bad & ex) return h_f64_avx2(o, R);
+  put_pair(o, R, rl, rh, ex, n);
+  return true;
+}
+int h_dmin_rows(const Op& o, Regs& R) { return h_dminmax_rows<false>(o, R); }
+int h_dmax_rows(const Op& o, Regs& R) { return h_dminmax_rows<true>(o, R); }
+
+// The one-input functions (Op::off0: the F64Id). Not done here: a lane whose result is a NaN (a NaN operand, the root of a negative).
+int h_d1_rows(const Op& o, Regs& R) {
+  using namespace rows64;
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const unsigned n = lanes_of(ex);
+  alignas(32) uint32_t th[64], rl[64], rh[64];
+  Wide w[3];
+  if (!wide_of(o.src[0], R, th, n, w[0])) return h_f64_avx2(o, R);
+  const __m256d one = _mm256_set1_pd(1.0);
+  uint64_t bad;
+#define TIER_D1(expr)                                                              \
+  bad = each4(w, n, rl, rh, [&](__m256i a, __m256i, __m256i, __m256i* r) {         \
+    const __m256d x = _mm256_castsi256_pd(a);                                      \
+    const __m256d y = (expr);                                                      \
+    *r = _mm256_castpd_si256(y);                                                   \
+    return mask4(_mm256_cmp_pd(y, y, _CMP_UNORD_Q));                               \
+  })
+  switch (o.off0) {
+    case DRCP: TIER_D1(_mm256_div_pd(one, x)); break;
+    case DSQRT: TIER_D1(_mm256_sqrt_pd(x)); break;
+    // (a value of 2^52 or more in magnitude is an integer already, and rounds to itself: the lane kernels' test is not needed)
+    case DFLOOR: TIER_D1(_mm256_round_pd(x, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC)); break;
+    case DCEIL: TIER_D1(_mm256_round_pd(x, _MM_FROUND_TO_POS_INF | _MM_FROUND_NO_EXC)); break;
+    case DTRUNC: TIER_D1(_mm256_round_pd(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC)); break;
+    case DRNDNE: TIER_D1(_mm256_round_pd(x, _MM_FROUND_CUR_DIRECTION | _MM_FROUND_NO_EXC)); break;   // (nearbyint: the rounding mode's)
+    default: return h_f64_avx2(o, R);
+  }
+#undef TIER_D1
+  if (bad & ex) return h_f64_avx2(o, R);
+  put_pair(o, R, rl, rh, ex, n);
+  return true;
+}
+
+// The 64-bit comparisons. Op::off0: the test (bits 0-3, the ISA's order) and what is compared (bits 4-5: 0 doubles, 1 signed, 2 unsigned).
+// Every lane is done here: a comparison with a NaN is the host's, as the lane kernel's is. Doubles: the host's one comparison for the test,
+// four lanes at a time. Integers: on the two rows of words, eight lanes at a time -- the high words decide, and the low words (unsigned)
+// where they are equal; a test is less-than, equal or greater-than, or the opposite of one.
+int h_cmp64_rows(const Op& o, Regs& R) {
+  using namespace rows64;
+  const uint64_t ex = *R.exec;
+  uint64_t result = 0;
+  if (ex) {
+    const unsigned n = lanes_of(ex);
+    alignas(32) uint32_t th[2][64];
+    Wide w[2];
+    if (!wide_of(o.src[0], R, th[0], n, w[0]) || !wide_of(o.src[1], R, th[1], n, w[1])) return h_cmp64_avx2(o, R);
+    const unsigned test = static_cast<unsigned>(o.off0) & 15, kind = static_cast<unsigned>(o.off0) >> 4 & 3;
+    uint64_t m = 0;
+    if (kind == 0) {
+      const __m256i ua = set64(w[0].u), ub = set64(w[1].u);
+#define TIER_CMPD(pred)                                                                                                                   \
+  for (unsigned i = 0; i < n; i += 8) {                                                                                                   \
+    __m256i a0, a1, b0, b1;                                                                                                               \
+    fetch(w[0], ua, i, a0, a1);                                                                                                           \
+    fetch(w[1], ub, i, b0, b1);                                                                                                           \
+    m |= (mask4(_mm256_cmp_pd(_mm256_castsi256_pd(a0), _mm256_castsi256_pd(b0), pred)) |                                                  \
+          mask4(_mm256_cmp_pd(_mm256_castsi256_pd(a1), _mm256_castsi256_pd(b1), pred)) << 4) << i;                                        \
+  }                                                                                                                                       \
+  break
+      switch (test) {   // F LT EQ LE GT LG GE O U NGE NLG NGT NLE NEQ NLT TRU (cmp_f64's expressions)
+        case 0: break;
+        case 1: TIER_CMPD(_CMP_LT_OQ);
+        case 2: TIER_CMPD(_CMP_EQ_OQ);
+        case 3: TIER_CMPD(_CMP_LE_OQ);
+        case 4: TIER_CMPD(_CMP_GT_OQ);
+        case 5: TIER_CMPD(_CMP_NEQ_OQ);
+        case 6: TIER_CMPD(_CMP_GE_OQ);
+        case 7: TIER_CMPD(_CMP_ORD_Q);
+        case 8: TIER_CMPD(_CMP_UNORD_Q);
+        case 9: TIER_CMPD(_CMP_NGE_UQ);
+        case 10: TIER_CMPD(_CMP_EQ_UQ);
+        case 11: TIER_CMPD(_CMP_NGT_UQ);
+        case 12: TIER_CMPD(_CMP_NLE_UQ);
+        case 13: TIER_CMPD(_CMP_NEQ_UQ);
+        case 14: TIER_CMPD(_CMP_NLT_UQ);
+        default: m = ~uint64_t{0}; break;
+      }
+#undef TIER_CMPD
+    } else {
+      // F LT EQ LE GT NE GE T: less-than (1), equal (2), greater-than (4), or the opposite of greater-than (3), equal (5), less-than (6).
+      const unsigned base = test == 3 ? 4 : test == 5 ? 2 : test == 6 ? 1 : test;
+      if (base == 1 || base == 2 || base == 4) {
+        const Wide& x = base == 4 ? w[1] : w[0];   // (a > b is b < a)
+        const Wide& y = base == 4 ? w[0] : w[1];
+        const __m256i xhu = _mm256_set1_epi32(static_cast<int>(x.u >> 32)), xlu = _mm256_set1_epi32(static_cast<int>(x.u));
+        const __m256i yhu = _mm256_set1_epi32(static_cast<int>(y.u >> 32)), ylu = _mm256_set1_epi32(static_cast<int>(y.u));
+        const __m256i top = _mm256_set1_epi32(static_cast<int>(0x80000000u)), high_bias = kind == 2 ? top : _mm256_setzero_si256();
+        for (unsigned i = 0; i < n; i += 8) {
+          const __m256i xh = x.uniform ? xhu : _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.hi + i));
+          const __m256i xl = x.uniform ? xlu : _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.lo + i));
+          const __m256i yh = y.uniform ? yhu : _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y.hi + i));
+          const __m256i yl = y.uniform ? ylu : _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y.lo + i));
+          const __m256i same_high = _mm256_cmpeq_epi32(xh, yh);
+          __m256i lanes;
+          if (base == 2) {
+            lanes = _mm256_and_si256(same_high, _mm256_cmpeq_epi32(xl, yl));
+          } else {   // (x < y: the high words as the kind has them, signed or not; the low words unsigned)
+            const __m256i high = _mm256_cmpgt_epi32(_mm256_xor_si256(yh, high_bias), _mm256_xor_si256(xh, high_bias));
+            const __m256i low = _mm256_cmpgt_epi32(_mm256_xor_si256(yl, top), _mm256_xor_si256(xl, top));
+            lanes = _mm256_or_si256(high, _mm256_and_si256(same_high, low));
+          }
+          m |= static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_ps(_mm256_castsi256_ps(lanes)))) << i;
+        }
+        if (base != test) m = ~m;
+      } else {
+        m = test == 7 ? ~uint64_t{0} : 0;
+      }
+    }
+    result = m & ex;
+  }
+  if (o.dst.kind) wr(R, o.dst, result);
+  if (o.sub) *R.exec = result;
+  return 1;
+}
+
+// The 64-bit lane functions whose result is a pair (h_l64's; Op::off0: the L64Id). Not done here: v_ashrrev_i64 and v_mov_b64 (never
+// sent here), a denormal in v_frexp_mant_f64, and in v_ldexp_f64 an operand or a result that is not a normal number (zero is: itself).
+int h_l64_rows(const Op& o, Regs& R) {
+  using namespace rows64;
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const unsigned n = lanes_of(ex);
+  alignas(32) uint32_t th[3][64], rl[64], rh[64];
+  Wide w[3];
+  for (int k = 0; k < 3; ++k) {
+    const Src& s = o.src[k];
+    if (!s.kind) continue;
+    if (!((o.sub >> k & 1) ? wide_of(s, R, th[k], n, w[k]) : narrow_of(s, R, w[k]))) return h_l64_avx2(o, R);
+  }
+  const __m256i c63 = set64(63), c7 = set64(7), c4 = set64(4), zero = _mm256_setzero_si256(), exp = set64(kExp), c7ff = set64(0x7FF);
+  uint64_t bad = 0;
+  switch (o.off0) {
+    case L_LSHLREV:
+      each4(w, n, rl, rh, [&](__m256i a, __m256i b, __m256i, __m256i* r) { *r = _mm256_sllv_epi64(b, _mm256_and_si256(a, c63)); return uint64_t{0}; });
+      break;
+    case L_LSHRREV:
+      each4(w, n, rl, rh, [&](__m256i a, __m256i b, __m256i, __m256i* r) { *r = _mm256_srlv_epi64(b, _mm256_and_si256(a, c63)); return uint64_t{0}; });
+      break;
+    case L_LSHL_ADD:
+      each4(w, n, rl, rh, [&](__m256i a, __m256i b, __m256i c, __m256i* r) {
+        *r = _mm256_add_epi64(_mm256_sllv_epi64(a, _mm256_and_si256(b, c63)), c);
+        return uint64_t{0};
+      });
+      break;
+    case L_LSHL_ADD_G:   // (the count is bits 2:0, and a count over 4 shifts by nothing)
+      each4(w, n, rl, rh, [&](__m256i a, __m256i b, __m256i c, __m256i* r) {
+        const __m256i count = _mm256_and_si256(b, c7);
+        *r = _mm256_add_epi64(_mm256_sllv_epi64(a, _mm256_andnot_si256(_mm256_cmpgt_epi64(count, c4), count)), c);
+        return uint64_t{0};
+      });
+      break;
+    case L_CVT_F64_I:   // (the low word of a lane, as a signed integer)
+      each4(w, n, rl, rh, [&](__m256i a, __m256i, __m256i, __m256i* r) {
+        *r = _mm256_castpd_si256(_mm256_cvtepi32_pd(low_words(a)));
+        return uint64_t{0};
+      });
+      break;
+    case L_CVT_F64_U: {   // (... as an unsigned one: the signed conversion of it less 2^31, plus 2^31, both exact)
+      const __m128i top = _mm_set1_epi32(static_cast<int>(0x80000000u));
+      const __m256d two31 = _mm256_set1_pd(2147483648.0);
+      each4(w, n, rl, rh, [&](__m256i a, __m256i, __m256i, __m256i* r) {
+        *r = _mm256_castpd_si256(_mm256_add_pd(_mm256_cvtepi32_pd(_mm_xor_si128(low_words(a), top)), two31));
+        return uint64_t{0};
+      });
+      break;
+    }
+    case L_CVT_F64_F32:   // (the low word of a lane, a float: the host's conversion, a NaN's included)
+      each4(w, n, rl, rh, [&](__m256i a, __m256i, __m256i, __m256i* r) {
+        *r = _mm256_castpd_si256(_mm256_cvtps_pd(_mm_castsi128_ps(low_words(a))));
+        return uint64_t{0};
+      });
+      break;
+    case L_FREXP_MANT: {   // (a finite number other than zero: its fraction with the exponent of [0.5, 1); zero, an infinity, a NaN: itself)
+      const __m256i half = set64(0x3FE0000000000000ull);
+      bad = each4(w, n, rl, rh, [&](__m256i a, __m256i, __m256i, __m256i* r) {
+        const __m256i e = _mm256_and_si256(a, exp);
+        const __m256i e0 = _mm256_cmpeq_epi64(e, zero), same = _mm256_or_si256(e0, _mm256_cmpeq_epi64(e, exp));
+        *r = _mm256_blendv_epi8(_mm256_or_si256(_mm256_andnot_si256(exp, a), half), a, same);
+        return mask4(_mm256_andnot_si256(_mm256_cmpeq_epi64(_mm256_slli_epi64(a, 1), zero), e0));   // (a denormal: libm's)
+      });
+      break;
+    }
+    case L_LDEXP: {   // (a normal number whose exponent stays one: the exponent field moved; zero: itself)
+      const __m256i c2046 = set64(2046);
+      bad = each4(w, n, rl, rh, [&](__m256i a, __m256i b, __m256i, __m256i* r) {
+        const __m256i by = _mm256_cvtepi32_epi64(low_words(b));
+        const __m256i e = _mm256_and_si256(_mm256_srli_epi64(a, 52), c7ff), sum = _mm256_add_epi64(e, by);
+        const __m256i is_zero = _mm256_cmpeq_epi64(_mm256_slli_epi64(a, 1), zero);
+        // (1 <= e <= 2046 and 1 <= e + by <= 2046)
+        const __m256i normal = _mm256_and_si256(_mm256_and_si256(_mm256_cmpgt_epi64(e, zero), _mm256_cmpgt_epi64(c7ff, e)),
+                                                _mm256_andnot_si256(_mm256_cmpgt_epi64(sum, c2046), _mm256_cmpgt_epi64(sum, zero)));
+        *r = _mm256_blendv_epi8(_mm256_add_epi64(a, _mm256_slli_epi64(by, 52)), a, is_zero);
+        return mask4(_mm256_or_si256(normal, is_zero)) ^ 15;
+      });
+      break;
+    }
+    default: return h_l64_avx2(o, R);
+  }
+  if (bad & ex) return h_l64_avx2(o, R);
+  put_pair(o, R, rl, rh, ex, n);
+  return true;
+}
+
+// ... and those whose result is one 32-bit word (h_l64n's). Not done here: a denormal in v_frexp_exp_i32_f64.
+int h_l64n_rows(const Op& o, Regs& R) {
+  using namespace rows64;
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const unsigned n = lanes_of(ex);
+  alignas(32) uint32_t th[64], r[64];
+  Wide w;
+  if (!wide_of(o.src[0], R, th, n, w)) return h_l64n_avx2(o, R);
+  const __m256i u = set64(w.u), zero = _mm256_setzero_si256(), c7ff = set64(0x7FF);
+  uint64_t bad = 0;
+#define TIER_N1(...)                                                                          \
+  for (unsigned i = 0; i < n; i += 8) {                                                       \
+    __m256i a0, a1;                                                                           \
+    fetch(w, u, i, a0, a1);                                                                   \
+    for (int half = 0; half < 2; ++half) {                                                    \
+      const __m256i a = half ? a1 : a0;                                                       \
+      [[maybe_unused]] const __m256d x = _mm256_castsi256_pd(a);                              \
+      __m128i out;                                                                            \
+      __VA_ARGS__;                                                                            \
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(r + i + 4 * half), out);                    \
+    }                                                                                         \
+  }
+  switch (o.off0) {
+    case L_FREXP_EXP: {   // (the exponent of the fraction in [0.5, 1); 0 for zero, an infinity and a NaN)
+      const __m256i c1022 = set64(1022);
+      TIER_N1({
+        const __m256i e = _mm256_and_si256(_mm256_srli_epi64(a, 52), c7ff);
+        const __m256i e0 = _mm256_cmpeq_epi64(e, zero), none = _mm256_or_si256(e0, _mm256_cmpeq_epi64(e, c7ff));
+        out = low_words(_mm256_andnot_si256(none, _mm256_sub_epi64(e, c1022)));
+        bad |= mask4(_mm256_andnot_si256(_mm256_cmpeq_epi64(_mm256_slli_epi64(a, 1), zero), e0)) << (i + 4 * half);
+      })
+      break;
+    }
+    case L_CVT_F32_F64: TIER_N1(out = _mm_castps_si128(_mm256_cvtpd_ps(x))) break;   // (the host's conversion, a NaN's included)
+    case L_CVT_I32_F64: {   // (a NaN: 0; 2^31 - 1 and above: 0x7FFFFFFF; -2^31 and below: 0x80000000, which the host's conversion gives)
+      const __m256d top = _mm256_set1_pd(2147483647.0);
+      const __m128i most = _mm_set1_epi32(0x7FFFFFFF);
+      TIER_N1({
+        out = _mm256_cvttpd_epi32(x);
+        out = _mm_blendv_epi8(out, most, low_words(_mm256_castpd_si256(_mm256_cmp_pd(x, top, _CMP_GE_OQ))));
+        out = _mm_andnot_si128(low_words(_mm256_castpd_si256(_mm256_cmp_pd(x, x, _CMP_UNORD_Q))), out);
+      })
+      break;
+    }
+    case L_CVT_U32_F64: {   // (not above zero: 0; 2^32 - 1 and above: 0xFFFFFFFF; from 2^31 up, the conversion of the value less 2^31)
+      const __m256d top = _mm256_set1_pd(4294967295.0), two31 = _mm256_set1_pd(2147483648.0), nothing = _mm256_setzero_pd();
+      const __m128i ones = _mm_set1_epi32(-1), bit31 = _mm_set1_epi32(static_cast<int>(0x80000000u));
+      TIER_N1({
+        const __m256d high = _mm256_cmp_pd(x, two31, _CMP_GE_OQ);
+        const __m128i high32 = low_words(_mm256_castpd_si256(high));
+        out = _mm256_cvttpd_epi32(_mm256_sub_pd(x, _mm256_and_pd(high, two31)));
+        out = _mm_xor_si128(out, _mm_and_si128(high32, bit31));
+        out = _mm_blendv_epi8(out, ones, low_words(_mm256_castpd_si256(_mm256_cmp_pd(x, top, _CMP_GE_OQ))));
+        out = _mm_and_si128(out, low_words(_mm256_castpd_si256(_mm256_cmp_pd(x, nothing, _CMP_GT_OQ))));
+      })
+      break;
+    }
+    default: return h_l64n_avx2(o, R);
+  }
+#undef TIER_N1
+  if (bad & ex) return h_l64n_avx2(o, R);
+  uint32_t* d = R.vgpr[o.dst.index];
+  if (full(ex, n)) copy_row(d, r, n);
+  else merge(d, r, ex, n);
+  return true;
+}
+
+// h_int_sdwa with its two per-lane loops as loops of whole rows: a source's part is two shifts, the destination's part a shift, a mask,
+// the sign's fill and the bits kept, all the same for every lane.
+int h_int_sdwa_rows(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const unsigned n = lanes_of(ex);
+  alignas(32) uint32_t t[3][64], r[64], out[64];
+  const uint32_t* s[3] = {nullptr, nullptr, nullptr};
+  for (int k = 0; k < 3; ++k) {
+    const Src& src = o.src[k];
+    if (!src.kind) {
+      s[k] = s[0];
+      continue;
+    }
+    const uint32_t* p = load32(src, R, t[k], n);
+    if (src.sel != 6) {   // (sdwa_pick: a byte or a half, up to the top and back down, with its sign or without)
+      const unsigned width = src.sel <= 3 ? 8 : 16, at = src.sel <= 3 ? 8u * src.sel : src.sel == 4 ? 0u : 16u;
+      const unsigned up = 32 - width - at, down = 32 - width;
+      if (src.sext)
+        for (unsigned i = 0; i < n; ++i) t[k][i] = static_cast<uint32_t>(static_cast<int32_t>(p[i] << up) >> down);
+      else
+        for (unsigned i = 0; i < n; ++i) t[k][i] = (p[i] << up) >> down;
+      p = t[k];
+    }
+    s[k] = p;
+  }
+  reinterpret_cast<K3>(o.kern)(r, s[0], s[1], s[2], n);
+  uint32_t* d = R.vgpr[o.dst.index];
+  const uint8_t sel = o.dsel;
+  if (sel == 6) {   // (the whole register: sdwa_dst leaves the result as it is)
+    if (full(ex, n)) copy_row(d, r, n);
+    else merge(d, r, ex, n);
+    return true;
+  }
+  // (sdwa_dst)
+  const uint32_t mask = sel <= 3 ? 0xFFu << (8 * sel) : sel == 4 ? 0xFFFFu : 0xFFFF0000u;
+  const unsigned shift = sel <= 3 ? 8u * sel : sel == 4 ? 0u : 16u;
+  const uint32_t top = mask & ~(mask >> 1), fill = o.dunused == 1 ? ~(mask | (top - 1)) : 0u, keep = o.dunused == 2 ? ~mask : 0u;
+  for (unsigned i = 0; i < n; ++i) {
+    const uint32_t v = (r[i] << shift) & mask;
+    out[i] = (d[i] & keep) | v | ((v & top) ? fill : 0u);
+  }
+  if (full(ex, n)) copy_row(d, out, n);
+  else merge(d, out, ex, n);
+  return true;
+}
+#pragma GCC pop_options
 
 }  // namespace
 
