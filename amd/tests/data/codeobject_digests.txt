@@ -56,6 +56,7 @@ data/asm_issue621.gfx942.o	5c09fa8b91c40754
 data/asm_issues_nov11.gfx90a.o	b9bc4bc6c94dc79
 data/asm_issues_nov11.gfx942.o	b6813be9e96a9ebf
 data/asm_lds64.gfx942.o	95e737f1b296751b
+data/asm_lds_banks.gfx942.o	c0d770eb09e7df6b
 data/asm_lds_dma.gfx950.o	abf26fe5faac0dfa
 data/asm_ldsf32.gfx942.o	8117a349aa1a79d7
 data/asm_libs.gfx942.o	ed2dce5a488b0a4f

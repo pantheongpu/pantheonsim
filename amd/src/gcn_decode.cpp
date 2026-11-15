@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "vgpu/amd_gcn.hpp"
+#include "vgpu/amd_memtraffic.hpp"
 #include "vgpu/error.hpp"
 #include "rdna_decode.hpp"
 
@@ -1955,6 +1956,10 @@ void finalize(Inst& in) {
   in.flags = f;
   in.mem = mem_facts_of(in);
   tier_classify(in);
+  if (in.fast.unit == tier::kUnitLds) {   // (the bytes an LDS instruction moves a lane, which the tier's handler does not count)
+    const LaneTraffic t = ds_lane_traffic(in.name);
+    in.fast.lds_rd = static_cast<uint8_t>(t.read), in.fast.lds_wr = static_cast<uint8_t>(t.written);
+  }
 }
 
 static Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64) {

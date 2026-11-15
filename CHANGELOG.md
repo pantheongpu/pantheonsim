@@ -7,6 +7,14 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- AMD counters: the `VGPU_DISPATCH_STATS` line now ends with the bytes the active lanes ask for (`vmem_bytes_rd`, `vmem_bytes_wr`, `lds_bytes_rd`, `lds_bytes_wr`),
+  the vector instruction mix (`mix=`), the matrix work by type (`mops=`) and the kernel's name (`kernel=`). The mix and the matrix work were already counted
+  and are now printed; the bytes are new. A reader that splits the line on `=` and converts every value to a number must skip the text fields
+  (`tools/bench-amd/bench.py` does). Requested in [discussion 631](https://github.com/pantheongpu/pantheonsim/discussions/631), issues #648 and #649.
+- AMD counters: LDS bank conflicts. `VGPU_DISPATCH_STATS` also prints `lds_bank_conflicts`, the passes through LDS's 32 banks beyond the first.
+  The rule was measured on an RX 6800 (`SQC_LDS_BANK_CONFLICT`, 906 combinations of instruction, stride and active lanes,
+  all reproduced; data in `amd/tests/data/lds_bank_conflicts.tsv`, probe in `amd/tools/lds-bank-probe`) and is applied unchecked to the other targets.
+  It is counted only when `VGPU_DISPATCH_STATS` is set. Sectors and cache lines are not counted yet (issue #650).
 - NVIDIA driver: a call made after `exit()` has torn the driver down, from the destructor of a library that loaded libcuda itself, now
   answers `CUDA_ERROR_DEINITIALIZED` (4), as NVIDIA's driver does (#646). NVHPC's OpenACC runtime (26.9) dlopens libcuda, retains the primary
   context once and releases it from its destructor, after the driver's own teardown; the simulator answered that release from its destroyed
