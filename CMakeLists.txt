@@ -5175,3 +5175,16 @@ foreach(_t e2e_cutlass_hopper e2e_cutlass_gemm)
     set_property(TEST ${_t} PROPERTY COST 1000)
   endif()
 endforeach()
+
+# The longest tests start first. ctest runs tests in cost order (by number when it has no history, which a fresh CI checkout has not),
+# so the ASan job (-j2 on a hosted runner) started its 1590 s, 1180 s, 930 s and 900 s tests wherever they fell in the number order and
+# could end with one of them running alone. Costs are the seconds of the ASan job in run 42978065497; only the order changes, not what runs.
+foreach(_pair test_amd_gcn_gather_same_bits:1600 test_amd_gcn_memory_same_bits:1200 test_amd_matrix_fast:950 e2e_sass_tier:900
+              test_amd_gcn_same_bits:500 e2e_sass_archs:210 test_host_gemm:180 e2e_lowprec_lt:160 test_fastpath:140 test_ptx_mem_runs:140)
+  string(REPLACE ":" ";" _pair_parts "${_pair}")
+  list(GET _pair_parts 0 _t)
+  list(GET _pair_parts 1 _cost)
+  if(TEST ${_t})
+    set_property(TEST ${_t} PROPERTY COST ${_cost})
+  endif()
+endforeach()

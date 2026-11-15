@@ -514,7 +514,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu: [amd/mi300x, amd/mi325x, amd/mi350x, amd/mi250x, amd/rx6900xt, amd/rx7900xtx, amd/rx9070xt]
+        # One GPU for each code path: the MI325X is the MI300X's gfx942 with more memory (amd/mi325x still runs in the nightly vLLM job).
+        gpu: [amd/mi300x, amd/mi350x, amd/mi250x, amd/rx6900xt, amd/rx7900xtx, amd/rx9070xt]
     env:
       OLLAMA_VERSION: v0.21.0
       # No container here, so the ceilings go to ci/jobs.sh (empty means none).
@@ -928,6 +929,17 @@ jobs:
         # (CMakeLists.txt) still run one at a time.
         run: ctest --test-dir build-san --output-on-failure -j"$(ci/jobs.sh -g 6 -m 4)" -E pantheon_workloads
 
+      # The peak of the whole job, build included (so an upper bound on the test step above), to choose the -g of its ctest -j with (docs/ci.md). It reads the
+      # container's own memory counter, cgroup v2's memory.peak or v1's max_usage_in_bytes, and never fails the job.
+      - name: Report the peak memory
+        if: always()
+        continue-on-error: true
+        run: |
+          for f in /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory/memory.max_usage_in_bytes; do
+            [ -r "$f" ] && { echo "peak memory of this job: $(( $(cat "$f") / 1048576 )) MiB at ctest -j$(ci/jobs.sh -g 6 -m 4) ($f)"; exit 0; }
+          done
+          echo "peak memory: no cgroup counter to read"
+
       # The jobs run as root in the container, in a workspace that belongs to the runner's
       # user. On a runner that lasts (the burst pool) what they leave there is root's, and the
       # next job's checkout cannot clean it. Hand it back, whatever the outcome.
@@ -1020,6 +1032,17 @@ jobs:
         run: |
           single_thread='test_amd_gcn_same_bits|test_amd_gcn_gather_same_bits|test_amd_gcn_tier_same_bits(_shard_[0-9]+of[0-9]+)?|test_amd_gcn_memory_same_bits|test_amd_gcn_packed_same_bits|test_amd_matrix_fast|test_decode_same_bits|test_hevc_decode|test_h264_decode|test_mpeg2_decode|test_nvenc_.*'
           setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -j"$(ci/jobs.sh -g 6 -m 4)" -E "^(pantheon_workloads|$single_thread)$"
+
+      # The peak of the whole job, build included (so an upper bound on the test step above), to choose the -g of its ctest -j with (docs/ci.md). It reads the
+      # container's own memory counter, cgroup v2's memory.peak or v1's max_usage_in_bytes, and never fails the job.
+      - name: Report the peak memory
+        if: always()
+        continue-on-error: true
+        run: |
+          for f in /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory/memory.max_usage_in_bytes; do
+            [ -r "$f" ] && { echo "peak memory of this job: $(( $(cat "$f") / 1048576 )) MiB at ctest -j$(ci/jobs.sh -g 6 -m 4) ($f)"; exit 0; }
+          done
+          echo "peak memory: no cgroup counter to read"
 
       # The jobs run as root in the container, in a workspace that belongs to the runner's
       # user. On a runner that lasts (the burst pool) what they leave there is root's, and the
