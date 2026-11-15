@@ -262,6 +262,8 @@ hipcc/mfma_broadcast.gfx942#0:gfx942	d7ce841439ee510b
 hipcc/mfma_broadcast.gfx950#0:gfx950	2bfbfe5aa648364e
 hipcc/mfma_modes.gfx942#0:gfx942	db22328cbe51e32d
 hipcc/mfma_modes.gfx950#0:gfx950	9d264e22a2743fa5
+hipcc/mfma_numerics.gfx90a.o	b57868c4d0985804
+hipcc/mfma_numerics.gfx942.o	86ea9a4160b5094a
 hipcc/modules_kernel.generic.co:gfx9-4-generic	51bb7a02b7aa4e2
 hipcc/numerics.flush.gfx942#0:gfx942	57dd41e43336221c
 hipcc/numerics.gfx942#0:gfx942	a9c9f5611a7ea449
