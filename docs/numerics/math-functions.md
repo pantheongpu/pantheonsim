@@ -313,7 +313,12 @@ different generations agree with each other.
 | L4 | sm_89 (Ada) | 595.112.07 | a rented card |
 | A10G | sm_86 (Ampere) | 595.112.07 | a rented card |
 
-No Hopper card (H100) and no Blackwell card ran any of this: everything below about them is *inferred* or *unmeasured*.
+No Blackwell card ran any of this: everything below about them is *inferred* or *unmeasured*. An H100 PCIe (sm_90, a rented
+card, driver 570.148.08, nvcc 12.8.93, 2026-11-15) ran the probe's hash pass (the same as the RTX 3060 on all ten operations, see
+"Which devices get the model") and `mathfn` built with its own toolkit: 302 of the 329 lines are the four cards', in both builds
+and in the default and the `-use_fast_math` program; the 27 others are acosh, asinh, atan2 and cbrt in single precision and asin,
+asinh, atan2 and atanh in double. With the instructions equal, those 27 are the library code of CUDA 12.8 against CUDA 13.0's, not
+the card (the pinned lines are CUDA 13.0's for that reason); no card ran both toolkits to show it directly.
 
 **The four cards print the same lines.** All 329 lines of `mathfn` and all 329 of `mathfn_fast` (131,072 results a random
 class) are identical on the four cards, and on each card the lines of its own architecture's build are the lines of the
@@ -484,11 +489,13 @@ host precision as before; no card was asked.
 | Devices | Evidence | Word |
 |---|---|---|
 | RTX 3060 (sm_86) | the probe: every operand of every operation; `mathfn`, `mathfn_fast`, the PTX forms, Varity | measured |
+| A10G (sm_86), H100 PCIe (sm_90) | `mufu-card-run.sh`: all ten operations over all 2^32 inputs, 64 hashes an operation, every one the RTX 3060's (2026-11-15; the A10G with nvcc 13.0, the H100 with nvcc 12.8) | measured |
 | Tesla T4 (sm_75), L4 (sm_89), A10G (sm_86) | `mathfn` and `mathfn_fast`: 329 + 329 lines of 131,072 results a class identical to the RTX 3060's, with the card's own build and the sm_75 build. The probe did not run on them | measured through the math library; the instruction-level run (`mufu-card-run.sh`) is still to make |
 | every other Turing, Ampere and Ada profile | the same architectures as the four | inferred from the four |
-| Hopper (h100, h200, gh200 and the other sm_90 profiles), Blackwell (sm_100, sm_103, sm_120 profiles) | none: no card of these ran `mathfn` or the probe | **inferred (measured on Turing, Ampere, Ada)** |
+| the other Hopper profiles (h100, h100-nvl, h200, h200-nvl, gh200) | the same architecture as the H100 PCIe | inferred from the H100 PCIe |
+| Blackwell (sm_100, sm_103, sm_120 profiles) | none: no card of these ran `mathfn` or the probe | **inferred (measured on Turing, Ampere, Ada, Hopper)** |
 
-The model is not in the profiles: every device gets it. If an H100 or a Blackwell card prints other hashes, the model
+The model is not in the profiles: every device gets it. If a Blackwell card prints other hashes, the model
 becomes a profile property, as the tensor-core sum is (`numerics.tensor_sum`, matrix-numerics.md).
 
 ## The switch
@@ -502,10 +509,12 @@ were scalar libm calls before and are a table lookup and three multiplies now. C
 
 ## What is not done
 
-- Hopper and Blackwell: no card ran `mathfn` or the probe. Their profiles get the model as *inferred*; an H100's
+- Blackwell: no card ran `mathfn` or the probe. Its profiles get the model as *inferred*; a Blackwell card's
   `mufu-card-run.sh` output decides it.
-- The probe ran on the RTX 3060 only. The T4, the L4 and the A10G are measured through the math library (329 + 329 lines),
-  not instruction by instruction.
+- The probe ran on the RTX 3060, and its hash pass on an A10G and an H100 PCIe. The T4 and the L4 are measured through the
+  math library (329 + 329 lines), not instruction by instruction.
+- `mathfn` under a toolkit other than CUDA 13.0: an H100's CUDA 12.8 build differs on 27 lines, and no simulator run of that
+  build was compared with it.
 - The half-precision forms (`MUFU` with the F16 bit; `.approx.f16`, `.f16x2`, `.bf16x2`) are the function at host precision,
   as they were. No card was asked.
 - The AMD math instructions (`v_rcp_f32`, `v_rsq_f32`, `v_exp_f32`, `v_log_f32`, `v_sin_f32`, `v_cos_f32`) are unchanged,

@@ -139,7 +139,11 @@ int main(int argc, char** argv) {
   CUdevice dev;
   ok(cuInit(0), "cuInit");
   ok(cuDeviceGet(&dev, 0), "cuDeviceGet");
+#if CUDA_VERSION >= 13000
   ok(cuCtxCreate(&c.ctx, nullptr, 0, dev), "cuCtxCreate");
+#else  // a toolkit before CUDA 13: the three-argument form
+  ok(cuCtxCreate(&c.ctx, 0, dev), "cuCtxCreate");
+#endif
   ok(cuModuleLoadData(&c.mod, elf.data()), "cuModuleLoadData");
   ok(cuModuleGetFunction(&c.dump, c.mod, "mufu_dump"), "mufu_dump");
   ok(cuModuleGetFunction(&c.hash, c.mod, "mufu_hash"), "mufu_hash");

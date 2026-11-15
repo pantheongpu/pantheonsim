@@ -25,8 +25,9 @@ release says what runs and what it produces, never how fast a real GPU would run
     Counters do not change.
   - **`VGPU_MUFU_EXACT=0` gives the earlier results**, bit for bit (the function at host precision; `div.full` the exact
     quotient). Read at every launch.
-  - Measured: RTX 3060 (every operand), and through the math library a Tesla T4, an L4 and an A10G. **Hopper and Blackwell
-    cards were not measured**: their profiles get the same model, inferred (measured on Turing, Ampere, Ada).
+  - Measured: RTX 3060 (every operand), an A10G and an H100 PCIe (every operand, as hashes), and through the math library a
+    Tesla T4 and an L4. **Blackwell cards were not measured**: their profiles get the same model, inferred (measured on
+    Turing, Ampere, Ada, Hopper).
     `tools/numerics/mufu-card-run.sh` is the run to make on one: all ten operations over all inputs as hashes, compared with
     the RTX 3060's (`tools/numerics/mufu/rtx3060.hashes.txt`), in seconds.
   - Also measured and now followed: the `|x|` and `-x` operand modifiers of `MUFU.RCP64H` and `MUFU.RSQ64H` apply to the
