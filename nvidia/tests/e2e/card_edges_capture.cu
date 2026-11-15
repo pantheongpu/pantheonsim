@@ -20,6 +20,12 @@
 //     forked the stream into the capture) and from one of its own streams 901.
 //   - cudaStreamAddCallback on a capturing stream is cudaErrorStreamCaptureUnsupported and the capture goes on without
 //     it; the simulator invalidated the capture.
+//   - Anything on the legacy stream while a blocking stream takes part in a capture -- a launch, a copy or fill (the
+//     synchronous cudaMemcpy and cudaMemset too), an event record, a query, a synchronization, a host function, a
+//     stream-ordered allocation, the stream's flags -- is cudaErrorStreamCaptureImplicit, is not done, and invalidates
+//     that capture (every one a blocking stream takes part in); cudaStreamIsCapturing(0) answers it without
+//     invalidating. A copy or fill of nothing, an unknown copy kind (21) and a null result pointer (1) are answered
+//     first. The simulator did all of them (only a wait was refused). A non-blocking capture is not touched.
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -31,6 +37,7 @@ static int mode_ = 0;
 
 __global__ void bump(int* p) { if (p) *p += 1; }
 static void CUDART_CB never(cudaStream_t, cudaError_t, void*) { std::printf("FAIL the refused callback ran\n"); }
+static void CUDART_CB never_fn(void*) { std::printf("FAIL the refused host function ran\n"); }
 
 static cudaStream_t c, s2, s3;
 static cudaEvent_t e, e0;
@@ -165,6 +172,88 @@ int main() {
     WANT(status(s2), cudaStreamCaptureStatusNone);
     end_invalidated();
   }
+  // The legacy stream while a blocking stream captures.
+  cudaStream_t b = nullptr;
+  WANT(cudaStreamCreate(&b), cudaSuccess);
+  int* h = nullptr;
+  WANT(cudaMallocHost(&h, 64), cudaSuccess);
+  for (mode_ = 0; mode_ < 3; ++mode_) {
+    const cudaStreamCaptureMode mode = static_cast<cudaStreamCaptureMode>(mode_);
+    for (int op = 0; op < 14; ++op) {
+      WANT(cudaMemset(d, 0, 64), cudaSuccess);
+      WANT(cudaDeviceSynchronize(), cudaSuccess);
+      WANT(cudaStreamBeginCapture(b, mode), cudaSuccess);
+      bump<<<1, 1, 0, b>>>(d);
+      int rc = -1;
+      unsigned flags = 0;
+      void* p = nullptr;
+      switch (op) {
+        case 0: bump<<<1, 1>>>(d); rc = cudaGetLastError(); break;
+        case 1: rc = cudaMemsetAsync(d, 7, 4, 0); break;
+        case 2: rc = cudaMemcpyAsync(d + 1, d, 4, cudaMemcpyDeviceToDevice, 0); break;
+        case 3: rc = cudaEventRecord(e, 0); break;
+        case 4: rc = cudaMemset(d, 7, 4); break;
+        case 5: rc = cudaMemcpy(d, h, 4, cudaMemcpyHostToDevice); break;
+        case 6: rc = cudaStreamQuery(0); break;
+        case 7: rc = cudaStreamSynchronize(0); break;
+        case 8: rc = cudaLaunchHostFunc(0, never_fn, nullptr); break;
+        case 9: rc = cudaMallocAsync(&p, 64, 0); break;
+        case 10: rc = cudaStreamGetFlags(0, &flags); break;
+        case 11: rc = cudaMemsetAsync(d, 7, 4, cudaStreamLegacy); break;
+        case 12: bump<<<0, 1>>>(d); rc = cudaGetLastError(); break;   // before the launch's own checks
+        case 13: rc = cudaEventRecord(nullptr, 0); break;            // before the event's
+      }
+      if (rc != cudaErrorStreamCaptureImplicit)
+        std::printf("FAIL mode %d legacy op %d -> %d, expected 906\n", mode_, op, rc);
+      fails += rc != cudaErrorStreamCaptureImplicit;
+      WANT(cudaGetLastError(), op == 0 || op == 12 ? cudaSuccess : cudaErrorStreamCaptureImplicit);
+      WANT(status(b), cudaStreamCaptureStatusInvalidated);
+      bump<<<1, 1>>>(d);   // and again, while the invalidated capture goes on
+      WANT(cudaGetLastError(), cudaErrorStreamCaptureImplicit);
+      {
+        cudaGraph_t g = nullptr;
+        WANT(cudaStreamEndCapture(b, &g), cudaErrorStreamCaptureInvalidated);
+        WANT(g == nullptr, true);
+      }
+      cudaGetLastError();
+      if (p) cudaFree(p);
+      int v[2] = {-1, -1};
+      WANT(cudaMemcpy(v, d, sizeof v, cudaMemcpyDeviceToHost), cudaSuccess);
+      if (v[0] != 0 || v[1] != 0) std::printf("FAIL mode %d legacy op %d was done: %d %d\n", mode_, op, v[0], v[1]);
+      fails += v[0] != 0 || v[1] != 0;
+    }
+    // Answered without invalidating: cudaStreamIsCapturing(0); nothing to copy or fill; an unknown kind; no result.
+    WANT(cudaStreamBeginCapture(b, mode), cudaSuccess);
+    {
+      cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+      WANT(cudaStreamIsCapturing(0, &cs), cudaErrorStreamCaptureImplicit);
+      WANT(cudaMemsetAsync(d, 0, 0, 0), cudaSuccess);
+      WANT(cudaMemcpyAsync(d, h, 0, cudaMemcpyHostToDevice, 0), cudaSuccess);
+      WANT(cudaMemset(d, 0, 0), cudaSuccess);
+      WANT(cudaMemcpy(d, h, 0, cudaMemcpyHostToDevice), cudaSuccess);
+      WANT(cudaMemcpyAsync(d, h, 4, static_cast<cudaMemcpyKind>(17), 0), cudaErrorInvalidMemcpyDirection);
+      WANT(cudaStreamGetFlags(0, nullptr), cudaErrorInvalidValue);
+      WANT(cudaStreamIsCapturing(0, nullptr), cudaErrorInvalidValue);   // (the simulator answered 0, capturing or not)
+      WANT(cudaStreamIsCapturing(b, nullptr), cudaErrorInvalidValue);
+      WANT(status(b), cudaStreamCaptureStatusActive);
+      cudaGraph_t g = nullptr;
+      WANT(cudaStreamEndCapture(b, &g), cudaSuccess);
+      if (g) WANT(cudaGraphDestroy(g), cudaSuccess);
+      cudaGetLastError();
+    }
+    // A non-blocking capture is left alone, unless a blocking stream has joined it.
+    WANT(cudaStreamBeginCapture(c, mode), cudaSuccess);
+    WANT(cudaMemsetAsync(d, 0, 4, 0), cudaSuccess);
+    WANT(status(c), cudaStreamCaptureStatusActive);
+    WANT(cudaEventRecord(e, c), cudaSuccess);
+    WANT(cudaStreamWaitEvent(b, e, 0), cudaSuccess);
+    WANT(cudaMemsetAsync(d, 0, 4, 0), cudaErrorStreamCaptureImplicit);
+    WANT(status(c), cudaStreamCaptureStatusInvalidated);
+    WANT(status(b), cudaStreamCaptureStatusInvalidated);
+    end_invalidated();
+  }
+  WANT(cudaFreeHost(h), cudaSuccess);
+  WANT(cudaStreamDestroy(b), cudaSuccess);
   WANT(cudaDeviceSynchronize(), cudaSuccess);
   WANT(cudaEventDestroy(e), cudaSuccess);
   WANT(cudaEventDestroy(e0), cudaSuccess);

@@ -1,0 +1,234 @@
+diff --git a/amd/include/vgpu/amd_gcn.hpp b/amd/include/vgpu/amd_gcn.hpp
+index d1884436..9a8d26fd 100644
+--- a/amd/include/vgpu/amd_gcn.hpp
++++ b/amd/include/vgpu/amd_gcn.hpp
+@@ -366,8 +366,9 @@ struct TierBlock {
+   // its lane kernels called on the rows, one after the other, with no handler between. The instructions [begin, end), `bytes` of code,
+   // are bound_ops[first_op, ...) in order; adds[first_add, first_add + n_adds) is what they count. A run ends the stretch before it as an
+   // instruction that is not plain does (the next stretch begins at `end`).
++  // `ints`: how many of them are integer operations, which need every lane of the wave on (a run of none of them runs with any lane on).
+   struct BoundRun {
+-    uint32_t begin, end, first_op, bytes, first_add, n_adds;
++    uint32_t begin, end, first_op, bytes, first_add, n_adds, ints;
+   };
+   std::vector<BoundRun> bound;
+   std::vector<uint32_t> bound_of;            // by instruction, for kBound and kBoundIn: its run
+diff --git a/amd/include/vgpu/amd_gcn_tier.hpp b/amd/include/vgpu/amd_gcn_tier.hpp
+index de6137b7..2b3a396e 100644
+--- a/amd/include/vgpu/amd_gcn_tier.hpp
++++ b/amd/include/vgpu/amd_gcn_tier.hpp
+@@ -113,12 +113,18 @@ bool gives_up_turn(const Op& o);
+ // bound(): whether blocks bind them (VGPU_AMD_BLOCKS_BOUND=0 turns it off; set_bound for tests).
+ bool bound();
+ void set_bound(bool on);
++// A bound operation can also be a binary64 add, multiply or fused multiply-add of register pairs and constants (kind 1; Round sp74): its
++// row kernel (Tables::f64_rows) on the pairs' rows, src the low register of a pair or -1 for a constant, whose value is u. Such an
++// operation needs no lane on in particular (its result is merged by EXEC), and where a lane of EXEC comes out a NaN it has not run:
++// run_bound_ints returns how many operations it ran, and the first it did not run is the handler's.
+ struct BoundInt {
+   AnyFn kern;
+   int32_t dst, src[3];
++  uint8_t kind = 0;
++  uint64_t u[3] = {0, 0, 0};
+ };
+ bool bind_int(const Op& o, BoundInt* out, int32_t (*constant)(void* block, uint32_t value), void* block);
+-void run_bound_ints(const BoundInt* ops, uint32_t count, const uint32_t (*constants)[64], uint32_t (*vgpr)[64], unsigned lanes);
++uint32_t run_bound_ints(const BoundInt* ops, uint32_t count, const uint32_t (*constants)[64], uint32_t (*vgpr)[64], unsigned lanes, uint64_t exec);
+ // VGPU_AMD_BLOCKS_STATS=1 (with blocks on): at exit, how many instructions ran inside blocks and the blocks that ran the most, each with its
+ // listing. note_block adds one machine's runs of one block (`listing` makes the text, the first time the block is seen).
+ bool blocks_stats();
+diff --git a/amd/src/gcn_exec.cpp b/amd/src/gcn_exec.cpp
+index 8f23efca..55a7ac98 100644
+--- a/amd/src/gcn_exec.cpp
++++ b/amd/src/gcn_exec.cpp
+@@ -12988,7 +12988,9 @@ struct Machine {
+             fresh->kind[k] = k == i ? gcn::TierBlock::kBound : gcn::TierBlock::kBoundIn;
+             fresh->bound_of[k] = static_cast<uint32_t>(fresh->bound.size());
+           }
+-          fresh->bound.push_back({i, end, static_cast<uint32_t>(fresh->bound_ops.size()), bytes, first_add, n_adds});
++          uint32_t ints = 0;
++          for (const gcn::tier::BoundInt& op : ops) ints += op.kind == 0;
++          fresh->bound.push_back({i, end, static_cast<uint32_t>(fresh->bound_ops.size()), bytes, first_add, n_adds, ints});
+           fresh->bound_ops.insert(fresh->bound_ops.end(), ops.begin(), ops.end());
+           i = end;
+         }
+@@ -13104,19 +13106,22 @@ struct Machine {
+         const gcn::TierBlock::BoundRun& run = b.bound[b.bound_of[i]];
+         const uint64_t ex = w.exec;
+         const unsigned lanes = (ex >> 32) ? 64 : 32;
+-        if (run.end <= limit && (lanes == 64 ? ex == ~uint64_t{0} : static_cast<uint32_t>(ex) == 0xFFFFFFFFu)) {
+-          gcn::tier::run_bound_ints(b.bound_ops.data() + run.first_op + (i - run.begin), run.end - i,
+-                                    reinterpret_cast<const uint32_t (*)[64]>(b.constants.data()), r.vgpr, lanes);
+-          w.pc = insts[run.end - 1]->pc + insts[run.end - 1]->size;
+-          if (i == run.begin) {
++        // (A run with no integer operation, doubles' rows only, needs no lane on in particular; one of its operations whose result has a
++        // NaN in a lane of EXEC has not run, and it and the rest of the run are the handlers'.)
++        if (run.end <= limit && ((lanes == 64 ? ex == ~uint64_t{0} : static_cast<uint32_t>(ex) == 0xFFFFFFFFu) || (!run.ints && ex))) {
++          const uint32_t did = gcn::tier::run_bound_ints(b.bound_ops.data() + run.first_op + (i - run.begin), run.end - i,
++                                                         reinterpret_cast<const uint32_t (*)[64]>(b.constants.data()), r.vgpr, lanes, ex);
++          if (did) w.pc = insts[i + did - 1]->pc + insts[i + did - 1]->size;
++          if (i == run.begin && i + did == run.end) {
+             char* const counters = reinterpret_cast<char*>(&stats);
+             for (const gcn::TierBlock::Add *a = b.adds.data() + run.first_add, *e = a + run.n_adds; a != e; ++a) *reinterpret_cast<uint64_t*>(counters + a->at) += a->n;
+           } else {
+-            count_range(b, i, run.end);
++            count_range(b, i, i + did);
+           }
+-          block_bound += run.end - i;
+-          i = run.end;
+-        } else {
++          block_bound += did;
++          i += did;
++        }
++        if (i != run.end) {
+           const uint32_t begin = i, to = run.end < limit ? run.end : limit;
+           for (; i < to; ++i) {
+             const Inst& x = *insts[i];
+diff --git a/amd/src/gcn_tier.cpp b/amd/src/gcn_tier.cpp
+index 95f57f6c..9aaa2263 100644
+--- a/amd/src/gcn_tier.cpp
++++ b/amd/src/gcn_tier.cpp
+@@ -109,7 +109,7 @@ void tier_classify(Inst&) {}   // (the lane kernels are x86's: elsewhere the int
+ namespace tier {
+ bool gives_up_turn(const Op&) { return false; }
+ bool bind_int(const Op&, BoundInt*, int32_t (*)(void*, uint32_t), void*) { return false; }
+-void run_bound_ints(const BoundInt*, uint32_t, const uint32_t (*)[64], uint32_t (*)[64], unsigned) {}
++uint32_t run_bound_ints(const BoundInt*, uint32_t, const uint32_t (*)[64], uint32_t (*)[64], unsigned, uint64_t) { return 0; }
+ }  // namespace tier
+ 
+ #else
+@@ -3940,6 +3940,24 @@ namespace tier {
+ bool gives_up_turn(const Op& o) { return o.run == b_waitcnt; }
+ // (h_int and h_intv with every lane on: the kernel on the sources' rows, into the destination's. A source that is not there is the first one.)
+ bool bind_int(const Op& o, BoundInt* out, int32_t (*constant)(void*, uint32_t), void* block) {
++  if (o.run == h_f64r_avx2) {   // (h_f64r with its operands found once: pairs as they are and constants; a modifier on a pair or a scalar register is the handler's)
++    if (o.dst.kind != kVgpr || o.dst.index + 1 >= kVgprs) return false;
++    *out = BoundInt();
++    out->kind = 1, out->kern = o.kern, out->dst = static_cast<int32_t>(o.dst.index);
++    for (int k = 0; k < 3; ++k) out->src[k] = -1;
++    for (int k = 0; k < (o.sub == 2 ? 3 : 2); ++k) {
++      const Src& s = o.src[k];
++      if (s.kind == kVgpr) {
++        if (!s.wide || s.neg || s.abs || s.index + 1 >= kVgprs) return false;
++        out->src[k] = static_cast<int32_t>(s.index);
++      } else if (s.kind == kConst) {
++        out->u[k] = (s.value64 & (s.abs ? 0x7FFFFFFFFFFFFFFFull : ~uint64_t{0})) ^ (s.neg ? 0x8000000000000000ull : 0);
++      } else {
++        return false;
++      }
++    }
++    return true;
++  }
+   if (o.run != h_int_avx2 && o.run != h_int_base && o.run != h_intv_avx2 && o.run != h_intv_base) return false;
+   if (o.dst.kind != kVgpr || o.dst.index >= kVgprs) return false;
+   for (int k = 0; k < 3; ++k) {
+@@ -3950,6 +3968,7 @@ bool bind_int(const Op& o, BoundInt* out, int32_t (*constant)(void*, uint32_t),
+     }
+     if (s.neg || s.abs || (s.kind != kVgpr && s.kind != kConst) || (s.kind == kVgpr && s.index >= kVgprs)) return false;
+   }
++  *out = BoundInt();
+   out->kern = o.kern;
+   out->dst = static_cast<int32_t>(o.dst.index);
+   for (int k = 0; k < 3; ++k) {
+@@ -3958,13 +3977,36 @@ bool bind_int(const Op& o, BoundInt* out, int32_t (*constant)(void*, uint32_t),
+   }
+   return true;
+ }
+-void run_bound_ints(const BoundInt* ops, uint32_t count, const uint32_t (*constants)[64], uint32_t (*vgpr)[64], unsigned lanes) {
++uint32_t run_bound_ints(const BoundInt* ops, uint32_t count, const uint32_t (*constants)[64], uint32_t (*vgpr)[64], unsigned lanes, uint64_t exec) {
+   for (const BoundInt* o = ops, *e = ops + count; o != e; ++o) {
++    if (o->kind == 1) {   // (h_f64r's: the kernel into rows of its own, nothing written where a lane of EXEC is a NaN)
++      alignas(32) uint32_t rl[64], rh[64];
++      const uint32_t *lo[3], *hi[3];
++      for (int k = 0; k < 3; ++k) lo[k] = o->src[k] >= 0 ? vgpr[o->src[k]] : rl, hi[k] = o->src[k] >= 0 ? vgpr[o->src[k] + 1] : rh;
++      const uint64_t nan = reinterpret_cast<F64RowsFn>(o->kern)(rl, rh, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], o->u, lanes);
++      if (nan & exec) return static_cast<uint32_t>(o - ops);
++      uint32_t* const dlo = vgpr[o->dst];
++      uint32_t* const dhi = vgpr[o->dst + 1];
++      if (full(exec, lanes)) {
++        copy_row(dlo, rl, lanes);
++        copy_row(dhi, rh, lanes);
++      } else if (__builtin_popcountll(exec) > 8) {
++        merge(dlo, rl, exec, lanes);
++        merge(dhi, rh, exec, lanes);
++      } else {
++        for (uint64_t m = exec; m; m &= m - 1) {
++          const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
++          dlo[l] = rl[l], dhi[l] = rh[l];
++        }
++      }
++      continue;
++    }
+     const uint32_t* const a = o->src[0] >= 0 ? vgpr[o->src[0]] : constants[~o->src[0]];
+     const uint32_t* const b = o->src[1] >= 0 ? vgpr[o->src[1]] : constants[~o->src[1]];
+     const uint32_t* const c = o->src[2] >= 0 ? vgpr[o->src[2]] : constants[~o->src[2]];
+     reinterpret_cast<K3>(o->kern)(vgpr[o->dst], a, b, c, lanes);
+   }
++  return count;
+ }
+ }  // namespace tier
+ 
+diff --git a/amd/tests/unit/test_gcn_blocks_same_bits.cpp b/amd/tests/unit/test_gcn_blocks_same_bits.cpp
+index cc18b094..f1b769b2 100644
+--- a/amd/tests/unit/test_gcn_blocks_same_bits.cpp
++++ b/amd/tests/unit/test_gcn_blocks_same_bits.cpp
+@@ -589,4 +589,59 @@ VTEST(row_handlers_of_the_64_bit_forms_inside_blocks) {
+   VCHECK(in_blocks * 2 > instructions);
+ }
+ 
++// Bound binary64 operations (Round sp74): runs of v_add_f64, v_mul_f64 and v_fma_f64 on register pairs and constants are their row kernels
++// called one after the other, with any lane on, and an operation whose result has a NaN in a lane that is on is the handler's from there.
++// Doubles without a NaN and every lane on (36), with a NaN, an infinity or a denormal here and there and half the lanes off (37: a run
++// stops in its middle), floats with their specials (2), half the lanes off (3). Blocks off, blocks without binding and blocks with it
++// must agree.
++VTEST(bound_binary64_runs_give_the_handlers_bits) {
++  const bool tier_was = amd::gcn::tier::enabled(), blocks_were = amd::gcn::tier::blocks(), bound_was = amd::gcn::tier::bound();
++  amd::gcn::tier::set_enabled(true);
++  uint64_t runs = 0, wrong = 0, instructions = 0, bound = 0, bound_with_lanes_off = 0;
++  for (const Target& t : {kTargets[0], kTargets[1]}) {
++    const Pools pool = pools_of(t);
++    std::vector<amd::gcn::Inst> doubles;
++    amd::gcn::tier::set_blocks(true);
++    amd::gcn::tier::set_bound(true);
++    for (const amd::gcn::Inst& in : pool.blockable) {
++      if (in.name.find("_f64") == std::string::npos) continue;
++      amd::ProgramRun run;
++      amd::digest_program({in, in, in, pool.endpgm[0]}, t.target, 1, 36, 1, 0, &run);
++      if (run.bound_in_blocks) doubles.push_back(in);
++    }
++    VCHECK(doubles.size() >= 6);
++    Rng r{0xd0b1e + static_cast<uint64_t>(t.target)};
++    for (uint64_t pn = 0; pn < 150; ++pn) {
++      std::vector<amd::gcn::Inst> program;
++      const size_t len = 10 + r.below(24);
++      for (size_t i = 0; i < len; ++i) program.push_back(r.below(8) ? doubles[r.below(doubles.size())] : pool.blockable[r.below(pool.blockable.size())]);
++      program.push_back(pool.endpgm[0]);
++      for (const uint32_t flavour : {36u, 37u, 2u, 3u}) {
++        const uint64_t slice = r.below(2) ? 0 : 1 + r.below(7);
++        const uint32_t waves = 1 + static_cast<uint32_t>(r.below(2));
++        amd::ProgramRun on_run;
++        amd::gcn::tier::set_blocks(false);
++        const uint64_t plain = amd::digest_program(program, t.target, pn, flavour, waves, slice);
++        amd::gcn::tier::set_blocks(true);
++        amd::gcn::tier::set_bound(false);
++        const uint64_t unbound = amd::digest_program(program, t.target, pn, flavour, waves, slice);
++        amd::gcn::tier::set_bound(true);
++        const uint64_t on = amd::digest_program(program, t.target, pn, flavour, waves, slice, &on_run);
++        ++runs, instructions += on_run.instructions, bound += on_run.bound_in_blocks;
++        if (flavour == 37 || flavour == 3) bound_with_lanes_off += on_run.bound_in_blocks;
++        wrong += plain != on || unbound != on;
++      }
++    }
++  }
++  amd::gcn::tier::set_bound(bound_was);
++  amd::gcn::tier::set_blocks(blocks_were);
++  amd::gcn::tier::set_enabled(tier_was);
++  std::fprintf(stderr, "bound binary64 runs: %llu runs each way, %llu instructions, %llu as bound operations (%llu with lanes off)\n",
++               static_cast<unsigned long long>(runs), static_cast<unsigned long long>(instructions), static_cast<unsigned long long>(bound),
++               static_cast<unsigned long long>(bound_with_lanes_off));
++  if (wrong) throw vtest::Failure(std::to_string(wrong) + " of " + std::to_string(runs) + " runs differ with bound binary64 operations");
++  VCHECK(bound * 8 > instructions);
++  VCHECK(bound_with_lanes_off * 40 > instructions);
++}
++
+ VTEST_MAIN

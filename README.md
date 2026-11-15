@@ -9,8 +9,7 @@ PantheonSim runs CUDA and HIP programs on a CPU, with no GPU. It supplies fake d
 - There is no timing. Timings mean nothing, and `%clock` and `%globaltimer` count instructions. It is also much slower than a GPU.
 - CUDA programs must be built with `nvcc -cudart shared`. Static cudart (CuPy, for example) does not work.
 - Kernels run to completion inside the launch call, so an event recorded behind a kernel is complete at once ([#523](https://github.com/pantheongpu/pantheonsim/issues/523)); `cudaLaunchHostFunc` and `cuLaunchHostFunc` are asynchronous ([#487](https://github.com/pantheongpu/pantheonsim/issues/487)).
-- Known bug in the v0.2.0 release (and so in `setup-pantheonsim@v0`): `shfl.sync` returns 0 for a lane that is still in a long loop, and reports nothing ([#488](https://github.com/pantheongpu/pantheonsim/issues/488)). It is fixed on `main` by [#527](https://github.com/pantheongpu/pantheonsim/pull/527).
-- `cudaDeviceCanAccessPeer` reports peer access between simulated GPUs, but a kernel that reads the other GPU's memory fails ([#598](https://github.com/pantheongpu/pantheonsim/issues/598)).
+- The v0.2.0 release has two bugs, both fixed in v0.2.1: `shfl.sync` returned 0 for a lane still in a long loop, with no error ([#488](https://github.com/pantheongpu/pantheonsim/issues/488)), and a kernel could not read another simulated GPU's memory after `cudaDeviceEnablePeerAccess` ([#598](https://github.com/pantheongpu/pantheonsim/issues/598)). Use v0.2.1 or later.
 - OptiX and NVIDIA's Nsight tools are not supported.
 - 31 of the 48 GPU profiles come from public documents, not from a card.
 

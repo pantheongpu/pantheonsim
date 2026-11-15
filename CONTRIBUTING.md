@@ -49,10 +49,10 @@ These are the project's fixed points (see [GOVERNANCE.md](GOVERNANCE.md)):
   simulator without being edited.
 - Anything unsupported fails with an error that names what is missing
   (instruction, API, kernel, profile). It never silently does the wrong thing.
-  Known exceptions are listed in [docs/status.md](docs/status.md): `shfl.sync`
-  in the v0.2.0 release ([#488](https://github.com/pantheongpu/pantheonsim/issues/488),
-  fixed on `main`) and peer access between simulated GPUs
-  ([#598](https://github.com/pantheongpu/pantheonsim/issues/598)).
+  Known exceptions are listed in [docs/status.md](docs/status.md); none is open
+  (the v0.2.0 release had two, fixed in v0.2.1:
+  [#488](https://github.com/pantheongpu/pantheonsim/issues/488) and
+  [#598](https://github.com/pantheongpu/pantheonsim/issues/598)).
 - Runs are reproducible: with `VGPU_THREADS=1`, the same program and inputs give
   bit-identical results.
 - Vendor interfaces are written from public documentation, and vendor code comes

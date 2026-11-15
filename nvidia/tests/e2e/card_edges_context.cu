@@ -23,6 +23,12 @@
 //     the thread with no context.
 //   - queries: cudaGetDeviceProperties, cudaDeviceGetAttribute and cudaGetDeviceCount on a fresh process make no
 //     context current or active.
+//   - device flags: cudaGetDeviceFlags is the current context's flags (cuCtxGetFlags), or with none current the device's
+//     primary context's (cudaSetDeviceFlags, cudaInitDevice with cudaInitDeviceFlagsAreValid,
+//     cuDevicePrimaryCtxSetFlags) with cudaDeviceMapHost, active or not; a null pointer is cudaErrorInvalidValue. The
+//     simulator answered 0. cudaSetDeviceFlags sets the primary context's flags (MapHost not kept), on an active one
+//     too, and makes it active and current; a value above 0xff or two scheduling modes is cudaErrorInvalidValue and
+//     starts nothing. The simulator took any value and did nothing.
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <sys/wait.h>
@@ -243,8 +249,120 @@ static void queries() {
   WANT(active(), 0);
 }
 
+static unsigned device_flags() {
+  unsigned f = 0xdead;
+  WANT(cudaGetDeviceFlags(&f), cudaSuccess);
+  return f;
+}
+static CUcontext own_context(unsigned flags) {
+  CUdevice dev = 0;
+  CUcontext c = nullptr;
+  WANT(cuDeviceGet(&dev, 0), CUDA_SUCCESS);
+#if CUDA_VERSION >= 13000
+  WANT(cuCtxCreate(&c, nullptr, flags, dev), CUDA_SUCCESS);
+#else
+  WANT(cuCtxCreate(&c, flags, dev), CUDA_SUCCESS);
+#endif
+  return c;
+}
+
+// how: 0 fresh, 1 cudaSetDeviceFlags before the device starts, 2 after, 3 refused values, 4 cudaInitDevice,
+// 5 cuDevicePrimaryCtxSetFlags, 6 contexts of the program's own.
+static void device_flags_group(int how) {
+  switch (how) {
+    case 0:
+      WANT(device_flags(), 0x8);
+      WANT(cudaGetDeviceFlags(nullptr), cudaErrorInvalidValue);
+      WANT(cuInit(0), CUDA_SUCCESS);
+      WANT(active(), 0);
+      WANT(cudaFree(nullptr), cudaSuccess);
+      WANT(device_flags(), 0x8);
+      break;
+    case 1:
+      WANT(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync), cudaSuccess);
+      WANT(cuInit(0), CUDA_SUCCESS);
+      WANT(active(), 1);
+      WANT(current() != nullptr, true);
+      WANT(primary_flags(), 0x4);
+      WANT(device_flags(), 0xc);
+      WANT(cudaSetDeviceFlags(cudaDeviceScheduleSpin | cudaDeviceMapHost), cudaSuccess);
+      WANT(primary_flags(), 0x1);
+      WANT(device_flags(), 0x9);
+      WANT(cudaSetDeviceFlags(cudaDeviceLmemResizeToMax), cudaSuccess);
+      WANT(device_flags(), 0x18);
+      break;
+    case 2:
+      WANT(cudaFree(nullptr), cudaSuccess);
+      WANT(cudaSetDeviceFlags(cudaDeviceScheduleYield), cudaSuccess);
+      WANT(device_flags(), 0xa);
+      WANT(cudaSetDeviceFlags(0), cudaSuccess);
+      WANT(device_flags(), 0x8);
+      for (unsigned bad : {3u, 5u, 6u, 7u, 0xffu, 0x100u, 0x80000000u}) {
+        WANT(cudaSetDeviceFlags(bad), cudaErrorInvalidValue);
+        WANT(cudaGetLastError(), cudaErrorInvalidValue);
+      }
+      WANT(device_flags(), 0x8);
+      break;
+    case 3:
+      for (unsigned bad : {3u, 0xffu, 0x100u}) WANT(cudaSetDeviceFlags(bad), cudaErrorInvalidValue);
+      WANT(cuInit(0), CUDA_SUCCESS);
+      WANT(active(), 0);
+      WANT(current() == nullptr, true);
+      WANT(device_flags(), 0x8);
+      break;
+    case 4:
+      WANT(cudaInitDevice(0, cudaDeviceScheduleYield, cudaInitDeviceFlagsAreValid), cudaSuccess);
+      WANT(cuInit(0), CUDA_SUCCESS);
+      WANT(current() == nullptr, true);
+      WANT(device_flags(), 0xa);
+      break;
+    case 5: {
+      WANT(cuInit(0), CUDA_SUCCESS);
+      WANT(cuDevicePrimaryCtxSetFlags(0, CU_CTX_SCHED_BLOCKING_SYNC), CUDA_SUCCESS);
+      WANT(active(), 0);
+      WANT(device_flags(), 0xc);
+      CUcontext prim = nullptr;
+      WANT(cuDevicePrimaryCtxRetain(&prim, 0), CUDA_SUCCESS);
+      WANT(cuDevicePrimaryCtxSetFlags(0, CU_CTX_SCHED_YIELD), CUDA_SUCCESS);
+      WANT(current() == nullptr, true);
+      WANT(device_flags(), 0xa);
+      WANT(cuCtxSetCurrent(prim), CUDA_SUCCESS);
+      WANT(device_flags(), 0xa);
+      WANT(cuDevicePrimaryCtxRelease(0), CUDA_SUCCESS);
+      break;
+    }
+    case 6: {
+      WANT(cuInit(0), CUDA_SUCCESS);
+      WANT(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync), cudaSuccess);
+      CUcontext a = own_context(0);
+      WANT(device_flags(), 0x0);
+      WANT(cuCtxDestroy(a), CUDA_SUCCESS);
+      WANT(device_flags(), 0xc);   // the primary context is current again
+      CUcontext b = own_context(CU_CTX_SCHED_SPIN | CU_CTX_LMEM_RESIZE_TO_MAX);
+      WANT(device_flags(), 0x11);
+      WANT(cuCtxDestroy(b), CUDA_SUCCESS);
+      CUcontext m = own_context(CU_CTX_MAP_HOST);
+      WANT(device_flags(), 0x8);
+      CUcontext popped = nullptr;
+      WANT(cuCtxPopCurrent(&popped), CUDA_SUCCESS);
+      WANT(cuCtxPopCurrent(&popped), CUDA_SUCCESS);   // and the primary context under it
+      WANT(current() == nullptr, true);
+      WANT(device_flags(), 0xc);   // none current: the primary context's
+      WANT(cuCtxDestroy(m), CUDA_SUCCESS);
+      break;
+    }
+  }
+}
+
 int main() {
   struct { const char* name; void (*run)(); } groups[] = {
+      {"device flags fresh", [] { device_flags_group(0); }},
+      {"cudaSetDeviceFlags before start", [] { device_flags_group(1); }},
+      {"cudaSetDeviceFlags after start", [] { device_flags_group(2); }},
+      {"cudaSetDeviceFlags refused", [] { device_flags_group(3); }},
+      {"cudaGetDeviceFlags after cudaInitDevice", [] { device_flags_group(4); }},
+      {"cudaGetDeviceFlags after cuDevicePrimaryCtxSetFlags", [] { device_flags_group(5); }},
+      {"cudaGetDeviceFlags own contexts", [] { device_flags_group(6); }},
       {"destroyed", destroyed},
       {"destroyed, runtime", destroyed_runtime},
       {"cudaDeviceReset", [] { reset(0); }},
