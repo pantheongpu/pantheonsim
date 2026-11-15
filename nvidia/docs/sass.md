@@ -243,7 +243,9 @@ sum (the published model is behind `VGPU_TC_EXACT=published`). Four corners of t
 fixed (a subnormal f32 result is cut, not rounded; a zero accumulator's chunk has an alignment floor; a subnormal accumulator's
 position; +0 for a negative sum that rounds to zero); tiles that can reach them, and every f16-accumulator tile, run in the scalar
 code. The model per profile, the cards, drivers and dates, and what is still unmeasured: [docs/matrix-numerics.md](../../docs/matrix-numerics.md).
-`tc86::device_sum_model` is the one table; `e2e_simd_lane_forms` and `e2e_float_half_forms` build the probes for sm_75 (`-DNO80`),
+`tc86::device_sum_model` is the one table (since the profiles carry the model it reads the loaded profile's
+`numerics.tensor_sum`, which is where the choice is written and tagged with its evidence: [profiles.md](profiles.md), "Numerics
+and provenance"; no engine compares a compute capability or an sm number for it); `e2e_simd_lane_forms` and `e2e_float_half_forms` build the probes for sm_75 (`-DNO80`),
 sm_80, sm_89, sm_90, sm_100 and sm_120 and hold each profile to its card's file or to the sequential pins.
 
 What stays different from the card: the SFU. `MUFU.RCP/RSQ/SQRT/EX2/LG2/SIN/COS/TANH` are not correctly rounded on the card (rcp,

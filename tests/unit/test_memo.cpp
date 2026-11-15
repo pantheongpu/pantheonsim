@@ -411,6 +411,57 @@ VTEST(the_hash_sees_every_byte_and_the_length) {
   VCHECK(memo::page_hash(zeros.data(), 4096) != memo::page_hash(zeros.data(), 4095));
 }
 
+// The device's part of a launch's key holds the numerics: two profiles that differ only in which sum the tensor core makes (or in
+// the published model VGPU_TC_EXACT=published would turn on) give different results, so they must not share a cached one. What a
+// value rests on (provenance, evidence) changes no result and is not in the key.
+VTEST(the_profile_hash_sees_the_numerics) {
+  const auto yaml = [](const std::string& numerics) {
+    return std::string("id: nvidia/testcard\nvendor: nvidia\nmodel: \"Test Card\"\narchitecture: hopper\ncompute_capability: \"9.0\"\n"
+                       "warp_size: 32\nvram_bytes: 85028896768\nverified: false\nlimits:\n  max_threads_per_block: 1024\n"
+                       "  max_block_dim: [1024, 1024, 64]\n  max_grid_dim: [2147483647, 65535, 65535]\n  shared_mem_per_block_bytes: 49152\n"
+                       "  shared_mem_per_block_optin_bytes: 232448\n  registers_per_block: 65536\n  multiprocessors: 132\n") + numerics;
+  };
+  const std::string four = "[numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]";
+  const std::string ampere = "numerics:\n  tensor_sum: ampere\n  tensor_sum_chunk: 8\n  tensor_sum_chunk_tf32: 4\n  tensor_sum_grid: 25\n";
+  const std::string hopper = "numerics:\n  tensor_sum: hopper\n  tensor_sum_chunk: 16\n  tensor_sum_chunk_tf32: 8\n  tensor_sum_grid: 26\n";
+  const std::string measured = "provenance:\n  measured: " + four + "\nevidence:\n  numerics: \"a card\"\n";
+  const std::string inferred = "provenance:\n  inferred: " + four + "\nevidence:\n  numerics: \"another card of the same capability\"\n";
+  const std::string seq = "numerics:\n  tensor_sum: sequential\nprovenance:\n  unknown: [numerics.tensor_sum]\n";
+  const std::string seq_pub = "numerics:\n  tensor_sum: sequential\n  tensor_sum_published: hopper\nprovenance:\n  unknown: [numerics.tensor_sum]\n"
+                              "  inferred: [numerics.tensor_sum_published]\nevidence:\n  numerics.tensor_sum_published: \"a paper\"\n";
+  const auto hash = [&](const std::string& numerics) { return memo::profile_hash(DeviceProfile::from_yaml(yaml(numerics), "t")); };
+  const memo::Hash128 a = hash(ampere + measured), h = hash(hopper + measured), s = hash(seq), sp = hash(seq_pub), none = hash("");
+  // Profiles that differ only in a numerics field: each pair apart.
+  VCHECK(a != h);
+  VCHECK(a != s && h != s);
+  VCHECK(s != sp);            // the published model alone
+  VCHECK(none != s);          // (a profile without the section is not one that says "sequential": a different document)
+  VCHECK(none != a && none != h && none != sp);
+  // The same numerics on another class of evidence: the same key.
+  VCHECK(hash(ampere + inferred) == a);
+  VCHECK(hash(ampere + measured) == a);
+  // Each field by itself, on a loaded profile.
+  const DeviceProfile base = load_gpu("nvidia/a10");
+  const memo::Hash128 hb = memo::profile_hash(base);
+  VCHECK(memo::profile_hash(load_gpu("nvidia/a10")) == hb);
+  const auto changed = [&](const std::function<void(DeviceProfile&)>& edit) {
+    DeviceProfile p = base;
+    edit(p);
+    return memo::profile_hash(p) != hb;
+  };
+  VCHECK(changed([](DeviceProfile& p) { p.numerics.tensor_sum = vgpu::TensorSum::Hopper; }));
+  VCHECK(changed([](DeviceProfile& p) { p.numerics.tensor_sum = vgpu::TensorSum::Sequential; }));
+  VCHECK(changed([](DeviceProfile& p) { p.numerics.tensor_sum_chunk = 16; }));
+  VCHECK(changed([](DeviceProfile& p) { p.numerics.tensor_sum_chunk_tf32 = 8; }));
+  VCHECK(changed([](DeviceProfile& p) { p.numerics.tensor_sum_grid = 26; }));
+  VCHECK(changed([](DeviceProfile& p) { p.numerics.tensor_sum_published = vgpu::TensorSum::Hopper; }));
+  VCHECK(changed([](DeviceProfile& p) { p.numerics.present = false; }));
+  VCHECK(!changed([](DeviceProfile& p) { p.provenance.clear(), p.evidence.clear(); }));
+  VCHECK(changed([](DeviceProfile& p) { p.limits.multiprocessors += 1; }));   // (and what it always saw)
+  // Two built-in profiles that are the same compute capability and differ in their sum's class only still differ (their ids do).
+  VCHECK(memo::profile_hash(load_gpu("nvidia/h100")) != memo::profile_hash(load_gpu("nvidia/h100-pcie")));
+}
+
 // ---- which called functions make a launch uncacheable ----------------------------------------------------------------------------
 
 VTEST(the_device_runtime_is_told_from_ptxas_helpers_by_name) {

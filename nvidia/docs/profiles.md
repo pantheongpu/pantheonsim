@@ -58,6 +58,130 @@ The memory column is NVIDIA's "GB", which for these boards is binary (an A100
 40 GB reports 40960 MiB). A real card shows a little less in `nvidia-smi`
 because the driver keeps some, so each figure is an upper bound until measured.
 
+## Numerics and provenance (`numerics:`, `provenance:`, `evidence:`)
+
+Three optional sections say what a device's arithmetic units do where that is not plain IEEE arithmetic, and what each value
+in the profile rests on. They are parsed by the same loader as the rest (`src/core/profile.cpp`, the restricted YAML of
+`include/vgpu/yamlish.hpp`: one level of nesting, inline lists), are embedded in the binaries with the profile, and
+`vgpu info --gpu <id>` prints them (`--json` too). AMD and Intel profiles use `provenance:` and `evidence:` with the same rules;
+`numerics:` is NVIDIA's only for now.
+
+```yaml
+# nvidia/profiles/t4.yaml
+numerics:
+  tensor_sum: ampere               # sequential | ampere | hopper
+  tensor_sum_chunk: 8              # products to a chunk, f16 and bf16
+  tensor_sum_chunk_tf32: 4         # ... tf32
+  tensor_sum_grid: 25              # a chunk's terms are cut at 2^(top - 25)
+provenance:
+  measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_grid]
+  inferred: [numerics.tensor_sum_chunk_tf32]
+evidence:
+  numerics: "card: Tesla T4 (this model), AWS; driver: 595.112.07; toolkit: CUDA 13.0; date: 2026-11-15. simd_lane_forms built -DNO80 prints ..."
+  numerics.tensor_sum_chunk_tf32: "not measurable on this card: a Turing tensor core has no tf32 form. ..."
+```
+
+```yaml
+# nvidia/profiles/b200.yaml
+numerics:
+  tensor_sum: sequential           # sequential | ampere | hopper
+  tensor_sum_published: hopper     # a published model exists; NOT in force by default: VGPU_TC_EXACT=published turns it on
+provenance:
+  unknown: [numerics.tensor_sum]
+  inferred: [numerics.tensor_sum_published]
+evidence:
+  numerics.tensor_sum: "no card of compute capability 10.0 has been run by us. ..."
+  numerics.tensor_sum_published: "published, not measured by us: MMA-Sim (Xie et al., arXiv 2511.10909) and ..."
+```
+
+### `numerics:`
+
+The sum the device's tensor core makes of f16, bf16 and tf32 products (`wmma`, `mma.sync`, SASS `HMMA`). **The engines read it
+from the loaded profile**; no engine compares a compute capability for it (`tc86::sum_model(profile)` in
+`include/vgpu/exec/tc_ampere.hpp` is the one place). The rule itself, the cards and what is still unmeasured are in
+[docs/matrix-numerics.md](../../docs/matrix-numerics.md).
+
+| Key | Value | Meaning |
+| --- | --- | --- |
+| `tensor_sum` | `sequential`, `ampere` or `hopper` (required when the section is there) | The model in force by default (`vgpu::TensorSum`). `sequential` is `acc += a * b` in f32: what no card is known to do, and what a device gets whose tensor core has not been measured. |
+| `tensor_sum_chunk` | integer | Products to a chunk, f16 and bf16: 8 (`ampere`), 16 (`hopper`). |
+| `tensor_sum_chunk_tf32` | integer | The same for tf32: 4, 8. |
+| `tensor_sum_grid` | integer | A chunk's terms are cut at `2^(top - grid)`: 25, 26. |
+| `tensor_sum_published` | `ampere` or `hopper` (optional, only beside `tensor_sum: sequential`) | The model the literature gives the device, which no card of ours has checked. Never in force by default: `VGPU_TC_EXACT=published` turns it on. |
+
+Rules the loader enforces (a profile that breaks one does not load, and the message names the file and the key):
+
+- The three numbers are required with `ampere` and `hopper` and must be that model's (8 / 4 / 25, 16 / 8 / 26); with `sequential`
+  they must be absent. The engines implement these two rules (scalar code for both, vector kernels for the first), not a sum of any
+  chunk and grid, so other numbers would be printed and hashed and would not be what runs. They are written out so that a profile
+  says what its card does, not only a name. A new rule is new engine code first.
+- A key the table does not have is refused, and so is the section on a profile that is not NVIDIA's.
+- **Every key in `numerics:` must have a provenance class** (below). A numerics value decides result bits, so none goes without one.
+- A profile without the section has the sequential sum and no published model. Every NVIDIA profile in the tree has the section
+  (`test_profile`, `every_builtin_profile_tags_its_numerics`).
+
+The numerics are part of the result cache's key (`memo::profile_hash`, `src/runtime/memo.cpp`): two profiles that differ only in
+a numerics value never share a cached result. The classes and the evidence text are not: they change no result.
+
+`VGPU_TC_EXACT` works on top of the profile, as before: `0` is the sequential sum whatever the profile says, `force` gives a
+profile whose `tensor_sum` is `sequential` the `ampere` rule, `published` gives it its `tensor_sum_published`.
+
+### `provenance:`
+
+Exactly four classes, each a list of keys. A key is named as it is written in the file: `section.key`
+(`numerics.tensor_sum`, `limits.multiprocessors`) or a bare top-level key (`vram_bytes`).
+
+| Class | Means | Its evidence says |
+| --- | --- | --- |
+| `measured` | Read from, or reproduced bit for bit against, a physical card **of this profile's model**, by this project. | The card, where it was, driver, toolkit, date, and what was compared. |
+| `documented` | The vendor's specification, data sheet or documentation. | The document. |
+| `inferred` | Not known of this device itself: carried over from a measured device of the same compute capability or die, or taken from a published model that no card of ours has checked. | The device or the publication it is carried over from. |
+| `unknown` | None of these. The value is what the simulator does, not a claim about the device. | Optional. |
+
+Rules the loader enforces:
+
+- A class that is not one of the four is refused.
+- **A key carries one class**: a key in two lists, or twice in one, is refused (and a class written twice is a duplicate key).
+- A listed key must be one the profile has, so a mistyped name cannot tag nothing.
+- `measured`, `documented` and `inferred` are claims and need an evidence entry (the key's own or its section's).
+- A key in `placeholders:` can only be `unknown`.
+
+**A key that is not listed has no per-key class.** That is the default, and it is deliberate: nothing is turned into `measured`
+or `documented` by a rule. What is said of an unlisted key is what was said before these sections existed:
+
+- if it is in `placeholders:` it is a stand-in, and `DeviceProfile::provenance_of` reports it as `unknown`;
+- otherwise the profile-wide `verified:` flag stands (true: the characterization, `nvidia/tools/characterize.cu`, was read from a
+  card of this model; false: it was not), together with the comments in the file, which say key by key where a value came from.
+  `verified: true` does not make every key measured (the H100's L2 size and thermal limit are data-sheet values in a verified
+  profile) and `verified: false` does not make every key documented (many are copied from the nearest profile), so the flag is not
+  translated into a class. `vgpu info` prints only the keys that have a class.
+
+Keys get a class when somebody checks what they rest on. Today that is the tensor-core sum on all 38 NVIDIA profiles and the
+values of the two Radeon cards that were read (`amd/profiles/rx6800.yaml`, `rx6700xt.yaml`: what HIP, rocminfo and amd-smi
+reported on the card, kept in `amd/registers/measurements/`, is `measured`; the per-multiprocessor block limit, which no tool
+reports, is `inferred` from the RX 6900 XT profile). No AMD matrix arithmetic is in any profile, and none is measured.
+
+### `evidence:`
+
+One text per tagged key, or per section for all of its tagged keys that have no entry of their own (`numerics: "..."`). An
+entry that belongs to no tagged key is refused. For a measured value the text starts with the same greppable fields in every
+profile: `card: <model> (this model), <where>; driver: <version>; toolkit: <version>; date: <date>.`, then what was compared and
+where the files are (`grep -n "card:" nvidia/profiles/*.yaml amd/profiles/*.yaml` lists every measurement a profile rests on).
+The text is one quoted line and may not contain a double quote.
+
+### The tensor-core sum of each profile
+
+| Class of `numerics.tensor_sum` | Profiles | Why |
+| --- | --- | --- |
+| `measured` (7) | `rtx3060`, `a10g`, `t4`, `l4`, `l40s`, `a100-sxm4-40gb` (`ampere`); `h100-pcie` (`hopper`) | A card of exactly this model was run (2026-11-15 and, for the RTX 3060, before). The T4's `tensor_sum_chunk_tf32` alone is `inferred`: a Turing card has no tf32 form to measure. |
+| `inferred` (20) | 7.5: `rtx2080ti`. 8.0: `a100` (the SXM4 80 GB), `a100-80gb-pcie`, `a30`. 8.6: `a10`, `a40`, `rtx-a5000`, `rtx-a6000`, `rtx3070`, `rtx3080ti`, `rtx3090`. 8.9: `l40`, `rtx4080`, `rtx4090`, `rtx6000-ada`. 9.0: `h100` (the SXM5 80 GB, **the default profile**), `h100-nvl`, `h200`, `h200-nvl`, `gh200-480gb` | Another model of the same compute capability was run, not this one. The sum is the measured card's. |
+| `unknown` (11) | 10.0: `b200`, `gb200`. 12.0: `rtx5090`, `rtx-pro-4500`, `rtx-pro-6000`, `rtx-pro-6000-server`, `rtx-pro-6000-max-q` (these seven carry `tensor_sum_published: hopper`, itself `inferred`). 10.3 `b300`, 10.7 `vr200`, 11.0 `thor`, 12.1 `gb10` (nothing published) | No card of the compute capability was run. They keep the sequential sum. |
+
+Moving the sum from a table keyed on the compute capability into the profiles changed no result: `test_exec3`
+(`tc_model_devices`) holds each of the 38 profiles to the model that table gave it, in every `VGPU_TC_EXACT` mode. A card run
+that turns an `inferred` or `unknown` into `measured` changes the profile, its row in `test_profile` and, if the model changes,
+its pin in `test_exec3` together.
+
 ## Peer access and managed memory (`cuda: peer_access`, `concurrent_managed_access`)
 
 Two facts about a board that the other profile fields do not say, both `true` unless a profile says `false`:

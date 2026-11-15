@@ -785,7 +785,7 @@ class Runner {
   }
   // The `kind` argument of simd::Kernels::hmma for an f16 (0), bf16 (1) or tf32 (2) HMMA: the device's sum model (tc86::sum_model: bit 4 the
   // RTX 3060's rule, bit 5 an H100's) unless VGPU_TC_EXACT=0. exec_mma (exec_ops.inc) and the tier's HMMA handler both call this, so that the choice is made in one place.
-  unsigned hmma_kernel_kind(unsigned kind) const { return kind | vgpu::exec::tc86::kernel_kind_bits(profile_.cc_major, profile_.cc_minor); }
+  unsigned hmma_kernel_kind(unsigned kind) const { return kind | vgpu::exec::tc86::kernel_kind_bits(profile_); }
   ~Runner() {
     if (coop_ws_) {
       try {

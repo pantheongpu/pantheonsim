@@ -113,6 +113,9 @@ struct Ticket {
 
 // The hash of every live allocation of a device, and the end-of-process record of it (VGPU_MEMO_FINAL_HASH).
 Hash128 memory_hash(const MemoryManager& mem);
+// The part of a launch's key that is the device: every profile value that can change what a kernel computes or whether it may
+// launch (identity, compute capability, limits, features, and the numerics). One function, so a test can hold it to that.
+Hash128 profile_hash(const DeviceProfile& p);
 void final_hash_register(const MemoryManager* m);
 void final_hash_write(const MemoryManager* m);   // (the device is going away: write its line now)
 

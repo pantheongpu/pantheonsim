@@ -2813,6 +2813,10 @@ set_tests_properties(regs_cli PROPERTIES DEPENDS vgpu_cli
 add_test(NAME config_cli COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_config_cli.sh)
 set_tests_properties(config_cli PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
+# `vgpu info`: a profile's numerics, the class of evidence of each value, and the evidence (nvidia/docs/profiles.md).
+add_test(NAME info_cli COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_info_cli.sh)
+set_tests_properties(info_cli PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
 add_test(NAME lint_makefile COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_makefile.sh)
 add_test(NAME lint_tracked_junk COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_tracked_junk.sh)
 set_tests_properties(lint_tracked_junk PROPERTIES TIMEOUT 60)
