@@ -123,6 +123,14 @@ has yet, add a row for it to the machines in `.github/workflows/workloads.yml` (
 check fails when a compute capability has none). A new card of an existing capability
 needs no row: the tests that run on every profile cover its data.
 
+An NVIDIA profile also says which sum its tensor core makes and what that rests on (`numerics:`, `provenance:`, `evidence:`;
+[nvidia/docs/profiles.md](nvidia/docs/profiles.md), "Numerics and provenance"). Tag a value `measured` only if a card of that
+exact model was run and name the card, driver, toolkit and date in the evidence; a model of the same compute capability as a
+measured card is `inferred`; with no card of the capability the sum stays `sequential` and `unknown`. A profile whose numerics
+have no class does not load. Add the profile's row to `every_builtin_profile_tags_its_numerics` (`tests/unit/test_profile.cpp`)
+and its pin to `kTensorSumPins` (`tests/unit/test_exec3.cpp`). Other keys may be tagged the same way when you have checked what
+they rest on; leave a key untagged rather than guess.
+
 ## Third-party code
 
 Do not add a file whose license forbids redistribution. NVIDIA's cuDNN headers

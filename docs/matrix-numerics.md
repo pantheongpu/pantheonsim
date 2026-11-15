@@ -30,8 +30,13 @@ Every f16, bf16 and tf32 tensor-core form measured so far is one rule with two n
 | `Hopper` | 16 | 8 (an m16n8k4 is one chunk; a wmma 16x16x8 fragment compiles to two m16n8k4, so chunks of 4) | 26 | block 16 / 8, 25 fraction bits, floors -133 / -21 |
 | `Sequential` | 1 | 1 | - | `acc += a * b` in f32, round to nearest even. Not a card's sum. |
 
-`tc86::device_sum_model(compute capability)` is the one table from a device to its model; the engines ask it and compare no sm
-number. The device chooses, not the architecture a cubin was built for (an H100 gives its own bits for sm_75, sm_80, sm_86, sm_89
+Which model a device takes is written in its profile, `numerics.tensor_sum` in `nvidia/profiles/<name>.yaml`, with the numbers of
+the model beside it and the class of evidence it rests on (`provenance:`, `evidence:`): **the profile fields are the source of
+truth**, and the table below is a summary of them ([nvidia/docs/profiles.md](../nvidia/docs/profiles.md), "Numerics and
+provenance", has the schema). `tc86::device_sum_model(profile)` reads the field; the engines ask it and compare no sm number and
+no compute capability. (Until the profiles carried it, `tc86::device_sum_model(compute capability)` was the one table from a
+device to its model; `test_exec3` keeps that table and holds every profile to it, so the move changed no result.) The device
+chooses, not the architecture a cubin was built for (an H100 gives its own bits for sm_75, sm_80, sm_86, sm_89
 and sm_90 builds of the same program, and an RTX 3060 its own for sm_75 and sm_80 builds).
 
 ## NVIDIA profiles
@@ -46,6 +51,17 @@ and sm_90 builds of the same program, and an RTX 3060 its own for sm_75 and sm_8
 | 10.0, 12.0 (Blackwell) | b200, gb200; rtx5090, rtx-pro-4500, rtx-pro-6000, -server, -max-q | `Sequential` by default; `Hopper` with `VGPU_TC_EXACT=published` | published, not measured by us | MMA-Sim and Khattak-Mikaitis give B200 and RTX PRO 6000 Blackwell the Hopper numbers |
 | 10.3, 10.7, 11.0, 12.1, 8.7 | b300, vr200, thor, gb10 | `Sequential` | unmeasured | no source covers them |
 | 7.0 (Volta) | no profile | - | published | block 4, no extra bit (`G` 24); a V100 profile would be new, and CUDA 13 cannot build sm_70 |
+
+The Status column is per compute capability: a card of that capability was run. Per profile the profile says more, in
+`provenance:`. `measured` there means a card of **that model** was run; a profile of another model of the same compute capability
+is `inferred`; a profile whose capability no card of ours has run is `unknown` and keeps the sequential sum (`vgpu info --gpu
+<id>` prints the class and the evidence):
+
+| Class of `numerics.tensor_sum` in the profile | Profiles |
+|---|---|
+| `measured` | rtx3060, a10g, t4 (its tf32 chunk is `inferred`: no tf32 form on Turing), l4, l40s, a100-sxm4-40gb, h100-pcie |
+| `inferred` | rtx2080ti; a100, a100-80gb-pcie, a30; a10, a40, rtx-a5000, rtx-a6000, rtx3070, rtx3080ti, rtx3090; l40, rtx4080, rtx4090, rtx6000-ada; h100 (the default profile), h100-nvl, h200, h200-nvl, gh200-480gb |
+| `unknown` | b200, gb200, rtx5090, rtx-pro-4500, rtx-pro-6000, rtx-pro-6000-server, rtx-pro-6000-max-q (each with `numerics.tensor_sum_published: hopper`, class `inferred`: the published model, opt-in); b300, vr200, thor, gb10 (nothing published) |
 
 Everywhere: the f64 form (DMMA) is a chain of IEEE double fused multiply-adds in the order of K, which is what FTTN's fp64
 program prints on every card we ran it on (RTX 3060, A10G, L4, L40S, A100, H100: three extra bits, round to nearest even, sticky
@@ -99,6 +115,8 @@ tile with an f16 accumulator, or with bf16 / tf32 operands small enough for a pr
 `VGPU_TC_EXACT`: unset, each device sums by its model. `0`: the sequential f32 sum on every device, as the earliest releases
 (bit for bit; pinned by `simd_lane_forms.*.tcseq.txt`). `force`: a device without a measured model takes `Ampere`.
 `published`: a device without a measured model takes the published one where there is one (Blackwell: `Hopper`).
+In the profile's terms: `0` ignores `numerics.tensor_sum`; `force` and `published` act only on a profile whose `tensor_sum` is
+`sequential`, giving it `ampere` or its `numerics.tensor_sum_published`.
 
 Results that changed with this work, all of matrix instructions: the t4, rtx2080ti, a100*, a30, l4, l40, l40s, rtx4080,
 rtx4090 and rtx6000-ada profiles (sequential to `Ampere`); the h100*, h200* and gh200 profiles (sequential to `Hopper`); on the
@@ -109,6 +127,9 @@ the PTX engine always did) and an sm_75 / sm_80 / sm_89 cubin on an 8.6 profile;
 ## AMD profiles
 
 **No AMD matrix-core hardware was available to us. Nothing on the AMD side is measured**; it is checked against papers only.
+The AMD sums below are in the code (`amd/src/mfma_math.hpp`), not in the profiles: no AMD profile has a `numerics:` section, so
+none carries a class for its matrix arithmetic, and none could honestly be anything but `unknown`. (The `provenance:` sections of
+`amd/profiles/rx6800.yaml` and `rx6700xt.yaml` tag device limits read from those two cards, which have no matrix instructions.)
 
 | Target | Profiles | f16 / bf16 MFMA, WMMA | f32 MFMA | f64 MFMA | Status |
 |---|---|---|---|---|---|
@@ -211,7 +232,8 @@ has run the program, so it is left out of the sm_75 SASS comparison and not chan
 `tools/fttn/card-run.sh <out-dir>` runs everything on a rented card (FTTN, both probes against the pinned file of the card's
 architecture, the million-result dump, the corners) and makes no cloud call. Then `tools/fttn/fit_tc_model.py <dump>` fits the
 rule family, and `tc_dump_check <dump> ampere|hopper` holds the simulator's code to the card. A rule goes into
-`device_sum_model` only when that says 100 %.
+`device_sum_model` only when that says 100 %: that is, into the profile of the card's model as `numerics.tensor_sum` with the
+class `measured` and the run as its evidence, and into the other profiles of its compute capability as `inferred`.
 
 | Card | Why |
 |---|---|

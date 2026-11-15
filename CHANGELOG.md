@@ -7,6 +7,21 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- Device profiles say what their numerics are and what each value rests on (issue #664, first step of architecture-aware
+  simulation; [nvidia/docs/profiles.md](nvidia/docs/profiles.md), "Numerics and provenance"). **No result changes.**
+  - New optional profile sections: `numerics:` (the tensor-core sum: `tensor_sum`, its chunk sizes and grid, and
+    `tensor_sum_published` where only a published model exists), `provenance:` (four classes: `measured`, `documented`, `inferred`,
+    `unknown`; one class a key) and `evidence:` (card, driver, toolkit and date, or the document). A profile with a numerics key that
+    has no class, an unknown class, a key in two classes, a claim without evidence or numbers the engines do not implement does not load.
+  - The tensor-core sum of every NVIDIA profile is now read from its profile instead of a table keyed on the compute capability.
+    Each of the 38 profiles has the model it had (held by `test_exec3`, in every `VGPU_TC_EXACT` mode). Seven are `measured` (the
+    card of that model was run: rtx3060, a10g, t4, l4, l40s, a100-sxm4-40gb, h100-pcie), twenty `inferred` from a measured card of
+    the same compute capability (the default `nvidia/h100` among them), and the eleven Blackwell and later profiles are `unknown`
+    and keep the sequential sum; seven of those name the published model that `VGPU_TC_EXACT=published` turns on.
+  - `amd/rx6800` and `amd/rx6700xt` tag the limits that were read from those cards. No AMD behaviour moved, and no AMD matrix
+    arithmetic is tagged: none has been measured.
+  - `vgpu info` prints the numerics, the classes and the evidence; `--json` gains `numerics`, `provenance` and `evidence` objects.
+  - The numerics are part of the result cache's key, so entries cached by an earlier build are not reused (a one-time miss).
 - NVIDIA runtime: `cudaStreamWaitEvent` on an event that is still pending keeps the stream waiting after `cudaEventDestroy` of that event, as on a card. A wait (and a queued record) used to look the event up by its handle when the stream's worker reached it, found it destroyed and took it for complete, so the waiting stream ran early. This is what made Ta-Cuda's batch tests (tacuda#5) fail now and then under the default asynchronous launches and pass with `VGPU_ASYNC_LAUNCH=0`. The queued item now holds the event's state itself.
 - AMD engine, the tier's handlers for double-precision and 64-bit integer instructions ([round sp74](docs/perf-design/rounds/11-rounds-sp36-sp41.md),
   [design](docs/perf-design/13-amd-compiled-tier.md), section 13). On hosts with AVX2, with `VGPU_AMD_BLOCKS` off or on:

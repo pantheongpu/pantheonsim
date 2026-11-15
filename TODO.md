@@ -96,4 +96,5 @@ What is measured, what the knobs do, and what was tried without gain: [docs/perf
 - Release-wide PGO was measured to give no speed-up on held-out programs and stays an opt-in tool ([docs/pgo.md](docs/pgo.md)).
 - Leads measured below the bar and not built (store-forward stalls, register-file clear, memory counting in the PTX and AMD engines, ...):
   [docs/performance.md](docs/performance.md), "What did not pay off".
-- Tensor-core sums of the sm_86 model cost 3.5 to 4.5 times the time of those instructions (`VGPU_TC_EXACT`).
+- Tensor-core sums of the sm_86 model cost 3.5 to 4.5 times the time of those instructions (`VGPU_TC_EXACT`). (The model is no
+  longer sm_86's alone: every profile whose `numerics.tensor_sum` is `ampere` pays this, and the `hopper` ones run in scalar code.)
