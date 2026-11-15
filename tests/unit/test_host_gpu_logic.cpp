@@ -2603,6 +2603,23 @@ VTEST(a_small_grid_without_a_followed_loop_is_sampled_only_with_bounded_blocks_a
   VCHECK(!worth_sampling(w, c, 0.26));
   w.static_s = kSampleStaticFloorSeconds;
   VCHECK(worth_sampling(w, c, 0.26));
+  // under the floor a small grid is sampled only by a process old enough to afford two runs of a block at the cap: HeCBench bilateral's third
+  // kernel (128 blocks, 6 ms counted) comes 0.2 s into the process, and was sampled for 13 ms of a program of 0.45 s before that was counted
+  w.blocks = 128;
+  w.static_s = 0.00614;
+  w.age_s = 0.2;
+  VCHECK(sample_expected_seconds(w) == kSampleCostGuessSeconds + 2 * kSampleBlockCapSeconds);
+  VCHECK(!worth_sampling(w, c, 0.26) && sample_refusal(w, c, 0.26) == NoSample::Floor);
+  w.age_s = 6.0;                                                  // 2 % of 6 s is under the 0.123 s
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.age_s = 6.2;
+  VCHECK(worth_sampling(w, c, 0.26));
+  w.blocks = 4096;                                                // a sampled grid is afforded as before: 3 ms, by a process 0.15 s old
+  w.age_s = 0.2;
+  VCHECK(sample_expected_seconds(w) == kSampleCostGuessSeconds && worth_sampling(w, c, 0.26));
+  w.blocks = 216;
+  w.static_s = kSampleStaticFloorSeconds;
+  w.age_s = 0.004;
   // the other conditions stand: a loop, no short whole launch before, at least two blocks
   w.loop = false;
   VCHECK(sample_refusal(w, c, 0.26) == NoSample::NoLoop);

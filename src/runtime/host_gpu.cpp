@@ -1731,7 +1731,7 @@ const char* Runtime::Impl::consider_sample(const ptx::EntryFn& fn, const exec::L
       if (b) c.bound_turns = std::max(c.bound_turns, bound_turns(*b, l.step));
     }
   }
-  const bool affordable = c.loop && (sample_static_estimate(c) >= sample_floor(c) || sample_affordable(c.age_s, c.spent_s, c.expected_s));
+  const bool affordable = c.loop && (sample_static_estimate(c) >= sample_floor(c) || sample_affordable(c.age_s, c.spent_s, sample_expected_seconds(c)));
   if (sample_mode != SampleMode::On && sample_mode != SampleMode::Whole) {   // (log, always: neither the loop, nor the floor, nor the process's age is asked)
     c.age_s = 1e18;
     c.loop = true;

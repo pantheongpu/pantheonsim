@@ -965,9 +965,9 @@ inline bool sample_offload(const Sample& s, uint64_t push_bytes, uint64_t live_b
 // else of the rule changes: the same margin against the same card path decides.
 //
 // The limit for a grid the sample of whole blocks takes (kSampleMinBlocks and up) is kSampleBlockSeconds: both runs of a block (the first,
-// and the timed one) fit the wait that was already given with 20 ms to spare (the copy is one more process on a machine that may be busy: on
-// server3 under load a limit of 18 ms left a copy unanswered now and then), so a sample costs no more than it did, and every block shorter than
-// the limit is run and timed exactly as before.
+// and the timed one) fit the wait that was already given with 20 ms to spare (the copy is one more process on a machine that may be busy, and
+// a copy that does not answer in time is the rule before: the launch stays), so a sample costs no more than it did, and every block shorter
+// than the limit is run and timed exactly as before.
 inline constexpr double kSampleBlockSeconds = 0.015;
 // The same bound is what lets a grid of fewer than kSampleMinBlocks blocks be sampled by whole blocks when its kernel has no loop the sample
 // inside the blocks can follow (the CUDA Samples' tensor-core GEMMs: 80 or 160 blocks, one loop that counts by the grid's size and ends on a
@@ -1248,6 +1248,13 @@ inline double bound_turns(int64_t bound, int64_t step) {
 inline double sample_floor(const SampleCandidate& w) {
   return sample_bounded_small(w) ? kSampleStaticFloorSeconds : sample_static_floor(w.live_bytes);
 }
+// What a sample is expected to cost, for the process that may afford it (sample_affordable). `expected_s` is the guess for a sample of a few
+// short blocks, or the dearest sample so far; bounded blocks of a small grid can wait two runs of a block at the cap on top of it, so only a
+// process that has run 50 times that (6 s) affords one by its age. (HeCBench bilateral: a kernel on 128 blocks, 6 ms counted, sampled 0.2 s
+// into the process for 13 ms, 2.5 % of the program, before this was counted.)
+inline double sample_expected_seconds(const SampleCandidate& w) {
+  return std::max(w.expected_s, 0.0) + (sample_bounded_small(w) ? 2 * kSampleBlockCapSeconds : 0.0);
+}
 // Why a launch with no estimate is not sampled (None: it is), in the order the rule asks; worth_sampling is `== None`. For the census of
 // VGPU_HOST_GPU_LOG (the host_gpu_kept reasons, Round sp75): "size rule" alone did not say which of these kept a launch.
 enum class NoSample : uint8_t { None, NoLoop, SmallGrid, ShortBefore, Floor };
@@ -1255,7 +1262,7 @@ inline NoSample sample_refusal(const SampleCandidate& w, const Costs& c, double 
   if (!w.loop) return NoSample::NoLoop;
   if (sample_blocks(w.blocks) == 0 && !sample_inside(w) && !sample_bounded_small(w)) return NoSample::SmallGrid;
   if (w.whole_s && *w.whole_s <= c.margin * card_path_s) return NoSample::ShortBefore;
-  if (!(sample_static_estimate(w) >= sample_floor(w) || sample_affordable(w.age_s, w.spent_s, w.expected_s))) return NoSample::Floor;
+  if (!(sample_static_estimate(w) >= sample_floor(w) || sample_affordable(w.age_s, w.spent_s, sample_expected_seconds(w)))) return NoSample::Floor;
   return NoSample::None;
 }
 inline const char* no_sample_text(NoSample r) {
