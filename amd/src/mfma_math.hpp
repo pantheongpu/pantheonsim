@@ -210,7 +210,10 @@ inline double mfma_dot_fma(const double* a, const double* bt, uint32_t k, double
 // So: a subnormal element of A or B and a subnormal C are read as zero, each product (exact in binary32: 11 x 11 or 8 x 8 significant
 // bits) is added to the running binary32 sum with one rounding to nearest even, and a sum in the subnormal range becomes zero.
 //
-// This is the paper's features, not a measurement of ours (no CDNA2 card is at hand), and they do not fix a bit-exact rule. What is
+// OPT-IN (VGPU_MFMA_CDNA2=fttn; amd::cdna2_matrix_model): off by default, the double sum below is what runs. This is the paper's
+// features, not a measurement of ours (no CDNA2 card is at hand), and they do not fix a bit-exact rule: the published bit-level
+// model of the same card (MMA-Sim, arXiv 2511.10909: products added in pairs, then fours, each sum rounded and flushed) prints the
+// same FTTN row, and gives 255.875 on the paper's motivating example where this rule gives the paper's 0. What is
 // chosen here and NOT known: the flushed zero keeps the sign of what it replaces; a subnormal running sum is flushed at each step, not
 // only at the end; a NaN result is the NaN the double sum below gives (the earlier rule). The paper ran the two 16x16x16 forms; the
 // other binary16 and bfloat16 shapes of gfx90a (32x32x8, 4x4x4, the bfloat16 forms without _1k) are given the same rule by
