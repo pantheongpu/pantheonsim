@@ -708,6 +708,6 @@ followed loop.
 From Round sp76 (which took the first of those another way: the launch is sampled with the driver up, section 13; its card run is done, above): a rerun of
 samples/interval and samples/reduction on a card (`data/sp76/rerun-interval-reduction.sh`); a static count that weighs a loop's body by its
 turns, which needs the flow scan to follow a loop that is left through a call to the kernel's `EXIT` and the census of every kernel it would
-newly have sampled (design with numbers: `data/sp76/start-model.md` and the #656 notes); what the page faults after a fork cost a program with
+newly have sampled (design with numbers: [data/turbo-left/README.md](data/turbo-left/README.md)); the open turbo issues #660 and #661 have card scripts there (`card-short-launch.sh`, `card-bmma-verify.sh`); what the page faults after a fork cost a program with
 hundreds of MiB live on the rig (the floor of warpAggregatedAtomicsCG's two kernels); whether the size of a process's environment tilts
 particlefilter's race (the card run's `pf` stage ran, but `data/sp76/card.md` records only that the program's own race moves its time: its group counts per form are not kept).
