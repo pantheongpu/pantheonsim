@@ -177,14 +177,16 @@ runs:
         # CUDA 13 renamed the NVVM package.
         nvvm="cuda-nvvm-$v"; [[ "${TOOLKIT%%.*}" -ge 13 ]] && nvvm="libnvvm-$v"
         # nvcc, plus the headers of every library the simulator stands in for:
-        # it builds each one against the toolkit's own declarations. And
-        # nvJitLink, which the toolkit's cuSPARSE needs to link a program
-        # against it, though NVIDIA's packages do not say so.
+        # it builds each one against the toolkit's own declarations. NVTX, whose
+        # headers projects include to annotate their code (they are no-ops without
+        # a profiler, and a full toolkit install has them). And nvJitLink, which
+        # the toolkit's cuSPARSE needs to link a program against it, though
+        # NVIDIA's packages do not say so.
         retry $SUDO timeout 900 apt-get install -y -qq --no-install-recommends \
           "cuda-nvcc-$v" "cuda-cudart-dev-$v" "cuda-crt-$v" "$nvvm" \
           "cuda-nvml-dev-$v" "cuda-cupti-dev-$v" "cuda-nvrtc-dev-$v" "libcublas-dev-$v" \
           "libcufft-dev-$v" "libcurand-dev-$v" "libcusparse-dev-$v" "libnvjpeg-dev-$v" \
-          "libcusolver-dev-$v" "libnpp-dev-$v" "libnvjitlink-dev-$v" "cuda-profiler-api-$v" \
+          "libcusolver-dev-$v" "libnpp-dev-$v" "libnvjitlink-dev-$v" "cuda-profiler-api-$v" "cuda-nvtx-$v" \
           || { echo "::error::could not install CUDA $TOOLKIT from NVIDIA's repository for Ubuntu $VERSION_ID"; exit 1; }
         echo "/usr/local/cuda-$TOOLKIT/bin" >> "$GITHUB_PATH"
 

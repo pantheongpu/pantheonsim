@@ -33,6 +33,8 @@ ln -s "$(readlink -f "$shim")" "$tmp/torch/lib/libamdhip64.so"
 # answers from the HIP runtime, where AMD's would read a kernel driver there
 # is none of.
 ln -s "$(readlink -f "$build/shim/librocm_smi64.so")" "$tmp/torch/lib/librocm_smi64.so"
+# Each rank is held to its own cap below, so the simulator's reserve for the rest of the machine (1024 MB) is
+# lowered: on a 16 GB runner the two ranks sit within 1 GB of their cap and the default refused a launch (#675).
 cap=()
 if command -v systemd-run >/dev/null && systemd-run --user --scope -q true 2>/dev/null; then
   cap=(systemd-run --user --scope -q -p "MemoryMax=${VGPU_TORCH_MEMORY_MAX:-5G}" -p MemorySwapMax=0)
@@ -40,6 +42,7 @@ fi
 port=$((29500 + RANDOM % 1000))
 for r in 0 1; do
   (cd "$tmp" && VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 VGPU_MEMORY_RAM_MB="${VGPU_MEMORY_RAM_MB:-2048}" \
+     VGPU_MEMORY_HOST_RESERVE_MB="${VGPU_MEMORY_HOST_RESERVE_MB:-256}" \
      PYTHONPATH="$tmp" MASTER_ADDR=127.0.0.1 MASTER_PORT=$port RANK=$r WORLD_SIZE=2 NCCL_DEBUG=ERROR \
      timeout 900 "${cap[@]}" "$python" "$root/amd/tests/pytorch/$script" > "$tmp/rank$r.log" 2>&1
    echo "exit $?" >> "$tmp/rank$r.log") &
