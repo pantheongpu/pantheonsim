@@ -17,9 +17,53 @@
 # VGPU_TIER_MIN_PERCENT (default 30) percent of sass_tier's warp instructions.
 #
 # VGPU_TIER_OTHER_ARCHS=1 builds the other programs for every architecture too (a soak).
+# VGPU_SASS_TIER_SHARD=k/n runs every nth of the program-and-architecture runs below (the numbering is the script's list, whatever the nvcc can
+# build, so the n shards together are the whole run, once each; CMakeLists.txt registers eight, e2e_sass_tier_shard_KofN), and builds only those.
+# VGPU_SASS_TIER_LIST=1 prints the runs this shard would take, one a line, and builds and runs nothing (tests/lint/check_shard_partition.sh).
 # VGPU_TIER_ARCHS narrows the architectures (default sm_75 sm_80 sm_86 sm_89 sm_90 sm_100 sm_120; an nvcc that cannot target one skips it), VGPU_TIER_PROGRAMS the other programs
 # (name:first architecture), VGPU_TIER_JOBS caps the builds run at once.
 set -uo pipefail
+declare -A gpu=([sm_75]=nvidia/t4 [sm_80]=nvidia/a100 [sm_86]=nvidia/rtx3060 [sm_89]=nvidia/l4 [sm_90]=nvidia/h100
+                [sm_100]=nvidia/b200 [sm_120]=nvidia/rtx5090)
+archs=(${VGPU_TIER_ARCHS:-sm_75 sm_80 sm_86 sm_89 sm_90 sm_100 sm_120})
+# program:first architecture[:last]; each runs on one architecture except sass_tier, which runs on every one.
+others=(${VGPU_TIER_PROGRAMS:-sass_tier_steps:75 sass_fastpath:80 sass_archs:75 vector_add:75 device_functions:75 device_intrinsics:75 video_forms:75
+        symbols:75 surface_oob:75 textures:75 texture_filtering:75 texture_gather:75 texture_layers:75 texture_forms:75
+        surface_formatted:75 texture_mipmaps:75 texture_mip_layers:75 texture_srgb:75 texture_int_coords:75 border_colour:75
+        block_semaphore:75 cooperative_grid:75 alloca_stack:75 shared_max:75 named_barriers:75 smid:75 smem_size_regs:75
+        bsync_recursive_abi:75 waterfall:90 sync_masks:86:86 large_params:75 shared_atomics64:75 mma_forms:80 mma_fragment_layout:80
+        modern_dtypes:80 wmma_gemm:80 wmma_types:80 vector_atomics:90 dsmem_cluster:90 cooperative_cluster:90 jit_loops:75})
+# VGPU_TIER_PROGRAMS=- builds none of the others, VGPU_TIER_NO_SASS_TIER=1 not sass_tier (run_sass_jit.sh's shards build only what they run).
+[[ ${VGPU_TIER_PROGRAMS:-} == - ]] && others=()
+min_percent="${VGPU_TIER_MIN_PERCENT:-30}"
+
+# The runs, in a fixed order that does not depend on what the nvcc can build: sass_tier on each architecture, then each other program on its
+# architecture(s). A shard takes every nth.
+cands=()
+for arch in "${archs[@]}"; do
+  [[ -n ${VGPU_TIER_NO_SASS_TIER:-} ]] || cands+=("sass_tier $arch")
+done
+for p in "${others[@]}"; do
+  IFS=: read -r name first last <<< "$p"
+  # One architecture each (sm_86, or sm_90 for the Hopper programs), unless VGPU_TIER_OTHER_ARCHS=1 (a soak: every one).
+  if [[ -n ${VGPU_TIER_OTHER_ARCHS:-} ]]; then oarchs=("${archs[@]}"); elif (( first > 86 )); then oarchs=(sm_90); else oarchs=(sm_86); fi
+  for arch in "${oarchs[@]}"; do
+    (( ${arch#sm_} >= first && ${arch#sm_} <= ${last:-999} )) || continue
+    cands+=("$name $arch")
+  done
+done
+shard_k=0; shard_n=1
+if [[ -n ${VGPU_SASS_TIER_SHARD:-} ]]; then
+  if [[ ! $VGPU_SASS_TIER_SHARD =~ ^([0-9]+)/([0-9]+)$ ]] || (( ${BASH_REMATCH[2]} == 0 || ${BASH_REMATCH[1]} >= ${BASH_REMATCH[2]} )); then
+    echo "FAIL: VGPU_SASS_TIER_SHARD wants k/n with k < n, got '$VGPU_SASS_TIER_SHARD'"; exit 1
+  fi
+  shard_k=${BASH_REMATCH[1]}; shard_n=${BASH_REMATCH[2]}
+fi
+sel=()
+for i in "${!cands[@]}"; do (( i % shard_n == shard_k )) && sel+=("${cands[$i]}"); done
+if [[ -n ${VGPU_SASS_TIER_LIST:-} ]]; then printf '%s\n' "${sel[@]}"; exit 0; fi
+(( ${#sel[@]} )) || { echo "ok: no run falls to shard $shard_k/$shard_n (VGPU_TIER_ARCHS or VGPU_TIER_PROGRAMS names fewer runs than shards)"; exit 0; }
+
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
 shim="${VGPU_BUILD_DIR:-$root/build}/shim"
@@ -39,39 +83,20 @@ else
   trap 'rm -rf "$work"' EXIT
 fi
 
-declare -A gpu=([sm_75]=nvidia/t4 [sm_80]=nvidia/a100 [sm_86]=nvidia/rtx3060 [sm_89]=nvidia/l4 [sm_90]=nvidia/h100
-                [sm_100]=nvidia/b200 [sm_120]=nvidia/rtx5090)
-archs=(${VGPU_TIER_ARCHS:-sm_75 sm_80 sm_86 sm_89 sm_90 sm_100 sm_120})
-# program:first architecture[:last]; each runs on one architecture except sass_tier, which runs on every one.
-others=(${VGPU_TIER_PROGRAMS:-sass_tier_steps:75 sass_fastpath:80 sass_archs:75 vector_add:75 device_functions:75 device_intrinsics:75 video_forms:75
-        symbols:75 surface_oob:75 textures:75 texture_filtering:75 texture_gather:75 texture_layers:75 texture_forms:75
-        surface_formatted:75 texture_mipmaps:75 texture_mip_layers:75 texture_srgb:75 texture_int_coords:75 border_colour:75
-        block_semaphore:75 cooperative_grid:75 alloca_stack:75 shared_max:75 named_barriers:75 smid:75 smem_size_regs:75
-        bsync_recursive_abi:75 waterfall:90 sync_masks:86:86 large_params:75 shared_atomics64:75 mma_forms:80 mma_fragment_layout:80
-        modern_dtypes:80 wmma_gemm:80 wmma_types:80 vector_atomics:90 dsmem_cluster:90 cooperative_cluster:90 jit_loops:75})
-# VGPU_TIER_PROGRAMS=- builds none of the others, VGPU_TIER_NO_SASS_TIER=1 not sass_tier (run_sass_jit.sh's shards build only what they run).
-[[ ${VGPU_TIER_PROGRAMS:-} == - ]] && others=()
-min_percent="${VGPU_TIER_MIN_PERCENT:-30}"
-
 supported="$("$nvcc_bin" --list-gpu-code 2>/dev/null)"
 read -r rmaj rmin <<< "$("$nvcc_bin" --version | sed -n 's/.*release \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')"
 # sync_masks' expected values are CUDA 13's ptxas code; the others need nothing special.
 jobs=()
-for arch in "${archs[@]}"; do
-  if ! grep -qx "$arch" <<< "$supported"; then echo "SKIP $arch: this nvcc cannot target it"; continue; fi
-  [[ -n ${VGPU_TIER_NO_SASS_TIER:-} ]] || jobs+=("sass_tier $arch")
-done
-for p in "${others[@]}"; do
-  IFS=: read -r name first last <<< "$p"
+for c in "${sel[@]}"; do
+  read -r name arch <<< "$c"
+  if ! grep -qx "$arch" <<< "$supported"; then
+    [[ $name == sass_tier ]] && echo "SKIP $arch: this nvcc cannot target it"
+    continue
+  fi
   [[ $name == sync_masks && ${rmaj:-0} -lt 13 ]] && continue
   [[ $name == mma_forms && ${rmaj:-0} -lt 13 ]] && continue   # its sparse forms are more than CUDA 12.0's ptxas assembles
   [[ $name == vector_atomics ]] && (( ${rmaj:-0} * 100 + ${rmin:-0} < 1201 )) && continue
-  # One architecture each (sm_86, or sm_90 for the Hopper programs), unless VGPU_TIER_OTHER_ARCHS=1 (a soak: every one).
-  if [[ -n ${VGPU_TIER_OTHER_ARCHS:-} ]]; then oarchs=("${archs[@]}"); elif (( first > 86 )); then oarchs=(sm_90); else oarchs=(sm_86); fi
-  for arch in "${oarchs[@]}"; do
-    (( ${arch#sm_} >= first && ${arch#sm_} <= ${last:-999} )) || continue
-    grep -qx "$arch" <<< "$supported" && jobs+=("$name $arch")
-  done
+  jobs+=("$c")
 done
 (( ${#jobs[@]} )) || { echo "SKIP: no architecture this nvcc can target"; exit 0; }
 

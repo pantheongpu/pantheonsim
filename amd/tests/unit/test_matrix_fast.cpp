@@ -14,6 +14,7 @@
 
 #include "vgpu/amd_exec.hpp"
 #include "vgpu/amd_gcn.hpp"
+#include "shard.hpp"
 #include "vtest.hpp"
 
 using namespace vgpu;
@@ -33,6 +34,14 @@ const Corpus kCorpora[] = {
     {"isa_corpus_gfx1250.txt", amd::gcn::Target::Gfx1250},
 };
 
+// VGPU_MATRIX_FAST_SHARD=k/n: every nth matrix instruction that decodes, in each of the three tests (CMakeLists.txt registers eight shards,
+// test_amd_matrix_fast_shard_KofN). An instruction keeps its seeds (they come from the seed loop and the text), so the shards together run
+// exactly the runs of the whole test.
+const vtest::Shard& shard() {
+  static const vtest::Shard s("VGPU_MATRIX_FAST_SHARD", "VGPU_MATRIX_FAST_LIST");
+  return s;
+}
+
 bool is_matrix(const std::string& text) {
   return text.rfind("v_mfma", 0) == 0 || text.rfind("v_smfmac", 0) == 0 || text.rfind("v_wmma", 0) == 0 || text.rfind("v_swmmac", 0) == 0;
 }
@@ -40,12 +49,14 @@ bool is_matrix(const std::string& text) {
 // Runs every matrix instruction of the corpora (those that decode) under `seeds` seeds; returns how many digests it compared.
 // `mutated` is set when a digest differs, with the text of the first such instruction.
 size_t compare_all(uint32_t seeds, bool shuffle_registers, std::string* first_wrong, size_t* wrong_total) {
-  size_t compared = 0;
+  size_t compared = 0, items = 0;
   *wrong_total = 0;
   for (const Corpus& c : kCorpora) {
     std::ifstream f(std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/" + c.file, std::ios::binary);
     if (!f) throw vtest::Failure(std::string("no fixture ") + c.file);
+    size_t line_no = 0;
     for (std::string line; std::getline(f, line);) {
+      ++line_no;
       if (line.empty() || line[0] == '#') continue;
       const size_t tab = line.find('\t');
       const std::string text = line.substr(tab + 1);
@@ -60,6 +71,11 @@ size_t compare_all(uint32_t seeds, bool shuffle_registers, std::string* first_wr
       try {
         in = amd::gcn::decode(code, 0, 0, c.target);
       } catch (const std::exception&) {
+        continue;
+      }
+      if (!shard().mine(items++)) continue;   // (another shard's instruction)
+      if (shard().list) {
+        std::printf("%s:%s:%zu\n", shuffle_registers ? "moved" : "plain", c.file, line_no);
         continue;
       }
       for (uint32_t seed = 0; seed < seeds; ++seed)
@@ -97,13 +113,15 @@ size_t compare_all(uint32_t seeds, bool shuffle_registers, std::string* first_wr
 // the reference's bits for each, with the registers as they are and moved over one another.
 size_t compare_modifiers(uint32_t seeds, std::string* first_wrong, size_t* wrong_total, size_t* variants, size_t* never_tiled,
                          std::string* first_slow) {
-  size_t compared = 0;
+  size_t compared = 0, items = 0;
   *wrong_total = 0;
   for (const Corpus& c : kCorpora) {
     if (c.target == amd::gcn::Target::Gfx1100 || c.target == amd::gcn::Target::Gfx1200 || c.target == amd::gcn::Target::Gfx1250) continue;
     std::ifstream f(std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/" + c.file, std::ios::binary);
     if (!f) throw vtest::Failure(std::string("no fixture ") + c.file);
+    size_t line_no = 0;
     for (std::string line; std::getline(f, line);) {
+      ++line_no;
       if (line.empty() || line[0] == '#') continue;
       const size_t tab = line.find('\t');
       const std::string text = line.substr(tab + 1);
@@ -118,6 +136,11 @@ size_t compare_modifiers(uint32_t seeds, std::string* first_wrong, size_t* wrong
       try {
         in = amd::gcn::decode(code, 0, 0, c.target);
       } catch (const std::exception&) {
+        continue;
+      }
+      if (!shard().mine(items++)) continue;   // (another shard's instruction)
+      if (shard().list) {
+        std::printf("modifiers:%s:%zu\n", c.file, line_no);
         continue;
       }
       const bool small = text.find("f8f6f4") != std::string::npos;
@@ -161,7 +184,8 @@ VTEST(the_modifier_bits_BLGP_CBSZ_and_the_scale_selectors_give_the_same_bits_on_
   size_t variants = 0, never_tiled = 0;
   std::string slow;
   const size_t compared = compare_modifiers(2, &first, &wrong, &variants, &never_tiled, &slow);
-  VCHECK(compared > 10000);
+  if (shard().list) return;
+  VCHECK(compared > shard().at_least(10000));
   if (wrong) throw vtest::Failure(std::to_string(wrong) + " of " + std::to_string(compared) + " differ; first: " + first);
   if (never_tiled) throw vtest::Failure(std::to_string(never_tiled) + " of " + std::to_string(variants) + " variants never took the tile path; first: " + slow);
 }
@@ -170,7 +194,8 @@ VTEST(every_matrix_instruction_gives_the_same_bits_on_the_tile_path_as_on_the_re
   std::string first;
   size_t wrong = 0;
   const size_t compared = compare_all(8, false, &first, &wrong);
-  VCHECK(compared > 10000);
+  if (shard().list) return;
+  VCHECK(compared > shard().at_least(10000));
   if (wrong) throw vtest::Failure(std::to_string(wrong) + " of " + std::to_string(compared) + " differ; first: " + first);
 }
 
@@ -178,7 +203,8 @@ VTEST(the_same_holds_with_the_registers_moved_over_one_another) {
   std::string first;
   size_t wrong = 0;
   const size_t compared = compare_all(8, true, &first, &wrong);
-  VCHECK(compared > 10000);
+  if (shard().list) return;
+  VCHECK(compared > shard().at_least(10000));
   if (wrong) throw vtest::Failure(std::to_string(wrong) + " of " + std::to_string(compared) + " differ; first: " + first);
 }
 

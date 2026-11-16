@@ -95,6 +95,10 @@ six jobs each compiled the same library. Two changes, neither of which removes a
 |---|---|---|
 | `test_amd_gcn_tier_same_bits` (679 s plain, about 3,400 s under ASan) | `test_amd_gcn_tier_same_bits_shard_0of8` ... `_7of8` | every eighth corpus shape with a handler (`VGPU_TIER_SHARD=k/n`); a shape keeps its seed and flavours, so the eight run exactly the runs of the whole |
 | `test_amd_gcn_tier_same_bits_simd_base` (688 s) | `..._simd_base_shard_0of8` ... `_7of8` | the same, with `VGPU_SIMD=base` |
+| `test_amd_gcn_gather_same_bits` (2,461 s under ASan) | `test_amd_gcn_gather_same_bits_shard_0of8` ... `_7of8` | every eighth flat shape (`VGPU_GATHER_SHARD=k/n`); a shape keeps the seed its number gives it |
+| `test_amd_gcn_memory_same_bits` (1,866 s under ASan) | `test_amd_gcn_memory_same_bits_shard_0of8` ... `_7of8` | every eighth line of each corpus (`VGPU_MEM_SAME_BITS_SHARD=k/n`); every line still counts toward the instruction families, so each line runs as in the whole |
+| `test_amd_matrix_fast` (1,553 s under ASan) | `test_amd_matrix_fast_shard_0of8` ... `_7of8` | every eighth matrix instruction that decodes, in each of its three tests (`VGPU_MATRIX_FAST_SHARD=k/n`) |
+| `e2e_sass_tier` (1,830 s under ASan, 1,580 s under TSan) | `e2e_sass_tier_shard_0of8` ... `_7of8` | every eighth of the script's program-and-architecture runs (`VGPU_SASS_TIER_SHARD=k/n`), built and run by the shard that has it; the numbering is the script's list, whatever the nvcc can build |
 | `e2e_sass_jit` (1,611 s before `loops`) | `e2e_sass_jit_shard_tier`, `_loops`, `_steps`, `_steps_gather`, `_steps_shared`, `_random`, `_modes` | `VGPU_JIT_SHARD`: sass_tier's variants, jit_loops' (loops and branches that run inside generated code: uniform and divergent exits, nested loops, a store in the body, a body past the region cap, the clock around a loop, barriers, guarded ops, uniform values; sass_tier's variants), sass_tier_steps' faults and region caps, its two step-limit bisections, the random kernels, the failure modes and (since round sp38, when the cheap form of the generated code became the default) the full form of it, `VGPU_JIT_RESIDENCE=1 VGPU_JIT_SPECIALIZE=1` and each part alone, against the tier; each shard builds only the programs it runs |
 
 The JIT also has unit legs: `test_jit_resid` (random graph regions against a model of the run loop, with and without register residence, new forms included; and, for linking (`VGPU_JIT_LINK=1`, round sp52), the linked code against the unlinked code with the run loop's rules between its calls), `test_sass_chain_cont_jit_link`, `test_sass_store_gate_jit_link`, `test_sass_alu_runs_jit_link` and `test_sass_dispatch_counts_jit_link` (the run-loop tests with the JIT forced on and linking: hand-written kernels whose warps diverge, loop apart, call a function and meet at a BSYNC, against the interpreter, with a check that linking happened; since round sp53 also an if and its else in a loop, whose BSYNC is the run loop's between the linked region calls; these four legs set `VGPU_JIT_LINK_RULE=0`, and `test_sass_chain_cont_jit_link_rule` runs the kernels with the loop rule, checking which sections it leaves unlinked), `test_jit_resid`'s check of the generated object (a kernel of SYR2K's shape compiled with and without linking and read with `objdump`: no `rep movs`, no out-of-line escape; skipped without `objdump`), the `linking` stages of `e2e_sass_jit_shard_modes`, `test_jit_resid`'s fused-run test (`VGPU_JIT_FUSE=1`: runs of register-only ops generated block by block of eight lanes against the op-by-op code), and `test_sass_chain_cont_jit`, `test_sass_store_gate_jit` and `test_sass_alu_runs_jit`, which
@@ -105,6 +109,17 @@ Each family also has a `_shards_partition` test (`tests/lint/check_shard_partiti
 take (`VGPU_TIER_LIST=1`: corpus and line of each shape; `VGPU_JIT_LIST=1`: stage names) without running anything, and the check
 fails unless the shards' lists together are the whole list, every item once, none empty. The shard specs it checks are the ones the
 shard tests were registered with, so a shard added to one list and not the other cannot slip through.
+
+**Slowest tests and the budget for one test.** Each job that runs ctest follows it with `ci/slowest_tests.sh <build dir>`, which puts the 20
+longest tests of that run in the job's summary and checks each against a budget: over 25 minutes is a warning, over 30 minutes fails the job
+(`CI_TEST_WARN_SECONDS`, `CI_TEST_LIMIT_SECONDS`; `0` turns the failing off). A test that reaches it is split with `vgpu_shard_tests` (above):
+the new shard's test reads its part from an environment variable, keeps every item's seed and number as they are in the whole run, and lists its
+items with a `..._LIST` variable so that `_shards_partition` can prove the parts are the whole (`tests/framework/shard.hpp` does the parsing for
+the C++ tests). `tests/lint/check_slowest_tests.sh` tests the script.
+
+**One run of a test, not four.** The `ml` job's "rest of the suite" step leaves out the heaviest tests that need nothing from its image (the SASS tier
+and JIT legs, the AMD executor's same-bits digests): the build + unit tests job runs them on every pull request, and they ran a second time on the
+ml runner. A test that needs ROCm or the runner's image still runs there.
 
 For local use: the binary still runs the whole test (`build/test_amd_gcn_tier_same_bits`, `nvidia/tests/e2e/run_sass_jit.sh`), `ctest -R
 test_amd_gcn_tier_same_bits` and `ctest -R '^e2e_sass_jit_shard'` run all the parts, and `-DVGPU_TEST_SHARDS=OFF` registers the old single

@@ -7,6 +7,11 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **CI: the longest tests are split into shards, and the slowest tests are reported** (CI work). `test_amd_gcn_gather_same_bits` (2,461 s under ASan),
+  `test_amd_gcn_memory_same_bits` (1,866 s), `test_amd_matrix_fast` (1,553 s) and `e2e_sass_tier` (1,830 s under ASan, 1,580 s under TSan) now run as
+  eight shards each, side by side (`..._shard_KofN`; each shard keeps every item's seed, and a `_shards_partition` test proves the shards are the whole
+  test). The ml job no longer re-runs the heaviest simulator-only tests that the unit job runs. Every job that runs ctest puts its 20 slowest tests
+  in the job summary (`ci/slowest_tests.sh`), and a test over 30 minutes fails the job. No check was removed.
 - **Double arithmetic in a kernel no longer inherits the host program's flush-to-zero** (issue #672). A host built with `nvc -fast`
   (or `-ffast-math`) turns FTZ and DAZ on in its own MXCSR, and the engines did a kernel's arithmetic with the host's
   instructions under that setting, so a subnormal double operand read as zero and a subnormal result was written as zero. NVHPC
