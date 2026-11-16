@@ -507,6 +507,12 @@ bit: with it the simulator prints the 329 + 329 lines pinned before this change.
 model: `MUFU.RCP`, `RSQ` and `SQRT` run as scalar integer code a lane where they were an AVX2 kernel a warp; the others
 were scalar libm calls before and are a table lookup and three multiplies now. Counters do not change.
 
+Measured (2026-11-15, one 16-core x86 host without a card, SASS executor, rtx3060 profile, the sm_86 programs of this directory
+with `--n 4194304`, whole-program wall time, three runs each, alternating): `mathfn` 44.3, 44.4 and 48.3 s with the model against
+43.2, 43.3 and 43.5 s with `VGPU_MUFU_EXACT=0`; `mathfn_fast` 43.7, 43.8 and 43.8 s against 42.9, 42.9 and 43.0 s. That is 2 to 3%
+on programs that do little but call math functions; the time includes the programs' own host work, so the kernels' share is
+larger than the figure by an amount not measured. No other program was timed.
+
 ## What is not done
 
 - Blackwell: no card ran `mathfn` or the probe. Its profiles get the model as *inferred*; a Blackwell card's
