@@ -66,7 +66,7 @@ jobs:
       - name: Build the HIP shim
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpuhip vgpu_cli
+          cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpuhip vgpu_cli vgpursmi
 
       - name: PyTorch on every simulated AMD GPU, and rocBLAS, hipSPARSELt, hipFFT, hipRAND, hipSOLVER and hipSPARSE
         # The libraries from the wheel, as nothing of ROCm is installed. A test
@@ -76,8 +76,66 @@ jobs:
           VGPU_ROCBLAS_FROM_WHEEL: "1"
           VGPU_LIBRARIES_FROM_WHEEL: "1"
         run: |
+          set -o pipefail
+          # The models tests (a model each, 45 minutes and more) run in the pytorch-models job below, weekly and by hand.
           ctest --test-dir build --output-on-failure --timeout 1800 \
-            -R '^amd_(pytorch.*|rocblas|hipsparselt.*|libraries)$' 2>&1 | tee ctest.log
+            -R '^amd_(pytorch.*|rocblas|hipsparselt.*|libraries)$' -E '^amd_pytorch_models' 2>&1 | tee ctest.log
+          if grep -q 'Skipped' ctest.log; then echo "a test skipped: something it needs is missing"; exit 1; fi
+
+  pytorch-models:
+    name: PyTorch models on ${{ matrix.test }}
+    # Weekly and by hand only: one runner per test, as each takes 45 minutes or more.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        test: [amd_pytorch_models, amd_pytorch_models_mi350x, amd_pytorch_models_mi250x, amd_pytorch_models_rx7900xtx, amd_pytorch_models_rx9070xt]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+
+      - name: Make room for the wheel
+        # The runner's image keeps SDKs this job has no use for; the wheel
+        # needs the space.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup /usr/share/swift
+          df -h / | tail -1
+
+      - name: Install toolchain
+        run: |
+          [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build python3-venv
+          cmake --version | head -1
+
+      - name: Install PyTorch for ROCm
+        # Where the tests look for it: a venv under ~/.local/share/torch-rocm*.
+        run: |
+          python3 -m venv "$HOME/.local/share/torch-rocm7.0"
+          "$HOME/.local/share/torch-rocm7.0/bin/pip" install --no-cache-dir -q "$TORCH" numpy --index-url "$TORCH_INDEX" \
+            --extra-index-url https://pypi.org/simple
+          "$HOME/.local/share/torch-rocm7.0/bin/python" -c "import torch; print(torch.__version__, torch.version.hip)"
+          df -h / | tail -1
+
+      - name: Build the HIP shim
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpuhip vgpu_cli vgpursmi
+
+      - name: PyTorch model checks
+        # The libraries from the wheel, as nothing of ROCm is installed. A test
+        # missing what it needs skips; here a skip fails the job, so a wheel
+        # that did not install is a red job, not a quietly green one.
+        env:
+          VGPU_ROCBLAS_FROM_WHEEL: "1"
+          VGPU_LIBRARIES_FROM_WHEEL: "1"
+        run: |
+          set -o pipefail
+          ctest --test-dir build --output-on-failure --timeout 7200 -R '^${{ matrix.test }}$' 2>&1 | tee ctest.log
           if grep -q 'Skipped' ctest.log; then echo "a test skipped: something it needs is missing"; exit 1; fi
 
   models:
