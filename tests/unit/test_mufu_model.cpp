@@ -492,12 +492,12 @@ VTEST(eval_bf16_is_the_unit_on_the_widened_value_cut_to_the_upper_half) {
   }
   // The values the card gave (an H100, and the model they equal): the exponential and the hyperbolic tangent of one, the square root
   // of four and the reciprocal of two.
-  VCHECK_EQ(mufu::eval_bf16(mufu::OpEx2, 0x3f80u), SPOT_EX2_1);
-  VCHECK_EQ(mufu::eval_bf16(mufu::OpTanh, 0x3f80u), SPOT_TANH_1);
-  VCHECK_EQ(mufu::eval_bf16(mufu::OpSqrt, 0x4080u), SPOT_SQRT_4);
-  VCHECK_EQ(mufu::eval_bf16(mufu::OpRcp, 0x4000u), SPOT_RCP_2);
-  VCHECK_EQ(mufu::eval_bf16(mufu::OpEx2, 0x7fc0u), SPOT_EX2_NAN);
-  VCHECK_EQ(mufu::eval_bf16(mufu::OpLg2, 0x0000u), SPOT_LG2_0);
+  VCHECK_EQ(mufu::eval_bf16(mufu::OpEx2, 0x3f80u), 0x4000u);
+  VCHECK_EQ(mufu::eval_bf16(mufu::OpTanh, 0x3f80u), 0x3f42u);
+  VCHECK_EQ(mufu::eval_bf16(mufu::OpSqrt, 0x4080u), 0x4000u);
+  VCHECK_EQ(mufu::eval_bf16(mufu::OpRcp, 0x4000u), 0x3f00u);
+  VCHECK_EQ(mufu::eval_bf16(mufu::OpEx2, 0x7fc0u), 0x7fffu);
+  VCHECK_EQ(mufu::eval_bf16(mufu::OpLg2, 0x0000u), 0xff80u);
 }
 
 // The decoder: bit 73 is .F16 up to sm_89, and from sm_90 bit 72 is .F16 and bit 73 is .BF16.
