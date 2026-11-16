@@ -7,7 +7,7 @@ function (`MUFU.RCP/RSQ/EX2/LG2/SIN/COS/TANH` on NVIDIA; `v_rcp/v_rsq/v_exp/v_lo
 simulator computed those instructions at the host's precision; a card reads them from tables that are within an ulp or two
 of that, so a program that calls a math function printed other last bits on the simulator than on the card. The NVIDIA
 instructions are now computed as an RTX 3060 computes them, bit for bit over every input ([The card's unit](#the-cards-unit-mufu-as-an-rtx-3060-computes-it));
-the AMD ones are still the function at host precision.
+the AMD ones are still the function at host precision: measured on two RDNA2 cards in 2026-11-16, not modelled ([the AMD section](#the-amd-instructions-on-rdna2-cards-measured-not-modelled-2026-11-16)).
 
 This page records the second group of published work of issue #664, in the order it was done: what was compared, how, what
 the simulator's side of the comparison found and what the published sources said a card would give (written before any card
@@ -38,6 +38,7 @@ Our own code; nothing is copied from the sources. The Varity generator (MIT) is 
 | `mufu_kernel.cu`, `mufu_probe.cu` | The probe of the approximate instructions themselves: one `MUFU` sub-operation over all 2^32 inputs on a card, as hashes, as a dump of a range, or checked against the simulator's model ([The probe](#the-probe-one-instruction-every-input)). |
 | `mufu-card-run.sh`, `mufu/rtx3060.hashes.txt` | The probe's hash pass for another card: ten operations, all inputs, about a second each, compared with the RTX 3060's hashes without shipping dumps. |
 | `mufu_forms.cu` | Every PTX approximate form (`rcp/rsqrt/sqrt/sin/cos/ex2/lg2/tanh.approx`, with and without `.ftz`, the double forms, `div.approx` and `div.full`) on a card, on the operands where ptxas puts more than one instruction around the form. |
+| `amd_trans_probe.cpp`, `amd-trans-card-run.sh`, `amd/gfx1030.hashes.txt`, `amd/gfx1030.vectors.txt` | The same probe for the AMD instructions (`v_rcp/rsq/sqrt/exp/log/sin/cos_f32` over all 2^32 inputs as hashes, a check against a double reference, a dump, and the f64 forms on a sample), the card runner, and the RX 6800's hashes (the RX 6700 XT's are identical) and 77 selected operands ([the AMD section](#the-amd-instructions-on-rdna2-cards-measured-not-modelled-2026-11-16)). |
 | `compare.py` | Compares two runs: per function, precision and class, how many results differ and by how many ulp; with `--truth`, each run's error against the true value beside the published figure. |
 
 `mathfn`'s classes:
@@ -453,6 +454,67 @@ lines with no dependency.
 and compares them with the card's file: one chunk of 2^26 operands an operation in every run, all 64 chunks of all ten
 operations, which is every operand there is, with `VGPU_EXHAUSTIVE=1`. It also holds the model to the card's results on
 310 listed operands an operation (`nvidia/tests/data/mufu/rtx3060.vectors.txt`).
+
+## The AMD instructions on RDNA2 cards: measured, not modelled (2026-11-16)
+
+The same probe as for `MUFU`, for the AMD transcendental instructions: `tools/numerics/amd_trans_probe.cpp` (plain hipcc kernels,
+the instruction forced with inline asm: `v_rcp_f32`, `v_rsq_f32`, `v_sqrt_f32`, `v_exp_f32`, `v_log_f32`, `v_sin_f32`,
+`v_cos_f32`) over all 2^32 inputs, hashed in the `mufu_probe` format (4096-result blocks, FNV-1a 64, chunks of 2^26).
+`tools/numerics/amd-trans-card-run.sh` runs it on another card and compares with `tools/numerics/amd/gfx1030.hashes.txt`.
+Cards: an RX 6800 (gfx1030) and an RX 6700 XT (gfx1031), ROCm 7.2.0 hipcc, one device named at a time.
+
+**Measured: the two cards agree.** All seven operations have identical hashes on the RX 6800 and the RX 6700 XT, over all
+2^32 inputs, in both kernel modes. The kernel's f32 denormal mode changes one result: `v_sin_f32` of a denormal (kept
+denormal: the sine of a turn fraction, `0x00000001` gives `0x00000006`; flushed: zero). The other six are the same in both
+modes: they flush a denormal operand and a denormal result whatever the mode says. 81 selected operands with the results are
+in `tools/numerics/amd/gfx1030.vectors.txt`.
+
+**Measured: none is the correctly rounded result.** Against the function evaluated in double precision, over every
+input with an ordinary result (default mode; `sin` and `cos` over |x| <= 256 turns, which the ISA guide gives as their range):
+
+| Operation | results not the nearest float | largest error (ulp of the true value) | note |
+|---|---|---|---|
+| `v_rcp_f32` | 10.7 % (452,384,016 of 4,227,173,206) | 0.88 | never 1 ulp or more |
+| `v_rsq_f32` | 11.0 % | 0.86 | |
+| `v_sqrt_f32` | 15.4 % | 0.92 | (a denormal operand gives zero) |
+| `v_exp_f32` | 1.4 % | 0.78 | |
+| `v_log_f32` | 49.3 % | 1.00 | |
+| `v_sin_f32`, `v_cos_f32` | 95 % and 10 % | the error is absolute near the zeros (relative error up to 9.8 ulp); not characterized further | |
+
+The documented bound (1 ulp, RDNA2 ISA guide) is not exceeded by the five that have a relative bound. The simulator computes
+them at the host's precision, rounded once (`1.0f / x`, `std::sqrt`, `std::exp2`, `std::log2`; sine and cosine through
+a double), so it differs from the card on those percentages of inputs, and also on operands that are special on the card:
+a denormal operand of `v_rcp_f32`, `v_rsq_f32`, `v_sqrt_f32`, `v_log_f32` is a zero on the card (`v_rcp`: infinity; `v_log`:
+-infinity) and a finite number on the host; a denormal result (`v_rcp_f32(2^127)`, `v_exp_f32(-127)`) is zero on the card;
+the NaN of a negative operand to `v_rsq_f32`/`v_sqrt_f32`/`v_log_f32` is `0xffc00000` on the card (read from the
+vectors file; the simulator's NaN for these was not run, the host's `-nan` is the same bits on x86). Whether the simulator's
+execution of each matches the card on those special operands was **not** run (no simulator build on the machine that took
+the measurement).
+
+**Measured: the double forms are about 24 bits.** `v_rcp_f64`, `v_rsq_f64`, `v_sqrt_f64` on 2^27 pseudo-random operands (and
+operands near 1): the result has 22 to 26 significant bits (the low 29 to 32 bits of the significand are zero; `v_sqrt_f64(1.0)`
+is 1 + 2^-24), the largest distance from the correctly rounded double is 2^28 ulp (2.6e8 for `rcp`), and the results are
+never the correct double except near powers of two. The compiler refines them with fused multiply-adds. Both cards agree
+on every sampled operand. Not characterized exhaustively (2^64 operands).
+
+**Not done: the fit.** The `MUFU` recipe was applied to `v_rcp_f32` (dumps of the binades [1, 2), [2, 4), 2^126 .. 2^127; the
+same for `rsq`, `sqrt`, `exp`, `log` on 2^23-result dumps) and did not reproduce the card:
+
+- The result is smooth in the input and locally exactly the floor of a straight line (long runs of identical first
+  differences; a slope of 3/5 per input over a stretch), so a table of low-degree polynomials with truncation is the
+  likely structure. **Inferred**, not established.
+- But "result = floor of a real second-degree polynomial of the leading-bits row" (the linear program of step 2 above) has no
+  solution for rows of 2^16, 2^15, ..., 2^11 mantissa units (the best possible slack is -0.10 to -0.3, -0.05, -0.02, -0.0126 ulp), and
+  only becomes feasible near rows of 1,024 where a straight line fits too. A cubic does not help (-0.03); neither does
+  truncating `x` before squaring (0 to 10 low bits), nor the folded-array squarer of the `MUFU` fit at any column. The
+  violations of the best polynomial recur every 8 inputs, which points at an intermediate truncation of a different kind
+  (the slack is about 2^-6 ulp for `exp`, `rsq`, `sqrt` and `rcp` alike, suggesting six guard bits).
+  A bipartite (two-table) form was tested for additivity at splits of 4 to 9 bits and is not it.
+  No coefficient, table row or width was found, so there is **no model and no switch**: the AMD instructions are
+  unchanged, and everything above is a measurement a model has to meet. The hashes are what such a model is held to.
+
+What the next attempt needs: more row-structure experiments on the RX 6800 (distinct per-operation bit widths), the card
+dumps are 32 MB a binade and `amd_trans_probe <OP> dump <start> <count>` writes them.
 
 ## The PTX forms
 
