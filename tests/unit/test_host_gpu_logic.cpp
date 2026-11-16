@@ -1152,7 +1152,7 @@ VTEST(turbo_classes_every_kind_of_instruction) {
   VCHECK(turbo_class("LEPC", {}) == C::Call && !exact_opcode_allowed("LEPC", {}));   // (Round sp66: the return address of vprintf's call)
   VCHECK(turbo_class("B2R", {"RESULT"}) == C::Extra && !exact_opcode_allowed("B2R", {"RESULT"}));   // (Round sp66; exact's set is unchanged)
   // never: textures, surfaces, what nobody named, what is not an instruction
-  for (const char* m : {"TEX", "TLD", "TLD4", "TXD", "SULD", "SUST", "QMMA", "BMMA", "OMMA", "HGMMA", "JMP", "BPT", "SYNCS", "STSM", "UTCMMA",
+  for (const char* m : {"TEX", "TLD", "TLD4", "TXD", "SULD", "SUST", "QMMA", "OMMA", "HGMMA", "JMP", "BPT", "SYNCS", "STSM", "UTCMMA",
                         "LDTM", "STTM", "UTMALDG", "VPRINTF", "", "mufu", "Unknown"})
     VCHECK(turbo_class(m, {}) == C::Never);
 }
@@ -1173,7 +1173,7 @@ VTEST(turbo_whitelist_covers_the_decoder_and_nothing_unnamed) {
   VCHECK_EQ(n[InsnClass::AtomInt], 3u);   // ATOM, ATOMG, ATOMS with no modifier
   VCHECK_EQ(n[InsnClass::Extra], 17u);   // (B2R is a mnemonic of the BAR op, not an op of its own; NANOSLEEP is one)
   VCHECK_EQ(n[InsnClass::FloatRed] + n[InsnClass::AtomFloat] + n[InsnClass::AtomSwap], 0u);
-  VCHECK_EQ(n[InsnClass::Exact] + n[InsnClass::Never] + 32u, static_cast<unsigned>(names.size()));
+  VCHECK_EQ(n[InsnClass::Exact] + n[InsnClass::Never] + 33u, static_cast<unsigned>(names.size()));
   VCHECK(n[InsnClass::Never] >= 30);
   for (unsigned c = 0; c < kInsnClasses; ++c) VCHECK(std::string(insn_class_name(static_cast<InsnClass>(c))).size() > 3);
   VCHECK(std::string(insn_class_name(InsnClass::Never)) == "never" && std::string(insn_class_name(InsnClass::Exact)) == "exact");
