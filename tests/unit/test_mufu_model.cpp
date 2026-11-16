@@ -12,10 +12,14 @@
 //  * the PTX interpreter, on the vectors (the forms ptxas makes one instruction of) and on the card's results for every PTX
 //    approximate form where ptxas puts more around the instruction (nvidia/tests/data/mufu/rtx3060.forms.txt, from
 //    tools/numerics/mufu_forms.cu: subnormal operands, |x| above 2^126, x below -126, the four divisions);
-//  * VGPU_MUFU_EXACT=0: both engines give the function at the host's precision again.
+//  * VGPU_MUFU_EXACT=0: both engines give the function at the host's precision again;
+//  * the half-precision forms (MUFU.<op>.F16 and the PTX ex2.approx.f16/.f16x2, tanh.approx.f16/.f16x2): the model, the SASS executor
+//    and the PTX interpreter against the card's hashes over every one of the 65,536 half patterns of each form
+//    (tools/numerics/mufu/rtx3060.f16.hashes.txt).
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -89,7 +93,7 @@ const std::map<std::string, std::vector<std::vector<uint64_t>>>& vectors() {
 
 // The cubin of tools/numerics/mufu_kernel.cu with every MUFU's sub-operation (bits 74-77) and operand modifiers (|x|: bit 62,
 // -x: bit 63) rewritten, as tools/numerics/mufu_probe.cu rewrites it for the card.
-std::vector<uint8_t> probe_cubin(unsigned op, bool src_abs, bool src_neg) {
+std::vector<uint8_t> probe_cubin(unsigned op, bool src_abs, bool src_neg, bool f16 = false, unsigned part = 0) {
   std::ifstream in(std::string(VGPU_SOURCE_DIR) + "/nvidia/tests/data/mufu/mufu_kernel.sm_86.cubin", std::ios::binary);
   if (!in) throw vtest::Failure("cannot read mufu_kernel.sm_86.cubin");
   std::vector<uint8_t> elf((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -106,6 +110,8 @@ std::vector<uint8_t> probe_cubin(unsigned op, bool src_abs, bool src_neg) {
       uint64_t lo = rd(p, 8), hi = rd(p + 8, 8);
       if ((lo & 0x1ff) != 0x108) continue;
       hi = (hi & ~(0xfull << 10)) | (static_cast<uint64_t>(op) << 10);
+      hi = (hi & ~(1ull << 9)) | (static_cast<uint64_t>(f16) << 9);   // bit 73: .F16
+      lo = (lo & ~(3ull << 60)) | (static_cast<uint64_t>(part) << 60);   // bits 60-61: the half read (.H1)
       lo = (lo & ~(3ull << 62)) | (static_cast<uint64_t>(src_abs) << 62) | (static_cast<uint64_t>(src_neg) << 63);
       std::memcpy(elf.data() + p, &lo, 8);
       std::memcpy(elf.data() + p + 8, &hi, 8);
@@ -121,8 +127,8 @@ struct Sass {
   DeviceProfile prof = load_gpu("nvidia/rtx3060");
   std::shared_ptr<sass::Module> m;
   uint64_t out;
-  Sass(unsigned op, bool src_abs = false, bool src_neg = false) {
-    const std::vector<uint8_t> c = probe_cubin(op, src_abs, src_neg);
+  Sass(unsigned op, bool src_abs = false, bool src_neg = false, bool f16 = false, unsigned part = 0) {
+    const std::vector<uint8_t> c = probe_cubin(op, src_abs, src_neg, f16, part);
     m = sass::load(c.data(), c.size(), mem, prof);
     out = mem.alloc(1 << 20);
   }
@@ -254,7 +260,178 @@ uint64_t chunk_hash(unsigned op, uint64_t start, uint64_t* total = nullptr) {
   return h;
 }
 
+// ---- the half-precision forms --------------------------------------------------------------------------------------------
+
+const uint64_t kFnvBasis = 0xcbf29ce484222325ull, kFnvPrime = 0x100000001b3ull;
+uint64_t fnv(const std::vector<uint32_t>& v) {
+  uint64_t h = kFnvBasis;
+  for (uint32_t x : v) h = (h ^ x) * kFnvPrime;
+  return h;
+}
+// The card's half-precision hashes by name ("EX2.F16 all", "ex2.approx.f16x2").
+std::map<std::string, uint64_t> f16_hashes() {
+  static const auto m = [] {
+    std::ifstream in(std::string(VGPU_SOURCE_DIR) + "/tools/numerics/mufu/rtx3060.f16.hashes.txt");
+    if (!in) throw vtest::Failure("cannot read rtx3060.f16.hashes.txt");
+    std::map<std::string, uint64_t> r;
+    for (std::string line; std::getline(in, line);) {
+      if (line.empty() || line[0] == '#') continue;
+      std::istringstream ss(line);
+      std::string name, a, b;
+      ss >> name >> a >> b;
+      r[name] = std::stoull(b.empty() ? a : b, nullptr, 16);
+    }
+    return r;
+  }();
+  return m;
+}
+const char* const kHalfOps[] = {"COS", "SIN", "EX2", "LG2", "RCP", "RSQ", "SQRT", "TANH"};
+unsigned half_op(const std::string& name) { return static_cast<unsigned>(op_of(name)); }
+std::vector<uint32_t> all_halves() {
+  std::vector<uint32_t> a(65536);
+  for (uint32_t i = 0; i < 65536; ++i) a[i] = i;
+  return a;
+}
+// The registers of the .f16x2 forms: x in the low half, (x * 40503 + 12345) mod 65536 in the high half.
+std::vector<uint32_t> half_pairs() {
+  std::vector<uint32_t> a(65536);
+  for (uint32_t i = 0; i < 65536; ++i) a[i] = i | (((i * 40503u + 12345u) & 0xffffu) << 16);
+  return a;
+}
+std::vector<uint32_t> model_halves(unsigned op, bool packed) {
+  std::vector<uint32_t> r(65536);
+  const std::vector<uint32_t> in = packed ? half_pairs() : all_halves();
+  for (uint32_t i = 0; i < 65536; ++i)
+    r[i] = packed ? mufu::eval_f16(op, in[i] & 0xffffu) | (mufu::eval_f16(op, in[i] >> 16) << 16) : mufu::eval_f16(op, in[i]);
+  return r;
+}
+
+// out[i] = <form>(in[i]) of a half form on b16 (ex2.approx.f16) or b32 (.f16x2) registers, in the order of `in`.
+std::vector<uint32_t> run_ptx_half(const std::string& form, bool packed, const std::vector<uint32_t>& in) {
+  const std::string rt = packed ? "b32" : "b16", w = packed ? "4" : "2";
+  std::string ptx = ".version 8.0\n.target sm_86\n.address_size 64\n.visible .entry k(.param .u64 pa, .param .u64 po, .param .u32 pn)\n{\n"
+                    " .reg .b32 %r<8>; .reg .b64 %rd<10>; .reg ." + rt + " %a, %c; .reg .pred %p;\n"
+                    " ld.param.u64 %rd1,[pa]; ld.param.u64 %rd3,[po]; ld.param.u32 %r6,[pn];\n"
+                    " mov.u32 %r1,%tid.x; mov.u32 %r2,%ctaid.x; mov.u32 %r3,%ntid.x; mad.lo.u32 %r4,%r2,%r3,%r1;\n"
+                    " setp.ge.u32 %p,%r4,%r6; @%p bra done;\n"
+                    " mul.wide.u32 %rd4," ;
+  ptx += "%r4," + w + "; add.u64 %rd5,%rd1,%rd4; add.u64 %rd7,%rd3,%rd4;\n"
+         " ld.global." + rt + " %a,[%rd5];\n " + form + " %c, %a;\n st.global." + rt + " [%rd7],%c;\ndone:\n ret;\n}\n";
+  MemoryManager mem{1 << 24};
+  const DeviceProfile prof = load_gpu("nvidia/rtx3060");
+  auto m = ptx::parse(ptx);
+  const uint32_t n = static_cast<uint32_t>(in.size()), bytes = n * (packed ? 4u : 2u);
+  const uint64_t pa = mem.alloc(bytes), po = mem.alloc(bytes);
+  for (uint32_t i = 0; i < n; ++i) mem.store_scalar(pa + i * (packed ? 4u : 2u), packed ? 4 : 2, in[i]);
+  exec::LaunchConfig cfg;
+  cfg.grid = {(n + 255) / 256, 1, 1};
+  cfg.block = {256, 1, 1};
+  exec::launch(m.entries[0], cfg, {bytes_of(&pa, 8), bytes_of(&po, 8), bytes_of(&n, 4)}, mem, prof);
+  std::vector<uint32_t> r(n);
+  for (uint32_t i = 0; i < n; ++i) r[i] = static_cast<uint32_t>(mem.load_scalar(po + i * (packed ? 4u : 2u), packed ? 4 : 2));
+  return r;
+}
+
 }  // namespace
+
+// The half-precision forms. The model: the single-precision unit on the exact float, the result cut toward zero to a half.
+VTEST(the_model_hashes_as_the_card_over_every_half_pattern) {
+  const auto want = f16_hashes();
+  VCHECK_EQ(want.size(), size_t{12});
+  for (const char* name : kHalfOps) {
+    const unsigned op = half_op(name);
+    VCHECK(mufu::has_f16(op));
+    const uint64_t got = fnv(model_halves(op, false));
+    if (got != want.at(std::string(name) + ".F16")) throw vtest::Failure(std::string("MUFU.") + name + ".F16: model " + hex(got, 16) + ", an RTX 3060 gives " + hex(want.at(std::string(name) + ".F16"), 16));
+  }
+  VCHECK(!mufu::has_f16(mufu::OpRcp64h) && !mufu::has_f16(mufu::OpRsq64h));
+  for (const char* name : {"ex2", "tanh"}) {
+    const unsigned op = name[0] == 'e' ? mufu::OpEx2 : mufu::OpTanh;
+    VCHECK_EQ(fnv(model_halves(op, true)), want.at(std::string(name) + ".approx.f16x2"));
+  }
+}
+
+// MUFU.<op>.F16 on the SASS executor, every half pattern of every operation: the registers 0 .. 65535 through the 32-lane path and
+// the general path, then the high half (.H1), |x| and -x on a sample of patterns (the modifiers act on the half's sign bit).
+static void sass_half_forms() {
+  const auto want = f16_hashes();
+  for (const char* name : kHalfOps) {
+    const unsigned op = half_op(name);
+    Sass s(op, false, false, true, 0);
+    const std::vector<uint32_t> r = s.dump(0, 65536);
+    if (fnv(r) != want.at(std::string(name) + ".F16")) {
+      for (uint32_t i = 0; i < 65536; ++i)
+        if (r[i] != mufu::eval_f16(op, i)) throw vtest::Failure(std::string("SASS MUFU.") + name + ".F16(" + hex(i, 4) + "): " + hex(r[i]) + ", an RTX 3060 gives " + hex(mufu::eval_f16(op, i)));
+      throw vtest::Failure(std::string("SASS MUFU.") + name + ".F16: the hash differs from the card's");
+    }
+  }
+  // The high half, and the modifiers: 1/251 of the patterns, the upper half of the operand register being the pattern. A
+  // consecutive run of registers shares its upper half, so a launch of one thread a pattern is used.
+  for (const char* name : {"EX2", "TANH", "RCP", "SIN"}) {
+    const unsigned op = half_op(name);
+    for (int mods = 0; mods < 4; ++mods) {
+      const bool ab = mods & 1, ng = mods & 2;
+      for (unsigned part : {0u, 1u}) {
+        Sass s(op, ab, ng, true, part);
+        for (uint32_t h = 3; h < 65536; h += 2503) {
+          const uint32_t reg = part ? (h << 16) | 0x3c00u : (0xbc00u << 16) | h;   // the half read, and the other half something else
+          uint32_t x = h;
+          if (ab) x &= 0x7fffu;
+          if (ng) x ^= 0x8000u;
+          const uint32_t got = s.dump(reg, 1)[0], w = mufu::eval_f16(op, x);
+          if (got != w) throw vtest::Failure(std::string("SASS MUFU.") + name + ".F16" + (part ? ".H1" : "") + (ng ? " -" : " ") + (ab ? "|x|" : "x") + " of " + hex(reg) + ": " + hex(got) + ", want " + hex(w));
+        }
+      }
+    }
+  }
+}
+VTEST(the_sass_executor_gives_the_cards_half_precision_results) { sass_half_forms(); }
+VTEST(the_sass_executor_general_path_gives_the_cards_half_precision_results) {
+  Env e("VGPU_FASTPATH", "0");
+  sass_half_forms();
+}
+
+// ex2.approx.f16 / .f16x2 and tanh.approx.f16 / .f16x2 on the PTX interpreter: the card's hashes.
+VTEST(the_ptx_interpreter_gives_the_cards_half_precision_results) {
+  const auto want = f16_hashes();
+  for (const char* base : {"ex2.approx", "tanh.approx"})
+    for (const char* ty : {".f16", ".f16x2"}) {
+      const bool packed = ty[4] == 'x';
+      const std::string form = std::string(base) + ty;
+      const std::vector<uint32_t> r = run_ptx_half(form, packed, packed ? half_pairs() : all_halves());
+      if (fnv(r) != want.at(form)) {
+        const unsigned op = base[0] == 'e' ? mufu::OpEx2 : mufu::OpTanh;
+        const std::vector<uint32_t> m = model_halves(op, packed);
+        for (uint32_t i = 0; i < 65536; ++i)
+          if (r[i] != m[i]) throw vtest::Failure("PTX " + form + "(" + hex(packed ? half_pairs()[i] : i) + "): " + hex(r[i]) + ", an RTX 3060 gives " + hex(m[i]));
+        throw vtest::Failure("PTX " + form + ": the hash differs from the card's");
+      }
+    }
+}
+
+// VGPU_MUFU_EXACT=0: the half forms are what they were: the PTX interpreter's the function in double rounded once to the nearest
+// half, the SASS executor's the register read as a float. The numbers are how many of the 65,536 patterns of a form differ from the card.
+VTEST(the_switch_restores_the_host_precision_half_results) {
+  const auto want = f16_hashes();
+  Env e("VGPU_MUFU_EXACT", "0");
+  for (const char* base : {"ex2.approx", "tanh.approx"}) {
+    const std::string form = std::string(base) + ".f16";
+    const std::vector<uint32_t> r = run_ptx_half(form, false, all_halves()), card = model_halves(base[0] == 'e' ? mufu::OpEx2 : mufu::OpTanh, false);
+    size_t differ = 0;
+    for (uint32_t i = 0; i < 65536; ++i) differ += r[i] != card[i];
+    std::printf("EXACT=0 PTX %s: %zu of 65536 differ from the card\n", form.c_str(), differ);
+    VCHECK(fnv(r) != want.at(form));
+    VCHECK_EQ(differ, base[0] == 'e' ? size_t{19417} : size_t{14736});
+  }
+  for (const char* name : kHalfOps) {
+    Sass s(half_op(name), false, false, true, 0);
+    const std::vector<uint32_t> r = s.dump(0, 65536), card = model_halves(half_op(name), false);
+    size_t differ = 0;
+    for (uint32_t i = 0; i < 65536; ++i) differ += r[i] != card[i];
+    std::printf("EXACT=0 SASS MUFU.%s.F16: %zu of 65536 differ from the card\n", name, differ);
+    VCHECK(fnv(r) != want.at(std::string(name) + ".F16"));
+  }
+}
 
 VTEST(the_model_gives_the_cards_result_on_every_measured_vector) {
   size_t rows = 0;

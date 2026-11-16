@@ -104,3 +104,20 @@ mutant 32: ast.cpp: div.full.f32 is lowered to the plain f32 micro-op (the exact
     killed by test_mufu_model (the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card, the_switch_restores_the_host_precision_results); test_exec3 (approximate_division_and_ftz_as_documented)
 mutant 33: interpreter.cpp: sin.approx multiplies by 1/2pi to nearest, not toward zero
     killed by test_mufu_model (the_ptx_forms_are_what_ptxas_makes_of_them_on_the_card); test_ptx_approx_forms (sin_and_cos_approx_take_the_scaled_argument)
+
+# Mutants of the half-precision forms (issue #664 follow-up), run on the build machine 2026-11-16. Each is one edit to the tree, built and
+# run alone (test_mufu_model, 15 cases; the control passes 15 of 15). "killed by" names the cases that fail.
+half mutant 1: mufu_model.hpp: f32_to_half_rz rounds to nearest instead of cutting (adds half an ulp before the shift)
+    killed by the_model_hashes_as_the_card_over_every_half_pattern, the_sass_executor_gives_the_cards_half_precision_results (both paths), the_ptx_interpreter_gives_the_cards_half_precision_results, the_switch_restores_the_host_precision_half_results
+half mutant 2: interpreter.cpp: ex2/tanh .f16 and .f16x2 back at host precision
+    killed by the_ptx_interpreter_gives_the_cards_half_precision_results
+half mutant 3: exec_ops.inc: MUFU.<op>.F16 in exec_float read as a float again (the model16 branch off)
+    killed by the_sass_executor_gives_the_cards_half_precision_results, the_sass_executor_general_path_gives_the_cards_half_precision_results
+half mutant 4: exec_ops.inc: the .H1 select ignored (the low half read)
+    killed by the_sass_executor_gives_the_cards_half_precision_results, the_sass_executor_general_path_gives_the_cards_half_precision_results
+half mutant 5: decode.cpp: the .H1 select not decoded
+    killed by the_sass_executor_gives_the_cards_half_precision_results, the_sass_executor_general_path_gives_the_cards_half_precision_results
+half mutant 6: exec_ops.inc: the 32-lane fast path takes the F16 forms (reads them as floats)
+    killed by the_sass_executor_gives_the_cards_half_precision_results
+# The tier needs no change: with the model on, its MUFU handler runs the interpreter's code for every function (h_mufu), F16 included;
+# with VGPU_MUFU_EXACT=0 the F16 forms are what they were.

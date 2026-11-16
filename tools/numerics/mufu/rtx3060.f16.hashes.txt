@@ -1,0 +1,18 @@
+# The half-precision forms of an RTX 3060 (sm_86, driver 610.88, nvcc 13.0.88, 2026-11-16), one FNV-1a 64 hash of the 32-bit results for
+# every one of the 65,536 half patterns of each form. tools/numerics/mufu-card-run.sh wrote it and compares another card's with it; the
+# unit test test_mufu_model computes the same hashes from the model and from both engines.
+# "<OP>.F16 all": the SASS instruction MUFU.<OP>.F16 on the registers 0 .. 65535 (tools/numerics/mufu_probe.cu --f16 --hash16): the result
+# register whole, so a nonzero upper half would show. The PTX forms (tools/numerics/mufu_f16_forms.cu) follow: the .f16x2 forms on the
+# registers (x, (x * 40503 + 12345) mod 65536 << 16) for x = 0 .. 65535.
+COS.F16 all d4e07f6a20424e19
+SIN.F16 all 5c64dfb7743875d9
+EX2.F16 all 80729ac6ad55e21a
+LG2.F16 all acf74aab00f369cf
+RCP.F16 all 5a24fdafed69ae8d
+RSQ.F16 all 0400810551c27c79
+SQRT.F16 all fbedd9f4242aaa89
+TANH.F16 all ad1f254087177b9d
+ex2.approx.f16 80729ac6ad55e21a
+tanh.approx.f16 ad1f254087177b9d
+ex2.approx.f16x2 0c4f224d842ce21a
+tanh.approx.f16x2 6bc878bf44617b9d

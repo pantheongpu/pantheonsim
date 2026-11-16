@@ -1961,6 +1961,7 @@ void dec_mufu(Instr& ins, const Word& w) {
   ins.dst.push_back(dst_reg(w, false, ins.sm));
   one_src(ins, w, kFloat, false);
   src_neg_abs(ins.src[0], w, true);
+  if (w.bit(73)) f16_part(ins, w, 1);   // .F16 reads the low half of the register, or the high one (.H1, bits 60-61)
   if (op == 6 || op == 7) double_imm(ins);   // an immediate is a double's high word
 }
 

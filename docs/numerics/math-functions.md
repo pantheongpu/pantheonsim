@@ -481,8 +481,66 @@ division: 1,452 results in `nvidia/tests/data/mufu/rtx3060.forms.txt`. The inter
 of them (`test_mufu_model`). `div.full.f32` used to be the exact quotient in the interpreter and `a * rcp(b)` in the SASS
 executor; both are now what the card computes. With `VGPU_MUFU_EXACT=0` it is the exact quotient again.
 
-Not covered: the half-precision forms (`MUFU` with the F16 bit, `*.approx.f16`, `.f16x2`, `.bf16x2`) are the function at
-host precision as before; no card was asked.
+The half-precision forms are the next section.
+
+## The half-precision forms (2026-11-16)
+
+Until now these were the function at host precision (the PTX interpreter) or, in the SASS executor, not a half-precision form at
+all: `MUFU.<op>.F16` read its source register as a float. Both are the card's now, on the RTX 3060.
+
+**Which forms exist** (measured: nvcc 13.0 and ptxas 13.0, sm_75 to sm_120, compile only except sm_86). `ex2.approx.f16`,
+`ex2.approx.f16x2`, `tanh.approx.f16` and `tanh.approx.f16x2` compile from sm_75 on to `MUFU.EX2.F16` / `MUFU.TANH.F16` (the
+packed forms: two of them, the second reading `R.H1`, and a `PRMT` joining the halves; nothing else around the instruction).
+`ex2.approx.ftz.bf16`, `.bf16x2`, `tanh.approx.bf16` and `.bf16x2` need sm_90 or later (ptxas: "requires .target sm_90 or higher")
+and compile to `MUFU.EX2.BF16` / `MUFU.TANH.BF16`. `rcp`, `rsqrt`, `sqrt`, `sin`, `cos` and `lg2` have no half-precision
+`.approx` form in PTX (ptxas rejects `rcp.approx.f16` and the others: "Unexpected instruction types"), and `ex2.approx.ftz.f16`
+is illegal. The library's half functions (`hexp2`, `hrcp`, `hsqrt`, `h2rcp`, ...) do not use the F16 instruction: nvcc widens the
+half with `HADD2.F32`, runs the single-precision `MUFU` and packs with `F2FP.PACK_AB`, which the simulator already did right.
+The F16 instruction does exist for every one of the eight sub-operations (the probe rewrites the `MUFU` of its kernel as it does
+for the 32-bit forms: `--f16`, and `--h1` for the register's high half), so the SASS executor has all eight.
+
+**What the card does** (measured, RTX 3060, sm_86): all 65,536 half patterns of each of `COS`, `SIN`, `EX2`, `LG2`, `RCP`, `RSQ`,
+`SQRT` and `TANH` with the F16 bit, and (`mufu_probe --f16 --check`, over the 2^32 registers, so every value of the unused
+half too) the high-half select, `|x|` and `-x`:
+
+> `MUFU.<op>.F16` widens the half exactly to a float, runs the single-precision unit ([above](#the-cards-unit-mufu-as-an-rtx-3060-computes-it))
+> and cuts the float to a half **toward zero**. The result is in the low 16 bits, the upper 16 are zero. A float of 2^16 or
+> more is an infinity (so 65504 is the largest finite result, and the floats from 65504 up to 2^16 cut to it); the unit's NaN
+> is 0x7fff; a result below 2^-24 is a zero of its sign; half-precision subnormal results are kept (cut, not flushed). The
+> operand's half is bits 0-15, or bits 16-31 with `.H1` (instruction bits 60-61); `|x|` and `-x` act on that half's sign bit.
+
+That is `model::eval_f16` (`include/vgpu/exec/mufu_model.hpp`), a function of the 32-bit model and no table. No fit was needed:
+the 8 x 65,536 results of the card equal it on every pattern. Nothing is stored beyond twelve hashes
+(`tools/numerics/mufu/rtx3060.f16.hashes.txt`). The PTX forms were also run on the card as PTX (`tools/numerics/mufu_f16_forms.cu`):
+`ex2.approx.f16` and `tanh.approx.f16` give the hashes of `MUFU.EX2.F16` and `MUFU.TANH.F16`; the `.f16x2` forms, on the
+65,536 registers (x, (x * 40503 + 12345) mod 65536), equal two independent halves.
+
+**Before and after, of the 65,536 patterns of each form, against the card** (the "before" is `VGPU_MUFU_EXACT=0`, the earlier
+code verbatim, run by `test_mufu_model`):
+
+| Form | Engine | Differed from the card before | After |
+|---|---|---|---|
+| `ex2.approx.f16` | PTX interpreter (host precision, rounded to nearest) | 19,417 | 0 |
+| `tanh.approx.f16` | PTX interpreter | 14,736 | 0 |
+| `ex2.approx.f16x2`, `tanh.approx.f16x2` | PTX interpreter | the same, a half at a time (the lanes are independent) | 0 |
+| `MUFU.EX2.F16`, `.COS.F16`, `.LG2.F16`, `.RCP.F16`, `.RSQ.F16` | SASS executor (the register read as a float) | 65,536 each | 0 |
+| `MUFU.SQRT.F16` | SASS executor | 65,535 | 0 |
+| `MUFU.SIN.F16` | SASS executor | 57,344 | 0 |
+| `MUFU.TANH.F16` | SASS executor | 51,183 | 0 |
+
+The PTX interpreter's errors were the rounding: it rounded the exact result to nearest, the card cuts a float of the unit's
+result toward zero (the one-ulp-low half results). Its NaN and infinity cases already agreed. The SASS executor's were a bug:
+the F16 bit was ignored, and the register of a half pattern was read as a float (a tiny subnormal) and the function of that
+written as a float.
+
+**Not covered**: the `BF16` forms (`MUFU.EX2.BF16`, `MUFU.TANH.BF16`; `ex2.approx.ftz.bf16` and `.bf16x2`, `tanh.approx.bf16`
+and `.bf16x2`) need an sm_90 card or later, and the local card is sm_86; the PTX interpreter keeps the host-precision result for
+them, as before, and the SASS executor's decoding of the `.BF16` instruction (an sm_90 encoding that was not looked at) is as it was.
+**Architectures**: the half-precision forms were measured on the RTX 3060 (sm_86) only. Turing (sm_75: the forms compile there),
+Ada, Hopper and Blackwell cards were not asked; they get the model as **inferred** from the 32-bit unit, which the cards of
+those architectures were shown to share ([below](#which-devices-get-the-model-and-on-what-evidence)), and the F16 cut is
+**unknown** on them. `tools/numerics/mufu-card-run.sh` now also hashes the half-precision forms (`hashes16.txt`), so a card of
+another architecture decides it in seconds. `VGPU_MUFU_EXACT=0` gives the earlier results for these forms too.
 
 ## Which devices get the model, and on what evidence
 
@@ -521,8 +579,9 @@ larger than the figure by an amount not measured. No other program was timed.
   math library (329 + 329 lines), not instruction by instruction.
 - `mathfn` under a toolkit other than CUDA 13.0: an H100's CUDA 12.8 build differs on 27 lines, and no simulator run of that
   build was compared with it.
-- The half-precision forms (`MUFU` with the F16 bit; `.approx.f16`, `.f16x2`, `.bf16x2`) are the function at host precision,
-  as they were. No card was asked.
+- The half-precision forms: the F16 forms are the card's on the RTX 3060 (the previous section), measured on that card alone;
+  the bf16 forms (sm_90 and later) were not asked (no local card has them) and are the function at host precision, as they were.
+  Turing, Ada, Hopper and Blackwell were not measured for these forms.
 - The AMD math instructions (`v_rcp_f32`, `v_rsq_f32`, `v_exp_f32`, `v_log_f32`, `v_sin_f32`, `v_cos_f32`) are unchanged,
   and no AMD card has run any of this.
 - The NaN an `erf(double)` of a NaN returns, and `hypot(double)` of a signaling NaN and a zero, still differ between the
@@ -549,6 +608,12 @@ larger than the figure by an amount not measured. No other program was timed.
   bits before), from four SASS runs (two profiles of each of two architectures); PTX against SASS line by line with the
   listed exceptions; `fp_examples`' documented answers; `compare.py` on a doctored copy; with `VGPU_MUFU_EXACT=0`, 66 and
   104 lines are not the card's, as before the model.
+- `test_mufu_model`, the half-precision forms: the model against the card's hashes over all 65,536 patterns of each of the eight
+  `MUFU.<op>.F16` and of the four PTX forms; the SASS executor (probe cubin with the F16 bit set) over all 65,536 registers of
+  each operation, through the fast and the general path, and with `.H1`, `|x|` and `-x`; the PTX interpreter on all 65,536
+  halves of `ex2.approx.f16`, `tanh.approx.f16` and on the 65,536 registers of the `.f16x2` forms; `VGPU_MUFU_EXACT=0`, which
+  gives the earlier results (19,417 and 14,736 patterns off the card for the two PTX forms). Mutants: [mathfn/mutants.txt](mathfn/mutants.txt)
+  (six edits to the half-precision code, each failing at least one case).
 - `test_ptx_approx_forms`: each expansion, on inputs where it differs from the function at host precision; the
   single-precision values are the card's now.
 - `test_amd_hipcc_scratch_flat`: the wave32 stack slot.

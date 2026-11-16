@@ -14,6 +14,8 @@
 //                                                               the number that differ, and the first of them
 //   mufu_probe <cubin> <op> --vectors <n>                       edge inputs and n sampled inputs with the card's results, as text
 //   mufu_probe <cubin> <op> --cubin-out <file>                  only write the rewritten cubin
+//   mufu_probe <cubin> <op> --f16 --hash16                      one hash of the results for the 65,536 half patterns (FNV-1a 64, a result a step)
+//   --f16 [--h1]                                                the half-precision form, MUFU.<op>.F16 (--h1: reading the register's high half)
 //   --abs, --neg (with any of them)                             the instruction with the operand modifier: MUFU.<op> Rd, |Rs| or -Rs
 //
 // <op>: COS SIN EX2 LG2 RCP RSQ RCP64H RSQ64H SQRT TANH (TANH: Ampere and later). The input is the 32-bit pattern itself:
@@ -49,7 +51,7 @@ static void ok(CUresult r, const char* what) {
 }
 
 // Rewrites the sub-operation of every MUFU in the ELF's .text sections; returns how many.
-static int patch(std::vector<uint8_t>& elf, unsigned op, bool src_abs, bool src_neg) {
+static int patch(std::vector<uint8_t>& elf, unsigned op, bool src_abs, bool src_neg, bool f16, unsigned part) {
   if (elf.size() < 64 || memcmp(elf.data(), "\177ELF", 4) != 0 || elf[4] != 2) { fprintf(stderr, "mufu_probe: not a 64-bit ELF\n"); exit(2); }
   auto rd = [&](size_t off, int bytes) { uint64_t v = 0; memcpy(&v, elf.data() + off, bytes); return v; };
   const uint64_t shoff = rd(0x28, 8);
@@ -66,7 +68,9 @@ static int patch(std::vector<uint8_t>& elf, unsigned op, bool src_abs, bool src_
       memcpy(&lo, elf.data() + p, 8); memcpy(&hi, elf.data() + p + 8, 8);
       if ((lo & 0x1ff) != 0x108) continue;
       hi = (hi & ~(0xfull << 10)) | (static_cast<uint64_t>(op) << 10);
+      hi = (hi & ~(1ull << 9)) | (static_cast<uint64_t>(f16) << 9);   // bit 73: .F16, the half-precision form
       memcpy(elf.data() + p + 8, &hi, 8);
+      lo = (lo & ~(3ull << 60)) | (static_cast<uint64_t>(part) << 60);   // bits 60-61: the half of the register a .F16 form reads (.H1)
       lo = (lo & ~(3ull << 62)) | (static_cast<uint64_t>(src_abs) << 62) | (static_cast<uint64_t>(src_neg) << 63);   // MUFU Rd, |Rs| / -Rs
       memcpy(elf.data() + p, &lo, 8);
       ++count;
@@ -98,21 +102,25 @@ int main(int argc, char** argv) {
   int op = -1;
   for (int i = 0; i < 10; ++i) if (strcmp(argv[2], kOps[i]) == 0) op = i;
   if (op < 0) { fprintf(stderr, "mufu_probe: unknown op %s\n", argv[2]); return 2; }
-  enum { Hash, Dump, Check, Vectors, CubinOut } mode = Hash;
+  enum { Hash, Dump, Check, Vectors, CubinOut, Hash16 } mode = Hash;
   const char* file = nullptr;
   uint64_t start = 0, count = 1ull << 32;
   unsigned chunk_bits = 26, nvec = 0;
-  bool src_abs = false, src_neg = false;
+  bool src_abs = false, src_neg = false, f16 = false;
+  unsigned part = 0;
   for (int i = 3; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--hash") mode = Hash;
     else if (a == "--dump" && i + 1 < argc) { mode = Dump; file = argv[++i]; }
     else if (a == "--check") mode = Check;
+    else if (a == "--hash16") mode = Hash16;
     else if (a == "--vectors" && i + 1 < argc) { mode = Vectors; nvec = strtoul(argv[++i], nullptr, 0); }
     else if (a == "--cubin-out" && i + 1 < argc) { mode = CubinOut; file = argv[++i]; }
     else if (a == "--start" && i + 1 < argc) start = strtoull(argv[++i], nullptr, 0);
     else if (a == "--count" && i + 1 < argc) count = strtoull(argv[++i], nullptr, 0);
     else if (a == "--chunk-bits" && i + 1 < argc) chunk_bits = strtoul(argv[++i], nullptr, 0);
+    else if (a == "--f16") f16 = true;
+    else if (a == "--h1") part = 1;
     else if (a == "--abs") src_abs = true;
     else if (a == "--neg") src_neg = true;
     else { fprintf(stderr, "mufu_probe: unknown argument %s\n", argv[i]); return 2; }
@@ -125,7 +133,7 @@ int main(int argc, char** argv) {
     uint8_t tmp[65536]; size_t n;
     while ((n = fread(tmp, 1, sizeof tmp, f)) > 0) elf.insert(elf.end(), tmp, tmp + n);
     fclose(f); }
-  const int patched = patch(elf, static_cast<unsigned>(op), src_abs, src_neg);
+  const int patched = patch(elf, static_cast<unsigned>(op), src_abs, src_neg, f16, part);
   if (patched == 0) { fprintf(stderr, "mufu_probe: no MUFU instruction in %s\n", argv[1]); return 2; }
   if (mode == CubinOut) {
     FILE* f = fopen(file, "wb");
@@ -173,6 +181,13 @@ int main(int argc, char** argv) {
   }
 
   std::vector<uint32_t> r(step);
+  if (mode == Hash16) {   // with --f16: one hash of the register the instruction leaves for each of the 65,536 halves (inputs 0 .. 65535)
+    c.run_dump(0, 65536, r.data());
+    uint64_t h = kFnvBasis;
+    for (uint32_t i = 0; i < 65536; ++i) h = (h ^ r[i]) * kFnvPrime;
+    printf("%s%s all %016llx\n", kOps[op], f16 ? ".F16" : "", static_cast<unsigned long long>(h));
+    return 0;
+  }
   if (mode == Vectors) {
     // Edge inputs (each also negated by the sign bit), then nvec inputs from a fixed generator; "input result" in hex.
     std::vector<uint32_t> in = {0x00000000u, 0x00000001u, 0x00000002u, 0x00400000u, 0x007fffffu, 0x00800000u, 0x00800001u, 0x00ffffffu,
@@ -218,7 +233,14 @@ int main(int argc, char** argv) {
     for (uint32_t i = 0; i < n; ++i) {
       const uint32_t x = static_cast<uint32_t>(s) + i;
       // (The operand modifiers: |x| first, then -x, on the sign bit; the 64H forms take them on the upper word's sign bit too.)
-      const uint32_t m = vgpu::mufu::eval(static_cast<unsigned>(op), (src_abs ? x & 0x7fffffffu : x) ^ (src_neg ? 0x80000000u : 0u));
+      uint32_t m;
+      if (f16) {   // the half the instruction reads (bits 0-15, or 16-31 with --h1), the modifiers on its sign bit; the result is a half, the upper bits zero
+        uint32_t h = part ? x >> 16 : x & 0xffffu;
+        if (src_abs) h &= 0x7fffu;
+        if (src_neg) h ^= 0x8000u;
+        m = vgpu::mufu::eval_f16(static_cast<unsigned>(op), h);
+      } else
+        m = vgpu::mufu::eval(static_cast<unsigned>(op), (src_abs ? x & 0x7fffffffu : x) ^ (src_neg ? 0x80000000u : 0u));
       if (m == r[i]) continue;
       ++differ;
       const int64_t d = static_cast<int64_t>(m) - static_cast<int64_t>(r[i]);
