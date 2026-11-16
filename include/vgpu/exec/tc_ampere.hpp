@@ -26,7 +26,7 @@
 // The same rule holds on Turing, GA100 and Ada cards (a Tesla T4, an A100, an L4 and an L40S print the RTX 3060's lines of the
 // probes that pin it). An H100 sums by the same rule with two numbers changed -- chunks of 16 products (tf32: 8) and terms cut
 // at 2^(top - 26) -- measured on an H100 PCIe, every one of 8,388,608 results: the general form at the end of this file (mma_wide).
-// device_sum_model below says which device takes which.
+// The device's profile says which it takes (numerics.tensor_sum; device_sum_model below).
 //
 // Not covered, and left as they were (the sequential sum): the m8n8k4 form, the sparse forms, and Blackwell (not measured). Not probed when the rule was first measured: results in the f32 subnormal range (here
 // ldexp's), and the sign of a zero f16 accumulator (+0 by analogy with f32).
@@ -42,6 +42,7 @@
 #include <cstring>
 #include <type_traits>
 
+#include "vgpu/profile.hpp"
 #include "vgpu/simd/fp16.hpp"
 #include "vgpu/simd/simd.hpp"
 
@@ -63,11 +64,11 @@
 
 namespace vgpu::exec::tc86 {
 
-// VGPU_TC_EXACT chooses where this model is used. Unset (or anything else): on the devices device_sum_model below gives a model. `0`:
+// VGPU_TC_EXACT chooses where this model is used. Unset (or anything else): on the devices whose profile names a model (device_sum_model below). `0`:
 // nowhere -- the tensor sums are then the sequential f32 ones of the earlier releases, bit for bit, on every device. `force`: on every
 // device, whatever its compute capability: one without a measured model takes the RTX 3060's (what the SASS engine did for an sm_86
 // cubin on any profile before the choice followed the device). `published`: a device without a measured model takes the model the
-// literature gives its architecture, where there is one (published_sum_model: Blackwell, compute capability 10.0 and 12.0). Read from the environment when the process starts
+// literature gives its architecture, where there is one (published_sum_model: the profile's numerics.tensor_sum_published; Blackwell, compute capability 10.0 and 12.0). Read from the environment when the process starts
 // and again at each launch (as VGPU_FASTPATH is), so a test can set it between launches. (Function-local statics of inline functions:
 // no external-linkage global of the shared code.)
 enum : int { kModeOff = 0, kModeDevice = 1, kModeForce = 2, kModePublished = 3 };
@@ -89,9 +90,12 @@ inline bool exact_enabled() { return exact_mode() != kModeOff; }
 
 // ---- Which sum a device's tensor core makes: one named property, decided in one place ------------------------------------------
 //
-// SumModel is the property. device_sum_model() is the only table from a device (its compute capability) to its model, and every
-// engine asks sum_model() / sum_rule() rather than comparing sm numbers. Each row says where it comes from; docs/matrix-numerics.md
-// has the cards, drivers, toolkits, dates and the lines compared, in a form that can move into the device profiles.
+// SumModel is the property, and it is the device profile's: `numerics.tensor_sum` in nvidia/profiles/<name>.yaml (vgpu::Numerics in
+// vgpu/profile.hpp), with the class of evidence it rests on in the profile's `provenance:` section. Every engine asks sum_model() /
+// sum_rule() with the loaded profile; nothing here or in an engine compares a compute capability or an sm number. (Until the
+// profiles carried it this was a table from the compute capability, device_sum_model(cc_major, cc_minor): 7.5, 8.0, 8.6 and 8.9
+// Ampere, 9.0 Hopper, everything else Sequential. tests/unit/test_exec3.cpp keeps that table and holds every profile to it.)
+// docs/matrix-numerics.md has the cards, drivers, toolkits, dates and the lines compared.
 //
 //   Sequential  acc += a * b in f32, k in order, round to nearest even. No card is known to do this: it is what a device whose
 //               tensor core we have not measured gets (7.0, 8.7, 10.x, 11.0, 12.x).
@@ -103,50 +107,39 @@ inline bool exact_enabled() { return exact_mode() != kModeOff; }
 //               which compiles to two of them, two), terms cut at 2^(top - 26).
 //                 9.0  measured: H100 PCIe -- 8,388,608 wmma results (f16, bf16 and tf32, f32 and f16 accumulators, random and
 //                      special values), every one reproduced, and the card's lines of both probes (mma.sync m16n8k8 tf32 among them)
-//               published, NOT measured by us, and so not a device's model by default (published_sum_model, VGPU_TC_EXACT=published):
+//               published, NOT measured by us, and so not a device's model by default (`numerics.tensor_sum_published` in the
+//               profile, VGPU_TC_EXACT=published):
 //                 10.0, 12.0  Blackwell: MMA-Sim (Xie et al., arXiv 2511.10909) and Khattak and Mikaitis (arXiv 2512.07004) give
 //                      B200 and RTX PRO 6000 Blackwell the Hopper numbers for f16, bf16 and tf32
 // The same two papers give this rule and these numbers for every card above; the four corners in the subnormal range (the cut of a
 // subnormal f32 result, the floor under a zero accumulator, a subnormal accumulator's position, +0 for a negative sum that rounds to
 // zero) are theirs, and the first two are confirmed on an RTX 3060 (tests/unit/test_tc_ampere.cpp, the_subnormal_corners).
-enum class SumModel : uint8_t { Sequential, Ampere, Hopper };
-struct SumRule {
-  const char* name;
-  unsigned chunk;        // products to a chunk, f16 and bf16
-  unsigned chunk_tf32;   // ... tf32
-  int grid;              // a chunk's terms are cut at 2^(top - grid)
-};
-inline constexpr SumRule kAmpereRule{"ampere: chunks of 8 (tf32 4), cut at 2^(top-25)", 8, 4, 25};
-inline constexpr SumRule kHopperRule{"hopper: chunks of 16 (tf32 8), cut at 2^(top-26)", 16, 8, 26};
+using SumModel = vgpu::TensorSum;       // { Sequential, Ampere, Hopper }
+using SumRule = vgpu::TensorSumRule;    // { name, chunk, chunk_tf32, grid }
+inline constexpr const SumRule& kAmpereRule = vgpu::kAmpereSumRule;
+inline constexpr const SumRule& kHopperRule = vgpu::kHopperSumRule;
 
-inline SumModel device_sum_model(int cc_major, int cc_minor) {
-  if ((cc_major == 7 && cc_minor == 5) || (cc_major == 8 && (cc_minor == 0 || cc_minor == 6 || cc_minor == 9))) return SumModel::Ampere;
-  if (cc_major == 9 && cc_minor == 0) return SumModel::Hopper;
-  return SumModel::Sequential;
-}
-inline bool device_sums_chunked(int cc_major, int cc_minor) { return device_sum_model(cc_major, cc_minor) != SumModel::Sequential; }
-
-// What the literature gives a device we have not measured (see the table above), or Sequential where it gives nothing.
-inline SumModel published_sum_model(int cc_major, int cc_minor) {
-  return (cc_major == 10 || cc_major == 12) && cc_minor == 0 ? SumModel::Hopper : SumModel::Sequential;
-}
-// The model in force for a device now: the switch, then the device. Forced, a device without a measured model takes Ampere's; with
+// The model a device's profile gives it (its `numerics.tensor_sum`; a profile without the section has the sequential sum).
+inline SumModel device_sum_model(const vgpu::DeviceProfile& p) { return p.numerics.tensor_sum; }
+// What the literature gives a device we have not measured (`numerics.tensor_sum_published`), or Sequential where it gives nothing.
+inline SumModel published_sum_model(const vgpu::DeviceProfile& p) { return p.numerics.tensor_sum_published; }
+// The model in force for a device now: the switch, then the device. Forced, a device without a model of its own takes Ampere's; with
 // `published`, the published one if there is one.
-inline SumModel sum_model(int cc_major, int cc_minor) {
+inline SumModel sum_model(const vgpu::DeviceProfile& p) {
   const int mode = exact_mode();
   if (mode == kModeOff) return SumModel::Sequential;
-  const SumModel m = device_sum_model(cc_major, cc_minor);
+  const SumModel m = device_sum_model(p);
   if (m != SumModel::Sequential) return m;
-  return mode == kModeForce ? SumModel::Ampere : mode == kModePublished ? published_sum_model(cc_major, cc_minor) : m;
+  return mode == kModeForce ? SumModel::Ampere : mode == kModePublished ? published_sum_model(p) : m;
 }
-inline const SumRule* rule_of(SumModel m) { return m == SumModel::Ampere ? &kAmpereRule : m == SumModel::Hopper ? &kHopperRule : nullptr; }
+inline const SumRule* rule_of(SumModel m) { return vgpu::tensor_sum_rule(m); }
 // The rule in force for a device, or null for the sequential sum.
-inline const SumRule* sum_rule(int cc_major, int cc_minor) { return rule_of(sum_model(cc_major, cc_minor)); }
-inline bool applies(int cc_major, int cc_minor) { return sum_model(cc_major, cc_minor) != SumModel::Sequential; }
+inline const SumRule* sum_rule(const vgpu::DeviceProfile& p) { return rule_of(sum_model(p)); }
+inline bool applies(const vgpu::DeviceProfile& p) { return sum_model(p) != SumModel::Sequential; }
 // The bits simd::Kernels::hmma's `kind` carries for the model: 16 Ampere, 32 Hopper, 0 the sequential sum.
 inline constexpr unsigned kKindAmpere = 16, kKindHopper = 32;
-inline unsigned kernel_kind_bits(int cc_major, int cc_minor) {
-  const SumModel m = sum_model(cc_major, cc_minor);
+inline unsigned kernel_kind_bits(const vgpu::DeviceProfile& p) {
+  const SumModel m = sum_model(p);
   return m == SumModel::Ampere ? kKindAmpere : m == SumModel::Hopper ? kKindHopper : 0u;
 }
 

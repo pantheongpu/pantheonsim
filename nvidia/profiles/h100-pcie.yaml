@@ -53,3 +53,16 @@ cuda:
 layout:
   tpcs: 57
   sms_per_tpc: 2
+
+# Numerics: the sum this device's tensor core makes of f16, bf16 and tf32 products (wmma, mma.sync, HMMA). The engines read it
+# from here. `provenance` gives each value one class (measured | documented | inferred | unknown) and `evidence` what the class
+# rests on. Schema: nvidia/docs/profiles.md. The rule and every card run: docs/matrix-numerics.md.
+numerics:
+  tensor_sum: hopper               # sequential | ampere | hopper
+  tensor_sum_chunk: 16             # products to a chunk, f16 and bf16
+  tensor_sum_chunk_tf32: 8         # ... tf32
+  tensor_sum_grid: 26              # a chunk's terms are cut at 2^(top - 26)
+provenance:
+  measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]
+evidence:
+  numerics: "card: NVIDIA H100 PCIe (this model), Lambda; driver: 570.148.08; toolkit: nvcc 12.8.93; date: 2026-11-15. Both probes print the card lines (nvidia/tests/data/simd_lane_forms.h100.txt, float_half_forms.h100.txt), the same from sm_80, sm_86 and sm_89 builds; FTTN; a dump of 8,388,608 wmma results, every one the hopper rule (tools/fttn/tc_dump_check.cpp). docs/matrix-numerics.md"

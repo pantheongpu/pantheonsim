@@ -2073,7 +2073,12 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       const unsigned op = ins.f[0];
       if (op > 9 || ins.src.empty() || !plain(ins.src[0]) || ins.src[0].bnot || ins.dst[0].kind != Kind::Reg)
         return false;
-      if (op == 6 || op == 7) {
+      if (!ins.f[1] && vgpu::mufu::has(op) && vgpu::mufu::enabled()) {
+        // The card's unit (vgpu/exec/mufu_model.hpp), unless VGPU_MUFU_EXACT=0: the operand's bits with |x| and -x applied (to the
+        // upper word's sign in the 64H forms too: an RTX 3060's MUFU.RCP64H R, -|R|), the result's bits as the unit gives them.
+        const uint32_t* a = lanes(0, ins.src[0], true);
+        for (unsigned l = 0; l < 32; ++l) r[l] = vgpu::mufu::eval(op, a[l]);
+      } else if (op == 6 || op == 7) {
         // RCP64H / RSQ64H: the high word of the reciprocal (root) of the double whose high word is the source (the low word zero);
         // the source's modifiers, the flush and the result's flush do not apply.
         const uint32_t* raw = lanes(0, ins.src[0], false);
@@ -2623,9 +2628,17 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
       return;
     case Op::MUFU: {
       const unsigned op = ins.f[0];
+      // The card's unit (vgpu/exec/mufu_model.hpp: measured on an RTX 3060, every input), which the PTX engine's .approx forms
+      // go through too. VGPU_MUFU_EXACT=0 and the half-precision forms: the function at the host's precision, below.
+      const bool model = !ins.f[1] && vgpu::mufu::has(op) && vgpu::mufu::enabled();
       each_lane(ex, [&](unsigned l) {
-        // Computed in double and rounded once, as the PTX engine computes
-        // the .approx functions, so the two engines agree to the bit.
+        if (model) {
+          const uint32_t raw = read32(w, ins.src[0], l);
+          const uint32_t bits = (ins.src[0].abs ? raw & 0x7fffffffu : raw) ^ (ins.src[0].neg ? 0x80000000u : 0u);   // (the 64H forms too, on the card)
+          write32(w, ins.dst[0], l, vgpu::mufu::eval(op, bits));
+          return;
+        }
+        // Computed in double and rounded once.
         const double x = op == 9 ? f32src(ins.src[0], l, false) : ftz(f32src(ins.src[0], l, true));   // (TANH does not flush)
         float r;
         switch (op) {
@@ -5141,7 +5154,7 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
     if (ok && !f64 && !b1 && acc != AccS32) {
       const auto sum86 = [](MmaT t) { return t == MmaT::F16 || t == MmaT::BF16 || t == MmaT::TF32; };
       const auto narrow = [](MmaT t) { return t == MmaT::E4M3 || t == MmaT::E5M2; };
-      if (vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) && ins.op == Op::HMMA && !is_sparse && sum86(at) && bt == at && K <= 16 &&
+      if (vgpu::exec::tc86::applies(profile_) && ins.op == Op::HMMA && !is_sparse && sum86(at) && bt == at && K <= 16 &&
           K % (at == MmaT::TF32 ? 4 : 8) == 0)
         ok = false;   // the chunked sum of an RTX 3060
       if (m_.sm / 10 == 12 && narrow(at) && narrow(bt) && acc == AccF32) ok = false;   // sm_120's narrow-float sum
@@ -5310,7 +5323,7 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
     }
   double D[16 * kN] = {};
   // On those devices the f16, bf16 and tf32 products sum as an RTX 3060's tensor core does (vgpu/exec/tc_ampere.hpp): the whole tile first.
-  const vgpu::exec::tc86::SumRule* const tc_rule = vgpu::exec::tc86::sum_rule(profile_.cc_major, profile_.cc_minor);
+  const vgpu::exec::tc86::SumRule* const tc_rule = vgpu::exec::tc86::sum_rule(profile_);
   const bool tc86_sum = tc_rule && ins.op == Op::HMMA && !sparse && (at == MmaT::F16 || at == MmaT::BF16 || at == MmaT::TF32) && bt == at &&
                         (acc == AccF32 || acc == AccF16) && K <= 16 && K % (at == MmaT::TF32 ? 4 : 8) == 0;
   float Dtc[16 * kN] = {};

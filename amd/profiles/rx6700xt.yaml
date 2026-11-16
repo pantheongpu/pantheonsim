@@ -48,3 +48,19 @@ telemetry:
   memory: gddr                 # GDDR6, Samsung, 192 bits
   memory_temperature: true     # rocm-smi reports a memory sensor on RDNA2 boards
   pcie_link: "Gen4 x16"
+
+# Provenance: the class of what each listed value rests on (measured | documented | inferred | unknown), and the evidence.
+# Only the keys whose value is in the card's files under amd/registers/measurements/rx6700xt/ are tagged; a key not listed has no
+# per-key class. Schema: nvidia/docs/profiles.md. This card has no matrix instructions, and no AMD matrix arithmetic is in any
+# profile: none has been measured (docs/matrix-numerics.md).
+provenance:
+  measured: [gcn_arch, warp_size, vram_bytes, limits.max_threads_per_block, limits.max_block_dim, limits.max_grid_dim, limits.shared_mem_per_block_bytes, limits.shared_mem_per_block_optin_bytes, limits.registers_per_block, limits.multiprocessors, limits.registers_per_sm, limits.max_threads_per_sm, limits.max_registers_per_thread, limits.shared_mem_per_sm, limits.l2_cache_bytes, telemetry.sm_clock_max_mhz, telemetry.power_limit_w, telemetry.temperature_max_c, telemetry.pci_vendor_id, telemetry.pci_device_id]
+  inferred: [limits.max_blocks_per_sm]
+evidence:
+  gcn_arch: "card: AMD Radeon RX 6700 XT (this model); date: 2026-10-09; ROCm 7.2.0, amdgpu on Linux 7.0. HIP's device properties read by amd/tools/characterize-hip.cpp (amd/registers/measurements/rx6700xt/characterize-hip.txt)."
+  warp_size: "card: AMD Radeon RX 6700 XT (this model); date: 2026-10-09; ROCm 7.2.0, amdgpu on Linux 7.0. HIP's device properties read by amd/tools/characterize-hip.cpp (amd/registers/measurements/rx6700xt/characterize-hip.txt)."
+  vram_bytes: "card: AMD Radeon RX 6700 XT (this model); date: 2026-10-09; ROCm 7.2.0, amdgpu on Linux 7.0. HIP's device properties read by amd/tools/characterize-hip.cpp (amd/registers/measurements/rx6700xt/characterize-hip.txt)."
+  limits: "card: AMD Radeon RX 6700 XT (this model); date: 2026-10-09; ROCm 7.2.0, amdgpu on Linux 7.0. HIP's device properties read by amd/tools/characterize-hip.cpp (amd/registers/measurements/rx6700xt/characterize-hip.txt)."
+  limits.l2_cache_bytes: "card: AMD Radeon RX 6700 XT (this model); date: 2026-10-09; ROCm 7.2.0. rocminfo's cache info (amd/registers/measurements/rx6700xt/rocminfo.txt)."
+  limits.max_blocks_per_sm: "not exposed by HIP or any tool run on the card: the value of the RX 6900 XT profile (amd/profiles/rx6900xt.yaml), which is not read from a card."
+  telemetry: "card: AMD Radeon RX 6700 XT (this model); date: 2026-10-09; ROCm 7.2.0, amdgpu on Linux 7.0. amd-smi static (amd/registers/measurements/rx6700xt/amd-smi-static.json: PCI ids, power cap, hotspot slowdown temperature) and rocminfo (rocminfo.txt: the top clock)."

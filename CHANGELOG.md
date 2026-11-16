@@ -7,6 +7,113 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **The approximate math instructions give a real card's bits** (issue #664). `MUFU` (SASS) and the PTX `.approx` forms
+  were the function at the host's precision, rounded once; a card computes them in a small fixed-point unit, and its
+  results differ in the last bit on 13 to 39 % of arguments (`RCP`, `RSQ`, `SQRT`, `EX2`), by an absolute error of a few
+  1e-7 (`LG2`, `SIN`, `COS`) or by up to about 130 ulp (`TANH`). The unit of an RTX 3060 was measured over all 2^32
+  operands of each of the ten sub-operations (`tools/numerics/mufu_probe.cu`) and a model fitted that reproduces every one
+  of them: 4,294,967,296 of 4,294,967,296 for `COS`, `SIN`, `EX2`, `LG2`, `RCP`, `RSQ`, `RCP64H`, `RSQ64H`, `SQRT` and `TANH`
+  (`include/vgpu/exec/mufu_model.hpp`; [docs/numerics/math-functions.md](docs/numerics/math-functions.md) has the
+  measurements, the model and its evidence). Both engines use it; the PTX interpreter forms each `.approx` instruction and
+  `div.full.f32` as ptxas expands it around the one instruction.
+  - **This changes the results of existing programs**, which is the point: any kernel that calls `expf`, `powf`, `tanhf`,
+    `rsqrtf`, `cbrt` and the other library functions built on these instructions, or is built with `-use_fast_math`, now
+    prints the card's last bits. On the math-function test set (`tools/numerics/mathfn`, 329 lines a build) the SASS executor
+    printed the card's line on 263 lines of the default build and 225 of the `-use_fast_math` build; it prints it on all
+    329 and all 329 (an RTX 3060, a Tesla T4, an L4 and an A10G print identical lines). Programs that only add, multiply,
+    divide (`/` without fast math) and take `sqrtf` are unchanged: those are IEEE operations on the card and here.
+    Counters do not change.
+  - **`VGPU_MUFU_EXACT=0` gives the earlier results**, bit for bit (the function at host precision; `div.full` the exact
+    quotient). Read at every launch.
+  - Measured: RTX 3060 (every operand), an A10G and an H100 PCIe (every operand, as hashes), and through the math library a
+    Tesla T4 and an L4. **Blackwell cards were not measured**: their profiles get the same model, inferred (measured on
+    Turing, Ampere, Ada, Hopper).
+    `tools/numerics/mufu-card-run.sh` is the run to make on one: all ten operations over all inputs as hashes, compared with
+    the RTX 3060's (`tools/numerics/mufu/rtx3060.hashes.txt`), in seconds.
+  - Also measured and now followed: the `|x|` and `-x` operand modifiers of `MUFU.RCP64H` and `MUFU.RSQ64H` apply to the
+    upper word's sign (the SASS executor ignored them on those two forms).
+  - Pinned test files that changed, each re-recorded from a card and saying so in its header:
+    `nvidia/tests/data/numerics_mathfn.txt` and `numerics_mathfn_fast.txt` (now an RTX 3060's lines; 66 and 104 lines
+    changed), ten expected values of `tests/unit/test_ptx_approx_forms.cpp` and one of `tests/unit/test_exec3.cpp`
+    (`div.full.f32`, which was the exact quotient in the PTX interpreter and is `a * MUFU.RCP(b)` on the card). The card
+    lines of `e2e_simd_lane_forms`, `e2e_float_half_forms` and `e2e_round9_probe` did not change.
+  - Not modelled: the half-precision forms (`MUFU` with the F16 bit, `.approx.f16`), and AMD's math instructions.
+- Math functions (issue #664, second group): a test set that compares a run of the math library with another run line by
+  line, simulator against simulator or against a card (`tools/numerics/`: 44 functions in both precisions over published
+  worst cases, edges and random arguments; the worked examples of NVIDIA's floating-point paper; the Varity GPU paper's
+  cases and generator), a card script (`tools/numerics/card-run.sh`) and what the published results say a card gives where
+  the simulator gives something else ([docs/numerics/math-functions.md](docs/numerics/math-functions.md)). No card was run
+  for this step and it left `MUFU` unchanged (the entry above is the card runs and the change). Two things it found change results:
+  - **A program run from its PTX now gives the bits it gives from its SASS** in the math library. The PTX interpreter
+    computed `sin.approx`, `cos.approx`, `ex2.approx` and `lg2.approx` without `.ftz`, `rcp.approx.ftz.f64`,
+    `rsqrt.approx.ftz.f64` and `rsqrt.approx.f64` as the function at host precision; ptxas makes other code of each, and
+    the same kernel differed between the engines: `rsqrt(double)` on 13 % of arguments and `hypot(double)` on 10 % (by 1 or
+    2 ulp), `asinh(double)` on 0.7 %, `exp2f` on subnormal results, `cbrtf` on subnormal arguments, and `sinf`, `cosf` and
+    `tanf` under `-use_fast_math` on most arguments. The interpreter now forms them as ptxas does. A program that runs from
+    SASS (the default wherever the binary carries SASS the device can run) is unchanged, bit for bit; a program that runs
+    from PTX and calls these functions changes in its last bits, or, for the fast-math sine and cosine of a large argument,
+    altogether, to what its SASS gives. Left as they were: the NaN `erf(double)` returns for a NaN and `hypot(double)` for a
+    signaling one (payloads only).
+  - **AMD, wave32 (RDNA) kernels built `-O0`**: a stack slot stored through the private segment buffer and loaded through a
+    flat pointer was not the same slot (the buffer's index stride was 64 lanes for every kernel; it is the wave's size), so
+    unoptimized code that passes the address of a local to a function read another slot or stopped on an invalid address:
+    on the rx6800 profile 441 of 900 results of the Varity programs did not run and 10 were wrong. Optimized code and
+    wave64 kernels are unchanged.
+
+- Host-GPU modes (`VGPU_HOST_GPU=exact|turbo`, experimental): a kernel's first launch is sampled when the driver is up, as it is before the
+  start ([round sp76](docs/perf-design/rounds/11-rounds-sp36-sp41.md#round-sp76-host-gpu-a-kernels-first-launch-once-the-driver-is-up),
+  [design](docs/perf-design/12-host-gpu-turbo.md), section 13; pantheonsim #657, #659). Until now no launch was sampled once the driver's
+  start had begun (a sample forks the process, and a process that held the real driver was not forked), so a kernel first launched after
+  the start was simulated however long its launch was: the second kernel of HeCBench aidw, 149 s of the program's 193 s on an A10G. Before
+  the fork the process now pulls what only the card holds, the forked copy takes every chunk as its own and cannot call the driver, and the
+  launch is held against a card path with no start in it; a kernel whose earlier whole launch was under the sampling floor is not sampled
+  again, and one whose earlier whole launch was over it is sampled at its next launch whatever its static count. Against the stand-in driver all four launches of aidw are sent (three before), and over the corpus twelve more first launches go (CUDA Samples alignedTypes ten,
+  histogram and mergeSort one each) for seventeen samples; with the switch off against on no program that starts the driver is more than
+  2 % apart in wall time. **Not run on a card**: that a process holding
+  the real driver can be forked is what the card test's new step 13 and `docs/perf-design/data/sp76/card-run.sh` ask first.
+  `VGPU_HOST_GPU_SAMPLE_STARTED=0` is the rule before (the benchmark's forms `exactd0` and `turbod0`). The plain simulator and the bits of
+  exact mode are unchanged.
+- Host-GPU modes, measured and not changed (round sp76): Rodinia particlefilter_float, which the card run of round sp75 left unsettled, is
+  not slower by that round's rule: with one host thread and its clock seed fixed the two forms agree to 1 %, and with several host threads
+  the program itself computes one of several answers per run (a race between the blocks of its `normalize_weights_kernel`), which is what
+  splits its run times in two groups. And no rule was found that keeps the driver start from HeCBench silu (bought at the 31st of 50
+  launches, pantheonsim #662) without taking it from programs that repay it: replayed over the launches of the corpus, each candidate costs
+  the keep list more than silu loses.
+- Host-GPU modes (`VGPU_HOST_GPU=exact|turbo`, experimental): a launch whose blocks each take longer than the wait for its sample is no longer
+  kept in the simulator for want of an answer ([round sp75](docs/perf-design/rounds/11-rounds-sp36-sp41.md#round-sp75-host-gpu-a-block-that-outlasts-the-wait),
+  [design](docs/perf-design/12-host-gpu-turbo.md), section 12; pantheonsim #656, #657). The forked copy that times a launch's first blocks now stops
+  a block at a limit and answers with the time it ran, which is under what the block takes; the estimate and the rule that decides are
+  unchanged. A grid of 2 to 255 blocks whose kernel has no loop the sample inside the blocks follows is sampled the same way when its static
+  estimate reaches 30 ms. Against the stand-in driver the first launch of HeCBench aidw (78 s in the simulator on the build machine) and the
+  single launches of the CUDA Samples cudaTensorCoreGemm, tf32TensorCoreGemm and bf16TensorCoreGemm (5 to 83 s) are sent to the card;
+  on one A10G (`docs/perf-design/data/sp75/card.md`, the run of `card-run.sh`) turbo mode takes tf32TensorCoreGemm from 209 s to 3.0 s,
+  bf16TensorCoreGemm from 157 s to 3.8 s, cudaTensorCoreGemm from 16.1 s to 1.3 s and immaTensorCoreGemm from 3.5 s to 1.2 s, the card's
+  results bit for bit the simulator's in verify runs, and aidw from 360 s to 193 s with 3 of its 4 launches on the card; no program of the
+  corpus was found slower by the rule (Rodinia particlefilter_float, whose time depends on its clock seed, is not settled). aidw's second kernel is still simulated once (no
+  sample is taken while the driver is up), and launches under the sampling floor in a young process (MC_SingleAsianOptionP,
+  MC_EstimatePiInlineP, warpAggregatedAtomicsCG, Rodinia lavaMD) are not reached. `VGPU_HOST_GPU_SAMPLE_BLOCK=0` is the rule before. The
+  plain simulator and the bits of exact mode are unchanged.
+- Host-GPU modes: `VGPU_HOST_GPU_LOG=1` says why each launch stayed in the simulator. The `host_gpu_kept:` reasons, which read `size rule`
+  for every launch the size rule, the first-launch rule or a sample kept, now name the cause (`size rule: no estimate, not sampled: <why>`,
+  `size rule: the sampled estimate does not repay the card path and the driver start`, `size rule: the estimate does not beat the card path`,
+  `size rule: the estimate does not repay the driver start`, `size rule: the kernel is banned ...`), a `host_gpu_nosample:` line gives the
+  numbers behind an unsampled launch (the kernel's first two), and a sampled launch's decision is printed when it is made. A script that
+  matches the reason `size rule` exactly must match its prefix instead.
+- Device profiles say what their numerics are and what each value rests on (issue #664, first step of architecture-aware
+  simulation; [nvidia/docs/profiles.md](nvidia/docs/profiles.md), "Numerics and provenance"). **No result changes.**
+  - New optional profile sections: `numerics:` (the tensor-core sum: `tensor_sum`, its chunk sizes and grid, and
+    `tensor_sum_published` where only a published model exists), `provenance:` (four classes: `measured`, `documented`, `inferred`,
+    `unknown`; one class a key) and `evidence:` (card, driver, toolkit and date, or the document). A profile with a numerics key that
+    has no class, an unknown class, a key in two classes, a claim without evidence or numbers the engines do not implement does not load.
+  - The tensor-core sum of every NVIDIA profile is now read from its profile instead of a table keyed on the compute capability.
+    Each of the 38 profiles has the model it had (held by `test_exec3`, in every `VGPU_TC_EXACT` mode). Seven are `measured` (the
+    card of that model was run: rtx3060, a10g, t4, l4, l40s, a100-sxm4-40gb, h100-pcie), twenty `inferred` from a measured card of
+    the same compute capability (the default `nvidia/h100` among them), and the eleven Blackwell and later profiles are `unknown`
+    and keep the sequential sum; seven of those name the published model that `VGPU_TC_EXACT=published` turns on.
+  - `amd/rx6800` and `amd/rx6700xt` tag the limits that were read from those cards. No AMD behaviour moved, and no AMD matrix
+    arithmetic is tagged: none has been measured.
+  - `vgpu info` prints the numerics, the classes and the evidence; `--json` gains `numerics`, `provenance` and `evidence` objects.
+  - The numerics are part of the result cache's key, so entries cached by an earlier build are not reused (a one-time miss).
 - NVIDIA runtime: `cudaStreamWaitEvent` on an event that is still pending keeps the stream waiting after `cudaEventDestroy` of that event, as on a card. A wait (and a queued record) used to look the event up by its handle when the stream's worker reached it, found it destroyed and took it for complete, so the waiting stream ran early. This is what made Ta-Cuda's batch tests (tacuda#5) fail now and then under the default asynchronous launches and pass with `VGPU_ASYNC_LAUNCH=0`. The queued item now holds the event's state itself.
 - AMD engine, the tier's handlers for double-precision and 64-bit integer instructions ([round sp74](docs/perf-design/rounds/11-rounds-sp36-sp41.md),
   [design](docs/perf-design/13-amd-compiled-tier.md), section 13). On hosts with AVX2, with `VGPU_AMD_BLOCKS` off or on:
@@ -20,12 +127,6 @@ release says what runs and what it produces, never how fast a real GPU would run
     its 62 kernel rows 1.06 in the geometric mean (1.18 with `VGPU_AMD_BLOCKS=1`); no row is more than 3 % slower beyond a control with
     no change. inq's unit tests on a simulated MI300X: eigensolvers::steepest_descent uses 18 % less CPU, ground_state::initial_guess
     12 %, systems::electrons 7 %, solvers::poisson 4 to 5 %; none is slower.
-## [0.2.1] - 2026-11-15
-
-Fixes and additions since 0.2.0. The two bugs that release shipped are fixed: `shfl.sync` returning 0 for a lane still in a long loop
-([#488](https://github.com/pantheongpu/pantheonsim/issues/488)) and a kernel that could not read another simulated GPU's memory after
-`cudaDeviceEnablePeerAccess` ([#598](https://github.com/pantheongpu/pantheonsim/issues/598)). The release carries the simulator prebuilt for the
-GitHub Action. The list below is every entry that was under Unreleased.
 - Tensor cores: the sum now follows the device, and more devices have a measured one ([docs/matrix-numerics.md](docs/matrix-numerics.md),
   issue #664). **Results of f16, bf16 and tf32 `wmma`, `mma.sync` and `HMMA` change on these profiles**; nothing else changes.
   - Compute capability 7.5 (t4, rtx2080ti), 8.0 (a100*, a30) and 8.9 (l4, l40, l40s, rtx4080, rtx4090, rtx6000-ada) take the RTX 3060's
@@ -48,6 +149,12 @@ GitHub Action. The list below is every entry that was under Unreleased.
   and the default sums of every AMD profile are unchanged.
 - `tools/fttn/`: fetches, builds and runs the FTTN test suite (arXiv 2403.00232) on the simulator and on a card, with the paper's
   motivating example, a card script, a fitter for tensor-core dumps and a checker that holds the simulator's code to a card's dump.
+## [0.2.1] - 2026-11-15
+
+Fixes and additions since 0.2.0. The two bugs that release shipped are fixed: `shfl.sync` returning 0 for a lane still in a long loop
+([#488](https://github.com/pantheongpu/pantheonsim/issues/488)) and a kernel that could not read another simulated GPU's memory after
+`cudaDeviceEnablePeerAccess` ([#598](https://github.com/pantheongpu/pantheonsim/issues/598)). The release carries the simulator prebuilt for the
+GitHub Action. The list below is every entry that was under Unreleased.
 
 - AMD counters: the `VGPU_DISPATCH_STATS` line now ends with the bytes the active lanes ask for (`vmem_bytes_rd`, `vmem_bytes_wr`, `lds_bytes_rd`, `lds_bytes_wr`),
   the vector instruction mix (`mix=`), the matrix work by type (`mops=`) and the kernel's name (`kernel=`). The mix and the matrix work were already counted

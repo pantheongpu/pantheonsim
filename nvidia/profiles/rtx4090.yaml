@@ -75,3 +75,16 @@ layout:
   gpcs: 11
   tpcs: 64
   sms_per_tpc: 2
+
+# Numerics: the sum this device's tensor core makes of f16, bf16 and tf32 products (wmma, mma.sync, HMMA). The engines read it
+# from here. `provenance` gives each value one class (measured | documented | inferred | unknown) and `evidence` what the class
+# rests on. Schema: nvidia/docs/profiles.md. The rule and every card run: docs/matrix-numerics.md.
+numerics:
+  tensor_sum: ampere               # sequential | ampere | hopper
+  tensor_sum_chunk: 8              # products to a chunk, f16 and bf16
+  tensor_sum_chunk_tf32: 4         # ... tf32
+  tensor_sum_grid: 25              # a chunk's terms are cut at 2^(top - 25)
+provenance:
+  inferred: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]
+evidence:
+  numerics: "not run on this model. Inferred from the same compute capability (8.9) as the cards that were run on 2026-11-15: an L4 and an L40S (nvidia/profiles/l4.yaml, l40s.yaml). docs/matrix-numerics.md"

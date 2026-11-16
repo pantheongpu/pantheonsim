@@ -556,7 +556,9 @@ Hash128 DeviceMemo::env_hash() {
   return env_hash_;
 }
 
-Hash128 DeviceMemo::profile_hash(const DeviceProfile& p) const {
+Hash128 DeviceMemo::profile_hash(const DeviceProfile& p) const { return memo::profile_hash(p); }
+
+Hash128 profile_hash(const DeviceProfile& p) {
   Hasher h(0x70726f66);
   h.str(p.id.c_str()), h.str(p.model.c_str()), h.str(p.vendor.c_str()), h.str(p.architecture.c_str());
   h.u64(static_cast<uint64_t>(p.cc_major)), h.u64(static_cast<uint64_t>(p.cc_minor)), h.u64(p.warp_size), h.u64(p.vram_bytes);
@@ -568,6 +570,12 @@ Hash128 DeviceMemo::profile_hash(const DeviceProfile& p) const {
   h.u64(l.registers_per_sm), h.u64(l.max_threads_per_sm), h.u64(l.max_blocks_per_sm), h.u64(l.max_registers_per_thread);
   h.u64(l.shared_mem_per_sm), h.u64(l.l2_cache_bytes);
   for (const auto& [k, v] : p.features) h.str(k.c_str()), h.u64(v ? 1 : 0);
+  // The numerics decide result bits (the tensor-core sum, and the model VGPU_TC_EXACT=published would turn on), so two profiles
+  // that differ in one of them must not share a cached result. The provenance classes and the evidence text describe the values
+  // and change no result: they are not hashed.
+  const Numerics& n = p.numerics;
+  h.u64(n.present ? 1 : 0), h.u64(static_cast<uint64_t>(n.tensor_sum)), h.u64(n.tensor_sum_chunk), h.u64(n.tensor_sum_chunk_tf32);
+  h.u64(static_cast<uint64_t>(static_cast<int64_t>(n.tensor_sum_grid))), h.u64(static_cast<uint64_t>(n.tensor_sum_published));
   return h.done();
 }
 

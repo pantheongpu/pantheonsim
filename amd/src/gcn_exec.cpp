@@ -9495,13 +9495,19 @@ struct Machine {
       throw Error::make(Err::Unsupported, in.name, " through the private segment buffer, which this does not model");
     const uint64_t soffset = static_cast<uint32_t>(scalar(w, soff));
     const uint32_t words = half || part ? 1 : data.width;
+    // One dword of every lane, in bytes: the index stride is the wave's size, 64 lanes or a wave32 kernel's 32. LLVM keeps the stack
+    // pointer scaled by that size and makes a flat pointer to a stack object from it (`v_lshrrev_b32 v, 5, s33` in a wave32 kernel,
+    // 6 in a wave64 one, added to src_private_base), so the offset unswizzled here has to be the offset that pointer names: with 64
+    // for a wave32 kernel a slot written through this buffer was at half its offset, and a load through the flat pointer read
+    // another slot (an RX 6800 kernel built -O0, which keeps its locals on the stack and reaches them both ways).
+    const uint64_t row = (d.kernel && d.kernel->wave32 ? 32u : kLanes) * 4;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       const uint64_t offset = uint64_t{in.offen ? word(w, vaddr, 0, lane) : 0} + static_cast<uint32_t>(in.offset);
       const auto place = [&](uint64_t off, uint32_t bytes) -> uint8_t* {
-        const uint64_t at = soffset + (off / 4) * 256 + lane * 4 + off % 4;
-        const uint32_t who = static_cast<uint32_t>(at % 256 / 4);
-        return scratch_at(g, w, who, at / 256 * 4 + at % 4, bytes);
+        const uint64_t at = soffset + (off / 4) * row + lane * 4 + off % 4;
+        const uint32_t who = static_cast<uint32_t>(at % row / 4);
+        return scratch_at(g, w, who, at / row * 4 + at % 4, bytes);
       };
       for (uint32_t k = 0; k < words; ++k) {
         const uint32_t bytes = half ? h.bytes : part ? n.bytes : 4;
@@ -13991,7 +13997,7 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
       m.set_sgpr(w, at, static_cast<uint32_t>(kScratchResourceBase));
       m.set_sgpr(w, at + 1, static_cast<uint32_t>(kScratchResourceBase >> 32) | 1u << 31);   // SWIZZLE_EN
       m.set_sgpr(w, at + 2, 0xFFFFFFFFu);                                                  // num_records
-      m.set_sgpr(w, at + 3, 4u << 15 | 3u << 21 | 1u << 23);   // 32-bit data, index stride 64, ADD_TID
+      m.set_sgpr(w, at + 3, 4u << 15 | (k.wave32 ? 2u : 3u) << 21 | 1u << 23);   // 32-bit data, index stride 64 (a wave32 kernel: 32), ADD_TID
       at += 4;
     }
     if (k.dispatch_ptr) {

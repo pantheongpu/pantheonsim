@@ -51,3 +51,16 @@ cuda:
   # between them, and no concurrent managed access (WSL's driver does not page managed memory on demand).
   peer_access: false
   concurrent_managed_access: false
+
+# Numerics: the sum this device's tensor core makes of f16, bf16 and tf32 products (wmma, mma.sync, HMMA). The engines read it
+# from here. `provenance` gives each value one class (measured | documented | inferred | unknown) and `evidence` what the class
+# rests on. Schema: nvidia/docs/profiles.md. The rule and every card run: docs/matrix-numerics.md.
+numerics:
+  tensor_sum: ampere               # sequential | ampere | hopper
+  tensor_sum_chunk: 8              # products to a chunk, f16 and bf16
+  tensor_sum_chunk_tf32: 4         # ... tf32
+  tensor_sum_grid: 25              # a chunk's terms are cut at 2^(top - 25)
+provenance:
+  measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]
+evidence:
+  numerics: "card: NVIDIA GeForce RTX 3060 (this model), local machine; driver: not recorded; toolkit: CUDA 13.0; date: before 2026-10 and 2026-11-15. 106,496 element-by-element results of mma.sync and wmma in f16, bf16 and tf32 fixed the rule, all reproduced; both probes (nvidia/tests/data/simd_lane_forms.rtx3060.txt, float_half_forms.rtx3060.txt); FTTN; the corner inputs S1 and S2. docs/matrix-numerics.md"

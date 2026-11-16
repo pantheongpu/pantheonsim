@@ -771,10 +771,59 @@ VTEST(wmma_accumulator_is_added) {
     VCHECK_EQ(as_f32(e.mem.load_scalar(out + l * 4, 4)), 106.0f);
 }
 
+// ---- The tensor-core sum of every NVIDIA profile, pinned -------------------------------------------------------------------------
+//
+// The model comes from the profile (numerics.tensor_sum, numerics.tensor_sum_published). Until the profiles carried it, it came from
+// a table keyed on the compute capability; legacy_device_sum_model and legacy_published_sum_model below are that table, kept here word
+// for word, and kTensorSumPins is what it gave each of the 38 profiles. Moving the property into the profiles changed no result:
+// tc_model_devices holds every profile to its pin and to the old table, in each VGPU_TC_EXACT mode. (A pin changes only with a card
+// run that says so: docs/matrix-numerics.md.)
+namespace {
+using vgpu::exec::tc86::SumModel;
+SumModel legacy_device_sum_model(int cc_major, int cc_minor) {
+  if ((cc_major == 7 && cc_minor == 5) || (cc_major == 8 && (cc_minor == 0 || cc_minor == 6 || cc_minor == 9))) return SumModel::Ampere;
+  if (cc_major == 9 && cc_minor == 0) return SumModel::Hopper;
+  return SumModel::Sequential;
+}
+SumModel legacy_published_sum_model(int cc_major, int cc_minor) {
+  return (cc_major == 10 || cc_major == 12) && cc_minor == 0 ? SumModel::Hopper : SumModel::Sequential;
+}
+// (The old sum_model: the switch, then the device.)
+SumModel legacy_sum_model(int mode, int cc_major, int cc_minor) {
+  using namespace vgpu::exec::tc86;
+  if (mode == kModeOff) return SumModel::Sequential;
+  const SumModel m = legacy_device_sum_model(cc_major, cc_minor);
+  if (m != SumModel::Sequential) return m;
+  return mode == kModeForce ? SumModel::Ampere : mode == kModePublished ? legacy_published_sum_model(cc_major, cc_minor) : m;
+}
+struct TensorSumPin {
+  const char* gpu;
+  SumModel model;       // in force by default
+  SumModel published;   // with VGPU_TC_EXACT=published, where the device has none of its own (Sequential: nothing published)
+};
+constexpr SumModel kSeq = SumModel::Sequential, kAmp = SumModel::Ampere, kHop = SumModel::Hopper;
+constexpr TensorSumPin kTensorSumPins[] = {
+    {"nvidia/t4", kAmp, kSeq},           {"nvidia/rtx2080ti", kAmp, kSeq},                                                    // 7.5
+    {"nvidia/a100", kAmp, kSeq},         {"nvidia/a100-80gb-pcie", kAmp, kSeq}, {"nvidia/a100-sxm4-40gb", kAmp, kSeq},        // 8.0
+    {"nvidia/a30", kAmp, kSeq},
+    {"nvidia/rtx3060", kAmp, kSeq},      {"nvidia/rtx3070", kAmp, kSeq},        {"nvidia/rtx3080ti", kAmp, kSeq},             // 8.6
+    {"nvidia/rtx3090", kAmp, kSeq},      {"nvidia/a10", kAmp, kSeq},            {"nvidia/a10g", kAmp, kSeq},
+    {"nvidia/a40", kAmp, kSeq},          {"nvidia/rtx-a5000", kAmp, kSeq},      {"nvidia/rtx-a6000", kAmp, kSeq},
+    {"nvidia/l4", kAmp, kSeq},           {"nvidia/l40", kAmp, kSeq},            {"nvidia/l40s", kAmp, kSeq},                  // 8.9
+    {"nvidia/rtx4080", kAmp, kSeq},      {"nvidia/rtx4090", kAmp, kSeq},        {"nvidia/rtx6000-ada", kAmp, kSeq},
+    {"nvidia/h100", kHop, kSeq},         {"nvidia/h100-pcie", kHop, kSeq},      {"nvidia/h100-nvl", kHop, kSeq},              // 9.0
+    {"nvidia/h200", kHop, kSeq},         {"nvidia/h200-nvl", kHop, kSeq},       {"nvidia/gh200-480gb", kHop, kSeq},
+    {"nvidia/b200", kSeq, kHop},         {"nvidia/gb200", kSeq, kHop},                                                        // 10.0
+    {"nvidia/b300", kSeq, kSeq},         {"nvidia/vr200", kSeq, kSeq},          {"nvidia/thor", kSeq, kSeq},                  // 10.3, 10.7, 11.0
+    {"nvidia/rtx5090", kSeq, kHop},      {"nvidia/rtx-pro-4500", kSeq, kHop},   {"nvidia/rtx-pro-6000", kSeq, kHop},          // 12.0
+    {"nvidia/rtx-pro-6000-server", kSeq, kHop}, {"nvidia/rtx-pro-6000-max-q", kSeq, kHop},
+    {"nvidia/gb10", kSeq, kSeq}};                                                                                             // 12.1
+}  // namespace
+
 // VGPU_TC_EXACT=0 returns the tensor cores' sums to the earlier sequential f32 one, and changes nothing else: the f16 wmma of random
 // operands with spread exponents (so that the chunked, truncating sum of a Turing, Ampere or Ada tensor core and the sequential one
 // differ) prints different words in the two modes on the profiles whose cards sum that way (compute capability 7.5, 8.0, 8.6, 8.9;
-// 9.0 by an H100's numbers: tc86::device_sum_model), and the same words on every other profile; and an f32 loop is the same in both.
+// 9.0 by an H100's numbers: the profile's numerics.tensor_sum, tc86::device_sum_model), and the same words on every other profile; and an f32 loop is the same in both.
 // VGPU_TC_EXACT=force puts the RTX 3060's sum on the profiles without a measured model: a B200 profile then prints its words.
 VTEST(tc_exact_switch_changes_only_sm86_tensor_sums) {
   const std::string ptx = std::string(kHeader) + R"(
@@ -845,38 +894,104 @@ VTEST(tc_exact_switch_changes_only_sm86_tensor_sums) {
   VCHECK(card != sequential);
   VCHECK(hopper != sequential);
   VCHECK(hopper != card);
-  using vgpu::exec::tc86::SumModel;
-  struct Case {
-    const char* gpu;
-    SumModel model;
-  };
-  // (t4 and rtx2080ti 7.5, a100 and a30 8.0, rtx3060 / a10 / a10g 8.6, l4 / l40s / rtx4090 8.9; h100 and h200 9.0; b200 10.0, rtx5090 and rtx-pro-6000 12.0)
-  const Case cases[] = {{"nvidia/rtx3060", SumModel::Ampere}, {"nvidia/a10", SumModel::Ampere},     {"nvidia/a10g", SumModel::Ampere},
-                        {"nvidia/a100", SumModel::Ampere},    {"nvidia/a30", SumModel::Ampere},     {"nvidia/l4", SumModel::Ampere},
-                        {"nvidia/l40s", SumModel::Ampere},    {"nvidia/rtx4090", SumModel::Ampere}, {"nvidia/t4", SumModel::Ampere},
-                        {"nvidia/rtx2080ti", SumModel::Ampere}, {"nvidia/h100", SumModel::Hopper},  {"nvidia/h200", SumModel::Hopper},
-                        {"nvidia/b200", SumModel::Sequential}, {"nvidia/rtx5090", SumModel::Sequential}, {"nvidia/rtx-pro-6000", SumModel::Sequential}};
-  for (const Case& c : cases) {
+  // Every NVIDIA profile, by its pin (kTensorSumPins: 7.5, 8.0, 8.6 and 8.9 Ampere; 9.0 Hopper; the rest sequential, 10.0 and 12.0 with a published model).
+  for (const TensorSumPin& c : kTensorSumPins) {
     const auto on = run(c.gpu, true, false), off = run(c.gpu, false, false), forced = run_mode(c.gpu, "force", false);
     VCHECK(off == sequential);   // off, every profile prints the sequential sum
     // By default each profile sums as its cards do; forced, a profile without a measured model takes the RTX 3060's.
     VCHECK(on == (c.model == SumModel::Ampere ? card : c.model == SumModel::Hopper ? hopper : sequential));
     VCHECK(forced == (c.model == SumModel::Hopper ? hopper : card));
     // `published`: a Blackwell profile takes the published model (the Hopper numbers); nothing else moves.
-    const bool blackwell = std::string(c.gpu) == "nvidia/b200" || std::string(c.gpu) == "nvidia/rtx5090" || std::string(c.gpu) == "nvidia/rtx-pro-6000";
+    const bool blackwell = c.published == SumModel::Hopper;
+    VCHECK(blackwell == (std::string(c.gpu) == "nvidia/b200" || std::string(c.gpu) == "nvidia/gb200" || std::string(c.gpu) == "nvidia/rtx5090" ||
+                         std::string(c.gpu).rfind("nvidia/rtx-pro-", 0) == 0));
     VCHECK(run_mode(c.gpu, "published", false) == (blackwell ? hopper : on));
     VCHECK(run(c.gpu, true, true) == run(c.gpu, false, true));   // and no other arithmetic moves
     VCHECK(run_mode(c.gpu, "force", true) == run(c.gpu, false, true));
   }
+  // A profile is asked, not its compute capability: the same h100 profile with another model in its numerics sums by that model.
+  {
+    const auto run_profile = [&](DeviceProfile prof) {
+      MemoryManager mem{1 << 20};
+      const uint64_t out = mem.alloc(32 * 36);
+      LaunchConfig cfg;
+      cfg.block = {32, 1, 1};
+      exec::launch(m.entries[0], cfg, {arg_u64(out)}, mem, prof);
+      std::vector<uint32_t> words;
+      for (uint32_t l = 0; l < 32; ++l)
+        for (uint32_t k = 0; k < 8u; ++k) words.push_back(static_cast<uint32_t>(mem.load_scalar(out + l * 36 + k * 4, 4)));
+      return words;
+    };
+    DeviceProfile prof = load_gpu("nvidia/h100");
+    VCHECK(run_profile(prof) == hopper);
+    prof.numerics.tensor_sum = SumModel::Ampere;
+    VCHECK(run_profile(prof) == card);
+    prof.numerics.tensor_sum = SumModel::Sequential;
+    VCHECK(run_profile(prof) == sequential);
+    prof = load_gpu("nvidia/rtx3060");
+    prof.numerics.tensor_sum = SumModel::Hopper;
+    VCHECK(run_profile(prof) == hopper);
+  }
 }
 
-// The table itself: which compute capabilities take which model. (A row added here needs a card that says so: docs/matrix-numerics.md.)
+// The table itself: which profile takes which model. It is read from the profiles (numerics.tensor_sum), and every profile is held to
+// what the compute-capability table gave it before the property moved there. (A pin changed here needs a card that says so: docs/matrix-numerics.md.)
 VTEST(tc_model_devices) {
   using namespace vgpu::exec::tc86;
-  for (const auto& cc : {std::pair{7, 5}, std::pair{8, 0}, std::pair{8, 6}, std::pair{8, 9}}) VCHECK(device_sum_model(cc.first, cc.second) == SumModel::Ampere);
-  VCHECK(device_sum_model(9, 0) == SumModel::Hopper);
+  // The old table, as it was.
+  for (const auto& cc : {std::pair{7, 5}, std::pair{8, 0}, std::pair{8, 6}, std::pair{8, 9}}) VCHECK(legacy_device_sum_model(cc.first, cc.second) == SumModel::Ampere);
+  VCHECK(legacy_device_sum_model(9, 0) == SumModel::Hopper);
   for (const auto& cc : {std::pair{7, 0}, std::pair{7, 2}, std::pair{8, 7}, std::pair{10, 0}, std::pair{10, 3}, std::pair{11, 0}, std::pair{12, 0}, std::pair{12, 1}, std::pair{6, 1}})
-    VCHECK(device_sum_model(cc.first, cc.second) == SumModel::Sequential);
+    VCHECK(legacy_device_sum_model(cc.first, cc.second) == SumModel::Sequential);
+  // Every NVIDIA profile in the binary has a pin, and its profile says the pin, which is what the old table said of its compute capability:
+  // by default and in each mode of the switch (the four functions the engines call).
+  int nvidia = 0;
+  for (const std::string& id : available_gpus()) {
+    const DeviceProfile p = load_gpu(id);
+    if (p.vendor != "nvidia") {
+      VCHECK(device_sum_model(p) == SumModel::Sequential && published_sum_model(p) == SumModel::Sequential);   // (the AMD engine does not ask)
+      continue;
+    }
+    ++nvidia;
+    const TensorSumPin* pin = nullptr;
+    for (const TensorSumPin& c : kTensorSumPins)
+      if (id == c.gpu) pin = &c;
+    if (!pin) throw vtest::Failure(id + " has no pin in kTensorSumPins");
+    if (device_sum_model(p) != pin->model) throw vtest::Failure(id + ": numerics.tensor_sum is not the pinned model");
+    if (published_sum_model(p) != pin->published) throw vtest::Failure(id + ": numerics.tensor_sum_published is not the pinned model");
+    if (pin->model != legacy_device_sum_model(p.cc_major, p.cc_minor)) throw vtest::Failure(id + ": the pin is not what the compute-capability table gave");
+    if (pin->published != (pin->model == SumModel::Sequential ? legacy_published_sum_model(p.cc_major, p.cc_minor) : SumModel::Sequential))
+      throw vtest::Failure(id + ": the published pin is not what the compute-capability table gave");
+    // The numbers written in the profile are the model's.
+    if (const SumRule* r = rule_of(pin->model)) {
+      VCHECK(p.numerics.tensor_sum_chunk == r->chunk && p.numerics.tensor_sum_chunk_tf32 == r->chunk_tf32 && p.numerics.tensor_sum_grid == r->grid);
+    } else {
+      VCHECK(p.numerics.tensor_sum_chunk == 0 && p.numerics.tensor_sum_chunk_tf32 == 0 && p.numerics.tensor_sum_grid == 0);
+    }
+    for (const char* mode : {static_cast<const char*>(nullptr), "0", "force", "published", "1"}) {
+      refresh_exact(mode);
+      const SumModel want = legacy_sum_model(parse_mode(mode), p.cc_major, p.cc_minor);
+      if (sum_model(p) != want) throw vtest::Failure(id + ": sum_model differs from the compute-capability table with VGPU_TC_EXACT=" + (mode ? mode : "(unset)"));
+      VCHECK(sum_rule(p) == rule_of(want));
+      VCHECK(applies(p) == (want != SumModel::Sequential));
+      VCHECK_EQ(kernel_kind_bits(p), want == SumModel::Ampere ? 16u : want == SumModel::Hopper ? 32u : 0u);
+    }
+    refresh_exact(nullptr);
+  }
+  VCHECK_EQ(nvidia, 38);
+  VCHECK_EQ(static_cast<int>(std::size(kTensorSumPins)), 38);
+  // A profile with no numerics section (an Intel part on the PTX engine, a profile built in a test) has the sequential sum, as a
+  // compute capability outside the table had; forced, the RTX 3060's, as before.
+  {
+    const DeviceProfile bare{};
+    refresh_exact(nullptr);
+    VCHECK(sum_model(bare) == SumModel::Sequential && sum_rule(bare) == nullptr && kernel_kind_bits(bare) == 0u);
+    refresh_exact("published");
+    VCHECK(sum_model(bare) == SumModel::Sequential);
+    refresh_exact("force");
+    VCHECK(sum_model(bare) == SumModel::Ampere);
+    refresh_exact(nullptr);
+  }
   VCHECK(rule_of(SumModel::Sequential) == nullptr);
   VCHECK(rule_of(SumModel::Ampere)->chunk == 8 && rule_of(SumModel::Ampere)->chunk_tf32 == 4 && rule_of(SumModel::Ampere)->grid == 25);
   VCHECK(rule_of(SumModel::Hopper)->chunk == 16 && rule_of(SumModel::Hopper)->chunk_tf32 == 8 && rule_of(SumModel::Hopper)->grid == 26);
@@ -887,9 +1002,12 @@ VTEST(tc_model_devices) {
   VCHECK_EQ(parse_mode("force"), static_cast<int>(kModeForce));
   VCHECK_EQ(parse_mode("published"), static_cast<int>(kModePublished));
   // What the literature gives the devices we have not measured: Blackwell the Hopper numbers, nothing for the rest.
-  VCHECK(published_sum_model(10, 0) == SumModel::Hopper && published_sum_model(12, 0) == SumModel::Hopper);
+  VCHECK(legacy_published_sum_model(10, 0) == SumModel::Hopper && legacy_published_sum_model(12, 0) == SumModel::Hopper);
   for (const auto& cc : {std::pair{7, 0}, std::pair{8, 7}, std::pair{10, 3}, std::pair{10, 7}, std::pair{11, 0}, std::pair{12, 1}})
-    VCHECK(published_sum_model(cc.first, cc.second) == SumModel::Sequential);
+    VCHECK(legacy_published_sum_model(cc.first, cc.second) == SumModel::Sequential);
+  VCHECK(published_sum_model(load_gpu("nvidia/b200")) == SumModel::Hopper && published_sum_model(load_gpu("nvidia/rtx-pro-6000")) == SumModel::Hopper);
+  for (const char* gpu : {"nvidia/b300", "nvidia/vr200", "nvidia/thor", "nvidia/gb10", "nvidia/h100", "nvidia/rtx3060"})
+    VCHECK(published_sum_model(load_gpu(gpu)) == SumModel::Sequential);
 }
 
 // Blocks run on several host threads by default, so an atomic that is only
@@ -4260,7 +4378,11 @@ VTEST(approximate_division_and_ftz_as_documented) {
       {"div.approx.f32 %r4, %r1, %r2", 0x3cae08fc, 0x41e66e7d, 0x3a415888},
       {"div.approx.ftz.f32 %r4, %r1, %r2", 0xbdbe23cc, 0xc0585d1d, 0x3ce0f8db},
       {"div.approx.f32 %r4, %r1, %r2", 0xbc8141ad, 0x439d254c, 0xb852911f},
-      {"div.full.f32 %r4, %r1, %r2", 0x3cae08fc, 0x41e66e7d, 0x3a415887},
+      // div.full.f32 is a * MUFU.RCP(b) too in what ptxas 13.0 makes of it (FMUL after MUFU.RCP, the operands scaled only where
+      // |b| is above 2^126 or subnormal): an RTX 3060 gives 0x3a415888 here (tools/numerics/mufu_forms.cu's kernel, run
+      // 2026-11-15), as for div.approx. The value pinned before, 0x3a415887, was the exact quotient, which the interpreter
+      // computed while it took div.full's documented error bound as licence to divide exactly (and computes with VGPU_MUFU_EXACT=0).
+      {"div.full.f32 %r4, %r1, %r2", 0x3cae08fc, 0x41e66e7d, 0x3a415888},
       // 2^126 < |b| < 2^128: a zero signed as the quotient, NaN for an infinite a.
       {"div.approx.f32 %r4, %r1, %r2", 0x3f800000, 0x7ec00000, 0},
       {"div.approx.f32 %r4, %r1, %r2", 0x3f800000, 0xff000000, 0x80000000},

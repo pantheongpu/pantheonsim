@@ -18,6 +18,13 @@ Turbo mode sends those kernels to the card as well. What the program then gets i
 real hardware, and which is close to the simulator's but not its bits. That is a different promise from exact mode's, so it is a different
 mode, and exact mode is byte for byte what it was: the same set, defaults, decisions and summary text (a unit test holds a copy of the set).
 
+Since 2026-11-15 the simulator models the approximate-math unit itself ([numerics/math-functions.md](../numerics/math-functions.md)): each of
+the ten `MUFU` sub-operations gives the card's bits on all 2^32 inputs, measured on an RTX 3060 and an A10G, unless `VGPU_MUFU_EXACT=0`.
+The 4% to 25% above is therefore the distance to the simulator of before the model (and of `VGPU_MUFU_EXACT=0`). Nothing in either mode
+changed with it: exact mode still refuses a kernel with a `MUFU` outside the division and square root idioms, and turbo mode's `mufu` class
+is what it was. Widening the exact set to `MUFU` kernels is open: it needs a card run with `VGPU_HOST_GPU_VERIFY=all` on the cards the model
+was measured on, and a rule for the cards where it is only inferred.
+
 ## 2. The classes
 
 Every instruction of a kernel is put in one class, once per kernel (`turbo_class` in `include/vgpu/host_gpu.hpp`), and a kernel is
@@ -211,7 +218,7 @@ on the card and in the simulator, launches kept in the simulator by reason, veri
 run's: identical, numeric (the same words, every number with a fraction or exponent within `atol + rtol * |sim|`; integers and hashes
 must be equal), or different, with the largest numeric difference. A run past `--timeout` is killed (its own process group) and recorded.
 The form `exactdiv` is exact with `VGPU_HOST_GPU_DIV=1`; `exactr0` and `turbor0` are exact and turbo with `VGPU_HOST_GPU_START_REPEATS=0`
-(section 11), `exactl0` and `turbol0` with `VGPU_HOST_GPU_START_LAUNCHES=0`; a program slower than `--long-secs` in the simulator gets `--long-runs` runs of each form.
+(section 11), `exactl0` and `turbol0` with `VGPU_HOST_GPU_START_LAUNCHES=0`, `exactb0` and `turbob0` with `VGPU_HOST_GPU_SAMPLE_BLOCK=0` (section 12); a program slower than `--long-secs` in the simulator gets `--long-runs` runs of each form.
 `--dry-run` is a self-test that needs no card; it is the ctest `hostgpu_bench_selftest`.
 
 ```
@@ -223,9 +230,9 @@ python3 tools/bench/hostgpu/run.py --build build --corp /path/to/corp --gpu nvid
 
 | test | where it runs | what it pins |
 |---|---|---|
-| `test_host_gpu_logic` | every CI job | the mode names; exact's set against a frozen copy and every decoder mnemonic; each class; joined modifiers; calls; the switches and the off list; the sampling rule (how many blocks, what a process can afford, the estimate, what repays the card, when not to sample); the rule for a launch while the card holds the memory (both sides by the formula, the margin and the floor found by bisection, the Costs it reads, when it does not act); the bans' reference while the card holds memory; the zero-grid check; the kinds of external functions and what each mode admits, the texture instructions, the `printf` switch and the atomics default, the card image (each relocation kind applied, the tables shortened, what it refuses) and the code relocation writer (Round sp66) |
+| `test_host_gpu_logic` | every CI job | the mode names; exact's set against a frozen copy and every decoder mnemonic; each class; joined modifiers; calls; the switches and the off list; the sampling rule (how many blocks, what a process can afford, the estimate, what repays the card, when not to sample); the rule for a launch while the card holds the memory (both sides by the formula, the margin and the floor found by bisection, the Costs it reads, when it does not act); the bans' reference while the card holds memory; the zero-grid check; the kinds of external functions and what each mode admits, the texture instructions, the `printf` switch and the atomics default, the card image (each relocation kind applied, the tables shortened, what it refuses) and the code relocation writer (Round sp66); the bounded blocks (Round sp75: the limit of a sampled grid and of a small one, the cap, what a stopped block's time sends, the least time a sample sends, which small grids are sampled and their floor, the reasons a launch is not sampled) |
 | `test_host_gpu_tol` | every CI job | the rule, the three readings, NaN, infinity, denormals, signed zero, range ends, the float-array hole, parsing of the tolerances |
-| `e2e_host_gpu_stub` | CI jobs with nvcc (a stand-in driver, no card) | turbo reaches the card path for expf, rcp and division beside expf; exact does not; the lines for scripts; the atomics default, `VGPU_HOST_GPU_ATOMICS=0` and the off list; unreadable values; verify against a card that computes nothing; the timeout; a contended reduction under verify; kernels with module variables in both modes, the image the card gets (no relocation of a variable left), the constant bank looked up and filled before the launch, `printf` in turbo only, a live texture object, a kernel that calls `malloc` (Round sp66, `host_gpu_vars.cu`, steps 30 to 36); a short launch that follows a long one to a card that keeps memory and computes nothing while the card holds the memory, and stays with `VGPU_HOST_GPU_STREAK=0` or when the program read the memory back (steps 24 to 26); a zero grid while the card holds the memory gets the simulator's error (step 27); a verify run pushes again only the chunks that differed (Round sp67, step 28); the square root idiom only with `VGPU_HOST_GPU_SQRT=1` (Round sp68, step 29); 400 launches of one kernel, each a hundredth of the start cost, start the driver after the 200th, and not with `VGPU_HOST_GPU_START_REPEATS=0` nor when there are 150 (Round sp69, step 37) |
+| `e2e_host_gpu_stub` | CI jobs with nvcc (a stand-in driver, no card) | turbo reaches the card path for expf, rcp and division beside expf; exact does not; the lines for scripts; the atomics default, `VGPU_HOST_GPU_ATOMICS=0` and the off list; unreadable values; verify against a card that computes nothing; the timeout; a contended reduction under verify; kernels with module variables in both modes, the image the card gets (no relocation of a variable left), the constant bank looked up and filled before the launch, `printf` in turbo only, a live texture object, a kernel that calls `malloc` (Round sp66, `host_gpu_vars.cu`, steps 30 to 36); a short launch that follows a long one to a card that keeps memory and computes nothing while the card holds the memory, and stays with `VGPU_HOST_GPU_STREAK=0` or when the program read the memory back (steps 24 to 26); a zero grid while the card holds the memory gets the simulator's error (step 27); a verify run pushes again only the chunks that differed (Round sp67, step 28); the square root idiom only with `VGPU_HOST_GPU_SQRT=1` (Round sp68, step 29); 400 launches of one kernel, each a hundredth of the start cost, start the driver after the 200th, and not with `VGPU_HOST_GPU_START_REPEATS=0` nor when there are 150 (Round sp69, step 37); a launch whose every block outlasts the wait is sent on a block stopped at the limit, the card given the memory as it was, and with `VGPU_HOST_GPU_SAMPLE_BLOCK=0` its copy does not answer; a grid of 96 blocks with no followed loop is sampled by bounded blocks, and not with the switch off (Round sp75, steps 38 to 40) |
 | `hostgpu_bench_selftest` | every CI job | the harness: parsing, output classes, the table, a hang that is killed |
 | `e2e_host_gpu`, `tools/card-ci/run-card-ci.sh` | a machine with a card only (passed on an A10G, Round sp59) | section 5, item 1; module variables, `printf` (the order of the lines, stdout a file) and a live texture object on the card, the output the mode-off output to the byte (Round sp66) |
 
@@ -242,7 +249,8 @@ that has a loop, on a grid of at least 256 blocks, in a process whose driver has
    not be alike). It runs each block twice and times the second run: the first pays what a launch pays once (decode, set-up, the chunks of
    memory the launch is the first to write). It takes no further block once the timed runs have taken 2 ms, writes the times to a pipe and
    ends with `_exit`. The process waits for the answer, 50 ms and 0.2 ms more per MiB of live memory at most (the fork copies the
-   page tables); a copy that has not answered is ended and the launch is the simulator's.
+   page tables); a copy that has not answered is ended and the launch is the simulator's. (Since Round sp75 a block's run in the copy is
+   bounded, so a long block no longer keeps the copy from answering: section 12.)
 2. The timed runs give a per-block time, and the launch is extrapolated from it:
    per-block time x blocks / host threads. Host threads do not scale perfectly, so this errs low, towards the simulator.
 3. If that estimate is more than twice the card path (the driver start, the live memory each way, the launch, and a card kernel time assumed to
@@ -264,7 +272,8 @@ What the copy can do outside its memory, and why it does not:
   or destructor of the program runs. A kernel that prints is not admitted to the card in either mode (its module has an external call), so it is
   never sampled.
 * *The real driver.* A process whose driver start has begun is not sampled: the copy never holds a driver context. (After the start, the rules of
-  sp43 and the static first-launch rule find the start paid and decide as before.)
+  sp43 and the static first-launch rule find the start paid and decide as before.) (Since Round sp76 a launch is sampled with the driver up
+  too, by a copy that cannot call the driver: section 13. This paragraph is the rule of `VGPU_HOST_GPU_SAMPLE_STARTED=0`.)
 * *Files and shared memory.* Device memory shared with another process, or mapped by `cuMemMap`, keeps the launch off the card and so is not sampled;
   pinned and managed host memory is the process's own (copy-on-write in the copy) unless the program mapped it shared itself. The diagnostics that
   write files per launch (counters, traces, digests) switch the mode off.
@@ -303,7 +312,8 @@ simulator's. No program with a sampled launch was more than 1% slower; the estim
 the card's kernel time 270 to 770 times under the estimate, not 8.
 
 **What it did not reach, and progress inside a block (Round sp61).** A grid of fewer than 256 blocks has too few blocks to time: a copy would
-have to run one of them to its end, and on such a grid a block is a large share of the launch. PolyBench COVAR and CORR spend their time in a
+have to run one of them to its end, and on such a grid a block is a large share of the launch. (Round sp75 bounds the run of a block, and samples
+such a grid by whole blocks when its kernel has no loop this section's sample can follow: section 12.) PolyBench COVAR and CORR spend their time in a
 kernel launched on 8 blocks of 256 threads (each thread loops over the whole matrix: 9.5 s and 10.2 s in the simulator on server3). Such a launch is
 now sampled *inside* its blocks, when its kernel has a loop the copy can follow:
 
@@ -479,8 +489,223 @@ no program of the integration's keep list is more than 3 % slower, and every out
 `VGPU_HOST_GPU_START_REPEATS=0` is the rule before. Numbers, the per-kernel table and the tests:
 [Round sp69](rounds/11-rounds-sp36-sp41.md#round-sp69-host-gpu-the-driver-start-of-a-program-of-many-short-launches).
 
-## 12. What is next
+## 12. A block that outlasts the wait (Round sp75; both modes)
+
+The summary run of 2026-11-13 left eight programs whose long launches the card never got (pantheonsim #656, #657): the CUDA Samples' three
+tensor-core GEMMs (16 to 208 s, one launch each), HeCBench aidw (365 s in turbo mode, two of its four launches simulated), and four short
+programs. A logged run of each against the stand-in driver ([data/sp75/](data/sp75/README.md)) read what kept every launch, which the mode had
+only ever called "size rule". There were three causes, and this round removes two.
+
+| what kept the launch | launches |
+|---|---|
+| it was sampled, and the copy did not answer: one block takes longer than the whole wait | aidw's `AIDW_Kernel` (400 blocks of 0.58 s each on server3; 78 s kept) |
+| no sample was possible: a grid under 256 blocks, and no loop the sample inside the blocks follows | the tensor GEMMs (80 or 160 blocks; their one loop counts by the grid's size and ends on a mask), Rodinia lavaMD (216 blocks) |
+| no sample was taken: the static estimate is under the floor and the process too young to afford one | `initRNG` of MC_SingleAsianOptionP and MC_EstimatePiInlineP (1.6 s of each program's 1.8 s; 9.5 ms counted), two kernels of warpAggregatedAtomicsCG, lavaMD again (3.4 ms counted) |
+| it was sampled and the estimate does not repay the driver start | the other launches of the two Monte Carlo programs and of warpAggregatedAtomicsCG: kept rightly |
+| no sample is possible once the driver is up (until Round sp76: section 13) | aidw's second kernel, on the card (below) |
+
+**The rule: a sampled block is bounded.** The copy ran each block to its end, and the process waited 50 ms for it (`sample_timeout_seconds`). A
+block that has not ended after *t* seconds takes more than *t*. So the copy now stops the first run of a block once it has lasted a limit, runs
+the block again from its start for as many rounds as the first run made, times that second run, as it times the second run of a whole block,
+and answers. The block counts for that time, which is under what it takes; the estimate (per-block time x blocks / host threads, unchanged) is
+then under what whole blocks would have given, and the same margin against the same card path decides.
+
+* *A grid the sample of whole blocks takes (256 blocks and up).* The limit is 15 ms (`kSampleBlockSeconds`): both runs fit the 50 ms that were
+  already given, with 20 ms to spare for a busy machine, so no sample costs more than it did, and every block shorter than the limit is run and timed exactly as before. What changes
+  is the launch whose copy did not answer: it cost the whole wait and said nothing; now it costs less and says "at least this much". aidw's
+  first launch: the copy answers after 30 to 34 ms, 14 ms timed for the stopped block, 1.9 s for the launch at least (it takes 78 s), sent.
+* *A grid of 2 to 255 blocks whose kernel has no followed loop.* Round sp60b left such grids out because a copy would have to run a block to
+  its end. Bounded, it does not, so they are sampled by whole blocks too. A stopped block of a small grid says little unless it was watched
+  long enough, so here the limit is what one block must last for the whole launch to repay the card path (`sample_need_seconds`: the least
+  simulator time `sampled_offload` sends, with the driver start and the live memory each way), shared among the launch's host threads, with a
+  slack of 1.4 (`exec::part_block_limit`), 15 ms at least. When that is over 60 ms (`kSampleBlockCapSeconds`) no stopped block could show
+  enough, and no block is run. The wait is 120 ms longer for such a sample.
+* *The floor of a small grid.* A sample is taken when the kernel's static estimate reaches a floor or the process is old enough to afford it
+  (section 8). The floor of a small grid sampled this way is 30 ms whatever the live memory (`sample_floor`). The term that grows with the
+  live memory (three times 0.6 ms a MiB, for the page faults after the fork) asked 0.36 to 1.45 s of the tensor GEMMs, whose one loop's body
+  the count sees once (46 to 116 ms); and a grid of under 256 blocks that counts 30 ms has blocks of thousands of instructions, the kernels
+  written to loop over their work inside each block. In the corpus the small grids with no followed loop that count 30 ms are the four
+  tensor GEMMs of the CUDA Samples (immaTensorCoreGemm with the three above: 80 blocks, 0.95 s here) and one sort pass of radixSortThrust
+  (161 blocks, 83 ms counted), whose blocks take turns, so that the copy runs none of them and the sample is the fork alone (1.3 ms in a
+  program of 14 s); the next counts 19 ms (HeCBench aop), the 89 others under 10 ms, and none of those is sampled by the floor. By its age a process affords such a sample only when it has run 50 times two runs of a block at the
+  cap, 6 s (`sample_expected_seconds`): before that was counted, HeCBench bilateral's third kernel (128 blocks, 6 ms counted, 0.2 s into the
+  process) was sampled for 13 ms, 2.5 % of the program, and kept.
+
+**Why it is sound.** Nothing about which side may run a launch changes, nor what the card is sent: the copy is the forked copy of section 8,
+with its own memory, and the decision is still between two things the process could already do. A stopped block is a lower bound for that
+block: a block runs on one host thread in the launch as in the copy, the rounds are the launch's own (`run_block` is the same loop of
+`block_round` without the clock; a bounded run takes turns of 64 steps a warp, so that the clock is read every few milliseconds even in a
+block of 32 warps), and the timed run pays none of what a launch pays once. From there on it is the estimate of Round sp60b, with that rule's
+one assumption, that the sampled blocks stand for the grid: a launch whose first block is its only long one is sent on it, as it was when
+that block ran whole, and costs one card path. Exact mode's bits and the plain simulator's are untouched: the engine's change is behind
+`LaunchPart`, which only a sample's copy has.
+
+**What it can cost.** For a sampled grid, nothing more than before. For a small grid, two runs of a block (each up to the limit: 30 to
+120 ms in all) and the page faults after the fork, on a launch that then stays (it took under the 0.7 to 1 s the card path needs). That is
+the most a launch can lose, and it is not small: immaTensorCoreGemm's sample costs 67 ms here, 5 % of the program when the launch stays, and
+on server3 it is at the bar (0.77 s estimated against 0.755 s needed, 0.95 s taken: sent in every run made, by 2 %; on the rig, whose
+simulator is 2.5 times slower, the launch is over 2 s). Only kernels that count 30 ms on such a grid, or a process 6 s old, pay it,
+and in the corpus those are the four GEMMs, which do not stay.
+
+**What it does not reach** (measured, not built):
+
+* *aidw's second kernel.* Once the first launch has gone to the card the driver is up, and a process that holds the driver is not forked
+  (section 8), so `AIDW_Kernel_Tiled`'s first launch has no sample and the static first-launch rule refuses its grid (400 blocks, under 8 a
+  multiprocessor): it is simulated, and its second launch goes by its history. Expected on the card: 3 of 4 launches, about half of the
+  365 s left (measured: 3 of 4, 193 s of 360 s). What would take it: a trial in the simulator that the card can undo. With the driver up the card holds the memory before the
+  launch once the simulator's chunks are pushed, so a launch the simulator has run for a while can be given up and run on the card from that
+  copy. Not built. (Round sp76 took it another way: the launch is sampled with the driver up, section 13.)
+* *`initRNG` and the other launches under the floor in a young process.* The first launch comes 5 ms into the process and counts 9.5 ms; a
+  sample costs 3 to 7 ms and the faults. Nothing known before the launch tells it from HeCBench silu's or s3d's kernels (5 to 14 ms counted,
+  under 4 ms taken), and a sample for each of those is 5 % of such a program. Its loops have immediate bounds (32 x 5 turns), which a count
+  that weighs a loop's body by its turns would see; a note in the round's text.
+* *lavaMD* (216 blocks, 3.4 ms counted, 0.62 s on server3): under the floor of a small grid, as s3d's fourteen kernels on 108 blocks are.
+* *A small grid whose kernel has a followed loop that its warps are not in* (a loop nvcc unrolled: section 8) is still sampled inside its
+  blocks, where it gets no estimate.
+
+`VGPU_HOST_GPU_SAMPLE_BLOCK=0` is the rule before: the copy runs whole blocks however long, and a small grid with no followed loop is not
+sampled (the benchmark's forms `exactb0` and `turbob0`). `VGPU_HOST_GPU_SAMPLE=whole` keeps the bound and samples no small grid. The
+`host_gpu_sample:` line of a bounded sample ends with `small=`, `unfinished=` and `block_limit_s=`, and with `VGPU_HOST_GPU_LOG` the mode now
+says why each launch stayed: the `host_gpu_kept` reasons name the rule (`size rule: no estimate, not sampled: ...`, `size rule: the sampled
+estimate does not repay the card path and the driver start`, `size rule: the estimate does not beat the card path`, ...), and a
+`host_gpu_nosample:` line gives the numbers for a kernel's first two launches, and `host_gpu_overhead: kept_launches=.. decide_s=.. scan_s=..
+after_s=.. kernels=..` what the mode's own work cost for the launches that stayed (deciding them, of which scanning each kernel's code once,
+and learning from them afterwards).
+
+**On a card** (2026-11-15, one A10G, the summary run's rig and build: [data/sp75/card.md](data/sp75/card.md)). In turbo mode
+tf32TensorCoreGemm goes from 209 s to 3.0 s, bf16TensorCoreGemm from 157 s to 3.8 s, cudaTensorCoreGemm from 16.1 s to 1.3 s and
+immaTensorCoreGemm from 3.5 s to 1.2 s, each launch sent on a block stopped at its limit (37 to 54 ms) with an estimate 2.4 times what the
+card path needs, and aidw from 360 s to 193 s with 3 of 4 launches on the card. Verify runs found no word of the four GEMMs' results that
+differs between the card and the simulator. The keep list, the small grids and the rest of the corpus (115 programs) show no program
+slower by the rule; Rodinia particlefilter_float, whose time depends on its clock seed, is not settled (0.947 s against 0.818 s, medians
+of 30 runs, with the same decisions in both forms).
+
+**On server3** the round had no card. There, against the stand-in driver, the three GEMMs and aidw's first launch are sent at their
+first launch (their estimates: 0.95, 1.37, 1.42 and 1.9 s at the least, against 5.3, 83, 57 and 78 s taken; the card path needs 0.81, 1.14,
+1.15 and 0.5 s of them), so is immaTensorCoreGemm's (which the summary run did not hold), and the stand-in test's steps 38 to 40 pin it. What the card made of them is above ([data/sp75/card-run.sh](data/sp75/card-run.sh) is the run); the numbers, the census over the corpus
+and the tests are in [Round sp75](rounds/11-rounds-sp36-sp41.md#round-sp75-host-gpu-a-block-that-outlasts-the-wait).
+
+## 13. A kernel's first launch once the driver is up (Round sp76; both modes)
+
+Round sp75's card run left one launch of HeCBench aidw in the simulator: the first launch of its second kernel, `AIDW_Kernel_Tiled`, 149 s of
+the program's 193 s. The mode's line for it was `host_gpu_nosample: ... reason=the driver has been started`. The same reason keeps the first
+one or two launches of every kernel a program first launches after its driver start (pantheonsim #657, #659: segmentationTreeThrust 34
+launches, histogram 4, mergeSort 2; over the corpus on server3, 68 launches in 8 programs).
+
+**Where the refusal came from.** It is Round sp60b's, and deliberate: a sample is taken in a forked copy of the process, and the round had
+never forked a process that held the real driver's context, so it did not ("the copy never holds a driver context", section 8; its text lists
+"the fork itself against a real driver" under what no test covers). Three things stood behind that caution, and this is what each is worth
+now:
+
+| what could go wrong | what holds |
+|---|---|
+| the copy calls the driver. A forked copy of a CUDA process must not: the driver's threads are not in it, and its context is the process's | the copy runs blocks of the launch in the simulator and ends with `_exit`; the one way from there into the driver is the gate, when a block reads a chunk only the card holds (section 3). Before the fork the process pulls every such chunk; the copy then makes every chunk its own, in its own memory, before it runs a block, so that no access of its blocks reaches the gate; and the gate's pull refuses to run in a copy at all |
+| the copy lives long, holding the driver's files and mappings, while the process goes on to launch on the card | since Round sp75 a block's run in the copy is bounded: a copy lives for the wait at most (50 ms and 0.2 ms per MiB of live memory, 120 ms more for a small grid), with or without an answer, as before the start, and the thread that launched waits for it |
+| the fork itself harms the process that holds the driver | nothing in the mode can show this without a card. A forked child that never calls the driver is what every program makes that calls `system()` or `popen()` after its first CUDA call; the copy shares the driver's open files, closes its own descriptors when it ends (which releases nothing while the process holds them) and maps nothing new. **Not measured before the round's card run**: the card test's step 13 and the `fork` stage of `data/sp76/card-run.sh` are there for it |
+
+So the reason no longer holds for the first two, and the third is the card's to confirm.
+
+**The rule** (`sample_allowed`, `sample_card_path_seconds`, `sample_short_before_seconds`, `sample_floor_estimate`, vgpu/host_gpu.hpp). A launch nothing is known of
+is sampled with the driver up as it is before the start: the same candidates (an admitted kernel with a loop; a grid of 256 blocks and up, or
+a small one sampled inside its blocks or by bounded blocks), the same floor (a static estimate of 30 ms, more with much live memory) or a
+process that can afford it (its samples within 2 % of its age), the same copy, the same estimate. What differs is what the launch is held
+against: with the driver up it has no start to repay, only the card path's own cost. `sampled_offload` already priced a sample that way
+(`driver_started`); the round gives the same card path to the two places that assumed the start: the least a block of a small grid must
+show (`sample_need_seconds`), and the bar under which an earlier whole launch of the kernel says "short, do not sample again".
+
+That second bar needed a rule of its own. Before the start it is twice the card path with the start, 0.5 s: over any floor. With the driver
+up it is twice 0.1 ms for a program with little memory, and a kernel whose first launch took a millisecond would be sampled at its second
+launch for three (the history rule has its two launches at the third whatever the sample says). So with the driver up a kernel is sampled
+again only if its whole launch reached the floor: what is asked of a static count, that it be ten samples long, is asked of the measured
+launch instead (`sample_short_before_seconds`).
+
+And the other way round: once the simulator has run a kernel's whole launch with the driver up, that launch says more than the static
+count does, so where it is the larger it is what the floor is asked of (`sample_floor_estimate`). The CUDA Samples' `histogram256Kernel`
+(240 blocks, 2.8 ms counted, 64 MiB live, 4 s into the process) takes 0.19 s here: its first launch is refused by the floor, as before the
+round it was refused for the driver's start, and its second launch, which the history rule would also give to the simulator, is now
+sampled on the strength of the first. Before the start nothing of this applies: a whole launch long enough to matter there (0.25 s) gives
+its kernel an estimate by itself, and the launch is not a candidate for a sample.
+
+**Before the fork.** With the driver up the card may hold chunks the simulator does not (every launch on the card leaves all of them so).
+`sample_plan` pulls them, under the lock that guards the card, and leaves them shared (`Where::Both`): it is the pull the simulator makes
+before it runs the launch itself, made a moment earlier, and because the card's copy stays valid a launch the sample then sends pushes
+nothing it would not have pushed. What it can waste is that pull, when the launch is sent after all: the live memory once, at 10 GB/s, which
+the estimate already charges (`sampled_estimate` counts the whole live memory coming back).
+
+**Why it is sound.** As in section 8, the copy changes nothing in the process that goes on, and the decision is between two things the
+process could already do. The copy's memory is the launch's real input (pulled before the fork), so its blocks time what the simulator would
+run. The copy cannot reach the driver: `sample_copy_begin` runs in it before any block, takes no lock (a lock another thread held at the
+fork is held for ever in the copy), ends the copy if a chunk is the card's alone (another thread of the program sent a launch between the
+pull and the fork) or if the gate's table was being changed at the fork (the lock's generation is odd), and otherwise makes every chunk the
+simulator's; and `pull_chunks` throws in a copy. A copy that ends that way gives no answer and the launch is the simulator's: a lost sample,
+not a wrong one. Exact mode's bits are the simulator's for any admitted kernel wherever it runs, so more launches on the card change no
+output; the plain simulator has no part in any of it.
+
+**What it costs.** A sample, as before the start: the fork, the copy's decode and set-up, the sampled blocks (1 to 12 ms for short blocks,
+30 ms for a block stopped at its limit, up to 120 ms for a small grid), and the page faults afterwards. The floor and the 2 % of the process's
+age bound it as they do before the start, and a process whose driver is up has run for a quarter of a second at the least. What is new: the
+pull before the fork when the launch is then sent (above), and whatever a fork costs a process with the driver loaded (the driver's own
+memory is copied on write like any other): the `host_gpu_sample:` line's `fork_s` of a sample taken with the driver up, against one taken
+before the start, is the card run's to read (0.5 ms against 0.5 ms with the stand-in driver, which holds nothing).
+
+**What it decides** (server3, the stand-in driver; [data/sp76/](data/sp76/README.md)). HeCBench aidw against a stand-in card that keeps memory
+and computes nothing: `AIDW_Kernel` is sampled and sent as in Round sp75, and `AIDW_Kernel_Tiled`, which was `not sampled: the driver has
+been started`, is sampled with the driver up: 2.3 MiB pulled in 0.4 ms, the first block stopped at 15 ms, 2.0 s at the least against a card
+path of 0.25 s (its assumed card time, an eighth of the estimate; no start), sent; the sample cost 32 ms. All four launches go, where three
+did. Over the corpus the rule touches eight programs
+([data/sp76/census.md](data/sp76/census.md): 43 programs on the final build, the 29 that start the driver among them): of 49 lines of
+`not sampled: the driver has been started`, 17 launches are now sampled, 12 sent and 5 kept. alignedTypes sends ten first launches (94 to
+592 ms estimated), histogram the second launch of `histogram256Kernel` (0.11 s), mergeSort one (85 ms); the rest stay for the reasons the
+rule keeps (no loop; under the floor of a process with 290 MiB live; an earlier launch that was short). With the switch off against on,
+22 programs that start the driver are within 0.990 to 1.017 of each other in wall time (the stand-in simulates what is sent: this is what
+the samples cost).
+
+**What it does not reach.** A kernel with no loop, a launch under the floor in a process too young to afford a sample, a grid of one block:
+the reasons of sections 8 and 12 stand with the driver up as before it. A kernel whose first launch after the start is short and under the
+floor is simulated twice, as ever, and goes by its history at the third launch. And the rule changes nothing for a program that never starts
+the driver: the four programs of pantheonsim #656 that are under the floor in a young process (`initRNG` of the two Monte Carlo Samples,
+warpAggregatedAtomicsCG, Rodinia lavaMD) are where they were ([Round sp76](rounds/11-rounds-sp36-sp41.md#round-sp76-host-gpu-a-kernels-first-launch-once-the-driver-is-up)
+says what a safe rule for each would need).
+
+`VGPU_HOST_GPU_SAMPLE_STARTED=0` is the rule before: no launch is sampled once the driver's start has begun (the benchmark's forms `exactd0`
+and `turbod0`). The `host_gpu_sampled:` line's `after_driver=` counts the samples taken with the driver up, the decision line of such a
+sample reads `sampled with the driver up: ... against a card path of ... ms without a start`, and with `VGPU_HOST_GPU_LOG` the pull before a
+sample is said (`... MiB only the card held pulled before a sample`).
+
+**On a card: not run.** The round had no card. What only a card can show, in the order `data/sp76/card-run.sh` asks it: that a process
+which holds the real driver can be forked and goes on to use the card (the card test's step 13, `e2e_host_gpu`: the two-kernel program
+sampled with the driver up, both launches on the card, the output the mode-off output; then twenty runs in each mode and the kernel log);
+that aidw's four launches go (193 s to about 45 s: what Round sp75's card run left after its 149 s launch); what the kernels first launched
+after the start gain in segmentationTreeThrust, histogram and mergeSort; and that no program of the keep list is more than 3 % slower than
+with the switch off. If the fork does harm on the card, `sample_started` in `src/runtime/host_gpu.cpp` is the default to turn off.
+
+**Two things the round measured and did not change** (numbers in the round's text):
+
+* *Rodinia particlefilter_float*, which Round sp75's card run left unsettled (turbo mode 5 to 8 % slower than with
+  `VGPU_HOST_GPU_SAMPLE_BLOCK=0`). The rule of section 12 does nothing to it: the two forms take the same decisions launch by launch and differ
+  in the text of a reason. What moves its time is the program: `normalize_weights_kernel` has a race between blocks (block 0 writes `u[0]`,
+  every other block reads it, nothing orders them), so with several host threads the program computes one of several answers per run, clock
+  seed fixed or not, and the next kernel's first launch takes 7 to 44 ms or 82 to 235 ms by which it was (server3, four host threads, the
+  clock fixed: 90 runs). With one host thread and the clock fixed the two forms are within 1 % of each other at six seeds.
+* *The driver start bought late* (pantheonsim #662, HeCBench silu: the start bought at the 31st of 50 launches, with 0.20 s of simulation
+  left). Replayed over the launches of the corpus, every rule that keeps the start from silu without knowing what follows (the account at
+  1.5 or 2 times the start; an account of what the card would have saved; this kernel's launches so far as the bound on what remains)
+  takes more from programs that repay the start than silu loses. Section 11's rule stands.
+
+## 14. What is next
 
 From Round sp59, less what section 8 does: a start-cost account that weighs the gain for programs of many short launches (they lose 0.1 to 0.2 s
-or gain nothing; section 11 is a first step: it counts the launches a kernel has had, not yet what the card saved on them); the card's fixed-point `MUFU.SIN` / `MUFU.COS` in the simulator; `BMMA` in the tensor class and a tensor probe whose sums round;
+or gain nothing; section 11 is a first step: it counts the launches a kernel has had, not yet what the card saved on them); the card's fixed-point `MUFU.SIN` / `MUFU.COS` in the simulator (done 2026-11-15 for every `MUFU` sub-operation, section 1); `BMMA` in the tensor class and a tensor probe whose sums round;
 other cards and toolkits.
+
+From Round sp75: a first launch while the driver is up (a trial in the simulator that the card's copy undoes: aidw's second kernel, and every
+kernel a program first launches after its start was bought); a static count that weighs a loop's body by its turns where the bound is an
+immediate (the floor of section 8 for `initRNG`); the bounded blocks as the fallback of a sample inside the blocks that finds no warp in a
+followed loop.
+
+From Round sp76 (which took the first of those another way: the launch is sampled with the driver up, section 13): the card run of
+`data/sp76/card-run.sh`, first of all the fork of a process that holds the real driver; a static count that weighs a loop's body by its
+turns, which needs the flow scan to follow a loop that is left through a call to the kernel's `EXIT` and the census of every kernel it would
+newly have sampled; what the page faults after a fork cost a program with hundreds of MiB live on the rig (the floor of
+warpAggregatedAtomicsCG's two kernels); whether the size of a process's environment tilts particlefilter's race (the `pf` stage of the card
+script runs the rule under an environment of the size of the rule-before form).

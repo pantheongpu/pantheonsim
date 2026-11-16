@@ -243,7 +243,9 @@ sum (the published model is behind `VGPU_TC_EXACT=published`). Four corners of t
 fixed (a subnormal f32 result is cut, not rounded; a zero accumulator's chunk has an alignment floor; a subnormal accumulator's
 position; +0 for a negative sum that rounds to zero); tiles that can reach them, and every f16-accumulator tile, run in the scalar
 code. The model per profile, the cards, drivers and dates, and what is still unmeasured: [docs/matrix-numerics.md](../../docs/matrix-numerics.md).
-`tc86::device_sum_model` is the one table; `e2e_simd_lane_forms` and `e2e_float_half_forms` build the probes for sm_75 (`-DNO80`),
+`tc86::device_sum_model` is the one table (since the profiles carry the model it reads the loaded profile's
+`numerics.tensor_sum`, which is where the choice is written and tagged with its evidence: [profiles.md](profiles.md), "Numerics
+and provenance"; no engine compares a compute capability or an sm number for it); `e2e_simd_lane_forms` and `e2e_float_half_forms` build the probes for sm_75 (`-DNO80`),
 sm_80, sm_89, sm_90, sm_100 and sm_120 and hold each profile to its card's file or to the sequential pins.
 
 What stays different from the card: the SFU. `MUFU.RCP/RSQ/SQRT/EX2/LG2/SIN/COS/TANH` are not correctly rounded on the card (rcp,
@@ -251,6 +253,15 @@ sqrt, rsqrt and ex2 are within 1 ulp of the correctly rounded result, lg2 near 1
 more, `sin` of a tiny or huge argument is 0), and the simulator computes the correctly rounded function; the special values (zero,
 subnormal, infinity, NaN, a negative root or logarithm) agree and are what the test hashes. Reproducing the card's tables needs a
 measurement of every mantissa (2^23 per function) and a compact form to keep them: not done.
+
+What that means for a program that calls a math function, against the published accuracy figures of the CUDA math library
+(17 of 30 single-precision functions return, at the library's published worst case, a neighbour of the result the published error
+implies; all 31 double-precision ones have the published error), the test set that compares a run with a card's line by line
+(`tools/numerics/`), and the card run it is prepared for: [docs/numerics/math-functions.md](../../docs/numerics/math-functions.md).
+The same test set holds the PTX interpreter to this executor: the interpreter forms `sin.approx` and `cos.approx` (the argument
+times 1/2pi, rounded toward zero, in turns), `ex2.approx` and `lg2.approx` without `.ftz`, `rcp.approx.ftz.f64` and
+`rsqrt.approx.ftz.f64` (`MUFU.RCP64H`, `MUFU.RSQ64H`: the upper word only) and `rsqrt.approx.f64` the way ptxas expands them, so
+a kernel's PTX gives the bits its SASS gives (`test_ptx_approx_forms`, `e2e_numerics_mathfn`); `MUFU` itself is as it was.
 
 ## Member masks of the `*.sync` warp instructions
 

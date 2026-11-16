@@ -72,6 +72,26 @@
 #      must only be repaid within as many launches again, and the driver starts; with VGPU_HOST_GPU_START_REPEATS=0 (the rule before) it is never
 #      touched, nor is it by `manyfew`, the same program with 150 launches (which would repay the start as well, but are too few to say that as many
 #      follow); the output is the mode-off output in each.
+# Bounded blocks (Round sp75; include/vgpu/host_gpu.hpp kSampleBlockSeconds, vgpu/exec/launch.hpp part_block_limit):
+#  38. `slow` launches one kernel once on 256 blocks, each of which takes longer than the whole wait for a sample's copy (the rounds are set from a
+#      timed run so that a block takes about 80 ms): the copy stops its first block at the limit and answers (the sample's line says unfinished=1),
+#      the launch is sent, and against a stand-in that keeps memory and computes nothing the program prints what `slownone`, which launches nothing,
+#      prints;
+#  39. ... and with VGPU_HOST_GPU_SAMPLE_BLOCK=0 (the rule before) the copy does not answer, the driver is never touched and the output is the
+#      mode-off output;
+#  40. `slowfew`, the same work on 96 blocks in a kernel whose loop counts by a parameter (a grid the sample of whole blocks does not take, of
+#      a kernel with no loop the sample inside the blocks follows), is sampled by bounded blocks (small=1) and sent, the memory left as it was; with VGPU_HOST_GPU_SAMPLE_BLOCK=0 it is not
+#      sampled at all and the driver is never touched.
+# A sample once the driver is up (Round sp76; include/vgpu/host_gpu.hpp sample_allowed, src/runtime/host_gpu.cpp sample_plan and sample_copy_begin):
+#  41. `two` launches two kernels once each, both on blocks that outlast the wait, beside 64 MiB no kernel touches. The first is sampled and sent
+#      and starts the driver; the second is sampled with the driver up (after_driver=1): what only the card held is pulled before the fork, the
+#      copy answers, and the launch is sent. Against a stand-in that keeps memory and computes nothing the program prints what `twonone`, which
+#      launches nothing, prints;
+#  42. ... and with VGPU_HOST_GPU_SAMPLE_STARTED=0 (the rule before) the second kernel is not sampled ("the driver has been started"), the
+#      simulator runs it on the memory the card left, and the program prints what `twob`, which launches the second kernel alone, prints;
+#  43. `twoshort`, whose second kernel runs two rounds, is sampled with the driver up and kept (its estimate is far under the card path of 64 MiB):
+#      one launch reaches the card, and the program prints what `twoshortb` prints;
+#  44. against the stand-in that refuses every module, `two` is sampled twice, the second time with the driver up, and prints the mode-off output.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -488,5 +508,94 @@ if [[ -n "$many_us" ]] && (( many_us >= 300 )); then
 else
   echo "FAIL: the shortest launch of many took ${many_us:-?} us: too short for the test (under 300 us)"; fails=1
 fi
+# 38 to 40. (Round sp75) bounded blocks. The rounds: from a timed run of `slow` with 1,024, so that one block of 256 threads takes about 80 ms on
+# one host thread here (the wait for a copy is 50 ms, the limit of a block 15 ms).
+env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" HOST_GPU_LAZY_ROUNDS=1024 "$work/prog" slow > /dev/null 2> "$work/slow_cal.err" || { echo "FAIL: the timed run of slow failed"; tail -5 "$work/slow_cal.err"; exit 1; }
+slow_cal_ms="$(sed -n 's/^first_launch_ms=\([0-9]*\).*/\1/p' "$work/slow_cal.err" | head -1)"
+slow_rounds="$(awk -v ms="${slow_cal_ms:-0}" 'BEGIN { if (ms < 1) ms = 1; r = int(1024 * 80 * 256 / 4 / ms); if (r < 4096) r = 4096; if (r > 4000000) r = 4000000; print r }')"
+export HOST_GPU_LAZY_ROUNDS="$slow_rounds"
+for arg in slow slownone slowfew slowfewnone; do
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" "$arg" > "$work/off_$arg.out" 2> "$work/off_$arg.err" || { echo "FAIL: the $arg run with the mode off failed"; tail -5 "$work/off_$arg.err"; exit 1; }
+done
+slow_ms="$(sed -n 's/^first_launch_ms=\([0-9]*\).*/\1/p' "$work/off_slow.err" | head -1)"
+unfinished_of() { grep -E '^host_gpu_sample: ' "$work/$1.err" | grep -c ' unfinished=1 '; }
+small_of() { grep -E '^host_gpu_sample: ' "$work/$1.err" | grep -c ' small=1 '; }
+timeouts_of() { sed -n 's/^host_gpu_sampled: .* timeouts=\([0-9]*\) .*/\1/p' "$work/$1.err" | head -1; }
+if (( ${slow_ms:-0} * 4 / 256 >= 40 )); then   # (a block takes 40 ms or more: its two runs outlast the wait, and it is stopped at the limit)
+  # 38. sent on a block stopped at the limit; the memory the card gets is the memory before the launch.
+  # (the copy must be given 30 ms of processor within the 50 ms the process waits: on a busy machine it may not be, and the launch then stays, as
+  # before the round. Tried up to three times.)
+  for try in 1 2 3; do
+    run blk_nop slow "${smp[@]}" STUB_CARD_OK=1 STUB_KEEP_MEMORY=1 || { echo "FAIL: the run of slow on a card that computes nothing failed"; tail -5 "$work/blk_nop.err"; fails=1; }
+    [[ "$(timeouts_of blk_nop)" == 0 ]] && break
+  done
+  read -r smp_n smp_sent <<< "$(sampled_of blk_nop)"
+  (( ${smp_n:-0} == 1 && ${smp_sent:-0} == 1 && $(unfinished_of blk_nop) == 1 )) || { echo "FAIL: slow: expected one sample, of a block stopped at the limit, and the launch sent: $(grep -E 'host_gpu_sampled|host_gpu_sample:|sampled' "$work/blk_nop.err" | head -3)"; fails=1; }
+  [[ "$(timeouts_of blk_nop)" == 0 ]] || { echo "FAIL: slow: the copy did not answer although its blocks are bounded: $(grep host_gpu_sampled "$work/blk_nop.err")"; fails=1; }
+  diff -q "$work/off_slownone.out" "$work/blk_nop.out" > /dev/null || { echo "FAIL: a launch sent on a block stopped at the limit does not leave the memory as it was before the launch"; fails=1; }
+  diff -q "$work/off_slow.out" "$work/blk_nop.out" > /dev/null && { echo "FAIL: the run of slow on a card that computes nothing printed the simulator's result: nothing was sent"; fails=1; }
+  # 39. the rule before: the copy runs its first block whole, does not answer in time, and the launch is the simulator's.
+  run blk_old slow "${smp[@]}" VGPU_HOST_GPU_SAMPLE_BLOCK=0 || { echo "FAIL: the run of slow with VGPU_HOST_GPU_SAMPLE_BLOCK=0 failed"; tail -5 "$work/blk_old.err"; fails=1; }
+  read -r smp_n smp_sent <<< "$(sampled_of blk_old)"
+  (( ${smp_n:-0} == 1 && ${smp_sent:-1} == 0 )) && [[ "$(timeouts_of blk_old)" == 1 ]] || { echo "FAIL: slow with VGPU_HOST_GPU_SAMPLE_BLOCK=0: expected one sample whose copy did not answer: $(grep host_gpu_sampled "$work/blk_old.err")"; fails=1; }
+  [[ ! -s "$work/blk_old.log" ]] || { echo "FAIL: slow with VGPU_HOST_GPU_SAMPLE_BLOCK=0 reached the driver: $(calls blk_old)"; fails=1; }
+  diff -q "$work/off_slow.out" "$work/blk_old.out" > /dev/null || { echo "FAIL: VGPU_HOST_GPU_SAMPLE_BLOCK=0 changes the output of slow"; fails=1; }
+  # 40. a grid of 96 blocks with no followed loop: sampled by bounded blocks and sent; not sampled under the rule before.
+  run few_nop slowfew "${smp[@]}" VGPU_HOST_GPU_START_COST=0 STUB_CARD_OK=1 STUB_KEEP_MEMORY=1 || { echo "FAIL: the run of slowfew on a card that computes nothing failed"; tail -5 "$work/few_nop.err"; fails=1; }
+  read -r smp_n smp_sent <<< "$(sampled_of few_nop)"
+  (( ${smp_n:-0} == 1 && ${smp_sent:-0} == 1 && $(small_of few_nop) == 1 && $(unfinished_of few_nop) == 1 )) || { echo "FAIL: slowfew: expected one sample by bounded blocks of a small grid, and the launch sent: $(grep -E 'host_gpu_sampled|host_gpu_sample:|sampled' "$work/few_nop.err" | head -3)"; fails=1; }
+  diff -q "$work/off_slowfewnone.out" "$work/few_nop.out" > /dev/null || { echo "FAIL: a launch of a small grid sent on a stopped block does not leave the memory as it was before the launch"; fails=1; }
+  run few_old slowfew "${smp[@]}" VGPU_HOST_GPU_START_COST=0 VGPU_HOST_GPU_SAMPLE_BLOCK=0 || { echo "FAIL: the run of slowfew with VGPU_HOST_GPU_SAMPLE_BLOCK=0 failed"; tail -5 "$work/few_old.err"; fails=1; }
+  read -r smp_n smp_sent <<< "$(sampled_of few_old)"
+  [[ "${smp_n:-x}" == 0 ]] || { echo "FAIL: slowfew with VGPU_HOST_GPU_SAMPLE_BLOCK=0 was sampled: $(grep host_gpu_sampled "$work/few_old.err")"; fails=1; }
+  [[ ! -s "$work/few_old.log" ]] || { echo "FAIL: slowfew with VGPU_HOST_GPU_SAMPLE_BLOCK=0 reached the driver: $(calls few_old)"; fails=1; }
+  diff -q "$work/off_slowfew.out" "$work/few_old.out" > /dev/null || { echo "FAIL: VGPU_HOST_GPU_SAMPLE_BLOCK=0 changes the output of slowfew"; fails=1; }
+  # 41 to 44. (Round sp76) a kernel's first launch once the driver is up. (The start costs nothing here, so that the first launch is sent whatever
+  # the 64 MiB add to its card path; the second launch has no start to repay either way.)
+  for arg in two twonone twob twoshort twoshortb; do
+    env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" "$arg" > "$work/off_$arg.out" 2> "$work/off_$arg.err" || { echo "FAIL: the $arg run with the mode off failed"; tail -5 "$work/off_$arg.err"; exit 1; }
+  done
+  after_of() { sed -n 's/^host_gpu_sampled: .* after_driver=\([0-9]*\) .*/\1/p' "$work/$1.err" | head -1; }
+  launches_of() { grep -c '^cuLaunchKernel$' "$work/$1.log"; }
+  up=("${smp[@]}" VGPU_HOST_GPU_START_COST=0)
+  # 41. both launches sent, the second on a sample taken with the driver up.
+  for try in 1 2 3; do
+    run two_nop two "${up[@]}" STUB_CARD_OK=1 STUB_KEEP_MEMORY=1 || { echo "FAIL: the run of two on a card that computes nothing failed"; tail -5 "$work/two_nop.err"; fails=1; }
+    [[ "$(timeouts_of two_nop)" == 0 ]] && break
+  done
+  read -r smp_n smp_sent <<< "$(sampled_of two_nop)"
+  (( ${smp_n:-0} == 2 && ${smp_sent:-0} == 2 )) && [[ "$(after_of two_nop)" == 1 && "$(launches_of two_nop)" == 2 ]] || { echo "FAIL: two: expected two samples, the second with the driver up, and both launches sent: $(grep -E 'host_gpu_sampled|host_gpu_nosample|sampled' "$work/two_nop.err" | head -4); $(calls two_nop)"; fails=1; }
+  grep -q 'MiB only the card held pulled before a sample' "$work/two_nop.err" || { echo "FAIL: two: nothing was pulled before the sample taken with the driver up, although the card held the memory"; fails=1; }
+  diff -q "$work/off_twonone.out" "$work/two_nop.out" > /dev/null || { echo "FAIL: two launches sent to a card that computes nothing do not leave the memory as it was"; fails=1; }
+  diff -q "$work/off_two.out" "$work/two_nop.out" > /dev/null && { echo "FAIL: the run of two on a card that computes nothing printed the simulator's result"; fails=1; }
+  # 42. the rule before: no sample once the driver has been started; the simulator runs the second launch on what the card left.
+  for try in 1 2 3; do
+    run two_old two "${up[@]}" VGPU_HOST_GPU_SAMPLE_STARTED=0 STUB_CARD_OK=1 STUB_KEEP_MEMORY=1 || { echo "FAIL: the run of two with VGPU_HOST_GPU_SAMPLE_STARTED=0 failed"; tail -5 "$work/two_old.err"; fails=1; }
+    [[ "$(timeouts_of two_old)" == 0 ]] && break
+  done
+  read -r smp_n smp_sent <<< "$(sampled_of two_old)"
+  (( ${smp_n:-0} == 1 && ${smp_sent:-0} == 1 )) && [[ "$(after_of two_old)" == 0 && "$(launches_of two_old)" == 1 ]] || { echo "FAIL: two with VGPU_HOST_GPU_SAMPLE_STARTED=0: expected one sample and one launch sent: $(grep -E 'host_gpu_sampled|host_gpu_nosample' "$work/two_old.err" | head -3); $(calls two_old)"; fails=1; }
+  grep -q '^host_gpu_nosample: .*reason=the driver has been started' "$work/two_old.err" || { echo "FAIL: two with VGPU_HOST_GPU_SAMPLE_STARTED=0: the second kernel was not kept for the driver's start: $(grep '^host_gpu_nosample' "$work/two_old.err" | head -2)"; fails=1; }
+  diff -q "$work/off_twob.out" "$work/two_old.out" > /dev/null || { echo "FAIL: with VGPU_HOST_GPU_SAMPLE_STARTED=0 the second launch of two did not run in the simulator on the memory the card left"; fails=1; }
+  # 43. a short second launch: sampled with the driver up, kept, run by the simulator on what the card left.
+  for try in 1 2 3; do
+    run two_short twoshort "${up[@]}" STUB_CARD_OK=1 STUB_KEEP_MEMORY=1 || { echo "FAIL: the run of twoshort failed"; tail -5 "$work/two_short.err"; fails=1; }
+    [[ "$(timeouts_of two_short)" == 0 ]] && break
+  done
+  read -r smp_n smp_sent <<< "$(sampled_of two_short)"
+  (( ${smp_n:-0} == 2 && ${smp_sent:-0} == 1 )) && [[ "$(after_of two_short)" == 1 && "$(launches_of two_short)" == 1 ]] || { echo "FAIL: twoshort: expected two samples, the second with the driver up and kept: $(grep -E 'host_gpu_sampled|host_gpu_nosample|sampled' "$work/two_short.err" | head -4); $(calls two_short)"; fails=1; }
+  diff -q "$work/off_twoshortb.out" "$work/two_short.out" > /dev/null || { echo "FAIL: a launch sampled with the driver up and kept did not run in the simulator on the memory the card left"; fails=1; }
+  # 44. a driver that refuses every module: both launches come back to the simulator, and the output is the mode-off output.
+  for try in 1 2 3; do
+    run two_ref two "${up[@]}" || { echo "FAIL: the run of two against a driver that refuses modules failed"; tail -5 "$work/two_ref.err"; fails=1; }
+    [[ "$(timeouts_of two_ref)" == 0 ]] && break
+  done
+  read -r smp_n smp_sent <<< "$(sampled_of two_ref)"
+  (( ${smp_n:-0} == 2 )) && [[ "$(after_of two_ref)" == 1 ]] || { echo "FAIL: two against a driver that refuses modules: expected two samples, the second with the driver up: $(grep -E 'host_gpu_sampled|host_gpu_nosample' "$work/two_ref.err" | head -3)"; fails=1; }
+  diff -q "$work/off_two.out" "$work/two_ref.out" > /dev/null || { echo "FAIL: a sample taken with the driver up changes the output of two"; fails=1; }
+else
+  echo "FAIL: a block of slow took $(( ${slow_ms:-0} * 4 / 256 )) ms with $slow_rounds rounds (a timed run of 1,024 took ${slow_cal_ms:-?} ms): too short for the test (under 40 ms)"; fails=1
+fi
+unset HOST_GPU_LAZY_ROUNDS
 (( fails == 0 )) && { echo "PASS: first launch $first ms against a driver start of $init_ms ms; driver calls in the big run: $(calls on_big); many launches of ${many_us:-?} us started the driver after ${many_at:-?} of them"; exit 0; }
 exit 1

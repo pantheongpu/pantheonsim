@@ -1,0 +1,45 @@
+# Mutation run of the profile numerics and provenance work (nvidia/docs/profiles.md, "Numerics and provenance"; issue #664).
+# server3, 2026-11-15, Release build with -Werror. One edit a mutant; the named test must fail on it. 35 mutants, 35 killed.
+# After the run the tree was restored (git status clean) and the five tests passed again.
+#
+# mutant                                                    killed by
+# -- loader (src/core/profile.cpp) --
+L1  a class that is not one of the four is accepted           test_profile: a_provenance_class_that_is_not_one_of_the_four_is_refused
+L2  a key tagged twice is accepted                            test_profile: a_key_carries_one_provenance_class
+L3  an untagged numerics key is accepted                      test_profile: every_numerics_key_must_have_a_provenance_class
+L4  a claim without evidence is accepted                      test_profile: a_provenance_claim_names_a_real_key_and_its_evidence
+L5  numbers that are not the named model's are accepted (grid)  test_profile: numerics_the_engines_do_not_implement_are_refused
+L6  a tag of a key the profile does not have is accepted      test_profile: a_provenance_claim_names_a_real_key_and_its_evidence
+L7  numerics on an AMD profile are accepted                   test_profile: the_tensor_sum_is_an_nvidia_property_and_a_placeholder_is_unknown
+L8  a placeholder tagged measured is accepted                 test_profile: the same
+L9  a published model beside a model in force is accepted     test_profile: numerics_the_engines_do_not_implement_are_refused
+L10 evidence for an untagged key is accepted                  test_profile: a_provenance_claim_names_a_real_key_and_its_evidence
+L11 numbers with the sequential sum are accepted              test_profile: numerics_the_engines_do_not_implement_are_refused
+L12 a placeholder is not unknown by default                   test_profile: the_tensor_sum_is_an_nvidia_property_and_a_placeholder_is_unknown
+L13 an untagged key of a verified profile becomes measured    test_profile: numerics_and_their_provenance_parse, every_builtin_profile_tags_its_numerics
+# -- profiles --
+P1  nvidia/h100 says ampere (8 / 4 / 25)                      test_exec3: tc_model_devices, tc_exact_switch_changes_only_sm86_tensor_sums
+P2  nvidia/b200 loses tensor_sum_published                    test_exec3: both
+P3  nvidia/b300 gains tensor_sum_published                    test_exec3: both
+P4  nvidia/a10 claims measured                                test_profile: every_builtin_profile_tags_its_numerics
+P5  nvidia/l40: one numerics key loses its tag                test_profile: all_builtin_profiles_parse and every test that loads the profiles
+P6  nvidia/rtx5090: the sequential sum claimed inferred       test_profile: every_builtin_profile_tags_its_numerics
+P7  nvidia/rtx4090 says sequential                            test_exec3: both
+P8  amd/mi300x claims a measured limit                        test_profile: every_builtin_profile_tags_its_numerics
+P9  amd/rx6800: the block limit no tool reports claimed measured  test_profile: every_builtin_profile_tags_its_numerics
+# -- result cache key (src/runtime/memo.cpp) --
+H1  the hash without the numerics                             test_memo: the_profile_hash_sees_the_numerics
+H2  ... without the published model                           test_memo: the same
+H3  ... without the model                                     test_memo: the same
+H4  ... without the grid                                      test_memo: the same
+H5  the hash sees the provenance classes                      test_memo: the same
+# -- engines (include/vgpu/exec/tc_ampere.hpp, src/exec/interpreter.cpp, src/sass/exec_ops.inc) --
+E1  the model from the compute capability, not the profile    test_exec3: tc_exact_switch_changes_only_sm86_tensor_sums (a profile whose numerics are edited)
+E2  VGPU_TC_EXACT=published ignores the profile               test_exec3: both
+E3  the published model from the compute capability's major   test_exec3: both
+E4  the PTX wmma site asks an empty profile                   test_exec3: tc_exact_switch_changes_only_sm86_tensor_sums
+E5  the SASS general form asks an empty profile               test_sass_mma_tiles: sass_mma_tile_route_matches_the_general_form
+# -- vgpu info (src/cli/main.cpp) --
+C1  the tf32 chunk printed with another key's class           info_cli
+C2  the published model not printed                           info_cli
+C3  --json without the provenance                             info_cli

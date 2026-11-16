@@ -302,6 +302,7 @@ hipcc/runtime.gfx1250#0:gfx1250	7146c193a2c084bb
 hipcc/runtime.gfx942#0:gfx942	8a878002631c35a
 hipcc/scalef32_narrow.gfx950#0:gfx950	4dbf5c325b56b895
 hipcc/scalef32_narrow1250.gfx1250#0:gfx1250	3096dce0b4f96155
+hipcc/scratch_flat.O0.gfx1030.o	c37973b0a6905a09
 hipcc/smfmac.gfx942#0:gfx942	4ab45b643a4f2d6
 hipcc/smfmac.gfx950#0:gfx950	a26f1b88405e4af4
 hipcc/smid.all#0:gfx1030	dd0f44ed7ee1e214

@@ -429,7 +429,8 @@ Still open, each with the reason:
 
 - `tex.grad` on cube textures (the model is in `nvidia/docs/textures.md` and matches the card on 31,083 of
   31,083 fetches with the card's own `MUFU.RCP`, but the simulator's reciprocal is the correctly rounded one and the
-  card's differs by an ulp on 13% of inputs: a table with a quadratic interpolation, not reproduced) and with
+  card's differs by an ulp on 13% of inputs: a table with a quadratic interpolation, not reproduced when this was
+  written; the table is modelled since 2026-11-15, `numerics/math-functions.md`, and `tex.grad` has not been re-measured with it) and with
   `maxAnisotropy` above 1; `tex.2dms`/`tex.a2dms`: CUDA cannot make a multi-sample texture; BC6H and BC7 texture
   objects (the arrays work; see the runtime and driver section).
 - `cvt.rs` to the x4 types: figures 41 and 42 do not say how a and b split their shared random bits;
@@ -559,6 +560,10 @@ not work for the simulator:
   `in_proj_bias` tensors), and with those gradients zeroed the CPU, the simulator and the 3060 agree
   (`tiny causal transformer ... key biases left out of the update`, a full-tier check, passes). No tolerance was
   loosened. The entry can only go if the check changes what it tests.
+  2026-11-15: the entry went another way. With the model of the card's approximate-math unit (`numerics/math-functions.md`)
+  the simulator's noise changed and the check is within 0.002 on the CI runner's PyTorch (the sweep printed XPASS, which
+  fails until the line is removed; the new difference was not printed). The line is now a comment in `known_failures.txt`.
+  It is still noise: another PyTorch, or `VGPU_MUFU_EXACT=0`, can bring it back.
 
 ### CUDA Samples known differences
 

@@ -20,9 +20,20 @@
 // `many` and `manyfew` (Round sp69, step 37) launch `scramble` on 64 blocks 400 and 150 times, a launch of a millisecond or so, and read the memory
 // back once at the end: no launch saves a 50th of a driver start that costs 100 launches, but 200 launches and more of one kernel say that as many
 // are still to come (start_share_launches). They print a hash of the memory and, on stderr, the shortest launch in microseconds ("min_launch_us=").
+// `slow` and `slowfew` (Round sp75, steps 38 to 40) launch `scramble` once on 256 blocks and `scrambles` once on 96, every thread looping HOST_GPU_LAZY_ROUNDS times
+// (131,072 unless set: the script sets it so that one block takes about 80 ms): a launch whose every block outlasts the wait for a sample's copy,
+// which only a block stopped at a limit can time, and on the 96 blocks a grid too small for the sample of whole blocks whose kernel has no
+// loop the sample inside the blocks follows. `slownone` and `slowfewnone` are the two with no launch. They print a hash of the memory and, on
+// stderr, how long the launch took ("first_launch_ms=").
+// `two` (Round sp76, steps 41 to 44) launches `scramble` and then `scrambles`, once each on 256 blocks with the rounds of `slow`, beside 64 MiB
+// that no kernel touches: the second kernel's first launch comes when the first has started the driver, and its blocks outlast the wait as the
+// first's do. `twoshort` gives the second kernel two rounds (a launch far too short for the card path of 64 MiB), `twob` and `twoshortb`
+// launch the second kernel alone and `twonone` launches nothing: what a card that computes nothing must leave when it is sent both launches, the
+// first only, or the first with the short second in the simulator. They print a hash of the memory.
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -46,6 +57,21 @@ __global__ void scramble1(uint32_t* d, int n, int rounds) {
   uint32_t x = d[i] ^ (uint32_t(i) * 2654435761u);
 #pragma unroll 1
   for (int r = 0; r < rounds; ++r) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    x += uint32_t(r) * 0x9e3779b9u;
+  }
+  d[i] = x;
+}
+// `scramble` with a loop that counts by a parameter (`slowfew`, Round sp75): the sample inside the blocks follows a counter that adds a constant
+// to itself, so this loop is not followed (the CUDA Samples' tensor-core GEMMs count by the grid's size in the same way).
+__global__ void scrambles(uint32_t* d, int n, int rounds, int step) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  uint32_t x = d[i] ^ (uint32_t(i) * 2654435761u);
+#pragma unroll 1
+  for (int r = 0; r < rounds; r += step) {
     x ^= x << 13;
     x ^= x >> 17;
     x ^= x << 5;
@@ -190,8 +216,62 @@ static int many_program(int launches) {
   return 0;
 }
 
+static int slow_program(int blocks, bool launch, bool stepped) {
+  const char* r = std::getenv("HOST_GPU_LAZY_ROUNDS");
+  const int rounds = r && *r ? std::atoi(r) : 1 << 17;
+  const int n = blocks * 256;
+  void* d = nullptr;
+  cudaMalloc(&d, n * 4);
+  cudaMemset(d, 1, n * 4);
+  const auto t0 = std::chrono::steady_clock::now();
+  if (launch && stepped) scrambles<<<blocks, 256>>>(static_cast<uint32_t*>(d), n, rounds, 1);
+  else if (launch) scramble<<<blocks, 256>>>(static_cast<uint32_t*>(d), n, rounds);
+  cudaDeviceSynchronize();
+  std::fprintf(stderr, "first_launch_ms=%.0f\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  std::vector<unsigned char> back(n * 4);
+  cudaMemcpy(back.data(), d, n * 4, cudaMemcpyDeviceToHost);
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char b : back) h = (h ^ b) * 0x100000001b3ull;
+  std::printf("%d blocks: %016llx\n", blocks, static_cast<unsigned long long>(h));
+  cudaFree(d);
+  return 0;
+}
+
+static int two_program(bool first, bool second, bool second_short) {
+  const char* r = std::getenv("HOST_GPU_LAZY_ROUNDS");
+  const int rounds = r && *r ? std::atoi(r) : 1 << 17;
+  const int blocks = 256, n = blocks * 256;
+  void *d = nullptr, *side = nullptr;
+  cudaMalloc(&d, n * 4);
+  cudaMemset(d, 1, n * 4);
+  cudaMalloc(&side, 64 << 20);
+  cudaMemset(side, 2, 64 << 20);
+  if (first) scramble<<<blocks, 256>>>(static_cast<uint32_t*>(d), n, rounds);
+  cudaDeviceSynchronize();
+  if (second) scrambles<<<blocks, 256>>>(static_cast<uint32_t*>(d), n, second_short ? 2 : rounds, 1);
+  cudaDeviceSynchronize();
+  std::vector<unsigned char> back(n * 4);
+  cudaMemcpy(back.data(), d, n * 4, cudaMemcpyDeviceToHost);
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char b : back) h = (h ^ b) * 0x100000001b3ull;
+  std::vector<unsigned char> s(64 << 20);
+  cudaMemcpy(s.data(), side, s.size(), cudaMemcpyDeviceToHost);
+  for (size_t i = 0; i < s.size(); i += 4096) h = (h ^ s[i]) * 0x100000001b3ull;
+  std::printf("two kernels: %016llx\n", static_cast<unsigned long long>(h));
+  cudaFree(side);
+  cudaFree(d);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "big";
+  if (!std::strcmp(mode, "two")) return two_program(true, true, false);
+  if (!std::strcmp(mode, "twoshort")) return two_program(true, true, true);
+  if (!std::strcmp(mode, "twob")) return two_program(false, true, false);
+  if (!std::strcmp(mode, "twoshortb")) return two_program(false, true, true);
+  if (!std::strcmp(mode, "twonone")) return two_program(false, false, false);
+  if (!std::strcmp(mode, "slow") || !std::strcmp(mode, "slownone")) return slow_program(256, !std::strcmp(mode, "slow"), false);
+  if (!std::strcmp(mode, "slowfew") || !std::strcmp(mode, "slowfewnone")) return slow_program(96, !std::strcmp(mode, "slowfew"), true);
   if (!std::strcmp(mode, "many")) return many_program(400);
   if (!std::strcmp(mode, "manyfew")) return many_program(150);
   if (!std::strcmp(mode, "zerogrid")) return zerogrid_program();

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -172,6 +173,62 @@ struct XeClass {
   }
 };
 
+// ---- Numerics: what a device's arithmetic units do where it is not IEEE arithmetic on the operands --------------------------------
+//
+// The sum an NVIDIA tensor core makes of f16, bf16 and tf32 products (wmma, mma.sync, HMMA; the rule itself is in
+// vgpu/exec/tc_ampere.hpp and docs/matrix-numerics.md). A profile names its model in `numerics.tensor_sum` and the engines ask the
+// loaded profile: no engine compares a compute capability for it.
+//
+//   Sequential  acc += a * b in f32, k in order, round to nearest even. No card is known to do this: it is what a device whose
+//               tensor core has not been measured gets.
+//   Ampere      chunks of 8 products (tf32: 4), a chunk's terms cut at 2^(top - 25).
+//   Hopper      the same rule with other numbers: chunks of 16 (tf32: 8), cut at 2^(top - 26).
+enum class TensorSum : uint8_t { Sequential, Ampere, Hopper };
+struct TensorSumRule {
+  const char* name;
+  unsigned chunk;        // products to a chunk, f16 and bf16
+  unsigned chunk_tf32;   // ... tf32
+  int grid;              // a chunk's terms are cut at 2^(top - grid)
+};
+inline constexpr TensorSumRule kAmpereSumRule{"ampere: chunks of 8 (tf32 4), cut at 2^(top-25)", 8, 4, 25};
+inline constexpr TensorSumRule kHopperSumRule{"hopper: chunks of 16 (tf32 8), cut at 2^(top-26)", 16, 8, 26};
+// The rule of a model, or null for the sequential sum. These two are the rules the engines implement (scalar code for both, vector
+// kernels for the first), so a profile may name no other numbers: the loader refuses them.
+inline constexpr const TensorSumRule* tensor_sum_rule(TensorSum m) {
+  return m == TensorSum::Ampere ? &kAmpereSumRule : m == TensorSum::Hopper ? &kHopperSumRule : nullptr;
+}
+// The model's name as a profile writes it.
+inline constexpr const char* tensor_sum_name(TensorSum m) {
+  return m == TensorSum::Ampere ? "ampere" : m == TensorSum::Hopper ? "hopper" : "sequential";
+}
+
+// A profile's `numerics:` section. Absent (present == false): the sequential sum and no published model, which is what an AMD or
+// Intel profile has -- their engines do not read this.
+struct Numerics {
+  bool present = false;
+  // numerics.tensor_sum: the model in force by default.
+  TensorSum tensor_sum = TensorSum::Sequential;
+  // numerics.tensor_sum_chunk, _chunk_tf32, _grid: the named model's numbers, written out so that a profile says what its card
+  // does and not only a name. Zero with the sequential sum. Always the numbers of tensor_sum_rule(tensor_sum): checked at load.
+  uint32_t tensor_sum_chunk = 0;
+  uint32_t tensor_sum_chunk_tf32 = 0;
+  int32_t tensor_sum_grid = 0;
+  // numerics.tensor_sum_published: the model the literature gives a device whose own sum is not measured (so only beside
+  // tensor_sum: sequential). Never in force by default: VGPU_TC_EXACT=published turns it on. Sequential: none is published.
+  TensorSum tensor_sum_published = TensorSum::Sequential;
+};
+
+// What a value in a profile rests on. Exactly four classes; a key carries at most one.
+//   Measured    read from, or reproduced bit for bit against, a physical card by this project. The evidence names the card.
+//   Documented  the vendor's specification, data sheet or documentation.
+//   Inferred    not known of this device itself: carried over from a measured device of the same compute capability or die, or
+//               taken from a published model that no card of ours has checked.
+//   Unknown     none of the above. The value is what the simulator does, not a claim about the device.
+enum class Provenance : uint8_t { Measured, Documented, Inferred, Unknown };
+inline constexpr const char* provenance_name(Provenance c) {
+  return c == Provenance::Measured ? "measured" : c == Provenance::Documented ? "documented" : c == Provenance::Inferred ? "inferred" : "unknown";
+}
+
 struct DeviceProfile {
   std::string id;            // registry id, e.g. "nvidia/h100"
   std::string vendor;        // "nvidia" | "amd" | "intel"
@@ -198,12 +255,29 @@ struct DeviceProfile {
   // needs in order to run, not figures from a source. Empty on a profile every value of which is sourced.
   std::vector<std::string> placeholders;
   std::map<std::string, bool> features;
+  Numerics numerics;         // the `numerics:` section; see Numerics
+  // The `provenance:` section: the class of each key the profile tags, by the key's name in the file ("numerics.tensor_sum",
+  // "limits.multiprocessors", "vram_bytes"). Every numerics.* key a profile has is in here (the loader refuses the profile
+  // otherwise); elsewhere a key need not be tagged, and provenance_of says what an untagged key is.
+  std::map<std::string, Provenance> provenance;
+  // The `evidence:` section: for a tagged key, or for a whole section ("numerics"), the card, driver, toolkit and date, or the
+  // document, that the tag rests on. evidence_of resolves a key.
+  std::map<std::string, std::string> evidence;
 
   bool is_placeholder(const std::string& key) const {
     for (const auto& k : placeholders)
       if (k == key) return true;
     return false;
   }
+
+  // The class of a key. A tagged key has its tag. An untagged key that is in `placeholders` is Unknown (a stand-in is by
+  // definition not a claim about the part). Any other untagged key has NO per-key class (nullopt): all that is said of it is the
+  // profile-wide `verified` flag (true: the characterization was read from a card of this model; false: it was not) and the
+  // comments in the file. It is deliberately not turned into "measured" or "documented": a verified profile holds data-sheet
+  // values and an unverified one holds values copied from its neighbours, and the flag does not say which key is which.
+  std::optional<Provenance> provenance_of(const std::string& key) const;
+  // The evidence text of a key: its own entry, else its section's ("numerics" for "numerics.tensor_sum"), else empty.
+  const std::string& evidence_of(const std::string& key) const;
 
   // Shared memory the driver keeps back in every block, on top of what the
   // kernel asks for: 1 KiB from compute capability 8.0 (an RTX 3060 reports
