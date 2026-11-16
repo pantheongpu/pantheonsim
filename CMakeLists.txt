@@ -1662,6 +1662,8 @@ vgpu_unit_test(test_sass_uldc_indexed)
 vgpu_unit_test(test_sass_uniform_switch)
 # Kernels launched while the host has floating-point traps enabled (#605): no SIGFPE, the host environment as it was.
 vgpu_unit_test(test_launch_fp_traps)
+# Kernels launched while the host has flush-to-zero on (nvc -fast, -ffast-math): subnormal doubles are numbers (#672).
+vgpu_unit_test(test_launch_fp_flush)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
 vgpu_unit_test(test_simd)
 # An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.
