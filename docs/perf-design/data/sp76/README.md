@@ -6,7 +6,7 @@ particlefilter_float, #662 and the rest of #656, measured and not changed).
 
 Everything here was built and run on server3 (Ryzen 7 PRO 8840U, GCC 13.3, `Release`, `-Werror`, no LTO, `VGPU_THREADS=3` unless said,
 profile `nvidia/a10g`), against the stand-in driver (`nvidia/tests/e2e/host_gpu_stub_driver.c`). **server3 has no card: nothing in this
-directory is a card result.** Builds and runs held the machine's build lock, `nice -n 19`, `-j3`; another session built and ran under the
+directory is a card result but `card.md`, which is the A10G run of `card-run.sh` made afterwards (2026-11-15).** Builds and runs held the machine's build lock, `nice -n 19`, `-j3`; another session built and ran under the
 same lock all the while, so wall times here are to within a few percent at best and a pass made an hour later can read 20 % apart (the
 tables say when). The corpus is the sm_86 binaries of `tools/bench/real/pack_corpora.sh` (nvcc 13.0). For the stand-in test the compiler
 part of the dev machine's CUDA 13.0 toolkit was copied into the round's scratch directory, named with `VGPU_NVCC`, and deleted with it.
@@ -20,7 +20,9 @@ part of the dev machine's CUDA 13.0 toolkit was copied into the round's scratch 
 | `start_model.py`, `start-model.md` | #662: the launches of 114 programs replayed under the start rule as it is and five others |
 | `mutants.py`, `e2e-mutants.sh`, `mutants.txt` | mutants of the rule in the header against `tests/unit/test_host_gpu_logic.cpp`, and of the mode's part against `nvidia/tests/e2e/run_host_gpu_stub.sh` |
 | `same-output.py`, `same-output.md` | stdout of programs with the mode off, in exact mode and in turbo mode (stand-in driver), and the plain simulator's counters and memory at exit, the build of PR #669 against this round's |
-| `card-run.sh` | the card run: stages `build`, `fork`, `decisions`, `changed`, `keep`, `pf`, `rest`. **Not run** |
+| `card-run.sh` | the card run: stages `build`, `fork`, `decisions`, `changed`, `keep`, `pf`, `rest`. Run on an A10G on 2026-11-15: `card.md` |
+| `card.md` | what the card run showed (A10G): the fork, the programs changed, the keep list, the rest of the corpus |
+| `rerun-interval-reduction.sh` | the card rerun of samples/interval and samples/reduction, which read 9 % and 7 % slower in the one-run pass: not yet run |
 
 ## Tests on server3
 
@@ -33,9 +35,9 @@ bash docs/perf-design/data/sp76/e2e-mutants.sh src mut-e2e cuda/bin/nvcc    # 5 
 python3 docs/perf-design/data/sp76/same-output.py --corp corp --stub libstubcuda.so --old build-old --new build --programs ...   # 0 different outputs; counters and memory at exit the same (same-output.md)
 ```
 
-`nvidia/tests/e2e/run_host_gpu.sh` (the card test) has a new step 13 and was **not run**: it needs a card.
+`nvidia/tests/e2e/run_host_gpu.sh` (the card test) has a new step 13; it was not run on server3 (it needs a card) and passed on the A10G (`card.md`).
 
-## The card run (`card-run.sh`; one A10G; not made)
+## The card run (`card-run.sh`; one A10G, 2026-11-15: results in `card.md`)
 
 From the root of the tree on the rig, corpora in `~/corp`, build as in `../summary-2026-11-13/README.md` for the timed stages
 (`SP76_BUILD`). What each stage should show:
