@@ -56,5 +56,8 @@ int main() {
   check(bad_calls == 0, "every call in the rounds succeeds");
   std::printf("%d of %d rounds copied stale data\n", stale, rounds);
   check(stale == 0, "a stream that waited on an event destroyed right after the wait still waits for it");
+  cudaFreeHost(hout);
+  cudaFree(dout);
+  cudaFree(dsink);
   return failures ? 1 : 0;
 }
