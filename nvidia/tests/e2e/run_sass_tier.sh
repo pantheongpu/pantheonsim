@@ -116,6 +116,13 @@ printf '%s\n' "${jobs[@]}" | xargs -P "${VGPU_TIER_JOBS:-$("$root/ci/jobs.sh" -p
 # side of sass_tier_steps (1.7 billion warp instructions) several times slower on a busy machine.
 run_limit="${VGPU_TIER_TIMEOUT:-$([[ -n $(shim_sanitizer "$shim") ]] && echo 2400 || echo 900)}"
 
+# run_to NAME COMMAND...: the command's output and exit status into $rundir/NAME and NAME.rc, run in $work.
+run_to() { local name=$1; shift; ( cd "$work" && "$@" > "$rundir/$name" 2>&1; echo $? > "$rundir/$name.rc" ); }
+# run_capped NAME COMMAND...: the same in the background, with at most four of these at a time (a sanitized simulator process is a few GB).
+run_capped() {
+  while (( $(jobs -rp | wc -l) >= 4 )); do wait -n; done
+  run_to "$@" &
+}
 fails=0
 extra_env=()   # (an environment variable for a variant of a run: VGPU_TC_EXACT=0)
 variant=""
@@ -126,11 +133,26 @@ check() {
   fi
   require_shim_libs "$shim" "$bin" >/dev/null || return
   local env=(VGPU_QUIET=1 VGPU_GPU=${gpu[$arch]} VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_SASS_LOG=1 LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim") "${extra_env[@]}")
-  a="$(cd "$work" && env "${env[@]}" VGPU_TIER=0 timeout "$run_limit" "$bin" 2>&1)"; ra=$?
+  # The runs of one program are independent of each other. The two heavy ones, sass_tier and sass_tier_steps (each of the steps program's runs is a
+  # bisection of some twenty processes), make all of theirs at once, which took a sanitizer's job from the sum of the runs to the longest of them.
+  local rundir="$work/$p.$arch.runs" par=0
+  [[ $p == sass_tier || $p == sass_tier_steps ]] && par=1
+  rm -rf "$rundir"; mkdir -p "$rundir"
   # (The tier's statistics go to a file of their own: printed at exit among the program's buffered output, they tear a line.)
   local stats bq sf="$work/$p.$arch.stats"
   rm -f "$sf"
-  b="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_TIER_STATS=1 VGPU_TIER_STATS_FILE="$sf" timeout "$run_limit" "$bin" 2>&1)"; rb=$?
+  if (( par )); then
+    run_to a env "${env[@]}" VGPU_TIER=0 timeout "$run_limit" "$bin" &
+    run_to b env "${env[@]}" VGPU_TIER=1 VGPU_TIER_STATS=1 VGPU_TIER_STATS_FILE="$sf" timeout "$run_limit" "$bin" &
+    [[ $p == sass_tier ]] && run_to c4 env "${env[@]}" VGPU_TIER=1 VGPU_THREADS=4 timeout "$run_limit" "$bin" &
+    run_to nc env "${env[@]}" VGPU_TIER=1 VGPU_TIER_CHAIN=0 timeout "$run_limit" "$bin" &
+    wait
+  else
+    run_to a env "${env[@]}" VGPU_TIER=0 timeout "$run_limit" "$bin"
+    run_to b env "${env[@]}" VGPU_TIER=1 VGPU_TIER_STATS=1 VGPU_TIER_STATS_FILE="$sf" timeout "$run_limit" "$bin"
+  fi
+  a="$(<"$rundir/a")"; ra=$(<"$rundir/a.rc")
+  b="$(<"$rundir/b")"; rb=$(<"$rundir/b.rc")
   stats="$(grep -h '^tier: ' "$sf" 2>/dev/null | head -1)"
   bq="$b"
   grep -q "running SASS" <<< "$a" || why="its SASS did not run"
@@ -149,7 +171,7 @@ check() {
     grep -q '^store gate: .* ok$' <<< "$bq" || why="${why:+$why; }the tier's store gate line is not ok"
     # The tier is shared by the host threads of a launch: four of them must give what one thread of the interpreter does.
     local c4
-    c4="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_THREADS=4 timeout "$run_limit" "$bin" 2>&1)"
+    c4="$(<"$rundir/c4")"
     [[ "$a" == "$c4" ]] || why="${why:+$why; }four threads with the tier print differently from the interpreter's one"
     local ran total
     ran="$(sed -n 's/^tier: \([0-9]*\) of \([0-9]*\) warp.*/\1/p' <<< "$stats")"
@@ -162,7 +184,7 @@ check() {
     # The tier without its chain (one run of straight instructions per call of the scheduler, as the interpreter has it): the
     # same again, so that a difference of the chain's is told from one of the handlers'.
     local nc
-    nc="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_TIER_CHAIN=0 timeout "$run_limit" "$bin" 2>&1)"
+    nc="$(<"$rundir/nc")"
     [[ "$a" == "$nc" ]] || why="${why:+$why; }the tier without its chain prints differently from the interpreter"
   fi
   if [[ $p == sass_tier_steps && -z $why ]]; then
@@ -170,8 +192,12 @@ check() {
     # address, so a handler that reports it differently shows here. VGPU_MAX_STEPS keeps the loop with no end short.
     local f fa fb fenv=(VGPU_GPU=${gpu[$arch]} VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_MAX_STEPS=50000 LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim"))
     for f in gather scatter local shared atomic trap forever; do
-      fa="$(cd "$work" && env "${fenv[@]}" VGPU_TIER=0 timeout 300 "$bin" fault $f 2>&1)"
-      fb="$(cd "$work" && env "${fenv[@]}" VGPU_TIER=1 timeout 300 "$bin" fault $f 2>&1)"
+      run_capped "fa_$f" env "${fenv[@]}" VGPU_TIER=0 timeout 300 "$bin" fault $f
+      run_capped "fb_$f" env "${fenv[@]}" VGPU_TIER=1 timeout 300 "$bin" fault $f
+    done
+    wait
+    for f in gather scatter local shared atomic trap forever; do
+      fa="$(<"$rundir/fa_$f")"; fb="$(<"$rundir/fb_$f")"
       if ! grep -q "^fault $f: " <<< "$fa" || grep -q "^fault $f: no error" <<< "$fa"; then why="${why:+$why; }the $f fault did not happen"
       elif [[ "$fa" != "$fb" ]]; then why="${why:+$why; }the $f fault is reported differently by the tier"; fi
     done

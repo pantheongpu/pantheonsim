@@ -4290,6 +4290,9 @@ vgpu_shard_tests(e2e_sass_tier ENV_VAR VGPU_SASS_TIER_SHARD LIST_ENV VGPU_SASS_T
   COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_tier.sh
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   PROPERTIES DEPENDS vgpucudart SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
+# (The sanitizer jobs narrow the shards' runs with VGPU_TIER_ARCHS and VGPU_TIER_PROGRAMS, which leaves three runs for eight shards: the partition is checked on
+# the script's whole list.)
+set_property(TEST e2e_sass_tier_shards_partition APPEND PROPERTY ENVIRONMENT "VGPU_TIER_ARCHS=" "VGPU_TIER_PROGRAMS=")
 
 # Host-GPU mode (include/vgpu/host_gpu.hpp, docs/perf-design/09-host-gpu-spike.md): VGPU_HOST_GPU=exact runs eligible launches on the machine's
 # real GPU. Skips (as on every hosted runner) when the machine has no card of a model the simulator knows.
