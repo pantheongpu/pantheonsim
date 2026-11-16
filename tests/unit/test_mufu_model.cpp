@@ -295,7 +295,7 @@ std::map<std::string, uint64_t> f16_hashes() {
   static const auto m = hash_file("rtx3060.f16.hashes.txt");
   return m;
 }
-// The H100's: the bfloat16 forms ("EX2.BF16 all", "ex2.approx.bf16x2") and the f16 forms ptxas emits for sm_90 (bit 72).
+// The H100's: the bfloat16 forms ("EX2.BF16", "ex2.approx.bf16x2") and the f16 forms ptxas emits for sm_90 (bit 72).
 std::map<std::string, uint64_t> bf16_hashes() {
   static const auto m = hash_file("h100.bf16.hashes.txt");
   return m;
@@ -468,8 +468,8 @@ VTEST(the_model_hashes_as_the_h100_over_every_bfloat16_pattern) {
   VCHECK_EQ(want.size(), size_t{12});
   for (const char* name : kHalfOps) {
     const uint64_t got = fnv(model_bf16(half_op(name), false));
-    if (got != want.at(std::string(name) + ".BF16 all"))
-      throw vtest::Failure(std::string("MUFU.") + name + ".BF16: model " + hex(got, 16) + ", an H100 gives " + hex(want.at(std::string(name) + ".BF16 all"), 16));
+    if (got != want.at(std::string(name) + ".BF16"))
+      throw vtest::Failure(std::string("MUFU.") + name + ".BF16: model " + hex(got, 16) + ", an H100 gives " + hex(want.at(std::string(name) + ".BF16"), 16));
   }
   VCHECK_EQ(fnv(model_bf16(mufu::OpEx2, false)), want.at("ex2.approx.bf16"));
   VCHECK_EQ(fnv(model_bf16(mufu::OpTanh, false)), want.at("tanh.approx.bf16"));
@@ -545,7 +545,7 @@ static void sass_sm90_forms() {
     const unsigned op = half_op(name);
     Sass sb(op, false, false, false, 0, 90, true);
     const std::vector<uint32_t> rb = sb.dump(0, 65536);
-    if (fnv(rb) != wbf.at(std::string(name) + ".BF16 all")) {
+    if (fnv(rb) != wbf.at(std::string(name) + ".BF16")) {
       for (uint32_t i = 0; i < 65536; ++i)
         if (rb[i] != mufu::eval_bf16(op, i)) throw vtest::Failure(std::string("SASS sm_90 MUFU.") + name + ".BF16(" + hex(i, 4) + "): " + hex(rb[i]) + ", an H100 gives " + hex(mufu::eval_bf16(op, i)));
       throw vtest::Failure(std::string("SASS sm_90 MUFU.") + name + ".BF16: the hash differs from the card's");
