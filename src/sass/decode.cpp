@@ -1955,13 +1955,20 @@ void dec_mufu(Instr& ins, const Word& w) {
                                     "SQRT", "TANH", "(10)", "(11)", "(12)", "(13)", "(14)", "(15)"};
   const unsigned op = static_cast<unsigned>(w.field(74, 4));
   ins.mods.push_back(ops[op]);
-  if (w.bit(73)) ins.mods.push_back("F16");
+  // The half-precision forms. Up to sm_89 bit 73 is .F16; from sm_90 bit 72 is .F16 and bit 73 is .BF16 (nvcc's EX2.F16 / TANH.F16 and
+  // EX2.BF16 / TANH.BF16 words, an H100 and cuobjdump of sm_90, sm_100, sm_120). f[1] is .F16, f[2] is .BF16.
+  const bool wide = ins.sm >= 90;
+  const bool f16 = wide ? w.bit(72) : w.bit(73);
+  const bool bf16 = wide && w.bit(73);
+  if (f16) ins.mods.push_back("F16");
+  if (bf16) ins.mods.push_back("BF16");
   ins.f[0] = op;
-  ins.f[1] = w.bit(73);
+  ins.f[1] = f16;
+  ins.f[2] = bf16;
   ins.dst.push_back(dst_reg(w, false, ins.sm));
   one_src(ins, w, kFloat, false);
   src_neg_abs(ins.src[0], w, true);
-  if (w.bit(73)) f16_part(ins, w, 1);   // .F16 reads the low half of the register, or the high one (.H1, bits 60-61)
+  if (f16 || bf16) f16_part(ins, w, 1);   // a half reads the low half of the register, or the high one (.H1, bits 60-61)
   if (op == 6 || op == 7) double_imm(ins);   // an immediate is a double's high word
 }
 

@@ -240,6 +240,11 @@ inline uint32_t f32_to_half_rz(uint32_t u) {
 }
 // The instruction on a half (its 16 bits); the result's 16 bits.
 inline uint32_t eval_f16(unsigned op, uint32_t h) { return f32_to_half_rz(eval(op, half_to_f32(h & 0xffffu))); }
+// The bfloat16 forms (MUFU.<op>.BF16, sm_90 and later; PTX ex2.approx.ftz.bf16, .bf16x2 and tanh.approx.bf16, .bf16x2). Measured on an
+// H100 PCIe over all 2^32 register values (low half and .H1) of all eight sub-operations: the single-precision unit above run on the
+// bfloat16 widened by a shift (bits << 16), the upper 16 bits of its result (the float cut toward zero), no special case (NaN, infinity
+// and subnormal inputs agree too), the register's upper half zero. Blackwell (sm_100, sm_120) has the same encoding; not run there.
+inline uint32_t eval_bf16(unsigned op, uint32_t h) { return eval(op, (h & 0xffffu) << 16) >> 16; }
 // Whether the model has the half form of the sub-operation: the eight that the card was asked for (not the 64H forms).
 inline bool has_f16(unsigned op) { return op <= OpTanh && op != OpRcp64h && op != OpRsq64h; }
 

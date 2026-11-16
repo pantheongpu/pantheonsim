@@ -12,6 +12,18 @@ release says what runs and what it produces, never how fast a real GPU would run
   eight shards each, side by side (`..._shard_KofN`; each shard keeps every item's seed, and a `_shards_partition` test proves the shards are the whole
   test). The ml job no longer re-runs the heaviest simulator-only tests that the unit job runs. Every job that runs ctest puts its 20 slowest tests
   in the job summary (`ci/slowest_tests.sh`), and a test over 30 minutes fails the job. No check was removed.
+- **Behaviour change: MUFU .F16 and .BF16 on sm_90 and later (Hopper, Blackwell) are the card's.** From sm_90 the instruction's `.F16`
+  bit moved from instruction bit 73 to bit 72 and bit 73 became `.BF16` (nvcc output for sm_90, sm_100 and sm_120; the same words).
+  The decoder read bit 73 as `.F16` for every architecture, so on sm_90 and later a real `MUFU.<op>.F16` ran as a plain 32-bit
+  `MUFU` on a half register and a real `MUFU.<op>.BF16` ran as `.F16`. It reads them by architecture now, and `MUFU.<op>.BF16` and
+  the PTX `ex2.approx.ftz.bf16`, `.bf16x2`, `tanh.approx.bf16` and `.bf16x2` are the single-precision unit on the bfloat16 widened
+  by a shift, the upper 16 bits of the result: equal to an H100 PCIe on all 2^32 register values of all eight sub-operations.
+  **Programs for sm_90 and later that use f16 or bf16 `ex2`/`tanh` or compiler-emitted `MUFU .F16` / `.BF16` change their outputs;
+  they now equal the card's** (the PTX bf16 forms were the function at host precision, rounded to nearest). Counters do not
+  change. **To get the earlier results back:** `VGPU_MUFU_EXACT=0`. Evidence: Hopper measured (H100 PCIe); Blackwell inferred (the
+  encoding is from nvcc output, the execution was not run on a Blackwell card). Tests: `test_mufu_model`, `test_decode_same_bits`
+  (its flipped and random digests moved for the MUFU words with bit 72 set on sm_90 and later, see its header); details in
+  [docs/numerics/math-functions.md](docs/numerics/math-functions.md).
 - **Behaviour change: the b200 and gb200 profiles sum tensor-core products by the Hopper rule by default, not sequentially.** On
   `nvidia/b200` and `nvidia/gb200` (compute capability 10.0), `wmma`, `mma.sync` and SASS `HMMA` in f16, bf16 and tf32 now add the
   products in chunks of 16 (tf32: 8) with the terms cut at 2^(top - 26), the rule of an H100, instead of one at a time in f32.
