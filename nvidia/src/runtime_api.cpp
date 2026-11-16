@@ -3491,9 +3491,9 @@ static cudaError_t cudaMemcpyAsync_body(void* dst, const void* src, size_t count
                                         cudaMemcpyKind kind, cudaStream_t stream) {
   if (count != 0 && copy_kind_known(kind)) if (const cudaError_t legacy_ = legacy_capture_gate(stream)) return legacy_;
   if (count != 0 && capture_invalidated(stream)) return cudaErrorStreamCaptureInvalidated;
-  // A kind the card refuses goes straight to cudaMemcpy, which refuses it; the capture and the queue below
-  // would load the out-of-range enum again (UBSan).
-  if (!copy_kind_known(kind)) return cudaMemcpy(dst, src, count, kind);
+  // A kind the card refuses is answered as cudaMemcpy answers it (nothing to copy is a success); the capture,
+  // the queue and a call to cudaMemcpy would each load the out-of-range enum again (UBSan).
+  if (!copy_kind_known(kind)) return count == 0 ? cudaSuccess : cudaErrorInvalidMemcpyDirection;
   if (vgpu_record_memcpy_if_capturing(dst, src, count, kind, stream)) return cudaSuccess;
   // Behind a host function that has not finished: queued after it, and the call returns (#634).
   if (async_defer(
