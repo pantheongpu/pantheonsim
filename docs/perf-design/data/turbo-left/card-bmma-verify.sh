@@ -7,14 +7,19 @@
 #   other_different=0 and other_identical>0   -> BMMA matches on this card: it can join the tensor class (include/vgpu/host_gpu.hpp, turbo_class) with a unit test, and
 #                                                the stand-in test's tensor step; then rerun with VGPU_HOST_GPU=turbo to see the speed.
 #   other_different>0                         -> do not admit it; the first differing chunk's address is in out/bmma-turbo-verify.txt (words_outside).
-# If bmmaTensorCoreGemm is not in the corpus, build it from the CUDA 13.0 samples (Samples/3_CUDA_Features/bmmaTensorCoreGemm, -arch=sm_86) and set SP76_BMMA_EXE.
+# The program is our own nvidia/tests/e2e/bmma_gemm.cu (the CUDA samples have no BMMA sample): 36 cases, XOR+popc and AND+popc, three tile
+# arrangements, self-checked against a host popcount. On an RTX 3060 and on the simulator its output is byte-identical
+# (nvidia/tests/data/bmma_gemm.rtx3060.txt); this script asks the one question left, whether turbo mode's verify=all agrees on the rig card.
+# SP76_BMMA_EXE names a built bmma_gemm; the default builds it here (an A10G is sm_86).
 set -u
 out=${1:-$HOME/turboleft-out}
 build=${SP76_BUILD:-$HOME/sp76-build}
 corp=${SP76_CORP:-$HOME/corp}
 mkdir -p "$out"
-exe=${SP76_BMMA_EXE:-$(find "$corp/samples" -type f -name bmmaTensorCoreGemm -perm -u+x | head -1)}
-[[ -n "$exe" ]] || { echo "no bmmaTensorCoreGemm: set SP76_BMMA_EXE"; exit 1; }
+exe=${SP76_BMMA_EXE:-$out/bmma_gemm}
+if [[ ! -x "$exe" ]]; then
+  nvcc -std=c++14 -cudart shared -arch=sm_86 -Wno-deprecated-gpu-targets nvidia/tests/e2e/bmma_gemm.cu -o "$exe" || { echo "cannot build bmma_gemm: set SP76_BMMA_EXE"; exit 1; }
+fi
 run() {   # <tag> <env...>
   local tag=$1; shift
   ( cd "$(dirname "$exe")" && env VGPU_GPU=nvidia/a10g LD_LIBRARY_PATH="$build/shim" VGPU_HOST_GPU_LOG=1 "$@" timeout -s KILL 900 "$exe" > "$out/$tag.out" 2> "$out/$tag.err"; echo "rc=$?" >> "$out/$tag.err" )

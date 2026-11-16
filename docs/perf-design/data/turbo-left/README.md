@@ -28,7 +28,7 @@ says in its header what each outcome means. If the sync latency is over about 50
 
 | item | what is needed | tag |
 |---|---|---|
-| `BMMA` (bmmaTensorCoreGemm) | it is in the turbo `never` class (`12-host-gpu-turbo.md` section 2). Admitting it needs a card showing the simulator's bits (the result is a popcount, so byte-identical is the bar) and a unit test and a stand-in step. `card-bmma-verify.sh` does the card part with `VGPU_HOST_GPU_VERIFY=all`, which already runs refused kernels on both sides | needs a card |
+| `BMMA` (1-bit tensor MMA) | it is in the turbo `never` class (`12-host-gpu-turbo.md` section 2). The samples have no BMMA program, so `nvidia/tests/e2e/bmma_gemm.cu` is our own (wmma `precision::b1`, 8x8x128, XOR+popc and AND+popc, 3 kernels, 6 shapes, 36 cases, host popcount self-check). Measured 2026-11-16: an RTX 3060 (CUDA 13.0, sm_86 SASS has `BMMA.88128.XOR.POPC` and `.AND.POPC`) matches the host reference in 36 of 36 cases, and the simulator prints the same bytes as the card (checksum `0xae570291798d39ce`) from sm_86 SASS, the PTX engine and a compute_80 build; pinned as `e2e_bmma_gemm`. Still open, and only a rig can do it: admitting BMMA to the class needs `card-bmma-verify.sh` (turbo `VGPU_HOST_GPU_VERIFY=all` on the rig card), then a unit test and a stand-in step. Not admitted | simulator equals card: measured on an RTX 3060; turbo admission: needs a rig |
 | `QMMA`, sm_90/sm_100 tensor instructions | not on the A10G (sm_86): no card here can run them. H100/B200 needed | unknown |
 | texture and surface instructions (dct8x8, simpleCubemapTexture, simpleLayeredTexture, simpleSurfaceWrite) | the card would hold texture objects the simulator keeps in its own tables: mirroring them is a design, not a fix. About 1 s of the issue's 4 s | not started |
 | argument into mapped host memory (zerocopy, simpleIPC, simpleZeroCopy: 3.4 s) | the card must see the host's mapping at the same address, the simulator's pointer being its own | not started |
@@ -62,5 +62,5 @@ names more than a handful of kernels the rule is a net loss of sample time. Firs
 | file | what |
 |---|---|
 | `card-short-launch.sh` | #660: native and mode times of the three programs, an empty-kernel micro benchmark (launch, launch + sync, copies), the kernel time from nsys. Not run |
-| `card-bmma-verify.sh` | #661: bmmaTensorCoreGemm under exact and turbo `VGPU_HOST_GPU_VERIFY=all`. Not run |
+| `card-bmma-verify.sh` | #661: `bmma_gemm` (our own program) under exact and turbo `VGPU_HOST_GPU_VERIFY=all`. Not run on a rig |
 | `../sp76/rerun-interval-reduction.sh` | the card rerun of samples/interval and samples/reduction (15 runs, three forms, one with the old environment size). Not run |

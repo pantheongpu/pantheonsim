@@ -35,6 +35,11 @@ almost none (0.386 s native against 0.419 s). A lower prior or a measured one is
 (exact mode and outputs are untouched), and has not been tried.
 
 ## #661 BMMA
-Not measured. `card-bmma-verify.sh` found no `bmmaTensorCoreGemm`: no tag of NVIDIA/cuda-samples from v11.8 to v13.0 contains it or any
-sample using the 1-bit `wmma` precision (checked on the rig with a grep for `precision::b1`). A test needs our own small `wmma` b1 program;
-not written.
+Not measured under turbo (no rig run). The result of 2026-11-16 on the way: no tag of NVIDIA/cuda-samples from v11.8 to v13.0 contains
+`bmmaTensorCoreGemm` or any sample using the 1-bit `wmma` precision (checked on the rig with a grep for `precision::b1`), so the program is
+our own, `nvidia/tests/e2e/bmma_gemm.cu`, and `card-bmma-verify.sh` now uses it. Measured on the local RTX 3060 (CUDA 13.0, sm_86 and
+compute_80 builds): 36 cases (6 shapes from 8x8x128 to 32x128x4096, XOR+popc and AND+popc, three tile arrangements: pre-tiled with
+ldm 128, staged through shared memory with two accumulators and a loaded C matrix, split K with atomicAdd and a column-major store) all equal
+the host popcount reference; checksum `0xae570291798d39ce`. The simulator (server3, rtx3060 and a10g profiles; sm_86 SASS, the same cubin on
+the PTX engine, compute_80 PTX) prints the identical 37 lines. So simulator = card for BMMA on this card; what is not known is whether the
+turbo path's chunk comparison agrees on the rig's A10G (it should: the same integers). Pinned by `e2e_bmma_gemm`; the turbo class is unchanged.

@@ -204,7 +204,7 @@ Memory has no types, so the compare guesses, and these are the guesses that can 
    results near zero differ from the simulator's by up to 3.6e-7 in a plain run.
 3. `... atomics <out>`: integer atomics leave the same memory in 7 of 7 repeats and return other values every time; float sums differ by up to 23 ulp
    from run to run; compare-and-swap and exchange never repeat. The defaults stand.
-4. `... tensor <out> <build>`: `HMMA`, `IMMA`, `DMMA` (and `BMMA`, not yet named) gave the simulator's bits in 394 launches, on inputs whose products
+4. `... tensor <out> <build>`: `HMMA`, `IMMA`, `DMMA` (and `BMMA`, not yet named; BMMA's integer results equal the card's in the simulator, `e2e_bmma_gemm`, but it stays in the `never` class until a rig runs `card-bmma-verify.sh`) gave the simulator's bits in 394 launches, on inputs whose products
    are exact; an accumulation that rounds was not tested.
 5. `tools/bench/hostgpu/run.py` (section 6) over the three corpora: the round's tables. Turbo adds five programs to exact's (one of them 78x); the
    `never` class refused nothing; `extra` was met in one kernel, which verified clean. What limits both modes is the first-launch rule, not the classes.

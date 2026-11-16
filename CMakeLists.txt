@@ -3244,6 +3244,15 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 900)
 
+  # BMMA (1-bit tensor MMA, XOR+popc and AND+popc, #661) on random bit matrices: nvidia/tests/e2e/bmma_gemm.cu against the RTX 3060's
+  # pinned output, from sm_86 SASS, the PTX engine and a compute_80 build.
+  add_test(NAME e2e_bmma_gemm
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_bmma_gemm.sh)
+  set_tests_properties(e2e_bmma_gemm PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+
   # The error each refused launch configuration reports, runtime and driver, against an RTX 3060's CUDA 13.0.
   add_test(NAME e2e_launch_refusals
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_launch_refusals.sh)
