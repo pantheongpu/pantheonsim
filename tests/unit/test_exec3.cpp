@@ -796,6 +796,16 @@ SumModel legacy_sum_model(int mode, int cc_major, int cc_minor) {
   if (m != SumModel::Sequential) return m;
   return mode == kModeForce ? SumModel::Ampere : mode == kModePublished ? legacy_published_sum_model(cc_major, cc_minor) : m;
 }
+// RE-RECORDED PINS (2026-11-16): nvidia/b200 and nvidia/gb200 (compute capability 10.0) went from {Sequential, published Hopper} to
+// {Hopper, nothing published}. Reason: the 20,000 test vectors Khattak and Mikaitis recorded on a B200 are reproduced bit for bit by the
+// Hopper rule (0 mismatches) and not by the sequential sum (8,020 mismatches); docs/numerics/tcpapers.md. The class is `inferred`: data
+// recorded by others, not a card run by us. No other pin moved. The two names below are the only places the pin may differ from the old
+// compute-capability table (legacy_device_sum_model), and legacy_sum_model is held to that in every mode.
+bool is_b200_class(const std::string& id) { return id == "nvidia/b200" || id == "nvidia/gb200"; }
+SumModel expected_by_old_table(const std::string& id, int mode, int cc_major, int cc_minor) {
+  if (is_b200_class(id)) return mode == vgpu::exec::tc86::kModeOff ? SumModel::Sequential : SumModel::Hopper;   // the deliberate departure
+  return legacy_sum_model(mode, cc_major, cc_minor);
+}
 struct TensorSumPin {
   const char* gpu;
   SumModel model;       // in force by default
@@ -813,7 +823,7 @@ constexpr TensorSumPin kTensorSumPins[] = {
     {"nvidia/rtx4080", kAmp, kSeq},      {"nvidia/rtx4090", kAmp, kSeq},        {"nvidia/rtx6000-ada", kAmp, kSeq},
     {"nvidia/h100", kHop, kSeq},         {"nvidia/h100-pcie", kHop, kSeq},      {"nvidia/h100-nvl", kHop, kSeq},              // 9.0
     {"nvidia/h200", kHop, kSeq},         {"nvidia/h200-nvl", kHop, kSeq},       {"nvidia/gh200-480gb", kHop, kSeq},
-    {"nvidia/b200", kSeq, kHop},         {"nvidia/gb200", kSeq, kHop},                                                        // 10.0
+    {"nvidia/b200", kHop, kSeq},         {"nvidia/gb200", kHop, kSeq},                                                        // 10.0: Hopper by default since 2026-11-16, see below
     {"nvidia/b300", kSeq, kSeq},         {"nvidia/vr200", kSeq, kSeq},          {"nvidia/thor", kSeq, kSeq},                  // 10.3, 10.7, 11.0
     {"nvidia/rtx5090", kSeq, kHop},      {"nvidia/rtx-pro-4500", kSeq, kHop},   {"nvidia/rtx-pro-6000", kSeq, kHop},          // 12.0
     {"nvidia/rtx-pro-6000-server", kSeq, kHop}, {"nvidia/rtx-pro-6000-max-q", kSeq, kHop},
@@ -824,7 +834,7 @@ constexpr TensorSumPin kTensorSumPins[] = {
 // operands with spread exponents (so that the chunked, truncating sum of a Turing, Ampere or Ada tensor core and the sequential one
 // differ) prints different words in the two modes on the profiles whose cards sum that way (compute capability 7.5, 8.0, 8.6, 8.9;
 // 9.0 by an H100's numbers: the profile's numerics.tensor_sum, tc86::device_sum_model), and the same words on every other profile; and an f32 loop is the same in both.
-// VGPU_TC_EXACT=force puts the RTX 3060's sum on the profiles without a measured model: a B200 profile then prints its words.
+// VGPU_TC_EXACT=force puts the RTX 3060's sum on the profiles without a model of their own (a b300 profile since 2026-11-16: b200 and gb200 have the Hopper rule).
 VTEST(tc_exact_switch_changes_only_sm86_tensor_sums) {
   const std::string ptx = std::string(kHeader) + R"(
 .visible .entry mma(.param .u64 out)
@@ -902,9 +912,9 @@ VTEST(tc_exact_switch_changes_only_sm86_tensor_sums) {
     VCHECK(on == (c.model == SumModel::Ampere ? card : c.model == SumModel::Hopper ? hopper : sequential));
     VCHECK(forced == (c.model == SumModel::Hopper ? hopper : card));
     // `published`: a Blackwell profile takes the published model (the Hopper numbers); nothing else moves.
+    // (b200 and gb200 are no longer here: their Hopper rule is in force by default, and they publish nothing further.)
     const bool blackwell = c.published == SumModel::Hopper;
-    VCHECK(blackwell == (std::string(c.gpu) == "nvidia/b200" || std::string(c.gpu) == "nvidia/gb200" || std::string(c.gpu) == "nvidia/rtx5090" ||
-                         std::string(c.gpu).rfind("nvidia/rtx-pro-", 0) == 0));
+    VCHECK(blackwell == (std::string(c.gpu) == "nvidia/rtx5090" || std::string(c.gpu).rfind("nvidia/rtx-pro-", 0) == 0));
     VCHECK(run_mode(c.gpu, "published", false) == (blackwell ? hopper : on));
     VCHECK(run(c.gpu, true, true) == run(c.gpu, false, true));   // and no other arithmetic moves
     VCHECK(run_mode(c.gpu, "force", true) == run(c.gpu, false, true));
@@ -934,6 +944,34 @@ VTEST(tc_exact_switch_changes_only_sm86_tensor_sums) {
   }
 }
 
+// The Blackwell profiles by default (2026-11-16). b200 and gb200 (sm_100) sum by the Hopper rule, `inferred` from the 20,000 vectors
+// recorded on a B200 (docs/numerics/tcpapers.md); every other Blackwell profile keeps the sequential sum, `unknown`, because no vector set
+// covers it. VGPU_TC_EXACT=0 is the opt-out that gives the earlier sequential sum back on b200 and gb200 too.
+// MUTATION: set b200.yaml back to `tensor_sum: sequential` (and drop the chunk keys) and this test fails at the first VCHECK.
+VTEST(blackwell_b200_gb200_default_to_the_hopper_rule_and_the_rest_do_not) {
+  using namespace vgpu::exec::tc86;
+  refresh_exact(nullptr);
+  for (const char* gpu : {"nvidia/b200", "nvidia/gb200"}) {
+    const DeviceProfile p = load_gpu(gpu);
+    if (p.numerics.tensor_sum != vgpu::TensorSum::Hopper) throw vtest::Failure(std::string(gpu) + ": numerics.tensor_sum is not hopper");
+    VCHECK(p.numerics.tensor_sum_chunk == 16 && p.numerics.tensor_sum_chunk_tf32 == 8 && p.numerics.tensor_sum_grid == 26);
+    VCHECK(p.provenance_of("numerics.tensor_sum") == vgpu::Provenance::Inferred);   // data recorded by others, not measured by us
+    VCHECK(p.numerics.tensor_sum_published == vgpu::TensorSum::Sequential);        // nothing is left to opt in to
+    VCHECK(sum_model(p) == SumModel::Hopper && sum_rule(p) == &kHopperRule);
+    for (const char* mode : {"published", "force", "1"}) { refresh_exact(mode); VCHECK(sum_model(p) == SumModel::Hopper); }
+    refresh_exact("0");   // the way back to the earlier results
+    VCHECK(sum_model(p) == SumModel::Sequential && sum_rule(p) == nullptr);
+    refresh_exact(nullptr);
+  }
+  for (const char* gpu : {"nvidia/b300", "nvidia/vr200", "nvidia/thor", "nvidia/gb10", "nvidia/rtx5090", "nvidia/rtx-pro-4500", "nvidia/rtx-pro-6000",
+                          "nvidia/rtx-pro-6000-server", "nvidia/rtx-pro-6000-max-q"}) {
+    const DeviceProfile p = load_gpu(gpu);
+    if (p.numerics.tensor_sum != vgpu::TensorSum::Sequential) throw vtest::Failure(std::string(gpu) + ": numerics.tensor_sum is not sequential: its set has no recorded vectors");
+    VCHECK(p.provenance_of("numerics.tensor_sum") == vgpu::Provenance::Unknown);
+    VCHECK(sum_model(p) == SumModel::Sequential);
+  }
+}
+
 // The table itself: which profile takes which model. It is read from the profiles (numerics.tensor_sum), and every profile is held to
 // what the compute-capability table gave it before the property moved there. (A pin changed here needs a card that says so: docs/matrix-numerics.md.)
 VTEST(tc_model_devices) {
@@ -959,7 +997,7 @@ VTEST(tc_model_devices) {
     if (!pin) throw vtest::Failure(id + " has no pin in kTensorSumPins");
     if (device_sum_model(p) != pin->model) throw vtest::Failure(id + ": numerics.tensor_sum is not the pinned model");
     if (published_sum_model(p) != pin->published) throw vtest::Failure(id + ": numerics.tensor_sum_published is not the pinned model");
-    if (pin->model != legacy_device_sum_model(p.cc_major, p.cc_minor)) throw vtest::Failure(id + ": the pin is not what the compute-capability table gave");
+    if (pin->model != (is_b200_class(id) ? SumModel::Hopper : legacy_device_sum_model(p.cc_major, p.cc_minor))) throw vtest::Failure(id + ": the pin is not what the compute-capability table gave");
     if (pin->published != (pin->model == SumModel::Sequential ? legacy_published_sum_model(p.cc_major, p.cc_minor) : SumModel::Sequential))
       throw vtest::Failure(id + ": the published pin is not what the compute-capability table gave");
     // The numbers written in the profile are the model's.
@@ -970,7 +1008,7 @@ VTEST(tc_model_devices) {
     }
     for (const char* mode : {static_cast<const char*>(nullptr), "0", "force", "published", "1"}) {
       refresh_exact(mode);
-      const SumModel want = legacy_sum_model(parse_mode(mode), p.cc_major, p.cc_minor);
+      const SumModel want = expected_by_old_table(id, parse_mode(mode), p.cc_major, p.cc_minor);
       if (sum_model(p) != want) throw vtest::Failure(id + ": sum_model differs from the compute-capability table with VGPU_TC_EXACT=" + (mode ? mode : "(unset)"));
       VCHECK(sum_rule(p) == rule_of(want));
       VCHECK(applies(p) == (want != SumModel::Sequential));
@@ -1005,8 +1043,8 @@ VTEST(tc_model_devices) {
   VCHECK(legacy_published_sum_model(10, 0) == SumModel::Hopper && legacy_published_sum_model(12, 0) == SumModel::Hopper);
   for (const auto& cc : {std::pair{7, 0}, std::pair{8, 7}, std::pair{10, 3}, std::pair{10, 7}, std::pair{11, 0}, std::pair{12, 1}})
     VCHECK(legacy_published_sum_model(cc.first, cc.second) == SumModel::Sequential);
-  VCHECK(published_sum_model(load_gpu("nvidia/b200")) == SumModel::Hopper && published_sum_model(load_gpu("nvidia/rtx-pro-6000")) == SumModel::Hopper);
-  for (const char* gpu : {"nvidia/b300", "nvidia/vr200", "nvidia/thor", "nvidia/gb10", "nvidia/h100", "nvidia/rtx3060"})
+  VCHECK(published_sum_model(load_gpu("nvidia/rtx-pro-6000")) == SumModel::Hopper && published_sum_model(load_gpu("nvidia/rtx5090")) == SumModel::Hopper);
+  for (const char* gpu : {"nvidia/b200", "nvidia/gb200", "nvidia/b300", "nvidia/vr200", "nvidia/thor", "nvidia/gb10", "nvidia/h100", "nvidia/rtx3060"})
     VCHECK(published_sum_model(load_gpu(gpu)) == SumModel::Sequential);
 }
 

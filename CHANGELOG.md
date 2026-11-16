@@ -7,6 +7,20 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **Behaviour change: the b200 and gb200 profiles sum tensor-core products by the Hopper rule by default, not sequentially.** On
+  `nvidia/b200` and `nvidia/gb200` (compute capability 10.0), `wmma`, `mma.sync` and SASS `HMMA` in f16, bf16 and tf32 now add the
+  products in chunks of 16 (tf32: 8) with the terms cut at 2^(top - 26), the rule of an H100, instead of one at a time in f32.
+  **The outputs of programs that use those instructions on these two profiles change** (and so do their cached results: the numerics
+  are part of the result-cache key). Counters do not. Why: the 20,000 test vectors Khattak and Mikaitis recorded on a B200
+  (arXiv 2512.07004; f16 with f32 and f16 accumulators, bf16, tf32) are reproduced bit for bit by this rule and 8,020 of them are
+  not by the sequential sum. The class is `inferred` (`vgpu info --gpu nvidia/b200`): that is data recorded by others, **we have not
+  run a B200**, and no GB200 was recorded. `tcgen05.mma`, `wgmma`, the sparse, FP8 and f64 forms are not covered and did not change.
+  **To get the earlier results back:** `VGPU_TC_EXACT=0` (the sequential sum on every device, as before; no new variable).
+  `VGPU_TC_EXACT=published` no longer does anything on b200 and gb200 (it is already in force). Not changed: sm_103 (b300), sm_120
+  (rtx5090, rtx-pro-*), thor, gb10 and vr200 keep the sequential sum by default (no recorded vectors cover them; the sm_120
+  profiles keep the published Hopper model opt-in). Tests: `test_exec3` (`blackwell_b200_gb200_default_to_the_hopper_rule_and_the_rest_do_not`,
+  pins of `tc_model_devices`), `test_profile` (provenance rows), `info_cli`, `simd_lane_forms`, `tcpapers`; details in
+  [docs/matrix-numerics.md](docs/matrix-numerics.md) and [docs/numerics/tcpapers.md](docs/numerics/tcpapers.md).
 - **Double arithmetic in a kernel no longer inherits the host program's flush-to-zero** (issue #672). A host built with `nvc -fast`
   (or `-ffast-math`) turns FTZ and DAZ on in its own MXCSR, and the engines did a kernel's arithmetic with the host's
   instructions under that setting, so a subnormal double operand read as zero and a subnormal result was written as zero. NVHPC

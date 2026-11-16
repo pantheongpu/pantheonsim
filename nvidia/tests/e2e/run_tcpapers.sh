@@ -6,13 +6,13 @@
 #                                                       wmma f16 / bf16 / tf32 loops: an RTX 3060's lines, measured. The simulator agrees on
 #                                                       both engines, and from an sm_80 cubin on the a100 profile.
 #   nvidia/tests/data/tcpapers/fprev.h100.txt           the same programs on the h100 profile (the Hopper rule: sums of 16 products); the
-#                                                       simulator's lines, no H100 of ours has run the program. The b200 profile with
-#                                                       VGPU_TC_EXACT=published prints them too.
+#                                                       simulator's lines, no H100 of ours has run the program. The b200 profile prints
+#                                                       them too, by default since 2026-11-16 (RE-RECORDED: it needed VGPU_TC_EXACT=published).
 #   nvidia/tests/data/tcpapers/tc_features.*.txt        the features of Fasi et al. (PeerJ CS 2021) and Khattak and Mikaitis (arXiv 2512.07004):
 #                                                       rtx3060 measured, h100 the simulator's.
 #   nvidia/tests/data/tcpapers/<card>.<fmt>.<out>.txt   24 recorded test vectors each of an A100, an H100 and a B200 (Khattak and Mikaitis's
 #                                                       model_validation, BSD-2, see NOTICE): the simulator must reproduce them bit for bit with the
-#                                                       profile of the card (b200 with VGPU_TC_EXACT=published), and the wrong rule must not.
+#                                                       profile of the card (b200 by default since 2026-11-16; before, with VGPU_TC_EXACT=published), and the wrong rule must not.
 #   VGPU_KHATTAK_VECTORS=<dir>   the full sets (tools/tcpapers/khattak-fetch.sh <x> then <x>/vectors): 5,000 vectors a file, 28 files.
 #   VGPU_TCPAPERS_BIN=<dir>      programs already built: <dir>/sm<NN>/{fprev_probe,tc_features,khattak_vectors} (skips nvcc).
 # The sum is the device's, not the cubin's architecture, so each profile runs the program built for its own architecture.
@@ -65,18 +65,19 @@ for prog in fprev_probe tc_features; do
     run $prog 86 rtx3060 $eng "$out/o.txt";            expect "$name sm_86 rtx3060 $eng" "$data/$name.rtx3060.txt" "$out/o.txt"
     [[ -x "$bin/sm80/$prog" ]] && { run $prog 80 a100 $eng "$out/o.txt"; expect "$name sm_80 a100 $eng (the RTX 3060's lines)" "$data/$name.rtx3060.txt" "$out/o.txt"; }
     [[ -x "$bin/sm90/$prog" ]] && { run $prog 90 h100 $eng "$out/o.txt"; expect "$name sm_90 h100 $eng" "$data/$name.h100.txt" "$out/o.txt"; }
-    [[ -x "$bin/sm100/$prog" ]] && { run $prog 100 b200 $eng "$out/o.txt" VGPU_TC_EXACT=published; expect "$name sm_100 b200 VGPU_TC_EXACT=published $eng (the h100's lines)" "$data/$name.h100.txt" "$out/o.txt"; }
+    [[ -x "$bin/sm100/$prog" ]] && { run $prog 100 b200 $eng "$out/o.txt"; expect "$name sm_100 b200 (default: the Hopper rule, inferred from a B200's recorded vectors) $eng (the h100's lines)" "$data/$name.h100.txt" "$out/o.txt"; }
     [[ -x "$bin/sm120/$prog" ]] && { run $prog 120 rtx-pro-6000 $eng "$out/o.txt" VGPU_TC_EXACT=published; expect "$name sm_120 rtx-pro-6000 VGPU_TC_EXACT=published $eng (the h100's lines)" "$data/$name.h100.txt" "$out/o.txt"; }
   done
 done
-# the switches reach the programs: the sequential sum is not the card's, and b200 without the published model is not Hopper's
+# the switches reach the programs: the sequential sum is not the card's, and b200 with VGPU_TC_EXACT=0 (the way back to the earlier
+# sequential results) is not Hopper's
 for prog in fprev_probe tc_features; do
   name="${prog/_probe/}"; [[ $prog == tc_features ]] && name=tc_features
   run $prog 86 rtx3060 sass "$out/o.txt" VGPU_TC_EXACT=0
   if cmp -s "$data/$name.rtx3060.txt" "$out/o.txt"; then echo "FAIL $name: VGPU_TC_EXACT=0 prints the card's lines (the switch does not reach the program)"; fails=1; else echo "ok   $name VGPU_TC_EXACT=0 differs from the card's lines"; fi
   if [[ -x "$bin/sm100/$prog" ]]; then
-    run $prog 100 b200 sass "$out/o.txt"
-    if cmp -s "$data/$name.h100.txt" "$out/o.txt"; then echo "FAIL $name: b200 prints the Hopper lines without VGPU_TC_EXACT=published"; fails=1; else echo "ok   $name b200 default is not the Hopper rule"; fi
+    run $prog 100 b200 sass "$out/o.txt" VGPU_TC_EXACT=0
+    if cmp -s "$data/$name.h100.txt" "$out/o.txt"; then echo "FAIL $name: b200 prints the Hopper lines with VGPU_TC_EXACT=0"; fails=1; else echo "ok   $name b200 with VGPU_TC_EXACT=0 is not the Hopper rule"; fi
   fi
 done
 # FPRev's non-tensor kernels do not depend on the matrix rule: the RTX 3060's lines for them are the same with the sequential sum
@@ -110,9 +111,9 @@ for eng in sass ptx; do
   fi
   if [[ -x "$bin/sm100/khattak_vectors" ]]; then
     for f in "$data"/B200.*.txt; do
-      m="$(kv 100 b200 $eng "$f" VGPU_TC_EXACT=published)"; if [[ "$m" == 0 ]]; then echo "ok   $(basename "$f" .txt) on b200 (published) $eng: 0 mismatches"; else echo "FAIL $(basename "$f" .txt) on b200 (published) $eng: mismatches=${m:-?}"; fails=1; fi
+      m="$(kv 100 b200 $eng "$f")"; if [[ "$m" == 0 ]]; then echo "ok   $(basename "$f" .txt) on b200 (default, the Hopper rule) $eng: 0 mismatches"; else echo "FAIL $(basename "$f" .txt) on b200 (default, the Hopper rule) $eng: mismatches=${m:-?}"; fails=1; fi
       [[ "$f" == */B200.fp16.fp16.txt ]] && continue   # the sequential sum is the B200's on 4,998 of its 5,000 binary16-accumulator vectors
-      m="$(kv 100 b200 $eng "$f")"; if [[ "$m" =~ ^[0-9]+$ ]] && (( m >= 16 )); then echo "ok   $(basename "$f" .txt) on b200 (default) $eng: $m mismatches (sequential sum, not the B200's)"; else echo "FAIL $(basename "$f" .txt) on b200 (default) $eng: expected at least 16 mismatches, got ${m:-?}"; fails=1; fi
+      m="$(kv 100 b200 $eng "$f" VGPU_TC_EXACT=0)"; if [[ "$m" =~ ^[0-9]+$ ]] && (( m >= 16 )); then echo "ok   $(basename "$f" .txt) on b200 (VGPU_TC_EXACT=0) $eng: $m mismatches (sequential sum, not the B200's)"; else echo "FAIL $(basename "$f" .txt) on b200 (VGPU_TC_EXACT=0) $eng: expected at least 16 mismatches, got ${m:-?}"; fails=1; fi
     done
   fi
 done
@@ -122,8 +123,7 @@ if [[ -n "${VGPU_KHATTAK_VECTORS:-}" ]]; then
     base="$(basename "$f" .txt)"; card="${base%%.*}"
     case $card in A100) a=80; gpu=a100;; A2) a=86; gpu=rtx3060;; Ada) a=89; gpu=rtx6000-ada;; L40S) a=89; gpu=l40s;; H100) a=90; gpu=h100;; H200) a=90; gpu=h200;; B200) a=100; gpu=b200;; *) continue;; esac
     [[ -x "$bin/sm$a/khattak_vectors" ]] || { echo "skip $base: no sm_$a build"; continue; }
-    ex=(); [[ $card == B200 ]] && ex=(VGPU_TC_EXACT=published)
-    m="$(kv "$a" "$gpu" sass "$f" ${ex[@]+"${ex[@]}"})"; if [[ "$m" == 0 ]]; then echo "ok   full $base on $gpu: 0 mismatches"; else echo "FAIL full $base on $gpu: mismatches=${m:-?}"; fails=1; fi
+    m="$(kv "$a" "$gpu" sass "$f")"; if [[ "$m" == 0 ]]; then echo "ok   full $base on $gpu: 0 mismatches"; else echo "FAIL full $base on $gpu: mismatches=${m:-?}"; fails=1; fi
   done
 fi
 (( fails == 0 )) && echo PASS || { echo FAIL; exit 1; }

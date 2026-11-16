@@ -20,12 +20,15 @@ Pinned files are in `nvidia/tests/data/tcpapers/` (under 100 KB; `NOTICE` says w
 - On the RTX 3060 the simulator and the card print **the same** for every program of the three papers, on both engines: Fasi's four
   programs (all checks pass on both), the HPEC feature program (all values equal), our features and trees. No difference was found.
 - The 5,000-vector validation sets that Khattak and Mikaitis recorded on **other cards** are reproduced bit for bit by the simulator
-  with the profile of that card: A100, A2, Ada, L40S, H100, H200, and **B200 with the published (Hopper) rule**,
-  `VGPU_TC_EXACT=published`: 20,000 vectors a card (f16 with an f32 accumulator, f16 with an f16 accumulator, bf16, tf32), 0
-  mismatches, both engines. The simulator's default for a B200 (the sequential sum) mismatches 8,020 of those 20,000 vectors. The
-  rule for a B200 is therefore no longer "published only": a data set recorded on a B200 agrees with it (class **measured by others**;
-  we have not run a B200). Nothing in the default behaviour was changed by this work; flipping the b200 and gb200 profiles to the
-  Hopper rule is a decision for the maintainers (it changes their matrix results), see "Not done" below.
+  with the profile of that card: A100, A2, Ada, L40S, H100, H200, and **B200 with the Hopper rule**: 20,000 vectors a card (f16
+  with an f32 accumulator, f16 with an f16 accumulator, bf16, tf32), 0 mismatches, both engines. The sequential sum the b200
+  profile used to have mismatches 8,020 of those 20,000 vectors. The rule for a B200 is therefore not "published only": a data set
+  recorded on a B200 agrees with it (class **inferred**: data recorded by others, we have not run a B200).
+  **Update 2026-11-16: the b200 and gb200 profiles now use the Hopper rule by default** (`numerics.tensor_sum: hopper`, class
+  `inferred`); this changes the matrix results of those two profiles, and `VGPU_TC_EXACT=0` gives the earlier sequential results
+  back. sm_103 (b300), sm_120 (rtx5090, rtx-pro-*), thor, gb10 and vr200 did not change: no recorded vectors cover them. Where
+  this document says "b200 default" or "sequential" for a b200 below, it describes the run as recorded on 2026-11-15, which is
+  what `VGPU_TC_EXACT=0` prints now; "with `VGPU_TC_EXACT=published`" for a b200 is the default now.
 - The RTX 3060 itself reproduces the recorded A100, A2, Ada and L40S vectors (4 x 20,000 = 80,000 vectors, 0 mismatches): the
   Ampere rule is one rule across GA100, GA10x and AD10x for these shapes, now on data from five more card models than ours.
 - FPRev's trees: the simulator's tensor-core loops have the structure the paper reports for A100 and H100 (a 9-way and a 17-way
@@ -44,7 +47,7 @@ run; the other four were built for each architecture the simulator has a profile
   passes (the paper: a T4 and an A100 differ only in binary64, which the 3060 does too).
 - **Hopper and the sequential sum fail three checks** (binary16: "products are accumulated in binary32", "sum starts from largest
   element" and D5 "monotonicity of the dot product"; bf16 and tf32: the same three): the checks encode what a Volta, Turing or
-  Ampere core does, and the h100 profile and b200 with the published rule print the same failures; the b200 profile by default (sequential)
+  Ampere core does, and the h100 profile and the b200 profile (Hopper rule by default since 2026-11-16, `VGPU_TC_EXACT=published` before) print the same failures; the b200 profile with `VGPU_TC_EXACT=0` (the earlier default, sequential)
   fails more (bf16: 7 of 13). No H100 of ours has run the suite; on the simulator this is the Hopper rule working as set, not a finding about a card.
 - **A bug in the suite.** `tc_test_numerics-A100-bf16.cu` and `-A100-tf32.cu` write `h_b[j-1]` outside the `if (j>0)` they
   meant (the missing braces): at `j == 0` they write one element before a heap array. On a card that is silent; on the simulator the
@@ -55,9 +58,9 @@ run; the other four were built for each architecture the simulator has a profile
   inputs and outputs, exact products, f32 accumulation, extra alignment bits (`align_max_j`: the largest j for which 1 + 2^-j - 1 is
   not lost; 24 is one extra bit, 25 two), whether the alignment truncates, the number of products added in one step (`fma_size`),
   the final rounding in both signs, a sum of sixteen equal products. A few lines, RTX 3060 = a100 = l4 = t4 (the Ampere rule,
-  **measured** on the 3060, as Fasi found for T4 and A100) against h100 = b200 with the published rule = rtx-pro-6000 with it:
+  **measured** on the 3060, as Fasi found for T4 and A100) against h100 = b200 (default since 2026-11-16) = rtx-pro-6000 with `VGPU_TC_EXACT=published`:
 
-| Feature (f16 inputs, f32 accumulator) | RTX 3060 and simulator ampere profiles | h100, and b200 / rtx-pro-6000 with `VGPU_TC_EXACT=published` | b200 default (sequential) |
+| Feature (f16 inputs, f32 accumulator) | RTX 3060 and simulator ampere profiles | h100, b200 (default since 2026-11-16), rtx-pro-6000 with `VGPU_TC_EXACT=published` | b200 with `VGPU_TC_EXACT=0` (the earlier default, sequential) |
 |---|---|---|---|
 | subnormal inputs read (A1) | yes | yes | yes |
 | `align_max_j` (extra alignment bits) | 24 (one bit) | 25 (two bits) | 28 (the scan's limit: no cut) |
@@ -82,11 +85,11 @@ run; the other four were built for each architecture the simulator has a profile
   vector as a wmma with the vector in row 0 of A and column 0 of B and compares bits. Mismatches out of 5,000, per file
   (f16 with f32 accumulator / f16 with f16 accumulator / bf16 / tf32):
 
-| Recorded card | RTX 3060 (card) | Simulator, that card's profile | Simulator, b200-class default |
+| Recorded card | RTX 3060 (card) | Simulator, that card's profile | Simulator, b200 with `VGPU_TC_EXACT=0` (the earlier default) |
 |---|---|---|---|
 | A100, A2, Ada, L40S | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 (a100; rtx3060 for the A2, an sm_86 part; rtx6000-ada and l40s) | - |
 | H100, H200 | 1,757 / 1,311 / 1,080 / 498 (H100); 1,755 / 1,362 / 1,091 / 483 (H200) | 0 / 0 / 0 / 0 (h100, h200) | - |
-| B200 | 1,812 / 1,316 / 1,073 / 481 | 0 / 0 / 0 / 0 with `VGPU_TC_EXACT=published` (b200; rtx-pro-6000 with it too, the same vectors) | 3,168 / 2 / 2,584 / 2,266 (b200 default) |
+| B200 | 1,812 / 1,316 / 1,073 / 481 | 0 / 0 / 0 / 0 (b200 by default since 2026-11-16, `VGPU_TC_EXACT=published` before; rtx-pro-6000 with `published`, the same vectors) | 3,168 / 2 / 2,584 / 2,266 (b200 with `VGPU_TC_EXACT=0`) |
 | V100 | 1,200 (f32 accumulator), 0 (f16) | no profile | - |
 
   The vectors were converted to the program's own format (`tools/tcpapers/khattak-fetch.sh`, pinned commit 79143bd). A sample of
@@ -101,7 +104,7 @@ The method needs only a way to run a sum with chosen inputs. Terms i and j are s
 (`fprev_probe.cu` says how). Our program, not FPRev's (MIT; not copied), runs on a card and the simulator unchanged. Printed
 trees (`a-b` is the consecutive terms a to b, one node with several children is a fused sum, the accumulator is not a leaf):
 
-| Kernel | n | RTX 3060 (card) = simulator rtx3060, a100 | simulator h100 (b200 with the published rule) |
+| Kernel | n | RTX 3060 (card) = simulator rtx3060, a100 | simulator h100 (and b200 by default since 2026-11-16) |
 |---|---|---|---|
 | f32 loop `acc += x` | 32 | `(((0-1) 2) 3) ...` the chain | same |
 | f32 `fma` loop | 32 | the chain | same |
@@ -141,9 +144,10 @@ Two things the method taught us, on the way:
 
 - **FP8 (E4M3, E5M2) vectors.** The data sets hold 5,000 vectors for Ada, L40S, H100, H200 and B200; the simulator's `mma` FP8 forms
   and Hopper's `wgmma` keep the sequential sum. A program through those instructions would run them; not written.
-- **Making Blackwell's published rule the default.** The B200 vectors agree with it (0 of 20,000), the default does not (8,020).
-  Left as it is: it changes the results of every Blackwell profile, and sm_120 (RTX PRO 6000, 5090) has no recorded data. A one-line
-  change per profile (`numerics.tensor_sum`) when the maintainers decide.
+- **Making Blackwell's published rule the default** for the profiles with no recorded data. Done on 2026-11-16 for b200 and gb200 only
+  (their B200 vectors agree with it, 0 of 20,000, and the sequential sum does not, 8,020). sm_103 (b300), sm_120 (RTX PRO 6000, 5090),
+  thor, gb10 and vr200 stay sequential by default: no recorded data covers them. A one-line change per profile
+  (`numerics.tensor_sum`, with the chunk and grid keys) when data does. `tcgen05.mma` is not covered by either set of vectors.
 - **V100.** Block of 4 products, no extra bit (published; 1,200 of 5,000 recorded f32-accumulator vectors differ from the Ampere
   rule on the card). No profile; the loader accepts two rules only (`include/vgpu/profile.hpp`), CUDA 13 cannot build sm_70.
 - **cuBLAS shape-dependent order.** Above.
