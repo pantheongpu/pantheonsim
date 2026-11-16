@@ -497,24 +497,43 @@ is 1 + 2^-24), the largest distance from the correctly rounded double is 2^28 ul
 never the correct double except near powers of two. The compiler refines them with fused multiply-adds. Both cards agree
 on every sampled operand. Not characterized exhaustively (2^64 operands).
 
-**Not done: the fit.** The `MUFU` recipe was applied to `v_rcp_f32` (dumps of the binades [1, 2), [2, 4), 2^126 .. 2^127; the
-same for `rsq`, `sqrt`, `exp`, `log` on 2^23-result dumps) and did not reproduce the card:
+**Not done: an exact model (round 8, 2026-11-16, second attempt; still no model, no switch).** The AMD instructions are
+unchanged. What the second attempt measured (RX 6800, dumps of the binade [1, 2) of each operation, 2^23 results, fits by
+`tools/numerics/amd_trans_fit.py`; the segment tests are on 2^18 consecutive mantissas):
 
-- The result is smooth in the input and locally exactly the floor of a straight line (long runs of identical first
-  differences; a slope of 3/5 per input over a stretch), so a table of low-degree polynomials with truncation is the
-  likely structure. **Inferred**, not established.
-- But "result = floor of a real second-degree polynomial of the leading-bits row" (the linear program of step 2 above) has no
-  solution for rows of 2^16, 2^15, ..., 2^11 mantissa units (the best possible slack is -0.10 to -0.3, -0.05, -0.02, -0.0126 ulp), and
-  only becomes feasible near rows of 1,024 where a straight line fits too. A cubic does not help (-0.03); neither does
-  truncating `x` before squaring (0 to 10 low bits), nor the folded-array squarer of the `MUFU` fit at any column. The
-  violations of the best polynomial recur every 8 inputs, which points at an intermediate truncation of a different kind
-  (the slack is about 2^-6 ulp for `exp`, `rsq`, `sqrt` and `rcp` alike, suggesting six guard bits).
-  A bipartite (two-table) form was tested for additivity at splits of 4 to 9 bits and is not it.
-  No coefficient, table row or width was found, so there is **no model and no switch**: the AMD instructions are
-  unchanged, and everything above is a measurement a model has to meet. The hashes are what such a model is held to.
+- **Measured: a cubic per segment of 2^18 mantissas (32 a binade) is the form.** The result as an integer in its own ulp
+  is the floor of a real cubic of the segment offset to within a slack of -0.015 to -0.03 ulp (about one to two
+  1/64-ulp steps), for `rcp`, `rsq`, `sqrt` and `exp`; a quadratic of the same segment misses by 0.13 to 10 ulp. Rows of
+  2^16 to 2^11 were tested by the first attempt (and a quadratic per row of 2^10 fits exactly, which is a table of 8,192 rows
+  a binade, not a datapath).
+- **Measured: the squarer operand has its low bit cleared for `rcp` and `rsq`.** A cubic with `fq*fq`, `fq = f & ~1`, in
+  place of `f*f` takes the slack of `rcp` segment 3 from -0.0572 to -0.0165 ulp and `rsq` segments 3/17/25 from
+  -0.030/-0.023/-0.019 to -0.016/-0.015/-0.015; clearing 2 or more bits is worse. The violations of the plain cubic are by
+  input parity (even inputs one side, odd inputs the other). `sqrt` is flat across 0 to 2 bits (-0.033 to -0.020) and `exp`
+  prefers no truncation (-0.015). This is the same shape the public AMD emulator describes for RDNA3 and RDNA4 (a cubic over
+  64 segments of 18-bit offsets, "the squared input has its low bit cleared"; source: the `rocjitsu` pull request #12510
+  in ROCm/rocm-systems, read for the shape only, no coefficient taken; **documented by a third party**, not measured on RDNA2).
+- **Measured: the linear term is an integer multiple with a 14-bit fraction.** With the linear term as `rne(B * f / 2^14)`
+  (B an integer) and the other terms free reals, the best slack has a sharp peak at one B per segment (`rcp` segment 3:
+  B = -1,753,039, slack -1.11 steps of 1/64 ulp, one step either side -1.99/-2.1, falling 1.3 steps per unit of B;
+  segment 17: B = -894,410). That fixes six guard bits (final result = sum >> 6) and a 14-bit linear fraction.
+- **Not explained: about one more 1/64-ulp step of noise.** At the best integer linear term the slack is still -1.1 steps
+  (-0.96 on segment 17), so some further truncation (the quadratic/cubic terms in coarser units, or two separately floored
+  products) is not reproduced. The best model reached (real-valued cubic coefficients from the linear program, floored)
+  reproduces **99.2 % of the `rcp` inputs of segments 3 and 17** (0.82 % and 0.79 % of inputs differ by one ulp), against
+  100 % required. An outside project that reproduces the RX 6700 XT with an RDNA3-shaped model needs a correction list of
+  2,761 inputs a binade for `rcp` (a third-party claim from its pull request, `boykopovar/AnyPS5` #9305; not verified here), which
+  is the same conclusion: a cubic plus a sparse residual, not a closed structure.
+- **Not done:** `log` (the result's ulp changes inside the binade, no fixed-point form was set up), `sin`, `cos`, the other
+  segments and binades, the integer widths of the quadratic and cubic coefficients, and every test of a candidate against the
+  hashes. A residual list large enough to be exact (about 66,000 inputs of the 2^23 of a binade for the best model here) is the card's
+  result table in another form and was not shipped; **no inexact model is on by default and there is no opt-out because
+  there is nothing to opt out of.**
 
-What the next attempt needs: more row-structure experiments on the RX 6800 (distinct per-operation bit widths), the card
-dumps are 32 MB a binade and `amd_trans_probe <OP> dump <start> <count>` writes them.
+What the next attempt needs: the integer pipeline of the quadratic and cubic terms (their units and truncation), found
+per segment by scanning the cubic coefficients as integers in the way the linear term was scanned (the peak in B shows
+the method works); the dumps are 32 MB a binade (`amd_trans_probe <OP> dump <start> <count>`), the hashes above are the
+test.
 
 ## The PTX forms
 
