@@ -90,7 +90,7 @@ PantheonSim runs everything on the CPU by default, and every run gives the same 
 **Turbo mode is the fast mode: it trades bit-for-bit equality with the simulator for speed.** Memory safety, synchronisation and launch checks are the same in all three. Measured on an A10G over 59 programs of PolyBench/GPU, Rodinia and HeCBench: total run time about 1.7x shorter in turbo and 1.2x in exact, and every program's output equal to the simulator's. `VGPU_HOST_GPU_VERIFY=1` runs each launch both ways and compares, in turbo within a tolerance (`VGPU_HOST_GPU_ATOL`, `VGPU_HOST_GPU_RTOL`). Counters, fault injection and the simulator's checks do not apply to launches that run on the card. Details: [turbo mode](docs/perf-design/12-host-gpu-turbo.md), [all variables](docs/cli.md).
 ## How PantheonSim is developed
 
-PantheonSim has one maintainer, Saqib Khan. Most of its code, tests and documentation were written with AI coding assistants (Anthropic's Claude), directed and reviewed by the maintainer, and pull requests here have no second reviewer. What it is checked against, and what is not checked, is in [CONTRIBUTING.md](CONTRIBUTING.md), "How PantheonSim is developed"; what does not work is in [status and limits](docs/status.md).
+PantheonSim is developed by a small maintainer team. Most of its code, tests and documentation were written with AI coding assistants (Anthropic's Claude), directed and reviewed by the maintainers, and pull requests here have no second reviewer. What it is checked against, and what is not checked, is in [CONTRIBUTING.md](CONTRIBUTING.md), "How PantheonSim is developed"; what does not work is in [status and limits](docs/status.md).
 
 ## More
 

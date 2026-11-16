@@ -7,9 +7,9 @@ made is in [GOVERNANCE.md](GOVERNANCE.md), the rules for taking part are in the
 
 ## How PantheonSim is developed
 
-PantheonSim has one maintainer, Saqib Khan. Most of its code, tests and
-documentation were written with AI coding assistants (Anthropic's Claude),
-directed and reviewed by the maintainer. That is why the project grew to its
+PantheonSim is developed by a small maintainer team. Most of its code, tests
+and documentation were written with AI coding assistants (Anthropic's Claude),
+directed and reviewed by the maintainers. That is why the project grew to its
 present size in a few months and why pull requests here carry no second
 reviewer. We do not ask you to trust the code because of who or what wrote it.
 Here is the evidence that exists: about 900 ctest tests are registered, and CI
