@@ -4,7 +4,7 @@ Status: experimental, opt-in (`VGPU_HOST_GPU=turbo`). Measured on one A10G in *R
 ([rounds/11-rounds-sp36-sp41.md](rounds/11-rounds-sp36-sp41.md#round-sp59-turbo-host-gpu-mode-on-an-a10g)): over 59 programs of PolyBench/GPU, Rodinia
 and HeCBench the geometric mean speed-up is 1.23x against 1.12x for exact mode (summed wall time 1.75x against 1.20x), every program's output is the
 simulator's, and no kernel was refused for an instruction of no class. Sections 5, 8 and 9 say what the card confirmed and what it changed.
-Round sp66 widened what both modes send (section 10; on an A10G the 45 programs it changes go from 1.20x to 1.60x in turbo mode and 1.08x to 1.12x in exact mode). Tracking issue: pantheonsim #587. Read [09-host-gpu-spike.md](09-host-gpu-spike.md) first: this mode is the same machinery with a wider
+Round sp66 widened what both modes send (section 10; on an A10G the 45 programs it changes go from 1.20x to 1.60x in turbo mode and 1.08x to 1.12x in exact mode). Tracking issue: pantheonsim #587. Rounds sp75 and sp76 (sections 12 and 13) were run on an A10G on 2026-11-15: a kernel's first launch, a block that outlasts the wait and a launch sampled with the driver up; HeCBench aidw 181.57 s to 44.41 s, the three tensor GEMMs of the CUDA Samples 16 to 209 s to 1.3 to 3.8 s, outputs identical ([data/sp75/card.md](data/sp75/card.md), [data/sp76/card.md](data/sp76/card.md)). Read [09-host-gpu-spike.md](09-host-gpu-spike.md) first: this mode is the same machinery with a wider
 door.
 
 ## 1. Why
@@ -15,11 +15,11 @@ instruction, packed half arithmetic or an atomic. Round sp44 measured how far th
 4% to 25% of all float patterns differ, by one or two units in the last place.
 
 Turbo mode sends those kernels to the card as well. What the program then gets is the card's value, which is what the program gets on
-real hardware, and which is close to the simulator's but not its bits. That is a different promise from exact mode's, so it is a different
+real hardware, and which is close to the simulator's but not its bits (for the approximate functions this describes the simulator before the model below; what still differs is tensor, half, atomic and reduction arithmetic and the order of atomics). That is a different promise from exact mode's, so it is a different
 mode, and exact mode is byte for byte what it was: the same set, defaults, decisions and summary text (a unit test holds a copy of the set).
 
 Since 2026-11-15 the simulator models the approximate-math unit itself ([numerics/math-functions.md](../numerics/math-functions.md)): each of
-the ten `MUFU` sub-operations gives the card's bits on all 2^32 inputs, measured on an RTX 3060 and an A10G, unless `VGPU_MUFU_EXACT=0`.
+the ten `MUFU` sub-operations gives the card's bits on all 2^32 inputs, measured on an RTX 3060, an A10G and an H100 PCIe (Blackwell inferred), unless `VGPU_MUFU_EXACT=0`.
 The 4% to 25% above is therefore the distance to the simulator of before the model (and of `VGPU_MUFU_EXACT=0`). Nothing in either mode
 changed with it: exact mode still refuses a kernel with a `MUFU` outside the division and square root idioms, and turbo mode's `mufu` class
 is what it was. Widening the exact set to `MUFU` kernels is open: it needs a card run with `VGPU_HOST_GPU_VERIFY=all` on the cards the model
@@ -601,9 +601,9 @@ now:
 |---|---|
 | the copy calls the driver. A forked copy of a CUDA process must not: the driver's threads are not in it, and its context is the process's | the copy runs blocks of the launch in the simulator and ends with `_exit`; the one way from there into the driver is the gate, when a block reads a chunk only the card holds (section 3). Before the fork the process pulls every such chunk; the copy then makes every chunk its own, in its own memory, before it runs a block, so that no access of its blocks reaches the gate; and the gate's pull refuses to run in a copy at all |
 | the copy lives long, holding the driver's files and mappings, while the process goes on to launch on the card | since Round sp75 a block's run in the copy is bounded: a copy lives for the wait at most (50 ms and 0.2 ms per MiB of live memory, 120 ms more for a small grid), with or without an answer, as before the start, and the thread that launched waits for it |
-| the fork itself harms the process that holds the driver | nothing in the mode can show this without a card. A forked child that never calls the driver is what every program makes that calls `system()` or `popen()` after its first CUDA call; the copy shares the driver's open files, closes its own descriptors when it ends (which releases nothing while the process holds them) and maps nothing new. **Not measured before the round's card run**: the card test's step 13 and the `fork` stage of `data/sp76/card-run.sh` are there for it |
+| the fork itself harms the process that holds the driver | nothing in the mode can show this without a card. A forked child that never calls the driver is what every program makes that calls `system()` or `popen()` after its first CUDA call; the copy shares the driver's open files, closes its own descriptors when it ends (which releases nothing while the process holds them) and maps nothing new. **Measured on an A10G, 2026-11-15** ([data/sp76/card.md](data/sp76/card.md)): 20 of 20 runs as expected in exact and in turbo mode (`sampled=2 sent=2 timeouts=0 after_driver=1 copies_left=0`), no new `NVRM` or `Xid` line, no process left; the fork costs 0.13 ms before the driver's start and 5 ms with the driver loaded |
 
-So the reason no longer holds for the first two, and the third is the card's to confirm.
+So the reason no longer holds for the first two, and the third was confirmed on an A10G (above); other cards and drivers were not run.
 
 **The rule** (`sample_allowed`, `sample_card_path_seconds`, `sample_short_before_seconds`, `sample_floor_estimate`, vgpu/host_gpu.hpp). A launch nothing is known of
 is sampled with the driver up as it is before the start: the same candidates (an admitted kernel with a loop; a grid of 256 blocks and up, or
@@ -672,12 +672,14 @@ and `turbod0`). The `host_gpu_sampled:` line's `after_driver=` counts the sample
 sample reads `sampled with the driver up: ... against a card path of ... ms without a start`, and with `VGPU_HOST_GPU_LOG` the pull before a
 sample is said (`... MiB only the card held pulled before a sample`).
 
-**On a card: not run.** The round had no card. What only a card can show, in the order `data/sp76/card-run.sh` asks it: that a process
-which holds the real driver can be forked and goes on to use the card (the card test's step 13, `e2e_host_gpu`: the two-kernel program
-sampled with the driver up, both launches on the card, the output the mode-off output; then twenty runs in each mode and the kernel log);
-that aidw's four launches go (193 s to about 45 s: what Round sp75's card run left after its 149 s launch); what the kernels first launched
-after the start gain in segmentationTreeThrust, histogram and mergeSort; and that no program of the keep list is more than 3 % slower than
-with the switch off. If the fork does harm on the card, `sample_started` in `src/runtime/host_gpu.cpp` is the default to turn off.
+**On a card** (2026-11-15, one A10G, driver 595.112.07, CUDA 13.0, every stage of `data/sp76/card-run.sh`; [data/sp76/card.md](data/sp76/card.md); `d0` is `VGPU_HOST_GPU_SAMPLE_STARTED=0`). Measured:
+
+* *The fork.* The card test passes with step 13 (the first fork of a process that holds the real driver). Twenty of twenty runs as expected in exact and in turbo mode, no new `NVRM` or `Xid` line, no process left. The fork costs 0.13 ms before the start and 5 ms with the driver loaded (what the stand-in could not show: it was 0.5 ms there).
+* *Programs changed* (turbo against `turbod0`, median of 10 runs; aidw one run, atomicAggregate 3): aidw 181.57 s to 44.41 s (4 of 4 launches on the card, 3 before); mergeSort 3.18 to 2.12 s (34 of 49 launches on the card to 42); histogram 3.27 to 2.30 s (58 of 68 to 62); segmentationTreeThrust 6.52 to 5.25 s (241 of 514 to 243); atomicAggregate 1.48 to 0.89 s (4 of 6 to 5). Outputs identical (aidw's was not compared).
+* *Programs kept* (18 programs, 3 runs): every one within 3 % of its `d0` form but particlefilter_float (1.07 s against 0.88 s), which takes no sample with the driver up and is the program's own race (below).
+* *The rest of the corpus* (113 programs, one run): no program that takes a sample with the driver up is slower. Seven programs over 0.3 s read 3 to 11 % slower with the same decisions in both forms; five are within 2 % in the `keep` stage. samples/interval (1.09) and samples/reduction (1.07) were **not rerun**, so the single-run reading stands as unconfirmed: a rerun is `data/sp76/rerun-interval-reduction.sh`.
+
+What the card did not show and nothing here measured: other cards, drivers and toolkits; a program with hundreds of MiB live on the rig (the page faults after the fork). If the fork does harm on another card, `sample_started` in `src/runtime/host_gpu.cpp` is the default to turn off.
 
 **Two things the round measured and did not change** (numbers in the round's text):
 
@@ -703,9 +705,9 @@ kernel a program first launches after its start was bought); a static count that
 immediate (the floor of section 8 for `initRNG`); the bounded blocks as the fallback of a sample inside the blocks that finds no warp in a
 followed loop.
 
-From Round sp76 (which took the first of those another way: the launch is sampled with the driver up, section 13): the card run of
-`data/sp76/card-run.sh`, first of all the fork of a process that holds the real driver; a static count that weighs a loop's body by its
+From Round sp76 (which took the first of those another way: the launch is sampled with the driver up, section 13; its card run is done, above): a rerun of
+samples/interval and samples/reduction on a card (`data/sp76/rerun-interval-reduction.sh`); a static count that weighs a loop's body by its
 turns, which needs the flow scan to follow a loop that is left through a call to the kernel's `EXIT` and the census of every kernel it would
-newly have sampled; what the page faults after a fork cost a program with hundreds of MiB live on the rig (the floor of
-warpAggregatedAtomicsCG's two kernels); whether the size of a process's environment tilts particlefilter's race (the `pf` stage of the card
-script runs the rule under an environment of the size of the rule-before form).
+newly have sampled (design with numbers: [data/turbo-left/README.md](data/turbo-left/README.md)); the open turbo issues #660 and #661 have card scripts there (`card-short-launch.sh`, `card-bmma-verify.sh`); what the page faults after a fork cost a program with
+hundreds of MiB live on the rig (the floor of warpAggregatedAtomicsCG's two kernels); whether the size of a process's environment tilts
+particlefilter's race (the card run's `pf` stage ran, but `data/sp76/card.md` records only that the program's own race moves its time: its group counts per form are not kept).
