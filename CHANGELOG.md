@@ -24,6 +24,7 @@ release says what runs and what it produces, never how fast a real GPU would run
   encoding is from nvcc output, the execution was not run on a Blackwell card). Tests: `test_mufu_model`, `test_decode_same_bits`
   (its flipped and random digests moved for the MUFU words with bit 72 set on sm_90 and later, see its header); details in
   [docs/numerics/math-functions.md](docs/numerics/math-functions.md).
+- **`VGPU_HOST_GPU=turbo` now sends kernels that use BMMA (1-bit tensor MMA) to the card** (issue #661). They were refused (`class=never insn=BMMA.88128.XOR.POPC`). BMMA is integer popcount arithmetic: on an A10G, `bmma_gemm` (36 launches, XOR and AND) ran on the card under `VGPU_HOST_GPU_VERIFY=all` with 0 different words of 775,680, byte-identical to the simulator. Measured on the A10G only; other cards with BMMA are inferred. `VGPU_HOST_GPU=exact` is unchanged (BMMA is not in its set), and `VGPU_HOST_GPU_TURBO_OFF=tensor` refuses these kernels again. Test: `test_host_gpu_logic`.
 - **Behaviour change: the b200 and gb200 profiles sum tensor-core products by the Hopper rule by default, not sequentially.** On
   `nvidia/b200` and `nvidia/gb200` (compute capability 10.0), `wmma`, `mma.sync` and SASS `HMMA` in f16, bf16 and tf32 now add the
   products in chunks of 16 (tf32: 8) with the terms cut at 2^(top - 26), the rule of an H100, instead of one at a time in f32.

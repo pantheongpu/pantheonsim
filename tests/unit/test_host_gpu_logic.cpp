@@ -1118,6 +1118,15 @@ VTEST(turbo_classes_every_kind_of_instruction) {
   VCHECK(turbo_class("RED", {"E", "EXCH"}) == C::AtomSwap);
   // tensor
   for (const char* m : {"HMMA", "IMMA", "DMMA"}) VCHECK(turbo_class(m, {"16816", "F32"}) == C::Tensor);
+  // BMMA (#661): integer popcount arithmetic, measured equal on an A10G; the exact set does not hold it
+  for (const char* op : {"XOR", "AND"}) {
+    VCHECK(turbo_class("BMMA", {"88128", op, "POPC"}) == C::Tensor);
+    VCHECK(!exact_opcode_allowed("BMMA", {"88128", op, "POPC"}));
+  }
+  VCHECK(!exact_opcode_allowed("BMMA", {}));
+  VCHECK(turbo_class("BMMA", {}) == C::Tensor);
+  VCHECK(turbo_class("BMMA", {"88128", "XOR", "(9)"}) == C::Never);   // an undecoded field still refuses
+  VCHECK(turbo_class("QMMA", {}) == C::Never);                        // its neighbour stays refused
   // atomics
   for (const char* m : {"ATOM", "ATOMG", "ATOMS"}) {
     for (const char* op : {"ADD", "MIN", "MAX", "INC", "DEC", "AND", "OR", "XOR"}) {
@@ -1160,7 +1169,7 @@ VTEST(turbo_whitelist_covers_the_decoder_and_nothing_unnamed) {
   VCHECK_EQ(n[InsnClass::Mufu], 1u);
   VCHECK_EQ(n[InsnClass::Half], 6u);
   VCHECK_EQ(n[InsnClass::Call], 2u);
-  VCHECK_EQ(n[InsnClass::Tensor], 3u);
+  VCHECK_EQ(n[InsnClass::Tensor], 4u);   // HMMA, IMMA, DMMA, BMMA
   VCHECK_EQ(n[InsnClass::AtomInt], 3u);   // ATOM, ATOMG, ATOMS with no modifier
   VCHECK_EQ(n[InsnClass::Extra], 17u);   // (B2R is a mnemonic of the BAR op, not an op of its own; NANOSLEEP is one)
   VCHECK_EQ(n[InsnClass::FloatRed] + n[InsnClass::AtomFloat] + n[InsnClass::AtomSwap], 0u);

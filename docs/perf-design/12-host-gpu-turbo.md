@@ -39,11 +39,11 @@ external functions) is decided apart, by the same rules in both modes, in sectio
 | float-red | `RED` / `REDG` on a float type (no value returned) | admitted | `=red` |
 | call | `CALL`, `RET` and `LEPC` (the return address of an absolute call; Round sp66), when every call is relative, to a label inside the kernel's own code section, or (Round sp66) absolute, to the first instruction of another code section of the module, whose code is then classed with the kernel's | admitted | `=call` |
 | extra | `IDP`, `VABSDIFF`, `VABSDIFF4`, `VIADDMNMX`, `VIMNMX3`, `FMNMX3`, `F2IP`, `FSWZADD`, `REDUX`, `LDGSTS`, `LDGDEPBAR`, `LDSM`, `MOVM`, `FFMA2`, `FMUL2`, `FADD2`, integer `REDG`; `B2R`, `NANOSLEEP` (Round sp66) | admitted | `=extra` |
-| tensor | `HMMA`, `IMMA`, `DMMA` | admitted | `=tensor` |
+| tensor | `HMMA`, `IMMA`, `DMMA`, `BMMA` (A10G measured 2026-11-16, 36 of 36 launches byte-identical under `VGPU_HOST_GPU_VERIFY=all`; integer popcount arithmetic, so other cards that have it are inferred, not measured) | admitted | `=tensor` |
 | atomic-int | `ATOM`, `ATOMG`, `ATOMS` on integers with `ADD`, `MIN`, `MAX`, `AND`, `OR`, `XOR`, `INC`, `DEC`; `RED` with `INC`, `DEC`, `POPC` | admitted | `=atomics` |
 | atomic-float | `ATOM`, `ATOMG`, `ATOMS` on a float type (a value is returned) | admitted (refused until Round sp66) | `VGPU_HOST_GPU_ATOMICS=0` |
 | atomic-swap | any `CAS`, `CAST.SPIN`, `EXCH` | admitted (refused until Round sp66) | `VGPU_HOST_GPU_ATOMICS=0` |
-| never | `TEX`, `TLD`, `TLD4`, `TXD`, `TXQ`, `TMML`, `SULD`, `SUST`, `SUATOM`, `SURED`; `QMMA`, `BMMA`, the sm_90 and sm_100 tensor and tensor-memory instructions; `JMP`, `BPT`; any other call that leaves the section (through a register, into the middle of a section, outside the module's code; the absolute call to `vprintf` excepted, section 10); `ATOMS.ARRIVE`; an instruction with a field the decoder cannot name; anything else | refused | none |
+| never | `TEX`, `TLD`, `TLD4`, `TXD`, `TXQ`, `TMML`, `SULD`, `SUST`, `SUATOM`, `SURED`; `QMMA`, the sm_90 and sm_100 tensor and tensor-memory instructions; `JMP`, `BPT`; any other call that leaves the section (through a register, into the middle of a section, outside the module's code; the absolute call to `vprintf` excepted, section 10); `ATOMS.ARRIVE`; an instruction with a field the decoder cannot name; anything else | refused | none |
 
 Why each admitted class is safe to run on the card, as distinct from numerically equal: the card executes the module's own cubin, so any
 instruction is "supported" there. What the mode must guarantee is that the card has everything the kernel reads. The shared checks do
@@ -204,7 +204,7 @@ Memory has no types, so the compare guesses, and these are the guesses that can 
    results near zero differ from the simulator's by up to 3.6e-7 in a plain run.
 3. `... atomics <out>`: integer atomics leave the same memory in 7 of 7 repeats and return other values every time; float sums differ by up to 23 ulp
    from run to run; compare-and-swap and exchange never repeat. The defaults stand.
-4. `... tensor <out> <build>`: `HMMA`, `IMMA`, `DMMA` (and `BMMA`, not yet named; BMMA's integer results equal the card's in the simulator, `e2e_bmma_gemm`, but it stays in the `never` class until a rig runs `card-bmma-verify.sh`) gave the simulator's bits in 394 launches, on inputs whose products
+4. `... tensor <out> <build>`: `HMMA`, `IMMA`, `DMMA` (and `BMMA`, admitted 2026-11-16: `e2e_bmma_gemm`, 36 launches, ran on an A10G under `VGPU_HOST_GPU_VERIFY=all` with 0 different words, `data/turbo-left/card-2026-11-16-bmma/`; the exact set does not hold it) gave the simulator's bits in 394 launches, on inputs whose products
    are exact; an accumulation that rounds was not tested.
 5. `tools/bench/hostgpu/run.py` (section 6) over the three corpora: the round's tables. Turbo adds five programs to exact's (one of them 78x); the
    `never` class refused nothing; `extra` was met in one kernel, which verified clean. What limits both modes is the first-launch rule, not the classes.
@@ -697,7 +697,7 @@ What the card did not show and nothing here measured: other cards, drivers and t
 ## 14. What is next
 
 From Round sp59, less what section 8 does: a start-cost account that weighs the gain for programs of many short launches (they lose 0.1 to 0.2 s
-or gain nothing; section 11 is a first step: it counts the launches a kernel has had, not yet what the card saved on them); the card's fixed-point `MUFU.SIN` / `MUFU.COS` in the simulator (done 2026-11-15 for every `MUFU` sub-operation, section 1); `BMMA` in the tensor class and a tensor probe whose sums round;
+or gain nothing; section 11 is a first step: it counts the launches a kernel has had, not yet what the card saved on them); the card's fixed-point `MUFU.SIN` / `MUFU.COS` in the simulator (done 2026-11-15 for every `MUFU` sub-operation, section 1); a tensor probe whose sums round (`BMMA` is in the tensor class since 2026-11-16);
 other cards and toolkits.
 
 From Round sp75: a first launch while the driver is up (a trial in the simulator that the card's copy undoes: aidw's second kernel, and every
