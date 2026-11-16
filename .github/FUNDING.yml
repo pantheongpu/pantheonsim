@@ -1,7 +1,7 @@
-# Shows the "Sponsor" button on the repository. The pantheongpu organisation is
-# the GitHub Sponsors account (the same one as pantheongpu/pantheon); the custom
-# link goes to pantheonsim.com, and https://pantheonsim.com/funding.json says what
-# support would be spent on (a server for the simulator and CI, and time on real
-# GPUs).
-github: [pantheongpu]
+# Shows the "Sponsor" button on the repository. The GitHub Sponsors account is
+# saqibkh (https://github.com/sponsors/saqibkh, the same one as
+# pantheongpu/pantheon); the custom link goes to pantheonsim.com, and
+# https://pantheonsim.com/funding.json says what support would be spent on (a
+# server for the simulator and CI, and time on real GPUs).
+github: [saqibkh]
 custom: ["https://pantheonsim.com"]
