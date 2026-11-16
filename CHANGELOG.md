@@ -7,6 +7,13 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **Double arithmetic in a kernel no longer inherits the host program's flush-to-zero** (issue #672). A host built with `nvc -fast`
+  (or `-ffast-math`) turns FTZ and DAZ on in its own MXCSR, and the engines did a kernel's arithmetic with the host's
+  instructions under that setting, so a subnormal double operand read as zero and a subnormal result was written as zero. NVHPC
+  26.9's `fmod(double)` reads the exponent of a subnormal remainder through a multiply by 2^54: on the simulated H100 `fmod(1.5, 1)`
+  was 1.4e-17 (the McStas PSI_DMC runs reached 39 % of their reference). A launch now clears FTZ and DAZ (and ARM's FZ) for the
+  kernel and puts the host's back afterwards (`include/vgpu/exec/host_fp.hpp`, test `test_launch_fp_flush`); a kernel that asks
+  for `.FTZ` still flushes, by the engine's own rule.
 - **The approximate math instructions give a real card's bits** (issue #664). `MUFU` (SASS) and the PTX `.approx` forms
   were the function at the host's precision, rounded once; a card computes them in a small fixed-point unit, and its
   results differ in the last bit on 13 to 39 % of arguments (`RCP`, `RSQ`, `SQRT`, `EX2`), by an absolute error of a few
