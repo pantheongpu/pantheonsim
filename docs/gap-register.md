@@ -560,6 +560,10 @@ not work for the simulator:
   `in_proj_bias` tensors), and with those gradients zeroed the CPU, the simulator and the 3060 agree
   (`tiny causal transformer ... key biases left out of the update`, a full-tier check, passes). No tolerance was
   loosened. The entry can only go if the check changes what it tests.
+  2026-11-15: the entry went another way. With the model of the card's approximate-math unit (`numerics/math-functions.md`)
+  the simulator's noise changed and the check is within 0.002 on the CI runner's PyTorch (the sweep printed XPASS, which
+  fails until the line is removed; the new difference was not printed). The line is now a comment in `known_failures.txt`.
+  It is still noise: another PyTorch, or `VGPU_MUFU_EXACT=0`, can bring it back.
 
 ### CUDA Samples known differences
 
