@@ -7,6 +7,7 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **The setup action installs NVTX's headers** (issue #677). A project that includes `nvtx3/nvToolsExt.h` (Arbor does, in `cuda_api.hpp`) failed to compile on a runner with a versioned CUDA toolkit, because the action installed the other libraries' headers but not NVTX's. It installs `cuda-nvtx-<version>` now. NVTX calls are no-ops with no profiler attached, so annotated programs run unchanged on the simulated GPU.
 - **Double arithmetic in a kernel no longer inherits the host program's flush-to-zero** (issue #672). A host built with `nvc -fast`
   (or `-ffast-math`) turns FTZ and DAZ on in its own MXCSR, and the engines did a kernel's arithmetic with the host's
   instructions under that setting, so a subnormal double operand read as zero and a subnormal result was written as zero. NVHPC
