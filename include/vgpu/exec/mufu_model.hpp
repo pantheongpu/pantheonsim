@@ -214,4 +214,33 @@ inline uint32_t eval(unsigned op, uint32_t x) {
   }
 }
 
+// ---- the half-precision forms (MUFU.<op>.F16; PTX ex2.approx.f16, .f16x2 and tanh.approx.f16, .f16x2) ----
+// Measured on an RTX 3060 over all 65,536 half patterns of each of the eight sub-operations that have a half form (COS, SIN,
+// EX2, LG2, RCP, RSQ, SQRT, TANH; the 64H forms have none): the instruction widens the half exactly to a float, runs the
+// single-precision unit above, and cuts the float to a half toward zero. A result of 2^16 or more is an infinity (the ones
+// from 65520 up to 2^16 are the largest half, 65504, as the cut gives them), a NaN is 0x7fff, the result below 2^-24 is a
+// zero of the result's sign, and the register's upper half is zero. A packed .f16x2 form is two of these, one
+// per half of the register.
+inline uint32_t half_to_f32(uint32_t h) {
+  const uint32_t sign = (h & 0x8000u) << 16, e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+  if (e == 31) return sign | 0x7f800000u | (m << 13);
+  if (e != 0) return sign | ((e + 112) << 23) | (m << 13);
+  if (m == 0) return sign;
+  const int n = 31 - __builtin_clz(m);                       // the position of the leading one, 0..9
+  return sign | (static_cast<uint32_t>(103 + n) << 23) | ((m << (23 - n)) & 0x7fffffu);
+}
+inline uint32_t f32_to_half_rz(uint32_t u) {
+  const uint32_t sign = (u >> 16) & 0x8000u, e = (u >> 23) & 0xffu, m = u & 0x7fffffu;
+  if (e == 0xff) return m ? 0x7fffu : sign | 0x7c00u;
+  const int ex = static_cast<int>(e) - 127;
+  if (ex > 15) return sign | 0x7c00u;
+  if (ex >= -14) return sign | (static_cast<uint32_t>(ex + 15) << 10) | (m >> 13);
+  const int sh = 13 + (-14 - ex);
+  return sh >= 24 ? sign : sign | ((0x800000u | m) >> sh);
+}
+// The instruction on a half (its 16 bits); the result's 16 bits.
+inline uint32_t eval_f16(unsigned op, uint32_t h) { return f32_to_half_rz(eval(op, half_to_f32(h & 0xffffu))); }
+// Whether the model has the half form of the sub-operation: the eight that the card was asked for (not the 64H forms).
+inline bool has_f16(unsigned op) { return op <= OpTanh && op != OpRcp64h && op != OpRsq64h; }
+
 }  // namespace vgpu::mufu

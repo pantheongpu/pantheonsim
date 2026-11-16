@@ -14,6 +14,16 @@ release says what runs and what it produces, never how fast a real GPU would run
   was 1.4e-17 (the McStas PSI_DMC runs reached 39 % of their reference). A launch now clears FTZ and DAZ (and ARM's FZ) for the
   kernel and puts the host's back afterwards (`include/vgpu/exec/host_fp.hpp`, test `test_launch_fp_flush`); a kernel that asks
   for `.FTZ` still flushes, by the engine's own rule.
+- **The half-precision approximate math forms give a card's bits** (issue #664, follow-up). `ex2.approx.f16`, `.f16x2` and
+  `tanh.approx.f16`, `.f16x2` (PTX interpreter) and `MUFU.<op>.F16` (SASS executor, all eight sub-operations) are what an RTX 3060
+  computes, bit for bit over all 65,536 half patterns of each: the single-precision unit on the exactly widened half, cut toward
+  zero to a half (`eval_f16` in `include/vgpu/exec/mufu_model.hpp`). Before: `ex2.approx.f16` differed on 19,417 of 65,536
+  patterns and `tanh.approx.f16` on 14,736 (host precision, rounded to nearest); the SASS executor ignored the F16 bit and read
+  the register as a float (65,536 of 65,536 patterns off for `MUFU.EX2.F16`, `COS`, `LG2`, `RCP`, `RSQ`). Also decoded now: the
+  `.H1` half-select of `MUFU.<op>.F16`. **Measured on sm_86 only**: Turing, Ada, Hopper and Blackwell cards were not asked
+  (inferred from the 32-bit unit); the bf16 forms (sm_90 and later) are unchanged and unmeasured. `VGPU_MUFU_EXACT=0` restores
+  the earlier results for these forms too. `tools/numerics/mufu-card-run.sh` hashes them (`hashes16.txt`) for another card; see
+  [docs/numerics/math-functions.md](docs/numerics/math-functions.md).
 - **The approximate math instructions give a real card's bits** (issue #664). `MUFU` (SASS) and the PTX `.approx` forms
   were the function at the host's precision, rounded once; a card computes them in a small fixed-point unit, and its
   results differ in the last bit on 13 to 39 % of arguments (`RCP`, `RSQ`, `SQRT`, `EX2`), by an absolute error of a few
