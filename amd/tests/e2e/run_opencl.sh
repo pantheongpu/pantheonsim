@@ -43,6 +43,8 @@ if command -v objdump >/dev/null; then
   preload=$(objdump -p "$shim/libhsa-runtime64.so.1" 2>/dev/null | awk '/NEEDED/ && /lib(asan|tsan)\.so/ {print $2}')
 fi
 
+# amd/mi455x (gfx1250) is not here: the installed ROCm OpenCL runtime (7.1.0) answers "Unsupported HSA device gfx1250"
+# and drops it, whatever the simulator offers (#651). Set VGPU_OPENCL_GPUS=amd/mi455x to see it.
 cases="amd/mi300x amd/mi250x amd/mi350x amd/rx7900xtx amd/rx9070xt amd/rx6900xt amd/rx6800 amd/rx6700xt"
 [[ -n "${VGPU_OPENCL_GPUS:-}" ]] && cases="$VGPU_OPENCL_GPUS"
 for gpu in $cases; do
@@ -52,6 +54,13 @@ for gpu in $cases; do
   grep -E '^(FAIL|build log)' <<< "$out" | sed 's/^/      /'
   expect "$gpu: it runs to the end" "0" "$status"
   expect "$gpu: both simulated devices are OpenCL devices" "devices 2" "$(grep -o '^devices [0-9]*' <<< "$out")"
+  if ! grep -q '^devices 2' <<< "$out"; then
+    # Why: ROCm's runtime logs each device it takes or drops at AMD_LOG_LEVEL 4 (issue #651: no device on gfx1250).
+    echo "      the runtime's own account of the devices it found (AMD_LOG_LEVEL=4), and the HSA agents the simulator offered:"
+    LD_PRELOAD="$preload" VGPU_QUIET=1 VGPU_GPU="$gpu" VGPU_DEVICE_COUNT=2 OCL_ICD_VENDORS="$tmp/vendors" AMD_LOG_LEVEL=4 \
+      ROCM_PATH="$rocm" LD_LIBRARY_PATH="$shim:$rocm/lib" timeout 300 "$tmp/cl" 2>&1 |
+      grep -i -E 'gfx|isa|device|agent|not supported|unsupported|skip|filter' | head -40 | sed 's/^/        /'
+  fi
   expect "$gpu: every check passes" "0" "$(grep -oE ', [0-9]+ failed' <<< "$out" | grep -oE '[0-9]+')"
 done
 exit $fail
