@@ -227,6 +227,18 @@ Open, found on the way: an sm_75 build of `float_half_forms` folds `__hmul2` and
 SASS executor's answer for that line (`half_form_30`) differs from the PTX engine's and from the RTX 3060's line; no Turing card
 has run the program, so it is left out of the sm_75 SASS comparison and not changed.
 
+## Three more papers, run on the RTX 3060 and the simulator
+
+Fasi et al. (PeerJ CS 2021), Khattak and Mikaitis (arXiv 2512.07004, HPEC 2025) and FPRev (Xie et al., USENIX ATC 2025, arXiv
+2411.00442) were run the way FTTN was; everything is in [numerics/tcpapers.md](numerics/tcpapers.md) and the programs in
+`tools/tcpapers/`. In short: on the RTX 3060 every program prints the same on the card and the simulator (both engines); the
+5,000-vector validation sets Khattak and Mikaitis recorded on A100, A2, Ada, L40S, H100 and H200 cards are reproduced bit for bit by
+the profile of that card, and a **B200's** by the published Hopper rule (`VGPU_TC_EXACT=published`: 0 of 20,000 vectors, against 8,020
+mismatches from the default sequential sum), so that rule is no longer paper-only for a B200 (sm_120 stays inferred: their data has no
+RTX PRO 6000). FPRev's summation trees of the tensor-core loops are the 9-way (8+1) and 17-way (16+1) fused sums the paper reports
+for an A100 and an H100. The one measured disagreement is the simulator's cuBLAS, which adds every product type in one sequential chain
+where the card's does not. CI: `e2e_tcpapers` (`nvidia/tests/e2e/run_tcpapers.sh`, pinned files in `nvidia/tests/data/tcpapers/`).
+
 ## What a card is still wanted for
 
 `tools/fttn/card-run.sh <out-dir>` runs everything on a rented card (FTTN, both probes against the pinned file of the card's
@@ -259,3 +271,9 @@ published results and which cards, what the simulator's own two engines disagree
 - FTTN: arXiv 2403.00232, github.com/LLNL/FTTN (MIT).
 - MMA-Sim: Xie, Xu, Wang, Yang, Yang, "Bit-Accurate Modeling of GPU Matrix Multiply-Accumulate Units", arXiv 2511.10909 (MIT).
 - Khattak, Mikaitis, "Accurate Models of NVIDIA Tensor Cores", arXiv 2512.07004.
+- Fasi, Higham, Mikaitis, Pranesh, "Numerical behavior of NVIDIA tensor cores", PeerJ Computer Science 7:e330, 2021;
+  github.com/north-numerical-computing/tensor-cores-numerical-behavior (GPL-2.0; run, not copied).
+- Khattak, Mikaitis, HPEC 2025 test methodology (github.com/faiziktk/IEEE_HPEC2025_block_FMA_tests, no licence stated; run, not copied) and
+  github.com/north-numerical-computing/MATLAB-tensor-core (BSD-2: models and recorded test vectors).
+- Xie, Gao, Wang, Xue, "Revealing Floating-Point Accumulation Orders in Software/Hardware Implementations" (FPRev), USENIX ATC 2025,
+  arXiv 2411.00442, github.com/peichenxie/FPRev (MIT).

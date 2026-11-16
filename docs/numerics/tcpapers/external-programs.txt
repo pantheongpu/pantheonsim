@@ -1,0 +1,71 @@
+# Two external test suites run on the simulator, one line a program and profile: what each printed. Unlicensed or GPL code is not in
+# this repository: tools/tcpapers/ has our own programs. Provenance: run 2026-11-16 on server3, SASS engine (PTX engine printed the same
+# on every line unless a ' | PTX:' tail says otherwise); cubin built for the profile's own architecture, CUDA 13.0.
+#   f_*  = Fasi, Higham, Mikaitis, Pranesh (PeerJ CS 7:e330, 2021) github.com/north-numerical-computing/tensor-cores-numerical-behavior (GPL-2.0):
+#          one letter a check in the program's order, P = PASS, F = FAIL. f_binary16 has 17 checks, f_bf16 and f_tf32 13, f_binary64 11.
+#          The checks encode the Volta / Turing / Ampere findings; F on a Hopper rule or a sequential sum means the feature differs.
+#   h_*  = Khattak and Mikaitis feature tests for HPEC 2025 (github.com/faiziktk/IEEE_HPEC2025_block_FMA_tests, no licence stated): the program's own
+#          values: 1bit/2bit = one / two extra alignment bits detected, carry = extra carry bits, fma = FMA size, round = final rounding of the
+#          f32 result, f16 result, then alignment roundings (RZ truncation, RNE nearest even).
+#   Fasi's A100-bf16 and A100-tf32 write h_b[-1] when j is 0 (a missing brace; an out-of-bounds heap write that corrupts the heap and aborts
+#   at exit under the simulator's allocator, found with AddressSanitizer). The runs below are of copies with the braces added; on the
+#   RTX 3060 the original and the copy print the same.
+# (profile, sm of the build, tag def = default switches / pub = VGPU_TC_EXACT=published, program) result
+a100 sm80 def f_bf16 PPPPPPPPPPPPP
+a100 sm80 def f_binary16 PPPPPPPPPPPPPPPPP
+a100 sm80 def f_binary64 PPPPPPPPPPP
+a100 sm80 def f_tf32 PPPPPPPPPPPPP
+a100 sm80 def h_BF16 1bit=Passed 2bit=Failed carry=3 fma=8 norm=Delayed/Late round=RZ/RZ/RZ/RZ
+a100 sm80 def h_FP16 1bit=Passed 2bit=Failed carry=3 fma=8 norm=Delayed/Late round=RZ/RNE/RZ/RZ/RZ
+a100 sm80 def h_TF32 1bit=Passed 2bit=Failed carry=2 fma=4 norm=Delayed/Late round=RZ/RZ/RZ/RZ
+b200 sm100 def f_bf16 PPPPPFFFPFFFF
+b200 sm100 def f_binary16 PPPPPPPPFFFPPFFFF
+b200 sm100 def f_binary64 PPPPPPPPPPP
+b200 sm100 def f_tf32 PPPPPFFFPFFFF
+b200 sm100 def h_BF16 1bit=Failed 2bit=Failed carry=0 fma=1 norm=- round=RNE/RNE/RNE/RNE
+b200 sm100 def h_FP16 1bit=Failed 2bit=Failed carry=0 fma=1 norm=- round=RNE/RNE/RNE/RNE/RNE
+b200 sm100 def h_TF32 1bit=Failed 2bit=Failed carry=0 fma=1 norm=- round=RNE/RNE/RNE/RNE
+b200 sm100 pub f_bf16 PPPPFFPPPPPPF
+b200 sm100 pub f_binary16 PPPPPPPFFPPPPPPPF
+b200 sm100 pub f_binary64 PPPPPPPPPPP
+b200 sm100 pub f_tf32 PPPPFFPPPPPPF
+b200 sm100 pub h_BF16 1bit=Passed 2bit=Passed carry=4 fma=0 norm=Delayed/Late round=RZ/RZ/RZ/RZ
+b200 sm100 pub h_FP16 1bit=Passed 2bit=Passed carry=4 fma=0 norm=Delayed/Late round=RZ/RNE/RZ/RZ/RZ
+b200 sm100 pub h_TF32 1bit=Passed 2bit=Passed carry=2 fma=4 norm=Delayed/Late round=RZ/RZ/RZ/RZ
+h100 sm90 def f_bf16 PPPPFFPPPPPPF
+h100 sm90 def f_binary16 PPPPPPPFFPPPPPPPF
+h100 sm90 def f_binary64 PPPPPPPPPPP
+h100 sm90 def f_tf32 PPPPFFPPPPPPF
+h100 sm90 def h_BF16 1bit=Passed 2bit=Passed carry=4 fma=0 norm=Delayed/Late round=RZ/RZ/RZ/RZ
+h100 sm90 def h_FP16 1bit=Passed 2bit=Passed carry=4 fma=0 norm=Delayed/Late round=RZ/RNE/RZ/RZ/RZ
+h100 sm90 def h_TF32 1bit=Passed 2bit=Passed carry=2 fma=4 norm=Delayed/Late round=RZ/RZ/RZ/RZ
+l4 sm89 def f_bf16 PPPPPPPPPPPPP
+l4 sm89 def f_binary16 PPPPPPPPPPPPPPPPP
+l4 sm89 def f_binary64 PPPPPPPPPPP
+l4 sm89 def f_tf32 PPPPPPPPPPPPP
+l4 sm89 def h_BF16 1bit=Passed 2bit=Failed carry=3 fma=8 norm=Delayed/Late round=RZ/RZ/RZ/RZ
+l4 sm89 def h_FP16 1bit=Passed 2bit=Failed carry=3 fma=8 norm=Delayed/Late round=RZ/RNE/RZ/RZ/RZ
+l4 sm89 def h_TF32 1bit=Passed 2bit=Failed carry=2 fma=4 norm=Delayed/Late round=RZ/RZ/RZ/RZ
+rtx-pro-6000 sm120 def f_bf16 PPPPPFFFPFFFF
+rtx-pro-6000 sm120 def f_binary16 PPPPPPPPFFFPPFFFF
+rtx-pro-6000 sm120 def f_binary64 PPPPPPPPPPP
+rtx-pro-6000 sm120 def f_tf32 PPPPPFFFPFFFF
+rtx-pro-6000 sm120 def h_BF16 1bit=Failed 2bit=Failed carry=0 fma=1 norm=- round=RNE/RNE/RNE/RNE
+rtx-pro-6000 sm120 def h_FP16 1bit=Failed 2bit=Failed carry=0 fma=1 norm=- round=RNE/RNE/RNE/RNE/RNE
+rtx-pro-6000 sm120 def h_TF32 1bit=Failed 2bit=Failed carry=0 fma=1 norm=- round=RNE/RNE/RNE/RNE
+rtx-pro-6000 sm120 pub f_bf16 PPPPFFPPPPPPF
+rtx-pro-6000 sm120 pub f_binary16 PPPPPPPFFPPPPPPPF
+rtx-pro-6000 sm120 pub f_binary64 PPPPPPPPPPP
+rtx-pro-6000 sm120 pub f_tf32 PPPPFFPPPPPPF
+rtx-pro-6000 sm120 pub h_BF16 1bit=Passed 2bit=Passed carry=4 fma=0 norm=Delayed/Late round=RZ/RZ/RZ/RZ
+rtx-pro-6000 sm120 pub h_FP16 1bit=Passed 2bit=Passed carry=4 fma=0 norm=Delayed/Late round=RZ/RNE/RZ/RZ/RZ
+rtx-pro-6000 sm120 pub h_TF32 1bit=Passed 2bit=Passed carry=2 fma=4 norm=Delayed/Late round=RZ/RZ/RZ/RZ
+rtx3060 sm86 def f_bf16 PPPPPPPPPPPPP
+rtx3060 sm86 def f_binary16 PPPPPPPPPPPPPPPPP
+rtx3060 sm86 def f_binary64 PPPPPPPPPPP
+rtx3060 sm86 def f_tf32 PPPPPPPPPPPPP
+rtx3060 sm86 def h_BF16 1bit=Passed 2bit=Failed carry=3 fma=8 norm=Delayed/Late round=RZ/RZ/RZ/RZ
+rtx3060 sm86 def h_FP16 1bit=Passed 2bit=Failed carry=3 fma=8 norm=Delayed/Late round=RZ/RNE/RZ/RZ/RZ
+rtx3060 sm86 def h_TF32 1bit=Passed 2bit=Failed carry=2 fma=4 norm=Delayed/Late round=RZ/RZ/RZ/RZ
+t4 sm75 def f_binary16 PPPPPPPPPPPPPPPPP
+t4 sm75 def h_FP16 1bit=Passed 2bit=Failed carry=3 fma=8 norm=Delayed/Late round=RZ/RNE/RZ/RZ/RZ

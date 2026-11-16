@@ -1,0 +1,21 @@
+khattak_sample files (A100.*.txt, H100.*.txt, B200.*.txt): 24 test vectors each, copied from the model_validation/ directory of
+https://github.com/north-numerical-computing/MATLAB-tensor-core (commit 79143bd29a4a71dc7c2ed47741b63572498b17f6), converted by
+tools/tcpapers/khattak_convert.py to one line a vector. They are the recorded results of A100, H100 and B200 cards; the full sets
+are 5,000 vectors a file (tools/tcpapers/khattak-fetch.sh downloads them). Which 24: for the A100 files the first 24; for H100 and
+B200 the first 8 vectors an RTX 3060 reproduces and the first 16 it does not (so the sample can tell an Ampere sum from a Hopper one).
+
+Copyright (c) 2025, Faizan A. Khattak and Mantas Mikaitis. All rights reserved.
+BSD 2-Clause License. Redistribution and use in source and binary forms, with or without modification, are permitted provided that
+the following conditions are met: 1. Redistributions of source code must retain the above copyright notice, this list of conditions
+and the following disclaimer. 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions
+and the following disclaimer in the documentation and/or other materials provided with the distribution.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+fprev.rtx3060.txt, tc_features.rtx3060.txt: what an RTX 3060 (sm_86, driver 610.88, nvcc 13.0.88) printed. fprev.h100.txt and
+tc_features.h100.txt are the simulator's lines (profile h100, SASS engine; the PTX engine and the b200 profile with
+VGPU_TC_EXACT=published print the same): no H100 of ours has run these programs.
