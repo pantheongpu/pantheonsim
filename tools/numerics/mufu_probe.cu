@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
   const char* file = nullptr;
   uint64_t start = 0, count = 1ull << 32;
   unsigned chunk_bits = 26, nvec = 0;
-  bool src_abs = false, src_neg = false, f16 = false;
+  bool src_abs = false, src_neg = false, f16 = false, bf16 = false;
   unsigned part = 0;
   for (int i = 3; i < argc; ++i) {
     const std::string a = argv[i];
@@ -120,6 +120,7 @@ int main(int argc, char** argv) {
     else if (a == "--count" && i + 1 < argc) count = strtoull(argv[++i], nullptr, 0);
     else if (a == "--chunk-bits" && i + 1 < argc) chunk_bits = strtoul(argv[++i], nullptr, 0);
     else if (a == "--f16") f16 = true;
+    else if (a == "--bf16") f16 = bf16 = true;   // the same instruction bit on sm_90: MUFU.<op>.BF16, the bfloat16 form (checked against the same unit, widened by a shift)
     else if (a == "--h1") part = 1;
     else if (a == "--abs") src_abs = true;
     else if (a == "--neg") src_neg = true;
@@ -185,7 +186,7 @@ int main(int argc, char** argv) {
     c.run_dump(0, 65536, r.data());
     uint64_t h = kFnvBasis;
     for (uint32_t i = 0; i < 65536; ++i) h = (h ^ r[i]) * kFnvPrime;
-    printf("%s%s all %016llx\n", kOps[op], f16 ? ".F16" : "", static_cast<unsigned long long>(h));
+    printf("%s%s all %016llx\n", kOps[op], bf16 ? ".BF16" : f16 ? ".F16" : "", static_cast<unsigned long long>(h));
     return 0;
   }
   if (mode == Vectors) {
@@ -238,7 +239,7 @@ int main(int argc, char** argv) {
         uint32_t h = part ? x >> 16 : x & 0xffffu;
         if (src_abs) h &= 0x7fffu;
         if (src_neg) h ^= 0x8000u;
-        m = vgpu::mufu::eval_f16(static_cast<unsigned>(op), h);
+        m = bf16 ? vgpu::mufu::eval(static_cast<unsigned>(op), h << 16) >> 16 : vgpu::mufu::eval_f16(static_cast<unsigned>(op), h);
       } else
         m = vgpu::mufu::eval(static_cast<unsigned>(op), (src_abs ? x & 0x7fffffffu : x) ^ (src_neg ? 0x80000000u : 0u));
       if (m == r[i]) continue;

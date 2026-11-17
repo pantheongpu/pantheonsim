@@ -1,0 +1,4 @@
+ex2.approx.f16 80729ac6ad55e21a
+tanh.approx.f16 ad1f254087177b9d
+ex2.approx.f16x2 0c4f224d842ce21a
+tanh.approx.f16x2 6bc878bf44617b9d

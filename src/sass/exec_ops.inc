@@ -2073,8 +2073,8 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       const unsigned op = ins.f[0];
       if (op > 9 || ins.src.empty() || !plain(ins.src[0]) || ins.src[0].bnot || ins.dst[0].kind != Kind::Reg)
         return false;
-      if (ins.f[1] && vgpu::mufu::enabled() && vgpu::mufu::has_f16(op)) return false;   // the half-precision form: exec_float (below) computes it
-      if (!ins.f[1] && vgpu::mufu::has(op) && vgpu::mufu::enabled()) {
+      if ((ins.f[1] || ins.f[2]) && vgpu::mufu::enabled() && vgpu::mufu::has_f16(op)) return false;   // the half-precision forms (.F16, .BF16): exec_float (below) computes them
+      if (!ins.f[1] && !ins.f[2] && vgpu::mufu::has(op) && vgpu::mufu::enabled()) {
         // The card's unit (vgpu/exec/mufu_model.hpp), unless VGPU_MUFU_EXACT=0: the operand's bits with |x| and -x applied (to the
         // upper word's sign in the 64H forms too: an RTX 3060's MUFU.RCP64H R, -|R|), the result's bits as the unit gives them.
         const uint32_t* a = lanes(0, ins.src[0], true);
@@ -2631,17 +2631,19 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
       const unsigned op = ins.f[0];
       // The card's unit (vgpu/exec/mufu_model.hpp: measured on an RTX 3060, every input), which the PTX engine's .approx forms
       // go through too. VGPU_MUFU_EXACT=0 and the half-precision forms: the function at the host's precision, below.
-      const bool model = !ins.f[1] && vgpu::mufu::has(op) && vgpu::mufu::enabled();
+      const bool model = !ins.f[1] && !ins.f[2] && vgpu::mufu::has(op) && vgpu::mufu::enabled();
       // MUFU.<op>.F16 (the F16 bit): the half of the source register that the instruction selects (.H1), |x| and -x on the half's sign
       // bit, the card's result (include/vgpu/exec/mufu_model.hpp, eval_f16: the single-precision unit on the exact float, cut toward
       // zero to a half) in the low 16 bits and zeros above. With VGPU_MUFU_EXACT=0 the register is read as a float, as before.
-      const bool model16 = ins.f[1] && vgpu::mufu::has_f16(op) && vgpu::mufu::enabled();
+      // MUFU.<op>.BF16 (sm_90 and later, f[2]): the same with eval_bf16 (the unit on the bfloat16 widened by a shift, the upper 16 bits
+      // of its result; measured on an H100 over every register, include/vgpu/exec/mufu_model.hpp).
+      const bool model16 = (ins.f[1] || ins.f[2]) && vgpu::mufu::has_f16(op) && vgpu::mufu::enabled();
       each_lane(ex, [&](unsigned l) {
         if (model16) {
           uint32_t h = (read32(w, ins.src[0], l) >> (16 * ins.f[5])) & 0xffffu;
           if (ins.src[0].abs) h &= 0x7fffu;
           if (ins.src[0].neg) h ^= 0x8000u;
-          write32(w, ins.dst[0], l, vgpu::mufu::eval_f16(op, h));
+          write32(w, ins.dst[0], l, ins.f[2] ? vgpu::mufu::eval_bf16(op, h) : vgpu::mufu::eval_f16(op, h));
           return;
         }
         if (model) {
