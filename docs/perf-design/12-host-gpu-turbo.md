@@ -759,7 +759,7 @@ What changed in turbo mode, and why:
 6. **Kept as they were** (safety, not bit-exactness): cooperative and cluster launches (the card path is a plain `cuLaunchKernel`), host-mapped arguments, VMM, IPC and managed memory, module
    variables the patch cannot apply, externs other than `vprintf`, texture objects, no code section, the diagnostics that need the simulator, and the watchdog.
 
-Not built: retargeting `.target sm_90` PTX to the card's architecture (rewrite the target, let the driver compile what the card's ISA accepts; blockers are `wgmma`, clusters, TMA, `elect`,
+Built later, narrowly, in section 16.3 (this paragraph described it as not built): retargeting `.target sm_90` PTX to the card's architecture (rewrite the target, let the driver compile what the card's ISA accepts; blockers are `wgmma`, clusters, TMA, `elect`,
 `setmaxnreg`... and a launch shape the card lacks). `scan_ptx_for_card` and the image choice are where it would hook in. Multi-card is out of scope.
 
 Limits: a simulated profile with an sm_90-only build (`-arch=sm_90`, no older cubin or PTX) has no image an sm_86 card runs; its kernels stay in the simulator. Libraries loaded with `cuLibraryLoadData` give the card the image the
