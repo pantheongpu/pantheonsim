@@ -84,15 +84,17 @@ evidence:
 ```yaml
 # nvidia/profiles/b200.yaml
 numerics:
-  tensor_sum: sequential           # sequential | ampere | hopper
-  tensor_sum_published: hopper     # a published model exists; NOT in force by default: VGPU_TC_EXACT=published turns it on
+  tensor_sum: hopper               # sequential | ampere | hopper
+  tensor_sum_chunk: 16             # products to a chunk, f16 and bf16
+  tensor_sum_chunk_tf32: 8         # ... tf32
+  tensor_sum_grid: 26              # a chunk's terms are cut at 2^(top - 26)
 provenance:
-  unknown: [numerics.tensor_sum]
-  inferred: [numerics.tensor_sum_published]
+  inferred: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]
 evidence:
-  numerics.tensor_sum: "no card of compute capability 10.0 has been run by us. ..."
-  numerics.tensor_sum_published: "published, not measured by us: MMA-Sim (Xie et al., arXiv 2511.10909) and ..."
+  numerics: "inferred from data recorded by others on a B200 (compute capability 10.0), NOT run by us on a card. ..."
 ```
+(Until 2026-11-16 this profile said `tensor_sum: sequential` with `tensor_sum_published: hopper`; the profiles that still do are
+`rtx5090` and the `rtx-pro-*` ones.)
 
 ### `numerics:`
 
@@ -107,7 +109,7 @@ from the loaded profile**; no engine compares a compute capability for it (`tc86
 | `tensor_sum_chunk` | integer | Products to a chunk, f16 and bf16: 8 (`ampere`), 16 (`hopper`). |
 | `tensor_sum_chunk_tf32` | integer | The same for tf32: 4, 8. |
 | `tensor_sum_grid` | integer | A chunk's terms are cut at `2^(top - grid)`: 25, 26. |
-| `tensor_sum_published` | `ampere` or `hopper` (optional, only beside `tensor_sum: sequential`) | The model the literature gives the device, which no card of ours has checked. Never in force by default: `VGPU_TC_EXACT=published` turns it on. |
+| `tensor_sum_published` | `ampere` or `hopper` (optional, only beside `tensor_sum: sequential`) | The model the literature gives the device, which no card of ours has checked and no recorded data covers. Never in force by default: `VGPU_TC_EXACT=published` turns it on (the sm_120 profiles only now: `b200` and `gb200` have the rule in force). |
 
 Rules the loader enforces (a profile that breaks one does not load, and the message names the file and the key):
 
@@ -123,7 +125,7 @@ Rules the loader enforces (a profile that breaks one does not load, and the mess
 The numerics are part of the result cache's key (`memo::profile_hash`, `src/runtime/memo.cpp`): two profiles that differ only in
 a numerics value never share a cached result. The classes and the evidence text are not: they change no result.
 
-`VGPU_TC_EXACT` works on top of the profile, as before: `0` is the sequential sum whatever the profile says, `force` gives a
+`VGPU_TC_EXACT` works on top of the profile, as before: `0` is the sequential sum whatever the profile says (the way back to the earlier results on `b200` and `gb200`), `force` gives a
 profile whose `tensor_sum` is `sequential` the `ampere` rule, `published` gives it its `tensor_sum_published`.
 
 ### `provenance:`
@@ -174,11 +176,11 @@ The text is one quoted line and may not contain a double quote.
 | Class of `numerics.tensor_sum` | Profiles | Why |
 | --- | --- | --- |
 | `measured` (7) | `rtx3060`, `a10g`, `t4`, `l4`, `l40s`, `a100-sxm4-40gb` (`ampere`); `h100-pcie` (`hopper`) | A card of exactly this model was run (2026-11-15 and, for the RTX 3060, before). The T4's `tensor_sum_chunk_tf32` alone is `inferred`: a Turing card has no tf32 form to measure. |
-| `inferred` (20) | 7.5: `rtx2080ti`. 8.0: `a100` (the SXM4 80 GB), `a100-80gb-pcie`, `a30`. 8.6: `a10`, `a40`, `rtx-a5000`, `rtx-a6000`, `rtx3070`, `rtx3080ti`, `rtx3090`. 8.9: `l40`, `rtx4080`, `rtx4090`, `rtx6000-ada`. 9.0: `h100` (the SXM5 80 GB, **the default profile**), `h100-nvl`, `h200`, `h200-nvl`, `gh200-480gb` | Another model of the same compute capability was run, not this one. The sum is the measured card's. |
-| `unknown` (11) | 10.0: `b200`, `gb200`. 12.0: `rtx5090`, `rtx-pro-4500`, `rtx-pro-6000`, `rtx-pro-6000-server`, `rtx-pro-6000-max-q` (these seven carry `tensor_sum_published: hopper`, itself `inferred`). 10.3 `b300`, 10.7 `vr200`, 11.0 `thor`, 12.1 `gb10` (nothing published) | No card of the compute capability was run. They keep the sequential sum. |
+| `inferred` (22) | 7.5: `rtx2080ti`. 8.0: `a100` (the SXM4 80 GB), `a100-80gb-pcie`, `a30`. 8.6: `a10`, `a40`, `rtx-a5000`, `rtx-a6000`, `rtx3070`, `rtx3080ti`, `rtx3090`. 8.9: `l40`, `rtx4080`, `rtx4090`, `rtx6000-ada`. 9.0: `h100` (the SXM5 80 GB, **the default profile**), `h100-nvl`, `h200`, `h200-nvl`, `gh200-480gb`. 10.0 (`hopper`, since 2026-11-16): `b200`, `gb200` | Another model of the same compute capability was run, not this one; the sum is the measured card's. For `b200` and `gb200` no card of ours was run at all: the sum is inferred from 20,000 vectors recorded by others on a B200 (docs/numerics/tcpapers.md). |
+| `unknown` (9) | 12.0: `rtx5090`, `rtx-pro-4500`, `rtx-pro-6000`, `rtx-pro-6000-server`, `rtx-pro-6000-max-q` (these five carry `tensor_sum_published: hopper`, itself `inferred`). 10.3 `b300`, 10.7 `vr200`, 11.0 `thor`, 12.1 `gb10` (nothing published) | No card of the compute capability was run. They keep the sequential sum. |
 
 Moving the sum from a table keyed on the compute capability into the profiles changed no result: `test_exec3`
-(`tc_model_devices`) holds each of the 38 profiles to the model that table gave it, in every `VGPU_TC_EXACT` mode. A card run
+(`tc_model_devices`) holds each of the 38 profiles to the model that table gave it, in every `VGPU_TC_EXACT` mode, except `b200` and `gb200`, which are the deliberate departure of 2026-11-16 (Hopper instead of sequential). A card run
 that turns an `inferred` or `unknown` into `measured` changes the profile, its row in `test_profile` and, if the model changes,
 its pin in `test_exec3` together.
 

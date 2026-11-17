@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Round sp76, the card part: run on the rig (one A10G), from the root of the source tree, with the corpora in ~/corp
 # (tools/bench/real/pack_corpora.sh's layout: the sm_86 binaries built with nvcc 13.0 and -cudart shared, the CUDA Samples under ~/corp/samples).
-# Nothing of this was run when the round was written: the round had no card. What each stage should show is in README.md, "The card run".
+# Nothing of this was run when the round was written: the round had no card; it was run on an A10G on 2026-11-15 (card.md). What each stage should show is in README.md, "The card run".
 #   docs/perf-design/data/sp76/card-run.sh <stage> [out dir]        stages: build fork decisions changed keep pf rest, and all (in that order)
 # Forms: turbo and exact are this round's rule; turbod0 and exactd0 the same build with VGPU_HOST_GPU_SAMPLE_STARTED=0, the rule before it (no
 # launch is sampled once the driver's start has begun). The harness interleaves them, run by run.

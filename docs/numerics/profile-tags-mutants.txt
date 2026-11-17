@@ -19,7 +19,7 @@ L12 a placeholder is not unknown by default                   test_profile: the_
 L13 an untagged key of a verified profile becomes measured    test_profile: numerics_and_their_provenance_parse, every_builtin_profile_tags_its_numerics
 # -- profiles --
 P1  nvidia/h100 says ampere (8 / 4 / 25)                      test_exec3: tc_model_devices, tc_exact_switch_changes_only_sm86_tensor_sums
-P2  nvidia/b200 loses tensor_sum_published                    test_exec3: both
+P2  nvidia/rtx5090 loses tensor_sum_published                  test_exec3: both   (2026-11-16: was nvidia/b200, which now has tensor_sum: hopper)
 P3  nvidia/b300 gains tensor_sum_published                    test_exec3: both
 P4  nvidia/a10 claims measured                                test_profile: every_builtin_profile_tags_its_numerics
 P5  nvidia/l40: one numerics key loses its tag                test_profile: all_builtin_profiles_parse and every test that loads the profiles

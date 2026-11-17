@@ -4,7 +4,7 @@
 #
 #   tools/fttn/run-sim.sh <dir> <build-dir> <out-dir> [ENV=value ...]
 #
-# e.g. VGPU_TC_EXACT=0 (the sequential sums), VGPU_TC_EXACT=published (Blackwell profiles take the published model),
+# e.g. VGPU_TC_EXACT=0 (the sequential sums), VGPU_TC_EXACT=published (the sm_120 Blackwell profiles take the published model; b200 and gb200 have it by default),
 # VGPU_MFMA_CDNA2=fttn (the opt-in MI250X rule). The AMD runs need ROCm's libraries on LD_LIBRARY_PATH.
 # FTTN's summary prints the block width in hexadecimal after a hex dump earlier in the run: "10" in a bf16 row is 16.
 set -uo pipefail

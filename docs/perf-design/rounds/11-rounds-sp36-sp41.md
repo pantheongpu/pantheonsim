@@ -5405,8 +5405,7 @@ Branch `sp76-turbo-driver-up`, on the head of PR #669 (Round sp75 and its card r
 four still simulated, 149 s of 193 s) and #659 (the first launches of kernels a program launches after its driver start), with Rodinia
 particlefilter_float (unsettled in Round sp75's card run), #662 (HeCBench silu: the start bought late) and the rest of #656 (the launches
 under the sampling floor in a young process) measured and not changed. Design: [12-host-gpu-turbo.md](../12-host-gpu-turbo.md), section 13.
-Data and commands: [`data/sp76/`](../data/sp76/README.md). **Everything below is server3 with the stand-in driver. The round had no card:
-no win is measured, and whether a process that holds the real driver can be forked is the first thing `data/sp76/card-run.sh` asks a card.**
+Data and commands: [`data/sp76/`](../data/sp76/README.md). **Everything below but the next paragraph is server3 with the stand-in driver; the round had no card when it was written. Card run afterwards, A10G, 2026-11-15** ([`data/sp76/card.md`](../data/sp76/card.md)): the fork of a process that holds the real driver is safe (20 of 20 runs in each mode, no `NVRM` or `Xid` line, 5 ms a fork); aidw 181.57 s to 44.41 s with 4 of 4 launches on the card, mergeSort 3.18 to 2.12 s, histogram 3.27 to 2.30 s, segmentationTreeThrust 6.52 to 5.25 s, outputs identical; no program that takes such a sample slower, but samples/interval (1.09) and samples/reduction (1.07) read slower in one run and were not rerun.
 
 **The question.** Round sp75's card run sent aidw's first kernel on a block stopped at its limit and left the first launch of its second
 kernel, `AIDW_Kernel_Tiled`, in the simulator: `host_gpu_nosample: ... blocks=400 threads_per_block=256 instrs=2624 loop=1 reason=the driver
@@ -5589,14 +5588,14 @@ out) in all but two programs: radixsort2, whose counters differ as much between 
 against new: its keys are random). segmentationTreeThrust's counters differ between two runs of one build as well (50 of 514 launches; 48 old against new). The digests were not compared; the simulator's own code is untouched but for
 `sample_in_copy`, which only the mode calls.
 
-**What the card must show** (`data/sp76/card-run.sh`, stages `build fork decisions changed keep pf rest`; the table of expected outcomes
+**What the card must show** (all of it was run on 2026-11-15: results in [`data/sp76/card.md`](../data/sp76/card.md) and the first paragraph above; the expectations are kept as they were written) (`data/sp76/card-run.sh`, stages `build fork decisions changed keep pf rest`; the table of expected outcomes
 is in `data/sp76/README.md`). In order: the card test's step 13 passes (the process forked while it holds the real driver, the second
 launch on the card after it, the output the mode-off output) and twenty runs in each mode leave no line in the kernel log; aidw runs its
 four launches on the card, 193 s to about 45 s; segmentationTreeThrust, histogram and mergeSort send the first launches they kept; no
 program of the keep list is more than 3 % slower than with the switch off; particlefilter's forms agree at one host thread and fall in
 the same two groups at four.
 
-**Not run.** A card. The full ctest set (the round built the runtime, the driver shim and `test_host_gpu_logic`, and ran the unit test,
+**Not run when the round was written** (the card run above did the card test's step 13 and `card-run.sh`; the rest below stands). The full ctest set (the round built the runtime, the driver shim and `test_host_gpu_logic`, and ran the unit test,
 the stand-in test and the harness's self-test). The card test's step 13 (it needs a card; its script was written and not executed). The stand-in test's new steps and the rule itself against memory
 the card really changed (the stand-in keeps what it is sent and computes nothing). `card-run.sh` itself and the card test's script: written, parsed on server3
 (`bash -n`), not executed. The census's programs of minutes (above).

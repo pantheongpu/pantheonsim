@@ -14,6 +14,7 @@
 #   check.txt          (MUFU_CHECK=1) every result against the simulator's model, include/vgpu/exec/mufu_model.hpp: the number
 #                      that differ and the first of them. About a minute an operation on one host core.
 #   <OP>.<start>.bin   (MUFU_DUMP="RCP:0x3f800000:0x800000 ...") the raw results of a range, for fitting a card that differs
+#   hashes16.txt       the half-precision forms (MUFU.<op>.F16 and the PTX .f16/.f16x2 forms): a hash over all 65,536 patterns each
 # Exit status: 0 when every operation that ran has the RTX 3060's hashes, 1 otherwise.
 #
 # Environment: NVCC (the compiler), MUFU_OPS (default: all ten), MUFU_CHECK, MUFU_DUMP, CUDA_VISIBLE_DEVICES (the card; the
@@ -66,6 +67,42 @@ for op in "${ops[@]}"; do
   fi
   if [[ "${MUFU_CHECK:-0}" == 1 ]]; then "$out/mufu_probe" "$out/mufu_kernel.cubin" "$op" --check >> "$out/check.txt" 2>&1; tail -1 "$out/check.txt"; fi
 done
+# The half-precision forms (MUFU.<op>.F16 and the PTX forms): every one of the 65,536 half patterns, hashed, against the RTX 3060's
+# (tools/numerics/mufu/rtx3060.f16.hashes.txt). MUFU_CHECK=1 also checks all 2^32 registers of each against the model.
+ref16="$here/mufu/rtx3060.f16.hashes.txt"
+: > "$out/hashes16.txt"
+if [[ -z "${MUFU_NO_F16:-}" ]]; then
+  for op in COS SIN EX2 LG2 RCP RSQ SQRT TANH; do
+    "$out/mufu_probe" "$out/mufu_kernel.cubin" "$op" --f16 --cubin-out "$out/rewritten.cubin" > /dev/null || { echo "$op.F16: not rewritten" | tee -a "$out/compare.txt"; status=1; continue; }
+    if command -v nvdisasm > /dev/null || [[ -x "$cuda_root/bin/nvdisasm" ]]; then
+      dis="$(command -v nvdisasm || echo "$cuda_root/bin/nvdisasm")"
+      { echo "== $op.F16"; "$dis" "$out/rewritten.cubin" | grep -E '^\.text\.|MUFU' | sed 's/^ *//'; } >> "$out/sass.txt"
+    fi
+    rm -f "$out/rewritten.cubin"
+    if ! "$out/mufu_probe" "$out/mufu_kernel.cubin" "$op" --f16 --hash16 >> "$out/hashes16.txt" 2> "$out/$op.err"; then
+      echo "$op.F16: did not run ($(head -1 "$out/$op.err"))" | tee -a "$out/compare.txt"; status=1
+    fi
+    rm -f "$out/$op.err"
+    if [[ "${MUFU_CHECK:-0}" == 1 ]]; then
+      for fl in "" "--h1"; do "$out/mufu_probe" "$out/mufu_kernel.cubin" "$op" --f16 $fl --check >> "$out/check.txt" 2>&1; tail -1 "$out/check.txt"; done
+    fi
+  done
+  # The PTX forms: nvcc's own code for ex2.approx.f16, .f16x2 and tanh.approx.f16, .f16x2 (cubin disassembly to sass.txt).
+  if "$nvcc_bin" -std=c++17 -arch="sm_$cap" -Wno-deprecated-gpu-targets "$here/mufu_f16_forms.cu" -o "$out/mufu_f16_forms" 2> "$out/f16forms.build.err"; then
+    "$out/mufu_f16_forms" >> "$out/hashes16.txt" || { echo "mufu_f16_forms did not run" | tee -a "$out/compare.txt"; status=1; }
+    rm -f "$out/f16forms.build.err"
+  else
+    echo "mufu_f16_forms does not build here:"; head -3 "$out/f16forms.build.err" | tee -a "$out/compare.txt"; status=1
+  fi
+  if [[ -f "$ref16" ]]; then
+    if diff <(grep -v '^#' "$ref16" | sort) <(sort "$out/hashes16.txt") > "$out/d.tmp"; then
+      echo "half-precision forms: the same as the RTX 3060 on all 65,536 patterns of each" | tee -a "$out/compare.txt"
+    else
+      echo "half-precision forms: DIFFER from the RTX 3060: $(grep '^>' "$out/d.tmp" | cut -d' ' -f2 | tr '\n' ' ')" | tee -a "$out/compare.txt"; status=1
+    fi
+    rm -f "$out/d.tmp"
+  fi
+fi
 for spec in ${MUFU_DUMP:-}; do
   IFS=: read -r op start count <<< "$spec"
   "$out/mufu_probe" "$out/mufu_kernel.cubin" "$op" --dump "$out/$op.$start.bin" --start "$start" --count "$count" && echo "dumped $op $start +$count"

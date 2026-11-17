@@ -48,20 +48,21 @@ and sm_90 builds of the same program, and an RTX 3060 its own for sm_75 and sm_8
 | 8.6 (GA10x) | rtx3060, rtx3070, rtx3080ti, rtx3090, a10, a10g, a40, rtx-a5000, rtx-a6000 | `Ampere` | measured | RTX 3060, A10G |
 | 8.9 (Ada) | l4, l40, l40s, rtx4080, rtx4090, rtx6000-ada | `Ampere` | measured | L4, L40S |
 | 9.0 (Hopper) | h100, h100-pcie, h100-nvl, h200, h200-nvl, gh200-480gb | `Hopper` | measured | H100 PCIe |
-| 10.0, 12.0 (Blackwell) | b200, gb200; rtx5090, rtx-pro-4500, rtx-pro-6000, -server, -max-q | `Sequential` by default; `Hopper` with `VGPU_TC_EXACT=published` | published, not measured by us | MMA-Sim and Khattak-Mikaitis give B200 and RTX PRO 6000 Blackwell the Hopper numbers |
+| 10.0 (Blackwell) | b200, gb200 | `Hopper` by default (since 2026-11-16; before: `Sequential`) | inferred: data recorded by others on a B200, not run by us | Khattak-Mikaitis's 20,000 B200 vectors: 0 mismatches with `Hopper`, 8,020 with `Sequential`; MMA-Sim gives Blackwell the same numbers |
+| 12.0 (Blackwell) | rtx5090, rtx-pro-4500, rtx-pro-6000, -server, -max-q | `Sequential` by default; `Hopper` with `VGPU_TC_EXACT=published` | published, not measured by us | MMA-Sim gives RTX PRO 6000 Blackwell the Hopper numbers; the recorded vectors contain no sm_120 card |
 | 10.3, 10.7, 11.0, 12.1, 8.7 | b300, vr200, thor, gb10 | `Sequential` | unmeasured | no source covers them |
 | 7.0 (Volta) | no profile | - | published | block 4, no extra bit (`G` 24); a V100 profile would be new, and CUDA 13 cannot build sm_70 |
 
 The Status column is per compute capability: a card of that capability was run. Per profile the profile says more, in
 `provenance:`. `measured` there means a card of **that model** was run; a profile of another model of the same compute capability
-is `inferred`; a profile whose capability no card of ours has run is `unknown` and keeps the sequential sum (`vgpu info --gpu
+is `inferred`; a profile whose capability no card of ours has run is `unknown` and keeps the sequential sum, except b200 and gb200, whose capability (10.0) a B200 *somebody else* recorded 20,000 vectors on: their Hopper rule is `inferred` from that data (`vgpu info --gpu
 <id>` prints the class and the evidence):
 
 | Class of `numerics.tensor_sum` in the profile | Profiles |
 |---|---|
 | `measured` | rtx3060, a10g, t4 (its tf32 chunk is `inferred`: no tf32 form on Turing), l4, l40s, a100-sxm4-40gb, h100-pcie |
-| `inferred` | rtx2080ti; a100, a100-80gb-pcie, a30; a10, a40, rtx-a5000, rtx-a6000, rtx3070, rtx3080ti, rtx3090; l40, rtx4080, rtx4090, rtx6000-ada; h100 (the default profile), h100-nvl, h200, h200-nvl, gh200-480gb |
-| `unknown` | b200, gb200, rtx5090, rtx-pro-4500, rtx-pro-6000, rtx-pro-6000-server, rtx-pro-6000-max-q (each with `numerics.tensor_sum_published: hopper`, class `inferred`: the published model, opt-in); b300, vr200, thor, gb10 (nothing published) |
+| `inferred` | rtx2080ti; a100, a100-80gb-pcie, a30; a10, a40, rtx-a5000, rtx-a6000, rtx3070, rtx3080ti, rtx3090; l40, rtx4080, rtx4090, rtx6000-ada; h100 (the default profile), h100-nvl, h200, h200-nvl, gh200-480gb; **b200, gb200** (`hopper`, from the B200 vectors recorded by Khattak and Mikaitis, 2026-11-16: not a card run of ours, and not run on a GB200) |
+| `unknown` | rtx5090, rtx-pro-4500, rtx-pro-6000, rtx-pro-6000-server, rtx-pro-6000-max-q (each with `numerics.tensor_sum_published: hopper`, class `inferred`: the published model, opt-in); b300, vr200, thor, gb10 (nothing published) |
 
 Everywhere: the f64 form (DMMA) is a chain of IEEE double fused multiply-adds in the order of K, which is what FTTN's fp64
 program prints on every card we ran it on (RTX 3060, A10G, L4, L40S, A100, H100: three extra bits, round to nearest even, sticky
@@ -114,7 +115,8 @@ tile with an f16 accumulator, or with bf16 / tf32 operands small enough for a pr
 
 `VGPU_TC_EXACT`: unset, each device sums by its model. `0`: the sequential f32 sum on every device, as the earliest releases
 (bit for bit; pinned by `simd_lane_forms.*.tcseq.txt`). `force`: a device without a measured model takes `Ampere`.
-`published`: a device without a measured model takes the published one where there is one (Blackwell: `Hopper`).
+`published`: a device without a model in force takes the published one where there is one (the sm_120 Blackwell profiles: `Hopper`; b200 and gb200 have `Hopper` in force already, so it changes nothing there).
+**The way back for b200 and gb200** is `VGPU_TC_EXACT=0`, the existing switch: the earlier sequential sum, bit for bit, on them and on every other device (there is no per-device opt-out and none was added).
 In the profile's terms: `0` ignores `numerics.tensor_sum`; `force` and `published` act only on a profile whose `tensor_sum` is
 `sequential`, giving it `ampere` or its `numerics.tensor_sum_published`.
 
@@ -123,6 +125,13 @@ rtx4090 and rtx6000-ada profiles (sequential to `Ampere`); the h100*, h200* and 
 SASS engine an sm_86 cubin on a profile that is not 8.6 (it took the RTX 3060's sum whatever the profile: now the device's, as
 the PTX engine always did) and an sm_75 / sm_80 / sm_89 cubin on an 8.6 profile; and the four corners on every `Ampere` profile.
 `VGPU_TC_EXACT=0` gives the sequential sums back; the corners have no switch (the earlier answers were wrong on the card).
+
+**2026-11-16: Blackwell b200 and gb200 changed too.** Their tensor-core sums (f16, bf16, tf32: wmma, `mma.sync`, SASS `HMMA`) went from the sequential
+f32 sum to the Hopper rule by default, so the outputs of a program that uses those instructions on the b200 or gb200 profile change
+(not `tcgen05.mma`, `wgmma`, the sparse, FP8 and f64 forms: unchanged). Evidence: the 20,000 vectors Khattak and Mikaitis recorded on
+a B200 are reproduced bit for bit by the Hopper rule and 8,020 of them are not by the sequential sum; class `inferred` (others' data,
+not a run of ours). `VGPU_TC_EXACT=0` gives the old results back. b300, vr200, thor, gb10 and the sm_120 profiles are unchanged:
+no recorded vectors cover them.
 
 ## AMD profiles
 
@@ -213,7 +222,8 @@ The motivating example (`D = C - A x B`, the real-number answer is 191.984375):
 |---|---|---|---|---|
 | t4, rtx3060, a10g, a100, l4, l40s | A100, V100: 0 | 0 | 0 | 0 on all six |
 | h100 | 191.875 | 0 | 191.875 | 191.875 |
-| b200, rtx-pro-6000, rtx5090 | - | 0 | 0 (191.875 with `VGPU_TC_EXACT=published`) | none |
+| b200 | - | 0 | 191.875 (from 2026-11-16; 0 with `VGPU_TC_EXACT=0`) | none |
+| rtx-pro-6000, rtx5090 | - | 0 | 0 (191.875 with `VGPU_TC_EXACT=published`) | none |
 | mi250x | 0 | 192 | 192 (0 with `VGPU_MFMA_CDNA2=fttn`) | none |
 | mi300x, mi325x, rx7900xtx, rx9070xt | - | 192 | 192 | none |
 
@@ -227,6 +237,18 @@ Open, found on the way: an sm_75 build of `float_half_forms` folds `__hmul2` and
 SASS executor's answer for that line (`half_form_30`) differs from the PTX engine's and from the RTX 3060's line; no Turing card
 has run the program, so it is left out of the sm_75 SASS comparison and not changed.
 
+## Three more papers, run on the RTX 3060 and the simulator
+
+Fasi et al. (PeerJ CS 2021), Khattak and Mikaitis (arXiv 2512.07004, HPEC 2025) and FPRev (Xie et al., USENIX ATC 2025, arXiv
+2411.00442) were run the way FTTN was; everything is in [numerics/tcpapers.md](numerics/tcpapers.md) and the programs in
+`tools/tcpapers/`. In short: on the RTX 3060 every program prints the same on the card and the simulator (both engines); the
+5,000-vector validation sets Khattak and Mikaitis recorded on A100, A2, Ada, L40S, H100 and H200 cards are reproduced bit for bit by
+the profile of that card, and a **B200's** by the Hopper rule (0 of 20,000 vectors, against 8,020 mismatches from the sequential sum
+the b200 profile had until 2026-11-16, and has again with `VGPU_TC_EXACT=0`), so the b200 and gb200 profiles now use that rule by default
+(sm_120 stays on the sequential sum: their data has no RTX PRO 6000). FPRev's summation trees of the tensor-core loops are the 9-way (8+1) and 17-way (16+1) fused sums the paper reports
+for an A100 and an H100. The one measured disagreement is the simulator's cuBLAS, which adds every product type in one sequential chain
+where the card's does not. CI: `e2e_tcpapers` (`nvidia/tests/e2e/run_tcpapers.sh`, pinned files in `nvidia/tests/data/tcpapers/`).
+
 ## What a card is still wanted for
 
 `tools/fttn/card-run.sh <out-dir>` runs everything on a rented card (FTTN, both probes against the pinned file of the card's
@@ -237,7 +259,8 @@ class `measured` and the run as its evidence, and into the other profiles of its
 
 | Card | Why |
 |---|---|
-| B200 or RTX PRO 6000 Blackwell (sm_100, sm_120) | no run of ours; the published model is opt-in until then |
+| B200 (sm_100) | no run of ours; the Hopper rule is in force on b200 and gb200 as `inferred` from others' recorded vectors, until a card of ours says `measured` (tcgen05 and the GB200 itself are unmeasured) |
+| RTX PRO 6000 Blackwell (sm_120) | no run of ours; the published model is opt-in until then |
 | Tesla T4 | `float_half_forms -DNO80` (the open `HMUL2.F32` line; the m16n8k8 mma lines) |
 | any Ampere, Ada or Hopper card | the corners R1, R3, R4 (S1 and S2 are on the RTX 3060 only; an H100's S1 and S2 are the published model's word) |
 | V100 (sm_70) | block 4 and no extra bit are published; needs a CUDA 12 toolkit and a new profile |
@@ -259,3 +282,9 @@ published results and which cards, what the simulator's own two engines disagree
 - FTTN: arXiv 2403.00232, github.com/LLNL/FTTN (MIT).
 - MMA-Sim: Xie, Xu, Wang, Yang, Yang, "Bit-Accurate Modeling of GPU Matrix Multiply-Accumulate Units", arXiv 2511.10909 (MIT).
 - Khattak, Mikaitis, "Accurate Models of NVIDIA Tensor Cores", arXiv 2512.07004.
+- Fasi, Higham, Mikaitis, Pranesh, "Numerical behavior of NVIDIA tensor cores", PeerJ Computer Science 7:e330, 2021;
+  github.com/north-numerical-computing/tensor-cores-numerical-behavior (GPL-2.0; run, not copied).
+- Khattak, Mikaitis, HPEC 2025 test methodology (github.com/faiziktk/IEEE_HPEC2025_block_FMA_tests, no licence stated; run, not copied) and
+  github.com/north-numerical-computing/MATLAB-tensor-core (BSD-2: models and recorded test vectors).
+- Xie, Gao, Wang, Xue, "Revealing Floating-Point Accumulation Orders in Software/Hardware Implementations" (FPRev), USENIX ATC 2025,
+  arXiv 2411.00442, github.com/peichenxie/FPRev (MIT).

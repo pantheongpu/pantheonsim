@@ -32,8 +32,9 @@
 # the RTX 3060's 60 lines and a Tesla T4 its 56, measured 2026-11-15. So the same program built for sm_75 (-DNO80), sm_80 and sm_89 must
 # print the card's lines on the t4 / rtx2080ti, a100 and l4 / l40s profiles on both engines, and the sequential pins with
 # VGPU_TC_EXACT=0. An sm_90 build on the h100 profile must print the H100's lines, and so must an sm_86 build there: the device chooses
-# the sum, not what the cubin was built for. On the profiles that keep the sequential sum (b200, rtx-pro-6000: not measured) an sm_100
-# or sm_120 build prints the sequential pins by default and the RTX 3060's lines with VGPU_TC_EXACT=force.
+# the sum, not what the cubin was built for. The b200 and gb200 profiles sum by the Hopper rule by default (inferred from data recorded by
+# others on a B200, 2026-11-16) and print the H100's lines; the profiles that keep the sequential sum (rtx-pro-6000 and the rest of Blackwell:
+# no recorded vectors) print the sequential pins by default and the RTX 3060's lines with VGPU_TC_EXACT=force.
 #
 #   run_simd_lane_forms.sh                  simulator vs the pinned files, with the tensor-core model on (the default) and off
 #   run_simd_lane_forms.sh --card [--update]   NVIDIA's runtime on a real GPU vs the card file (or rewrite it). The program is built for
@@ -167,8 +168,20 @@ done
 changed="$( { diff "$data/simd_lane_forms.rtx3060.txt" "$data/simd_lane_forms.h100.txt" || true; } | { grep '^>' || true; } | awk '{print $2 "." $3}' | tr '\n' ' ')"
 want_changed="wmma_f16_f32acc.random wmma_f16_f16acc.random wmma_bf16_f32acc.random wmma_tf32_f32acc.random wmma_f16_f16acc.edges wmma_bf16_f32acc.edges wmma_tf32_f32acc.edges "
 if [[ "$changed" != "$want_changed" ]]; then echo "FAIL: simd_lane_forms.h100.txt differs from the RTX 3060's on: $changed"; fails=1; fi
-# Not measured: the sequential sum by default, the RTX 3060's rule only when forced.
-for pair in 100:b200 120:rtx-pro-6000 86:b200; do
+# RE-RECORDED 2026-11-16: the b200 profile (and gb200) now sums by the Hopper rule by default, inferred from the 20,000 vectors recorded on a
+# B200 by others (docs/numerics/tcpapers.md; not a card run of ours): an sm_100 or sm_86 build prints the H100's lines by default and with
+# VGPU_TC_EXACT=force, and the sequential pins with VGPU_TC_EXACT=0 (the way back to the earlier results). Before: the sequential pins by default.
+for pair in 100:b200 86:b200 100:gb200; do
+  a="${pair%%:*}"; gpu="${pair##*:}"
+  [[ -x "$out/app$a" ]] || continue
+  for engine in sass ptx; do
+    run_case "hopper by default (inferred from a B200's recorded vectors)" "$out/app$a" "$a" "$gpu" "$engine" "$data/simd_lane_forms.h100.txt"
+    run_case "VGPU_TC_EXACT=0" "$out/app$a" "$a" "$gpu" "$engine" "$data/simd_lane_forms.$engine.tcseq.txt" VGPU_TC_EXACT=0
+    run_case "VGPU_TC_EXACT=force (its own rule still)" "$out/app$a" "$a" "$gpu" "$engine" "$data/simd_lane_forms.h100.txt" VGPU_TC_EXACT=force
+  done
+done
+# Not measured, and no recorded vectors: the sequential sum by default, the RTX 3060's rule only when forced.
+for pair in 120:rtx-pro-6000; do
   a="${pair%%:*}"; gpu="${pair##*:}"
   [[ -x "$out/app$a" ]] || continue
   for engine in sass ptx; do
