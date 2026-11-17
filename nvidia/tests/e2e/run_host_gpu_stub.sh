@@ -133,6 +133,11 @@ if [[ "$cc" == 86 ]]; then
   "$nvcc_bin" "${nvf[@]}" -arch=sm_80 "$fitsrc" -o "$work/fit80" || { echo "FAIL: host_gpu_fit.cu does not compile for sm_80"; exit 1; }
   "$nvcc_bin" "${nvf[@]}" -gencode arch=compute_75,code=compute_75 "$fitsrc" -o "$work/fit75p" || { echo "FAIL: host_gpu_fit.cu does not compile as PTX for compute_75"; exit 1; }
   "$nvcc_bin" "${nvf[@]}" -gencode arch=compute_86,code=compute_86 "$root/nvidia/tests/e2e/host_gpu_vars.cu" -o "$work/varsp" || { echo "FAIL: host_gpu_vars.cu does not compile as PTX"; exit 1; }
+  trapsrc="$root/nvidia/tests/e2e/host_gpu_trap.cu"
+  "$nvcc_bin" "${nvf[@]}" -arch=sm_86 "$trapsrc" -o "$work/trap" || { echo "FAIL: host_gpu_trap.cu does not compile"; exit 1; }
+  "$nvcc_bin" "${nvf[@]}" -gencode arch=compute_86,code=compute_86 "$trapsrc" -o "$work/trapall" || { echo "FAIL: host_gpu_trap.cu does not compile as PTX"; exit 1; }
+  "$nvcc_bin" "${nvf[@]}" -DNO_ASSERT -gencode arch=compute_86,code=compute_86 "$trapsrc" -o "$work/trapp" || { echo "FAIL: host_gpu_trap.cu does not compile as PTX"; exit 1; }
+  "$nvcc_bin" "${nvf[@]}" -DNO_ASSERT -DREFERENCE_VAR -gencode arch=compute_86,code=compute_86 "$trapsrc" -o "$work/trappr" || { echo "FAIL: host_gpu_trap.cu does not compile as PTX with a referenced variable"; exit 1; }
 fi
 "$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_overhead.cu" -o "$work/ovh" || { echo "FAIL: host_gpu_overhead.cu does not compile"; exit 1; }
 "$cc_bin" -shared -fPIC -O1 -o "$work/libstubcuda.so" "$root/nvidia/tests/e2e/host_gpu_stub_driver.c" || { echo "FAIL: the stand-in driver does not compile"; exit 1; }
@@ -846,6 +851,56 @@ if [[ "$cc" == 86 ]]; then
   ! grep -q 'this host is WSL2' "$work/wsl_exact.err" || { echo "FAIL: exact mode was turned off for WSL"; fails=1; }
 else
   echo "NOTE: turbo fit steps 45 to 52 need the rtx3060 profile (sm_86); skipped for $profile"
+fi
+# 59. (section 20) a kernel that can assert or trap, and a PTX module whose variables no instruction names. The stand-in card computes nothing, so the failure is the stand-in's
+# (STUB_LAUNCH_FAIL=710 for an assert, 719 for a trap): the program has to print what the plain simulator, which fires the assert or the trap itself, makes it print.
+if [[ "$cc" == 86 ]]; then
+  for m in assertok assertfire trapok trapfire plain; do
+    env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/trap" "$m" > "$work/off_trap_$m.out" 2> "$work/off_trap_$m.err" || { echo "FAIL: the $m run of host_gpu_trap with the mode off failed"; exit 1; }
+  done
+  grep -q 'sync=710 copy=710 later_call=710' "$work/off_trap_assertfire.out" && grep -q 'sync=719 copy=719 later_call=719' "$work/off_trap_trapfire.out" && grep -q 'sync=0 copy=0 later_call=0' "$work/off_trap_assertok.out" \
+    || { echo "FAIL: the plain simulator does not print the codes this step is written against: $(cat "$work"/off_trap_*.out | tr '\n' ' ')"; fails=1; }
+  # (a) a kernel that asserts is sent in turbo mode (it was refused before), not in exact mode, not with VGPU_HOST_GPU_TURBO_OFF=assert
+  PROG=trap run tr_ok assertok VGPU_HOST_GPU=turbo STUB_CARD_OK=1 || { echo "FAIL: the turbo run of assertok failed"; tail -5 "$work/tr_ok.err"; fails=1; }
+  grep -q '^cuLaunchKernel$' "$work/tr_ok.log" || { echo "FAIL: a kernel that asserts did not reach the card in turbo mode: $(calls tr_ok); $(grep -m3 host_gpu "$work/tr_ok.err")"; fails=1; }
+  diff -q "$work/off_trap_assertok.out" "$work/tr_ok.out" > /dev/null || { echo "FAIL: turbo mode changes the output of assertok"; fails=1; }
+  PROG=trap run tr_exact assertok VGPU_HOST_GPU=exact STUB_CARD_OK=1 || { echo "FAIL: the exact run of assertok failed"; fails=1; }
+  ! grep -q '^cuLaunchKernel$' "$work/tr_exact.log" || { echo "FAIL: exact mode sent a kernel that asserts to the card: $(calls tr_exact)"; fails=1; }
+  PROG=trap run tr_off assertok VGPU_HOST_GPU=turbo VGPU_HOST_GPU_TURBO_OFF=assert VGPU_HOST_GPU_LOG=1 STUB_CARD_OK=1 || { echo "FAIL: the turbo run of assertok with assert off failed"; fails=1; }
+  ! grep -q '^cuLaunchKernel$' "$work/tr_off.log" && grep -q 'the kernel calls __assertfail (VGPU_HOST_GPU_TURBO_OFF=assert)' "$work/tr_off.err" || { echo "FAIL: VGPU_HOST_GPU_TURBO_OFF=assert did not keep the kernel in the simulator, with the reason: $(calls tr_off); $(grep -m3 host_gpu "$work/tr_off.err")"; fails=1; }
+  diff -q "$work/off_trap_assertok.out" "$work/tr_off.out" > /dev/null || { echo "FAIL: TURBO_OFF=assert changes the output of assertok"; fails=1; }
+  # (b) a card that fails the launch with the assert's or the trap's error: the program sees what the simulator makes it see, whether or not the card held data
+  for pair in assertfire:710:device-assert trapfire:719:trap; do
+    m=${pair%%:*}; rest=${pair#*:}; code=${rest%%:*}; kind=${rest#*:}
+    PROG=trap run "tr_$m" "$m" VGPU_HOST_GPU=turbo STUB_CARD_OK=1 STUB_LAUNCH_FAIL=$code || { echo "FAIL: the turbo run of $m failed (exit $?): $(tail -3 "$work/tr_$m.err")"; fails=1; }
+    grep -q '^cuLaunchKernel$' "$work/tr_$m.log" || { echo "FAIL: $m did not reach the card: $(calls "tr_$m")"; fails=1; }
+    diff -q "$work/off_trap_$m.out" "$work/tr_$m.out" > /dev/null || { echo "FAIL: a card that fails $m with $code changes the program's lines: $(cat "$work/off_trap_$m.out") against $(cat "$work/tr_$m.out")"; fails=1; }
+    grep -q "VirtualGPU error \[$kind\]" "$work/tr_$m.err" || { echo "FAIL: $m: the launch did not fail with the simulator's error [$kind]: $(grep -m3 'VirtualGPU error\|host_gpu' "$work/tr_$m.err")"; fails=1; }
+    grep -q "on the card (error $code); the launch fails as it does in the simulator" "$work/tr_$m.err" || { echo "FAIL: $m: the failure on the card was not said: $(grep -m3 host_gpu "$work/tr_$m.err")"; fails=1; }
+    # ... the other error codes of a card launch that fails are not taken for the program's own failure
+    PROG=trap run "tr_${m}_other" "$m" VGPU_HOST_GPU=turbo STUB_CARD_OK=1 STUB_LAUNCH_FAIL=701 || { echo "FAIL: the turbo run of $m against a card that fails with 701 failed"; fails=1; }
+    grep -q "failed on the card (error 701); mode off, the simulator runs it" "$work/tr_${m}_other.err" || { echo "FAIL: $m: an error 701 was not handled as any card failure: $(grep -m2 host_gpu "$work/tr_${m}_other.err")"; fails=1; }
+    diff -q "$work/off_trap_$m.out" "$work/tr_${m}_other.out" > /dev/null || { echo "FAIL: error 701 on a kernel that can fire changes the program's lines"; fails=1; }
+  done
+  # (c) PTX only: a module that declares a variable no instruction names (only the host writes it) is given to the card; one whose kernel reads it is not
+  PROG=trapp run tp_un plain VGPU_HOST_GPU=turbo STUB_CARD_OK=1 VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the PTX run with an unreferenced variable failed"; tail -5 "$work/tp_un.err"; fails=1; }
+  grep -q '^cuModuleLoadData$' "$work/tp_un.log" && grep -q '^image ptx$' "$work/tp_un.log" || { echo "FAIL: PTX whose only variable no instruction names was not given to the card: $(calls tp_un); $(grep -m3 'host_gpu' "$work/tp_un.err")"; fails=1; }
+  diff -q "$work/off_trap_plain.out" "$work/tp_un.out" > /dev/null || { echo "FAIL: an unreferenced variable changes the output"; fails=1; }
+  PROG=trapp run tp_all plain VGPU_HOST_GPU=turbo STUB_CARD_OK=1 VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_PTX_VARIABLES=all || { echo "FAIL: the PTX run with VGPU_HOST_GPU_PTX_VARIABLES=all failed"; fails=1; }
+  ! grep -q '^cuModuleLoadData$' "$work/tp_all.log" && grep -q 'the PTX declares a module variable' "$work/tp_all.err" || { echo "FAIL: VGPU_HOST_GPU_PTX_VARIABLES=all did not bring back the rule that any variable refuses: $(calls tp_all); $(grep -m3 host_gpu "$work/tp_all.err")"; fails=1; }
+  PROG=trappr run tp_ref plain VGPU_HOST_GPU=turbo STUB_CARD_OK=1 VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the PTX run with a referenced variable failed"; fails=1; }
+  ! grep -q '^cuModuleLoadData$' "$work/tp_ref.log" && grep -q 'the PTX declares a module variable (.global) that the module can reach' "$work/tp_ref.err" || { echo "FAIL: PTX whose kernel reads a variable was given to the card: $(calls tp_ref); $(grep -m3 host_gpu "$work/tp_ref.err")"; fails=1; }
+  diff -q "$work/off_trap_plain.out" "$work/tp_ref.out" > /dev/null || { echo "FAIL: a referenced variable changes the output"; fails=1; }
+  # ... a PTX module with a trap is given to the card (turbo only), and its failure is told as the simulator tells it
+  PROG=trapp run tp_trap trapfire VGPU_HOST_GPU=turbo STUB_CARD_OK=1 STUB_LAUNCH_FAIL=719 VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the PTX trapfire run failed"; tail -3 "$work/tp_trap.err"; fails=1; }
+  grep -q '^cuLaunchKernel$' "$work/tp_trap.log" && grep -q "VirtualGPU error \[trap\]" "$work/tp_trap.err" || { echo "FAIL: a PTX trap was not sent, or its failure was not the simulator's: $(calls tp_trap); $(grep -m3 'host_gpu\|VirtualGPU' "$work/tp_trap.err")"; fails=1; }
+  diff -q "$work/off_trap_trapfire.out" "$work/tp_trap.out" > /dev/null || { echo "FAIL: a trap in PTX on a failing card changes the program's lines"; fails=1; }
+  PROG=trapp run tp_trap_off trapok VGPU_HOST_GPU=turbo VGPU_HOST_GPU_TURBO_OFF=assert STUB_CARD_OK=1 VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the PTX trapok run with assert off failed"; fails=1; }
+  ! grep -q '^cuLaunchKernel$' "$work/tp_trap_off.log" || { echo "FAIL: TURBO_OFF=assert did not keep a PTX trap in the simulator: $(calls tp_trap_off)"; fails=1; }
+  # ... and the PTX of a kernel that asserts keeps its message strings, which the kernel reaches: not given to the card
+  PROG=trapall run tp_as assertok VGPU_HOST_GPU=turbo STUB_CARD_OK=1 VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the PTX run of assertok failed"; fails=1; }
+  ! grep -q '^cuModuleLoadData$' "$work/tp_as.log" || { echo "FAIL: PTX of a kernel that asserts (its message strings are variables the kernel reads) was given to the card: $(calls tp_as)"; fails=1; }
+  diff -q "$work/off_trap_assertok.out" "$work/tp_as.out" > /dev/null || { echo "FAIL: the PTX assert changes the output"; fails=1; }
 fi
 # 58. (#660, #662) what a kernel kept in the simulator costs the mode: 50 kernels of one launch each and a looping kernel stay in the simulator and say so. These pin the size rules, which
 # turbo mode asks with VGPU_HOST_GPU_FIT=0 (the default FIT=1 would send every one of them to the card).

@@ -197,10 +197,12 @@ inline bool ptx_decl_unreferenced(const PtxVarDecl& d, const std::set<std::strin
 
 inline PtxScan scan_ptx_for_card(const std::string& text, bool printf_off, bool retarget = false, bool unreferenced_ok = true, bool assert_off = true) {
   PtxScan out;
+  size_t at_stmt = 0, refused_at = 0;   // (the statement being read, and the one the first refusal came from: a variable's refusal is only known at the end, and still goes first if its declaration did)
   const auto refuse = [&](std::string why, bool never) {
     if (out.refuse.empty()) {
       out.refuse = std::move(why);
       out.never = never;
+      refused_at = at_stmt;
     }
   };
   // The text without comments, cut into statements.
@@ -272,6 +274,7 @@ inline PtxScan scan_ptx_for_card(const std::string& text, bool printf_off, bool 
   std::vector<PtxVarDecl> decls;
   for (size_t si = 0; si < stmts.size(); ++si) {
     const std::string& st = stmts[si];
+    at_stmt = si;
     std::vector<std::string> w = words(st);
     if (w.empty()) continue;
     size_t i = 0;
@@ -375,6 +378,8 @@ inline PtxScan scan_ptx_for_card(const std::string& text, bool printf_off, bool 
     }
     for (const PtxVarDecl& d : decls)
       if (!ptx_decl_unreferenced(d, used)) {
+        at_stmt = d.stmt;
+        if (!out.refuse.empty() && d.stmt < refused_at) out.refuse.clear();   // (its declaration came first: it is the reason, as it was when every variable refused)
         refuse("the PTX declares a module variable (" + d.space + ") that the module can reach" + (d.name.empty() ? "" : " (" + d.name + ")"), false);
         break;
       }
