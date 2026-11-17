@@ -504,6 +504,9 @@ VTEST(max_steps_env_raises_the_budget) {
   ::unsetenv("VGPU_MAX_STEPS");
   auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, mem, prof));
   VCHECK(err.code() == Err::ExecLimit);
+  // The message says a long wait on a clock reaches the budget too, and how to lift it (#687).
+  VCHECK_CONTAINS(err.what(), "%globaltimer");
+  VCHECK_CONTAINS(err.what(), "--max-steps 0");
 
   g.set("100000");  // now it fits
   exec::launch(m.entries[0], cfg, {}, mem, prof);
@@ -795,4 +798,45 @@ SKIP:
   // And with lanes idle on the diverged paths, utilisation is below full.
   VCHECK(st.thread_instructions < st.instructions * 32);
   mem.free(buf);
+}
+
+// A busy-wait on %globaltimer (issue #687): a read of the timer costs vgpu::kGlobalTimerReadNs of the clock on top of its instruction, so a wait of N ns is
+// about N / 68 passes of this four-instruction loop and not N instructions. Without the latency a 1 ms wait is a million instructions, which a budget of
+// 100,000 stops; with it, some 59,000 finish. A longer wait still ends at the budget: the loop is bounded, not free.
+VTEST(a_wait_on_the_global_timer_costs_a_read_latency_and_not_an_instruction_per_ns) {
+  const char* kSpin = R"(
+.version 8.3
+.target sm_90
+.address_size 64
+.visible .entry spin(.param .u64 ns)
+{
+    .reg .pred %p<2>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd3, [ns];
+    mov.u64 %rd1, %globaltimer;
+LOOP:
+    mov.u64 %rd2, %globaltimer;
+    sub.u64 %rd4, %rd2, %rd1;
+    setp.lt.u64 %p1, %rd4, %rd3;
+    @%p1 bra LOOP;
+    ret;
+}
+)";
+  ptx::Module m = ptx::parse(kSpin);
+  DeviceProfile prof = load_gpu("nvidia/h100");
+  LaunchConfig cfg;
+  cfg.max_steps = 100000;
+  EnvGuard g("VGPU_MAX_STEPS");
+  ::unsetenv("VGPU_MAX_STEPS");
+  {
+    MemoryManager mem(1 << 20);
+    auto st = exec::launch(m.entries[0], cfg, {arg_u64(1000000)}, mem, prof);   // a millisecond
+    // About 14,700 passes of four instructions (and the setup), well under the budget and well over a hundred.
+    VCHECK(st.instructions > 40000 && st.instructions < 100000);
+  }
+  {
+    MemoryManager mem(1 << 20);
+    auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(100000000)}, mem, prof));   // a tenth of a second
+    VCHECK(err.code() == Err::ExecLimit);
+  }
 }
