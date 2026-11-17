@@ -1622,6 +1622,11 @@ struct GlobalVar {
   // A .const variable (__constant__): module constant memory, which cudaFuncGetAttributes counts as
   // constSizeBytes. Everything else is a .global.
   bool is_const = false;
+  // Declared ".extern .global" (or ".const") and, so far, defined nowhere in the module. A whole-program module has nothing to resolve it
+  // against, and NVIDIA's driver then drops the qualifier and gives it a zero-initialised definition of that size, which
+  // cuModuleGetGlobal returns and the host may write (PoCL's _global_offset_x relies on that). The parser drops this entry when the
+  // module defines the name itself.
+  bool extern_decl = false;
   // A pointer-valued global can be initialised with another symbol's address
   // ("= my_array;"), and an array of them with a list ("= {f, g, h};") -- a
   // table of function pointers is exactly that. Addresses are not known until

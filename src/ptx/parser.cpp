@@ -252,6 +252,25 @@ class Parser {
           m.module_shared.push_back(std::move(d));
           continue;
         }
+        // ".extern .global" / ".extern .const" with a size: nothing in a whole-program module defines it, so it becomes a zero-initialised
+        // definition (the driver does the same, with a ptxas warning). An unsized one ("x[]") has no size to give and stays skipped.
+        if (peek(1).kind == Token::Kind::Word && (peek(1).text == ".global" || peek(1).text == ".const")) {
+          bool unsized = false;
+          for (size_t k = 2; peek(k).kind != Token::Kind::End && !(peek(k).kind == Token::Kind::Punct && peek(k).text == ";"); ++k)
+            if (peek(k).kind == Token::Kind::Punct && peek(k).text == "[" && peek(k + 1).kind == Token::Kind::Punct && peek(k + 1).text == "]")
+              unsized = true;
+          if (!unsized) {
+            const bool is_const = peek(1).text == ".const";
+            const size_t line = t.line;
+            next();  // .extern
+            next();  // .global or .const
+            GlobalVar g = parse_global(line);
+            g.is_const = is_const;
+            g.extern_decl = true;
+            m.globals.push_back(std::move(g));
+            continue;
+          }
+        }
         while (!at_end() && !peek_punct(";")) next();
         if (!at_end()) next();
         continue;
@@ -302,6 +321,14 @@ class Parser {
                        "directive not in the implemented PTX subset (supported: .version .target "
                        ".address_size .visible .weak .common .extern .global .const .entry .file .loc "
                        ".section)");
+    }
+    // An ".extern" declaration of a name the module defines (before or after it) is only the declaration: drop it, and the duplicates of it.
+    std::set<std::string> defined;
+    for (const GlobalVar& g : m.globals)
+      if (!g.extern_decl) defined.insert(g.name);
+    for (auto it = m.globals.begin(); it != m.globals.end();) {
+      if (it->extern_decl && !defined.insert(it->name).second) it = m.globals.erase(it);
+      else ++it;
     }
     return m;
   }
