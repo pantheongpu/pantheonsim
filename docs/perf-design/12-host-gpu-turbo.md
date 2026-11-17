@@ -711,3 +711,13 @@ turns, which needs the flow scan to follow a loop that is left through a call to
 newly have sampled (design with numbers: [data/turbo-left/README.md](data/turbo-left/README.md)); the open turbo issues #660 and #661 have card scripts there (`card-short-launch.sh`, `card-bmma-verify.sh`); what the page faults after a fork cost a program with
 hundreds of MiB live on the rig (the floor of warpAggregatedAtomicsCG's two kernels); whether the size of a process's environment tilts
 particlefilter's race (the card run's `pf` stage ran, but `data/sp76/card.md` records only that the program's own race moves its time: its group counts per form are not kept).
+
+## 15. Very short launches (#660; both modes)
+
+A10G, 2026-11-17 (`data/turbo-left/card-short-launch.sh`, results in `data/turbo-left/card-2026-11-17-short/`): an empty kernel costs 2.8 us per asynchronous
+launch and 8 us with a sync, so the "no gain above 50 us of latency" outcome did not apply. JACOBI1D (20,000 launches of 0.1 ms in the simulator) was never
+sent, for four reasons, each now a member of `Costs::short_launches()` (what the runtime uses; `VGPU_HOST_GPU_SHORT=0` is the rule before): the card time
+of a kernel never run there was a fixed 100 us, and a launch under 200 us never went, so the prior stayed (now at most `sim_s / 20`, floor 40 us); the
+start share of a kernel launched thousands of times was capped at 500 launches (5,000); the first card launch's time includes the module load (65 us for a
+20 us kernel) and was kept for good (the prior is kept instead, later times at their least); and one launch that was 60 us late ended the card for its kernel
+(three in a row now). JACOBI1D 2.3 s to 1.5 s, sc_gpu 0.96 s to 0.85 s; LargeKernelParameter saves 0.2 ms a launch against the 0.25 ms its start needs, and stays in the simulator.

@@ -54,6 +54,9 @@
 #  29. (Round sp68) the square root idiom (include/vgpu/host_gpu_idiom.hpp, on the SASS nvcc emits for sqrtf): with VGPU_HOST_GPU_SQRT=1 a kernel that is a
 #      square root reaches the card path, and one with a square root and a division only with VGPU_HOST_GPU_DIV=1 as well; without the switch, or with a
 #      bare rsqrtf, the driver is never touched; the output is the mode-off output.
+# What the mode costs a program whose launches stay in the simulator (pantheonsim #662, #660; host_gpu_overhead.cu):
+#  45. 50 large kernels launched once each, and one kernel launched 5000 times, in both modes: nothing reaches the driver, the program prints what it prints
+#      with the mode off, and the scan says the same of the code as before it was made cheaper (no loop in any of the 50 kernels; a loop in `acct`).
 # What a module holds besides code (Round sp66; host_gpu_vars.cu, one module with __device__ and __constant__ variables, string literals, vprintf,
 # malloc/free and assert):
 #  30. kernels that use the module's variables (by name, and through a pointer from cudaGetSymbolAddress) reach the card path in both modes, and the
@@ -118,6 +121,7 @@ trap 'rm -rf "$work"' EXIT
 "$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_lazy.cu" "$root/nvidia/tests/e2e/host_gpu_lazy_heap.cu" -o "$work/prog" || { echo "FAIL: does not compile"; exit 1; }
 "$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_vars.cu" -o "$work/vars" || { echo "FAIL: host_gpu_vars.cu does not compile"; exit 1; }
 "$nvcc_bin" -std=c++17 -arch="sm_$cc" -rdc=true -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_rdc.cu" "$root/nvidia/tests/e2e/host_gpu_rdc_fn.cu" -o "$work/rdc" || { echo "FAIL: host_gpu_rdc.cu does not compile"; exit 1; }
+"$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_overhead.cu" -o "$work/ovh" || { echo "FAIL: host_gpu_overhead.cu does not compile"; exit 1; }
 "$cc_bin" -shared -fPIC -O1 -o "$work/libstubcuda.so" "$root/nvidia/tests/e2e/host_gpu_stub_driver.c" || { echo "FAIL: the stand-in driver does not compile"; exit 1; }
 if ! require_shim_libs "$shim" "$work/prog"; then exit 0; fi
 init_ms=2000
@@ -597,5 +601,23 @@ else
   echo "FAIL: a block of slow took $(( ${slow_ms:-0} * 4 / 256 )) ms with $slow_rounds rounds (a timed run of 1,024 took ${slow_cal_ms:-?} ms): too short for the test (under 40 ms)"; fails=1
 fi
 unset HOST_GPU_LAZY_ROUNDS
+# 45.
+for arg in kernels repeat; do
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/ovh" "$arg" > "$work/off_ovh_$arg.out" 2> /dev/null || { echo "FAIL: the $arg run with the mode off failed"; fails=1; }
+  for mode in exact turbo; do
+    PROG=ovh run "ovh_${mode}_$arg" "$arg" VGPU_HOST_GPU=$mode VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the $mode $arg run failed"; fails=1; }
+    [[ ! -s "$work/ovh_${mode}_$arg.log" ]] || { echo "FAIL: $mode $arg reached the driver: $(calls "ovh_${mode}_$arg")"; fails=1; }
+    diff -q "$work/off_ovh_$arg.out" "$work/ovh_${mode}_$arg.out" > /dev/null || { echo "FAIL: $mode changes the output of $arg"; fails=1; }
+    grep -q '^host_gpu: 0 launches ran on the card, ' "$work/ovh_${mode}_$arg.err" || { echo "FAIL: $mode $arg: a launch went to the card: $(grep '^host_gpu: ' "$work/ovh_${mode}_$arg.err" | head -1)"; fails=1; }
+  done
+done
+n="$(grep -c '^host_gpu_overhead: kept_launches=50 .* kernels=50$' "$work/ovh_turbo_kernels.err")"
+(( n == 1 )) || { echo "FAIL: turbo kernels: expected 50 kept launches of 50 kernels: $(grep '^host_gpu_overhead' "$work/ovh_turbo_kernels.err")"; fails=1; }
+n="$(grep -c '^host_gpu: _Z3k[0-9]*Pf: classes: exact; admitted' "$work/ovh_turbo_kernels.err")"
+(( n == 50 )) || { echo "FAIL: turbo kernels: expected 50 kernels classed exact and admitted, got $n"; fails=1; }
+n="$(grep -c '^host_gpu_nosample: kernel=_Z3k[0-9]*Pf .* loop=0 ' "$work/ovh_turbo_kernels.err")"
+(( n == 50 )) || { echo "FAIL: turbo kernels: expected 50 kernels without a loop, got $n"; fails=1; }
+run ovh_loop acct VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=1000 || { echo "FAIL: the turbo acct run failed"; fails=1; }
+grep -q '^host_gpu_nosample: .* loop=1 ' "$work/ovh_loop.err" || { echo "FAIL: acct, whose kernel loops, was not seen to loop: $(grep -m2 'host_gpu_nosample' "$work/ovh_loop.err")"; fails=1; }
 (( fails == 0 )) && { echo "PASS: first launch $first ms against a driver start of $init_ms ms; driver calls in the big run: $(calls on_big); many launches of ${many_us:-?} us started the driver after ${many_at:-?} of them"; exit 0; }
 exit 1

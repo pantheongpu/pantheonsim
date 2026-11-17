@@ -183,9 +183,12 @@ bool quiet() {
   const char* q = std::getenv("VGPU_QUIET");
   return q && *q && *q != '0';
 }
-bool logging() {
-  const char* q = std::getenv("VGPU_HOST_GPU_LOG");
-  return q && *q && *q != '0';
+bool logging() {   // (read once: every launch asks several times, and a getenv is a scan of the environment)
+  static const bool on = [] {
+    const char* q = std::getenv("VGPU_HOST_GPU_LOG");
+    return q && *q && *q != '0';
+  }();
+  return on;
 }
 // VGPU_HOST_GPU_LOG=2: also the SASS text of a kernel the exact set refuses for an SFU instruction (to read what the instruction is part of).
 bool logging_code() {
@@ -195,15 +198,26 @@ bool logging_code() {
 
 }  // namespace
 
+// The index of the instruction at pc (decoded with pc = 16 * index), or -1.
+static int64_t code_index(int64_t pc, size_t count) { return pc >= 0 && pc % 16 == 0 && static_cast<uint64_t>(pc) / 16 < count ? pc / 16 : -1; }
+
 struct Runtime::Impl : CardGate {
   Api api;
   CUcontext ctx = nullptr;
   uint64_t window_base = 0;
   uint64_t mapped_end = 0;   // granules [window_base, mapped_end) are backed
   Stats stats;
-  Costs costs;
+  Costs costs = Costs::short_launches();
   SimTimeTable sim_times;
   std::map<std::string, double> card_kernel_s;
+  std::map<std::string, unsigned> slow_launches;   // per kernel: card launches in a row that did not pay off (offload_ends)
+  std::map<std::string, double> card_real_s;   // the least time of a launch after the first (card_time_to_keep)
+  double keep_card_time(const std::string& kernel, double measured_s, bool first, double sim_s) {
+    const auto it = card_real_s.find(kernel);
+    const double t = card_time_to_keep(measured_s, first, it == card_real_s.end() ? std::nullopt : std::optional<double>(it->second), sim_s, costs);
+    if (!first && costs.kernel_prior_ratio > 0) card_real_s[kernel] = t;
+    return t;
+  }
   TrafficTable traffic;
   std::set<std::string> banned;   // kernels whose offloaded launch took longer than the simulator was expected to
   std::map<const sass::Module*, CUmodule> modules;
@@ -764,6 +778,7 @@ struct Runtime::Impl : CardGate {
       v.why = why;   // (before the reason was kept, a later launch of such a kernel was said, and counted, as "not in the exact set")
     }
     ClassMask classes = 0;
+    bool indirect = false;   // a jump through a register, a call or a return, or a branch to nowhere in the code (the flow's `indirect`)
     std::string first_never, first_gated;   // the text of the first instruction of no class, and of the first one a switch refuses
     if (ok) {
       const sass::Code& code = m.code[ci->second];
@@ -780,9 +795,16 @@ struct Runtime::Impl : CardGate {
         const uint64_t code_lo = sec.count ? sec.instr(0).pc : 0, code_hi = sec.count ? sec.instr(sec.count - 1).pc : 0;
         for (size_t i = 0; i < sec.count; ++i) {
           const sass::Instr& ins = sec.instr(i);
-          if (own && ins.op == sass::Op::BRA)
+          if (own && ins.op == sass::Op::BRA) {
+            int64_t label = -1;
             for (const auto& o : ins.src)
-              if (o.kind == sass::Kind::Label) branches.emplace_back(ins.pc, static_cast<uint64_t>(o.imm));
+              if (o.kind == sass::Kind::Label) {
+                branches.emplace_back(ins.pc, static_cast<uint64_t>(o.imm));
+                label = o.imm;
+              }
+            indirect = indirect || code_index(label, code.count) < 0;
+          }
+          indirect = indirect || (own && (ins.op == sass::Op::BRX || ins.op == sass::Op::CALL || ins.op == sass::Op::RET));
           InsnClass c = turbo_class(ins.mnemonic, ins.mods);
           if (ins.op == sass::Op::CALL && c == InsnClass::Call) {
             // A call that leaves the section runs code this scan has to see. Three kinds are followed: a relative call inside the section; the absolute
@@ -812,7 +834,9 @@ struct Runtime::Impl : CardGate {
       // The exact set's scan; the idioms (VGPU_HOST_GPU_DIV, VGPU_HOST_GPU_SQRT) are checked once, at the first instruction outside the set that one of them
       // could explain.
       bool idiom_checked = false, idiom_ok = false;
-      for (size_t i = 0; i < code.count && ok; ++i) {
+      // (turbo mode admits a kernel its classes admit, in the exact set or not: the scan could only change what exact mode says)
+      const bool exact_needed = !turbo || turbo_refusal(classes, sw) != TurboRefusal::None;
+      for (size_t i = 0; i < code.count && ok && exact_needed; ++i) {
         const sass::Instr& ins = code.instr(i);
         if (!exact_opcode_allowed(ins.mnemonic, ins.mods)) {
           if ((div_idiom || sqrt_idiom) && (ins.op == sass::Op::MUFU || ins.op == sass::Op::CALL || ins.op == sass::Op::RET)) {
@@ -892,10 +916,8 @@ struct Runtime::Impl : CardGate {
     v.back_edge = has_back_edge(branches);
     if (runnable_here) {
       const sass::Code& code = m.code[ci->second];
-      std::map<uint64_t, int64_t> index_of;
-      for (size_t i = 0; i < code.count; ++i) index_of[code.instr(i).pc] = static_cast<int64_t>(i);
-      std::vector<FlowInsn> flow(code.count);
-      for (size_t i = 0; i < code.count; ++i) {
+      std::vector<FlowInsn> flow(v.back_edge ? code.count : 0);   // (no back edge: a loop is only an indirect jump, which the class scan saw)
+      for (size_t i = 0; i < flow.size(); ++i) {
         const sass::Instr& ins = code.instr(i);
         const bool always = ins.guard == sass::kPT;
         if (ins.op == sass::Op::BRA) {
@@ -905,9 +927,8 @@ struct Runtime::Impl : CardGate {
             if (o.kind == sass::Kind::Label) label = o.imm;
             else other = true;
           }
-          const auto it = index_of.find(static_cast<uint64_t>(label));
-          if (label < 0 || it == index_of.end()) flow[i].indirect = true;
-          else flow[i].target = it->second;
+          if (const int64_t to = code_index(label, code.count); to < 0) flow[i].indirect = true;
+          else flow[i].target = to;
           flow[i].falls_through = !always || other;
         } else if (ins.op == sass::Op::BRX || ins.op == sass::Op::CALL || ins.op == sass::Op::RET) {
           flow[i].indirect = true;
@@ -915,9 +936,10 @@ struct Runtime::Impl : CardGate {
           flow[i].falls_through = !always;
         }
       }
-      v.loop = code_has_loop(flow);
+      const bool cycles = has_reachable_back_edge(flow);   // (the compilers end a kernel with a branch to itself: a back edge no loop runs)
+      v.loop = indirect || (cycles && code_has_loop(flow));
       // The counted loops a sample inside the blocks follows (vgpu/host_gpu.hpp find_probe_loops).
-      std::vector<LoopCodeInsn> lc(code.count);
+      std::vector<LoopCodeInsn> lc(cycles ? code.count : 0);
       const unsigned urz = code.sm >= 100 ? 255u : 63u;
       const auto reg_of = [urz](const sass::Operand& o) { return o.kind == sass::Kind::Reg ? (o.reg == sass::kRZ ? -1 : static_cast<int>(o.reg))
                                                             : o.kind == sass::Kind::UReg ? (o.reg >= urz ? -1 : 256 + static_cast<int>(o.reg)) : -1; };
@@ -942,7 +964,7 @@ struct Runtime::Impl : CardGate {
         }
         return q;
       };
-      for (size_t i = 0; i < code.count; ++i) {
+      for (size_t i = 0; i < lc.size(); ++i) {
         const sass::Instr& ins = code.instr(i);
         LoopCodeInsn& c = lc[i];
         c.flow = flow[i];
@@ -1203,6 +1225,7 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
                               std::string(v) == "always" ? Impl::SampleMode::Always : std::string(v) == "whole" ? Impl::SampleMode::Whole : Impl::SampleMode::On;
     if (const char* v = std::getenv("VGPU_HOST_GPU_SAMPLE_BLOCK"); v && std::string(v) == "0") r->impl_->sample_block = false;   // the copy runs whole blocks (the rule before Round sp75)
     if (const char* v = std::getenv("VGPU_HOST_GPU_SAMPLE_STARTED"); v && std::string(v) == "0") r->impl_->sample_started = false;   // no sample once the driver's start has begun (the rule before Round sp76)
+    if (const char* v = std::getenv("VGPU_HOST_GPU_SHORT"); v && std::string(v) == "0") r->impl_->costs = Costs{};   // the size rule before #660: a fixed 100 us card prior, 200 us floor
     if (const char* v = std::getenv("VGPU_HOST_GPU_STATIC"); v && *v && *v != '0') r->impl_->static_estimate = true;
     if (const char* v = std::getenv("VGPU_HOST_GPU_START_COST"); v && *v) {   // seconds; 0: do not charge the driver start (the rule before sp43)
       char* end = nullptr;
@@ -1635,14 +1658,14 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   if (im.resident) {   // nothing comes back now: the simulator's memory is stale where the card wrote, and the gate pulls it when it is read
     const double total_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     const bool first_card_launch = im.card_kernel_s.count(fn.name) == 0;
-    if (!first_card_launch && !offload_paid_off(total_s, ref_s)) {
+    if (!first_card_launch && offload_ends(im.slow_launches[fn.name], offload_paid_off(total_s, ref_s), im.costs)) {
       im.banned.insert(fn.name);
       if (logging()) std::fprintf(stderr, "host_gpu: %s took %.3f ms on the card path against an estimate of %.3f ms in the simulator: offloading it ends\n", fn.name.c_str(), total_s * 1e3, ref_s * 1e3);
     }
     if (im.traffic.record(fn.name, push_bytes, total, total_s, ref_s, !first_card_launch) && im.banned.insert(fn.name).second && logging())
       std::fprintf(stderr, "host_gpu: %s pushed %.1f MiB of %.1f MiB live on each of its last %u launches: offloading it ends (traffic)\n", fn.name.c_str(),
                    push_bytes / 1048576.0, total / 1048576.0, kTrafficLaunches);
-    im.card_kernel_s[fn.name] = kernel_s;
+    im.card_kernel_s[fn.name] = im.keep_card_time(fn.name, kernel_s, first_card_launch, e.sim_s);
     ++im.stats.offloaded;
     im.sim_times.note_offload(fn.name);
     if (first_launch_rule && logging()) std::fprintf(stderr, "host_gpu: %s: first launch decided by the static rule (loop, %llu blocks)\n", fn.name.c_str(), static_cast<unsigned long long>(blocks));
@@ -1681,11 +1704,11 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     }
   const double total_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   // The first launch of a kernel on the card also pays the module's load: not held against the estimate.
-  if (im.card_kernel_s.count(fn.name) && !offload_paid_off(total_s, e.sim_s)) {
+  if (im.card_kernel_s.count(fn.name) && offload_ends(im.slow_launches[fn.name], offload_paid_off(total_s, e.sim_s), im.costs)) {
     im.banned.insert(fn.name);
     if (logging()) std::fprintf(stderr, "host_gpu: %s took %.3f ms on the card path against an estimate of %.3f ms in the simulator: offloading it ends\n", fn.name.c_str(), total_s * 1e3, e.sim_s * 1e3);
   }
-  im.card_kernel_s[fn.name] = kernel_s;
+  im.card_kernel_s[fn.name] = im.keep_card_time(fn.name, kernel_s, !im.card_kernel_s.count(fn.name), e.sim_s);
   ++im.stats.offloaded;
   im.sim_times.note_offload(fn.name);
   if (logging())

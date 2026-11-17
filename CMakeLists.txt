@@ -3624,6 +3624,13 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_ret_condition_predicate
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ret_condition_predicate.sh)
+  set_tests_properties(e2e_ret_condition_predicate PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_bsync_recursive_abi
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_bsync_recursive_abi.sh)
   set_tests_properties(e2e_bsync_recursive_abi PROPERTIES
