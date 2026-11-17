@@ -545,6 +545,9 @@ struct Costs {
   double margin = 2.0;                // offload only when the simulator is expected to take this many times the card path
   double sim_warp_instr_per_s = 100e6;   // a lower bound of the simulator's speed in warp instructions per second (tens to ~150 M per thread in the benchmarks)
   double min_sim_s = 200e-6;          // never below this, whatever the arithmetic says (timer noise, the estimate's error)
+  // A kernel the card has not run yet takes at most sim_s / kernel_prior_ratio there (a card is far faster than the simulator), and never more than
+  // kernel_s_default. 0: kernel_s_default always.
+  double kernel_prior_ratio = 0;
   // The one-off cost of the first card launch: loading the driver, cuInit, the primary context and the window reservation. Measured on an A10G at 0.23 s of
   // process wall time (docs/performance.md "Round sp42": the native process of a trivial program also takes 0.24 s). 0.25 rounds it up. VGPU_HOST_GPU_START_COST
   // sets it in seconds; 0 charges nothing (the rule before sp43: the driver starts at the first launch the per-launch rule accepts).
@@ -562,6 +565,17 @@ struct Costs {
   // ... of which at most this many count: the launch must save start_cost_s / start_repeats_max (0.5 ms) however often its kernel has run. A smaller
   // saving is within the error of the card path's estimate (LargeKernelParameter: 0.1 to 0.2 ms saved by the estimate, none of the start repaid on the card).
   double start_repeats_max = 500;
+
+  // What the runtime uses (#660, A10G: an empty launch plus its sync costs 8 us, a card runs a short kernel 20 times faster than the simulator): a launch
+  // the simulator takes 40 us for (5 latencies) can go, with the card's time for a kernel it has not run taken from the simulator's estimate, and a kernel
+  // launched thousands of times repays the start by saving 50 us a launch. The members above are the rule before, VGPU_HOST_GPU_SHORT=0.
+  static Costs short_launches() {
+    Costs c;
+    c.min_sim_s = 40e-6;
+    c.kernel_prior_ratio = 20;
+    c.start_repeats_max = 5000;
+    return c;
+  }
 };
 
 struct Estimate {
@@ -572,8 +586,13 @@ struct Estimate {
   double start_s = 0;                 // the driver start this launch would pay (the first card launch of the process); 0 once the driver is up
 };
 
+// The card's time for a kernel it has not run: the prior, shrunk for a launch the simulator takes little time for (JACOBI1D: 20,000 launches of 0.1 ms).
+inline double kernel_prior_seconds(double sim_s, const Costs& c) {
+  return c.kernel_prior_ratio > 0 ? std::min(c.kernel_s_default, sim_s / c.kernel_prior_ratio) : c.kernel_s_default;
+}
+
 inline double card_path_seconds(const Estimate& e, const Costs& c) {
-  return e.start_s + c.launch_s + e.card_kernel_s.value_or(c.kernel_s_default) + static_cast<double>(e.push_bytes) / c.push_bytes_per_s +
+  return e.start_s + c.launch_s + e.card_kernel_s.value_or(kernel_prior_seconds(e.sim_s, c)) + static_cast<double>(e.push_bytes) / c.push_bytes_per_s +
          static_cast<double>(e.pull_bytes) / c.pull_bytes_per_s;
 }
 
@@ -663,7 +682,7 @@ inline double streak_keep_seconds(const StreakLaunch& s, const Costs& c) {
   return s.sim_s + static_cast<double>(s.card_only_bytes) / c.pull_bytes_per_s;
 }
 inline double streak_card_seconds(const StreakLaunch& s, const Costs& c) {
-  return c.launch_s + s.card_kernel_s.value_or(c.kernel_s_default) + static_cast<double>(s.push_bytes) / c.push_bytes_per_s;
+  return c.launch_s + s.card_kernel_s.value_or(kernel_prior_seconds(s.sim_s, c)) + static_cast<double>(s.push_bytes) / c.push_bytes_per_s;
 }
 inline bool streak_offload(const StreakLaunch& s, const Costs& c, bool driver_started) {
   if (!driver_started || s.card_only_bytes == 0 || !(s.sim_s > 0)) return false;

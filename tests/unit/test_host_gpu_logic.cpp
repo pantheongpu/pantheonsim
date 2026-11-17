@@ -787,7 +787,7 @@ VTEST(a_start_share_of_zero_is_the_account_alone) {   // VGPU_HOST_GPU_START_LAU
 // ---- a kernel launched many times (Round sp69; host_gpu.hpp start_share_launches): the start repaid within the launches of it seen so far ----
 VTEST(the_start_is_repaid_within_fifty_launches_until_a_kernel_has_run_two_hundred_times) {
   const Costs c;
-  VCHECK(c.start_repeats == 200 && c.start_repeats_max == 500);
+  VCHECK(c.start_repeats == 200 && c.start_repeats_max == 500 && c.min_sim_s == 200e-6 && c.kernel_prior_ratio == 0);   // (the rule before #660)
   for (uint64_t kept : {0ull, 1ull, 50ull, 51ull, 199ull}) VCHECK(start_share_launches(c, kept) == 50);
   VCHECK(start_share_launches(c, 200) == 200);
   VCHECK(start_share_launches(c, 201) == 201);
@@ -2869,6 +2869,40 @@ VTEST(with_the_driver_up_a_whole_launch_over_the_floor_stands_in_for_the_static_
   VCHECK(sample_refusal(g, c, up100) == NoSample::None);
   g.whole_s = 0.18;
   VCHECK(sample_refusal(g, c, up100) == NoSample::ShortBefore);
+}
+
+// ---- very short launches (#660; A10G: an empty launch + sync 8 us, so the card prior follows the simulator's estimate) ----
+VTEST(the_card_prior_of_an_unseen_kernel_is_a_twentieth_of_the_simulator_time_up_to_100_us) {
+  const Costs c = Costs::short_launches(), before;
+  VCHECK(kernel_prior_seconds(0.0004, c) == 0.0004 / 20 && kernel_prior_seconds(0.001, c) == 0.00005);
+  VCHECK(kernel_prior_seconds(0.002, c) == c.kernel_s_default && kernel_prior_seconds(5.0, c) == c.kernel_s_default);
+  VCHECK(kernel_prior_seconds(0.0004, before) == before.kernel_s_default);   // the rule before: always 100 us
+  Estimate e = bare(0.0004);
+  e.card_kernel_s = 30e-6;                                                    // a time the card measured wins over the prior
+  VCHECK(card_path_seconds(e, c) == c.launch_s + 30e-6);
+  const StreakLaunch s{0.0004, 1 << 20, 0, std::nullopt};
+  VCHECK(streak_card_seconds(s, c) == c.launch_s + 0.00002 && streak_card_seconds(s, before) == c.launch_s + before.kernel_s_default);
+}
+
+VTEST(a_launch_of_a_hundred_microseconds_goes_to_the_card_that_runs_it_in_a_few) {
+  const Costs c = Costs::short_launches(), before;
+  VCHECK(c.min_sim_s == 40e-6 && c.start_repeats_max == 5000 && before.min_sim_s == 200e-6 && before.start_repeats_max == 500);
+  VCHECK(!should_offload(bare(39e-6), c) && should_offload(bare(41e-6), c));   // the floor: 5 latencies
+  VCHECK(!should_offload(bare(0.000111), before) && should_offload(bare(0.000111), c));   // JACOBI1D kernel1: 111 us, 20,000 launches
+  VCHECK(should_offload(bare(0.000091), c));
+}
+
+VTEST(a_kernel_launched_thousands_of_times_buys_the_start_at_fifty_microseconds_a_launch) {
+  const Costs c = Costs::short_launches(), before;
+  const Estimate jacobi = bare(0.000111);   // saves 98 us a launch: 0.25 s over 2551 launches
+  VCHECK(!should_offload_with_start(jacobi, c, false, 0.30, 2000) && should_offload_with_start(jacobi, c, false, 0.30, 2600));
+  VCHECK(!should_offload_with_start(jacobi, before, false, 0.30, 20000));
+  VCHECK(!should_offload_with_start(jacobi, c, false, 0.20, 5000));         // the account is still asked
+  Estimate sc = bare(0.00054);                // sc_gpu: 0.4 MiB each way, 1,430 launches, 0.15 ms card path by the rule
+  sc.push_bytes = sc.pull_bytes = 400 * 1024;
+  VCHECK(should_offload_with_start(sc, c, false, 0.30, 1430) && !should_offload_with_start(sc, before, false, 0.30, 1430));
+  VCHECK(!should_offload_with_start(bare(0.00022), c, false, 0.30, 1000));   // LargeKernelParameter: saves 0.2 ms, the start needs 0.25: stays
+  VCHECK(should_offload_with_start(bare(0.00022), c, true, 0.0, 1000));      // (with the driver up it would go)
 }
 
 VTEST_MAIN

@@ -201,7 +201,7 @@ struct Runtime::Impl : CardGate {
   uint64_t window_base = 0;
   uint64_t mapped_end = 0;   // granules [window_base, mapped_end) are backed
   Stats stats;
-  Costs costs;
+  Costs costs = Costs::short_launches();
   SimTimeTable sim_times;
   std::map<std::string, double> card_kernel_s;
   TrafficTable traffic;
@@ -1203,6 +1203,7 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
                               std::string(v) == "always" ? Impl::SampleMode::Always : std::string(v) == "whole" ? Impl::SampleMode::Whole : Impl::SampleMode::On;
     if (const char* v = std::getenv("VGPU_HOST_GPU_SAMPLE_BLOCK"); v && std::string(v) == "0") r->impl_->sample_block = false;   // the copy runs whole blocks (the rule before Round sp75)
     if (const char* v = std::getenv("VGPU_HOST_GPU_SAMPLE_STARTED"); v && std::string(v) == "0") r->impl_->sample_started = false;   // no sample once the driver's start has begun (the rule before Round sp76)
+    if (const char* v = std::getenv("VGPU_HOST_GPU_SHORT"); v && std::string(v) == "0") r->impl_->costs = Costs{};   // the size rule before #660: a fixed 100 us card prior, 200 us floor
     if (const char* v = std::getenv("VGPU_HOST_GPU_STATIC"); v && *v && *v != '0') r->impl_->static_estimate = true;
     if (const char* v = std::getenv("VGPU_HOST_GPU_START_COST"); v && *v) {   // seconds; 0: do not charge the driver start (the rule before sp43)
       char* end = nullptr;
