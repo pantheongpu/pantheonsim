@@ -881,6 +881,8 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         throw Error(Err::UnsupportedPtx, "SASS kernel " + k_.name + " reads " + ins.src[0].text +
                                              ", a performance-monitor counter; VirtualGPU has no timing "
                                              "model, so it has nothing to count");
+      // Reading the global timer takes a card's time (vgpu/clock_model.hpp), once for the instruction, not once per lane.
+      if (ex && ins.f[0] == 0x52) w.timer_extra += kGlobalTimerReadNs;
       each_lane(ex, [&](unsigned l) {
         const unsigned idx = ins.f[0];
         if (ins.op == Op::CS2R) {

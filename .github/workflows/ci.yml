@@ -956,6 +956,9 @@ jobs:
       - name: Slowest tests
         # The longest tests of the run above, in the job's summary; a test over 25 minutes warns and one over 30 fails (ci/slowest_tests.sh).
         if: always()
+        # Under a sanitizer e2e_sass_tier_steps is one run that cannot be sharded further and took 30.0 min on 2026-11-17: 40 min here, still warned at 25.
+        env:
+          CI_TEST_LIMIT_SECONDS: 2400
         run: ci/slowest_tests.sh build-san
 
       # The peak of the whole job, build included (so an upper bound on the test step above), to choose the -g of its ctest -j with (docs/ci.md). It reads the
@@ -1065,6 +1068,9 @@ jobs:
       - name: Slowest tests
         # The longest tests of the run above, in the job's summary; a test over 25 minutes warns and one over 30 fails (ci/slowest_tests.sh).
         if: always()
+        # Under a sanitizer e2e_sass_tier_steps is one run that cannot be sharded further and took 30.0 min on 2026-11-17: 40 min here, still warned at 25.
+        env:
+          CI_TEST_LIMIT_SECONDS: 2400
         run: ci/slowest_tests.sh build-tsan
 
       # The peak of the whole job, build included (so an upper bound on the test step above), to choose the -g of its ctest -j with (docs/ci.md). It reads the

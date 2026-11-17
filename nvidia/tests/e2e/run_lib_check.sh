@@ -84,7 +84,7 @@ if grep -q cudnn_dlhandle "$src"; then
 fi
 # A program that takes driver functions from the runtime (cudaGetDriverEntryPoint) loads libcuda beside libcudart:
 # both_shims_env is what a sanitizer build needs for that.
-if grep -q cudaGetDriverEntryPoint "$src"; then
+if grep -qE 'cudaGetDriverEntryPoint|dlopen\("libcuda\.so\.1"' "$src"; then
   both="$(both_shims_env "$shim")"
   [[ -n "$both" ]] && export "$both"
 fi

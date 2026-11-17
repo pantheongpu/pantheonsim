@@ -351,6 +351,20 @@ const MemoryManager::Allocation* MemoryManager::resolve_mapped(uint64_t addr, ui
   return nullptr;
 }
 
+uint64_t MemoryManager::mapped_run(uint64_t addr, uint64_t len) const {
+  if (maps_.empty()) return 0;
+  SharedGuard table_guard(table_lock_.get());
+  auto mu = maps_.upper_bound(addr);
+  if (mu == maps_.begin()) return 0;
+  const auto prev = std::prev(mu);
+  if (addr - prev->first >= prev->second.size) return 0;
+  const uint64_t end = prev->first + prev->second.size;
+  const uint64_t remaining = end - addr;
+  if (len <= remaining) return 0;
+  // Only when the next mapping starts where this one ends: past a gap the range is an overrun of this mapping, as before.
+  return mu != maps_.end() && mu->first == end ? remaining : 0;
+}
+
 const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t len, const char* op,
                                                         uint64_t* base_out, bool writing, bool page_slack) const {
   if (card_resident_.load(std::memory_order_relaxed) > 0)
@@ -1019,6 +1033,14 @@ uint8_t* MemoryManager::materialize(Allocation& a, uint64_t chunk_idx) {
 void MemoryManager::fill(uint64_t dst, const uint8_t* pattern, uint32_t pattern_len, uint64_t len) {
   if (spec_) [[unlikely]] spec_write(dst, len);
   if (len == 0) return;
+  // A range over several mappings is filled a mapping at a time, the pattern's phase running on (#686).
+  if (const uint64_t head = mapped_run(dst, len)) {
+    fill(dst, pattern, pattern_len, head);
+    std::vector<uint8_t> rotated(pattern_len);
+    for (uint32_t i = 0; i < pattern_len; ++i) rotated[i] = pattern[(i + head) % pattern_len];
+    fill(dst + head, rotated.data(), pattern_len, len - head);
+    return;
+  }
   if (memo_sink_) memo_sink_->on_fill(dst, pattern, pattern_len, len);
   VGPU_MEM_TRACE('Z', dst, len);
   // Host memory mapped here is filled where it is, the pattern's phase
@@ -1092,6 +1114,13 @@ uint64_t MemoryManager::resident_bytes() const {
 void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   if (spec_) [[unlikely]] spec_write(dst, len);
   if (len == 0) return;
+  // A range over several mappings is written a mapping at a time (#686).
+  if (src)
+    if (const uint64_t head = mapped_run(dst, len)) {
+      write(dst, src, head);
+      write(dst + head, static_cast<const uint8_t*>(src) + head, len - head);
+      return;
+    }
   if (memo_sink_) memo_sink_->on_write(dst, src, len);
   VGPU_MEM_TRACE('W', dst, len);
   if (host_maps_ && host_maps_->may_contain(dst)) {
@@ -1739,6 +1768,13 @@ bool MemoryManager::is_host_mapped(uint64_t addr) const {
 void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
   if (spec_) [[unlikely]] spec_read(src, len);
   if (len == 0) return;
+  // A range over several mappings is read a mapping at a time (#686).
+  if (dst)
+    if (const uint64_t head = mapped_run(src, len)) {
+      read(src, dst, head);
+      read(src + head, static_cast<uint8_t*>(dst) + head, len - head);
+      return;
+    }
   VGPU_MEM_TRACE('R', src, len);
   // Managed memory is the caller's own buffer; there is no chunk table to walk.
   if (host_maps_ && host_maps_->may_contain(src)) {
