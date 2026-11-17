@@ -295,6 +295,14 @@ inline bool parse_fit(const char* text, bool* out) {
   return false;
 }
 
+// WSL2 cannot serve the mode's window: there `cuMemAddressReserve` at the simulator's address never returns (09-host-gpu-spike.md), so the driver start would wait for its whole
+// 10 s deadline in every process. Turbo with FIT=1 starts the driver at the first launch, so it checks the host first: /proc/version of a WSL kernel names Microsoft or WSL.
+inline bool host_is_wsl(const std::string& proc_version, bool dxg_present) {
+  std::string v;
+  for (char c : proc_version) v += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return dxg_present || v.find("microsoft") != std::string::npos || v.find("wsl") != std::string::npos;
+}
+
 // What turbo mode says once, when it is on (it is not the simulator's bits: docs/perf-design/12-host-gpu-turbo.md).
 inline const char* turbo_notice() {
   return "host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host GPU, in the card's own arithmetic and order of operations: results may differ from "

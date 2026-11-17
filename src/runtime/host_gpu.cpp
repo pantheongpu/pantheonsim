@@ -1442,6 +1442,20 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
       std::fprintf(stderr, "host_gpu: VGPU_HOST_GPU_TIMEOUT=%s is not a number of seconds that is zero or more; mode off\n", v);
       return;
     }
+    if (mode == Mode::Turbo && fit) {   // (FIT=0 starts the driver lazily, as before; exact is untouched)
+      std::string ver;
+      const char* vp = std::getenv("VGPU_HOST_GPU_PROC_VERSION");   // (tests: a file standing in for /proc/version; /dev/dxg is then not looked at)
+      if (FILE* f = std::fopen(vp && *vp ? vp : "/proc/version", "r")) {
+        char b[512];
+        size_t n = std::fread(b, 1, sizeof b - 1, f);
+        ver.assign(b, n);
+        std::fclose(f);
+      }
+      if (host_is_wsl(ver, !(vp && *vp) && access("/dev/dxg", F_OK) == 0)) {
+        std::fprintf(stderr, "host_gpu: this host is WSL2, where the driver start does not return (a 10 s wait in every process); turbo mode with VGPU_HOST_GPU_FIT=1 is off here (VGPU_HOST_GPU_FIT=0 starts it lazily); mode off\n");
+        return;
+      }
+    }
     auto* r = new Runtime;
     r->impl_->mode = mode;
     r->impl_->sw = sw;

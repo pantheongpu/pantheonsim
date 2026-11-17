@@ -751,6 +751,15 @@ if [[ "$cc" == 86 ]]; then
   grep -q 'may differ from the simulator' "$work/fit_exact.err" && { echo "FAIL: exact mode said that its results may differ"; fails=1; }
   PROG=fit run fit_quiet tiny VGPU_QUIET=1 VGPU_HOST_GPU=turbo || { echo "FAIL: the quiet turbo run failed"; fails=1; }
   grep -q 'may differ from the simulator' "$work/fit_quiet.err" && { echo "FAIL: VGPU_QUIET=1 did not silence the notice"; fails=1; }
+  # 53. WSL2: turbo with FIT=1 is off at once (the driver is never touched); FIT=0 and exact are not asked.
+  echo "Linux version 6.18.0-microsoft-standard-WSL2" > "$work/wslver"
+  PROG=fit run wsl_fit tiny VGPU_HOST_GPU=turbo VGPU_HOST_GPU_PROC_VERSION="$work/wslver" || { echo "FAIL: the turbo run on a WSL host failed"; fails=1; }
+  [[ ! -s "$work/wsl_fit.log" ]] && grep -q 'this host is WSL2.*mode off' "$work/wsl_fit.err" || { echo "FAIL: turbo with FIT=1 on a WSL host was not turned off at once: $(calls wsl_fit); $(grep -m2 host_gpu "$work/wsl_fit.err")"; fails=1; }
+  diff -q "$work/off_f_tiny.out" "$work/wsl_fit.out" > /dev/null || { echo "FAIL: the WSL notice changes the output"; fails=1; }
+  PROG=fit run wsl_rules tiny VGPU_HOST_GPU=turbo VGPU_HOST_GPU_FIT=0 VGPU_HOST_GPU_PROC_VERSION="$work/wslver" "${reachx[@]}" || { echo "FAIL: the FIT=0 run on a WSL host failed"; fails=1; }
+  ! grep -q 'this host is WSL2' "$work/wsl_rules.err" || { echo "FAIL: FIT=0 was turned off for WSL"; fails=1; }
+  PROG=fit run wsl_exact tiny VGPU_HOST_GPU=exact VGPU_HOST_GPU_PROC_VERSION="$work/wslver" || { echo "FAIL: the exact run failed"; fails=1; }
+  ! grep -q 'this host is WSL2' "$work/wsl_exact.err" || { echo "FAIL: exact mode was turned off for WSL"; fails=1; }
 else
   echo "NOTE: turbo fit steps 45 to 52 need the rtx3060 profile (sm_86); skipped for $profile"
 fi

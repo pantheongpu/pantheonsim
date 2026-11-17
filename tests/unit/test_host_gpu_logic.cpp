@@ -3090,4 +3090,12 @@ VTEST(ptx_the_card_may_be_given) {
   VCHECK(r.refuse.empty());
 }
 
+VTEST(wsl_is_read_from_the_kernel_version) {
+  VCHECK(host_is_wsl("Linux version 6.18.58.1-microsoft-standard-WSL2 (root@x) (gcc)", false));
+  VCHECK(host_is_wsl("Linux version 5.15.0-Microsoft", false));
+  VCHECK(host_is_wsl("Linux version 6.8.0-1021-aws (buildd@lcy02) (gcc 13.3.0)", true));   // /dev/dxg
+  VCHECK(!host_is_wsl("Linux version 6.8.0-1021-aws (buildd@lcy02) (gcc 13.3.0)", false));
+  VCHECK(!host_is_wsl("", false));
+}
+
 VTEST_MAIN
