@@ -717,3 +717,52 @@ turns, which needs the flow scan to follow a loop that is left through a call to
 newly have sampled (design with numbers: [data/turbo-left/README.md](data/turbo-left/README.md)); the open turbo issues #660 and #661 have card scripts there (`card-short-launch.sh`, `card-bmma-verify.sh`); what the page faults after a fork cost a program with
 hundreds of MiB live on the rig (the floor of warpAggregatedAtomicsCG's two kernels); whether the size of a process's environment tilts
 particlefilter's race (the card run's `pf` stage ran, but `data/sp76/card.md` records only that the program's own race moves its time: its group counts per form are not kept).
+
+## 15. Turbo fit: every kernel the card can run (2026-11-17)
+
+**Decision (owner, 2026-11-17).** `VGPU_HOST_GPU=turbo` is not promised to be bit-accurate. It sends to the host GPU every kernel the card can physically run,
+including the kernels of a simulated profile of another architecture (a simulated H100, sm_90, on an RTX 3060, sm_86: whatever the card can run, however it can).
+Its results can differ from the simulator's by a few bits, and the mode says so once when it comes on (`host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host
+GPU ... results may differ from the simulator's`; not under `VGPU_QUIET`). `VGPU_HOST_GPU=exact` is unchanged: its set, its gates (the card must be the simulated
+model: same architecture, same SM count), its decisions and its output.
+
+What changed in turbo mode, and why:
+
+1. **The card is given its own image of each module.** Until now the card loaded the very cubin the simulator ran, chosen for the *simulated* profile, so a
+   profile of another architecture than the card's switched the whole mode off at start-up. Now the shim keeps every image of a module's fatbin (cubins and PTX; only in turbo,
+   `nvidia/src/fatbin_sass.cpp card_source_from_fatbin`, attached to each kernel as `ptx::EntryFn::card`) and the runtime chooses, once the card's architecture is
+   known, the image the driver itself would: a cubin for exactly the card's sm, else the newest cubin of its major with a lower or equal minor, else the newest PTX whose
+   `.target` the card can run (the driver compiles it), else none and the module stays in the simulator (`include/vgpu/host_gpu_source.hpp pick_card_image`; the rules are those of
+   `sass::runs_on` and `nvidia/src/fatbin.cpp pick_cubin/pick_ptx`, and a unit test holds the first equal to the simulator's over every pair of architectures). The
+   start-up gates on architecture and SM count are gone in turbo (kept in exact); a module with no image the card runs is refused per module, with its reason
+   (`no image of the module runs on the card (sm_86): it holds SASS sm_90, PTX sm_90`), counted in `refused_image`.
+2. **The scan reads the card's image.** A card cubin that is not the simulator's is read with `sass::analyze` (the loader's placement and relocation of code with no device
+   memory taken), so the instruction classes, the calls and the externs are those of the code the card runs. Its module variables must be laid out as the simulator's are
+   (symbol, section, offset, size, section size all agree, else the module is refused, never guessed), and the relocation patch that points them at the simulator's copy is made on the card's
+   image; every kernel's parameters must have the simulator's sizes. PTX is given to the card only when its text declares no variable, texture or surface, has no texture or surface
+   instruction, `trap` or `brkpt`, makes no call through a pointer and calls no external function but `vprintf` (`scan_ptx_for_card`, a conservative text scan).
+3. **Instruction classes.** A mnemonic no class names is class `unlisted` and is admitted (exact refuses it, its whitelist is untouched); `never` is only what needs the
+   simulator's tables (texture and surface instructions), `BPT`, and a call the scan cannot follow. `VGPU_HOST_GPU_TURBO_OFF=unlisted` keeps them out.
+4. **A fit check** before a launch goes to the card: block dimensions and threads against the card's limits and the kernel's own (`cuFuncGetAttribute`: the most threads it
+   can run, registers, static shared memory), registers per block, static plus dynamic shared memory against the opt-in limit, grid dimensions, and the simulator's memory
+   window against the card's total memory (`fits_card`, `window_fits`). A launch that does not fit stays in the simulator and the mode goes on (`refused_fit`). The local
+   memory a thread's frame needs cannot be checked beforehand (the driver allocates it at launch). A launch the card refuses after the check ends the mode as before: the simulator runs
+   it, and when the card holds data the simulator lacks the process ends with an internal error naming the kernel; a kernel that does not return is ended by the watchdog (status 124).
+5. **`VGPU_HOST_GPU_FIT`** (default `1` in turbo): every kernel that passes the safety checks and fits the card goes to the card, whatever its size: no size rule, no sample of its
+   first blocks, no first-launch rule, no start cost, no bans, no streak rule, and not the 2 GiB `VGPU_HOST_GPU_MAX_MIB` pipe cap (the card's capacity is what is checked). The card is
+   started at the first launch that passes the cheap checks, since the image depends on it. **Why it is the default:** "every kernel the card can run" cannot hold with the size rule
+   (a one-warp launch would stay in the simulator), and the owner asked for it. The cost is real for programs of many tiny launches (a driver start of 0.15 to 0.35 s, and a push or
+   pull of memory whenever the simulator and the card alternate); the table below measures it. `VGPU_HOST_GPU_FIT=0` keeps every earlier rule (and the lazy driver start; the verdicts are redone
+   when the card turns out to be of another architecture than the profile).
+6. **Kept as they were** (safety, not bit-exactness): cooperative and cluster launches (the card path is a plain `cuLaunchKernel`), host-mapped arguments, VMM, IPC and managed memory, module
+   variables the patch cannot apply, externs other than `vprintf`, texture objects, no code section, the diagnostics that need the simulator, and the watchdog.
+
+Not built: retargeting `.target sm_90` PTX to the card's architecture (rewrite the target, let the driver compile what the card's ISA accepts; blockers are `wgmma`, clusters, TMA, `elect`,
+`setmaxnreg`... and a launch shape the card lacks). `scan_ptx_for_card` and the image choice are where it would hook in. Multi-card is out of scope.
+
+Limits: a simulated profile with an sm_90-only build (`-arch=sm_90`, no older cubin or PTX) has no image an sm_86 card runs; its kernels stay in the simulator. Libraries loaded with `cuLibraryLoadData` give the card the image the
+simulator was given (the fatbin's other images are not kept there). Results of kernels that read the simulated profile's properties (SM count, shared memory size) follow the simulated profile, as the program sees it.
+
+Tests: `tests/unit/test_host_gpu_logic.cpp` (class table, `pick_card_image`, `fits_card` boundaries, `scan_ptx_for_card`, `window_fits`, `parse_fit`) and steps 45 to 52 of
+`nvidia/tests/e2e/run_host_gpu_stub.sh` (stand-in driver, no card; steps 10 to 44 run with `VGPU_HOST_GPU_FIT=0`, which pins the rules they were written for). Mutation evidence is in
+[data/turbo-fit/README.md](data/turbo-fit/README.md).

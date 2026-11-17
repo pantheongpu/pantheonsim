@@ -7,6 +7,15 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **Turbo host-GPU mode sends every kernel the card can run, from the card's own image, and is documented as not bit-accurate** (owner decision 2026-11-17).
+  `VGPU_HOST_GPU=turbo` now chooses, per module, the image the host GPU runs (a cubin for its own architecture, else an older cubin of its major, else PTX the
+  driver compiles) instead of the one the simulated profile runs, so a simulated H100 on an RTX 3060 uses the card; the start-up gates on architecture and SM count are gone in turbo
+  (exact keeps them, and is unchanged in every other way). Instructions no class names (class `unlisted`; `VGPU_HOST_GPU_TURBO_OFF=unlisted` keeps them out) no longer keep a kernel
+  in the simulator; texture and surface instructions and `BPT` still do. A launch is checked against the card's limits (threads, registers, shared memory, grid, memory)
+  and stays simulated when it does not fit. **`VGPU_HOST_GPU_FIT=1` (the default in turbo) skips the size rule, the sample, the first-launch rule, the start cost and the bans, so every
+  fitting kernel goes to the card; `VGPU_HOST_GPU_FIT=0` keeps the earlier rules.** Turbo prints a notice that its results may differ from the simulator's; the summary gains
+  `bits_different=` and a `host_gpu_fit:` line. Details, measurements and mutation evidence: `docs/perf-design/12-host-gpu-turbo.md` section 15, `docs/perf-design/data/turbo-fit/`.
+
 - **An undefined `.extern .global` (or `.const`) in a PTX module is a zero-initialised variable, as on NVIDIA's driver** (issue #681). A module that
   declares `.extern .global .align 4 .u32 x;` and defines it nowhere used to fail at the first launch that read it
   (`CUDA_ERROR_NOT_FOUND: unknown symbol`), and `cuModuleGetGlobal` could not find it. On a real RTX 3080 Ti the driver drops the qualifier in a
