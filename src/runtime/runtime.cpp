@@ -336,6 +336,9 @@ uint64_t Device::load_module(const std::string& ptx_src) {
       }
     }
     auto mod = std::make_shared<ptx::Module>(ptx::parse(lazy ? lazy->decls : ptx_src));
+    // A whole-program load has nothing to resolve an unsized extern variable against; the driver's ptxas refuses it.
+    if (!mod->unresolved_externs.empty())
+      throw Error::make(Err::PtxParse, "Unresolved extern variable '", mod->unresolved_externs.front(), "' in whole program compilation");
     if (lazy) {
       lazy->text = ptx_src;
       for (const auto& g : mod->globals)

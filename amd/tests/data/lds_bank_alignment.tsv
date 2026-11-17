@@ -1,0 +1,39 @@
+# SQC_LDS_BANK_CONFLICT read from a real card for ds_read_b96 and ds_write_b96 at BASE addresses that are not 16-byte multiples: the model
+# takes a 96-bit access to need 16-byte alignment (misaligned: no conflicts counted, the access is served a lane at a time), and
+# this is the 12-byte case lds_bank_conflicts.tsv did not hold (it only had base 0).
+# Card: AMD Radeon RX 6800 (gfx1030), ROCm 7.2.0, rocprofv2, one wave32 of `lanes` lanes alone on the GPU, the instruction issued 1000
+# times, counter / 1000. Lane L addresses LDS byte (base + L * stride) % 65536. Recorded 2026-11-17 on server2 with a private copy of
+# amd/tools/lds-bank-probe that takes a base. Checked by test_amd_gcn_lds_banks.
+# Columns: card, wave, instruction, base (bytes), stride (bytes), lanes, conflicts
+rx6800	32	ds_read_b96	0	128	32	28
+rx6800	32	ds_read_b96	4	128	32	0
+rx6800	32	ds_read_b96	8	128	32	0
+rx6800	32	ds_read_b96	12	128	32	0
+rx6800	32	ds_read_b96	16	128	32	28
+rx6800	32	ds_read_b96	20	128	32	0
+rx6800	32	ds_read_b96	24	128	32	0
+rx6800	32	ds_read_b96	28	128	32	0
+rx6800	32	ds_read_b96	0	48	32	0
+rx6800	32	ds_read_b96	4	48	32	0
+rx6800	32	ds_read_b96	12	48	32	0
+rx6800	32	ds_read_b96	0	12	32	0
+rx6800	32	ds_read_b96	0	128	8	6
+rx6800	32	ds_read_b96	12	128	8	0
+rx6800	32	ds_read_b96	0	128	16	12
+rx6800	32	ds_read_b96	12	128	16	0
+rx6800	32	ds_write_b96	0	128	32	28
+rx6800	32	ds_write_b96	4	128	32	0
+rx6800	32	ds_write_b96	8	128	32	0
+rx6800	32	ds_write_b96	12	128	32	0
+rx6800	32	ds_write_b96	16	128	32	28
+rx6800	32	ds_write_b96	20	128	32	0
+rx6800	32	ds_write_b96	24	128	32	0
+rx6800	32	ds_write_b96	28	128	32	0
+rx6800	32	ds_write_b96	0	48	32	0
+rx6800	32	ds_write_b96	4	48	32	0
+rx6800	32	ds_write_b96	12	48	32	0
+rx6800	32	ds_write_b96	0	12	32	0
+rx6800	32	ds_write_b96	0	128	8	7
+rx6800	32	ds_write_b96	12	128	8	0
+rx6800	32	ds_write_b96	0	128	16	14
+rx6800	32	ds_write_b96	12	128	16	0

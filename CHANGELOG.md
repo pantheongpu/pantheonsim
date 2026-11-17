@@ -7,6 +7,25 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **PTX with an `.extern` variable is judged as NVIDIA's driver judges it** (issue #681, follow-up to the entry below). The same RTX 3080 Ti was
+  asked about the cases the first change did not cover, and answered differently from the simulator in four of them. Now, as on the card:
+  an `.extern` variable with an initialiser (`.extern .global .u32 e = 5;`) fails the load with `CUDA_ERROR_INVALID_PTX`
+  ("No initial value is allowed for external symbol"); so does an unsized `.extern` array (`x[]`) that the module does not define
+  ("Unresolved extern variable ... in whole program compilation"; linking another module that defines it is fine); so does an `.extern`
+  whose only definition is a plain one without `.visible`, `.weak` or `.common` (".extern variable cannot be resolved by a .static");
+  `cuLinkComplete` on an input with an undefined `.extern` variable fails with `CUDA_ERROR_INVALID_SOURCE` and "Undefined reference to 'x'" in the
+  error log (it linked before, and gave the variable zeroed storage), while the same input linked with one that defines it works; and the info log
+  of `cuModuleLoadDataEx` carries the `ptxas warning : Unresolved extern variable 'x' in whole program compilation, ignoring extern qualifier`
+  that the card prints for the zeroed-storage case. Not changed: a plain definition **before** an `.extern` declaration of the same name (the order
+  not measured on the card). Tests: `c_harness_extern_global` (its second module had a plain definition, which the card refuses; it is `.visible` now)
+  and `e2e_driver_extern_global` (same fix, and the unsized array it loaded is gone, since the card refuses it).
+- **LDS: the 12-byte case of a 96-bit access is measured** (follow-up to the bank-conflict rule). `ds_read_b96` and `ds_write_b96` at a base that
+  is a multiple of 12 but not of 16 count no conflicts on an RX 6800, like 4 and 8, and the alignment is a property of the whole access (a stride
+  of 12 gives no conflicts although lane 0 is aligned), so the model's 16-byte rule stands. 32 rows are in `amd/tests/data/lds_bank_alignment.tsv`,
+  checked by `test_amd_gcn_lds_banks`. Also measured: on the RX 6800 only the SQ counters work under `rocprofv2` (no TA, TCP or L2 counters), and
+  `rocprofv3 --pmc` aborts there even with the iGPU hidden, so the bytes counters can be checked against the card only through the instruction counts
+  they are built from (copy, triad, float4 copy, half-lane and reuse kernels: FLAT, VALU and SMEM per wave match the simulator exactly), not
+  against a memory counter.
 - **A program that `dlopen`s libcuda after libcudart has started finds the driver initialised** (issue #685). On a card the runtime brings the driver up, so a
   program that links only libcudart and loads `libcuda.so.1` itself (cedana-samples' `jit_modules` and `vmm_pools`) can call `cuCtxGetDevice` with no
   `cuInit` of its own. The driver shim kept its own flag, and the runtime's lookup of `cuInit` cannot see a library opened `RTLD_LOCAL` or opened late:
@@ -33,8 +52,7 @@ release says what runs and what it produces, never how fast a real GPU would run
   (`CUDA_ERROR_NOT_FOUND: unknown symbol`), and `cuModuleGetGlobal` could not find it. On a real RTX 3080 Ti the driver drops the qualifier in a
   whole-program module (`ptxas warning : Unresolved extern variable`), gives the variable its declared size, zero, and lets `cuModuleGetGlobal`
   return it and the host write it. The simulator does the same. PoCL's CUDA backend declares `_global_offset_x` this way and launches every kernel
-  with it, so OpenCL through PoCL can now launch kernels on the simulated NVIDIA GPUs. A name the module defines itself keeps its definition, and an
-  unsized `.extern .global x[]` still loads. (The simulator writes no ptxas warning: `cuModuleLoadDataEx` has no JIT log here.)
+  with it, so OpenCL through PoCL can now launch kernels on the simulated NVIDIA GPUs. A name the module defines itself keeps its definition.
 - **CI: the longest tests are split into shards, and the slowest tests are reported** (CI work). `test_amd_gcn_gather_same_bits` (2,461 s under ASan),
   `test_amd_gcn_memory_same_bits` (1,866 s), `test_amd_matrix_fast` (1,553 s) and `e2e_sass_tier` (1,830 s under ASan, 1,580 s under TSan) now run as
   eight shards each, side by side (`..._shard_KofN`; each shard keeps every item's seed, and a `_shards_partition` test proves the shards are the whole

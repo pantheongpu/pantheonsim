@@ -8,6 +8,12 @@
  * qualifier") and gives the variable zeroed storage of the declared size: cuModuleGetGlobal returns it and the host can write
  * it. Measured on an RTX 3080 Ti (driver 595.99.02): the kernel reads 0, and 7 after the host writes 7. This checks the same
  * on the simulator, and that an .extern declaration of a variable the module does define is not a second variable.
+ *
+ * It also checks what the same card refuses, which is not the same as zeroed storage: an .extern with an initialiser
+ * ("No initial value is allowed for external symbol"), an unsized .extern array ("Unresolved extern variable") and an .extern
+ * resolved only by a plain (non-.visible) definition (".extern variable cannot be resolved by a .static") all fail the load
+ * with CUDA_ERROR_INVALID_PTX; cuLinkComplete on an undefined .extern fails with CUDA_ERROR_INVALID_SOURCE and "Undefined
+ * reference to 'x'", yet links when another input defines it; and the load's info log carries the ptxas warning.
  */
 #include <stdio.h>
 #include <string.h>
@@ -16,6 +22,13 @@
 
 /* Not in vgpu_cuda.h. */
 CUresult cuModuleGetGlobal_v2(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name);
+typedef struct CUlinkState_st* CUlinkState;
+CUresult cuLinkCreate(unsigned int numOptions, int* options, void** optionValues, CUlinkState* stateOut);
+CUresult cuLinkAddData(CUlinkState state, int type, void* data, size_t size, const char* name,
+                       unsigned int numOptions, int* options, void** optionValues);
+CUresult cuLinkComplete(CUlinkState state, void** cubinOut, size_t* sizeOut);
+CUresult cuLinkDestroy(CUlinkState state);
+enum { kInputPtx = 1, kInvalidSource = 300 };
 
 #define CHECK(call)                                                      \
   do {                                                                   \
@@ -42,13 +55,13 @@ static const char* kUndefined =
     "  ret;\n"
     "}\n";
 
-/* The same name declared .extern and then defined (with a value) in the module: one variable, the defined one. */
+/* The same name declared .extern and then defined (with a value, and .visible so the declaration can resolve to it): one variable. */
 static const char* kDefined =
     ".version 6.3\n"
     ".target sm_75\n"
     ".address_size 64\n"
     ".extern .global .align 4 .u32 v;\n"
-    ".global .align 4 .u32 v = 42;\n"
+    ".visible .global .align 4 .u32 v = 42;\n"
     ".visible .entry k(.param .u64 out)\n"
     "{\n"
     "  .reg .b32 %r<2>;\n"
@@ -58,6 +71,23 @@ static const char* kDefined =
     "  st.global.u32 [%rd1], %r1;\n"
     "  ret;\n"
     "}\n";
+
+/* A kernel reading a variable, for the modules below: the first line is the declaration under test. */
+#define KERNEL_READING(decl, name)                                                  \
+  ".version 6.3\n.target sm_75\n.address_size 64\n" decl                            \
+  ".visible .entry k(.param .u64 out)\n{\n"                                         \
+  "  .reg .b32 %r<2>;\n  .reg .b64 %rd<2>;\n"                                       \
+  "  ld.param.u64 %rd1, [out];\n"                                                  \
+  "  ld.global.u32 %r1, [" name "];\n"                                             \
+  "  st.global.u32 [%rd1], %r1;\n  ret;\n}\n"
+
+static const char* kInitialiser = KERNEL_READING(".extern .global .align 4 .u32 e = 5;\n", "e");
+static const char* kUnsized = KERNEL_READING(".extern .global .align 4 .b8 arr[];\n", "arr");
+static const char* kStaticDefinition =
+    KERNEL_READING(".extern .global .align 4 .u32 s;\n.global .align 4 .u32 s = 42;\n", "s");
+/* Two inputs to the linker: one declares .extern, the other defines it (.visible). */
+static const char* kLinkUser = KERNEL_READING(".extern .global .align 4 .u32 base;\n", "base");
+static const char* kLinkDefiner = ".version 6.3\n.target sm_75\n.address_size 64\n.visible .global .align 4 .u32 base = 77;\n";
 
 static int run(CUfunction fn, CUdeviceptr out, unsigned* value) {
   unsigned poison = 0xdeadbeefu;
@@ -120,6 +150,66 @@ int main(void) {
     return 1;
   }
   CHECK(cuModuleUnload(mod));
+
+  /* What the card refuses: the load fails with INVALID_PTX. */
+  {
+    const char* bad[] = {kInitialiser, kUnsized, kStaticDefinition};
+    const char* what[] = {"an .extern with an initialiser", "an unsized .extern array", "an .extern resolved by a plain definition"};
+    for (int i = 0; i < 3; ++i) {
+      CUmodule m = NULL;
+      const CUresult rc = cuModuleLoadData(&m, bad[i]);
+      if (rc != CUDA_ERROR_INVALID_PTX) {
+        fprintf(stderr, "FAIL: %s loaded with %d, expected CUDA_ERROR_INVALID_PTX (%d)\n", what[i], (int)rc, (int)CUDA_ERROR_INVALID_PTX);
+        return 1;
+      }
+    }
+  }
+
+  /* The load's info log carries the ptxas warning for an undefined .extern. */
+  {
+    char log[512] = {0};
+    int opt[] = {3, 4};   /* CU_JIT_INFO_LOG_BUFFER, ..._SIZE_BYTES */
+    void* val[] = {log, (void*)(size_t)sizeof log};
+    CHECK(cuModuleLoadDataEx(&mod, kUndefined, 2, opt, val));
+    if (!strstr(log, "Unresolved extern variable '_global_offset_x'") || !strstr(log, "ignoring extern qualifier")) {
+      fprintf(stderr, "FAIL: the info log is '%s'\n", log);
+      return 1;
+    }
+    CHECK(cuModuleUnload(mod));
+  }
+
+  /* The linker: an .extern nothing defines is an undefined reference (INVALID_SOURCE), and one another input defines links. */
+  {
+    char log[512] = {0};
+    int opt[] = {5, 6};   /* CU_JIT_ERROR_LOG_BUFFER, ..._SIZE_BYTES */
+    void* val[] = {log, (void*)(size_t)sizeof log};
+    CUlinkState st;
+    void* image = NULL;
+    size_t image_size = 0;
+    CHECK(cuLinkCreate(2, opt, val, &st));
+    CHECK(cuLinkAddData(st, kInputPtx, (void*)kUndefined, strlen(kUndefined) + 1, "undefined.ptx", 0, NULL, NULL));
+    const CUresult rc = cuLinkComplete(st, &image, &image_size);
+    if (rc != (CUresult)kInvalidSource || !strstr(log, "Undefined reference to '_global_offset_x'")) {
+      fprintf(stderr, "FAIL: linking an undefined .extern gave %d with log '%s', expected %d and 'Undefined reference'\n", (int)rc, log,
+              kInvalidSource);
+      return 1;
+    }
+    CHECK(cuLinkDestroy(st));
+
+    CHECK(cuLinkCreate(0, NULL, NULL, &st));
+    CHECK(cuLinkAddData(st, kInputPtx, (void*)kLinkUser, strlen(kLinkUser) + 1, "user.ptx", 0, NULL, NULL));
+    CHECK(cuLinkAddData(st, kInputPtx, (void*)kLinkDefiner, strlen(kLinkDefiner) + 1, "definer.ptx", 0, NULL, NULL));
+    CHECK(cuLinkComplete(st, &image, &image_size));
+    CHECK(cuModuleLoadData(&mod, image));
+    CHECK(cuModuleGetFunction(&fn, mod, "k"));
+    if (run(fn, out, &v)) return 1;
+    if (v != 77) {
+      fprintf(stderr, "FAIL: the linked definition read as %u, expected 77\n", v);
+      return 1;
+    }
+    CHECK(cuModuleUnload(mod));
+    CHECK(cuLinkDestroy(st));
+  }
 
   CHECK(cuMemFree(out));
   printf("PASS\n");

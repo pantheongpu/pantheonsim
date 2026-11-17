@@ -176,6 +176,7 @@ class Parser {
 
   Module parse_module() {
     Module m;
+    bool linkage = false;   // a .visible, .weak or .common was the last thing read
     while (!at_end()) {
       const Token& t = peek();
       if (t.kind != Token::Kind::Word) fail(t.line, "expected directive, got '" + t.text + "'");
@@ -208,6 +209,7 @@ class Parser {
       // link time. Once a module is loaded there is nothing left to merge with,
       // so it declares exactly what ".global" does. Numba emits one per kernel.
       if (t.text == ".visible" || t.text == ".weak" || t.text == ".common") {
+        linkage = true;
         next();
         continue;
       }
@@ -253,26 +255,36 @@ class Parser {
           continue;
         }
         // ".extern .global" / ".extern .const" with a size: nothing in a whole-program module defines it, so it becomes a zero-initialised
-        // definition (the driver does the same, with a ptxas warning). An unsized one ("x[]") has no size to give and stays skipped.
+        // definition (the driver does the same, with a ptxas warning). Two forms the driver refuses: an initialiser ("No initial value is
+        // allowed for external symbol"), and an unsized array ("x[]"), which has no size to give and which a whole-program load
+        // refuses as an unresolved extern (recorded here; a module linked in later may define it).
         if (peek(1).kind == Token::Kind::Word && (peek(1).text == ".global" || peek(1).text == ".const")) {
           bool unsized = false;
+          std::string unsized_name;
           for (size_t k = 2; peek(k).kind != Token::Kind::End && !(peek(k).kind == Token::Kind::Punct && peek(k).text == ";"); ++k)
-            if (peek(k).kind == Token::Kind::Punct && peek(k).text == "[" && peek(k + 1).kind == Token::Kind::Punct && peek(k + 1).text == "]")
+            if (peek(k).kind == Token::Kind::Punct && peek(k).text == "[" && peek(k + 1).kind == Token::Kind::Punct && peek(k + 1).text == "]") {
               unsized = true;
+              unsized_name = peek(k - 1).text;
+            }
           if (!unsized) {
             const bool is_const = peek(1).text == ".const";
             const size_t line = t.line;
             next();  // .extern
             next();  // .global or .const
             GlobalVar g = parse_global(line);
+            if (!g.init.empty() || !g.init_symbols.empty())
+              fail(line, "No initial value is allowed for external symbol '" + g.name + "'");
             g.is_const = is_const;
             g.extern_decl = true;
             m.globals.push_back(std::move(g));
+            linkage = false;
             continue;
           }
+          m.unresolved_externs.push_back(unsized_name);
         }
         while (!at_end() && !peek_punct(";")) next();
         if (!at_end()) next();
+        linkage = false;
         continue;
       }
       if (t.text == ".shared") {
@@ -286,6 +298,7 @@ class Parser {
         // A prototype (".entry name(params);") declares a kernel defined later
         // or elsewhere; only a definition carries a body worth keeping.
         if (parse_entry(&fn)) m.entries.push_back(std::move(fn));
+        linkage = false;
         continue;
       }
       if (t.text == ".global" || t.text == ".const") {
@@ -294,6 +307,8 @@ class Parser {
         next();
         m.globals.push_back(parse_global(line));
         m.globals.back().is_const = is_const;
+        m.globals.back().linkage = linkage;
+        linkage = false;
         continue;
       }
       if (t.text == ".func" || t.text == ".weak" || t.text == ".visible") {
@@ -311,6 +326,7 @@ class Parser {
         if (t.text != ".func") next();  // consume ".func" after the qualifier
         auto fn = std::make_shared<EntryFn>();
         if (parse_device_func(fn.get())) m.funcs.push_back(std::move(fn));
+        linkage = false;
         continue;
       }
       // A word that is no directive at all ("this is not valid ptx") is a
@@ -322,6 +338,17 @@ class Parser {
                        ".address_size .visible .weak .common .extern .global .const .entry .file .loc "
                        ".section)");
     }
+    // An ".extern" declaration of a variable is resolved by a definition with linkage (.visible, .weak, .common), never by a plain one:
+    // NVIDIA's ptxas refuses ".extern variable cannot be resolved by a .static". (Measured with the declaration first; a plain definition
+    // first and an .extern after it is not checked.)
+    {
+      std::set<std::string> declared_extern;
+      for (const GlobalVar& g : m.globals) {
+        if (g.extern_decl) declared_extern.insert(g.name);
+        else if (!g.linkage && declared_extern.count(g.name))
+          throw Error::make(Err::PtxParse, ".extern variable '", g.name, "' cannot be resolved by a .static variable (give the definition .visible)");
+      }
+    }
     // An ".extern" declaration of a name the module defines (before or after it) is only the declaration: drop it, and the duplicates of it.
     std::set<std::string> defined;
     for (const GlobalVar& g : m.globals)
@@ -330,6 +357,9 @@ class Parser {
       if (it->extern_decl && !defined.insert(it->name).second) it = m.globals.erase(it);
       else ++it;
     }
+    // An unsized extern array the module defines is not unresolved.
+    for (auto it = m.unresolved_externs.begin(); it != m.unresolved_externs.end();)
+      it = defined.count(*it) ? m.unresolved_externs.erase(it) : std::next(it);
     return m;
   }
 

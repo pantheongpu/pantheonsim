@@ -1627,6 +1627,9 @@ struct GlobalVar {
   // cuModuleGetGlobal returns and the host may write (PoCL's _global_offset_x relies on that). The parser drops this entry when the
   // module defines the name itself.
   bool extern_decl = false;
+  // Defined with a linkage qualifier (.visible, .weak or .common) in front, so another module may resolve a reference to it. An .extern
+  // declaration cannot be resolved by one without ('.extern variable cannot be resolved by a .static'), which the parser refuses.
+  bool linkage = false;
   // A pointer-valued global can be initialised with another symbol's address
   // ("= my_array;"), and an array of them with a list ("= {f, g, h};") -- a
   // table of function pointers is exactly that. Addresses are not known until
@@ -1645,6 +1648,9 @@ struct Module {
   uint32_t address_size = 64;
   std::vector<EntryFn> entries;
   std::vector<GlobalVar> globals;
+  // ".extern .global|.const x[];" declarations (no size) of names the module does not define. Whole-program loading refuses them
+  // ('Unresolved extern variable'); linking another module in is what would define them, so the parser only records them.
+  std::vector<std::string> unresolved_externs;
   // Device functions, by definition order. Kept as shared_ptr so a kernel's
   // module_funcs can hold them without caring how the module is copied or moved.
   std::vector<std::shared_ptr<EntryFn>> funcs;
