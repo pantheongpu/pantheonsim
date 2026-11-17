@@ -7,8 +7,7 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
-- **CI: the playground host can take burst jobs** (`tools/burst-runners/host-burst.sh`, docs/ci.md). A gate counts the host as three slots and uses it only
-  when two are free; `start` registers two runners with their own label and routes the burst jobs to them, `stop` restores the variables and unregisters.
+- **CI: the playground host can take burst jobs when two of its three slots are free** (`tools/burst-runners/host-burst.sh`, docs/ci.md).
 - **A program that `dlopen`s libcuda after libcudart has started finds the driver initialised** (issue #685). On a card the runtime brings the driver up, so a
   program that links only libcudart and loads `libcuda.so.1` itself (cedana-samples' `jit_modules` and `vmm_pools`) can call `cuCtxGetDevice` with no
   `cuInit` of its own. The driver shim kept its own flag, and the runtime's lookup of `cuInit` cannot see a library opened `RTLD_LOCAL` or opened late:
