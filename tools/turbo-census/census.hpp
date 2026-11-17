@@ -77,13 +77,13 @@ struct Analysis {
 };
 
 // The reason group of an instruction turbo_class made class Never (hostgpu::unmeasured_private_mnemonic and the rest of it).
-inline std::string never_reason(const std::string& m) {
+inline std::string never_group(const std::string& m) {
   if (hostgpu::texture_mnemonic(m)) return "never:texture-surface";
   if (m == "BPT") return "never:bpt";
   if (m == "UTMALDG" || m == "UTMASTG" || m == "UTMAREDG" || m == "UTMAPF" || m == "UTMACMDFLUSH" || m == "UBLKRED" || m == "UBLKCP") return "never:tma";
   if (m == "HGMMA" || m == "IGMMA" || m == "BGMMA" || m == "QGMMA" || m == "WARPGROUP" || m == "USETMAXREG") return "never:warpgroup";
-  if (m == "UCGABAR" || m == "ENDCOLLECTIVE" || m == "STAS" || m == "REDAS" || m == "ARRIVES" || m == "LDGMC") return "never:cluster-dsmem";
-  if (m == "SYNCS") return "never:syncs-mbarrier";
+  if (m == "UCGABAR" || m == "STAS" || m == "REDAS" || m == "LDGMC") return "never:cluster-dsmem";
+  if (m == "ARRIVES" || m == "SYNCS" || m == "ENDCOLLECTIVE") return "never:arrives-syncs-endcollective";
   if (m == "ELECT") return "never:elect";
   if (m == "STSM") return "never:stsm";
   if (m == "LDTM" || m == "STTM" || m == "UTCSHIFT" || m == "UTCMMA" || m == "UTCBAR" || m == "UTCCP" || m == "UTCATOMSWS") return "never:tensor-memory";
@@ -91,13 +91,15 @@ inline std::string never_reason(const std::string& m) {
   if (m == "JMP") return "never:jmp";
   return "never:other";
 }
+// "never:<group>/<MNEMONIC>": the group says what building it would mean, the mnemonic is what the scan met first.
+inline std::string never_reason(const std::string& m) { return never_group(m) + "/" + m; }
 
 // The reason group of the text a PTX scan refused with (hostgpu::scan_ptx_for_card's messages).
 inline std::string ptx_reason(const hostgpu::PtxScan& s) {
   const std::string& r = s.refuse;
   const auto has = [&](const char* t) { return r.find(t) != std::string::npos; };
   if (has("texture or surface")) return "ptx:texture-surface";
-  if (has("module variable")) return "ptx:module-variable";
+  if (has("module variable")) return std::string("ptx:module-variable/") + (has("(.const)") ? ".const" : ".global");
   if (has("trap") || has("brkpt")) return "ptx:trap";
   if (has("through a pointer")) return "ptx:indirect-call";
   if (has("cluster directive")) return "ptx:cluster-directive";
@@ -282,7 +284,10 @@ inline std::vector<std::string> kernel_names(const std::vector<CardCandidate>& c
   for (size_t i = 0; i < c.size(); ++i)
     if (c[i].kind == CardCandidate::Cubin)
       if (const sass::Module* m = an.get(c, i)) {
-        for (const sass::CubinKernel& k : m->cubin.kernels) names.insert(k.name);
+        // (cubin.kernels lists every function with a .nv.info section, device functions such as __cuda_sm70_barrier_sync_0 included; an entry point is one with a
+        // constant bank 0 section of its own, ".nv.constant0.<name>", where its parameters are: measured on the corpus, local "__nv_static_..." kernels have one and no device function does)
+        for (const sass::CubinKernel& k : m->cubin.kernels)
+          if (m->cubin.section(".nv.constant0." + k.name)) names.insert(k.name);
         if (!names.empty()) return {names.begin(), names.end()};
       }
   for (const CardCandidate& p : c)

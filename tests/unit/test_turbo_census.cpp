@@ -32,7 +32,7 @@ W iadd3() { return {0x000fc80007ffe000ull, 0x7210ull | uint64_t{1} << 16 | uint6
 // A linked cubin for sm_<sm> with one kernel "k" (one 8-byte parameter) whose code is `code` (tests/unit/test_sass_dispatch.cpp make_cubin).
 std::string make_cubin(unsigned sm, const std::vector<W>& code, bool with_symbol = false) {
   (void)with_symbol;
-  const std::string names("\0.shstrtab\0.text.k\0.nv.info.k\0", 31);
+  const std::string names("\0.shstrtab\0.text.k\0.nv.info.k\0.nv.constant0.k\0", 47);   // (.nv.constant0.k at 30: what makes "k" an entry point, census::kernel_names)
   std::string info;
   put<uint8_t>(info, 4), put<uint8_t>(info, 0x17), put<uint16_t>(info, 12);
   put<uint32_t>(info, 0), put<uint32_t>(info, 0), put<uint32_t>(info, 8u << 18);
@@ -55,8 +55,9 @@ std::string make_cubin(unsigned sm, const std::vector<W>& code, bool with_symbol
   shdr(1, 3, names_off, names.size());
   shdr(11, 1, text_off, 16 * code.size());
   shdr(19, 0x70000000, info_off, info.size());
+  shdr(30, 8, info_off, 0x168);   // NOBITS
   out[0] = 0x7f, out[1] = 'E', out[2] = 'L', out[3] = 'F', out[4] = 2, out[5] = 1, out[6] = 1, out[7] = 0x41, out[8] = 8;
-  const uint16_t type = 2, machine = 190, shentsize = 64, shnum = 4, shstrndx = 1;
+  const uint16_t type = 2, machine = 190, shentsize = 64, shnum = 5, shstrndx = 1;
   const uint32_t flags = 0x06000002u | (sm << 8);
   std::memcpy(&out[16], &type, 2), std::memcpy(&out[18], &machine, 2);
   std::memcpy(&out[0x28], &shoff, 8), std::memcpy(&out[0x30], &flags, 4);
@@ -149,10 +150,10 @@ VTEST(census_never_instructions_follow_turbo_class) {
     bool by_scan;   // turbo_class says Call; it is the scan (call_stays_inside / call_to_entry) that makes it Never
   };
   const Case cases[] = {
-      {"breakpoint", 86, {0x000fea0003800000ull, 0x95cull | uint64_t{7} << 12}, "BPT", "never:bpt", false},
-      {"texture", 86, {0x000fea0003800000ull, 0xb60ull | uint64_t{7} << 12}, "TEX", "never:texture-surface", false},
+      {"breakpoint", 86, {0x000fea0003800000ull, 0x95cull | uint64_t{7} << 12}, "BPT", "never:bpt/BPT", false},
+      {"texture", 86, {0x000fea0003800000ull, 0xb60ull | uint64_t{7} << 12}, "TEX", "never:texture-surface/TEX", false},
       {"call through a register", 86, {0x000fea0003800000ull, 0x343ull | uint64_t{7} << 12 | uint64_t{4} << 24}, "CALL", "never:call-through-register", true},
-      {"tensor-map load", 90, {0x000fea0003800000ull, 0x5b4ull | uint64_t{7} << 12}, "UTMALDG", "never:tma", false},
+      {"tensor-map load", 90, {0x000fea0003800000ull, 0x5b4ull | uint64_t{7} << 12}, "UTMALDG", "never:tma/UTMALDG", false},
   };
   for (const Case& cs : cases) {
     const std::vector<W> code{cs.word, exit_()};
@@ -202,7 +203,8 @@ VTEST(census_ptx_follows_the_text_scan) {
   const std::string head = ".visible .entry k(.param .u64 p)\n{\n";
   const Case cases[] = {
       {".visible .entry k(.param .u64 p)\n{\nret;\n}\n", ""},
-      {".global .align 4 .u32 v;\n.visible .entry k(.param .u64 p)\n{\nret;\n}\n", "ptx:module-variable"},
+      {".global .align 4 .u32 v;\n.visible .entry k(.param .u64 p)\n{\nret;\n}\n", "ptx:module-variable/.global"},
+      {".const .align 4 .b8 c[16];\n.visible .entry k(.param .u64 p)\n{\nret;\n}\n", "ptx:module-variable/.const"},
       {".visible .entry k(.param .u64 p)\n{\n.reg .f32 f<4>;\ntex.2d.v4.f32.f32 {f0,f1,f2,f3}, [t, {f0,f1}];\nret;\n}\n", "ptx:texture-surface"},
       {".visible .entry k(.param .u64 p)\n{\ntrap;\nret;\n}\n", "ptx:trap"},
       {".visible .entry k(.param .u64 p)\n{\ncp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [a], [b, {c, d}], [e];\nret;\n}\n", "ptx:tma"},
