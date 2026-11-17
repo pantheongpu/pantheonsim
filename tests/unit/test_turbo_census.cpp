@@ -3,6 +3,7 @@
 // scan_ptx_for_card on hand-made modules: cubins built word by word (SASS for sm_86 and sm_90), and PTX texts.
 // No driver, no device.
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -25,8 +26,6 @@ void put(std::string& s, T v) {
 struct W {
   uint64_t hi, lo;
 };
-// opcode word with the guard PT (7) in bits 12-14; hi as nvcc writes it for a control-flow instruction
-W op(uint64_t opcode) { return {0x000fea0003800000ull, opcode | uint64_t{7} << 12}; }
 W exit_() { return {0x000fea0003800000ull, 0x000000000000794dull}; }
 W iadd3() { return {0x000fc80007ffe000ull, 0x7210ull | uint64_t{1} << 16 | uint64_t{2} << 24 | uint64_t{3} << 32}; }
 
@@ -72,7 +71,7 @@ CardCandidate cubin(unsigned sm, const std::vector<W>& code) {
   c.bytes = make_cubin(sm, code);
   return c;
 }
-CardCandidate ptx(int target, const std::string& body) {
+CardCandidate ptx_mod(int target, const std::string& body) {
   CardCandidate c;
   c.kind = CardCandidate::Ptx;
   c.arch = target;
@@ -131,7 +130,7 @@ VTEST(census_plain_kernel_runs_where_its_image_does) {
 
 VTEST(census_picks_the_image_as_the_runtime_does) {
   const std::vector<W> code{iadd3(), exit_()};
-  const std::vector<CardCandidate> c{cubin(75, code), cubin(86, code), ptx(86, kPtxOk)};
+  const std::vector<CardCandidate> c{cubin(75, code), cubin(86, code), ptx_mod(86, kPtxOk)};
   for (int host : {75, 80, 86, 87, 89, 90, 120}) {
     const int want = hostgpu::pick_card_image(c, host);
     const census::KernelCell k = cell(c, 1, host);
@@ -147,29 +146,37 @@ VTEST(census_never_instructions_follow_turbo_class) {
     W word;
     const char* mnemonic;
     const char* blocker;
+    bool by_scan;   // turbo_class says Call; it is the scan (call_stays_inside / call_to_entry) that makes it Never
   };
   const Case cases[] = {
-      {"breakpoint", 86, {0x000fea0003800000ull, 0x95cull | uint64_t{7} << 12}, "BPT", "never:bpt"},
-      {"texture", 86, {0x000fea0003800000ull, 0xb60ull | uint64_t{7} << 12}, "TEX", "never:texture-surface"},
-      {"call through a register", 86, {0x000fea0003800000ull, 0x343ull | uint64_t{7} << 12 | uint64_t{4} << 24}, "CALL", "never:call-through-register"},
-      {"tensor-map load", 90, {0x000fea0003800000ull, 0x5b4ull | uint64_t{7} << 12}, "UTMALDG", "never:tma"},
+      {"breakpoint", 86, {0x000fea0003800000ull, 0x95cull | uint64_t{7} << 12}, "BPT", "never:bpt", false},
+      {"texture", 86, {0x000fea0003800000ull, 0xb60ull | uint64_t{7} << 12}, "TEX", "never:texture-surface", false},
+      {"call through a register", 86, {0x000fea0003800000ull, 0x343ull | uint64_t{7} << 12 | uint64_t{4} << 24}, "CALL", "never:call-through-register", true},
+      {"tensor-map load", 90, {0x000fea0003800000ull, 0x5b4ull | uint64_t{7} << 12}, "UTMALDG", "never:tma", false},
   };
   for (const Case& cs : cases) {
     const std::vector<W> code{cs.word, exit_()};
     VCHECK_EQ(text_of(cs.sm, cs.word), std::string(cs.mnemonic));   // (the word is the instruction the case means)
     const hostgpu::ClassMask want = classes_of(cs.sm, code);
-    VCHECK(want & hostgpu::class_bit(hostgpu::InsnClass::Never));
-    VCHECK(hostgpu::turbo_refusal(want, {}) == hostgpu::TurboRefusal::Never);
+    if (cs.by_scan) {
+      VCHECK(want & hostgpu::class_bit(hostgpu::InsnClass::Call));
+      VCHECK(hostgpu::call_needs_scan(true, hostgpu::InsnClass::Call));
+      VCHECK(!hostgpu::call_stays_inside(false, false, -1, 0, 16));
+    } else {
+      VCHECK(want & hostgpu::class_bit(hostgpu::InsnClass::Never));
+      VCHECK(hostgpu::turbo_refusal(want, {}) == hostgpu::TurboRefusal::Never);
+    }
     const census::KernelCell k = cell({cubin(cs.sm, code)}, 0, static_cast<int>(cs.sm));
     VCHECK(!k.admitted);
-    VCHECK_EQ(k.classes, want);
+    const hostgpu::ClassMask ignore = hostgpu::class_bit(hostgpu::InsnClass::Never) | (cs.by_scan ? hostgpu::class_bit(hostgpu::InsnClass::Call) : 0);
+    VCHECK_EQ(k.classes & ~ignore, want & ~ignore);   // (the rest of the classes are turbo_class's, word by word)
     VCHECK_EQ(joined(k), std::string(cs.blocker));
   }
 }
 
 VTEST(census_admits_what_turbo_admits) {
   // RED / ATOM / MUFU forms and IADD3: classes are turbo_class's, none is Never, so the kernel is admitted (the atomics switch is on by default)
-  const std::vector<W> code{iadd3(), {0x000fea0003800000ull, 0x108ull | uint64_t{7} << 12}, exit_()};
+  const std::vector<W> code{iadd3(), {0x000fea0003800000ull, 0x308ull | uint64_t{7} << 12}, exit_()};
   const hostgpu::ClassMask want = classes_of(86, code);
   VCHECK(hostgpu::turbo_refusal(want, {}) == hostgpu::TurboRefusal::None);
   const census::KernelCell k = cell({cubin(86, code)}, 0, 86);
@@ -203,7 +210,7 @@ VTEST(census_ptx_follows_the_text_scan) {
       {".visible .entry k(.param .u64 p)\n{\nelect.sync %p0|%p1, 0xffffffff;\nret;\n}\n", "ptx:elect"},
   };
   for (const Case& cs : cases) {
-    const std::vector<CardCandidate> c{ptx(90, cs.body)};
+    const std::vector<CardCandidate> c{ptx_mod(90, cs.body)};
     // the runtime's scan, called directly, with the retarget flag a plain sm_90 module on an sm_86 card gets
     const hostgpu::PtxScan scan = hostgpu::scan_ptx_for_card(c[0].bytes, false, true);
     const census::KernelCell k = cell(c, -1, 86);
@@ -221,15 +228,15 @@ VTEST(census_ptx_follows_the_text_scan) {
 
 VTEST(census_retarget_forms_and_sm90a) {
   // a form ptxas rejects for sm_86 blocks the retarget but not an sm_90 card
-  const std::vector<CardCandidate> c{ptx(90, ".visible .entry k(.param .u64 p)\n{\nfence.proxy.async.shared::cta;\nret;\n}\n")};
+  const std::vector<CardCandidate> c{ptx_mod(90, ".visible .entry k(.param .u64 p)\n{\nfence.proxy.async.shared::cta;\nret;\n}\n")};
   VCHECK_EQ(joined(cell(c, -1, 86)), std::string("ptx:retarget-form(fence.proxy.async)"));
   VCHECK(cell(c, -1, 90).admitted);
   // sm_90a PTX is not retargeted at all: no image on sm_86
-  CardCandidate a = ptx(90, kPtxOk);
+  CardCandidate a = ptx_mod(90, kPtxOk);
   a.suffix = 'a';
   VCHECK_EQ(joined(cell({a}, -1, 86)), std::string("image:none"));
   // only sm_80..sm_87 hosts retarget (hostgpu::retarget_host)
-  VCHECK_EQ(joined(cell({ptx(90, kPtxOk)}, -1, 75)), std::string("image:none"));
+  VCHECK_EQ(joined(cell({ptx_mod(90, kPtxOk)}, -1, 75)), std::string("image:none"));
 }
 
 VTEST(census_cubin_module_variable_rules) {
