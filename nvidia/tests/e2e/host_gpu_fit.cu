@@ -106,10 +106,12 @@ int main(int argc, char** argv) {
     int *h = nullptr, *dh = nullptr;
     if (cudaHostAlloc(&h, 32 * sizeof(int), cudaHostAllocMapped) != cudaSuccess || cudaHostGetDevicePointer(&dh, h, 0) != cudaSuccess) return 2;
     std::memset(h, 0, 32 * sizeof(int));
+    cudaFree(d);   // (no device memory at all, as in a zero-copy program)
     tiny<<<1, 32>>>(dh, 32);
     cudaDeviceSynchronize();
     std::printf("hostsum=%lld\n", sum(h, 32));
     cudaFreeHost(h);
+    return 0;
   } else if (!std::strcmp(mode, "qmma")) {
 #ifndef FIT_NO_ELECT
     qmma<<<1, 32>>>(d);

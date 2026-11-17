@@ -1917,7 +1917,7 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     return false;
   };
   if (turbo && hi > base && im.limits.memory_total && hi - base > im.limits.memory_total) return fit_refuse(FitRefusal::Memory);
-  if (hi < base || !im.ensure_mapped(hi)) {
+  if (hi && (hi < base || !im.ensure_mapped(hi))) {   // (no device allocation, as in a zero-copy program: nothing to back)
     if (logging()) std::fprintf(stderr, "host_gpu: %s: could not back the simulator's window up to 0x%llx on the card\n", fn.name.c_str(), static_cast<unsigned long long>(hi));
     ++im.stats.failed;
     ++im.stats.simulated;
