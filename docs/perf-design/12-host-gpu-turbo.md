@@ -858,3 +858,9 @@ Under `VGPU_HOST_GPU_VERIFY` the host buffers are saved before the card runs, co
 runs the launch on that memory (unknown how often this matters; the same hazard as card-held data).
 
 **Textures and surfaces** stay refused: `14-turbo-textures-design.md`.
+
+**Measured, A10G (g5.xlarge), 5 interleaved runs, medians, output identical in every form** (2026-11-17): HeCBench `zerocopy` 28 of 28 launches on the card, 20.4 s against
+25.1 s with `VGPU_HOST_GPU_HOSTMAP=0` (sim 24.9 s); `simpleAWBarrier` 1 of 1 on the card, 0.34 s against 1.22 s with `VGPU_HOST_GPU_COOP=0` (sim 1.08 s);
+`simpleZeroCopy` 1 of 1 on the card, 0.25 s (sim 0.06 s: the driver start; with `HOSTMAP=0` the run aborts in a glibc mutex assertion, a failure of the old rule not
+looked into). `VGPU_HOST_GPU_VERIFY=all`: 0 words different (1.6 G, 20 M and 3 M words compared). ATAX, GEMM, MVT, hotspot, bfs and nn: turbo within 3 % of the
+switches-off forms (no program slower). A launch with no device allocation (a zero-copy program) used to fail "could not back the window up to 0x0"; fixed here.
