@@ -7,6 +7,8 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **AMD counters: cache lines of global and flat accesses** (issue #650, the second half). `VGPU_DISPATCH_STATS` also prints `vmem_lines_rd` and `vmem_lines_wr`, the distinct vector L1 lines the active lanes touch (64 bytes on CDNA, 128 on RDNA and gfx1250; the table is in `docs/cli.md`).
+  It is modelled, not verified against a card, and no rocprofiler counter is mapped to it. The test is `test_amd_gcn_cache_lines`.
 - **CI: the playground host can take burst jobs when two of its three slots are free** (`tools/burst-runners/host-burst.sh`, docs/ci.md).
 - **A SASS `RET` with a condition predicate returns only the lanes where both predicates hold** (issue #691). On sm_90 ptxas ends a `__noinline__`
   function that returns early when two cells are equal with a `RET` whose second predicate sits in the same bits as `BRA` and `EXIT` have it; the decoder

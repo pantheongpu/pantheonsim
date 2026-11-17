@@ -8314,6 +8314,24 @@ struct Machine {
       n.lds_bank_conflicts += gcn::lds_bank_conflicts(addr, w.exec, a);
     }
   }
+  // The cache lines a global or flat access touches (vgpu/amd_memtraffic.hpp), from each active lane's address. A lane whose flat
+  // address is in LDS reaches no cache; scratch, the block, transpose and addtid forms are not counted.
+  void count_vmem_lines(const Wave& w, const Inst& in, uint32_t fl, InstructionCounts& n) {
+    if (!w.exec || in.segment == Inst::Segment::Scratch) return;
+    gcn::MemFacts scratch;
+    const gcn::MemKind kind = gcn::mem_facts(in, scratch).kind;
+    const uint32_t bytes = flat_lane_bytes(w, in, fl);
+    if (!bytes || kind == gcn::MemKind::AddTid || kind == gcn::MemKind::Block || kind == gcn::MemKind::Transpose) return;
+    uint64_t addr[64];
+    uint64_t live = 0;
+    for (uint64_t m = w.exec; m; m &= m - 1) {
+      const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(m));
+      addr[lane] = flat_address(const_cast<Wave&>(w), in, lane, bytes);
+      if (!(in.segment == Inst::Segment::Flat && addr[lane] - kSharedBase < kSharedSize)) live |= uint64_t{1} << lane;
+    }
+    const uint64_t lines = gcn::cache_lines(addr, live, bytes, gcn::vl1d_line_bytes(in.arch));
+    ((fl & (gcn::kInstStore | gcn::kInstAtomic)) ? n.vmem_lines_wr : n.vmem_lines_rd) += lines;
+  }
   static void count_bytes(InstructionCounts& n, uint64_t exec, uint32_t lane_bytes, bool writes, bool lds) {
     const uint64_t b = uint64_t{static_cast<uint32_t>(__builtin_popcountll(exec))} * lane_bytes;
     (lds ? (writes ? n.lds_bytes_wr : n.lds_bytes_rd) : (writes ? n.vmem_bytes_wr : n.vmem_bytes_rd)) += b;
@@ -12998,6 +13016,8 @@ struct Machine {
     if (w.vgpr_msb || w.gpr_idx || w.vskip || !FloatMode::is_default(w.mode)) return 0;
     // Bank conflicts read every lane's address, which the tier's handlers do not give: the interpreter runs the LDS instruction.
     if (d.count_lds_banks && in.fast.unit == gcn::tier::kUnitLds) return 0;
+    // Cache lines read every lane's address: the interpreter runs the global loads and stores.
+    if (d.count_lines && (in.fast.mach == 1 || in.fast.mach == 2 || in.fast.mach == 4 || in.fast.mach == 5)) return 0;
     if (in.fast.mach) return tier_mach(w, g, in);
     if (__builtin_expect(!w.tier.ok, 0)) make_tier_regs(w, g);
     gcn::tier::Regs& r = w.tier.r;
@@ -13501,6 +13521,7 @@ struct Machine {
         else if (fl & gcn::kInstStore) ++n.flat_write, ++n.vmem_wr;
         else ++n.flat_read, ++n.vmem_rd, issued_load(w);
         count_bytes(n, w.exec, flat_lane_bytes(w, in, fl), (fl & (gcn::kInstStore | gcn::kInstAtomic)) != 0, false);
+        if (d.count_lines) count_vmem_lines(w, in, fl, n);
         if (in.segment == Inst::Segment::Scratch) scratch_access(w, in, g);
         else if (in.segment == Inst::Segment::Flat) n.lds += flat_access(w, in, g);
         else if (fl & gcn::kInstLoadLds) global_load_lds(w, in, g), ++n.lds;
