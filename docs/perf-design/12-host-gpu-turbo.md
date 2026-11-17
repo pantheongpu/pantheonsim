@@ -435,7 +435,7 @@ would read in the simulator, at the addresses it would read them.
 **External functions, by the kernel.** The external functions a kernel can reach are its call graph's and its own code's call relocations
 (`sass::reachable`), and only those decide, by kind (`extern_kind`, `include/vgpu/host_gpu.hpp`): a kernel that calls `malloc` or `free` stays in
 the simulator (the card's heap is the card's own, outside the window: a pointer from it kept in memory means nothing to the simulator), so does one
-that calls `assert` (a failed assert on the card loses the context, and with it data only the card holds), one that launches kernels (the child
+that calls `assert` (a failed assert on the card loses the context, and with it data only the card holds; in exact mode: turbo mode admits it since section 20), one that launches kernels (the child
 grids, their code and their addresses would be the card's, and the scan has not seen them), and one that calls anything else not named. A kernel
 of the same module that calls none of them is judged by its own code. Turbo mode admits a kernel that calls `vprintf`: the absolute call to it is
 the one call that may leave the kernel's section (the driver links it at load). The card writes the arguments to its printf buffer and the driver

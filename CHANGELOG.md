@@ -29,6 +29,12 @@ release says what runs and what it produces, never how fast a real GPU would run
   launch of 40 us or more be sent (was 200 us), and lets a kernel launched thousands of times repay the driver start at 50 us saved a launch.
   The simulator's results do not change, only which path a launch takes. `VGPU_HOST_GPU_SHORT=0` restores the old rule.
 
+- **Turbo host-GPU mode admits a kernel that can assert or trap, and a PTX module whose variables no instruction names** (`12-host-gpu-turbo.md` section 20, [data](docs/perf-design/data/turbo-admit/README.md)). On an A10G a failed `assert` ends the context with error 710 and `__trap()` / `__brkpt()` with 719,
+  every later call returns the same code and the memory the card held is gone, exactly as the plain simulator does it; turbo now sends such kernels (`__assertfail`, `BPT.TRAP`, and nvcc 13's call through a register that the scan can bound to a slot of constant bank 4 naming
+  an external function it admits), and when the card reports 710 or 719 the launch fails with the simulator's own error, whether or not the card held data the simulator lacks (the card's assertion text is on stderr; the process no longer ends with an internal error). `VGPU_HOST_GPU_TURBO_OFF=assert` keeps them
+  in the simulator; exact mode and the plain simulator are unchanged. A PTX module is refused only for a variable some statement of it can name (`.extern`, `.visible`, `.weak`, `.managed`, unreadable declarations and any
+  name that occurs outside its declaration count as named); the libcu++ marker objects nvcc declares in every module that includes `<cuda/std/...>` no longer keep it off the card (`VGPU_HOST_GPU_PTX_VARIABLES=all` restores the old rule). Tests: unit tests of the scan and the register-call bound, stub step 59, `tools/turbo-census` follows both rules.
+
 - **Turbo refusal census** (`tools/turbo-census`, `test_turbo_census`, [docs/perf-design/data/turbo-census/](docs/perf-design/data/turbo-census/README.md), `12-host-gpu-turbo.md` section 17): a CPU-only tool that says, for every kernel of built binaries and libraries, which image
   turbo would give each host card (sm_75, sm_86, sm_89, sm_90) under the a10g and h100 profiles and why a kernel stays in the simulator, using the runtime's own image choice, PTX scan and instruction classes. Turbo itself is unchanged.
 - **Turbo host-GPU mode, next round: PTX retargeting, a driver start that overlaps the program's set-up, and the simulated profile's launch limits** (follows the turbo-fit round, PR #693).

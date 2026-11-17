@@ -3424,6 +3424,11 @@ VTEST(ptx_variables_that_no_instruction_names_do_not_keep_a_module_off_the_card)
   VCHECK(r.refuse.empty());
   r = scan_ptx_for_card(with(".global .align 4 .b8 g[16];\n.pragma \"g\";\n", "st.global.u32 [%rd1], 1;"), false, true);
   VCHECK(!r.refuse.empty());
+  // a name with a dot (LLVM names such as `tab.1`): the scan reads identifiers apart at the dot, so a piece of the name counts
+  r = scan_ptx_for_card(with(".global .align 4 .b8 tab.1[16];\n", "ld.global.u32 %r1, [tab.1+4];"), false, true);
+  VCHECK(!r.refuse.empty());
+  r = scan_ptx_for_card(with(".global .align 4 .b8 tab.1[16];\n", "ld.global.u32 %r1, [%rd1+4];"), false, true);
+  VCHECK(r.refuse.empty());
   // initialised data of a variable is not a reference to the variable (the data statements hold numbers); a string literal's bytes are not names
   r = scan_ptx_for_card(with(".global .align 1 .b8 s[6] = {104, 101, 108, 108, 111, 0};\n", "st.global.u32 [%rd1], 1;"), false, true);
   VCHECK(r.refuse.empty() && r.unreferenced_variables == 1);

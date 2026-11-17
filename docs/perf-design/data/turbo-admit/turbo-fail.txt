@@ -1,0 +1,88 @@
+# VGPU_HOST_GPU=turbo on the same card, VGPU_GPU=nvidia/a10g
+### fail assert
+[vgpu] virtual GPU platform initialized: 1 x nvidia/a10g (NVIDIA A10G)
+mode assert
+cudaDeviceSynchronize()            -> 0 (no error)
+cudaGetLastError()                 -> 0 (no error)
+fail.cu:6: void k_assert(int *, int): block: [0,0,0], thread: [3,0,0] Assertion `!(fire && threadIdx.x==3)` failed.
+host_gpu: _Z8k_assertPii asserted on the card (error 710); the launch fails as it does in the simulator
+[vgpu] cudaLaunchKernel: VirtualGPU error [device-assert]: device-side assertion failed in _Z8k_assertPii on the card (VGPU_HOST_GPU=turbo; the card printed the assertion text above)
+cudaGetLastError()                 -> 0 (no error)
+cudaDeviceSynchronize()            -> 710 (device-side assert triggered)
+cudaGetLastError()                 -> 710 (device-side assert triggered)
+cudaMemcpy(h,d,sizeof h,cudaMemcpyDeviceToHost) -> 710 (device-side assert triggered)
+cudaGetLastError()                 -> 710 (device-side assert triggered)
+cudaDeviceSynchronize()            -> 710 (device-side assert triggered)
+cudaMalloc((void**)&d,16)          -> 710 (device-side assert triggered)
+cudaDeviceReset()                  -> 0 (no error)
+cudaMalloc(&d,1024)                -> 0 (no error)
+cudaDeviceSynchronize()            -> 0 (no error)
+host_gpu: 1 launches ran on the card, 1 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 1 failed on the card)
+exit=0
+### fail trap
+[vgpu] virtual GPU platform initialized: 1 x nvidia/a10g (NVIDIA A10G)
+mode trap
+cudaDeviceSynchronize()            -> 0 (no error)
+cudaGetLastError()                 -> 0 (no error)
+host_gpu: _Z6k_trapPii trapped on the card (error 719); the launch fails as it does in the simulator
+[vgpu] cudaLaunchKernel: VirtualGPU error [trap]: kernel _Z6k_trapPii trapped on the card (VGPU_HOST_GPU=turbo)
+cudaGetLastError()                 -> 0 (no error)
+cudaDeviceSynchronize()            -> 719 (unspecified launch failure)
+cudaGetLastError()                 -> 719 (unspecified launch failure)
+cudaMemcpy(h,d,sizeof h,cudaMemcpyDeviceToHost) -> 719 (unspecified launch failure)
+cudaGetLastError()                 -> 719 (unspecified launch failure)
+cudaDeviceSynchronize()            -> 719 (unspecified launch failure)
+cudaMalloc((void**)&d,16)          -> 719 (unspecified launch failure)
+cudaDeviceReset()                  -> 0 (no error)
+cudaMalloc(&d,1024)                -> 0 (no error)
+cudaDeviceSynchronize()            -> 0 (no error)
+host_gpu: 1 launches ran on the card, 1 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 1 failed on the card)
+exit=0
+### fail brkpt
+[vgpu] virtual GPU platform initialized: 1 x nvidia/a10g (NVIDIA A10G)
+mode brkpt
+cudaDeviceSynchronize()            -> 0 (no error)
+cudaGetLastError()                 -> 0 (no error)
+host_gpu: _Z5k_brkPii trapped on the card (error 719); the launch fails as it does in the simulator
+[vgpu] cudaLaunchKernel: VirtualGPU error [trap]: kernel _Z5k_brkPii trapped on the card (VGPU_HOST_GPU=turbo)
+cudaGetLastError()                 -> 0 (no error)
+cudaDeviceSynchronize()            -> 719 (unspecified launch failure)
+cudaGetLastError()                 -> 719 (unspecified launch failure)
+cudaMemcpy(h,d,sizeof h,cudaMemcpyDeviceToHost) -> 719 (unspecified launch failure)
+cudaGetLastError()                 -> 719 (unspecified launch failure)
+cudaDeviceSynchronize()            -> 719 (unspecified launch failure)
+cudaMalloc((void**)&d,16)          -> 719 (unspecified launch failure)
+cudaDeviceReset()                  -> 0 (no error)
+cudaMalloc(&d,1024)                -> 0 (no error)
+cudaDeviceSynchronize()            -> 0 (no error)
+host_gpu: 1 launches ran on the card, 1 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 1 failed on the card)
+exit=0
+### fatal
+[vgpu] virtual GPU platform initialized: 1 x nvidia/a10g (NVIDIA A10G)
+fatal.cu:5: void k(int *): block: [0,0,0], thread: [3,0,0] Assertion `threadIdx.x!=3` failed.
+host_gpu: _Z1kPi asserted on the card (error 710); the launch fails as it does in the simulator
+[vgpu] cudaLaunchKernel: VirtualGPU error [device-assert]: device-side assertion failed in _Z1kPi on the card (VGPU_HOST_GPU=turbo; the card printed the assertion text above)
+host_gpu: 0 launches ran on the card, 1 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 1 failed on the card)
+sync=710
+copy=710 h3=32573
+### hang barrier
+[vgpu] virtual GPU platform initialized: 1 x nvidia/a10g (NVIDIA A10G)
+hang.cu:6: void k_bar(int *): block: [0,0,0], thread: [3,0,0] Assertion `false && "fired"` failed.
+host_gpu: _Z5k_barPi asserted on the card (error 710); the launch fails as it does in the simulator
+[vgpu] cudaLaunchKernel: VirtualGPU error [device-assert]: device-side assertion failed in _Z5k_barPi on the card (VGPU_HOST_GPU=turbo; the card printed the assertion text above)
+host_gpu: 0 launches ran on the card, 1 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 1 failed on the card)
+barrier sync=710 (device-side assert triggered)
+real	0m0.281s
+### hang spin
+[vgpu] virtual GPU platform initialized: 1 x nvidia/a10g (NVIDIA A10G)
+host_gpu: _Z6k_spinPViPi trapped on the card (error 719); the launch fails as it does in the simulator
+[vgpu] cudaLaunchKernel: VirtualGPU error [trap]: kernel _Z6k_spinPViPi trapped on the card (VGPU_HOST_GPU=turbo)
+host_gpu: 0 launches ran on the card, 1 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 1 failed on the card)
+spin sync=719 (unspecified launch failure)
+real	0m0.436s
+### with VGPU_HOST_GPU_TURBO_OFF=assert (fatal)
+[vgpu] virtual GPU platform initialized: 1 x nvidia/a10g (NVIDIA A10G)
+[vgpu] cudaLaunchKernel: VirtualGPU error [device-assert]: SASS kernel _Z1kPi, warp 0 lane 3, at 0x1b0 (CALL.ABS.NOINC R2): device-side assertion failed: threadIdx.x!=3
+host_gpu: 0 launches ran on the card, 1 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 1 unsupported launch shapes, 0 failed on the card)
+sync=710
+copy=710 h3=30021
