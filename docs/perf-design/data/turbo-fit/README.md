@@ -2,29 +2,30 @@
 
 Design and rules: [../../12-host-gpu-turbo.md](../../12-host-gpu-turbo.md) section 15.
 
-## What could not be measured, and why
+## Card measurements: [results.md](results.md)
 
-The card evidence asked for (turbo on the local RTX 3060 with the rtx3060 and the H100 profile, `VGPU_HOST_GPU_VERIFY=all` differing words and bits)
-**could not be produced on this machine.** It runs under WSL2, where the mode's driver start cannot work: `cuMemAddressReserve` of the simulator's
-window at `0x2000'0000'0000` does not return, the start's 10 s deadline passes and the mode turns itself off
-(`the driver did not answer within 10 s ... mode off`; known since the spike, [09-host-gpu-spike.md](../../09-host-gpu-spike.md) section 3, and not changed here).
-server1 (RTX 3080 Ti) is closed to workloads and no cloud card was allowed. So no number below comes from a launch that ran on a card by this branch, and none is claimed.
-The differing-bit counter (`bits_different`) and `host_gpu_fit:` line are in the summary and unit/stub tested, but have no card reading yet. Open: run
-`tools/bench/hostgpu/run.py --forms sim,turbo,verify` (and `--gpu nvidia/h100` on a non-H100 card) on a non-WSL machine with a card.
+Three AWS rigs (2 x A10G sm_86 with 80 SMs, 1 x L4 sm_89 with 58 SMs; native Linux, driver 595, CUDA 13.0 toolkit), 14 programs (5 PolyBench, 5 Rodinia, 4 HeCBench) built for sm_86, one run each,
+`tools/bench/hostgpu/run.py --forms sim,turbo,verify`. The before build is origin/main 37c4cc9d, the after build is this branch; the stand-in tests also passed on rig 1 (unit 127/127, stub script PASS, WSL step included).
 
-## What was measured (WSL2, RTX 3060, GPU 0, `VGPU_THREADS=4`, one run each, same programs)
-
-* `before_3060_wsl.txt`: origin/main turbo (rtx3060 profile). `after_3060_wsl.txt`: this branch, turbo with the default `VGPU_HOST_GPU_FIT=1`. Columns: simulator-only wall time, turbo wall time.
-  Every turbo run ends "mode off". Before: the driver starts only for the few programs the size rule sends (FDTD-2D, LU, gaussian pay the 10 s wait, +10 s); after: **every program
-  pays the 10 s wait, because with FIT the card is started at the first launch**: on a host whose driver start hangs (WSL2), FIT=1 costs 10 s a process (0.01 to 28 s programs become 10 to 38 s). `VGPU_HOST_GPU_FIT=0` is lazy as before.
-  Outputs are identical to the simulator's in every row (the mode was off).
-* `native_3060.json`: the same binaries run natively on the 3060 (seconds): 2DCONV 0.63, ATAX 0.23, FDTD-2D 5.95, GEMM 0.28, LU 0.81, backprop 0.29, gaussian 0.19, srad_v2 0.21, hotspot 0.18, bfs 0.17
-  (process start-up dominates the small ones). The simulator took 0.4 to 28 s for them (before_3060_wsl.txt).
-* The H100-profile-on-3060 runs of the brief were not made for the same reason (the mode would be off).
+Measured (see results.md for every row):
+* A10G, profile a10g, turbo FIT=1: geometric mean 1.79x over the simulator (before, same card class: 2.09x for the size-rule turbo; with `VGPU_HOST_GPU_FIT=0` on this branch 2.11x). Long programs gain the most
+  (PolyBench FDTD-2D 92.3 s to 4.3 s, LU 28.2 s to 1.0 s, Rodinia gaussian 3.7 s to 0.27 s; native 4.2 s, 0.94 s and 0.30 s).
+* **The price of FIT=1 is paid by the small programs**: every program starts the driver, so 2DCONV 0.93 s to 2.0 s (the driver start of that process), bfs, atan2 and srad_v2 0.01 to 0.06 s become 0.24 to 0.5 s.
+  The size rule (before, or `FIT=0`) kept those in the simulator. That is why the geometric mean is lower than before although every long program is as fast or faster.
+* A10G with the **H100 profile** (sm_90 simulated on the sm_86 card; before: no card path at all, 0 of 17,000+ launches, "not a SASS module"): FDTD-2D 198 s to 4.3 s, LU 63 s to 1.1 s, gaussian 8.4 s to 0.27 s, black-scholes 19.5 s to 6.0 s; geometric mean 2.62x
+  (before: 1.00x). On the L4 (sm_89, so the lower-minor rule: the card runs the sm_86 cubin) with the H100 profile 2.45x and with the a10g profile (80 simulated SMs on a 58-SM card, which exact mode refuses) 1.69x.
+* **Differences from the simulator: none observed.** In all 14 programs on every card and profile, `VGPU_HOST_GPU_VERIFY=all` compared every launch the card ran and found 0 words different (so 0 bits, largest difference 0), and the turbo output equals the simulator's. A single
+  summary line read directly (L4, H100 profile, PolyBench GEMM): `host_gpu_turbo: ... words_compared=786432 words_different=0 ... bits_different=0` and `host_gpu_fit: policy=fit card_sm=89 card_sms=58`,
+  with the log line `card image sm_86 cubin (not the simulator's image)`. These programs hold no approximate function (black-scholes is the only MUFU kernel), so this does not say what a MUFU-, half- or atomic-heavy program does; unknown.
+* **Rodinia srad_v2** (all cards): the kernel faulted on the card (error 700, illegal address: a known out-of-bounds read of the benchmark, which the simulator tolerates and the mirrored window does not), the mode turned itself off and the
+  simulator ran the launch; the output is identical. The fallback is the one that existed; the launch was not checked beforehand (the fit check cannot see an address fault).
+* Native: A10G 0.17 to 5.3 s, L4 0.23 to 4.5 s (the small ones are process start-up).
+* WSL2: the local RTX 3060 under WSL2 cannot serve the mode (the driver's address-window reservation never returns, [09-host-gpu-spike.md](../../09-host-gpu-spike.md)). Before the guard, turbo with FIT=1 waited out the 10 s start deadline in every process there
+  (measured: 2DCONV 0.6 s to 10.6 s, mode off). Now turbo with FIT=1 turns itself off at once on a WSL host with a one-line notice (`host_is_wsl`, unit test and stub step 53; `VGPU_HOST_GPU_FIT=0` and exact are untouched).
 
 ## What was proved with a stand-in driver (no card): `nvidia/tests/e2e/run_host_gpu_stub.sh` steps 45 to 52, run on server3
 
-Clean run: `mut_m5_shared_and_clean_run.txt` (last lines): PASS, exit 0. Unit tests: `test_host_gpu_logic` 126/126.
+Clean run: `mut_m5_shared_and_clean_run.txt` (last lines): PASS, exit 0; unit tests `test_host_gpu_logic` 127/127 (the later WSL step 53 and unit test were run on rig 1: PASS).
 
 Mutations (each applied alone, rebuilt, unit test and stub script run; every one fails):
 
@@ -34,4 +35,5 @@ Mutations (each applied alone, rebuilt, unit test and stub script run; every one
 | M2 fit check dropped (`if (fr != None) return fit_refuse` removed) | src/runtime/host_gpu.cpp | stub: every `fl_*` refusal launch reaches `cuLaunchKernel` (`mut_m2_nofit.txt`, 28 FAIL); unit passes (the check is a call, not a function) |
 | M3 architecture/SM-count gate restored in turbo | src/runtime/host_gpu.cpp | stub: the H100-profile run, the sm_90 card and the 80-SM card are mode off (`mut_m3_gate.txt`, 41 FAIL) |
 | M4 performance rules back under FIT (`fit_send = false`) | src/runtime/host_gpu.cpp | stub: the one-warp launch stays in the simulator (`mut_m4_rules.txt`, 22 FAIL) |
+| M6 `host_is_wsl` never true | include/vgpu/host_gpu_source.hpp | unit: `wsl_is_read_from_the_kernel_version` (`mut_m6_wsl.txt`) |
 | M5 `fits_card` shared-memory bound `>` to `>=` | include/vgpu/host_gpu_source.hpp | unit: `a_launch_fits_the_card_by_its_limits` (boundary); stub: `fl_shared_ok` |

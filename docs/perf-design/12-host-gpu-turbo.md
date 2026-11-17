@@ -751,8 +751,8 @@ What changed in turbo mode, and why:
 5. **`VGPU_HOST_GPU_FIT`** (default `1` in turbo): every kernel that passes the safety checks and fits the card goes to the card, whatever its size: no size rule, no sample of its
    first blocks, no first-launch rule, no start cost, no bans, no streak rule, and not the 2 GiB `VGPU_HOST_GPU_MAX_MIB` pipe cap (the card's capacity is what is checked). The card is
    started at the first launch that passes the cheap checks, since the image depends on it. **Why it is the default:** "every kernel the card can run" cannot hold with the size rule
-   (a one-warp launch would stay in the simulator), and the owner asked for it. The cost is real for programs of many tiny launches (a driver start of 0.15 to 0.35 s, and a push or
-   pull of memory whenever the simulator and the card alternate); the table below measures it. `VGPU_HOST_GPU_FIT=0` keeps every earlier rule (and the lazy driver start; the verdicts are redone
+   (a one-warp launch would stay in the simulator), and the owner asked for it. The cost is real for small programs (a driver start in every process, and a push or
+   pull of memory whenever the simulator and the card alternate): measured on an A10G, 2DCONV 0.93 s to 2.0 s and 0.01 to 0.06 s programs 0.24 to 0.5 s, while the long ones are as fast or faster (below). On a WSL2 host turbo with FIT=1 turns itself off at once with a notice (the driver start never returns there). `VGPU_HOST_GPU_FIT=0` keeps every earlier rule (and the lazy driver start; the verdicts are redone
    when the card turns out to be of another architecture than the profile).
 6. **Kept as they were** (safety, not bit-exactness): cooperative and cluster launches (the card path is a plain `cuLaunchKernel`), host-mapped arguments, VMM, IPC and managed memory, module
    variables the patch cannot apply, externs other than `vprintf`, texture objects, no code section, the diagnostics that need the simulator, and the watchdog.
@@ -766,3 +766,20 @@ simulator was given (the fatbin's other images are not kept there). Results of k
 Tests: `tests/unit/test_host_gpu_logic.cpp` (class table, `pick_card_image`, `fits_card` boundaries, `scan_ptx_for_card`, `window_fits`, `parse_fit`) and steps 45 to 52 of
 `nvidia/tests/e2e/run_host_gpu_stub.sh` (stand-in driver, no card; steps 10 to 44 run with `VGPU_HOST_GPU_FIT=0`, which pins the rules they were written for). Mutation evidence is in
 [data/turbo-fit/README.md](data/turbo-fit/README.md).
+
+### Measurements (AWS, 2026-11-17; every number measured, on the card named)
+
+Setup: 2 x A10G (sm_86, 80 SMs) and 1 x L4 (sm_89, 58 SMs), 14 programs built for sm_86 (PolyBench, Rodinia, HeCBench), one run each, `tools/bench/hostgpu/run.py --forms sim,turbo,verify`. Rows: [data/turbo-fit/results.md](data/turbo-fit/results.md).
+
+| case | geometric mean over the simulator | notes |
+|---|---:|---|
+| A10G, profile a10g, origin/main turbo | 2.09x | size rule; small programs stay in the simulator |
+| A10G, profile a10g, this branch, FIT=1 | 1.79x | long programs as fast or faster; small ones pay the driver start (+0.2 to +1 s) |
+| A10G, profile a10g, this branch, FIT=0 | 2.11x | the earlier rules |
+| A10G, profile h100 (sm_90 on sm_86), origin/main | 1.00x | no card path (the simulator runs PTX: "not a SASS module") |
+| A10G, profile h100, this branch, FIT=1 | 2.62x | FDTD-2D 198 s to 4.3 s, LU 63 s to 1.1 s |
+| L4, profile h100, this branch | 2.45x | the card runs its sm_86 cubin (lower minor of the same major) |
+| L4, profile a10g (80 SMs simulated, 58 real), this branch | 1.69x | exact mode would be off here |
+
+Differences from the simulator: 0 words and 0 bits in every verified launch of every program (measured); the programs hold almost no approximate math, so the size of the differences of an SFU-, half- or atomic-heavy program on these cards is unknown here.
+Rodinia srad_v2 faults on the card (an out-of-bounds read of the benchmark) and falls back to the simulator with identical output (measured). Not measured: sm_90-only builds, PTX-only builds on a card, `cuLibrary` modules.

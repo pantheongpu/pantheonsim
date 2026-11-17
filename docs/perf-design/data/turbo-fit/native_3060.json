@@ -1,1 +1,0 @@
-{"polybench/2DCONV": 0.625, "polybench/ATAX": 0.234, "polybench/FDTD-2D": 5.949, "polybench/GEMM": 0.284, "polybench/LU": 0.811, "rodinia/backprop": 0.287, "rodinia/gaussian": 0.191, "rodinia/srad_v2": 0.21, "rodinia/hotspot": 0.18, "rodinia/bfs": 0.17}
