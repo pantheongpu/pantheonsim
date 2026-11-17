@@ -37,7 +37,6 @@ __global__ void elect(int* p) {
 #endif
 }
 
-#endif
 
 // An FP8 tensor-core multiply (QMMA on sm_89): an instruction no turbo class names, which runs on an sm_89 card.
 __global__ void qmma(int* p) {
@@ -51,6 +50,8 @@ __global__ void qmma(int* p) {
   p[threadIdx.x] = 1;
 #endif
 }
+
+#endif
 
 // A float atomic: class atomic-float (turbo keeps it out with VGPU_HOST_GPU_ATOMICS=0), also in PTX the card compiles.
 __global__ void fatom(float* p) { atomicAdd(p, 1.0f); }
@@ -79,7 +80,9 @@ int main(int argc, char** argv) {
   } else if (!std::strcmp(mode, "grid")) {
     tiny<<<4096, 4>>>(d, n);
   } else if (!std::strcmp(mode, "qmma")) {
+#ifndef FIT_NO_ELECT
     qmma<<<1, 32>>>(d);
+#endif
   } else if (!std::strcmp(mode, "elect")) {
 #ifndef FIT_NO_ELECT
     elect<<<1, 32>>>(d);
