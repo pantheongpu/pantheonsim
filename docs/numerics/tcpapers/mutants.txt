@@ -1,0 +1,13 @@
+# Mutation evidence, server3, 2026-11-16: one constant of the two tensor-core sum rules (include/vgpu/profile.hpp, kAmpereSumRule and
+# kHopperSumRule: chunk, chunk_tf32, grid) changed in a copy of the tree, vgpucudart rebuilt, nvidia/tests/e2e/run_tcpapers.sh run with
+# the programs built from the unmodified sources. Each mutant must make the test FAIL; the unmodified tree PASSes (75 checks, and with
+# VGPU_KHATTAK_VECTORS=<the full sets> 20 more: 5,000 vectors each for A100, A2, H100, H200 and B200).
+# Columns: mutant | result | failing checks of the three groups (FPRev trees, features, recorded vectors) | all failing checks
+hopper-grid-25 (Hopper cut at 2^(top-25)) | killed | fprev 2, tc_features 6, vectors 18 | 27
+hopper-chunk-8 (Hopper chunk 16 -> 8) | killed | fprev 6, tc_features 6, vectors 18 | 31
+hopper-tf32-chunk-4 (Hopper tf32 chunk 8 -> 4) | killed | fprev 2, tc_features 2, vectors 12 | 17
+ampere-chunk-16 (Ampere chunk 8 -> 16) | killed | fprev 5, tc_features 4, vectors 24 | 34
+ampere-grid-26 (Ampere cut at 2^(top-26)) | killed | fprev 5, tc_features 7, vectors 26 | 39
+ampere-tf32-chunk-8 (Ampere tf32 chunk 4 -> 8) | killed | fprev 5, tc_features 4, vectors 24 | 34
+# Nothing in the simulator's behaviour was changed by this work, so these are mutants of the code under test, not of a change.
+# The programs that built the pins (tools/tcpapers) were run on an RTX 3060 for the card's lines; the vectors are the published ones.

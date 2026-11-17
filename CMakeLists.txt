@@ -3254,6 +3254,24 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 900)
 
+  # The tensor-core numerics papers (tools/tcpapers): FPRev's summation trees, the features of Fasi et al. and of Khattak and Mikaitis,
+  # and recorded A100, H100 and B200 test vectors, against an RTX 3060's lines and the published data (docs/matrix-numerics.md).
+  add_test(NAME e2e_tcpapers
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_tcpapers.sh)
+  set_tests_properties(e2e_tcpapers PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 900)
+
+  # BMMA (1-bit tensor MMA, XOR+popc and AND+popc, #661) on random bit matrices: nvidia/tests/e2e/bmma_gemm.cu against the RTX 3060's
+  # pinned output, from sm_86 SASS, the PTX engine and a compute_80 build.
+  add_test(NAME e2e_bmma_gemm
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_bmma_gemm.sh)
+  set_tests_properties(e2e_bmma_gemm PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+
   # The error each refused launch configuration reports, runtime and driver, against an RTX 3060's CUDA 13.0.
   add_test(NAME e2e_launch_refusals
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_launch_refusals.sh)

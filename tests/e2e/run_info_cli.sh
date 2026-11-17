@@ -50,14 +50,26 @@ expect "h100: grid 26" "tensor_sum_grid: 26 [inferred]" "$(line 'tensor_sum_grid
 contains "h100: inferred from the card that was run" "an H100 PCIe (nvidia/profiles/h100-pcie.yaml)" "$out"
 expect "h100-pcie is the measured one" "tensor_sum: hopper [measured]" "$("$vgpu" info --gpu nvidia/h100-pcie 2>&1 | line 'tensor_sum:')"
 
-# ---- Blackwell: the sequential sum, unknown, and the published model named as not in force ---------------------
-out=$("$vgpu" info --gpu nvidia/b200 2>&1)
-expect "b200: sequential, unknown" "tensor_sum: sequential [unknown]" "$(line 'tensor_sum:' <<<"$out")"
-expect "b200: the published model is opt-in" "tensor_sum_published: hopper [inferred] (not in force: VGPU_TC_EXACT=published)" \
+# ---- Blackwell: b200 and gb200 sum by the Hopper rule, inferred from data others recorded on a B200 (RE-RECORDED 2026-11-16; before: ------
+# ---- sequential, unknown, with the published model named as not in force); the other Blackwell profiles stay sequential, unknown ---------
+for gpu in b200 gb200; do
+  out=$("$vgpu" info --gpu nvidia/$gpu 2>&1)
+  expect "$gpu: hopper, inferred" "tensor_sum: hopper [inferred]" "$(line 'tensor_sum:' <<<"$out")"
+  expect "$gpu: chunk 16" "tensor_sum_chunk: 16 [inferred]" "$(line 'tensor_sum_chunk:' <<<"$out")"
+  expect "$gpu: tf32 chunk 8" "tensor_sum_chunk_tf32: 8 [inferred]" "$(line 'tensor_sum_chunk_tf32:' <<<"$out")"
+  expect "$gpu: grid 26" "tensor_sum_grid: 26 [inferred]" "$(line 'tensor_sum_grid:' <<<"$out")"
+  lacks "$gpu: nothing left to opt in to" "tensor_sum_published" "$out"
+  contains "$gpu: the evidence says whose data it is" "NOT run by us on a card" "$out"
+done
+for gpu in b300 vr200 thor gb10 rtx5090 rtx-pro-6000; do
+  out=$("$vgpu" info --gpu nvidia/$gpu 2>&1)
+  expect "$gpu: sequential, unknown" "tensor_sum: sequential [unknown]" "$(line 'tensor_sum:' <<<"$out")"
+  lacks "$gpu: no chunk is printed for the sequential sum" "tensor_sum_chunk" "$out"
+done
+out=$("$vgpu" info --gpu nvidia/rtx5090 2>&1)
+expect "rtx5090: the published model is still opt-in" "tensor_sum_published: hopper [inferred] (not in force: VGPU_TC_EXACT=published)" \
   "$(line 'tensor_sum_published:' <<<"$out")"
-lacks "b200: no chunk is printed for the sequential sum" "tensor_sum_chunk" "$out"
 out=$("$vgpu" info --gpu nvidia/b300 2>&1)
-expect "b300: sequential, unknown" "tensor_sum: sequential [unknown]" "$(line 'tensor_sum:' <<<"$out")"
 lacks "b300: nothing published" "tensor_sum_published" "$out"
 
 # ---- AMD: tagged limits on the two cards that were read, no numerics anywhere --------------------------------

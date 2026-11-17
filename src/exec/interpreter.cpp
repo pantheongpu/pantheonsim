@@ -8683,6 +8683,14 @@ class Interpreter {
             const int halves = op->packed ? 2 : 1;
             for (int h = 0; h < halves; ++h) {
               const uint64_t bits = (v[lane] >> (16 * h)) & 0xFFFF;
+              if (!is_bf && !op->exact && vgpu::mufu::enabled()) {
+                // The card's half-precision unit (MUFU.<op>.F16, vgpu/exec/mufu_model.hpp eval_f16: the single-precision unit on the
+                // exact float, cut toward zero to a half). The bf16 forms (sm_90 and later) were not measured and stay below.
+                static constexpr unsigned kFn[] = {vgpu::mufu::OpEx2, vgpu::mufu::OpLg2, vgpu::mufu::OpSin, vgpu::mufu::OpCos,
+                                                   vgpu::mufu::OpSqrt, vgpu::mufu::OpRsq, vgpu::mufu::OpRcp, vgpu::mufu::OpTanh};
+                out |= static_cast<uint64_t>(vgpu::mufu::eval_f16(kFn[static_cast<unsigned>(op->op)], static_cast<uint32_t>(bits))) << (16 * h);
+                continue;
+              }
               const double y = apply(is_bf ? bf16_to_double(bits) : f16_to_double(bits));
               out |= (is_bf ? double_to_bf16(y) : double_to_f16(y)) << (16 * h);
             }

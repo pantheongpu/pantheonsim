@@ -538,6 +538,8 @@ VTEST(every_builtin_profile_tags_its_numerics) {
   const Provenance M = Provenance::Measured, I = Provenance::Inferred, U = Provenance::Unknown;
   // measured: the card of the profile's own model was run (docs/matrix-numerics.md, "Card runs behind the table").
   // inferred: another model of the same compute capability was. unknown: no card of the compute capability was.
+  // RE-RECORDED 2026-11-16: nvidia/b200 and nvidia/gb200 went unknown -> inferred (and the counts 20/11 -> 22/9). Reason: they now sum by the Hopper
+  // rule, which the 20,000 vectors Khattak and Mikaitis recorded on a B200 reproduce (docs/numerics/tcpapers.md): data of others, not a card run by us.
   const Row rows[] = {
       {"nvidia/rtx3060", M}, {"nvidia/a10g", M}, {"nvidia/t4", M}, {"nvidia/l4", M}, {"nvidia/l40s", M}, {"nvidia/a100-sxm4-40gb", M}, {"nvidia/h100-pcie", M},
       {"nvidia/rtx2080ti", I},                                                                                                    // 7.5
@@ -545,7 +547,7 @@ VTEST(every_builtin_profile_tags_its_numerics) {
       {"nvidia/a10", I}, {"nvidia/a40", I}, {"nvidia/rtx-a5000", I}, {"nvidia/rtx-a6000", I}, {"nvidia/rtx3070", I}, {"nvidia/rtx3080ti", I}, {"nvidia/rtx3090", I},   // 8.6
       {"nvidia/l40", I}, {"nvidia/rtx4080", I}, {"nvidia/rtx4090", I}, {"nvidia/rtx6000-ada", I},                                 // 8.9
       {"nvidia/h100", I}, {"nvidia/h100-nvl", I}, {"nvidia/h200", I}, {"nvidia/h200-nvl", I}, {"nvidia/gh200-480gb", I},          // 9.0
-      {"nvidia/b200", U}, {"nvidia/gb200", U}, {"nvidia/b300", U}, {"nvidia/vr200", U}, {"nvidia/thor", U},                       // 10.x, 11.0
+      {"nvidia/b200", I}, {"nvidia/gb200", I}, {"nvidia/b300", U}, {"nvidia/vr200", U}, {"nvidia/thor", U},                       // 10.x, 11.0
       {"nvidia/rtx5090", U}, {"nvidia/rtx-pro-4500", U}, {"nvidia/rtx-pro-6000", U}, {"nvidia/rtx-pro-6000-server", U}, {"nvidia/rtx-pro-6000-max-q", U}, {"nvidia/gb10", U}};   // 12.x
   int nvidia = 0, measured = 0, inferred = 0, unknown = 0;
   auto ids = vgpu::available_gpus();
@@ -592,8 +594,8 @@ VTEST(every_builtin_profile_tags_its_numerics) {
   VCHECK_EQ(nvidia, 38);
   VCHECK_EQ(static_cast<int>(std::size(rows)), 38);
   VCHECK_EQ(measured, 7);
-  VCHECK_EQ(inferred, 20);
-  VCHECK_EQ(unknown, 11);
+  VCHECK_EQ(inferred, 22);
+  VCHECK_EQ(unknown, 9);
   // A Turing card has no tf32 form, so the T4's tf32 chunk is the model's number and not its own measurement.
   VCHECK(vgpu::load_gpu("nvidia/t4").provenance_of("numerics.tensor_sum_chunk_tf32") == Provenance::Inferred);
   VCHECK(vgpu::load_gpu("nvidia/t4").provenance_of("numerics.tensor_sum_chunk") == Provenance::Measured);

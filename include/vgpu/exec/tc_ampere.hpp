@@ -98,7 +98,7 @@ inline bool exact_enabled() { return exact_mode() != kModeOff; }
 // docs/matrix-numerics.md has the cards, drivers, toolkits, dates and the lines compared.
 //
 //   Sequential  acc += a * b in f32, k in order, round to nearest even. No card is known to do this: it is what a device whose
-//               tensor core we have not measured gets (7.0, 8.7, 10.x, 11.0, 12.x).
+//               tensor core we have not measured and no recorded data covers gets (7.0, 8.7, 10.3, 10.7, 11.0, 12.x).
 //   Ampere      the rule at the top of this file: chunks of 8 products (tf32: 4), terms cut at 2^(top - 25).
 //                 8.6  measured: RTX 3060 (106,496 results), A10G        8.0  measured: A100-SXM4-40GB (8,388,608 results)
 //                 8.9  measured: L4, L40S          7.5  measured: Tesla T4 (f16; a Turing card has no bf16 or tf32 form)
@@ -107,9 +107,12 @@ inline bool exact_enabled() { return exact_mode() != kModeOff; }
 //               which compiles to two of them, two), terms cut at 2^(top - 26).
 //                 9.0  measured: H100 PCIe -- 8,388,608 wmma results (f16, bf16 and tf32, f32 and f16 accumulators, random and
 //                      special values), every one reproduced, and the card's lines of both probes (mma.sync m16n8k8 tf32 among them)
-//               published, NOT measured by us, and so not a device's model by default (`numerics.tensor_sum_published` in the
-//               profile, VGPU_TC_EXACT=published):
-//                 10.0, 12.0  Blackwell: MMA-Sim (Xie et al., arXiv 2511.10909) and Khattak and Mikaitis (arXiv 2512.07004) give
+//                 10.0 (b200, gb200: since 2026-11-16, class `inferred`) -- the 20,000 test vectors Khattak and Mikaitis recorded on a
+//                      B200 are reproduced bit for bit (the sequential sum mismatches 8,020); NOT run by us on a card. VGPU_TC_EXACT=0 is the
+//                      way back to the earlier sequential results.
+//               published, NOT measured by us and with no recorded data, and so not a device's model by default
+//               (`numerics.tensor_sum_published` in the profile, VGPU_TC_EXACT=published):
+//                 12.0  Blackwell (rtx5090, rtx-pro-*): MMA-Sim (Xie et al., arXiv 2511.10909) and Khattak and Mikaitis (arXiv 2512.07004) give
 //                      B200 and RTX PRO 6000 Blackwell the Hopper numbers for f16, bf16 and tf32
 // The same two papers give this rule and these numbers for every card above; the four corners in the subnormal range (the cut of a
 // subnormal f32 result, the floor under a zero accumulator, a subnormal accumulator's position, +0 for a negative sum that rounds to

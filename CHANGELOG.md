@@ -12,6 +12,20 @@ release says what runs and what it produces, never how fast a real GPU would run
   eight shards each, side by side (`..._shard_KofN`; each shard keeps every item's seed, and a `_shards_partition` test proves the shards are the whole
   test). The ml job no longer re-runs the heaviest simulator-only tests that the unit job runs. Every job that runs ctest puts its 20 slowest tests
   in the job summary (`ci/slowest_tests.sh`), and a test over 30 minutes fails the job. No check was removed.
+- **Behaviour change: the b200 and gb200 profiles sum tensor-core products by the Hopper rule by default, not sequentially.** On
+  `nvidia/b200` and `nvidia/gb200` (compute capability 10.0), `wmma`, `mma.sync` and SASS `HMMA` in f16, bf16 and tf32 now add the
+  products in chunks of 16 (tf32: 8) with the terms cut at 2^(top - 26), the rule of an H100, instead of one at a time in f32.
+  **The outputs of programs that use those instructions on these two profiles change** (and so do their cached results: the numerics
+  are part of the result-cache key). Counters do not. Why: the 20,000 test vectors Khattak and Mikaitis recorded on a B200
+  (arXiv 2512.07004; f16 with f32 and f16 accumulators, bf16, tf32) are reproduced bit for bit by this rule and 8,020 of them are
+  not by the sequential sum. The class is `inferred` (`vgpu info --gpu nvidia/b200`): that is data recorded by others, **we have not
+  run a B200**, and no GB200 was recorded. `tcgen05.mma`, `wgmma`, the sparse, FP8 and f64 forms are not covered and did not change.
+  **To get the earlier results back:** `VGPU_TC_EXACT=0` (the sequential sum on every device, as before; no new variable).
+  `VGPU_TC_EXACT=published` no longer does anything on b200 and gb200 (it is already in force). Not changed: sm_103 (b300), sm_120
+  (rtx5090, rtx-pro-*), thor, gb10 and vr200 keep the sequential sum by default (no recorded vectors cover them; the sm_120
+  profiles keep the published Hopper model opt-in). Tests: `test_exec3` (`blackwell_b200_gb200_default_to_the_hopper_rule_and_the_rest_do_not`,
+  pins of `tc_model_devices`), `test_profile` (provenance rows), `info_cli`, `simd_lane_forms`, `tcpapers`; details in
+  [docs/matrix-numerics.md](docs/matrix-numerics.md) and [docs/numerics/tcpapers.md](docs/numerics/tcpapers.md).
 - **The setup action installs NVTX's headers** (issue #677). A project that includes `nvtx3/nvToolsExt.h` (Arbor does, in `cuda_api.hpp`) failed to compile on a runner with a versioned CUDA toolkit, because the action installed the other libraries' headers but not NVTX's. It installs `cuda-nvtx-<version>` now. NVTX calls are no-ops with no profiler attached, so annotated programs run unchanged on the simulated GPU.
 - **Double arithmetic in a kernel no longer inherits the host program's flush-to-zero** (issue #672). A host built with `nvc -fast`
   (or `-ffast-math`) turns FTZ and DAZ on in its own MXCSR, and the engines did a kernel's arithmetic with the host's
@@ -20,6 +34,16 @@ release says what runs and what it produces, never how fast a real GPU would run
   was 1.4e-17 (the McStas PSI_DMC runs reached 39 % of their reference). A launch now clears FTZ and DAZ (and ARM's FZ) for the
   kernel and puts the host's back afterwards (`include/vgpu/exec/host_fp.hpp`, test `test_launch_fp_flush`); a kernel that asks
   for `.FTZ` still flushes, by the engine's own rule.
+- **The half-precision approximate math forms give a card's bits** (issue #664, follow-up). `ex2.approx.f16`, `.f16x2` and
+  `tanh.approx.f16`, `.f16x2` (PTX interpreter) and `MUFU.<op>.F16` (SASS executor, all eight sub-operations) are what an RTX 3060
+  computes, bit for bit over all 65,536 half patterns of each: the single-precision unit on the exactly widened half, cut toward
+  zero to a half (`eval_f16` in `include/vgpu/exec/mufu_model.hpp`). Before: `ex2.approx.f16` differed on 19,417 of 65,536
+  patterns and `tanh.approx.f16` on 14,736 (host precision, rounded to nearest); the SASS executor ignored the F16 bit and read
+  the register as a float (65,536 of 65,536 patterns off for `MUFU.EX2.F16`, `COS`, `LG2`, `RCP`, `RSQ`). Also decoded now: the
+  `.H1` half-select of `MUFU.<op>.F16`. **Measured on sm_86 only**: Turing, Ada, Hopper and Blackwell cards were not asked
+  (inferred from the 32-bit unit); the bf16 forms (sm_90 and later) are unchanged and unmeasured. `VGPU_MUFU_EXACT=0` restores
+  the earlier results for these forms too. `tools/numerics/mufu-card-run.sh` hashes them (`hashes16.txt`) for another card; see
+  [docs/numerics/math-functions.md](docs/numerics/math-functions.md).
 - **The approximate math instructions give a real card's bits** (issue #664). `MUFU` (SASS) and the PTX `.approx` forms
   were the function at the host's precision, rounded once; a card computes them in a small fixed-point unit, and its
   results differ in the last bit on 13 to 39 % of arguments (`RCP`, `RSQ`, `SQRT`, `EX2`), by an absolute error of a few
