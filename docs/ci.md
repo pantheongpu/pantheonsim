@@ -241,6 +241,16 @@ that sets `runs-on` from the runner list; a scheduled workflow with
 `issues: write` that opens an issue when jobs have waited over two hours with no
 job in progress on the label.
 
+## The playground host as a burst runner
+
+`tools/burst-runners/host-burst.sh` (run by hand, `check | install | start | stop`) lets the playground host take the burst
+jobs when the backlog is long. The host counts as three slots of 8/3 vCPUs; the ML job uses 4 vCPUs and a playground session 1,
+and the host takes jobs only while two slots are free. `start` registers two runners with the label `pantheonsim-hostburst`
+and points `BURST_RUNS_ON` and the container limits at them; `stop` puts the variables back. The gate is read at `start`, so
+a running job is not stopped when a session arrives; its container is limited to CPUs 0-3 at a low CPU weight instead. Queued
+jobs keep their old label (cancel and re-run them), and if the runners go down while `BURST_RUNS_ON` names the host, burst jobs
+wait: run `stop`. A slot is smaller than a hosted runner, so measure the ASan and TSan jobs there before routing them.
+
 ## The burst pool is offline: recovery
 
 `scripts/ci-pool.sh` (read-only; `--queued` also counts waiting jobs) says
