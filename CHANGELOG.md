@@ -7,6 +7,9 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **Turbo mode sends cooperative launches and launches with an argument into mapped host memory to the card** (issue #661). A cooperative launch (grid-wide barrier) goes
+  through `cuLaunchCooperativeKernel` when the card holds the grid at once; mapped host buffers are registered with the driver at their own addresses. Results are the
+  card's, as in turbo; `VGPU_HOST_GPU_COOP=0` and `VGPU_HOST_GPU_HOSTMAP=0` keep them in the simulator. Textures stay refused (design note, `docs/perf-design/14-turbo-textures-design.md`).
 - **CI: the playground host can take burst jobs when two of its three slots are free** (`tools/burst-runners/host-burst.sh`, docs/ci.md).
 - **A SASS `RET` with a condition predicate returns only the lanes where both predicates hold** (issue #691). On sm_90 ptxas ends a `__noinline__`
   function that returns early when two cells are equal with a `RET` whose second predicate sits in the same bits as `BRA` and `EXIT` have it; the decoder
