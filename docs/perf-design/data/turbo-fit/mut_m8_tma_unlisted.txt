@@ -1,0 +1,6 @@
+== unit m8_tma_unlisted
+[ FAIL ] turbo_classes_every_kind_of_instruction
+/home/saqib/.cache/pantheonsim-turbo-fit/tests/unit/test_host_gpu_logic.cpp:1167: VCHECK(unmeasured_private_mnemonic(m)) failed
+[ FAIL ] unlisted_is_turbo_only
+/home/saqib/.cache/pantheonsim-turbo-fit/tests/unit/test_host_gpu_logic.cpp:1192: VCHECK(turbo_class(m, {}) == C::Never) failed
+129/131 tests passed

@@ -27,6 +27,10 @@ struct Stats {
   // Launches kept in the simulator for their kernel's code, by why (vgpu/host_gpu.hpp TurboRefusal); `refused_exact` is exact mode's count of
   // launches whose kernel turbo mode would admit with its default switches.
   uint64_t refused_never = 0, refused_atomics = 0, refused_off = 0, refused_exact = 0;
+  // Turbo mode (docs/perf-design/12-host-gpu-turbo.md "Turbo fit"): launches kept in the simulator because no image of their module runs on the card
+  // (or the card's image cannot be given the simulator's variables), and because the launch does not fit the card.
+  uint64_t refused_image = 0, refused_fit = 0;
+  uint64_t retargeted = 0, retarget_refused = 0;   // modules of plain sm_90 PTX the driver compiled for an older card (loaded), and ones the scan refused for a form that card lacks
   TolReport tol;   // turbo mode's verify: every compared launch
   // Sampled launches (vgpu/host_gpu.hpp "The first blocks of a launch, timed"): how many, how many of them the card then ran (`sample_sent`, also
   // in `offloaded`), how many copies did not answer in time, and what the samples cost the process in wall seconds (the fork and the wait).
@@ -38,6 +42,9 @@ struct Stats {
   uint64_t streak_sent = 0, streak_card_only_bytes = 0;
 };
 
+// Whether VGPU_HOST_GPU is turbo: the loaders of the shim keep every image of a fatbin only then (nvidia/src/fatbin_sass.cpp).
+bool turbo_selected();
+
 // The forked copies of sampled launches (runtime.cpp): reaps the ones that have ended, waits for the rest when asked. Returns how many were
 // still running.
 size_t sample_copies_reap(bool wait);
@@ -47,6 +54,12 @@ class Runtime {
   // The runtime for a device's launches, or null when the mode is off or could not be started (said once on stderr unless
   // VGPU_QUIET). Only device 0 of the simulated machine is served: its window is the one reserved on the card.
   static Runtime* for_device(const DeviceProfile& profile, int ordinal);
+  // Turbo mode with VGPU_HOST_GPU_FIT=1 (every fitting launch goes to the card, so the card is going to be needed): starts the real driver on its helper thread when the simulated
+  // device is created, so that its 0.15 to 0.35 s overlap the program's own set-up (reading input, allocating, copying) instead of delaying the first launch. Returns at once; the
+  // first launch still waits for it (to the same 10 s deadline). Does nothing in exact mode, with VGPU_HOST_GPU_FIT=0, or with VGPU_HOST_GPU_PRESTART=0.
+  // Whether this is turbo mode: the simulator then makes the launch checks of the simulated profile (Device::check_launch) before the card is asked, as a launch it runs itself would.
+  bool turbo() const;
+  static void prestart(const DeviceProfile& profile, int ordinal);
 
   // Runs the launch on the card if it is eligible and worth it, and returns true; false leaves the launch to the simulator, with
   // the simulator's memory untouched. `sim_seconds`: how long the simulator took for a launch it did run (feeds the estimate).

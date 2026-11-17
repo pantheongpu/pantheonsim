@@ -1,6 +1,9 @@
 # Host-GPU mode, turbo: kernels whose result is the card's own
 
-Status: experimental, opt-in (`VGPU_HOST_GPU=turbo`). Measured on one A10G in *Round sp59*
+Status: experimental, opt-in (`VGPU_HOST_GPU=turbo`). **Turbo is not promised to be bit-accurate, and since 2026-11-17 it sends to the host GPU every kernel the card can
+physically run, including the kernels of a simulated profile of another architecture** (a simulated H100 on an RTX 3060: the card runs what it can, from its own
+image of the program): section 15 says what changed and why; the earlier text of this document describes the rules that `VGPU_HOST_GPU_FIT=0` keeps. Turbo prints a notice
+when it comes on that its results may differ from the simulator's, and they can, by a few bits. `VGPU_HOST_GPU=exact` is unchanged and still bit-exact. Measured on one A10G in *Round sp59*
 ([rounds/11-rounds-sp36-sp41.md](rounds/11-rounds-sp36-sp41.md#round-sp59-turbo-host-gpu-mode-on-an-a10g)): over 59 programs of PolyBench/GPU, Rodinia
 and HeCBench the geometric mean speed-up is 1.23x against 1.12x for exact mode (summed wall time 1.75x against 1.20x), every program's output is the
 simulator's, and no kernel was refused for an instruction of no class. Sections 5, 8 and 9 say what the card confirmed and what it changed.
@@ -28,7 +31,8 @@ was measured on, and a rule for the cards where it is only inferred.
 ## 2. The classes
 
 Every instruction of a kernel is put in one class, once per kernel (`turbo_class` in `include/vgpu/host_gpu.hpp`), and a kernel is
-admitted by the classes it holds. It is still a whitelist: a mnemonic nobody named is `never`. What a kernel needs of its module besides code (variables,
+admitted by the classes it holds. Since 2026-11-17 (section 15) a mnemonic nobody named is `unlisted` and turbo admits it: the card runs the cubin's own words whatever the
+simulator's decoder calls them. `never` is only what the card cannot run for the simulator. What a kernel needs of its module besides code (variables,
 external functions) is decided apart, by the same rules in both modes, in section 3.
 
 | class | instructions | default | switch |
@@ -43,13 +47,15 @@ external functions) is decided apart, by the same rules in both modes, in sectio
 | atomic-int | `ATOM`, `ATOMG`, `ATOMS` on integers with `ADD`, `MIN`, `MAX`, `AND`, `OR`, `XOR`, `INC`, `DEC`; `RED` with `INC`, `DEC`, `POPC` | admitted | `=atomics` |
 | atomic-float | `ATOM`, `ATOMG`, `ATOMS` on a float type (a value is returned) | admitted (refused until Round sp66) | `VGPU_HOST_GPU_ATOMICS=0` |
 | atomic-swap | any `CAS`, `CAST.SPIN`, `EXCH` | admitted (refused until Round sp66) | `VGPU_HOST_GPU_ATOMICS=0` |
-| never | `TEX`, `TLD`, `TLD4`, `TXD`, `TXQ`, `TMML`, `SULD`, `SUST`, `SUATOM`, `SURED`; `QMMA`, the sm_90 and sm_100 tensor and tensor-memory instructions; `JMP`, `BPT`; any other call that leaves the section (through a register, into the middle of a section, outside the module's code; the absolute call to `vprintf` excepted, section 10); `ATOMS.ARRIVE`; an instruction with a field the decoder cannot name; anything else | refused | none |
+| never | `TEX`, `TLD`, `TLD4`, `TXD`, `TXQ`, `TMML`, `SULD`, `SUST`, `SUATOM`, `SURED` (their handles are indices into the simulator's tables); `BPT` (a breakpoint or trap ends the card's context); since the review of PR #693 also the sm_90 and later forms that touch state the simulator keeps in its own format or that no card run has shown safe: every tensor-memory-access form (`UTMALDG`, `UTMASTG`, `UTMAREDG`, `UTMAPF`, `UTMACMDFLUSH`, `UBLKCP`, `UBLKRED`: the shim's `CUtensorMap` is the simulator's own layout, not the hardware descriptor), the warpgroup, cluster and tensor-memory forms (`HGMMA` and kin, `SYNCS`, `UCGABAR`, `USETMAXREG`, `ELECT`, `STSM`, `LDTM`, `UTCMMA` ...) and `JMP` (it can leave the section the scan read); any other call that leaves the section (through a register, into the middle of a section, outside the module's code; the absolute call to `vprintf` excepted, section 10) | refused | none |
+| unlisted | whatever no class names: `QMMA` (sm_89 FP8), `ATOMS.ARRIVE`, an unnamed mnemonic, an instruction with a field the decoder cannot name (admitted since 2026-11-17; refused until then, as `never`). Exact mode refuses all of it | admitted | `=unlisted` |
 
 Why each admitted class is safe to run on the card, as distinct from numerically equal: the card executes the module's own cubin, so any
 instruction is "supported" there. What the mode must guarantee is that the card has everything the kernel reads. The shared checks do
 that (section 3), and they are about memory and launch shape, not about opcodes. The classes above touch registers, shared memory and
 global memory through the same addresses as `LDG` and `STG`. The `never` class holds what does not: textures and surfaces live in the
-simulator's own tables, and the rest is unnamed because nobody has looked, not because it is known to be unsafe. The `extra` class is the
+simulator's own tables, and a trap ends the card's context. What is unnamed (`unlisted`) is admitted since 2026-11-17 because nobody has looked, not because it is
+known to be unsafe, and a result that is the card's own is what turbo promises: no measurement backs the class, which is why it has a switch of its own, as `extra` has. The `extra` class is the
 judgement call of this list: no measurement backs it yet, which is why it has a switch of its own.
 
 A kernel of the exact set (the division idiom with `VGPU_HOST_GPU_DIV=1` and the square root idiom with `VGPU_HOST_GPU_SQRT=1` included, Round sp68) is admitted whatever is switched off; turbo mode itself takes every `MUFU` anyway, so the square root idiom changes nothing in it.
@@ -57,7 +63,7 @@ A kernel of the exact set (the division idiom with `VGPU_HOST_GPU_DIV=1` and the
 A refused kernel is named once on stderr, with the first instruction that refused it, so that a benchmark shows what is still missing:
 
 ```
-host_gpu_refused: kernel=<name> class=never|off|atomics insn=<the instruction as nvdisasm prints it>
+host_gpu_refused: kernel=<name> class=never|off|atomics insn=<the instruction as nvdisasm prints it>   (`unlisted` is admitted: it is named only with VGPU_HOST_GPU_TURBO_OFF=unlisted, as class=off)
 ```
 
 ### The order-dependent classes
@@ -712,7 +718,122 @@ newly have sampled (design with numbers: [data/turbo-left/README.md](data/turbo-
 hundreds of MiB live on the rig (the floor of warpAggregatedAtomicsCG's two kernels); whether the size of a process's environment tilts
 particlefilter's race (the card run's `pf` stage ran, but `data/sp76/card.md` records only that the program's own race moves its time: its group counts per form are not kept).
 
-## 15. Very short launches (#660; both modes)
+## 15. Turbo fit: every kernel the card can run (2026-11-17)
+
+**Decision (owner, 2026-11-17).** `VGPU_HOST_GPU=turbo` is not promised to be bit-accurate. It sends to the host GPU every kernel the card can physically run,
+including the kernels of a simulated profile of another architecture (a simulated H100, sm_90, on an RTX 3060, sm_86: whatever the card can run, however it can).
+Its results can differ from the simulator's by a few bits, and the mode says so once when it comes on (`host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host
+GPU ... results may differ from the simulator's`; not under `VGPU_QUIET`). `VGPU_HOST_GPU=exact` is unchanged: its set, its gates (the card must be the simulated
+model: same architecture, same SM count), its decisions and its output.
+
+What changed in turbo mode, and why:
+
+1. **The card is given its own image of each module.** Until now the card loaded the very cubin the simulator ran, chosen for the *simulated* profile, so a
+   profile of another architecture than the card's switched the whole mode off at start-up. Now the shim keeps every image of a module's fatbin (cubins and PTX; only in turbo,
+   `nvidia/src/fatbin_sass.cpp card_source_from_fatbin`, attached to each kernel as `ptx::EntryFn::card`) and the runtime chooses, once the card's architecture is
+   known, the image the driver itself would: a cubin for exactly the card's sm, else the newest cubin of its major with a lower or equal minor, else the newest PTX whose
+   `.target` the card can run (the driver compiles it), else none and the module stays in the simulator (`include/vgpu/host_gpu_source.hpp pick_card_image`; the rules are those of
+   `sass::runs_on` and `nvidia/src/fatbin.cpp pick_cubin/pick_ptx`, and a unit test holds the first equal to the simulator's over every pair of architectures). The
+   start-up gates on architecture and SM count are gone in turbo (kept in exact); a module with no image the card runs is refused per module, with its reason
+   (`no image of the module runs on the card (sm_86): it holds SASS sm_90, PTX sm_90`), counted in `refused_image`.
+2. **The scan reads the card's image.** A card cubin that is not the simulator's is read with `sass::analyze` (the loader's placement and relocation of code with no device
+   memory taken), so the instruction classes, the calls and the externs are those of the code the card runs. Its module variables must be laid out as the simulator's are
+   (symbol, section, offset, size, section size all agree, else the module is refused, never guessed), and the relocation patch that points them at the simulator's copy is made on the card's
+   image; every kernel's parameters must have the simulator's sizes. PTX is given to the card only when its text declares no variable, texture or surface, has no texture or surface
+   instruction, `trap` or `brkpt`, makes no call through a pointer and calls no external function but `vprintf` (`scan_ptx_for_card`, a conservative text scan).
+3. **Instruction classes.** A mnemonic no class names is class `unlisted` and is admitted (exact refuses it, its whitelist is untouched); `never` is what needs the
+   simulator's tables (texture and surface instructions), `BPT`, a call the scan cannot follow (an unlisted `CALL`, one with a modifier the decoder cannot name, is followed like any other),
+   and the sm_90+ forms listed in section 2 (tensor-memory access reads the simulator's own tensor map; the rest has no card evidence: no sm_90 card was available, so none of them was measured).
+   A module the card compiles from PTX gets the classes of its text (atomics, approximate math, half, tensor, calls) and the same switches, `VGPU_HOST_GPU_TURBO_OFF` and `VGPU_HOST_GPU_ATOMICS=0`, as a cubin does; its class is that of all its kernels together (one atomic keeps the whole module out). PTX has no `unlisted` class, and its sm_90+ forms (`cp.async.bulk`, `wgmma`, `setmaxnreg`, `elect`, cluster and `mapa` forms ...) are class never. `VGPU_HOST_GPU_TURBO_OFF=unlisted` keeps them out.
+4. **A fit check** before a launch goes to the card: block dimensions and threads against the card's limits and the kernel's own (`cuFuncGetAttribute`: the most threads it
+   can run, registers, static shared memory), registers per block, static plus dynamic shared memory against the opt-in limit, grid dimensions, and the simulator's memory
+   window against the card's total memory (`fits_card`, `window_fits`). A launch that does not fit stays in the simulator and the mode goes on (`refused_fit`). The local
+   memory a thread's frame needs cannot be checked beforehand (the driver allocates it at launch). A launch the card refuses after the check ends the mode as before: the simulator runs
+   it, and when the card holds data the simulator lacks the process ends with an internal error naming the kernel; a kernel that does not return is ended by the watchdog (status 124).
+5. **`VGPU_HOST_GPU_FIT`** (default `1` in turbo): every kernel that passes the safety checks and fits the card goes to the card, whatever its size: no size rule, no sample of its
+   first blocks, no first-launch rule, no start cost, no bans, no streak rule, and not the 2 GiB `VGPU_HOST_GPU_MAX_MIB` pipe cap (the card's capacity is what is checked). The card is
+   started at the first launch that passes the cheap checks, since the image depends on it. **Why it is the default:** "every kernel the card can run" cannot hold with the size rule
+   (a one-warp launch would stay in the simulator), and the owner asked for it. The cost is real for small programs (a driver start in every process, and a push or
+   pull of memory whenever the simulator and the card alternate): measured on an A10G, 2DCONV 0.93 s to 2.0 s and 0.01 to 0.06 s programs 0.24 to 0.5 s, while the long ones are as fast or faster (below). On a WSL2 host turbo with FIT=1 turns itself off at once with a notice (the driver start never returns there). `VGPU_HOST_GPU_FIT=0` keeps every earlier rule (including section 17's short-launch rule, #660, which is now what FIT=0 and exact mode use: a kernel's card time prior of a twentieth of the simulator's estimate, a 40 us floor, three slow launches in a row before a ban, `VGPU_HOST_GPU_SHORT=0` for the rule before it; under FIT=1 none of it is asked, because every fitting launch goes to the card whatever it would save) (and the lazy driver start; the verdicts are redone
+   when the card turns out to be of another architecture than the profile).
+6. **Kept as they were** (safety, not bit-exactness): cooperative and cluster launches (the card path is a plain `cuLaunchKernel`), host-mapped arguments, VMM, IPC and managed memory, module
+   variables the patch cannot apply, externs other than `vprintf`, texture objects, no code section, the diagnostics that need the simulator, and the watchdog.
+
+Built later, narrowly, in section 16.3 (this paragraph described it as not built): retargeting `.target sm_90` PTX to the card's architecture (rewrite the target, let the driver compile what the card's ISA accepts; blockers are `wgmma`, clusters, TMA, `elect`,
+`setmaxnreg`... and a launch shape the card lacks). `scan_ptx_for_card` and the image choice are where it would hook in. Multi-card is out of scope.
+
+Limits: a simulated profile with an sm_90-only build (`-arch=sm_90`, no older cubin or PTX) has no image an sm_86 card runs; its kernels stay in the simulator. Libraries loaded with `cuLibraryLoadData` give the card the image the
+simulator was given (the fatbin's other images are not kept there). Results of kernels that read the simulated profile's properties (SM count, shared memory size) follow the simulated profile, as the program sees it.
+
+Tests: `tests/unit/test_host_gpu_logic.cpp` (class table, `pick_card_image`, `fits_card` boundaries, `scan_ptx_for_card`, `window_fits`, `parse_fit`) and steps 45 to 52 of
+`nvidia/tests/e2e/run_host_gpu_stub.sh` (stand-in driver, no card; steps 10 to 44 run with `VGPU_HOST_GPU_FIT=0`, which pins the rules they were written for). Mutation evidence is in
+[data/turbo-fit/README.md](data/turbo-fit/README.md).
+
+### Measurements (AWS, 2026-11-17; every number measured, on the card named)
+
+Setup: 2 x A10G (sm_86, 80 SMs) and 1 x L4 (sm_89, 58 SMs), 14 programs built for sm_86 (PolyBench, Rodinia, HeCBench), one run each, `tools/bench/hostgpu/run.py --forms sim,turbo,verify`. Rows: [data/turbo-fit/results.md](data/turbo-fit/results.md).
+
+| case | geometric mean over the simulator | notes |
+|---|---:|---|
+| A10G, profile a10g, origin/main turbo | 2.09x | size rule; small programs stay in the simulator |
+| A10G, profile a10g, this branch, FIT=1 | 1.79x | long programs as fast or faster; small ones pay the driver start (+0.2 to +1 s) |
+| A10G, profile a10g, this branch, FIT=0 | 2.11x | the earlier rules |
+| A10G, profile h100 (sm_90 on sm_86), origin/main | 1.00x | no card path: 0 of 7,708 launches reached the card (the simulator runs PTX: "not a SASS module"; results.md section E) |
+| A10G, profile h100, this branch, FIT=1 | 2.61x | FDTD-2D 198 s to 4.3 s, LU 63 s to 1.1 s |
+| L4, profile h100, this branch | 2.45x | the card runs its sm_86 cubin (lower minor of the same major) |
+| L4, profile a10g (80 SMs simulated, 58 real), this branch | 1.69x | exact mode would be off here |
+
+Differences from the simulator: 0 words and 0 bits in every verified launch of every program (measured); the programs hold almost no approximate math, so the size of the differences of an SFU-, half- or atomic-heavy program on these cards is unknown here.
+Rodinia srad_v2 faults on the card (an out-of-bounds read of the benchmark) and falls back to the simulator with identical output (measured). Not measured: sm_90-only builds, PTX-only builds on a card, `cuLibrary` modules.
+
+### Known limits of sending every launch (FIT=1)
+
+Sending everything the card can run also sends what the simulator would have run differently, and a launch that goes wrong on the card is not recoverable once the card holds data the simulator lacks:
+* A launch the card faults on (an out-of-bounds read the simulator tolerates, Rodinia srad_v2; measured) falls back to the simulator only while the card holds nothing the simulator lacks (srad_v2 was the first card launch). After earlier card launches the process ends with an internal error naming the kernel (the message says which switch avoids it).
+* A kernel that waits for blocks the card cannot hold at once (a persistent or spin-barrier kernel sized for the simulated profile's SM count, an H100 profile on a 28-SM card) or for another stream (a producer/consumer pair the simulator overlaps and the card path serialises: one launch at a time) can hang; the watchdog ends the process with status 124 after `VGPU_HOST_GPU_TIMEOUT` (600 s). No static guard is built (it would need the kernel's occupancy on the card and a recognised polling pattern; the simulator's polling analysis is not available to this scan). Inferred, not measured: no such program was among the 14 measured.
+* The fit check cannot see the local memory a kernel's frames need (the driver allocates it at launch).
+* Avoid with `VGPU_HOST_GPU_FIT=0` (the size rules keep most of these in the simulator) or `VGPU_HOST_GPU_TURBO_OFF=<class>`.
+* Follow-ups, not done: the module tables here are keyed by pointers with no unload hook (a reused address could meet a stale entry; older than this change); a forked child inherits a started driver whose context it cannot use (its launches fall back, counted failed); the WSL guard matches "microsoft" or "wsl" in /proc/version and prints in every process; the dxg branch has a unit test but no stub step.
+
+## 16. Turbo next: what the first measurements said, a driver start that overlaps set-up, PTX retargeting (2026-11-17)
+
+Tags: [M] measured on one A10G (sm_86, 80 SMs, driver 595, CUDA 13.0), one run each unless a number says three; [I] inferred; [U] unknown. Rows: [data/turbo-fit/next-results.md](data/turbo-fit/next-results.md). The before build is turbo-fit fae3230b.
+
+### 16.1 Programs the first round did not measure [M]
+
+On the a10g profile with `VGPU_HOST_GPU_FIT=1`, 18 HeCBench programs with math, atomics or sorting and 15 CUDA Samples (atomics, reductions, scans, four tensor-core GEMMs), each as sim, turbo and `VGPU_HOST_GPU_VERIFY=all`:
+* Speed-ups are large where the simulator is slow: bf16TensorCoreGemm 183 s to 3.8 s, tf32TensorCoreGemm 238 s to 2.9 s, cudaTensorCoreGemm 16 s to 1.2 s, atomicAggregate 4.5 s to 0.25 s, radixsort2 3.2 s to 0.30 s, mergeSort 7.0 s to 0.49 s, histogram 11.6 s to 1.3 s; the short ones are slower than the simulator by the driver start (binaryPartitionCG 0.02 s to 0.29 s, scalarProd 0.06 s to 0.28 s).
+  Three HeCBench programs the simulator could not finish in 240 s (aidw, atomicReduction, binomial) took 44.3, 2.1 and 1.3 s in turbo (native 44.4, 1.9, 1.3 s).
+* **Differences from the simulator are real here, unlike the first round's programs.** Words that differ under verify: HeCBench aop 32,595 words (largest absolute 2.27e33, relative 1.15e-5, none outside the default tolerance), bh 23,488 words of which 12,583 are outside tolerance (largest absolute 3.4e-41, a denormal; 1 kernel), attention 1 word (abs 2.2e-3, rel 5.4e-7), CUDA Samples warpAggregatedAtomicsCG 16,000,741 words and simpleAtomicIntrinsics 2 (none outside tolerance; the order of atomics), immaTensorCoreGemm differs in its verify output text (abs 0.01). Every other program: 0 words. Bits differing are not in this table (the benchmark script reads words only): [U].
+* HeCBench atomicCost: the simulator run was killed (rc -9) and the turbo run took 72 s with a different output text (38 words against none): not understood [U].
+* Three repeats of the 14 earlier programs (same build): the spread between runs is under 10 % except sub-second programs (a few hundredths of a second); native A10G times equal turbo's for the short ones (0.24 s is the process's own CUDA start-up).
+* sm_90-only builds on the h100 profile before this round (PolyBench GEMM, ATAX, 2DCONV, FDTD-2D, HeCBench atomicAggregate, silu; each as PTX-only, SASS-only and `-arch=sm_90`): 0 launches on the card in all 18 runs ("no image of the module runs on the card"); turbo equals the simulator's time plus 0.2 s.
+
+### 16.2 Driver start on a helper thread [M for the effect, I for the safety argument]
+
+The start was already a helper thread (`begin_start`: load libcuda, cuInit, the primary context, the address-window reservation) that the launching thread waited for, with a 10 s deadline. What changed: with `VGPU_HOST_GPU_FIT=1` it is begun when the simulated device is created
+(`Runtime::prestart`, from `Device::Device`), so it overlaps the program's own set-up; the first launch waits for it as before. Why it is safe: the start thread touches only the driver's function table and the context, which nothing reads before `await_start`; the context is bound on the launching thread by `cuCtxSetCurrent` before every card call (as before); every use is under the launch lock; a failed start (cuInit fails, no device, the window cannot be reserved, no answer in 10 s) turns the mode off once, with the message, as before and the launch that waits for it falls to the simulator; with `VGPU_HOST_GPU_FIT=0`, in exact mode and with `VGPU_HOST_GPU_PRESTART=0` the start stays lazy (stub step 56).
+Measured, three runs each, same programs: PolyBench 2DCONV 0.89 to 0.75 s, ATAX 0.42 to 0.32 s, Rodinia backprop 0.46 to 0.34 s, LU 1.10 to 1.00 s, silu 0.28 to 0.26 s; no change for bfs (0.24 s), srad_v2 (0.44 s), hotspot, GEMM, FDTD-2D, black-scholes; HeCBench atan2 0.25 to 0.29 s (three runs each, slower). The gain is the program's own set-up time that the start now hides, at most the start's 0.1 to 0.15 s; programs that finish in the simulator in a few milliseconds cannot gain (0.24 s is also what the same program costs natively), and one small program lost 0.04 s [M], cause unknown [U]. A verify pass of the new build over the 14 programs: 0 words different. Cheap predicate to skip the start for tiny programs: none found (the program's length is unknown when it starts).
+
+### 16.3 Retargeting sm_90 PTX for sm_80, sm_86 and sm_87 cards [M]
+
+A module whose only usable image is PTX for plain `.target sm_90` (no cubin the card runs, no older PTX) used to stay in the simulator. Now (`pick_retarget_image`, `retarget_ptx_text`, `scan_ptx_for_card(..., retarget)`): on an sm_80, sm_86 or sm_87 card the `.target` line is rewritten to the card's (the `.version` is never lowered) and the driver compiles the PTX, unless the text scan finds a form ptxas 13.0 rejects for those architectures (the experiment's micro-tests: `mbarrier.try_wait`, `expect_tx`/`complete_tx`, count-form `mbarrier.arrive`, vector and 128-bit atomics, `fence.proxy.async`, `%aggr_smem_size`, `min`/`max` with `.relu`, packed 16-bit integer arithmetic, fp8/fp4 converts and mma, the cluster directives, and the forms refused in section 15), or declares any module variable (rule 1: the card's module has its own copy). sm_90a PTX, other hosts (sm_75, sm_89, sm_90 and later) and `code=sm_90`-only builds (no PTX) are not retargeted. The summary counts `retargeted=` (modules the driver compiled) and `retarget_refused=` (refused by the scan).
+Measured on the A10G with the h100 profile, builds for sm_90 only (table in next-results.md section 1c):
+* PTX-only builds and `-arch=sm_90` builds (which also hold PTX) now run on the card: FDTD-2D 119 to 4.2 s (1,500 launches on the card), atomicAggregate 14.0 to 0.25 s, silu 0.81 to 0.26 s, ATAX 1.13 to 0.32 s, 2DCONV 0.99 to 0.77 s, GEMM 0.75 to 0.52 s; `VGPU_HOST_GPU_VERIFY=all` found 0 words different in all of them.
+* The driver's compile is paid on the first launch of a module: GEMM built as PTX only spent 2.5 s of card time on it (3.0 s in all, against 1.5 s in the simulator), a cost the driver's cache avoids on later runs of the same PTX [I: the cache, not measured].
+* Builds with `code=sm_90` only (no PTX): still no card path (0 launches on the card), as the scan cannot help them.
+* A form the text scan does not know (`atom.add.noftz.bf16x2`, sm_90): the driver refuses the compile with error 218 (invalid PTX); the message says so, the module stays in the simulator, the result equals the simulator's, turbo goes on (next-results.md section 3b). Loud, not silent.
+* Not measured: sm_80 or sm_87 cards, modules with referenced-only variables (rule 2: not built), kernels that assume sm_90's occupancy or shared memory beyond the card's (the fit check refuses what exceeds the card; persistent kernels sized for 132 SMs are the known hang risk of section 15), the JIT time of large modules (the experiment's ptxas took 16 s on a 25 MB PTX [M, ptxas not the driver]; the driver's start deadline of 10 s does not cover the module load [I]).
+
+### 16.4 Launch limits of the simulated profile [M, stub; the real card could not tell]
+
+Turbo's fit check knows the card's limits, not the simulated profile's, and the simulator's launch validation ran only on launches the simulator itself ran. A launch the profile refuses (launch bounds, block or grid dimensions, registers, shared memory, a cluster) could therefore reach the card. Fixed: turbo mode now calls the simulator's check (`Device::check_launch`) before asking the card, so the launch is refused with the plain simulator's error; a zero grid or block is still the mode's own to refuse with its log line. Found on a stand-in card that a `__launch_bounds__(128)` kernel launched with 256 threads was sent to the card before the fix (the real card would have refused it by the kernel's thread limit, which the fit check reads, so the real-card effect is smaller; not run) [M for the stand-in]. For shared memory the runtime API already refuses a launch the profile refuses (T4 profile, 80 KiB of dynamic memory, A10G card: same error in plain and turbo, before and after the fix) [M, rig]; an H100 profile launch of 120 KiB (over the A10G's 99 KiB) is the simulator's to run and gives the plain simulator's result before and after [M, rig]. Registers, threads and grid limits are the same on every NVIDIA profile and card pair available, so a mismatch there cannot be made on real hardware [I].
+
+### 16.5 Known limits, new and old
+
+Retargeted modules inherit section 15's limits and add: the 10 s driver start deadline does not bound the module compile; one failing module compile is counted once per kernel launch that meets it (`failed` and `refused_image`); a PTX module's classes are those of the whole module.
+
+## 17. Very short launches (#660; both modes; merged after sections 15 and 16 were written, so numbered after them)
 
 A10G, 2026-11-17 (`data/turbo-left/card-short-launch.sh`, results in `data/turbo-left/card-2026-11-17-short/`): an empty kernel costs 2.8 us per asynchronous
 launch and 8 us with a sync, so the "no gain above 50 us of latency" outcome did not apply. JACOBI1D (20,000 launches of 0.1 ms in the simulator) was never

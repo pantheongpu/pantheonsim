@@ -1,0 +1,6 @@
+FAIL: fl_shared_ok: a launch that fits the card was not sent:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 3 cuFuncGetAttribute; 1 cuInit; 1 cuMemAddressReserve; 1 cuModuleLoadData; 1 image elf sm_86; 
+host_gpu: 0 launches ran on the card, 1 in the simulator (0 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+FAIL: fl_shared_ok: a launch that fits was counted as not fitting
+EXIT=1
+PASS: first launch 10 ms against a driver start of 2000 ms; driver calls in the big run:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 1 cuInit; 1 cuMemAddressReserve; 2 cuModuleLoadData; 2 image elf sm_86; 2 relocs_to_variables 0;; many launches of 2035 us started the driver after 200 of them
+EXIT=0

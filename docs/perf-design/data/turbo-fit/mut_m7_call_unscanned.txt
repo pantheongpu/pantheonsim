@@ -1,0 +1,4 @@
+== unit m7_call_unscanned
+[ FAIL ] a_call_is_scanned_whatever_its_class
+/home/saqib/.cache/pantheonsim-turbo-fit/tests/unit/test_host_gpu_logic.cpp:1179: VCHECK(call_needs_scan(true, turbo_class("CALL", {"REL", "(7)"}))) failed
+130/131 tests passed

@@ -11,10 +11,13 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <cstddef>
 #include <utility>
 #include <vector>
+
+#include "vgpu/host_gpu_source.hpp"
 
 namespace vgpu::cuda {
 
@@ -118,6 +121,14 @@ std::vector<FatbinPtx> extract_elf_for(const void* data, uint32_t cc);
 // regardless). In fatbin_sass.cpp, apart from the rest: it needs the SASS
 // executor, which nvJitLink and nvFatbin, built from this file, do not carry.
 std::string pick_cubin(const void* fatbin, uint32_t cc);
+
+// Host-GPU turbo mode (src/runtime/host_gpu.cpp): every image of a fatbin the card could be given, linked cubins and PTX, for the card to choose from
+// once it knows its own architecture (vgpu/host_gpu_source.hpp pick_card_image). Null when VGPU_HOST_GPU is not turbo (the exact mode and the
+// plain simulator pay nothing), when the fatbin cannot be read, and when it holds nothing. In fatbin_sass.cpp, with pick_cubin.
+std::shared_ptr<const vgpu::hostgpu::CardSource> card_source_from_fatbin(const void* fatbin);
+// The same for a cubin or PTX text loaded on its own (cuModuleLoadData of a bare image, a library).
+std::shared_ptr<const vgpu::hostgpu::CardSource> card_source_from_cubin(const void* cubin, size_t bytes);
+std::shared_ptr<const vgpu::hostgpu::CardSource> card_source_from_ptx(const std::string& ptx);
 
 // Every entry of one fatbin container, not only the PTX: what nvJitLink and
 // nvFatbin need to tell a SASS-only or LTO-IR-only input from one they can

@@ -168,16 +168,22 @@ bool is_bank(const std::string& name, unsigned* bank) {
 // Writes `value` into the instruction a code relocation names (vgpu/sass/reloc_patch.hpp).
 static void patch_code(CubinSection& s, const CubinReloc& r, uint64_t value) { patch_code_word(&s.bytes[r.offset], r.type, value); }
 
-std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& mem, const DeviceProfile& profile) {
+// `mem` null: an analysis-only load (analyze()): the code is placed, decoded when asked for and its relocations that name code or a function the
+// simulator provides are applied, but nothing is checked against a device and no device memory is taken (the variables and banks get addresses
+// that exist nowhere, and their bytes are not written).
+static std::shared_ptr<Module> load_impl(const uint8_t* image, size_t size, MemoryManager* mem, const DeviceProfile* profile) {
   auto m = std::make_shared<Module>();
   m->cubin = parse_cubin(image, size);
-  if (const char* hg = std::getenv("VGPU_HOST_GPU"); hg && *hg) m->image.assign(image, image + size);
+  if (const char* hg = std::getenv("VGPU_HOST_GPU"); mem && hg && *hg) m->image.assign(image, image + size);
   const Cubin& c = m->cubin;
   m->sm = c.sm;
-  const int device_sm = profile.cc_major * 10 + profile.cc_minor;
-  if (!runs_on(c.sm, c.arch_specific, device_sm))
-    throw Error(Err::UnsupportedPtx, "cubin built for sm_" + std::to_string(c.sm) + " does not run on " + profile.id +
-                                         " (sm_" + std::to_string(device_sm) + ")");
+  if (profile) {
+    const int device_sm = profile->cc_major * 10 + profile->cc_minor;
+    if (!runs_on(c.sm, c.arch_specific, device_sm))
+      throw Error(Err::UnsupportedPtx, "cubin built for sm_" + std::to_string(c.sm) + " does not run on " + profile->id +
+                                           " (sm_" + std::to_string(device_sm) + ")");
+  }
+  uint64_t fake_va = 0x100000000000ull;   // (analysis only)
 
   // Code: every .text section, placed in the code window; each is decoded
   // when it first runs (Code::instr). The cubin's sections outlive them.
@@ -220,9 +226,15 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
       const bool is_var = s.name == ".nv.global" || s.name == ".nv.global.init";
       if (!is_const && !is_var) continue;
       if (s.size == 0) continue;
-      const uint64_t va = mem.alloc(s.size);
-      m->allocations.push_back(va);
-      if (!s.bytes.empty()) mem.write(va, s.bytes.data(), s.bytes.size());
+      uint64_t va;
+      if (mem) {
+        va = mem->alloc(s.size);
+        m->allocations.push_back(va);
+        if (!s.bytes.empty()) mem->write(va, s.bytes.data(), s.bytes.size());
+      } else {
+        va = fake_va;
+        fake_va += (s.size + 0xffff) & ~uint64_t{0xffff};
+      }
       section_va[s.name] = va;
       if (is_const) m->bank_va[s.name] = va;
     }
@@ -327,7 +339,7 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
         const uint64_t target = resolve(r, &in_code, &code_off);
         if (!code) {
           const uint64_t value = target + static_cast<uint64_t>(r.addend);
-          mem.write(dst->second + r.offset, &value, 8);
+          if (mem) mem->write(dst->second + r.offset, &value, 8);
           continue;
         }
         if (r.offset + 16 > s.bytes.size())
@@ -340,12 +352,16 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
       }
     }
   } catch (...) {
-    unload(*m, mem);
+    if (mem) unload(*m, *mem);
     throw;
   }
   m->section_va = std::move(section_va);
   return m;
 }
+
+std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& mem, const DeviceProfile& profile) { return load_impl(image, size, &mem, &profile); }
+
+std::shared_ptr<Module> analyze(const uint8_t* image, size_t size) { return load_impl(image, size, nullptr, nullptr); }
 
 void rebind(Module& m, MemoryManager& mem, const std::string& name, uint64_t va) {
   const auto it = m.symbol_va.find(name);

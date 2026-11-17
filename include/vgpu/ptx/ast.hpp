@@ -21,6 +21,9 @@
 namespace vgpu::sass {
 struct Module;
 }
+namespace vgpu::hostgpu {
+struct CardSource;   // (vgpu/host_gpu_source.hpp)
+}
 
 namespace vgpu::ptx {
 
@@ -1591,6 +1594,9 @@ struct EntryFn {
   // A kernel loaded from a cubin rather than PTX: its SASS, which the launch
   // runs instead of `body` (empty then). See nvidia/docs/sass.md.
   std::shared_ptr<const sass::Module> sass;
+  // The images of the kernel's module that the host GPU could run (VGPU_HOST_GPU=turbo only; null otherwise, and for a module built without an image).
+  // The card is given one of these for the card's own architecture, whatever the simulated profile's is (vgpu/host_gpu_source.hpp).
+  std::shared_ptr<const hostgpu::CardSource> card;
   // What the kernel's loops poll global memory with (vgpu/exec/lockstep.hpp): -1 not yet
   // looked at, else 0 (nothing), 1 (loads), 2 (atomics) or 3 (both). Memoized here, as the register analysis is, and copyable so that the
   // function still is.

@@ -28,7 +28,8 @@
 #include "vgpu/telemetry.hpp"
 
 namespace vgpu::hostgpu {
-class Runtime;   // (vgpu/host_gpu_rt.hpp)
+class Runtime;       // (vgpu/host_gpu_rt.hpp)
+struct CardSource;   // (vgpu/host_gpu_source.hpp)
 }
 namespace vgpu::memo {
 class DeviceMemo;
@@ -94,6 +95,9 @@ class Device {
   // Loads a cubin (the SASS a fatbin carries for this architecture). Its
   // kernels are looked up and launched like a PTX module's.
   uint64_t load_cubin(const uint8_t* image, size_t size);
+  // Records the images of a module's fatbin that the host GPU could run (turbo mode, vgpu/host_gpu_source.hpp): every kernel of the module, parsed now
+  // or when first looked up, carries it as ptx::EntryFn::card. The module the simulator runs is unchanged.
+  void set_card_source(uint64_t module_id, std::shared_ptr<const hostgpu::CardSource> source);
   void unload_module(uint64_t module_id);
 
   // Looks up a kernel. The returned pointer lives as long as the module.
@@ -198,6 +202,7 @@ class Device {
     std::vector<std::pair<uint64_t, const ptx::EntryFn*>> kernels;
     std::shared_ptr<LazyModule> lazy;
     std::shared_ptr<sass::Module> sass;   // a cubin's: its code, banks and variables
+    std::shared_ptr<const hostgpu::CardSource> card;   // turbo mode: the images the host GPU could run (set_card_source)
     // A cubin's kernels by name, to the first entry of that name (ptx::Module::find_entry's answer).
     // A cubin can carry thousands, and looking one up by name was a search of all of them.
     std::unordered_map<std::string, size_t> entry_index;

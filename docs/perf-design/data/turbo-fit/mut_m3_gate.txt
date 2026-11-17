@@ -1,0 +1,8 @@
+FAIL: turbo verify compared 0 words over 0 card launches: host_gpu_turbo: mode=turbo launches_card=0 launches_sim=4 card_s=0.000000 sim_s=0.008600 words_compared=0 words_different=0 words_outside=0 wo
+FAIL: a card that computed nothing was not reported outside tolerance: host_gpu_turbo: mode=turbo launches_card=0 launches_sim=4 card_s=0.000000 sim_s=0.008600 words_compared=0 words_different=0 words
+FAIL: expected the first three launches outside tolerance to be listed without the log, got 0
+FAIL: the per-launch report has no first address: 
+FAIL: no host_gpu_outside line
+FAIL: turbo verify's host_gpu_verify line: host_gpu_verify: in_set_identical=0 in_set_different=0 other_identical=0 other_different=0
+FAIL: a launch that hung on the card ended with status 0, not 124
+host_gpu_refusals: refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=0 too_small=0 failed=0

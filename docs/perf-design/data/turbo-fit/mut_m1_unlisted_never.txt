@@ -1,0 +1,7 @@
+FAIL: a kernel with an instruction no class names did not reach the card in turbo mode:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 1 cuInit; 1 cuMemAddressReserve;; host_gpu: VGPU_HOST_GPU=turbo runs
+host_gpu_refused: kernel=_Z5electPi class=never insn=ELECT P0, URZ, PT
+host_gpu: _Z5electPi: card image sm_90 cubin; classes: exact never; an instruction the card cannot run for the simulator (class never)
+FAIL: turbo refused a kernel with an unlisted instruction: host_gpu_refused: kernel=_Z5electPi class=never insn=ELECT P0, URZ, PT
+FAIL: the kernel's classes do not include unlisted: host_gpu: _Z5electPi: card image sm_90 cubin; classes: exact never; an instruction the card cannot run for the simulator (class never)
+FAIL: no class=off line for ELECT: host_gpu_refused: kernel=_Z5electPi class=never insn=ELECT P0, URZ, PT
+EXIT=1

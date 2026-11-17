@@ -121,6 +121,19 @@ trap 'rm -rf "$work"' EXIT
 "$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_lazy.cu" "$root/nvidia/tests/e2e/host_gpu_lazy_heap.cu" -o "$work/prog" || { echo "FAIL: does not compile"; exit 1; }
 "$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_vars.cu" -o "$work/vars" || { echo "FAIL: host_gpu_vars.cu does not compile"; exit 1; }
 "$nvcc_bin" -std=c++17 -arch="sm_$cc" -rdc=true -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_rdc.cu" "$root/nvidia/tests/e2e/host_gpu_rdc_fn.cu" -o "$work/rdc" || { echo "FAIL: host_gpu_rdc.cu does not compile"; exit 1; }
+# (turbo fit, steps 45 to 52: the same program built for the architectures the stand-in card is told to be, and as PTX only)
+if [[ "$cc" == 86 ]]; then
+  fitsrc="$root/nvidia/tests/e2e/host_gpu_fit.cu"
+  nvf=(-std=c++17 -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim"))
+  "$nvcc_bin" "${nvf[@]}" -arch=sm_86 "$fitsrc" -o "$work/fit" || { echo "FAIL: host_gpu_fit.cu does not compile for sm_86"; exit 1; }
+  "$nvcc_bin" "${nvf[@]}" -arch=sm_90 "$fitsrc" -o "$work/fit90" || { echo "FAIL: host_gpu_fit.cu does not compile for sm_90"; exit 1; }
+  "$nvcc_bin" "${nvf[@]}" -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 "$root/nvidia/tests/e2e/host_gpu_vars.cu" -o "$work/vars80" || { echo "FAIL: host_gpu_vars.cu does not compile for sm_80 and sm_86"; exit 1; }
+  "$nvcc_bin" "${nvf[@]}" -arch=sm_89 "$fitsrc" -o "$work/fit89" || { echo "FAIL: host_gpu_fit.cu does not compile for sm_89"; exit 1; }
+  "$nvcc_bin" "${nvf[@]}" -DFIT_NO_ELECT -gencode arch=compute_90,code=compute_90 "$fitsrc" -o "$work/fit90p" || { echo "FAIL: host_gpu_fit.cu does not compile as PTX for compute_90"; exit 1; }
+  "$nvcc_bin" "${nvf[@]}" -arch=sm_80 "$fitsrc" -o "$work/fit80" || { echo "FAIL: host_gpu_fit.cu does not compile for sm_80"; exit 1; }
+  "$nvcc_bin" "${nvf[@]}" -gencode arch=compute_75,code=compute_75 "$fitsrc" -o "$work/fit75p" || { echo "FAIL: host_gpu_fit.cu does not compile as PTX for compute_75"; exit 1; }
+  "$nvcc_bin" "${nvf[@]}" -gencode arch=compute_86,code=compute_86 "$root/nvidia/tests/e2e/host_gpu_vars.cu" -o "$work/varsp" || { echo "FAIL: host_gpu_vars.cu does not compile as PTX"; exit 1; }
+fi
 "$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_overhead.cu" -o "$work/ovh" || { echo "FAIL: host_gpu_overhead.cu does not compile"; exit 1; }
 "$cc_bin" -shared -fPIC -O1 -o "$work/libstubcuda.so" "$root/nvidia/tests/e2e/host_gpu_stub_driver.c" || { echo "FAIL: the stand-in driver does not compile"; exit 1; }
 if ! require_shim_libs "$shim" "$work/prog"; then exit 0; fi
@@ -209,7 +222,10 @@ grep -Eq '^host_gpu_verify: in_set_identical=[0-9]+ in_set_different=[0-9]+ othe
 grep -Eq '^host_gpu: [0-9]+ launches ran on the card' "$work/q_ver.err" || { echo "FAIL: VGPU_QUIET=1 with VGPU_HOST_GPU_VERIFY=1 printed no 'launches ran on the card' line"; fails=1; }
 diff -q "$work/off_big.out" "$work/q_ver.out" > /dev/null || { echo "FAIL: verify under VGPU_QUIET changes the output"; fails=1; }
 # ---- turbo mode ----
-reach=(VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=0)
+# (VGPU_HOST_GPU_FIT=0: steps 10 to 44 pin what turbo mode does with its performance rules on, which is what VGPU_HOST_GPU_FIT=0 keeps; exact mode does not read
+# the variable. The default, FIT=1, sends every kernel that fits the card, and is pinned by steps 45 to 52.)
+reach=(VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=0 VGPU_HOST_GPU_FIT=0)
+reachx=(VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=0)
 for arg in iatom fatom cas; do
   env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" "$arg" > "$work/off_$arg.out" 2> "$work/off_$arg.err" || { echo "FAIL: the $arg run with the mode off failed"; tail -5 "$work/off_$arg.err"; exit 1; }
 done
@@ -223,7 +239,7 @@ done
 run ex_mufu mufu VGPU_HOST_GPU=exact "${reach[@]}" || { echo "FAIL: the exact mufu run failed"; fails=1; }
 [[ ! -s "$work/ex_mufu.log" ]] || { echo "FAIL: exact mode sent the expf kernel to the card: $(calls ex_mufu)"; fails=1; }
 # 11. the lines for scripts.
-rl='^host_gpu_turbo: mode=turbo launches_card=[0-9]+ launches_sim=[0-9]+ card_s=[0-9.]+ sim_s=[0-9.]+ words_compared=[0-9]+ words_different=[0-9]+ words_outside=[0-9]+ words_subnormal=[0-9]+ kernels_outside=[0-9]+ max_abs=[^ ]+ max_rel=[^ ]+$'
+rl='^host_gpu_turbo: mode=turbo launches_card=[0-9]+ launches_sim=[0-9]+ card_s=[0-9.]+ sim_s=[0-9.]+ words_compared=[0-9]+ words_different=[0-9]+ words_outside=[0-9]+ words_subnormal=[0-9]+ kernels_outside=[0-9]+ max_abs=[^ ]+ max_rel=[^ ]+ bits_different=[0-9]+$'
 fl='^host_gpu_refusals: refused_never=[0-9]+ refused_atomics=[0-9]+ refused_off=[0-9]+ refused_exact=[0-9]+ refused_safety=[0-9]+ too_small=[0-9]+ failed=[0-9]+$'
 grep -Eq "$rl" "$work/rel_mufu.err" || { echo "FAIL: turbo mode printed no host_gpu_turbo line: $(grep '^host_gpu_turbo' "$work/rel_mufu.err")"; fails=1; }
 grep -Eq "$fl" "$work/rel_mufu.err" || { echo "FAIL: turbo mode printed no host_gpu_refusals line: $(grep '^host_gpu_refusals' "$work/rel_mufu.err")"; fails=1; }
@@ -371,7 +387,7 @@ diff -q "$work/off_fewshort.out" "$work/in_short.out" > /dev/null || { echo "FAI
 # 24 to 26. a launch while the card holds the live memory. The counters are what a card that computes nothing leaves: 2 when every bump after the
 # first two (the history) went to the card, 8 when none did.
 streak_of() { sed -n 's/^host_gpu_streak: sent=\([0-9]*\) card_only_mib=[0-9.]* rule=\([01]\)$/\1 \2/p' "$work/$1.err" | head -1; }
-str=(VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=0 STUB_CARD_OK=1 STUB_KEEP_MEMORY=1 STUB_INIT_MS=50)
+str=(VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=0 VGPU_HOST_GPU_FIT=0 STUB_CARD_OK=1 STUB_KEEP_MEMORY=1 STUB_INIT_MS=50)   # (FIT=0: the streak rule is one of the performance rules)
 for arg in streak streakread; do
   env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" "$arg" > "$work/off_$arg.out" 2> "$work/off_$arg.err" || { echo "FAIL: the $arg run with the mode off failed"; exit 1; }
   grep -q '^bumps 8 to 8, ' "$work/off_$arg.out" || { echo "FAIL: $arg with the mode off: $(cat "$work/off_$arg.out")"; fails=1; }
@@ -388,7 +404,8 @@ run str_off streak VGPU_HOST_GPU=exact VGPU_HOST_GPU_STREAK=0 "${str[@]}" || { e
 grep -q '^bumps 8 to 8, ' "$work/str_off.out" || { echo "FAIL: with VGPU_HOST_GPU_STREAK=0 a bump went to the card: $(cat "$work/str_off.out")"; fails=1; }
 [[ "$(streak_of str_off)" == "0 0" ]] || { echo "FAIL: with VGPU_HOST_GPU_STREAK=0: $(grep '^host_gpu_streak' "$work/str_off.err")"; fails=1; }
 diff -q "$work/off_streak.out" "$work/str_off.out" > /dev/null && { echo "FAIL: scramble did not go to the card in the streak runs (the hash is the simulator's)"; fails=1; }
-run str_read streakread VGPU_HOST_GPU=exact "${str[@]}" || { echo "FAIL: the run of streakread failed"; fails=1; }
+# (VGPU_HOST_GPU_SHORT=0, the size rule this step was written for: under #660 a launch whose simulator time reaches 40 us on a loaded machine is sent, and 4 to 14 us is the usual figure here)
+run str_read streakread VGPU_HOST_GPU=exact VGPU_HOST_GPU_SHORT=0 "${str[@]}" || { echo "FAIL: the run of streakread failed"; fails=1; }
 grep -q '^bumps 8 to 8, ' "$work/str_read.out" || { echo "FAIL: a bump went to the card although the program had read the memory back: $(cat "$work/str_read.out")"; fails=1; }
 [[ "$(streak_of str_read)" == "0 1" ]] || { echo "FAIL: streakread: $(grep '^host_gpu_streak' "$work/str_read.err")"; fails=1; }
 # 27. a zero grid while the card holds the memory (Round sp65: PolyBench LU's last lu_kernel1).
@@ -601,11 +618,241 @@ else
   echo "FAIL: a block of slow took $(( ${slow_ms:-0} * 4 / 256 )) ms with $slow_rounds rounds (a timed run of 1,024 took ${slow_cal_ms:-?} ms): too short for the test (under 40 ms)"; fails=1
 fi
 unset HOST_GPU_LAZY_ROUNDS
-# 45.
+# ---- turbo fit (docs/perf-design/12-host-gpu-turbo.md "Turbo fit") ----
+# Turbo mode sends every kernel the card can run (VGPU_HOST_GPU_FIT=1, the default), from the image the CARD runs, whatever the simulated profile is. The stand-in
+# card is told what it is (STUB_SM, STUB_MP) and what its limits are (STUB_MAX_THREADS, STUB_SHARED_OPTIN, STUB_MAX_GRID_X, STUB_FUNC_REGS ...).
+#  45. a launch of one warp, far under the size rule, goes to the card in turbo mode, and stays in the simulator with VGPU_HOST_GPU_FIT=0 (and in exact mode);
+#      a value of the switch that is neither 0 nor 1 turns the mode off with a message;
+#  46. a launch that does not fit the card stays in the simulator and the mode goes on: more threads than the card allows a block, than the kernel can run, more
+#      registers for the block than the card has, more shared memory, a longer grid, more simulated memory than the card has; the same launch with the card's
+#      limits wide enough is sent;
+#  47. a kernel with an instruction no turbo class names (ELECT, sm_90) is sent in turbo mode, not in exact mode, and not with
+#      VGPU_HOST_GPU_TURBO_OFF=unlisted (class=off);
+#  48. a profile of another architecture than the card's (a simulated H100 on an sm_86 card): turbo mode runs, on the card's own cubin (the stand-in says which
+#      image it was given); exact mode is off, with its message;
+#  49. the image follows the card: sm_86 and sm_80 cubins for an sm_86 card, PTX when no cubin of the card's major runs (an sm_90 card given an sm_86 build),
+#      nothing when no image runs (an sm_80 card given an sm_86 build, an sm_86 card given an sm_90 build);
+#  50. PTX is given to the card only when its module holds no variable;
+#  51. a launch the card refuses after the fit check says so, the simulator runs it, and the output is the mode-off output;
+#  52. turbo mode says once that its results may differ from the simulator's; exact mode says nothing of the kind.
+if [[ "$cc" == 86 ]]; then
+  fitoff() { env VGPU_GPU="${2:-$profile}" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/${PROG:-fit}" "$1" > "$work/off_f_$1.out" 2> "$work/off_f_$1.err" || { echo "FAIL: the $1 run of ${PROG:-fit} with the mode off failed"; tail -5 "$work/off_f_$1.err"; exit 1; }; }
+  fitline() { sed -n "s/^host_gpu_fit:\(.*\) $2=\([0-9a-z]*\).*/\2/p" "$work/$1.err" | tail -1; }
+  for arg in tiny wide shared grid mem; do fitoff "$arg"; done
+  # 45.
+  PROG=fit run fit_tiny tiny VGPU_HOST_GPU=turbo || { echo "FAIL: the turbo tiny run failed"; tail -5 "$work/fit_tiny.err"; fails=1; }
+  grep -q '^cuModuleLoadData$' "$work/fit_tiny.log" || { echo "FAIL: a launch of one warp did not reach the card in turbo mode: $(calls fit_tiny); $(grep -m2 host_gpu "$work/fit_tiny.err")"; fails=1; }
+  diff -q "$work/off_f_tiny.out" "$work/fit_tiny.out" > /dev/null || { echo "FAIL: turbo mode with a card that refuses the module changes the output of fit tiny"; fails=1; }
+  [[ "$(fitline fit_tiny policy)" == fit ]] || { echo "FAIL: no 'host_gpu_fit: policy=fit' line: $(grep '^host_gpu_fit' "$work/fit_tiny.err")"; fails=1; }
+  PROG=fit run fit_rules tiny VGPU_HOST_GPU=turbo VGPU_HOST_GPU_FIT=0 || { echo "FAIL: the turbo tiny run with VGPU_HOST_GPU_FIT=0 failed"; fails=1; }
+  [[ ! -s "$work/fit_rules.log" ]] || { echo "FAIL: VGPU_HOST_GPU_FIT=0 sent a launch of one warp to the card: $(calls fit_rules)"; fails=1; }
+  [[ "$(fitline fit_rules policy)" == rules ]] || { echo "FAIL: no 'host_gpu_fit: policy=rules' line with VGPU_HOST_GPU_FIT=0: $(grep '^host_gpu_fit' "$work/fit_rules.err")"; fails=1; }
+  PROG=fit run fit_exact tiny VGPU_HOST_GPU=exact || { echo "FAIL: the exact tiny run failed"; fails=1; }
+  [[ ! -s "$work/fit_exact.log" ]] || { echo "FAIL: exact mode sent a launch of one warp to the card: $(calls fit_exact)"; fails=1; }
+  PROG=fit run fit_badsw tiny VGPU_HOST_GPU=turbo VGPU_HOST_GPU_FIT=2 || { echo "FAIL: the run with VGPU_HOST_GPU_FIT=2 failed"; fails=1; }
+  [[ ! -s "$work/fit_badsw.log" ]] || { echo "FAIL: VGPU_HOST_GPU_FIT=2 reached the driver: $(calls fit_badsw)"; fails=1; }
+  [[ "$(grep -c 'VGPU_HOST_GPU_FIT=2 is not 0 or 1; mode off' "$work/fit_badsw.err")" == 1 ]] || { echo "FAIL: VGPU_HOST_GPU_FIT=2 was not said once to be bad: $(grep -m2 host_gpu "$work/fit_badsw.err")"; fails=1; }
+  run fit_exact_sw big VGPU_HOST_GPU=exact VGPU_HOST_GPU_FIT=2 "${reachx[@]}" || { echo "FAIL: the exact run with VGPU_HOST_GPU_FIT=2 failed"; fails=1; }
+  grep -q '^cuModuleLoadData$' "$work/fit_exact_sw.log" || { echo "FAIL: exact mode was switched off by VGPU_HOST_GPU_FIT (a turbo-only variable)"; fails=1; }
+  # 46.
+  lim() {   # <tag> <program argument> <expected: refused|sent> [env...]
+    local tag=$1 arg=$2 want=$3
+    shift 3
+    if [[ $want == refused ]]; then
+      PROG=fit run "$tag" "$arg" VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 STUB_CARD_OK=1 "$@" || { echo "FAIL: the $tag run failed"; tail -5 "$work/$tag.err"; fails=1; }
+      ! grep -q '^cuLaunchKernel$' "$work/$tag.log" || { echo "FAIL: $tag: a launch that does not fit the card was sent to it: $(calls "$tag")"; fails=1; }
+      (( $(fitline "$tag" refused_fit) >= 1 )) || { echo "FAIL: $tag: refused_fit is not counted: $(grep '^host_gpu_fit' "$work/$tag.err")"; fails=1; }
+      grep -q 'does not fit the card' "$work/$tag.err" || { echo "FAIL: $tag: the log does not say that the launch does not fit: $(grep -m2 host_gpu "$work/$tag.err")"; fails=1; }
+      grep -q 'failed on the card (error\|; mode off' "$work/$tag.err" && { echo "FAIL: $tag: a launch that does not fit ended the mode: $(grep -m1 'failed on the card (error\|; mode off' "$work/$tag.err")"; fails=1; }
+      diff -q "$work/off_f_$arg.out" "$work/$tag.out" > /dev/null || { echo "FAIL: $tag changes the output of fit $arg"; fails=1; }
+    else   # (a verify run: the card computes nothing, the program's output is the simulator's)
+      PROG=fit run "$tag" "$arg" VGPU_HOST_GPU=turbo VGPU_HOST_GPU_VERIFY=1 STUB_CARD_OK=1 "$@" || { echo "FAIL: the $tag run failed"; tail -5 "$work/$tag.err"; fails=1; }
+      grep -q '^cuLaunchKernel$' "$work/$tag.log" || { echo "FAIL: $tag: a launch that fits the card was not sent: $(calls "$tag"); $(grep -m2 host_gpu "$work/$tag.err")"; fails=1; }
+      (( $(fitline "$tag" refused_fit) == 0 )) || { echo "FAIL: $tag: a launch that fits was counted as not fitting"; fails=1; }
+      diff -q "$work/off_f_$arg.out" "$work/$tag.out" > /dev/null || { echo "FAIL: $tag changes the output of fit $arg"; fails=1; }
+    fi
+  }
+  lim fl_threads wide refused STUB_MAX_THREADS=512
+  lim fl_threads_ok wide sent
+  lim fl_blockx wide refused STUB_MAX_BLOCK_X=512
+  lim fl_kernel wide refused STUB_FUNC_MAX_THREADS=512
+  lim fl_regs wide refused STUB_FUNC_REGS=100
+  lim fl_regs_ok wide sent STUB_FUNC_REGS=64
+  lim fl_shared shared refused STUB_SHARED_OPTIN=49152
+  lim fl_shared_ok shared sent STUB_SHARED_OPTIN=65536
+  lim fl_shared_static shared refused STUB_FUNC_SHARED=40000
+  lim fl_grid grid refused STUB_MAX_GRID_X=1000
+  lim fl_grid_ok grid sent STUB_MAX_GRID_X=4096
+  lim fl_mem mem refused STUB_TOTAL_MIB=4
+  lim fl_mem_ok mem sent STUB_TOTAL_MIB=4096
+  # 47.
+  # (QMMA, FP8 tensor cores, sm_89: no class names it, and a card that has it runs it)
+  PROG=fit89 fitoff qmma nvidia/rtx4090
+  for m in turbo exact; do
+    PROG=fit89 run "fe_$m" qmma VGPU_GPU=nvidia/rtx4090 STUB_SM=89 STUB_MP=128 VGPU_HOST_GPU=$m VGPU_HOST_GPU_LOG=1 "${reachx[@]}" || { echo "FAIL: the $m qmma run failed"; tail -5 "$work/fe_$m.err"; fails=1; }
+    diff -q "$work/off_f_qmma.out" "$work/fe_$m.out" > /dev/null || { echo "FAIL: $m changes the output of fit89 qmma"; fails=1; }
+  done
+  grep -q '^cuModuleLoadData$' "$work/fe_turbo.log" && grep -q '^image elf sm_89$' "$work/fe_turbo.log" || { echo "FAIL: a kernel with an instruction no class names did not reach the card in turbo mode: $(calls fe_turbo); $(grep -m3 host_gpu "$work/fe_turbo.err")"; fails=1; }
+  grep -q '^host_gpu_refused:' "$work/fe_turbo.err" && { echo "FAIL: turbo refused a kernel with an unlisted instruction: $(grep -m1 '^host_gpu_refused' "$work/fe_turbo.err")"; fails=1; }
+  grep -q 'classes: .*unlisted' "$work/fe_turbo.err" || { echo "FAIL: the kernel's classes do not include unlisted: $(grep -m2 'classes:' "$work/fe_turbo.err")"; fails=1; }
+  ! grep -q '^cuModuleLoadData$' "$work/fe_exact.log" || { echo "FAIL: exact mode sent a kernel with an unlisted instruction to the card: $(calls fe_exact)"; fails=1; }
+  PROG=fit89 run fe_off qmma VGPU_GPU=nvidia/rtx4090 STUB_SM=89 STUB_MP=128 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_TURBO_OFF=unlisted "${reachx[@]}" || { echo "FAIL: the qmma run with unlisted off failed"; fails=1; }
+  ! grep -q '^cuModuleLoadData$' "$work/fe_off.log" || { echo "FAIL: VGPU_HOST_GPU_TURBO_OFF=unlisted did not keep the kernel in the simulator: $(calls fe_off)"; fails=1; }
+  grep -q '^host_gpu_refused: kernel=[^ ]* class=off insn=QMMA' "$work/fe_off.err" || { echo "FAIL: no class=off line for QMMA: $(grep -m2 '^host_gpu_refused' "$work/fe_off.err")"; fails=1; }
+  # (ELECT, sm_90: a form no card run has shown safe: class never in turbo, exact refuses it too)
+  PROG=fit90 fitoff elect nvidia/h100
+  grep -q '^mode=elect sum=1$' "$work/off_f_elect.out" || { echo "FAIL: the sm_90 build of fit elect printed: $(cat "$work/off_f_elect.out")"; fails=1; }
+  PROG=fit90 run fe_elect elect VGPU_GPU=nvidia/h100 STUB_SM=90 STUB_MP=132 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 "${reachx[@]}" || { echo "FAIL: the turbo elect run failed"; fails=1; }
+  ! grep -q '^cuModuleLoadData$' "$work/fe_elect.log" && grep -q '^host_gpu_refused: kernel=[^ ]* class=never insn=ELECT' "$work/fe_elect.err" || { echo "FAIL: ELECT (an sm_90 form no card run has shown safe) was not refused as class never: $(calls fe_elect); $(grep -m2 '^host_gpu_refused' "$work/fe_elect.err")"; fails=1; }
+  diff -q "$work/off_f_elect.out" "$work/fe_elect.out" > /dev/null || { echo "FAIL: the elect refusal changes the output"; fails=1; }
+  # 48. a simulated H100 (sm_90) on an sm_86 card: turbo mode runs the card's own sm_86 cubin; exact mode is off.
+  fitoff tiny nvidia/h100
+  PROG=fit run h_turbo tiny VGPU_GPU=nvidia/h100 STUB_SM=86 STUB_MP=28 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the turbo run of an H100 profile on an sm_86 card failed"; tail -5 "$work/h_turbo.err"; fails=1; }
+  grep -q '^cuModuleLoadData$' "$work/h_turbo.log" && grep -q '^image elf sm_86$' "$work/h_turbo.log" || { echo "FAIL: an H100 profile on an sm_86 card did not give the card its sm_86 cubin: $(calls h_turbo); $(grep -m3 host_gpu "$work/h_turbo.err")"; fails=1; }
+  grep -q 'is not the simulated device\|mode off' "$work/h_turbo.err" && { echo "FAIL: turbo mode went off for a profile of another architecture: $(grep -m1 'mode off' "$work/h_turbo.err")"; fails=1; }
+  [[ "$(fitline h_turbo card_sm)" == 86 && "$(fitline h_turbo card_sms)" == 28 ]] || { echo "FAIL: the card's architecture is not in the host_gpu_fit line: $(grep '^host_gpu_fit' "$work/h_turbo.err")"; fails=1; }
+  diff -q "$work/off_f_tiny.out" "$work/h_turbo.out" > /dev/null || { echo "FAIL: turbo mode changes the output of fit tiny under an H100 profile"; fails=1; }
+  # ... the same two gates in exact mode, which keeps them: a card of another architecture, and a card with another SM count, than the profile's
+  run gate_sm big VGPU_HOST_GPU=exact STUB_SM=90 STUB_MP=132 "${reachx[@]}" || { echo "FAIL: the exact run on an sm_90 card failed"; fails=1; }
+  grep -q 'the card (sm_90, 132 SMs) is not the simulated device (sm_86, 28 SMs); mode off' "$work/gate_sm.err" && ! grep -q '^cuModuleLoadData$' "$work/gate_sm.log" || { echo "FAIL: exact mode ran on a card of another architecture than the profile's: $(calls gate_sm); $(grep -m2 host_gpu "$work/gate_sm.err")"; fails=1; }
+  run gate_mp big VGPU_HOST_GPU=exact STUB_MP=80 "${reachx[@]}" || { echo "FAIL: the exact run on a card of 80 SMs failed"; fails=1; }
+  grep -q 'the card (sm_86, 80 SMs) is not the simulated device (sm_86, 28 SMs); mode off' "$work/gate_mp.err" && ! grep -q '^cuModuleLoadData$' "$work/gate_mp.log" || { echo "FAIL: exact mode ran on a card with another SM count than the profile's: $(calls gate_mp); $(grep -m2 host_gpu "$work/gate_mp.err")"; fails=1; }
+  # ... and turbo mode runs on both (the program is `big`: launches that the performance rules send)
+  run gate_t_sm big VGPU_HOST_GPU=turbo STUB_SM=90 STUB_MP=132 "${reachx[@]}" || { echo "FAIL: the turbo run on an sm_90 card failed"; fails=1; }
+  grep -q 'is not the simulated device\|; mode off' "$work/gate_t_sm.err" && { echo "FAIL: turbo mode went off for a card of another architecture: $(grep -m1 'mode off' "$work/gate_t_sm.err")"; fails=1; }
+  grep -q '^image ptx$' "$work/gate_t_sm.log" || { echo "FAIL: an sm_90 card was not given the PTX of an sm_86 build: $(calls gate_t_sm); $(grep -m2 host_gpu "$work/gate_t_sm.err")"; fails=1; }
+  run gate_t_mp big VGPU_HOST_GPU=turbo STUB_MP=80 "${reachx[@]}" || { echo "FAIL: the turbo run on a card of 80 SMs failed"; fails=1; }
+  grep -q '^cuModuleLoadData$' "$work/gate_t_mp.log" && ! grep -q '; mode off' "$work/gate_t_mp.err" || { echo "FAIL: turbo mode did not run on a card with another SM count than the profile's: $(calls gate_t_mp); $(grep -m2 host_gpu "$work/gate_t_mp.err")"; fails=1; }
+  for t in gate_sm gate_mp gate_t_sm gate_t_mp; do diff -q "$work/off_big.out" "$work/$t.out" > /dev/null || { echo "FAIL: $t changes the output of big"; fails=1; }; done
+  # 49. the image follows the card.
+  img() {   # <tag> <program> <card sm> <expected image line, or none> [env...]
+    local tag=$1 prog=$2 sm=$3 want=$4
+    shift 4
+    PROG=$prog run "$tag" tiny STUB_SM="$sm" VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 "$@" || { echo "FAIL: the $tag run failed"; tail -5 "$work/$tag.err"; fails=1; }
+    diff -q "$work/off_f_tiny.out" "$work/$tag.out" > /dev/null || { echo "FAIL: $tag changes the output of tiny"; fails=1; }
+    if [[ $want == none ]]; then
+      ! grep -q '^cuModuleLoadData$' "$work/$tag.log" || { echo "FAIL: $tag: an image that does not run on sm_$sm was given to the card: $(calls "$tag")"; fails=1; }
+      (( $(fitline "$tag" refused_image) >= 1 )) || { echo "FAIL: $tag: no image refusal counted: $(grep '^host_gpu_fit' "$work/$tag.err")"; fails=1; }
+      grep -q 'no image of the module runs on the card' "$work/$tag.err" || { echo "FAIL: $tag: the reason is not said: $(grep -m2 host_gpu "$work/$tag.err")"; fails=1; }
+    else
+      grep -q "^$want\$" "$work/$tag.log" || { echo "FAIL: $tag: the card was not given '$want': $(grep '^image' "$work/$tag.log" | head -2)"; fails=1; }
+    fi
+  }
+  img im_86 fit 86 "image elf sm_86"
+  img im_80 fit80 86 "image elf sm_80"                      # the same major, a lower minor
+  img im_ptx fit 90 "image ptx" STUB_MP=132                   # an sm_90 card: the sm_86 cubin does not run, its PTX does
+  img im_75p fit75p 86 "image ptx"                            # a build that holds PTX for compute_75 only: the driver compiles it
+  img im_none fit 80 none STUB_MP=108                         # an sm_80 card, an sm_86 build: no cubin and no PTX that runs
+  fitoff tiny nvidia/h100
+  PROG=fit90 fitoff tiny nvidia/h100
+  img_h() { PROG=fit90 run "$1" tiny VGPU_GPU=nvidia/h100 STUB_SM="$2" STUB_MP=28 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the $1 run failed"; fails=1; }; }
+  # (the sm_90 build holds an ELECT kernel, so its PTX is refused for the card; the reason is the form, not a missing image)
+  img_h im_90_on_86 86
+  ! grep -q '^cuModuleLoadData$' "$work/im_90_on_86.log" && grep -q 'compute_90 PTX could be retargeted to sm_86 but the PTX uses an sm_90 or later form (elect' "$work/im_90_on_86.err" || { echo "FAIL: an sm_90 build with an ELECT kernel reached an sm_86 card: $(calls im_90_on_86); $(grep -m2 host_gpu "$work/im_90_on_86.err")"; fails=1; }
+  diff -q "$work/off_f_tiny.out" "$work/im_90_on_86.out" > /dev/null || { echo "FAIL: the sm_90 build under an H100 profile changes its output on an sm_86 card"; fails=1; }
+  # ... and the one without it (PTX for compute_90 only) is retargeted: the driver is given `.target sm_86`, and the card path is reached; not on an sm_90 card (the PTX is its own),
+  # not on sm_75 or sm_89 (the rule is for sm_80, 86 and 87), and VGPU_HOST_GPU_FIT=0 does the same (the rule is the image's, not the size rule's)
+  PROG=fit90p fitoff tiny nvidia/h100
+  rt90() { PROG=fit90p run "$1" tiny VGPU_GPU=nvidia/h100 STUB_SM="$2" STUB_MP=28 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 STUB_CARD_OK=1 VGPU_HOST_GPU_VERIFY=1 "${@:3}" || { echo "FAIL: the $1 run failed"; fails=1; }; }
+  rt90 rt_86 86
+  grep -q '^image ptx$' "$work/rt_86.log" && grep -q '^ptx_target sm_86$' "$work/rt_86.log" || { echo "FAIL: plain sm_90 PTX was not given to an sm_86 card with its target rewritten: $(grep -E '^image|^ptx_target' "$work/rt_86.log" | tr '\n' ' ')"; fails=1; }
+  [[ "$(fitline rt_86 retargeted)" == 1 ]] || { echo "FAIL: no retargeted module counted: $(grep '^host_gpu_fit' "$work/rt_86.err")"; fails=1; }
+  diff -q "$work/off_f_tiny.out" "$work/rt_86.out" > /dev/null || { echo "FAIL: a retargeted module changes the output"; fails=1; }
+  rt90 rt_80 80
+  grep -q '^ptx_target sm_80$' "$work/rt_80.log" || { echo "FAIL: not retargeted to an sm_80 card: $(grep -E '^image|^ptx_target' "$work/rt_80.log" | tr '\n' ' ')"; fails=1; }
+  rt90 rt_90 90 STUB_MP=132
+  grep -q '^ptx_target sm_90$' "$work/rt_90.log" && [[ "$(fitline rt_90 retargeted)" == 0 ]] || { echo "FAIL: an sm_90 card was given a retargeted module: $(grep -E '^image|^ptx_target' "$work/rt_90.log" | tr '\n' ' ')"; fails=1; }
+  for sm in 75 89; do
+    rt90 rt_$sm $sm
+    ! grep -q '^cuModuleLoadData$' "$work/rt_$sm.log" || { echo "FAIL: plain sm_90 PTX was retargeted for an sm_$sm card"; fails=1; }
+  done
+  # a card that refuses the compiled module (the driver's JIT fails): the module stays in the simulator, the mode goes on, the output is the mode-off output
+  rt90 rt_jit 86 STUB_CARD_OK=0
+  [[ "$(grep -c '^cuModuleLoadData$' "$work/rt_jit.log")" == 1 ]] && grep -q 'cuModuleLoadData failed (1) for the card.s compute_90 PTX retargeted to sm_86' "$work/rt_jit.err" || { echo "FAIL: a failed JIT of a retargeted module was not said once or was retried: $(calls rt_jit); $(grep -m3 host_gpu "$work/rt_jit.err")"; fails=1; }
+  ! grep -q 'mode off' "$work/rt_jit.err" || { echo "FAIL: a failed JIT ended turbo mode: $(grep -m1 'mode off' "$work/rt_jit.err")"; fails=1; }
+  # 50. PTX with module variables is not given to the card.
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/varsp" vars > "$work/off_varsp.out" 2> "$work/off_varsp.err" || { echo "FAIL: the PTX build of host_gpu_vars with the mode off failed"; tail -5 "$work/off_varsp.err"; exit 1; }
+  PROG=varsp run vp_ptx vars STUB_SM=90 STUB_MP=132 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the PTX-only vars run failed"; tail -5 "$work/vp_ptx.err"; fails=1; }
+  ! grep -q '^cuModuleLoadData$' "$work/vp_ptx.log" || { echo "FAIL: PTX with module variables was given to the card: $(calls vp_ptx)"; fails=1; }
+  grep -q 'the PTX declares a module variable' "$work/vp_ptx.err" || { echo "FAIL: the PTX's variables were not the reason: $(grep -m3 host_gpu "$work/vp_ptx.err")"; fails=1; }
+  diff -q "$work/off_varsp.out" "$work/vp_ptx.out" > /dev/null || { echo "FAIL: turbo mode changes the output of the PTX build of host_gpu_vars"; fails=1; }
+  # 51. a card that takes the module and refuses the launch (error 701): the mode ends, the simulator runs it, the output is the mode-off output.
+  PROG=fit run lf_run wide VGPU_HOST_GPU=turbo STUB_CARD_OK=1 STUB_LAUNCH_FAIL=701 || { echo "FAIL: the run against a card that refuses the launch failed (exit $?): $(tail -3 "$work/lf_run.err")"; fails=1; }
+  grep -q 'wide.* failed on the card (error 701); mode off, the simulator runs it' "$work/lf_run.err" || { echo "FAIL: a launch the card refused was not said: $(grep -m2 host_gpu "$work/lf_run.err")"; fails=1; }
+  diff -q "$work/off_f_wide.out" "$work/lf_run.out" > /dev/null || { echo "FAIL: a launch the card refused changes the output of fit wide"; fails=1; }
+  # 54. a module the card compiles from PTX obeys the turbo switches as a cubin does: a float atomic in it is kept out by VGPU_HOST_GPU_ATOMICS=0 and TURBO_OFF=atomics
+  # (the class of a PTX module is that of all its kernels: its first kernel's launch is refused for the atomic of another)
+  FIT_ATOM=1 PROG=fit75p run pa_on tiny VGPU_HOST_GPU=turbo || { echo "FAIL: the PTX atomic run failed"; fails=1; }
+  grep -q '^cuModuleLoadData$' "$work/pa_on.log" && grep -q '^image ptx$' "$work/pa_on.log" || { echo "FAIL: PTX with a float atomic did not reach the card by default: $(calls pa_on)"; fails=1; }
+  for sw in VGPU_HOST_GPU_ATOMICS=0 VGPU_HOST_GPU_TURBO_OFF=atomics; do
+    FIT_ATOM=1 PROG=fit75p run pa_off tiny VGPU_HOST_GPU=turbo "$sw" || { echo "FAIL: the PTX atomic run with $sw failed"; fails=1; }
+    ! grep -q '^cuModuleLoadData$' "$work/pa_off.log" || { echo "FAIL: $sw did not keep a PTX module with a float atomic out of the card: $(calls pa_off)"; fails=1; }
+    grep -q '^host_gpu_refused: kernel=[^ ]* class=\(atomics\|off\) insn=PTX' "$work/pa_off.err" || { echo "FAIL: $sw: no class line for the PTX module: $(grep -m2 '^host_gpu_refused' "$work/pa_off.err")"; fails=1; }
+  done
+  # 55. variables in a card image that is not the simulator's: host_gpu_vars built for sm_80 and sm_86, an sm_80 card, the simulator on sm_86 (it runs the sm_86 image): the card's own
+  # sm_80 cubin has the same layout, is given the simulator's addresses (no relocation left against a variable) and the kernels reach the card.
+  PROG=vars80 run va_80 vars STUB_SM=80 STUB_MP=108 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the sm_80 card vars run failed"; tail -3 "$work/va_80.err"; fails=1; }
+  grep -q '^image elf sm_80$' "$work/va_80.log" && grep -q '^relocs_to_variables 0$' "$work/va_80.log" || { echo "FAIL: the sm_80 cubin of a module with variables was not given to the sm_80 card with the simulator's addresses: $(calls va_80); $(grep -m3 host_gpu "$work/va_80.err")"; fails=1; }
+  diff -q "$work/off_vvars.out" "$work/va_80.out" > /dev/null || { echo "FAIL: the sm_80 card changes the output of host_gpu_vars vars"; fails=1; }
+  # 56. the driver starts while the program sets up (VGPU_HOST_GPU_FIT=1): a program that allocates and launches nothing has touched the stand-in driver by exit; with
+  # VGPU_HOST_GPU_FIT=0, VGPU_HOST_GPU_PRESTART=0 or in exact mode it has not. The output is the mode-off output in each. The first launch of `tiny` finds the driver up.
+  fitoff none
+  PROG=fit run ps_on none VGPU_HOST_GPU=turbo || { echo "FAIL: the prestart run failed"; fails=1; }
+  grep -q '^cuInit$' "$work/ps_on.log" || { echo "FAIL: turbo with FIT=1 did not start the driver while the program set up: $(calls ps_on)"; fails=1; }
+  for sw in "VGPU_HOST_GPU=turbo VGPU_HOST_GPU_FIT=0" "VGPU_HOST_GPU=turbo VGPU_HOST_GPU_PRESTART=0" "VGPU_HOST_GPU=exact"; do
+    PROG=fit run ps_off none $sw || { echo "FAIL: the run with $sw failed"; fails=1; }
+    [[ ! -s "$work/ps_off.log" ]] || { echo "FAIL: $sw started the driver without a launch worth a card: $(calls ps_off)"; fails=1; }
+    diff -q "$work/off_f_none.out" "$work/ps_off.out" > /dev/null || { echo "FAIL: $sw changes the output of fit none"; fails=1; }
+  done
+  diff -q "$work/off_f_none.out" "$work/ps_on.out" > /dev/null || { echo "FAIL: the prestart changes the output of fit none"; fails=1; }
+  # ... a driver that cannot start (cuInit fails): said once, the mode is off, the output is the mode-off output, and no launch is held up
+  PROG=fit run ps_bad tiny VGPU_HOST_GPU=turbo STUB_FAIL_INIT=1 || { echo "FAIL: the run with a driver that cannot start failed"; fails=1; }
+  [[ "$(grep -c 'cuInit failed; mode off' "$work/ps_bad.err")" == 1 ]] || { echo "FAIL: a prestarted driver that fails was not said once: $(grep -m2 host_gpu "$work/ps_bad.err")"; fails=1; }
+  ! grep -q '^cuModuleLoadData$' "$work/ps_bad.log" || { echo "FAIL: a launch reached the card after the prestarted driver failed"; fails=1; }
+  diff -q "$work/off_f_tiny.out" "$work/ps_bad.out" > /dev/null || { echo "FAIL: a prestarted driver that fails changes the output"; fails=1; }
+  # 57. what the SIMULATED profile and the kernel refuse is the simulator's to refuse, whatever the card would take (the stand-in card accepts any shape its limits allow): a kernel compiled
+  # with __launch_bounds__(128) launched with 256 threads, which the simulator's launch validation refuses (launch-config), is refused by turbo mode the same way, with the same error, before
+  # the card is asked, and the launch of 128 threads goes to the card; a shared-memory launch the T4 profile refuses (64 KiB a block at most) and the stand-in card (99 KiB) would take is refused
+  # by the runtime API's check in both; and the reverse (an H100 profile, 227 KiB, on the card's 99 KiB: 120 KiB) is the simulator's to run, with the plain simulator's result.
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/fit" bounds > "$work/off_lb.out" 2> "$work/off_lb.err"; echo $? > "$work/off_lb.rc"
+  grep -q 'launch=[1-9]' "$work/off_lb.out" && grep -q 'VirtualGPU error \[launch-config\]' "$work/off_lb.err" || { echo "FAIL: the plain simulator accepted 256 threads of a __launch_bounds__(128) kernel: $(cat "$work/off_lb.out") $(head -2 "$work/off_lb.err")"; fails=1; }
+  PROG=fit run lb_t bounds VGPU_HOST_GPU=turbo STUB_CARD_OK=1 VGPU_HOST_GPU_LOG=1; echo $? > "$work/lb_t.rc"
+  ! grep -q '^cuLaunchKernel$' "$work/lb_t.log" || { echo "FAIL: turbo mode sent a launch the simulator's validation refuses to the card: $(calls lb_t)"; fails=1; }
+  diff -q "$work/off_lb.rc" "$work/lb_t.rc" > /dev/null && diff -q "$work/off_lb.out" "$work/lb_t.out" > /dev/null && diff <(grep 'VirtualGPU error' "$work/off_lb.err") <(grep 'VirtualGPU error' "$work/lb_t.err") > /dev/null || { echo "FAIL: turbo mode does not refuse the launch as the plain simulator does: rc $(cat "$work/off_lb.rc") against $(cat "$work/lb_t.rc"); $(grep 'VirtualGPU error' "$work/off_lb.err") against $(grep 'VirtualGPU error' "$work/lb_t.err")"; fails=1; }
+  env FIT_THREADS=128 VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/fit" bounds > "$work/off_lb128.out" 2> "$work/off_lb128.err" || { echo "FAIL: the plain simulator refused 128 threads"; fails=1; }
+  FIT_THREADS=128 PROG=fit run lb_ok bounds VGPU_HOST_GPU=turbo VGPU_HOST_GPU_VERIFY=1 STUB_CARD_OK=1 || { echo "FAIL: the turbo run of 128 threads failed"; fails=1; }
+  grep -q '^cuLaunchKernel$' "$work/lb_ok.log" || { echo "FAIL: a launch inside the kernel's bounds did not reach the card: $(calls lb_ok)"; fails=1; }
+  diff -q "$work/off_lb128.out" "$work/lb_ok.out" > /dev/null || { echo "FAIL: turbo mode changes the output of the 128-thread launch"; fails=1; }
+  env FIT_SHARED_KB=30 VGPU_GPU=nvidia/t4 VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/fit75p" shared2 > "$work/off_t4.out" 2> "$work/off_t4.err"
+  FIT_SHARED_KB=30 PROG=fit75p run sh_t4 shared2 VGPU_GPU=nvidia/t4 STUB_SM=75 STUB_MP=40 VGPU_HOST_GPU=turbo STUB_CARD_OK=1 VGPU_HOST_GPU_LOG=1
+  grep -q 'launch=[1-9]' "$work/off_t4.out" && ! grep -q '^cuLaunchKernel$' "$work/sh_t4.log" && diff -q "$work/off_t4.out" "$work/sh_t4.out" > /dev/null && diff <(grep 'VirtualGPU error' "$work/off_t4.err") <(grep 'VirtualGPU error' "$work/sh_t4.err") > /dev/null || { echo "FAIL: 70 KiB of shared memory on a T4 profile is not refused alike by the plain simulator and turbo mode: $(cat "$work/off_t4.out" "$work/sh_t4.out" | tr '\n' ' ')"; fails=1; }
+  env FIT_SHARED_KB=120 VGPU_GPU=nvidia/h100 VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/fit" shared > "$work/off_h120.out" 2> "$work/off_h120.err" || { echo "FAIL: the plain simulator refused 120 KiB on an H100 profile: $(head -2 "$work/off_h120.err")"; fails=1; }
+  FIT_SHARED_KB=120 PROG=fit run sh_h120 shared VGPU_GPU=nvidia/h100 STUB_SM=86 STUB_MP=28 VGPU_HOST_GPU=turbo STUB_CARD_OK=1 VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the turbo run of 120 KiB on an H100 profile failed"; fails=1; }
+  ! grep -q '^cuLaunchKernel$' "$work/sh_h120.log" && diff -q "$work/off_h120.out" "$work/sh_h120.out" > /dev/null || { echo "FAIL: 120 KiB on an H100 profile (over the card's 99 KiB) was not the simulator's: $(calls sh_h120)"; fails=1; }
+  # 52. the notice.
+  grep -q '^host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host GPU.*results may differ from the simulator' "$work/fit_tiny.err" || { echo "FAIL: turbo mode did not say that its results may differ: $(grep -m2 host_gpu "$work/fit_tiny.err")"; fails=1; }
+  [[ "$(grep -c 'may differ from the simulator' "$work/fit_tiny.err")" == 1 ]] || { echo "FAIL: the notice was not said exactly once"; fails=1; }
+  grep -q 'may differ from the simulator' "$work/fit_exact.err" && { echo "FAIL: exact mode said that its results may differ"; fails=1; }
+  PROG=fit run fit_quiet tiny VGPU_QUIET=1 VGPU_HOST_GPU=turbo || { echo "FAIL: the quiet turbo run failed"; fails=1; }
+  grep -q 'may differ from the simulator' "$work/fit_quiet.err" && { echo "FAIL: VGPU_QUIET=1 did not silence the notice"; fails=1; }
+  # 53. WSL2: turbo with FIT=1 is off at once (the driver is never touched); FIT=0 and exact are not asked.
+  echo "Linux version 6.18.0-microsoft-standard-WSL2" > "$work/wslver"
+  PROG=fit run wsl_fit tiny VGPU_HOST_GPU=turbo VGPU_HOST_GPU_PROC_VERSION="$work/wslver" || { echo "FAIL: the turbo run on a WSL host failed"; fails=1; }
+  [[ ! -s "$work/wsl_fit.log" ]] && grep -q 'this host is WSL2.*mode off' "$work/wsl_fit.err" || { echo "FAIL: turbo with FIT=1 on a WSL host was not turned off at once: $(calls wsl_fit); $(grep -m2 host_gpu "$work/wsl_fit.err")"; fails=1; }
+  diff -q "$work/off_f_tiny.out" "$work/wsl_fit.out" > /dev/null || { echo "FAIL: the WSL notice changes the output"; fails=1; }
+  PROG=fit run wsl_rules tiny VGPU_HOST_GPU=turbo VGPU_HOST_GPU_FIT=0 VGPU_HOST_GPU_PROC_VERSION="$work/wslver" "${reachx[@]}" || { echo "FAIL: the FIT=0 run on a WSL host failed"; fails=1; }
+  ! grep -q 'this host is WSL2' "$work/wsl_rules.err" || { echo "FAIL: FIT=0 was turned off for WSL"; fails=1; }
+  PROG=fit run wsl_exact tiny VGPU_HOST_GPU=exact VGPU_HOST_GPU_PROC_VERSION="$work/wslver" || { echo "FAIL: the exact run failed"; fails=1; }
+  ! grep -q 'this host is WSL2' "$work/wsl_exact.err" || { echo "FAIL: exact mode was turned off for WSL"; fails=1; }
+else
+  echo "NOTE: turbo fit steps 45 to 52 need the rtx3060 profile (sm_86); skipped for $profile"
+fi
+# 58. (#660, #662) what a kernel kept in the simulator costs the mode: 50 kernels of one launch each and a looping kernel stay in the simulator and say so. These pin the size rules, which
+# turbo mode asks with VGPU_HOST_GPU_FIT=0 (the default FIT=1 would send every one of them to the card).
 for arg in kernels repeat; do
   env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/ovh" "$arg" > "$work/off_ovh_$arg.out" 2> /dev/null || { echo "FAIL: the $arg run with the mode off failed"; fails=1; }
   for mode in exact turbo; do
-    PROG=ovh run "ovh_${mode}_$arg" "$arg" VGPU_HOST_GPU=$mode VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the $mode $arg run failed"; fails=1; }
+    PROG=ovh run "ovh_${mode}_$arg" "$arg" VGPU_HOST_GPU=$mode VGPU_HOST_GPU_FIT=0 VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the $mode $arg run failed"; fails=1; }
     [[ ! -s "$work/ovh_${mode}_$arg.log" ]] || { echo "FAIL: $mode $arg reached the driver: $(calls "ovh_${mode}_$arg")"; fails=1; }
     diff -q "$work/off_ovh_$arg.out" "$work/ovh_${mode}_$arg.out" > /dev/null || { echo "FAIL: $mode changes the output of $arg"; fails=1; }
     grep -q '^host_gpu: 0 launches ran on the card, ' "$work/ovh_${mode}_$arg.err" || { echo "FAIL: $mode $arg: a launch went to the card: $(grep '^host_gpu: ' "$work/ovh_${mode}_$arg.err" | head -1)"; fails=1; }
@@ -613,11 +860,11 @@ for arg in kernels repeat; do
 done
 n="$(grep -c '^host_gpu_overhead: kept_launches=50 .* kernels=50$' "$work/ovh_turbo_kernels.err")"
 (( n == 1 )) || { echo "FAIL: turbo kernels: expected 50 kept launches of 50 kernels: $(grep '^host_gpu_overhead' "$work/ovh_turbo_kernels.err")"; fails=1; }
-n="$(grep -c '^host_gpu: _Z3k[0-9]*Pf: classes: exact; admitted' "$work/ovh_turbo_kernels.err")"
+n="$(grep -c '^host_gpu: _Z3k[0-9]*Pf: card image [^;]*; classes: exact; admitted' "$work/ovh_turbo_kernels.err")"
 (( n == 50 )) || { echo "FAIL: turbo kernels: expected 50 kernels classed exact and admitted, got $n"; fails=1; }
 n="$(grep -c '^host_gpu_nosample: kernel=_Z3k[0-9]*Pf .* loop=0 ' "$work/ovh_turbo_kernels.err")"
 (( n == 50 )) || { echo "FAIL: turbo kernels: expected 50 kernels without a loop, got $n"; fails=1; }
-run ovh_loop acct VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=1000 || { echo "FAIL: the turbo acct run failed"; fails=1; }
+run ovh_loop acct VGPU_HOST_GPU=turbo VGPU_HOST_GPU_FIT=0 VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=1000 || { echo "FAIL: the turbo acct run failed"; fails=1; }
 grep -q '^host_gpu_nosample: .* loop=1 ' "$work/ovh_loop.err" || { echo "FAIL: acct, whose kernel loops, was not seen to loop: $(grep -m2 'host_gpu_nosample' "$work/ovh_loop.err")"; fails=1; }
 (( fails == 0 )) && { echo "PASS: first launch $first ms against a driver start of $init_ms ms; driver calls in the big run: $(calls on_big); many launches of ${many_us:-?} us started the driver after ${many_at:-?} of them"; exit 0; }
 exit 1

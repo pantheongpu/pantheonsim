@@ -19,6 +19,8 @@
 #include "vgpu/exec/launch.hpp"
 #include "vgpu/host_gpu.hpp"
 #include "vgpu/host_gpu_image.hpp"
+#include "vgpu/host_gpu_source.hpp"
+#include "vgpu/sass/exec.hpp"
 #include "vtest.hpp"
 
 using namespace vgpu::hostgpu;
@@ -1097,7 +1099,7 @@ VTEST(turbo_classes_every_kind_of_instruction) {
   VCHECK(turbo_class("RED", {"E", "ADD", "STRONG", "GPU"}) == C::Exact);
   // approximate
   for (const char* f : {"COS", "SIN", "EX2", "LG2", "RCP", "RSQ", "RCP64H", "RSQ64H", "SQRT", "TANH"}) VCHECK(turbo_class("MUFU", {f}) == C::Mufu);
-  VCHECK(turbo_class("MUFU", {"(10)"}) == C::Never);   // a function the decoder cannot name
+  VCHECK(turbo_class("MUFU", {"(10)"}) == C::Unlisted);   // a function the decoder cannot name: the card runs it all the same (turbo fit)
   for (const char* m : {"HADD2", "HMUL2", "HFMA2", "HSETP2", "HSET2", "HMNMX2"}) VCHECK(turbo_class(m, {}) == C::Half);
   VCHECK(turbo_class("HFMA2", {"MMA"}) == C::Half);
   VCHECK(turbo_class("CALL", {"REL", "NOINC"}) == C::Call);
@@ -1125,8 +1127,8 @@ VTEST(turbo_classes_every_kind_of_instruction) {
   }
   VCHECK(!exact_opcode_allowed("BMMA", {}));
   VCHECK(turbo_class("BMMA", {}) == C::Tensor);
-  VCHECK(turbo_class("BMMA", {"88128", "XOR", "(9)"}) == C::Never);   // an undecoded field still refuses
-  VCHECK(turbo_class("QMMA", {}) == C::Never);                        // its neighbour stays refused
+  VCHECK(turbo_class("BMMA", {"88128", "XOR", "(9)"}) == C::Unlisted);   // an undecoded field is unlisted, not tensor
+  VCHECK(turbo_class("QMMA", {}) == C::Unlisted);                        // its neighbour is unnamed (turbo fit: the card runs it where it has it)
   // atomics
   for (const char* m : {"ATOM", "ATOMG", "ATOMS"}) {
     for (const char* op : {"ADD", "MIN", "MAX", "INC", "DEC", "AND", "OR", "XOR"}) {
@@ -1141,20 +1143,64 @@ VTEST(turbo_classes_every_kind_of_instruction) {
     VCHECK(turbo_class(m, {"CAST", "SPIN", "64"}) == C::AtomSwap);
     VCHECK(turbo_class(m, {"E", "EXCH"}) == C::AtomSwap);
     VCHECK(turbo_class(m, {"E", "EXCH", "F32.FTZ.RN"}) == C::AtomSwap);   // an exchange is an exchange whatever its type
-    VCHECK(turbo_class(m, {"E", "(9)"}) == C::Never);
+    VCHECK(turbo_class(m, {"E", "(9)"}) == C::Unlisted);
   }
   VCHECK(turbo_class("ATOMS", {"POPC", "INC", "32"}) == C::AtomInt);
-  VCHECK(turbo_class("ATOMS", {"ARRIVE", "64"}) == C::Never);
+  VCHECK(turbo_class("ATOMS", {"ARRIVE", "64"}) == C::Unlisted);
   // extra: named one by one
   for (const char* m : {"IDP", "VABSDIFF", "VABSDIFF4", "VIADDMNMX", "VIMNMX3", "FMNMX3", "F2IP", "FSWZADD", "REDUX", "LDGSTS", "LDGDEPBAR", "LDSM", "MOVM",
                         "FFMA2", "FMUL2", "FADD2", "B2R", "NANOSLEEP"})
     VCHECK(turbo_class(m, {}) == C::Extra);
   VCHECK(turbo_class("LEPC", {}) == C::Call && !exact_opcode_allowed("LEPC", {}));   // (Round sp66: the return address of vprintf's call)
   VCHECK(turbo_class("B2R", {"RESULT"}) == C::Extra && !exact_opcode_allowed("B2R", {"RESULT"}));   // (Round sp66; exact's set is unchanged)
-  // never: textures, surfaces, what nobody named, what is not an instruction
-  for (const char* m : {"TEX", "TLD", "TLD4", "TXD", "SULD", "SUST", "QMMA", "OMMA", "HGMMA", "JMP", "BPT", "SYNCS", "STSM", "UTCMMA",
-                        "LDTM", "STTM", "UTMALDG", "VPRINTF", "", "mufu", "Unknown"})
+  // never: what needs a table only the simulator holds (textures, surfaces) or ends the card's context (BPT), in any spelling of its modifiers
+  for (const char* m : {"TEX", "TLD", "TLD4", "TXD", "SULD", "SUST", "BPT"}) {
     VCHECK(turbo_class(m, {}) == C::Never);
+    VCHECK(turbo_class(m, {"(9)"}) == C::Never);   // (an undecoded field does not make it merely unlisted)
+  }
+  // unlisted (turbo fit): what nobody named, what is not an instruction, the sm_90 and later forms; the card runs the cubin's own words
+  for (const char* m : {"QMMA", "OMMA", "VPRINTF", "", "mufu", "Unknown"}) VCHECK(turbo_class(m, {}) == C::Unlisted);
+  // never: the sm_90 and later forms that touch state the simulator keeps in its own format (the tensor-map descriptor, "GPUTMAP1") or that no card run has shown safe
+  for (const char* m : {"UTMALDG", "UTMASTG", "UTMAREDG", "UTMAPF", "UTMACMDFLUSH", "UBLKCP", "UBLKRED", "UCGABAR", "HGMMA", "IGMMA", "BGMMA", "QGMMA", "WARPGROUP", "SYNCS", "ELECT",
+                        "USETMAXREG", "LDGMC", "ENDCOLLECTIVE", "STSM", "STAS", "REDAS", "ARRIVES", "UGETNEXTWORKID", "RPCMOV", "LDTM", "STTM", "UTCSHIFT", "UTCMMA", "UTCBAR", "UTCCP",
+                        "UTCATOMSWS", "JMP"}) {
+    VCHECK(unmeasured_private_mnemonic(m));
+    VCHECK(turbo_class(m, {}) == C::Never);
+    VCHECK(turbo_class(m, {"(9)"}) == C::Never);
+    VCHECK(!exact_opcode_allowed(m, {}));
+  }
+  VCHECK(!unmeasured_private_mnemonic("QMMA") && !unmeasured_private_mnemonic("IMAD") && !unmeasured_private_mnemonic("UTMAL"));
+}
+
+// An unlisted CALL (a modifier the decoder cannot name) must still go through the call-target scan; a call is a call whatever class its modifiers made of it.
+VTEST(a_call_is_scanned_whatever_its_class) {
+  using C = InsnClass;
+  VCHECK(turbo_class("CALL", {"REL", "(7)"}) == C::Unlisted);
+  VCHECK(call_needs_scan(true, turbo_class("CALL", {"REL", "(7)"})));
+  VCHECK(call_needs_scan(true, turbo_class("CALL", {"ABS", "NOINC"})));
+  VCHECK(!call_needs_scan(false, C::Unlisted) && !call_needs_scan(false, C::Call));
+  VCHECK(!call_needs_scan(true, C::Never) && !call_needs_scan(true, C::Exact));
+}
+
+// Turbo mode takes an unlisted instruction and exact mode never did: the exact whitelist is not touched by the new class.
+VTEST(unlisted_is_turbo_only) {
+  using C = InsnClass;
+  for (const char* m : {"QMMA", "OMMA", "Unknown", ""}) {
+    VCHECK(turbo_class(m, {}) == C::Unlisted);
+    VCHECK(!exact_opcode_allowed(m, {}));
+  }
+  for (const char* m : {"JMP", "STSM", "UTMALDG", "UBLKCP", "HGMMA", "SYNCS"}) VCHECK(turbo_class(m, {}) == C::Never);   // (TMA reads the simulator's own descriptor)
+  VCHECK(!exact_opcode_allowed("ATOMS", {"ARRIVE", "64"}) && turbo_class("ATOMS", {"ARRIVE", "64"}) == C::Unlisted);
+  const TurboSwitches def;
+  VCHECK(turbo_refusal(class_bit(C::Unlisted), def) == TurboRefusal::None);
+  VCHECK(turbo_refusal(class_bit(C::Exact) | class_bit(C::Unlisted) | class_bit(C::Mufu), def) == TurboRefusal::None);
+  VCHECK(turbo_refusal(class_bit(C::Unlisted) | class_bit(C::Never), def) == TurboRefusal::Never);   // an unlisted instruction does not admit a texture
+  TurboSwitches off;
+  VCHECK(parse_turbo_off("unlisted", &off.off));
+  VCHECK(turbo_refusal(class_bit(C::Unlisted), off) == TurboRefusal::Off);
+  VCHECK(turbo_refusal(class_bit(C::Exact) | class_bit(C::Mufu), off) == TurboRefusal::None);
+  VCHECK(std::string(insn_class_name(C::Unlisted)) == "unlisted");
+  VCHECK(kInsnClasses == 12);
 }
 
 // Every instruction the decoder knows has a class, and the classes of the ones turbo mode adds are the ones the doc lists: a new instruction in ops.inc is
@@ -1173,8 +1219,13 @@ VTEST(turbo_whitelist_covers_the_decoder_and_nothing_unnamed) {
   VCHECK_EQ(n[InsnClass::AtomInt], 3u);   // ATOM, ATOMG, ATOMS with no modifier
   VCHECK_EQ(n[InsnClass::Extra], 17u);   // (B2R is a mnemonic of the BAR op, not an op of its own; NANOSLEEP is one)
   VCHECK_EQ(n[InsnClass::FloatRed] + n[InsnClass::AtomFloat] + n[InsnClass::AtomSwap], 0u);
-  VCHECK_EQ(n[InsnClass::Exact] + n[InsnClass::Never] + 33u, static_cast<unsigned>(names.size()));
-  VCHECK(n[InsnClass::Never] >= 30);
+  VCHECK_EQ(n[InsnClass::Exact] + n[InsnClass::Never] + n[InsnClass::Unlisted] + 33u, static_cast<unsigned>(names.size()));
+  // Never is only what the card cannot run for the simulator: the texture and surface instructions the decoder names, and BPT. Every other mnemonic the
+  // decoder knows and no class names is Unlisted (turbo fit: admitted).
+  unsigned never_names = 0;
+  for (const std::string& m : names) never_names += texture_mnemonic(m) || m == "BPT" || unmeasured_private_mnemonic(m);
+  VCHECK_EQ(n[InsnClass::Never], never_names);
+  VCHECK(n[InsnClass::Unlisted] >= 1);   // (QMMA, OMMA ...: what is left once the sm_90+ private forms are Never)
   for (unsigned c = 0; c < kInsnClasses; ++c) VCHECK(std::string(insn_class_name(static_cast<InsnClass>(c))).size() > 3);
   VCHECK(std::string(insn_class_name(InsnClass::Never)) == "never" && std::string(insn_class_name(InsnClass::Exact)) == "exact");
 }
@@ -1223,6 +1274,7 @@ VTEST(turbo_admits_by_class_and_switch) {
   VCHECK(turbo_refusal(mask({C::Exact, C::Mufu, C::Half, C::FloatRed, C::Call, C::Extra, C::Tensor, C::AtomInt, C::AtomFloat, C::AtomSwap}), def) == TurboRefusal::None);
   VCHECK(turbo_refusal(mask({C::Never}), def) == TurboRefusal::Never);
   VCHECK(turbo_refusal(mask({C::AtomSwap, C::Never}), def) == TurboRefusal::Never);   // nothing admits Never
+  VCHECK(turbo_refusal(mask({C::Exact, C::Unlisted}), def) == TurboRefusal::None);     // (turbo fit: an instruction no class names is admitted)
   // VGPU_HOST_GPU_ATOMICS=0: float atomics with a value and swaps stay; integer atomics are the off list's
   TurboSwitches no;
   no.atomics = false;
@@ -1232,7 +1284,7 @@ VTEST(turbo_admits_by_class_and_switch) {
   // the off list: each name switches its class off, and only its class
   const struct { const char* name; std::vector<C> off; } rows[] = {
       {"mufu", {C::Mufu}}, {"tensor", {C::Tensor}}, {"half", {C::Half}}, {"call", {C::Call}}, {"red", {C::FloatRed}}, {"extra", {C::Extra}},
-      {"atomics", {C::AtomInt, C::AtomFloat, C::AtomSwap}}};
+      {"atomics", {C::AtomInt, C::AtomFloat, C::AtomSwap}}, {"unlisted", {C::Unlisted}}};
   for (const auto& row : rows) {
     TurboSwitches sw;
     sw.atomics = true;
@@ -1251,7 +1303,7 @@ VTEST(turbo_admits_by_class_and_switch) {
   VCHECK(turbo_refusal(mask({C::Mufu, C::AtomSwap}), sw) == TurboRefusal::Off);
   VCHECK(turbo_refusal(mask({C::Mufu, C::AtomSwap, C::Never}), sw) == TurboRefusal::Never);
   // the exact class cannot be switched off
-  VCHECK(parse_turbo_off("mufu,tensor,half,call,atomics,red,extra", &sw.off));
+  VCHECK(parse_turbo_off("mufu,tensor,half,call,atomics,red,extra,unlisted", &sw.off));
   VCHECK(turbo_refusal(mask({C::Exact}), sw) == TurboRefusal::None);
   VCHECK((sw.off & (class_bit(C::Exact) | class_bit(C::Never))) == 0);
 }
@@ -2869,6 +2921,342 @@ VTEST(with_the_driver_up_a_whole_launch_over_the_floor_stands_in_for_the_static_
   VCHECK(sample_refusal(g, c, up100) == NoSample::None);
   g.whole_s = 0.18;
   VCHECK(sample_refusal(g, c, up100) == NoSample::ShortBefore);
+}
+
+// ---- turbo fit: the card's own image, whether a launch fits, the PTX scan (include/vgpu/host_gpu_source.hpp) ----
+
+namespace {
+CardCandidate cubin_of(int arch, char suffix = 0) {
+  CardCandidate c;
+  c.kind = CardCandidate::Cubin;
+  c.arch = arch;
+  c.suffix = suffix;
+  c.bytes = "cubin" + std::to_string(arch) + suffix;
+  return c;
+}
+CardCandidate ptx_of(int arch, char suffix = 0) {
+  CardCandidate c;
+  c.kind = CardCandidate::Ptx;
+  c.arch = arch;
+  c.suffix = suffix;
+  c.bytes = "ptx" + std::to_string(arch) + suffix;
+  return c;
+}
+}  // namespace
+
+VTEST(card_image_is_the_best_one_the_card_runs) {
+  // An sm_86 card (an RTX 3060) given the fatbin of a program built for a simulated H100 (sm_90): the cubin of its own architecture, else the same
+  // major with a lower minor, else PTX (the driver's JIT), else nothing: the kernels stay in the simulator.
+  VCHECK_EQ(pick_card_image({cubin_of(86), cubin_of(90)}, 86), 0);
+  VCHECK_EQ(pick_card_image({cubin_of(90), cubin_of(86)}, 86), 1);   // (the image the simulated profile runs is not the card's)
+  VCHECK_EQ(pick_card_image({cubin_of(80), cubin_of(90)}, 86), 0);   // lower minor of the same major
+  VCHECK_EQ(pick_card_image({cubin_of(80), cubin_of(86), cubin_of(90)}, 86), 1);   // exact over lower
+  VCHECK_EQ(pick_card_image({cubin_of(75)}, 86), -1);     // another major
+  VCHECK_EQ(pick_card_image({cubin_of(90)}, 86), -1);     // newer
+  VCHECK_EQ(pick_card_image({cubin_of(89)}, 86), -1);     // a newer minor
+  VCHECK_EQ(pick_card_image({cubin_of(90, 'a')}, 86), -1);
+  VCHECK_EQ(pick_card_image({cubin_of(90, 'a')}, 90), 0);   // an `a` image runs on exactly its architecture ...
+  VCHECK_EQ(pick_card_image({cubin_of(80, 'a')}, 86), -1);  // ... and not on a newer minor
+  VCHECK_EQ(pick_card_image({cubin_of(90), cubin_of(90, 'a')}, 90), 1);   // of two for one architecture, the `a` one
+  VCHECK_EQ(pick_card_image({cubin_of(90, 'a'), cubin_of(90)}, 90), 0);
+  // PTX: only when no cubin runs; the newest target the card can run
+  VCHECK_EQ(pick_card_image({cubin_of(90), ptx_of(80), ptx_of(75)}, 86), 1);
+  VCHECK_EQ(pick_card_image({cubin_of(90), ptx_of(90)}, 86), -1);   // PTX for a newer architecture does not run: a fatbin built only for sm_90
+  VCHECK_EQ(pick_card_image({ptx_of(75), ptx_of(86), ptx_of(80)}, 86), 1);
+  VCHECK_EQ(pick_card_image({cubin_of(86), ptx_of(86)}, 86), 0);   // a cubin beats PTX of the same architecture
+  VCHECK_EQ(pick_card_image({cubin_of(75), ptx_of(75)}, 86), 1);   // the sm_75-only build: the card JITs its PTX
+  VCHECK_EQ(pick_card_image({ptx_of(90, 'a')}, 90), 0);
+  VCHECK_EQ(pick_card_image({ptx_of(90, 'a')}, 100), -1);   // `a`: exactly
+  VCHECK_EQ(pick_card_image({ptx_of(100, 'f')}, 103), 0);   // `f`: within the major
+  VCHECK_EQ(pick_card_image({ptx_of(100, 'f')}, 90), -1);
+  VCHECK_EQ(pick_card_image({ptx_of(80), ptx_of(80, 'a')}, 80), 1);
+  VCHECK_EQ(pick_card_image({}, 86), -1);
+  // the two rules are the simulator's own
+  for (int cubin = 50; cubin <= 130; ++cubin)
+    for (int host = 50; host <= 130; ++host)
+      for (bool a : {false, true}) VCHECK_EQ(cubin_runs_on(cubin, a, host), vgpu::sass::runs_on(cubin, a, host));
+  VCHECK(describe_candidates({cubin_of(75), cubin_of(90, 'a'), ptx_of(90)}) == "SASS sm_75, sm_90a, PTX sm_90");
+  VCHECK(describe_candidates({ptx_of(75)}) == "PTX sm_75" && describe_candidates({}) == "no image");
+}
+
+VTEST(ptx_target_is_read_from_its_line) {
+  int arch = -1;
+  char suffix = 'x';
+  VCHECK(ptx_target_of(".version 8.5\n.target sm_90a\n.address_size 64\n", &arch, &suffix) && arch == 90 && suffix == 'a');
+  VCHECK(ptx_target_of(".version 8.5\n.target sm_86, debug\n", &arch, &suffix) && arch == 86 && suffix == 0);
+  VCHECK(ptx_target_of("// c\n.target sm_100f\n", &arch, &suffix) && arch == 100 && suffix == 'f');
+  VCHECK(!ptx_target_of(".version 8.5\n", &arch, &suffix) && arch == 0 && suffix == 0);
+  VCHECK(!ptx_target_of(".target texmode_independent\nsm_90\n", &arch, &suffix));   // (the architecture on a later line is not the target's)
+  VCHECK(ptx_target_runs_on(75, 0, 86) && ptx_target_runs_on(86, 0, 86) && !ptx_target_runs_on(90, 0, 86));
+  VCHECK(ptx_target_runs_on(90, 'a', 90) && !ptx_target_runs_on(90, 'a', 100) && !ptx_target_runs_on(100, 'a', 90));
+  VCHECK(ptx_target_runs_on(100, 'f', 103) && !ptx_target_runs_on(100, 'f', 120) && !ptx_target_runs_on(103, 'f', 100));
+}
+
+VTEST(a_launch_fits_the_card_by_its_limits) {
+  // An RTX 3060 (sm_86): 1024 threads a block, dims 1024 x 1024 x 64, grid 2^31-1 x 65535 x 65535, 99 KiB shared opt-in, 65536 registers a block.
+  CardLimits c;
+  c.max_threads_per_block = 1024;
+  c.max_block[0] = 1024; c.max_block[1] = 1024; c.max_block[2] = 64;
+  c.max_grid[0] = 2147483647ull; c.max_grid[1] = 65535; c.max_grid[2] = 65535;
+  c.shared_optin = 101376;
+  c.regs_per_block = 65536;
+  c.memory_total = 12ull << 30;
+  FuncAttrs f;
+  f.known = true;
+  f.max_threads = 1024;
+  f.static_shared = 0;
+  f.regs = 32;
+  const auto fits = [&](std::initializer_list<uint32_t> grid, std::initializer_list<uint32_t> block, uint64_t dyn, uint64_t window = 1ull << 20) {
+    uint32_t g[3], b[3];
+    std::copy(grid.begin(), grid.end(), g);
+    std::copy(block.begin(), block.end(), b);
+    return fits_card(c, f, g, b, dyn, window);
+  };
+  VCHECK(c.known() && f.known);
+  VCHECK(fits({1, 1, 1}, {256, 1, 1}, 0) == FitRefusal::None);
+  VCHECK(fits({1, 1, 1}, {1024, 1, 1}, 0) == FitRefusal::None);   // 1024 x 32 registers = 32768 <= 65536
+  VCHECK(fits({1, 1, 1}, {1025, 1, 1}, 0) == FitRefusal::BlockDim);
+  VCHECK(fits({1, 1, 1}, {1, 1, 65}, 0) == FitRefusal::BlockDim);
+  VCHECK(fits({1, 1, 1}, {32, 32, 2}, 0) == FitRefusal::Threads);   // 2048 threads, each dimension under its own limit
+  VCHECK(fits({1, 1, 1}, {32, 32, 1}, 0) == FitRefusal::None);
+  f.max_threads = 512;   // a kernel built with __launch_bounds__(512), or whose registers allow no more
+  VCHECK(fits({1, 1, 1}, {512, 1, 1}, 0) == FitRefusal::None);
+  VCHECK(fits({1, 1, 1}, {513, 1, 1}, 0) == FitRefusal::KernelThreads);
+  f.max_threads = 1024;
+  f.regs = 64;
+  VCHECK(fits({1, 1, 1}, {1024, 1, 1}, 0) == FitRefusal::None);   // 65536: exactly the file
+  f.regs = 65;
+  VCHECK(fits({1, 1, 1}, {1024, 1, 1}, 0) == FitRefusal::Registers);
+  VCHECK(fits({1, 1, 1}, {1008, 1, 1}, 0) == FitRefusal::None);   // 1008 x 65 = 65520
+  f.regs = 32;
+  f.static_shared = 48 * 1024;
+  VCHECK(fits({1, 1, 1}, {64, 1, 1}, 101376 - 48 * 1024) == FitRefusal::None);      // static + dynamic = the opt-in limit exactly
+  VCHECK(fits({1, 1, 1}, {64, 1, 1}, 101376 - 48 * 1024 + 1) == FitRefusal::Shared);   // one byte more
+  f.static_shared = 0;
+  VCHECK(fits({1, 1, 1}, {64, 1, 1}, 227 * 1024) == FitRefusal::Shared);   // what an H100 allows a block, and the card does not
+  VCHECK(fits({2147483647u, 65535, 65535}, {64, 1, 1}, 0) == FitRefusal::None);
+  VCHECK(fits({2147483648u, 1, 1}, {64, 1, 1}, 0) == FitRefusal::GridDim);
+  VCHECK(fits({1, 65536, 1}, {64, 1, 1}, 0) == FitRefusal::GridDim);
+  VCHECK(fits({1, 1, 65536}, {64, 1, 1}, 0) == FitRefusal::GridDim);
+  VCHECK(fits({1, 1, 1}, {64, 1, 1}, 0, 12ull << 30) == FitRefusal::None);          // the window is the card's whole memory ...
+  VCHECK(fits({1, 1, 1}, {64, 1, 1}, 0, (12ull << 30) + 1) == FitRefusal::Memory);   // ... one byte more
+  // what is not known is not guessed
+  f.known = false;
+  VCHECK(fits({1, 1, 1}, {64, 1, 1}, 0) == FitRefusal::Unknown);
+  f.known = true;
+  c.shared_optin = 0;
+  VCHECK(!c.known() && fits({1, 1, 1}, {64, 1, 1}, 0) == FitRefusal::Unknown);
+  for (unsigned r = 0; r <= static_cast<unsigned>(FitRefusal::SharedAttribute); ++r) VCHECK(r ? std::string(fit_refusal_text(static_cast<FitRefusal>(r))).size() > 10u : std::string(fit_refusal_text(FitRefusal::None)).empty());
+}
+
+VTEST(the_window_needs_the_free_memory_and_a_reserve) {
+  VCHECK(window_fits(1ull << 30, (1ull << 30) + kWindowReserve));
+  VCHECK(!window_fits(1ull << 30, (1ull << 30) + kWindowReserve - 1));
+  VCHECK(window_fits(0, kWindowReserve) && !window_fits(0, kWindowReserve - 1));
+  VCHECK_EQ(kWindowReserve, 256ull << 20);
+}
+
+VTEST(the_fit_switch_and_the_notice) {
+  bool fit = false;
+  VCHECK(parse_fit(nullptr, &fit) && !fit);   // (unset: the default, the caller's own value stays)
+  fit = true;
+  VCHECK(parse_fit("", &fit) && fit);
+  VCHECK(parse_fit("0", &fit) && !fit);
+  VCHECK(parse_fit("1", &fit) && fit);
+  for (const char* bad : {"2", "on", "off", "true", "fit", " 1", "01", "-1"}) {
+    fit = true;
+    VCHECK(!parse_fit(bad, &fit));
+  }
+  const std::string n = turbo_notice();
+  VCHECK(n.find("turbo") != std::string::npos && n.find("may differ from the simulator") != std::string::npos && n.find("exact") != std::string::npos);
+}
+
+VTEST(ptx_the_card_may_be_given) {
+  const std::string head = ".version 8.5\n.target sm_75\n.address_size 64\n";
+  const std::string plain = head + ".visible .entry k(.param .u64 k_param_0)\n{\n.reg .b64 %rd<3>;\n.reg .b32 %r<3>;\nld.param.u64 %rd1, [k_param_0];\nld.global.u32 %r1, [%rd1];\nst.global.u32 [%rd1], %r1;\nret;\n}\n";
+  PtxScan r = scan_ptx_for_card(plain, false);
+  VCHECK(r.refuse.empty() && !r.never && !r.printf);   // (ld.global and st.global are instructions, not declarations)
+  // a module variable: the card's module would have a second copy
+  for (const char* decl : {".global .align 4 .u32 g;", ".visible .global .align 4 .b8 g[16];", ".const .align 4 .u32 c[4];", ".extern .global .u32 g;", ".weak .const .u32 c;"}) {
+    r = scan_ptx_for_card(head + decl + "\n" + plain.substr(head.size()), false);
+    VCHECK(!r.refuse.empty() && !r.never);
+  }
+  VCHECK(scan_ptx_for_card(head + ".shared .align 4 .b8 sh[64];\n.local .align 4 .b8 lc[16];\n" + plain.substr(head.size()), false).refuse.empty());
+  // textures and surfaces: class never
+  for (const char* t : {".global .texref t;", ".global .surfref s;", ".tex .u32 t;"}) {
+    r = scan_ptx_for_card(head + t + "\n", false);
+    VCHECK(!r.refuse.empty() && r.never);
+  }
+  for (const char* ins : {"tex.1d.v4.f32.f32 {%f1,%f2,%f3,%f4}, [t, {%f0}];", "tld4.r.2d.v4.f32.f32 {%f1,%f2,%f3,%f4}, [t, {%f0,%f0}];", "txq.width.b32 %r1, [t];",
+                          "suld.b.1d.b32.trap %r1, [s, {%r0}];", "sust.b.1d.b32.trap [s, {%r0}], {%r1};", "sured.b.add.1d.u32.trap [s, {%r0}], %r1;", "suq.width.b32 %r1, [s];",
+                          "trap;", "brkpt;"}) {
+    r = scan_ptx_for_card(head + ".visible .entry k()\n{\n" + ins + "\nret;\n}\n", false);
+    VCHECK(!r.refuse.empty() && r.never);
+  }
+  // calls: vprintf is admitted (turbo mode; not when switched off), the rest of the external functions are not, nor is a call through a pointer
+  const std::string pf = head + ".extern .func  (.param .b32 func_retval0) vprintf\n(\n.param .b64 vprintf_param_0,\n.param .b64 vprintf_param_1\n)\n;\n.visible .entry k()\n{\n"
+                               "{\n.param .b32 retval0;\ncall.uni (retval0), vprintf, (a, b);\n}\nret;\n}\n";
+  r = scan_ptx_for_card(pf, false);
+  VCHECK(r.refuse.empty() && r.printf);
+  r = scan_ptx_for_card(pf, true);
+  VCHECK(!r.refuse.empty() && !r.printf && r.refuse.find("printf") != std::string::npos);
+  const std::string malloc_ = head + ".extern .func  (.param .b64 func_retval0) malloc\n(\n.param .b64 malloc_param_0\n)\n;\n.visible .entry k()\n{\ncall.uni (retval0), malloc, (n);\nret;\n}\n";
+  r = scan_ptx_for_card(malloc_, false);
+  VCHECK(!r.refuse.empty() && !r.never && r.refuse.find("malloc") != std::string::npos);
+  r = scan_ptx_for_card(head + ".visible .entry k()\n{\ncall (retval0), %rd5, (p), proto;\nret;\n}\n", false);
+  VCHECK(!r.refuse.empty() && r.never);
+  // a call to a function of the module itself is the module's own, and comments hold nothing
+  r = scan_ptx_for_card(head + ".func f()\n{\nret;\n}\n.visible .entry k()\n{\ncall.uni f, ();\n// tex.1d .global .u32 g; trap;\n/* suld.b trap; */ ret;\n}\n", false);
+  VCHECK(r.refuse.empty());
+}
+
+VTEST(wsl_is_read_from_the_kernel_version) {
+  VCHECK(host_is_wsl("Linux version 6.18.58.1-microsoft-standard-WSL2 (root@x) (gcc)", false));
+  VCHECK(host_is_wsl("Linux version 5.15.0-Microsoft", false));
+  VCHECK(host_is_wsl("Linux version 6.8.0-1021-aws (buildd@lcy02) (gcc 13.3.0)", true));   // /dev/dxg
+  VCHECK(!host_is_wsl("Linux version 6.8.0-1021-aws (buildd@lcy02) (gcc 13.3.0)", false));
+  VCHECK(!host_is_wsl("", false));
+}
+
+VTEST(ptx_classes_follow_the_switches) {
+  const std::string head = ".version 8.5\n.target sm_75\n.address_size 64\n";
+  const auto scan = [&](const char* body) { return scan_ptx_for_card(head + ".visible .entry k()\n{\n" + body + "\nret;\n}\n", false); };
+  using C = InsnClass;
+  VCHECK(scan("atom.global.add.u32 %r1, [%rd1], 1;").classes == class_bit(C::AtomInt));
+  VCHECK(scan("atom.global.cas.b32 %r1, [%rd1], 1, 2;").classes == class_bit(C::AtomSwap));
+  VCHECK(scan("atom.global.exch.b32 %r1, [%rd1], 2;").classes == class_bit(C::AtomSwap));
+  VCHECK(scan("atom.global.add.f32 %f1, [%rd1], %f2;").classes == class_bit(C::AtomFloat));
+  VCHECK(scan("red.global.add.f32 [%rd1], %f2;").classes == class_bit(C::FloatRed));
+  VCHECK(scan("ex2.approx.ftz.f32 %f1, %f2;").classes == class_bit(C::Mufu));
+  VCHECK(scan("fma.rn.f16x2 %r1, %r2, %r3, %r4;").classes == class_bit(C::Half));
+  VCHECK(scan("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%f1,%f2,%f3,%f4}, {%r1,%r2,%r3,%r4}, {%r5,%r6}, {%f1,%f2,%f3,%f4};").classes == class_bit(C::Tensor));
+  VCHECK(scan("add.s32 %r1, %r2, %r3;").classes == 0);
+  // the turbo switches decide on those classes: ATOMICS=0 keeps swaps and float atomics out, TURBO_OFF=atomics all atomics, =mufu the approximations
+  TurboSwitches no;
+  no.atomics = false;
+  VCHECK(turbo_refusal(scan("atom.global.cas.b32 %r1, [%rd1], 1, 2;").classes, no) == TurboRefusal::Atomics);
+  VCHECK(turbo_refusal(scan("atom.global.add.f32 %f1, [%rd1], %f2;").classes, no) == TurboRefusal::Atomics);
+  VCHECK(turbo_refusal(scan("atom.global.add.u32 %r1, [%rd1], 1;").classes, no) == TurboRefusal::None);
+  TurboSwitches off;
+  VCHECK(parse_turbo_off("atomics", &off.off));
+  VCHECK(turbo_refusal(scan("atom.global.add.u32 %r1, [%rd1], 1;").classes, off) == TurboRefusal::Off);
+  VCHECK(parse_turbo_off("mufu", &off.off));
+  VCHECK(turbo_refusal(scan("ex2.approx.ftz.f32 %f1, %f2;").classes, off) == TurboRefusal::Off);
+  // sm_90 and later forms (the tensor-map descriptor is the simulator's own): never
+  for (const char* ins : {"cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%r1], [%rd1, {%r2, %r3}], [%r4];", "wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f1}, %rd1, %rd2, 1, 1, 1, 0, 0;",
+                          "setmaxnreg.inc.sync.aligned.u32 240;", "elect.sync %r1|%p1, 0xffffffff;", "barrier.cluster.arrive;", "mapa.shared::cluster.u64 %rd1, %rd2, %r1;",
+                          "prefetch.tensormap [%rd1];", "mov.u32 %r1, %clusterid.x;", "stmatrix.sync.aligned.m8n8.x1.shared.b16 [%r1], {%r2};"}) {
+    const PtxScan r = scan(ins);
+    VCHECK(!r.refuse.empty() && r.never);
+  }
+}
+
+namespace {
+vgpu::sass::Cubin cubin_with(std::initializer_list<std::tuple<const char*, const char*, uint64_t, uint64_t>> vars, uint64_t global_size = 64, uint64_t const3_size = 32) {
+  vgpu::sass::Cubin c;
+  for (const char* name : {".nv.global", ".nv.constant3"}) {
+    vgpu::sass::CubinSection s;
+    s.name = name;
+    s.size = std::string(name) == ".nv.global" ? global_size : const3_size;
+    c.section_index[name] = c.sections.size();
+    c.sections.push_back(s);
+  }
+  for (const auto& [name, section, value, size] : vars) {
+    vgpu::sass::CubinSymbol y;
+    y.name = name;
+    y.section = section;
+    y.value = value;
+    y.size = size;
+    c.symbols.push_back(y);
+  }
+  return c;
+}
+}  // namespace
+
+VTEST(the_card_image_must_lay_variables_out_as_the_simulator_s_does) {
+  const vgpu::sass::Cubin sim = cubin_with({{"a", ".nv.global", 0, 16}, {"b", ".nv.global", 16, 8}, {"c", ".nv.constant3", 0, 4}});
+  VCHECK(variable_layout_mismatch(sim, sim).empty());
+  VCHECK(variable_layout_mismatch(cubin_with({{"c", ".nv.constant3", 0, 4}, {"b", ".nv.global", 16, 8}, {"a", ".nv.global", 0, 16}}), sim).empty());   // (the order is not compared)
+  VCHECK(!variable_layout_mismatch(cubin_with({{"a", ".nv.global", 0, 16}, {"b", ".nv.global", 24, 8}, {"c", ".nv.constant3", 0, 4}}), sim).empty());   // an offset
+  VCHECK(!variable_layout_mismatch(cubin_with({{"a", ".nv.global", 0, 16}, {"b", ".nv.global", 16, 12}, {"c", ".nv.constant3", 0, 4}}), sim).empty());  // a size
+  VCHECK(!variable_layout_mismatch(cubin_with({{"a", ".nv.global", 0, 16}, {"b", ".nv.constant3", 16, 8}, {"c", ".nv.constant3", 0, 4}}), sim).empty());  // a section
+  VCHECK(!variable_layout_mismatch(cubin_with({{"a", ".nv.global", 0, 16}, {"b", ".nv.global", 16, 8}, {"c", ".nv.constant3", 0, 4}}, 128), sim).empty());  // a section's size
+  VCHECK(!variable_layout_mismatch(cubin_with({{"a", ".nv.global", 0, 16}, {"c", ".nv.constant3", 0, 4}}), sim).empty());   // a variable the card's image lacks
+  VCHECK(!variable_layout_mismatch(cubin_with({{"a", ".nv.global", 0, 16}, {"b", ".nv.global", 16, 8}, {"c", ".nv.constant3", 0, 4}, {"d", ".nv.global", 24, 4}}), sim).empty());   // one the simulator lacks
+  // not variables: functions, names that start with '.', symbols of other sections (static shared memory) are not compared
+  vgpu::sass::Cubin card = sim;
+  vgpu::sass::CubinSymbol sh;
+  sh.name = "tile";
+  sh.section = ".nv.shared.k";
+  sh.size = 4096;
+  card.symbols.push_back(sh);
+  VCHECK(variable_layout_mismatch(card, sim).empty());
+  vgpu::sass::CubinSymbol fn;
+  fn.name = "f";
+  fn.function = true;
+  fn.section = ".text.f";
+  card.symbols.push_back(fn);
+  VCHECK(variable_layout_mismatch(card, sim).empty());
+}
+
+VTEST(the_card_image_must_take_the_simulator_s_arguments) {
+  vgpu::sass::CubinKernel k;
+  k.params = {{0, 0, 8}, {1, 8, 4}};
+  VCHECK(parameter_sizes_agree(k, {8, 4}));
+  VCHECK(!parameter_sizes_agree(k, {8, 8}));   // a size
+  VCHECK(!parameter_sizes_agree(k, {8}));      // a count
+  VCHECK(!parameter_sizes_agree(k, {8, 4, 4}));
+  VCHECK(parameter_sizes_agree(vgpu::sass::CubinKernel{}, {}));
+}
+
+VTEST(plain_sm_90_ptx_is_retargeted_for_an_older_card) {
+  const auto ptx = [](int arch, char suffix) {
+    CardCandidate c;
+    c.kind = CardCandidate::Ptx;
+    c.arch = arch;
+    c.suffix = suffix;
+    c.bytes = ".version 9.0\n.target sm_" + std::to_string(arch) + (suffix ? std::string(1, suffix) : std::string()) + "\n.address_size 64\n";
+    return c;
+  };
+  for (int host : {80, 86, 87}) VCHECK_EQ(pick_retarget_image({ptx(90, 0)}, host), 0);
+  for (int host : {70, 75, 89, 90, 100, 120}) VCHECK_EQ(pick_retarget_image({ptx(90, 0)}, host), -1);   // only the sm_80 family has been measured
+  VCHECK_EQ(pick_retarget_image({ptx(90, 'a')}, 86), -1);       // sm_90a PTX has wgmma and setmaxnreg: no plain sibling, no retarget
+  VCHECK_EQ(pick_retarget_image({ptx(100, 0)}, 86), -1);        // another architecture's PTX
+  VCHECK_EQ(pick_retarget_image({ptx(90, 'a'), ptx(90, 0)}, 86), 1);   // the plain sm_90 PTX of an sm_90a build
+  VCHECK_EQ(pick_retarget_image({}, 86), -1);
+  VCHECK(pick_card_image({ptx(90, 0)}, 86) < 0);   // (it is the fallback: the ordinary choice finds nothing)
+  // the rewrite: the target line only, the version untouched
+  VCHECK(retarget_ptx_text(".version 9.0\n.target sm_90\n.address_size 64\n", 86) == ".version 9.0\n.target sm_86\n.address_size 64\n");
+  VCHECK(retarget_ptx_text(".version 9.0\n.target sm_90, debug\n", 80) == ".version 9.0\n.target sm_80, debug\n");
+  VCHECK(retarget_ptx_text(".target sm_90\n.visible .entry k(){ // sm_90 here\n}", 87) == ".target sm_87\n.visible .entry k(){ // sm_90 here\n}");
+  VCHECK(retarget_ptx_text(".target sm_90a\n", 86).empty() && retarget_ptx_text(".target sm_900\n", 86).empty() && retarget_ptx_text(".target sm_86\n", 80).empty() && retarget_ptx_text("", 86).empty());
+}
+
+// The forms ptxas 13.0 rejects for sm_86 in a module retargeted from sm_90 ("requires .target sm_90 or higher", micro-tests of the experiment), and the ones it takes.
+VTEST(retargeted_ptx_is_refused_for_the_forms_the_older_card_lacks) {
+  const std::string head = ".version 9.0\n.target sm_90\n.address_size 64\n";
+  const auto scan = [&](const char* body, bool retarget = true) { return scan_ptx_for_card(head + ".visible .entry k()\n{\n" + body + "\nret;\n}\n", false, retarget); };
+  for (const char* ins : {"mbarrier.try_wait.shared::cta.b64 %p1, [%rd1], %rd2;", "mbarrier.try_wait.parity.shared::cta.b64 %p1, [%rd1], %r2;", "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%rd1], %r2;",
+                          "mbarrier.arrive.shared::cta.b64 %rd2, [%rd1], %r3;", "atom.global.v2.f32.add {%f1, %f2}, [%rd1], {%f3, %f4};", "red.global.add.noftz.v4.f16x2 [%rd1], {%r1, %r2, %r3, %r4};",
+                          "atom.global.exch.b128 %rq1, [%rd1], %rq2;", "fence.proxy.async.shared::cta;", "mov.u32 %r1, %aggr_smem_size;", "max.s32.relu %r1, %r2, %r3;",
+                          "add.s16x2 %r1, %r2, %r3;", "min.u16x2 %r1, %r2, %r3;", "cvt.rn.satfinite.e4m3x2.f32 %rs1, %f1, %f2;", "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%f1,%f2,%f3,%f4}, {%r1,%r2,%r3,%r4}, {%r5,%r6}, {%f1,%f2,%f3,%f4};"}) {
+    const PtxScan r = scan(ins);
+    VCHECK(!r.refuse.empty() && r.never);
+  }
+  for (const char* d : {".reqnctapercluster 2, 1, 1;", ".maxclusterrank 4;", ".explicitcluster;"}) {
+    const PtxScan r = scan_ptx_for_card(head + ".visible .entry k()\n" + d + "\n{\nret;\n}\n", false, true);
+    VCHECK(!r.refuse.empty() && r.never);
+  }
+  // what assembles for sm_86 in the experiment (ptxas 13.0): basic mbarrier, ldmatrix, fences, mma.sync, bf16 and cp.async
+  for (const char* ins : {"mbarrier.init.shared::cta.b64 [%rd1], 1;", "mbarrier.arrive.shared::cta.b64 %rd2, [%rd1];", "mbarrier.test_wait.shared::cta.b64 %p1, [%rd1], %rd2;", "ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%r1}, [%r2];",
+                          "fence.sc.gpu;", "fence.acq_rel.gpu;", "membar.gl;", "cp.async.ca.shared.global [%r1], [%rd1], 16;", "cp.async.commit_group;", "cvt.rn.bf16x2.f32 %r1, %f1, %f2;",
+                          "redux.sync.add.s32 %r1, %r2, 0xffffffff;", "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%f1,%f2,%f3,%f4}, {%r1,%r2,%r3,%r4}, {%r5,%r6}, {%f1,%f2,%f3,%f4};",
+                          "shfl.sync.bfly.b32 %r1, %r2, 1, 31, 0xffffffff;", "nanosleep.u32 100;", "add.f16x2 %r1, %r2, %r3;"})
+    VCHECK(scan(ins).refuse.empty());
+  VCHECK(scan("mbarrier.try_wait.shared::cta.b64 %p1, [%rd1], %rd2;", false).refuse.empty());   // (without the flag only the ordinary rules apply)
+  // a variable still keeps a retargeted module out (rule 1: the card's JIT module has its own copy)
+  const PtxScan v = scan_ptx_for_card(head + ".global .align 4 .u32 g;\n", false, true);
+  VCHECK(!v.refuse.empty() && !v.never);
 }
 
 // The scan's shortcuts (pantheonsim #662) must give what the plain code gave.
