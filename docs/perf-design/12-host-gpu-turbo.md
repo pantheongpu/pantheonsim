@@ -860,3 +860,119 @@ and the other functions of this mode. Its walk over a kernel's code is a copy of
   45 % of its kernels only declare unreferenced ones).
 * The recommendation (build: admit `__assertfail` and the trap; refuse a PTX module only for a referenced variable; one H100 run for `ENDCOLLECTIVE`; do not build texture on the card, TMA translation or multi-card on this data) is in the round's report;
   limits: 120 of 613 programs have a simulator time, launch-time refusals (fit, host-mapped memory, cooperative) are invisible to a static scan, and a PTX module reports only its first blocker.
+
+## 20. Turbo admits assert and trap, and a PTX module whose variables nothing names (2026-11-17)
+
+Tags: [M] measured (A10G, sm_86, driver 595, CUDA 13.0 toolkit, the rig of 2026-11-17: data in [data/turbo-admit/](data/turbo-admit/README.md)); [D] documented; [I] inferred; [U] unknown.
+Nothing is claimed for Hopper or Blackwell: no sm_90 or sm_100 card was used, and the sm_90 PTX below is run on the sm_86 card after the section 15 retarget.
+Exact mode, the plain simulator and its counters are unchanged: every rule here is turbo only (`mode == Turbo`), and `VGPU_HOST_GPU=exact` is tested to refuse the same kernels as before.
+
+Two refusals that the census (section 17) found to be the largest levers outside the corpus were taken apart: what turbo kept in the simulator because a failed `assert` or a trap ends a real context, and what it kept
+out of the card because a PTX module declares a variable.
+
+### 20.1 What a card does when an assert fires or a trap executes [M, A10G]
+
+`data/turbo-admit/native-fail.txt` (programs `fail.cu`, `fatal.cu`, `hang.cu`, built `-arch=sm_86`, run natively; every row is a runtime-API call and the code it returned):
+
+| event | kernel launch call | `cudaDeviceSynchronize` | message | later calls |
+|---|---|---|---|---|
+| `assert(false)` in thread 3 | 0 | 710 `cudaErrorAssert` | the driver prints `file:line: kernel: block: [..], thread: [..] Assertion `cond` failed.` to stderr at the synchronisation | `cudaGetLastError`, `cudaMemcpy` (device to host), `cudaMalloc`, the next `cudaDeviceSynchronize`: all 710 |
+| `__trap()` | 0 | 719 `cudaErrorLaunchFailure` | none | all 719 |
+| `__brkpt()` | 0 | 719 | none | all 719 |
+
+* The context is dead: after the failure no copy works, so **memory the card held and the host did not is gone, as it is on a real GPU** (`cudaMemcpy` returns 710 or 719, the data is not read). `cudaDeviceReset` returns 0 and the process's next allocation then returns 46
+  (`cudaErrorDevicesUnavailable`): the runtime of this process does not recover on the card.
+* The process does not exit by itself: a program that does not look at the codes goes on (`fatal.cu`: exit status 0, `sync=710 copy=710`).
+* A kernel whose other warps wait does not hang: a block with warp 1 at `__syncthreads()` or spinning on a flag that never comes, and warp 0 asserting or trapping, ends at once with the same codes (`hang.cu`: 0.3 s and 0.5 s).
+* SASS: `__trap()` and `__brkpt()` both compile to `BPT.TRAP 0x1`; the assert is `CALL.ABS.NOINC R` to a function the driver links, which does not return [M: `cuobjdump -sass`].
+* What the simulator does for the same programs (`data/turbo-admit/sim-fail.txt`): the same codes at the same calls (710 for the assert, 719 for the trap and `__brkpt`), the message in its own words (`[vgpu] ... VirtualGPU error [device-assert]: ... device-side assertion failed: <expression>`), and a context that is
+  dead the same way; it differs after `cudaDeviceReset`, which recovers (the simulator's allocation returns 0, the card's 46). The simulator's errors are `Err::DeviceAssert` and `Err::Trap`; the shim turns them into 710 and 719.
+
+### 20.2 The policy
+
+A kernel that can assert or trap is admitted in turbo mode, **because a fired assert or trap ends the real program's context on the card exactly as it ends the simulated one**, and the simulator is the specification of what the program was
+promised: turbo keeps the codes and the sticky error, and loses only what a dead context loses anyway. What the mode does when the card says it fired (`launch()` in `host_gpu.cpp`, `dec.trap`):
+
+* the card's launch returned 710 (kernel can assert) or 719 (kernel can trap or assert): the card has already printed the assertion text. The launch is failed with the simulator's own error (`Err::DeviceAssert` / `Err::Trap`), so the program sees 710 / 719 at the same calls as
+  under the plain simulator and every later call fails with the sticky error; stderr says `host_gpu: <kernel> asserted|trapped on the card (error N); the launch fails as it does in the simulator`. The card's copy of the memory is discarded (`discard_card_data`: the simulator's bytes become the truth again, nothing is pulled from a dead context). This happens
+  **whether or not the card held data the simulator lacks**: there is no fall back to the simulator after such a failure, because a real GPU has no way back either, and a fall back that re-ran the kernel in the simulator could produce a different outcome from the one the card had (turbo is not bit-accurate), which would be a
+  silently different program. (Before this change the same failure with card-only data ended the process with `Err::Internal` ("failed on the card, which holds data the simulator does not"), the message of a launch that failed for a reason of the mode's own.)
+* any other card error from a kernel that can assert (700, 701, a hang killed by the watchdog) is not the program's failure: it keeps the old handling (mode off; the simulator takes the launch; `Err::Internal` when the card holds data).
+* `VGPU_HOST_GPU_TURBO_OFF=assert` keeps such kernels in the simulator (the reason is printed: `the kernel calls __assertfail (VGPU_HOST_GPU_TURBO_OFF=assert)`); exact mode never sends them (its promise is the simulator's bits, and a card is not told how to fire the simulator's way).
+* What is admitted, and how it is found: (1) the extern `__assertfail` (class `ExternKind::Assert` in `extern_admitted`), (2) `BPT.TRAP` and only it (`bpt_is_trap`; `DRAIN`, `CAL`, `PAUSE`, `INT` and a form the decoder cannot name stay class never), counted in class `unlisted` (so `TURBO_OFF=unlisted` also keeps them out), (3) a PTX `trap`, `brkpt`
+  or a call to `__assertfail` (a PTX module that asserts is still refused, for the reasons in 20.4).
+
+### 20.3 The call through a register [M, I]
+
+nvcc 13 does not call `__assertfail` with a relative or absolute label: it emits `MOV Rx, 0x0 ; LDC.64 Rt, c[0x4][Rx+off] ; ... ; CALL.ABS.NOINC Rt`, and `.nv.constant4` is a table of 8-byte slots the module's `.rel.nv.constant4` relocations fill (slot 0 `__assertfail`, the others the message strings) [M: readelf of
+HeCBench assert-cuda, sm_86]. That is the "call through a register" the scan refused (and counted as 5,714 libtorch kernels). It is **followed only when it can be bounded** (`register_call_slot`, `register_call_to_admitted_extern`, `host_gpu_regcall.hpp`):
+
+* the target register is, in straight-line code, written last by an unguarded 64-bit `LDC` from bank 4 whose index register was last written by a `MOV` immediate (or is `RZ`): the slot is the immediate plus the load's offset;
+* nothing between those instructions writes either half of the target, branches, calls, returns or is a place another path can enter (branch and `BSSY` targets, the instruction after a call), and the section has no `BRX` or `JMP`;
+* `.rel.nv.constant4` has exactly one relocation at that slot, naming an **undefined function** of the module (`__assertfail`, or `vprintf` when printf is admitted), and that function is one `extern_admitted` takes.
+
+Anything else (a load whose index comes from memory, a function pointer in a register, a slot naming a defined function or a variable, a guarded load, a join point) is refused as before, with `never:call-through-register`; the unit test `a_call_through_a_register_is_followed_only_when_its_target_slot_is_known` has 13 such cases and 4 mutations. [U] other
+toolchains' spelling of the same call (CUDA 12, `IMAD.MOV.U32 Rx, RZ, RZ, imm` for the index) is not recognised and is refused, which is the safe side; it was not measured here.
+
+### 20.4 A PTX module is refused only for a variable something can reach [M, D]
+
+Section 15's rule (a JIT-compiled module has its own copy of every variable, so a module that declares one cannot be shared with the simulator's) is kept for every variable a **statement of the module can name**. `scan_ptx_for_card` now declares a variable *unreferenced*, and admits the module, only when
+none of these holds: any statement other than its own declaration holds its name as a whole identifier (instruction operands of every kind, `cvta`, `mov`, call arguments, another function, another variable's initialiser, a directive; the part of a declaration before `=` does not count); it is `.extern`, `.visible`, `.weak`, `.common` or `.hidden`
+(another module or the host may name it); `.managed`; the declaration cannot be read (a declaration list `.global .u32 a, b;`, no name); a piece of its name (split at `.`) occurs. Over-counting is the safe side (a name inside a `.pragma` string counts).
+A reason names the variable: `the PTX declares a module variable (.global) that the module can reach (name)`. `VGPU_HOST_GPU_PTX_VARIABLES=all` brings the section 15 rule back (any variable refuses).
+
+Why the rest is safe [D, I]: the card's module has its own copy of a variable the code never reads, so nothing the kernels compute depends on it. A host write to it (`cudaMemcpyToSymbol`) goes to the simulator's copy, which no card kernel reads; an address handed to a kernel as an argument (`cudaGetSymbolAddress`) is an address in the simulator's
+window, which the card reaches through the mirror like any allocation. The 600 or so `.global .align 1 .b8 _ZN4cuda3std3__45__cpo5beginE[1]` objects nvcc emits for `<cuda/std/...>` are of this kind. What is **not** admitted: nvcc's printf and assert message strings are variables the kernel reads, so a PTX module that prints or asserts keeps being refused.
+
+### 20.5 Measurements [M, A10G, 2026-11-17]
+
+**Static, the census tool** (`build/turbo_census`, the runtime's own scan; "before" is `--assert-off --ptx-variables-all`, "after" the defaults; the file `data/turbo-admit/census.md` has the commands):
+
+| input | cell | before | after |
+|---|---|---|---|
+| 78 HeCBench programs built `-arch=compute_90` (PTX only; 293 kernels), simulated as an H100 | sm_86 card (retarget) | 0 kernels, 0 programs | **176 kernels (60 %), 33 programs** whole; the other 117 kernels reference a variable (77 `.global`, 40 `.const`) |
+| Ollama 0.40.16 `cuda_v12/libggml-cuda.so` (7,263 kernels, SASS) | sm_86 card | 5,476 (75.4 %) | **7,263 (100.0 %)** |
+| same | sm_90 card (static only) | 3,823 (52.6 %) | 5,609 (77.2 %); the rest is `ENDCOLLECTIVE` (1,654), not changed here |
+| Ollama 0.40.16 `cuda_v13/libggml-cuda.so` (7,254 kernels, PTX only) | sm_86 card | **0** | **1,479 (20.4 %)**; 5,775 reference a variable (message strings of `GGML_ABORT`/`GGML_ASSERT` and lookup tables) |
+| same | sm_90 card (static only) | 0 | 228 (3.1 %): 1,251 more hold sm_90 cluster forms |
+
+The libtorch figure of the census (74 % to about 99 %) was **not measured here**: no libtorch was on the rig [U]; it rests on the census' count of 5,488 `__assertfail` kernels and the 26 % call-through-register class being the same pattern as measured on HeCBench and ggml.
+
+**Real runs, HeCBench** (`data/turbo-admit/programs.tsv`, `src/run_admit.sh`, `src/agg.py`): 31 programs of the 33 that are admitted whole after the change, built `-arch=compute_90` (PTX only, so on the sm_86 card turbo retargets the PTX, section 15), with reduced arguments, simulated as an `nvidia/h100`
+(the plain simulator cannot run sm_90 PTX as an sm_86 profile). Five forms each: native (the sm_86 build on the card), plain simulator, turbo with the rule before (`VGPU_HOST_GPU_PTX_VARIABLES=all`), turbo after, turbo after with `VGPU_HOST_GPU_VERIFY=all`. 60 s cap on every form (150 s for accuracy and adjacent, which ran first and finished in far less); a capped time is a lower bound.
+
+* **before**: 0 launches on the card in every program (the module's variables).
+* **after**: 28 of 31 programs run **every launch on the card** (determinant: the card cannot back the H100 profile's window, `could not back the simulator's window`, a section 15 limit; laplace and topk: no form finished in 60 s). Output lines other than timings equal the plain simulator's in all 21 programs where both finished.
+* **wall seconds, plain simulator to turbo after** (native sm_86 build in brackets): accuracy 9.0 to 2.9 [0.8]; dp4a 23.6 to 0.34 [0.31]; moe-align 34.0 to 2.4 [0.91]; multinomial 25.3 to 2.8 [2.7]; scel 26.0 to 8.3 [8.1]; channelSum 2.95 to 1.7 [1.6]; remap 1.7 to 1.05 [0.29]; rowwiseMoments 7.8 to 4.7 [5.3];
+  rotary 37.9 to 27.9 [26.7]; attention 7.5 to 6.3 [5.5]; rle 1.5 to 1.6 [1.1]; and where the simulator hit the cap: all-pairs-distance >60 to 0.42 [0.57], sort >60 to 0.96 [0.49], ssim >60 to 4.0 [3.6], ssm >60 to 9.6 [9.1], segment-reduce >60 to 26.2 [22.9], softmax-online >60 to 31.6 [29.8], f16sp >60 to 38.2 [37.2].
+  Short programs get **slower** (the driver start and the first window push, section 15, FIT=1 sends everything): damage 0.02 to 0.28, attentionMultiHead 0.04 to 0.30, groupnorm 0.06 to 0.37, nosync 0.10 to 0.67, ccsd-trpdrv 0.02 to 0.28, dropout 0.31 to 0.56, mtf 0.69 to 0.97, kurtosis 0.28 to 3.1 (not looked into [U]).
+* **verify=all** (every launch on the card and in the simulator, compared word by word with the default tolerance): 19 programs finished, **0 words outside the tolerance in all of them**; words that differ at all: attention 1 of 805,711,995, ccsd-trpdrv 1 of 26,240, groupnorm 36 of 788,796, the other 16 programs 0. moe-align was cut at 60 s with 222,918,083 of
+  1,014,840,000 words different and none outside the tolerance [U: it is atomics-bound; not investigated]. rotary's verify run was killed for memory (137), several others hit the cap.
+
+**Real runs, assert and trap** (`native-fail.txt`, `sim-fail.txt`, `turbo-fail.txt`; `src/fail.cu`, `fatal.cu`, `hang.cu`): the three transcripts are the same at every call (codes 710 and 719, the sticky error, the copies refused). Differences: the simulator and turbo recover after `cudaDeviceReset` and the card does not; the message
+text is the driver's in turbo (printed before the failure is reported) and the simulator's own in the simulator. `VGPU_HOST_GPU_TURBO_OFF=assert` gives the simulator's run of the same program. The kernels that failed were launched on the card (`launches_card` counts them as simulated: the launch was handed to the simulator's error).
+
+**Ollama 0.40.16 with SmolLM2-135M** (`src/run_ollama.sh`: `ollama serve` under the shims of this build, `VGPU_GPU=nvidia/a10g`, the A10G card, three greedy tokens of "The capital of France is"): Ollama picks `cuda_v13`. All four forms reply `The capital of` as the CPU backend does: plain simulator 27.7 s, turbo with the old rules 28.2 s,
+turbo after 29.0 s and 30.1 s (two runs), turbo after with verify=all 29.0 s. **Turbo gains nothing here**: of about 2,530 launches three reached the card (`rms_norm_f32`, `rope_norm` twice: PTX modules whose variables no instruction names, now admitted; 364 MiB of window pushed for the first), then every launch stays in the simulator because ggml
+maps its memory with `cuMemMap` ("virtual memory mappings hold device memory the card copy would lack", a rule of section 10 that is not touched here), and two kernels (`mul_mat_f`, `k_set_rows`) keep their PTX module off the card for a variable they read (`__unnamed_1`, `kvalues_iq4nl`). So the static 20.4 % is an upper bound of what Ollama's v13 library can use, not a speed-up, until the VMM rule is lifted.
+
+
+### 20.6 Tests and mutations
+
+* Unit, `tests/unit/test_host_gpu_logic.cpp` (CTest `test_host_gpu_logic`, no card, hosted CI): `ptx_variables_that_no_instruction_names_do_not_keep_a_module_off_the_card` (the markers admitted and counted; the old rule by argument; 11 ways an instruction names a variable; another function and an initialiser; 7 linkage and unreadable forms; part-of-an-identifier is not a reference, a `.pragma`
+  string is; data bytes are not names; textures stay never), `assert_and_trap_are_admitted_by_turbo_only_and_not_when_switched_off` (the extern, `BPT` forms, the switch, PTX `trap`/`brkpt`/`__assertfail`), `a_call_through_a_register_is_followed_only_when_its_target_slot_is_known` (the measured nvcc sequence and its offsets; 13 refusals). `test_turbo_census` follows the new rules.
+* Stub e2e, `nvidia/tests/e2e/run_host_gpu_stub.sh` step 59 with `host_gpu_trap.cu` (CI job `e2e_host_gpu_stub`; the stand-in driver fails the launch with `STUB_LAUNCH_FAIL=710` or `719`): the program prints the same lines under the plain simulator and under turbo against a card that fails; an assert kernel is sent in turbo and not in exact mode or with `TURBO_OFF=assert`; 701 is not taken for the program's failure; PTX with a variable only the host names is given to the card, one whose kernel reads it, or
+  one with `VGPU_HOST_GPU_PTX_VARIABLES=all`, or an assert, is not; a PTX trap is sent and its failure told. The whole stub test passes on the A10G rig (380 s).
+* Mutations: `data/turbo-admit/mutations.txt` has each mutation, the file it changes and the failing check. 13 unit mutations (every one caught; one, `name pieces not checked`, was first NOT caught and a test was added) and 4 runtime mutations (assert and trap never admitted; a card assert treated as an ordinary failure; any card error taken for the program's own; PTX variables always refuse), each failing step 59, and the unmutated step passes.
+
+### 20.7 Not done, and not known
+
+* **libtorch** (74 % to about 99 % in the census) was not measured; no PyTorch ran on the rig [U]. The code path is the one measured on HeCBench and ggml; a launch of a torch assert kernel that fires was not exercised.
+* **The Ollama run gains nothing** (the VMM rule, section 10, stops the card path after three launches; the variable-reading kernels stay). Lifting it is a design question of its own (the card would need the device memory `cuMemMap` maps) and was not attempted.
+* **Referenced variables are still refused** (5,775 of Ollama v13's 7,254 kernels; 117 of 293 HeCBench kernels). The common referenced cases are message strings that only `vprintf` or `__assertfail` read; admitting a constant byte array whose every use is such a call's argument was **not** done: it needs the same reference analysis per use, and a wrong guess reads a second copy.
+* The bound on the call through a register recognises the measured nvcc 13 sequence only (`MOV` immediate, 64-bit `LDC` from bank 4, `CALL.ABS.NOINC`); other toolchains' spelling is refused (safe). A **function pointer in a register stays refused**: its target set cannot be bounded statically, and no attempt was made.
+* After a card assert the card is not asked to recover (`cudaDeviceReset` on it returns 0 and the next call 46); turbo does not try either, and the simulator's recovery after a reset is its own behaviour.
+* A kernel whose assert fires **because turbo is not bit-accurate** (the card's approximate result trips a check the simulator's would pass) now ends the program with the card's text, as it would on a real GPU; `TURBO_OFF=assert` is the way back. How often this happens in real use is unknown [U].
+* `moe-align`'s 222,918,083 differing words (none outside the tolerance), `kurtosis`'s 3.1 s, `determinant`'s window refusal and rotary's memory kill were seen and not investigated.
+* Nothing is claimed for Hopper or Blackwell cards: the sm_90 runs above are sm_90 PTX retargeted onto the sm_86 card.
+

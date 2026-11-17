@@ -1,0 +1,85 @@
+# Mutations of section 20 (A10G rig, 2026-11-17). Each is applied to a copy of the tree, built, and run; the first failing checks are shown. A mutation that all tests pass is a hole.
+# Unit mutations: tests/unit/test_host_gpu_logic.cpp (test_host_gpu_logic). Scripts: src/mut_unit.py, src/mut_stub.py.
+
+MUTATION m1_every_ptx_variable_unreferenced
+[ FAIL ] ptx_variables_that_no_instruction_names_do_not_keep_a_module_off_the_card
+tests/unit/test_host_gpu_logic.cpp:3409: VCHECK(!r.refuse.empty() && !r.never && r.refuse.find("module variable") != std::string::npos) failed
+
+MUTATION m2_linkage_ignored
+[ FAIL ] ptx_variables_that_no_instruction_names_do_not_keep_a_module_off_the_card
+tests/unit/test_host_gpu_logic.cpp:3420: VCHECK(!r.refuse.empty() && !r.never) failed
+
+MUTATION m3_managed_ignored
+[ FAIL ] ptx_variables_that_no_instruction_names_do_not_keep_a_module_off_the_card
+tests/unit/test_host_gpu_logic.cpp:3420: VCHECK(!r.refuse.empty() && !r.never) failed
+
+MUTATION m4_call_statements_not_read
+[ FAIL ] ptx_variables_that_no_instruction_names_do_not_keep_a_module_off_the_card
+tests/unit/test_host_gpu_logic.cpp:3409: VCHECK(!r.refuse.empty() && !r.never && r.refuse.find("module variable") != std::string::npos) failed
+
+MUTATION m5_initialisers_not_read
+[ FAIL ] ptx_variables_that_no_instruction_names_do_not_keep_a_module_off_the_card
+tests/unit/test_host_gpu_logic.cpp:3415: VCHECK(!r.refuse.empty()) failed
+
+MUTATION m7_register_call_join_point_ignored
+[ FAIL ] a_call_through_a_register_is_followed_only_when_its_target_slot_is_known
+tests/unit/test_host_gpu_logic.cpp:3520: VCHECK(register_call_slot(bad, 7) == -1) failed
+
+MUTATION m8_register_call_any_bank
+[ FAIL ] a_call_through_a_register_is_followed_only_when_its_target_slot_is_known
+tests/unit/test_host_gpu_logic.cpp:3506: VCHECK(register_call_slot(bad, 7) == -1) failed
+
+MUTATION m9_register_call_high_half_write_ignored
+[ FAIL ] a_call_through_a_register_is_followed_only_when_its_target_slot_is_known
+tests/unit/test_host_gpu_logic.cpp:3512: VCHECK(register_call_slot(bad, 7) == -1) failed
+
+MUTATION m10_guarded_load_accepted
+[ FAIL ] a_call_through_a_register_is_followed_only_when_its_target_slot_is_known
+tests/unit/test_host_gpu_logic.cpp:3516: VCHECK(register_call_slot(bad, 7) == -1) failed
+
+MUTATION m11_every_bpt_is_a_trap
+[ FAIL ] assert_and_trap_are_admitted_by_turbo_only_and_not_when_switched_off
+tests/unit/test_host_gpu_logic.cpp:3453: VCHECK(turbo_class("BPT", {m}, true) == InsnClass::Never) failed
+
+MUTATION m12_assert_admitted_when_switched_off
+[ FAIL ] externs_by_kind_and_what_each_mode_admits
+tests/unit/test_host_gpu_logic.cpp:2277: VCHECK(!extern_admitted(k, m, false)) failed
+[ FAIL ] assert_and_trap_are_admitted_by_turbo_only_and_not_when_switched_off
+tests/unit/test_host_gpu_logic.cpp:3443: VCHECK(!extern_admitted(K::Assert, Mode::Turbo, false, true)) failed
+
+MUTATION m13_assert_admitted_in_exact_mode
+[ FAIL ] externs_by_kind_and_what_each_mode_admits
+tests/unit/test_host_gpu_logic.cpp:2274: VCHECK(!extern_admitted(K::Printf, Mode::Exact, false)) failed
+[ FAIL ] assert_and_trap_are_admitted_by_turbo_only_and_not_when_switched_off
+tests/unit/test_host_gpu_logic.cpp:3445: VCHECK(!extern_admitted(K::Assert, Mode::Exact, false, false)) failed
+
+MUTATION m6_name_pieces_not_checked
+[ FAIL ] ptx_variables_that_no_instruction_names_do_not_keep_a_module_off_the_card
+tests/unit/test_host_gpu_logic.cpp:3429: VCHECK(!r.refuse.empty()) failed
+
+
+# Runtime mutations: step 59 of nvidia/tests/e2e/run_host_gpu_stub.sh, run alone (the unmutated run prints PASS step 59). Long lines cut to 160 characters.
+
+MUTATION s1_assert_and_trap_never_admitted
+FAIL: a kernel that asserts did not reach the card in turbo mode:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 1 cuInit; 1 cuMemAddressReserve;; host_gpu: VGPU_H
+FAIL: assertfire did not reach the card:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 1 cuInit; 1 cuMemAddressReserve;
+FAIL: assertfire: the failure on the card was not said: host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host GPU, in the card's own arithmetic and 
+FAIL: assertfire: an error 701 was not handled as any card failure: host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host GPU, in the card's own ari
+FAIL: trapfire did not reach the card:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 1 cuInit; 1 cuMemAddressReserve;
+
+MUTATION s2_a_card_assert_is_an_ordinary_failure
+FAIL: assertfire: the failure on the card was not said: host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host GPU, in the card's own arithmetic and 
+FAIL: trapfire: the failure on the card was not said: host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host GPU, in the card's own arithmetic and or
+
+MUTATION s3_any_card_error_is_taken_for_the_programs_own
+FAIL: assertfire: an error 701 was not handled as any card failure: host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host GPU, in the card's own ari
+FAIL: error 701 on a kernel that can fire changes the program's lines
+FAIL: trapfire: an error 701 was not handled as any card failure: host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host GPU, in the card's own arith
+
+MUTATION s4_ptx_variables_always_refuse
+FAIL: PTX whose only variable no instruction names was not given to the card:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 1 cuInit; 1 cuMemAddressReserve;; host
+FAIL: PTX whose kernel reads a variable was given to the card:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 1 cuInit; 1 cuMemAddressReserve;; host_gpu: VGPU_HOST
+FAIL: a PTX trap was not sent, or its failure was not the simulator's:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 1 cuInit; 1 cuMemAddressReserve;; host_gpu: V
+
+restored build: 0
+UNMUTATED ['PASS step 59']
