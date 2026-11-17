@@ -135,10 +135,67 @@ inline std::string describe_candidates(const std::vector<CardCandidate>& c) {
 struct PtxScan {
   std::string refuse;      // why the card cannot be given this PTX for the simulator; empty: it can
   bool never = false;      // ... and the reason is class Never (an instruction that needs the simulator's tables, a trap, an indirect call)
+  bool trap = false;       // it has trap, brkpt or a call to __assertfail, and the scan admitted it (section 20)
   bool printf = false;     // it calls vprintf (admitted in turbo mode unless switched off)
+  size_t unreferenced_variables = 0;   // module variables it declares that no instruction names (admitted: section 20), 0 when it refuses for one
   ClassMask classes = 0;   // the classes of its instructions (vgpu/host_gpu.hpp InsnClass bits), so that the turbo switches (TURBO_OFF, ATOMICS) apply to PTX as to SASS
 };
-inline PtxScan scan_ptx_for_card(const std::string& text, bool printf_off, bool retarget = false) {
+// ---- module variables of PTX: referenced or not (section 20) ------------------------------------------------------------------------------
+// The card compiles PTX into a module of its own, with its own copy of every variable, so a variable the code READS OR WRITES cannot be shared with the simulator's
+// copy. A variable no instruction of the module names is never read by the module's code: whatever the simulator holds in its copy cannot reach the card's kernels
+// through it (a host write to it, cudaMemcpyToSymbol, changes a copy nobody reads; an address handed in as a kernel argument is a simulator allocation the card
+// reaches through the window like any other). nvcc emits such declarations for libcu++ marker objects (`cuda::std::__cpo::begin` and the like, one byte each) in
+// every module that includes <cuda/std/...> [measured: HeCBench minmax-cuda, tsne-cuda, sm_90 PTX; docs/perf-design/12-host-gpu-turbo.md section 20].
+// A variable counts as referenced when any statement of the module other than its own declaration holds its name as a whole identifier (instruction operands of
+// every kind, call arguments, other variables' initialisers, directives, even a name inside a string: over-counting is the safe side). Everything that cannot be shown
+// unreferenced counts as referenced: external, visible, weak or common linkage (another module, or the host, may name it), managed, a declaration list, a name the
+// scan cannot read.
+struct PtxVarDecl {
+  size_t stmt = 0;
+  std::string space;       // ".global" or ".const"
+  std::string name;        // empty: not readable
+  bool linked = false;     // .extern, .visible, .weak, .common, .hidden
+  bool managed = false;
+};
+// The name a variable declaration statement declares ("" when the scan cannot read it): `.global .align 4 .b8 name[16] = {` gives "name".
+inline std::string ptx_decl_name(const std::string& st) {
+  const std::string head = st.substr(0, st.find('='));
+  if (head.find(',') != std::string::npos) return {};
+  size_t e = head.size();
+  while (e > 0 && std::isspace(static_cast<unsigned char>(head[e - 1]))) --e;
+  size_t b = e;
+  while (b > 0 && !std::isspace(static_cast<unsigned char>(head[b - 1]))) --b;
+  std::string tok = head.substr(b, e - b);
+  if (const size_t br = tok.find('['); br != std::string::npos) tok.resize(br);
+  if (tok.empty() || !(std::isalpha(static_cast<unsigned char>(tok[0])) || tok[0] == '_' || tok[0] == '$' || tok[0] == '%')) return {};
+  for (char c : tok)
+    if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$' || c == '.')) return {};
+  return tok;
+}
+// Identifiers of a text (alphanumerics, `_` and `$`; anything else separates).
+inline void ptx_identifiers(const std::string& s, size_t from, std::set<std::string>& out) {
+  std::string t;
+  for (size_t i = from; i <= s.size(); ++i) {
+    const char c = i < s.size() ? s[i] : ' ';
+    if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$') {
+      t += c;
+    } else if (!t.empty()) {
+      out.insert(t);
+      t.clear();
+    }
+  }
+}
+// Whether the declaration is shown unreferenced by `used` (every identifier of the module's other statements): its name, and every identifier-piece of it, absent.
+inline bool ptx_decl_unreferenced(const PtxVarDecl& d, const std::set<std::string>& used) {
+  if (d.name.empty() || d.linked || d.managed) return false;
+  std::set<std::string> pieces;
+  ptx_identifiers(d.name, 0, pieces);
+  for (const std::string& p : pieces)
+    if (used.count(p)) return false;
+  return true;
+}
+
+inline PtxScan scan_ptx_for_card(const std::string& text, bool printf_off, bool retarget = false, bool unreferenced_ok = true, bool assert_off = true) {
   PtxScan out;
   const auto refuse = [&](std::string why, bool never) {
     if (out.refuse.empty()) {
@@ -212,7 +269,9 @@ inline PtxScan scan_ptx_for_card(const std::string& text, bool printf_off, bool 
     while (end < st.size() && (std::isalnum(static_cast<unsigned char>(st[end])) || st[end] == '_' || st[end] == '$' || st[end] == '.')) ++end;
     if (end > at) externs.insert(st.substr(at, end - at));
   }
-  for (const std::string& st : stmts) {
+  std::vector<PtxVarDecl> decls;
+  for (size_t si = 0; si < stmts.size(); ++si) {
+    const std::string& st = stmts[si];
     std::vector<std::string> w = words(st);
     if (w.empty()) continue;
     size_t i = 0;
@@ -224,11 +283,21 @@ inline PtxScan scan_ptx_for_card(const std::string& text, bool printf_off, bool 
       refuse("the PTX has the cluster directive " + op + ", which the card's architecture lacks", true);
     if (op[0] == '.') {   // a directive: a declaration of something the card's own module would keep a second copy of
       size_t k = i;
-      while (k < w.size() && (w[k] == ".visible" || w[k] == ".extern" || w[k] == ".weak" || w[k] == ".common" || w[k] == ".hidden")) ++k;
+      bool linked = false;
+      while (k < w.size() && (w[k] == ".visible" || w[k] == ".extern" || w[k] == ".weak" || w[k] == ".common" || w[k] == ".hidden")) linked = true, ++k;
       bool tex = false;   // (`.global .texref t;` is how a texture is declared: the texture is what it is, not a variable)
       for (size_t t = k; t < w.size(); ++t) tex = tex || w[t] == ".tex" || w[t] == ".texref" || w[t] == ".surf" || w[t] == ".surfref" || w[t] == ".samplerref";
       if (tex) refuse("the PTX declares a texture or surface", true);
-      else if (k < w.size() && (w[k] == ".global" || w[k] == ".const")) refuse("the PTX declares a module variable (" + w[k] + ")", false);
+      else if (k < w.size() && (w[k] == ".global" || w[k] == ".const")) {
+        PtxVarDecl d;
+        d.stmt = si;
+        d.space = w[k];
+        d.name = ptx_decl_name(st);
+        d.linked = linked;
+        d.managed = st.find(".managed") != std::string::npos;
+        decls.push_back(std::move(d));
+        if (!unreferenced_ok) refuse("the PTX declares a module variable (" + w[k] + ")", false);
+      }
       continue;
     }
     const std::string base = op.substr(0, op.find('.'));
@@ -270,6 +339,7 @@ inline PtxScan scan_ptx_for_card(const std::string& text, bool printf_off, bool 
       if (why) refuse(std::string("the PTX uses ") + why + ", which the card's architecture lacks", true);
     }
     if (base == "tex" || base == "tld4" || base == "txq" || base == "suld" || base == "sust" || base == "sured" || base == "suq") refuse("the PTX has a texture or surface instruction (" + base + ")", true);
+    else if ((base == "trap" || base == "brkpt") && !assert_off) out.trap = true;   // (section 20: the card ends the kernel with 719 as the simulator does; the launch is told)
     else if (base == "trap" || base == "brkpt") refuse("the PTX has " + base + ", which ends the card's context", true);
     else if (base == "call") {
       size_t at = st.find("call") + 4;
@@ -290,9 +360,25 @@ inline PtxScan scan_ptx_for_card(const std::string& text, bool printf_off, bool 
       if (target.empty() || target[0] == '%') refuse("the PTX calls through a pointer", true);
       else if (externs.count(target)) {
         if (target == "vprintf" && !printf_off) out.printf = true;
+        else if (target == "__assertfail" && !assert_off) out.trap = true;
         else refuse("the PTX calls " + target + (target == "vprintf" ? " (VGPU_HOST_GPU_TURBO_OFF=printf)" : ""), false);
       }
     }
+  }
+  if (!decls.empty() && unreferenced_ok) {
+    std::set<std::string> used;
+    std::set<size_t> decl_stmt;
+    for (const PtxVarDecl& d : decls) decl_stmt.insert(d.stmt);
+    for (size_t si = 0; si < stmts.size(); ++si) {
+      if (!decl_stmt.count(si)) ptx_identifiers(stmts[si], 0, used);
+      else if (const size_t eq = stmts[si].find('='); eq != std::string::npos) ptx_identifiers(stmts[si], eq + 1, used);   // (an initialiser may name another variable)
+    }
+    for (const PtxVarDecl& d : decls)
+      if (!ptx_decl_unreferenced(d, used)) {
+        refuse("the PTX declares a module variable (" + d.space + ") that the module can reach" + (d.name.empty() ? "" : " (" + d.name + ")"), false);
+        break;
+      }
+    if (out.refuse.empty()) out.unreferenced_variables = decls.size();
   }
   return out;
 }

@@ -32,6 +32,7 @@
 #include "vgpu/host_gpu.hpp"
 #include "vgpu/host_gpu_image.hpp"
 #include "vgpu/host_gpu_source.hpp"
+#include "vgpu/host_gpu_regcall.hpp"
 #include "vgpu/sass/exec.hpp"
 
 namespace vgpu::census {
@@ -181,8 +182,8 @@ inline void scan_kernel(const sass::Module& m, const std::string& kernel, bool p
     for (const auto& [addr, name] : m.builtins) builtin = builtin || name == f;
     if (!devrt && !builtin && std::find(m.cubin.externs.begin(), m.cubin.externs.end(), f) == m.cubin.externs.end()) continue;
     const ExternKind k = extern_kind(f, devrt);
-    if (extern_admitted(k, Mode::Turbo, opt.printf_off) && printf_admitted) {
-      printf = true;
+    if (extern_admitted(k, Mode::Turbo, opt.printf_off, opt.sw.assert_off) && (k != ExternKind::Printf || printf_admitted)) {
+      if (k == ExternKind::Printf) printf = true;
       continue;
     }
     add(k == ExternKind::Assert ? "extern:assert" : k == ExternKind::Heap ? "extern:malloc-free" : k == ExternKind::DeviceLaunch ? "extern:device-launch" : k == ExternKind::Printf ? "extern:printf-off" : "extern:other");
@@ -203,7 +204,8 @@ inline void scan_kernel(const sass::Module& m, const std::string& kernel, bool p
     const uint64_t code_lo = sec.count ? sec.instr(0).pc : 0, code_hi = sec.count ? sec.instr(sec.count - 1).pc : 0;
     for (size_t i = 0; i < sec.count; ++i) {
       const sass::Instr& ins = sec.instr(i);
-      InsnClass c = turbo_class(ins.mnemonic, ins.mods);
+      const bool trap_ok = !opt.sw.assert_off;   // (section 20: BPT.TRAP and the bounded call through a register, as the runtime does)
+      InsnClass c = turbo_class(ins.mnemonic, ins.mods, trap_ok);
       std::string why;
       if (c == InsnClass::Never) why = never_reason(ins.mnemonic);
       if (call_needs_scan(ins.op == sass::Op::CALL, c)) {
@@ -216,6 +218,8 @@ inline void scan_kernel(const sass::Module& m, const std::string& kernel, bool p
           const sass::Code* callee = label && !rel && target >= 0 ? m.code_at(static_cast<uint64_t>(target)) : nullptr;
           if (callee && call_to_entry(rel, label, target, callee->base, callee->count)) {
             if (seen.insert(callee).second) todo.push_back(callee);
+          } else if (trap_ok && !label && !rel && register_call_to_admitted_extern(m, sec, i, opt.sw, nullptr)) {
+            // (admitted: the target is a slot of bank 4 that names an external function turbo admits)
           } else {
             c = InsnClass::Never;
             why = label ? "never:call-unfollowed" : "never:call-through-register";
@@ -252,7 +256,7 @@ inline std::vector<KernelCell> classify_module(const std::vector<CardCandidate>&
   if (pick < 0) return all(Image::None, "image:none");
   const CardCandidate& pc = c[static_cast<size_t>(pick)];
   if (pc.kind == CardCandidate::Ptx) {
-    PtxScan ps = scan_ptx_for_card(pc.bytes, opt.printf_off, retarget);
+    PtxScan ps = scan_ptx_for_card(pc.bytes, opt.printf_off, retarget, opt.sw.ptx_vars_unreferenced, opt.sw.assert_off);
     const Image im = retarget ? Image::Retarget : Image::PtxJit;
     if (retarget && retarget_ptx_text(pc.bytes, host_sm).empty()) return all(im, "image:ptx-not-plain-sm90");
     for (KernelCell& k : out) {

@@ -203,11 +203,11 @@ VTEST(census_ptx_follows_the_text_scan) {
   const std::string head = ".visible .entry k(.param .u64 p)\n{\n";
   const Case cases[] = {
       {".visible .entry k(.param .u64 p)\n{\nret;\n}\n", ""},
-      {".global .align 4 .u32 v;\n.visible .entry k(.param .u64 p)\n{\nret;\n}\n", "ptx:module-variable/.global.unreferenced"},
-      {".const .align 4 .b8 c[16];\n.visible .entry k(.param .u64 p)\n{\nret;\n}\n", "ptx:module-variable/.const.unreferenced"},
+      {".global .align 4 .u32 v;\n.visible .entry k(.param .u64 p)\n{\nret;\n}\n", ""},   // (section 20: no instruction names it)
+      {".const .align 4 .b8 c[16];\n.visible .entry k(.param .u64 p)\n{\nret;\n}\n", ""},
       {".global .align 4 .u32 v;\n.visible .entry k(.param .u64 p)\n{\n.reg .b64 a;\nmov.u64 a, v;\nret;\n}\n", "ptx:module-variable/.global.referenced"},
       {".visible .entry k(.param .u64 p)\n{\n.reg .f32 f<4>;\ntex.2d.v4.f32.f32 {f0,f1,f2,f3}, [t, {f0,f1}];\nret;\n}\n", "ptx:texture-surface"},
-      {".visible .entry k(.param .u64 p)\n{\ntrap;\nret;\n}\n", "ptx:trap"},
+      {".visible .entry k(.param .u64 p)\n{\ntrap;\nret;\n}\n", ""},   // (section 20)
       {".visible .entry k(.param .u64 p)\n{\ncp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [a], [b, {c, d}], [e];\nret;\n}\n", "ptx:tma"},
       {".visible .entry k(.param .u64 p)\n{\nwgmma.fence.sync.aligned;\nret;\n}\n", "ptx:warpgroup"},
       {".visible .entry k(.param .u64 p)\n{\nelect.sync %p0|%p1, 0xffffffff;\nret;\n}\n", "ptx:elect"},
@@ -215,13 +215,13 @@ VTEST(census_ptx_follows_the_text_scan) {
   for (const Case& cs : cases) {
     const std::vector<CardCandidate> c{ptx_mod(90, cs.body)};
     // the runtime's scan, called directly, with the retarget flag a plain sm_90 module on an sm_86 card gets
-    const hostgpu::PtxScan scan = hostgpu::scan_ptx_for_card(c[0].bytes, false, true);
+    const hostgpu::PtxScan scan = hostgpu::scan_ptx_for_card(c[0].bytes, false, true, true, false);
     const census::KernelCell k = cell(c, -1, 86);
     VCHECK_EQ(std::string(census::image_name(k.image)), std::string("retarget"));
     VCHECK_EQ(k.admitted, scan.refuse.empty());
     VCHECK_EQ(joined(k), std::string(cs.blocker));
     // on an sm_90 card the PTX is not retargeted: the scan has no retarget rules and the image is the PTX JIT
-    const hostgpu::PtxScan scan90 = hostgpu::scan_ptx_for_card(c[0].bytes, false, false);
+    const hostgpu::PtxScan scan90 = hostgpu::scan_ptx_for_card(c[0].bytes, false, false, true, false);
     const census::KernelCell k90 = cell(c, -1, 90);
     VCHECK_EQ(std::string(census::image_name(k90.image)), std::string("ptx-jit"));
     VCHECK_EQ(k90.admitted, scan90.refuse.empty());

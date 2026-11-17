@@ -454,6 +454,7 @@ struct TurboSwitches {
   bool atomics = true;
   ClassMask off = 0;        // VGPU_HOST_GPU_TURBO_OFF: classes switched off for an experiment
   bool printf_off = false;  // VGPU_HOST_GPU_TURBO_OFF=printf: a kernel that calls vprintf stays in the simulator (Round sp66)
+  bool ptx_vars_unreferenced = true;   // a PTX module's variables that no instruction names are admitted (VGPU_HOST_GPU_PTX_VARIABLES=all: refuse any variable; section 20)
   bool assert_off = false;  // VGPU_HOST_GPU_TURBO_OFF=assert: a kernel that can assert or trap stays in the simulator (section 20)
 };
 

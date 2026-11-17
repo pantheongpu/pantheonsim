@@ -112,11 +112,14 @@ int main(int argc, char** argv) {
   std::vector<int> hosts, profiles;
   std::vector<const char*> files;
   FILE* out = stdout;
+  census::Options opt;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--host" && i + 1 < argc) hosts.push_back(std::atoi(argv[++i]));
     else if (a == "--profile" && i + 1 < argc) profiles.push_back(std::atoi(argv[++i]));
     else if (a == "--out" && i + 1 < argc) out = std::fopen(argv[++i], "w");
+    else if (a == "--assert-off") opt.sw.assert_off = true;                      // the rule before section 20: __assertfail, BPT.TRAP and the register call refused
+    else if (a == "--ptx-variables-all") opt.sw.ptx_vars_unreferenced = false;   // the rule before section 20: any variable of a PTX module refuses it
     else files.push_back(argv[i]);
   }
   if (!out) return 2;
@@ -170,7 +173,7 @@ int main(int argc, char** argv) {
         std::fprintf(out, "M\t%s\t%u\t%s%s\n", path, module, hostgpu::describe_candidates(c).c_str(), sims.c_str());
         std::vector<std::vector<census::KernelCell>> cells;
         for (size_t pi = 0; pi < profiles.size(); ++pi)
-          for (int h : hosts) cells.push_back(census::classify_module(c, sim_index[pi], h, kernels, an));
+          for (int h : hosts) cells.push_back(census::classify_module(c, sim_index[pi], h, kernels, an, opt));
         for (size_t k = 0; k < kernels.size(); ++k) {
           std::fprintf(out, "K\t%s\t%u\t%s", path, module, kernels[k].c_str());
           for (const auto& cc : cells) std::fprintf(out, "\t%s", cell_text(cc[k]).c_str());

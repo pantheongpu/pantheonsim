@@ -3078,7 +3078,7 @@ VTEST(ptx_the_card_may_be_given) {
   VCHECK(r.refuse.empty() && !r.never && !r.printf);   // (ld.global and st.global are instructions, not declarations)
   // a module variable: the card's module would have a second copy
   for (const char* decl : {".global .align 4 .u32 g;", ".visible .global .align 4 .b8 g[16];", ".const .align 4 .u32 c[4];", ".extern .global .u32 g;", ".weak .const .u32 c;"}) {
-    r = scan_ptx_for_card(head + decl + "\n" + plain.substr(head.size()), false);
+    r = scan_ptx_for_card(head + decl + "\n" + plain.substr(head.size()), false, false, /*unreferenced_ok=*/false);   // (the rule before section 20: any variable)
     VCHECK(!r.refuse.empty() && !r.never);
   }
   VCHECK(scan_ptx_for_card(head + ".shared .align 4 .b8 sh[64];\n.local .align 4 .b8 lc[16];\n" + plain.substr(head.size()), false).refuse.empty());
@@ -3255,7 +3255,7 @@ VTEST(retargeted_ptx_is_refused_for_the_forms_the_older_card_lacks) {
     VCHECK(scan(ins).refuse.empty());
   VCHECK(scan("mbarrier.try_wait.shared::cta.b64 %p1, [%rd1], %rd2;", false).refuse.empty());   // (without the flag only the ordinary rules apply)
   // a variable still keeps a retargeted module out (rule 1: the card's JIT module has its own copy)
-  const PtxScan v = scan_ptx_for_card(head + ".global .align 4 .u32 g;\n", false, true);
+  const PtxScan v = scan_ptx_for_card(head + ".global .align 4 .u32 g;\n", false, true, false);
   VCHECK(!v.refuse.empty() && !v.never);
 }
 
@@ -3385,5 +3385,162 @@ VTEST(a_kernel_is_banned_after_three_slow_launches_in_a_row_with_the_short_rule)
   unsigned t = 0;
   VCHECK(offload_ends(t, false, before) && !offload_ends(t = 0, true, before));                  // one is enough before
 }
+
+// ---- section 20: a PTX module's variables that no instruction names ---------------------------------------------------------------------------
+VTEST(ptx_variables_that_no_instruction_names_do_not_keep_a_module_off_the_card) {
+  const std::string head = ".version 8.5\n.target sm_90\n.address_size 64\n";
+  const std::string kern = ".visible .entry k(.param .u64 p)\n{\n.reg .b64 %rd<4>;\n.reg .b32 %r<3>;\nld.param.u64 %rd1, [p];\nBODY\nret;\n}\n";
+  const auto with = [&](const std::string& decls, const std::string& body) {
+    std::string k = kern;
+    k.replace(k.find("BODY"), 4, body);
+    return head + decls + k;
+  };
+  const std::string marker = ".global .align 1 .b8 _ZN4cuda3std3__45__cpo5beginE[1];\n.global .align 1 .b8 _ZN4cuda3std3__45__cpo3endE[1];\n";
+  // the libcu++ markers: declared, never named: admitted, and counted
+  PtxScan r = scan_ptx_for_card(with(marker, "st.global.u32 [%rd1], 1;"), false, true);
+  VCHECK(r.refuse.empty() && r.unreferenced_variables == 2);
+  // the rule before (`unreferenced_ok = false`) refuses the same text
+  r = scan_ptx_for_card(with(marker, "st.global.u32 [%rd1], 1;"), false, true, false);
+  VCHECK(!r.refuse.empty() && !r.never);
+  // every way an instruction can name a variable: referenced, refused (not class never: a Safety refusal, the module's)
+  for (const char* body : {"mov.u64 %rd2, g;", "cvta.global.u64 %rd2, g;", "ld.global.u32 %r1, [g];", "ld.global.u32 %r1, [g+4];", "st.global.u32 [g], %r1;", "atom.global.add.u32 %r1, [g], 1;",
+                           "ld.const.u32 %r1, [g];", "mov.u64 %rd2, generic(g);", "ld.global.u32 %r1, [%rd2+g];", "call.uni foo, (g);", "mov.u64 %rd2, g+8;"}) {
+    r = scan_ptx_for_card(with(".global .align 4 .b8 g[16];\n", body), false, true);
+    VCHECK(!r.refuse.empty() && !r.never && r.refuse.find("module variable") != std::string::npos);
+  }
+  // another function of the module names it; so does another variable's initialiser
+  r = scan_ptx_for_card(head + ".global .align 4 .b8 g[16];\n.func f()\n{\n.reg .b64 %rd<2>;\nmov.u64 %rd1, g;\nret;\n}\n" + with("", "st.global.u32 [%rd1], 1;").substr(head.size()), false, true);
+  VCHECK(!r.refuse.empty());
+  r = scan_ptx_for_card(with(".global .align 4 .b8 g[16];\n.global .u64 ptr = g;\n", "st.global.u32 [%rd1], 1;"), false, true);
+  VCHECK(!r.refuse.empty());
+  // linkage that another module or the host can see, __managed__, a declaration list and a name the scan cannot read are all treated as referenced
+  for (const char* decl : {".visible .global .align 4 .b8 g[16];\n", ".extern .global .align 4 .b8 g[16];\n", ".weak .global .align 4 .b8 g[16];\n", ".common .global .align 4 .b8 g[16];\n",
+                           ".global .attribute(.managed) .align 4 .b8 g[16];\n", ".global .u32 a, b;\n", ".global .align 4 .b8 [16];\n"}) {
+    r = scan_ptx_for_card(with(decl, "st.global.u32 [%rd1], 1;"), false, true);
+    VCHECK(!r.refuse.empty() && !r.never);
+  }
+  // a name that is only part of another identifier is not a reference; the name as a whole identifier in a string or a directive is (over-counting is safe)
+  r = scan_ptx_for_card(with(".global .align 4 .b8 g[16];\n", "ld.global.u32 %r1, [%rd1+4];\nld.global.u32 %r2, [gg];\nmov.u32 %r1, g2;"), false, true);
+  VCHECK(r.refuse.empty());
+  r = scan_ptx_for_card(with(".global .align 4 .b8 g[16];\n.pragma \"g\";\n", "st.global.u32 [%rd1], 1;"), false, true);
+  VCHECK(!r.refuse.empty());
+  // initialised data of a variable is not a reference to the variable (the data statements hold numbers); a string literal's bytes are not names
+  r = scan_ptx_for_card(with(".global .align 1 .b8 s[6] = {104, 101, 108, 108, 111, 0};\n", "st.global.u32 [%rd1], 1;"), false, true);
+  VCHECK(r.refuse.empty() && r.unreferenced_variables == 1);
+  // textures stay class never whatever else the text says
+  r = scan_ptx_for_card(with(".global .texref t;\n", "st.global.u32 [%rd1], 1;"), false, true);
+  VCHECK(r.never);
+  // the declaration helpers
+  VCHECK(ptx_decl_name(".global .align 4 .b8 name[16] =") == "name");
+  VCHECK(ptx_decl_name(".global .u32 x") == "x" && ptx_decl_name(".const .align 1 .b8 $str$1[8]") == "$str$1");
+  VCHECK(ptx_decl_name(".global .u32 a, b").empty() && ptx_decl_name(".global .align 4").empty());
+}
+
+// ---- section 20: assert, trap and the call through a register ----------------------------------------------------------------------------------
+VTEST(assert_and_trap_are_admitted_by_turbo_only_and_not_when_switched_off) {
+  using K = ExternKind;
+  VCHECK(extern_admitted(K::Assert, Mode::Turbo, false, false));
+  VCHECK(!extern_admitted(K::Assert, Mode::Turbo, false, true));    // VGPU_HOST_GPU_TURBO_OFF=assert
+  VCHECK(!extern_admitted(K::Assert, Mode::Turbo, false));          // (the default of the argument is the rule before)
+  VCHECK(!extern_admitted(K::Assert, Mode::Exact, false, false));   // exact mode's promise is the simulator's bits
+  for (K k : {K::Heap, K::DeviceLaunch, K::Other}) VCHECK(!extern_admitted(k, Mode::Turbo, false, false));
+  VCHECK(extern_admitted(K::Printf, Mode::Turbo, false, false) && !extern_admitted(K::Printf, Mode::Turbo, true, false));
+  // BPT: only the TRAP form, only when the caller says so; the debugger forms and an undecoded one stay class never
+  const std::vector<std::string> trap{"TRAP"};
+  VCHECK(turbo_class("BPT", trap) == InsnClass::Never);
+  VCHECK(turbo_class("BPT", trap, true) == InsnClass::Unlisted);
+  for (const char* m : {"DRAIN", "CAL", "PAUSE", "INT", "(0)", "(6)", "(7)"}) {
+    VCHECK(turbo_class("BPT", {m}, true) == InsnClass::Never);
+    VCHECK(!bpt_is_trap("BPT", {m}));
+  }
+  VCHECK(turbo_class("BPT", {"TRAP", "X"}, true) == InsnClass::Never && turbo_class("BPT", {}, true) == InsnClass::Never);
+  VCHECK(turbo_class("BPT", trap, true) != InsnClass::Exact);
+  VCHECK(bpt_is_trap("BPT", trap) && !bpt_is_trap("EXIT", trap));
+  // the switch
+  ClassMask off = 0;
+  bool printf_off = true, assert_off = false;
+  VCHECK(parse_turbo_off("assert", &off, nullptr, &printf_off, &assert_off) && assert_off && !printf_off && off == 0);
+  VCHECK(parse_turbo_off("mufu,assert,printf", &off, nullptr, &printf_off, &assert_off) && assert_off && printf_off && off == class_bit(InsnClass::Mufu));
+  std::string bad;
+  VCHECK(!parse_turbo_off("assert", &off, &bad, &printf_off) && bad == "assert");   // (a caller that does not know the switch gets a bad name, as for printf)
+  VCHECK(parse_turbo_off("", &off, nullptr, &printf_off, &assert_off) && !assert_off);
+  // PTX: trap, brkpt and a call to __assertfail are admitted only when the caller says so
+  const std::string head = ".version 8.5\n.target sm_75\n.address_size 64\n";
+  const std::string af = head + ".extern .func __assertfail (.param .b64 a)\n;\n.visible .entry k()\n{\n{\ncall.uni __assertfail, (a);\n}\nret;\n}\n";
+  for (const char* ins : {"trap;", "brkpt;"}) {
+    const std::string t = head + ".visible .entry k()\n{\n" + ins + "\nret;\n}\n";
+    VCHECK(!scan_ptx_for_card(t, false).refuse.empty());
+    const PtxScan r = scan_ptx_for_card(t, false, false, true, false);
+    VCHECK(r.refuse.empty() && r.trap);
+    VCHECK(!scan_ptx_for_card(t, false, false, true, true).refuse.empty());
+  }
+  VCHECK(!scan_ptx_for_card(af, false).refuse.empty());
+  const PtxScan a = scan_ptx_for_card(af, false, false, true, false);
+  VCHECK(a.refuse.empty() && a.trap);
+}
+
+VTEST(a_call_through_a_register_is_followed_only_when_its_target_slot_is_known) {
+  using K = RcInsn::Kind;
+  const auto mov = [](uint32_t reg, int64_t imm) { RcInsn r; r.kind = K::MovImm; r.reg = reg; r.imm = imm; r.dst_reg = reg; r.dst_n = 1; return r; };
+  const auto ldc = [](uint32_t dst, uint32_t idx, int64_t off, uint32_t bank = 4, bool wide = true) {
+    RcInsn r; r.kind = K::LdcBank; r.reg = idx; r.imm = off; r.bank = bank; r.wide = wide; r.dst_reg = dst; r.dst_n = 2; return r;
+  };
+  const auto other = [](uint32_t dst, uint32_t n = 1) { RcInsn r; r.dst_reg = dst; r.dst_n = n; return r; };
+  const auto call = [](uint32_t reg) { RcInsn r; r.kind = K::CallReg; r.reg = reg; return r; };
+  // the sequence nvcc 13 emits for an assert (measured, HeCBench assert-cuda sm_86): MOV R2, 0x0 ; ... ; LDC.64 R2, c[0x4][R2] ; ... ; CALL.ABS.NOINC R2
+  std::vector<RcInsn> v{mov(2, 0), other(4), other(5), ldc(2, 2, 0), other(7), other(14), other(20), call(2)};
+  VCHECK(register_call_slot(v, 7) == 0);
+  v[0] = mov(2, 8);
+  VCHECK(register_call_slot(v, 7) == 8);
+  v[3] = ldc(2, 2, 0x10);   // (the offset of the load is added)
+  VCHECK(register_call_slot(v, 7) == 0x18);
+  v[3] = ldc(2, kRcRZ, 0x20);   // (no index register)
+  VCHECK(register_call_slot(v, 7) == 0x20);
+  v[3] = ldc(2, 2, 0);
+  v[0] = mov(2, 0);
+  // refused: the index comes from elsewhere, the load is not bank 4 or not 64 bits, another instruction writes the target (either half), a guarded load, a join point
+  std::vector<RcInsn> bad = v;
+  bad[0] = other(2);
+  VCHECK(register_call_slot(bad, 7) == -1);   // (the index register is not set by a MOV immediate)
+  bad = v; bad[3] = ldc(2, 2, 0, 3);
+  VCHECK(register_call_slot(bad, 7) == -1);
+  bad = v; bad[3] = ldc(2, 2, 0, 4, false); bad[3].dst_n = 1;
+  VCHECK(register_call_slot(bad, 7) == -1);
+  bad = v; bad[5] = other(2);
+  VCHECK(register_call_slot(bad, 7) == -1);   // (the target is overwritten after the load)
+  bad = v; bad[5] = other(3);
+  VCHECK(register_call_slot(bad, 7) == -1);   // (so is its high half)
+  bad = v; bad[5] = other(1, 2);
+  VCHECK(register_call_slot(bad, 7) == -1);   // (a two-register write that covers R2)
+  bad = v; bad[3].guarded = true;
+  VCHECK(register_call_slot(bad, 7) == -1);
+  bad = v; bad[0].guarded = true;
+  VCHECK(register_call_slot(bad, 7) == -1);
+  bad = v; bad[5].entry = true;
+  VCHECK(register_call_slot(bad, 7) == -1);   // (a join point between the load and the call)
+  bad = v; bad[7].entry = true;
+  VCHECK(register_call_slot(bad, 7) == -1);   // (the call itself can be entered from elsewhere)
+  bad = v; bad[3].entry = true;
+  VCHECK(register_call_slot(bad, 7) == -1);   // (entered at the load: the index register is whatever the other path left)
+  bad[3] = ldc(2, kRcRZ, 0x20); bad[3].entry = true;
+  VCHECK(register_call_slot(bad, 7) == 0x20); // (with no index register, entering AT the load is fine: it is the first thing that runs)
+  bad = v; bad.insert(bad.begin(), RcInsn{}); bad[0].kind = K::Control;
+  VCHECK(register_call_slot(bad, 8) == 0);    // (a branch BEFORE the index is set does not matter: the walk stops at the index's MOV)
+  bad = v; bad[1].kind = K::Control;
+  VCHECK(register_call_slot(bad, 7) == -1);   // (one between the index and the load does)
+  bad = v; bad[5].kind = K::Control;
+  VCHECK(register_call_slot(bad, 7) == -1);   // (a branch or call between the load and the call)
+  bad = v; bad[2].entry = true;
+  VCHECK(register_call_slot(bad, 7) == -1);   // (a join point between the index and the load: not through MOV ... LDC straight-line)
+  VCHECK(register_call_slot(v, 3) == -1 && register_call_slot(v, 99) == -1);   // (not a call)
+  bad = v; bad[7].reg = kRcRZ;
+  VCHECK(register_call_slot(bad, 7) == -1);
+  bad = v; bad[0] = mov(2, -8);
+  VCHECK(register_call_slot(bad, 7) == -1);   // (a negative slot)
+  // no load at all in the section before the call
+  std::vector<RcInsn> none{other(4), call(2)};
+  VCHECK(register_call_slot(none, 1) == -1);
+}
+
 
 VTEST_MAIN
