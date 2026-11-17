@@ -7,6 +7,15 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **Turbo host-GPU mode, next round: PTX retargeting, a driver start that overlaps the program's set-up, and the simulated profile's launch limits** (follows the turbo-fit round, PR #693).
+  A module whose only PTX is plain `.target sm_90` (a build with `-arch=sm_90` or `compute_90` alone) now runs on an sm_80, sm_86 or sm_87 card: its target line is rewritten to
+  the card's and the driver compiles it, provided the PTX uses no form that card lacks (a text scan of the forms ptxas 13.0 rejects there: `mbarrier.try_wait`, `expect_tx`, count-form
+  `mbarrier.arrive`, vector and 128-bit atomics, `fence.proxy.async`, packed 16-bit integer arithmetic, fp8 converts, cluster directives, plus the sm_90 forms already refused) and declares
+  no module variable. A module the driver then refuses stays in the simulator without ending turbo; `retargeted=` and `retarget_refused=` count them on the `host_gpu_fit:` line. Measured on an
+  A10G: PolyBench FDTD-2D built for sm_90 went from 119 s in the simulator (no card path before) to 4.2 s. With `VGPU_HOST_GPU_FIT=1` the card's driver now starts on its helper thread when the
+  simulated device is created (`VGPU_HOST_GPU_PRESTART=0` restores the lazy start), which took 0.1 to 0.14 s off programs with set-up to overlap. Turbo now makes the simulated profile's launch checks
+  (launch bounds, registers, grid, shared memory) before it asks the card, so a launch the plain simulator refuses is refused the same way. Details and measurements: `docs/perf-design/12-host-gpu-turbo.md` section 16.
+
 - **Turbo host-GPU mode sends every kernel the card can run, from the card's own image, and is documented as not bit-accurate** (owner decision 2026-11-17).
   `VGPU_HOST_GPU=turbo` now chooses, per module, the image the host GPU runs (a cubin for its own architecture, else an older cubin of its major, else PTX the
   driver compiles) instead of the one the simulated profile runs, so a simulated H100 on an RTX 3060 uses the card; the start-up gates on architecture and SM count are gone in turbo
