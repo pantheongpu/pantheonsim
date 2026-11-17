@@ -558,6 +558,9 @@ struct Costs {
   double margin = 2.0;                // offload only when the simulator is expected to take this many times the card path
   double sim_warp_instr_per_s = 100e6;   // a lower bound of the simulator's speed in warp instructions per second (tens to ~150 M per thread in the benchmarks)
   double min_sim_s = 200e-6;          // never below this, whatever the arithmetic says (timer noise, the estimate's error)
+  // A kernel the card has not run yet takes at most sim_s / kernel_prior_ratio there (a card is far faster than the simulator), and never more than
+  // kernel_s_default. 0: kernel_s_default always.
+  double kernel_prior_ratio = 0;
   // The one-off cost of the first card launch: loading the driver, cuInit, the primary context and the window reservation. Measured on an A10G at 0.23 s of
   // process wall time (docs/performance.md "Round sp42": the native process of a trivial program also takes 0.24 s). 0.25 rounds it up. VGPU_HOST_GPU_START_COST
   // sets it in seconds; 0 charges nothing (the rule before sp43: the driver starts at the first launch the per-launch rule accepts).
@@ -575,6 +578,20 @@ struct Costs {
   // ... of which at most this many count: the launch must save start_cost_s / start_repeats_max (0.5 ms) however often its kernel has run. A smaller
   // saving is within the error of the card path's estimate (LargeKernelParameter: 0.1 to 0.2 ms saved by the estimate, none of the start repaid on the card).
   double start_repeats_max = 500;
+  // How many launches of a kernel in a row may take longer on the card path than the simulator was expected to need before offloading it ends (offload_paid_off).
+  int ban_strikes = 1;
+
+  // What the runtime uses (#660, A10G: an empty launch plus its sync costs 8 us, a card runs a short kernel 20 times faster than the simulator): a launch
+  // the simulator takes 40 us for (5 latencies) can go, with the card's time for a kernel it has not run taken from the simulator's estimate, and a kernel
+  // launched thousands of times repays the start by saving 50 us a launch. The members above are the rule before, VGPU_HOST_GPU_SHORT=0.
+  static Costs short_launches() {
+    Costs c;
+    c.min_sim_s = 40e-6;
+    c.kernel_prior_ratio = 20;
+    c.start_repeats_max = 5000;
+    c.ban_strikes = 3;   // a launch of 20 us is late by 60 us now and then (scheduling) and the card is still 4 times faster
+    return c;
+  }
 };
 
 struct Estimate {
@@ -585,8 +602,22 @@ struct Estimate {
   double start_s = 0;                 // the driver start this launch would pay (the first card launch of the process); 0 once the driver is up
 };
 
+// The card's time for a kernel it has not run: the prior, shrunk for a launch the simulator takes little time for (JACOBI1D: 20,000 launches of 0.1 ms).
+inline double kernel_prior_seconds(double sim_s, const Costs& c) {
+  return c.kernel_prior_ratio > 0 ? std::min(c.kernel_s_default, sim_s / c.kernel_prior_ratio) : c.kernel_s_default;
+}
+
+// What to remember of a kernel's time on the card, with the short-launch rule on. The first launch also loads the module (65 us for a JACOBI1D kernel of
+// 20 us), and a kernel the rule keeps off the card never replaces that time, so it is taken for the prior. Later times are kept at their least, `real_before`:
+// the one slow launch (41 us among 20 us ones) must not end the card for a kernel (the bans still weigh each launch against the simulator).
+inline double card_time_to_keep(double measured_s, bool first_launch, std::optional<double> real_before, double sim_s, const Costs& c) {
+  if (c.kernel_prior_ratio <= 0) return measured_s;
+  if (first_launch) return std::min(measured_s, kernel_prior_seconds(sim_s, c));
+  return real_before ? std::min(*real_before, measured_s) : measured_s;
+}
+
 inline double card_path_seconds(const Estimate& e, const Costs& c) {
-  return e.start_s + c.launch_s + e.card_kernel_s.value_or(c.kernel_s_default) + static_cast<double>(e.push_bytes) / c.push_bytes_per_s +
+  return e.start_s + c.launch_s + e.card_kernel_s.value_or(kernel_prior_seconds(e.sim_s, c)) + static_cast<double>(e.push_bytes) / c.push_bytes_per_s +
          static_cast<double>(e.pull_bytes) / c.pull_bytes_per_s;
 }
 
@@ -676,7 +707,7 @@ inline double streak_keep_seconds(const StreakLaunch& s, const Costs& c) {
   return s.sim_s + static_cast<double>(s.card_only_bytes) / c.pull_bytes_per_s;
 }
 inline double streak_card_seconds(const StreakLaunch& s, const Costs& c) {
-  return c.launch_s + s.card_kernel_s.value_or(c.kernel_s_default) + static_cast<double>(s.push_bytes) / c.push_bytes_per_s;
+  return c.launch_s + s.card_kernel_s.value_or(kernel_prior_seconds(s.sim_s, c)) + static_cast<double>(s.push_bytes) / c.push_bytes_per_s;
 }
 inline bool streak_offload(const StreakLaunch& s, const Costs& c, bool driver_started) {
   if (!driver_started || s.card_only_bytes == 0 || !(s.sim_s > 0)) return false;
@@ -1366,6 +1397,11 @@ inline double sample_card_path_seconds(uint64_t live_bytes, const Costs& c, bool
 // A safety net for any estimate that turns out wrong: an offloaded launch that took longer on the card path (copies, launch, copy back)
 // than the simulator was expected to need ends the offloading of that kernel. One bad launch is the most it can cost.
 inline bool offload_paid_off(double card_total_s, double sim_estimate_s) { return card_total_s <= sim_estimate_s; }
+// `strikes`: the kernel's launches in a row that did not pay off, counted by the caller; true when offloading the kernel ends.
+inline bool offload_ends(unsigned& strikes, bool paid_off, const Costs& c) {
+  strikes = paid_off ? 0 : strikes + 1;
+  return strikes >= static_cast<unsigned>(std::max(c.ban_strikes, 1));
+}
 
 // A second safety net, by traffic (docs/perf-design/09-host-gpu-spike.md 7.3; docs/perf-design/rounds/08-rounds-sp11-sp15.md "Round sp14"). With a persistent card copy, a kernel that
 // alternates with simulator launches on the same buffers gives the copy up and gets it pushed again every time. A kernel is banned when kTrafficLaunches

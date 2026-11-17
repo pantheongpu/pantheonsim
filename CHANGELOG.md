@@ -15,6 +15,10 @@ release says what runs and what it produces, never how fast a real GPU would run
   kernels launched once each ran 1.29x slower with `VGPU_HOST_GPU=turbo` than without; it is now 1.02x, and 5,000 short launches of one kernel went from
   1.18x to 1.07x (the same decisions, outputs and counters). The scan of each kernel's code skips the loop analysis when no loop can run, looks
   mnemonics up as integers, and the module's call graph walk no longer builds a string per section; `VGPU_HOST_GPU_LOG` is read once.
+- **Turbo mode sends very short launches to the card when it clearly wins** (issue #660). On an A10G an empty launch plus its sync costs 8 us, so the
+  size rule now takes the card's time for a kernel it has not run as a twentieth of the simulator's estimate (at most 100 us, as before), lets a
+  launch of 40 us or more be sent (was 200 us), and lets a kernel launched thousands of times repay the driver start at 50 us saved a launch.
+  The simulator's results do not change, only which path a launch takes. `VGPU_HOST_GPU_SHORT=0` restores the old rule.
 
 - **PTX with an `.extern` variable is judged as NVIDIA's driver judges it** (issue #681, follow-up to the entry below). The same RTX 3080 Ti was
   asked about the cases the first change did not cover, and answered differently from the simulator in four of them. Now, as on the card:
