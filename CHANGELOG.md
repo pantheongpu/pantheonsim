@@ -7,6 +7,13 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **An undefined `.extern .global` (or `.const`) in a PTX module is a zero-initialised variable, as on NVIDIA's driver** (issue #681). A module that
+  declares `.extern .global .align 4 .u32 x;` and defines it nowhere used to fail at the first launch that read it
+  (`CUDA_ERROR_NOT_FOUND: unknown symbol`), and `cuModuleGetGlobal` could not find it. On a real RTX 3080 Ti the driver drops the qualifier in a
+  whole-program module (`ptxas warning : Unresolved extern variable`), gives the variable its declared size, zero, and lets `cuModuleGetGlobal`
+  return it and the host write it. The simulator does the same. PoCL's CUDA backend declares `_global_offset_x` this way and launches every kernel
+  with it, so OpenCL through PoCL can now launch kernels on the simulated NVIDIA GPUs. A name the module defines itself keeps its definition, and an
+  unsized `.extern .global x[]` still loads. (The simulator writes no ptxas warning: `cuModuleLoadDataEx` has no JIT log here.)
 - **Behaviour change: the b200 and gb200 profiles sum tensor-core products by the Hopper rule by default, not sequentially.** On
   `nvidia/b200` and `nvidia/gb200` (compute capability 10.0), `wmma`, `mma.sync` and SASS `HMMA` in f16, bf16 and tf32 now add the
   products in chunks of 16 (tf32: 8) with the terms cut at 2^(top - 26), the rule of an H100, instead of one at a time in f32.
