@@ -102,6 +102,7 @@ inline bool halves_close(uint16_t card, uint16_t sim, const Tolerance& t, double
 struct TolReport {
   uint64_t words = 0;        // 4-byte words compared (a partial word at either end of a range counts as one)
   uint64_t different = 0;    // of them, words whose bits differ
+  uint64_t bits = 0;         // the bits that differ, over all the different words (popcount of card ^ sim)
   uint64_t outside = 0;      // of those, words outside tolerance
   uint64_t subnormal = 0;    // of the different words inside tolerance: both sides zero or denormal as binary32 (what two small integers look like)
   double max_abs = 0;        // largest differences of the different words, each under the reading that passed (binary32 for a word outside tolerance,
@@ -113,6 +114,7 @@ struct TolReport {
   void add(const TolReport& o) {
     words += o.words;
     different += o.different;
+    bits += o.bits;
     outside += o.outside;
     subnormal += o.subnormal;
     if (o.max_abs > max_abs) max_abs = o.max_abs;
@@ -194,6 +196,7 @@ inline void compare_words(const uint8_t* card, const uint8_t* sim, uint64_t addr
     uint32_t c = 0, s = 0;
     std::memcpy(&c, card + at, n);
     std::memcpy(&s, sim + at, n);
+    r.bits += static_cast<uint64_t>(__builtin_popcount(c ^ s));
     outside_word(at, c, s);
   };
   uint64_t at = 0;
@@ -207,6 +210,7 @@ inline void compare_words(const uint8_t* card, const uint8_t* sim, uint64_t addr
     const uint32_t c = load32(card + at), s = load32(sim + at);
     if (c == s) continue;
     ++r.different;
+    r.bits += static_cast<uint64_t>(__builtin_popcount(c ^ s));
     double a = 0, rel = 0;
     const uint64_t w = addr + at;
     const bool high_half = (w & 4) != 0;   // of the aligned 8 bytes that hold this word

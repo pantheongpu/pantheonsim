@@ -860,6 +860,9 @@ uint64_t library_module_on(ShimState& s, uintptr_t lib_handle, int dev) {
                      ? s.rt->device(dev).load_cubin(reinterpret_cast<const uint8_t*>(lib.cubin.data()), lib.cubin.size())
                      : s.rt->device(dev).load_module(lib.ptx);
   lib.per_device_module[dev] = mid;
+  // (turbo mode: the library's image is the one the simulator was given; its fatbin's other images are not kept)
+  if (auto src = !lib.cubin.empty() ? vgpu::cuda::card_source_from_cubin(lib.cubin.data(), lib.cubin.size()) : vgpu::cuda::card_source_from_ptx(lib.ptx))
+    s.rt->device(dev).set_card_source(mid, src);
   bind_managed_globals(s, dev, mid);
   return mid;
 }
@@ -1886,11 +1889,13 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
     int dev = current_device(s);
     uint64_t mid = 0;
     std::vector<uint8_t> loaded_cubin;   // the module's code, when it is a cubin (for a profiler)
+    std::shared_ptr<const vgpu::hostgpu::CardSource> card_src;   // turbo mode: the images the host GPU could run (null otherwise)
     const vgpu::DeviceProfile& prof = s.rt->device(dev).profile();
     const uint32_t cc = static_cast<uint32_t>(prof.cc_major * 10 + prof.cc_minor);
     if (magic == 0x466243B1u || magic == 0xBA55ED50u) {
       // A fatbin (wrapper or container): its SASS for this GPU if it has
       // some, as the real driver runs; else its PTX.
+      card_src = vgpu::cuda::card_source_from_fatbin(image);
       const std::string cubin = vgpu::cuda::pick_cubin(image, cc);
       if (!cubin.empty()) {
         mid = s.rt->device(dev).load_cubin(reinterpret_cast<const uint8_t*>(cubin.data()), cubin.size());
@@ -1929,6 +1934,7 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
       // An sm_XYa cubin runs on XY alone, a plain one on its major from XY up.
       if (!vgpu::sass::runs_on(sm, vgpu::sass::cubin_arch_specific(b, size), static_cast<int>(cc)))
         return CUDA_ERROR_NO_BINARY_FOR_GPU;
+      card_src = vgpu::cuda::card_source_from_cubin(b, size);
       const std::string aside = ptx_for_unsupported_cubin(b, size);
       try {
         mid = !aside.empty() ? s.rt->device(dev).load_module(aside.c_str()) : s.rt->device(dev).load_cubin(b, size);
@@ -1940,7 +1946,9 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
     } else {
       check_ptx_image(text, static_cast<size_t>(-1));
       mid = s.rt->device(dev).load_module(text);
+      card_src = vgpu::cuda::card_source_from_ptx(text);
     }
+    if (card_src) s.rt->device(dev).set_card_source(mid, card_src);
     bind_managed_globals(s, dev, mid);
     uintptr_t h = make_handle(s, kTagModule);
     s.modules[h] = {dev, mid};

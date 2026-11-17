@@ -596,6 +596,20 @@ uint64_t Device::module_const_bytes(uint64_t module_id, const std::string& kerne
   return 0;
 }
 
+void Device::set_card_source(uint64_t module_id, std::shared_ptr<const hostgpu::CardSource> source) {
+  LoadedModule* found = find_module(module_id);
+  if (!found) return;
+  LoadedModule& lm = *found;
+  lm.card = source;
+  if (lm.mod)
+    for (ptx::EntryFn& e : lm.mod->entries) e.card = source;
+  if (lm.lazy) {   // (the kernels parsed so far; the others take it when they are parsed, in lazy_function)
+    std::lock_guard<std::recursive_mutex> lock(lm.lazy->mu);
+    for (auto& [name, part] : lm.lazy->parsed)
+      for (ptx::EntryFn& e : part->entries) e.card = source;
+  }
+}
+
 const ptx::EntryFn* Device::get_function(uint64_t module_id, const std::string& name) const {
   if (LoadedModule* found = find_module(module_id)) {
     LoadedModule& lm = *found;
@@ -664,6 +678,7 @@ const ptx::EntryFn* Device::lazy_function(LoadedModule& lm, const std::string& n
   for (size_t i = 0; i < lz.func_order.size(); ++i)
     if (auto it = by_name.find(lz.func_order[i]); it != by_name.end()) fn.module_funcs[i] = it->second;
   fn.module_entry_names = lz.entry_order;
+  fn.card = lm.card;
   for (auto& [va, k] : lm.kernels)
     if (!k && va == lm.symbols.at(name)) k = &fn;
   forget_kernel_table();

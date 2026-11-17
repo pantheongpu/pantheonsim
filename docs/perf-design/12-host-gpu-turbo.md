@@ -1,6 +1,9 @@
 # Host-GPU mode, turbo: kernels whose result is the card's own
 
-Status: experimental, opt-in (`VGPU_HOST_GPU=turbo`). Measured on one A10G in *Round sp59*
+Status: experimental, opt-in (`VGPU_HOST_GPU=turbo`). **Turbo is not promised to be bit-accurate, and since 2026-11-17 it sends to the host GPU every kernel the card can
+physically run, including the kernels of a simulated profile of another architecture** (a simulated H100 on an RTX 3060: the card runs what it can, from its own
+image of the program): section 15 says what changed and why; the earlier text of this document describes the rules that `VGPU_HOST_GPU_FIT=0` keeps. Turbo prints a notice
+when it comes on that its results may differ from the simulator's, and they can, by a few bits. `VGPU_HOST_GPU=exact` is unchanged and still bit-exact. Measured on one A10G in *Round sp59*
 ([rounds/11-rounds-sp36-sp41.md](rounds/11-rounds-sp36-sp41.md#round-sp59-turbo-host-gpu-mode-on-an-a10g)): over 59 programs of PolyBench/GPU, Rodinia
 and HeCBench the geometric mean speed-up is 1.23x against 1.12x for exact mode (summed wall time 1.75x against 1.20x), every program's output is the
 simulator's, and no kernel was refused for an instruction of no class. Sections 5, 8 and 9 say what the card confirmed and what it changed.
@@ -28,7 +31,8 @@ was measured on, and a rule for the cards where it is only inferred.
 ## 2. The classes
 
 Every instruction of a kernel is put in one class, once per kernel (`turbo_class` in `include/vgpu/host_gpu.hpp`), and a kernel is
-admitted by the classes it holds. It is still a whitelist: a mnemonic nobody named is `never`. What a kernel needs of its module besides code (variables,
+admitted by the classes it holds. Since 2026-11-17 (section 15) a mnemonic nobody named is `unlisted` and turbo admits it: the card runs the cubin's own words whatever the
+simulator's decoder calls them. `never` is only what the card cannot run for the simulator. What a kernel needs of its module besides code (variables,
 external functions) is decided apart, by the same rules in both modes, in section 3.
 
 | class | instructions | default | switch |
@@ -43,13 +47,15 @@ external functions) is decided apart, by the same rules in both modes, in sectio
 | atomic-int | `ATOM`, `ATOMG`, `ATOMS` on integers with `ADD`, `MIN`, `MAX`, `AND`, `OR`, `XOR`, `INC`, `DEC`; `RED` with `INC`, `DEC`, `POPC` | admitted | `=atomics` |
 | atomic-float | `ATOM`, `ATOMG`, `ATOMS` on a float type (a value is returned) | admitted (refused until Round sp66) | `VGPU_HOST_GPU_ATOMICS=0` |
 | atomic-swap | any `CAS`, `CAST.SPIN`, `EXCH` | admitted (refused until Round sp66) | `VGPU_HOST_GPU_ATOMICS=0` |
-| never | `TEX`, `TLD`, `TLD4`, `TXD`, `TXQ`, `TMML`, `SULD`, `SUST`, `SUATOM`, `SURED`; `QMMA`, the sm_90 and sm_100 tensor and tensor-memory instructions; `JMP`, `BPT`; any other call that leaves the section (through a register, into the middle of a section, outside the module's code; the absolute call to `vprintf` excepted, section 10); `ATOMS.ARRIVE`; an instruction with a field the decoder cannot name; anything else | refused | none |
+| never | `TEX`, `TLD`, `TLD4`, `TXD`, `TXQ`, `TMML`, `SULD`, `SUST`, `SUATOM`, `SURED` (their handles are indices into the simulator's tables); `BPT` (a breakpoint or trap ends the card's context); any other call that leaves the section (through a register, into the middle of a section, outside the module's code; the absolute call to `vprintf` excepted, section 10) | refused | none |
+| unlisted | whatever no class names: `QMMA`, the sm_90 and sm_100 tensor and tensor-memory instructions, `JMP`, `ATOMS.ARRIVE`, `ELECT`, `STSM`, an unnamed mnemonic, an instruction with a field the decoder cannot name (admitted since 2026-11-17; refused until then, as `never`). Exact mode refuses all of it | admitted | `=unlisted` |
 
 Why each admitted class is safe to run on the card, as distinct from numerically equal: the card executes the module's own cubin, so any
 instruction is "supported" there. What the mode must guarantee is that the card has everything the kernel reads. The shared checks do
 that (section 3), and they are about memory and launch shape, not about opcodes. The classes above touch registers, shared memory and
 global memory through the same addresses as `LDG` and `STG`. The `never` class holds what does not: textures and surfaces live in the
-simulator's own tables, and the rest is unnamed because nobody has looked, not because it is known to be unsafe. The `extra` class is the
+simulator's own tables, and a trap ends the card's context. What is unnamed (`unlisted`) is admitted since 2026-11-17 because nobody has looked, not because it is
+known to be unsafe, and a result that is the card's own is what turbo promises: no measurement backs the class, which is why it has a switch of its own, as `extra` has. The `extra` class is the
 judgement call of this list: no measurement backs it yet, which is why it has a switch of its own.
 
 A kernel of the exact set (the division idiom with `VGPU_HOST_GPU_DIV=1` and the square root idiom with `VGPU_HOST_GPU_SQRT=1` included, Round sp68) is admitted whatever is switched off; turbo mode itself takes every `MUFU` anyway, so the square root idiom changes nothing in it.
@@ -57,7 +63,7 @@ A kernel of the exact set (the division idiom with `VGPU_HOST_GPU_DIV=1` and the
 A refused kernel is named once on stderr, with the first instruction that refused it, so that a benchmark shows what is still missing:
 
 ```
-host_gpu_refused: kernel=<name> class=never|off|atomics insn=<the instruction as nvdisasm prints it>
+host_gpu_refused: kernel=<name> class=never|off|atomics insn=<the instruction as nvdisasm prints it>   (`unlisted` is admitted: it is named only with VGPU_HOST_GPU_TURBO_OFF=unlisted, as class=off)
 ```
 
 ### The order-dependent classes

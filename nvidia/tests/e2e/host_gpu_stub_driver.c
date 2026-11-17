@@ -26,9 +26,32 @@ int cuInit(unsigned flags) {
   return env_int("STUB_FAIL_INIT", 0) ? 100 : 0;
 }
 int cuDeviceGet(int* d, int i) { note("cuDeviceGet"); *d = i; return 0; }
+/* The card's launch limits (turbo mode's fit check): an sm_86 card's by default (RTX 3060: 1024 threads a block, dimensions 1024 x 1024 x 64, a grid of
+ * 2^31-1 x 65535 x 65535, 99 KiB of shared memory a block with the opt-in, 65536 registers a block), each overridable to put a launch outside the card. */
 int cuDeviceGetAttribute(int* v, int attr, int d) {
   (void)d;
-  *v = attr == 16 ? env_int("STUB_MP", 28) : attr == 75 ? env_int("STUB_SM", 86) / 10 : attr == 76 ? env_int("STUB_SM", 86) % 10 : 0;
+  switch (attr) {
+    case 1: *v = env_int("STUB_MAX_THREADS", 1024); break;
+    case 2: *v = env_int("STUB_MAX_BLOCK_X", 1024); break;
+    case 3: *v = 1024; break;
+    case 4: *v = 64; break;
+    case 5: *v = env_int("STUB_MAX_GRID_X", 2147483647); break;
+    case 6: *v = 65535; break;
+    case 7: *v = 65535; break;
+    case 12: *v = env_int("STUB_REGS_PER_BLOCK", 65536); break;
+    case 16: *v = env_int("STUB_MP", 28); break;
+    case 75: *v = env_int("STUB_SM", 86) / 10; break;
+    case 76: *v = env_int("STUB_SM", 86) % 10; break;
+    case 97: *v = env_int("STUB_SHARED_OPTIN", 101376); break;
+    default: *v = 0;
+  }
+  return 0;
+}
+/* A function's attributes: its registers, static shared memory and the most threads it can run (cuFuncGetAttribute 4, 1, 0). */
+int cuFuncGetAttribute(int* v, int attr, void* f) {
+  (void)f;
+  note("cuFuncGetAttribute");
+  *v = attr == 0 ? env_int("STUB_FUNC_MAX_THREADS", 1024) : attr == 1 ? env_int("STUB_FUNC_SHARED", 0) : attr == 4 ? env_int("STUB_FUNC_REGS", 32) : 0;
   return 0;
 }
 int cuDevicePrimaryCtxRetain(void** c, int d) { (void)d; note("cuDevicePrimaryCtxRetain"); *c = (void*)0x1000; return 0; }
@@ -76,7 +99,12 @@ int cuMemSetAccess(u64 p, size_t size, const void* d, size_t n) { (void)p; (void
 int cuMemsetD8_v2(u64 p, unsigned char v, size_t n) { unsigned char* b = backing(p, n); if (b) memset(b, v, n); return 0; }
 int cuMemcpyHtoD_v2(u64 d, const void* s, size_t n) { unsigned char* b = backing(d, n); note("cuMemcpyHtoD"); if (b) memcpy(b, s, n); return 0; }
 int cuMemcpyDtoH_v2(void* d, u64 s, size_t n) { unsigned char* b = backing(s, n); if (b) memcpy(d, b, n); return 0; }
-int cuMemGetInfo_v2(size_t* f, size_t* t) { *f = 1ull << 40; *t = 1ull << 40; return 0; }
+/* STUB_TOTAL_MIB: the card has this much memory (all of it free), for a window of the simulator's memory the card cannot hold. */
+int cuMemGetInfo_v2(size_t* f, size_t* t) {
+  const int mib = env_int("STUB_TOTAL_MIB", 0);
+  *f = *t = mib ? (size_t)mib << 20 : 1ull << 40;
+  return 0;
+}
 /* STUB_CARD_OK=1: the module loads and a launch succeeds without doing anything (the card's memory is whatever the stub's copies left: nothing). For a run that only
  * needs the mode to believe a launch ran on the card, such as VGPU_HOST_GPU_VERIFY=1, whose result is the simulator's whatever the card did. Never for a run whose
  * output matters in the plain mode: the offloaded launches would not have run at all. */
@@ -112,6 +140,18 @@ static void count_relocs(const unsigned char* img) {
 int cuModuleLoadData(void** m, const void* image) {
   note("cuModuleLoadData");
   g_img = (const unsigned char*)image;
+  if (memcmp(g_img, "\x7f" "ELF", 4) != 0) {   /* PTX text: the driver compiles it (turbo mode gives the card PTX when no cubin of its own runs) */
+    note("image ptx");
+    g_img = 0;
+    if (env_int("STUB_CARD_OK", 0)) { *m = (void*)0x2000; return 0; }
+    return 1;
+  }
+  {   /* the architecture of the cubin: e_flags' second byte from ELF ABI version 8 (CUDA 13), its low byte before */
+    const unsigned eflags = (unsigned)rd(g_img + 0x30, 4);
+    char line[48];
+    snprintf(line, sizeof line, "image elf sm_%u", g_img[7] == 0x33 ? eflags & 0xff : (eflags >> 8) & 0xff);
+    note(line);
+  }
   count_relocs(g_img);
   if (env_int("STUB_CARD_OK", 0)) { *m = (void*)0x2000; return 0; }
   return 1;
@@ -145,5 +185,8 @@ int cuMemcpyDtoD_v2(u64 d, u64 s, size_t n) {
 int cuModuleGetFunction(void** f, void* m, const char* name) { (void)m; (void)name; if (env_int("STUB_CARD_OK", 0)) { *f = (void*)0x3000; return 0; } return 1; }
 int cuFuncSetAttribute(void* f, int a, int v) { (void)f; (void)a; (void)v; return 0; }
 int cuLaunchKernel(void* f, unsigned a, unsigned b, unsigned c, unsigned d, unsigned e, unsigned g, unsigned sh, void* s, void** p, void** x) {
-  (void)f; (void)a; (void)b; (void)c; (void)d; (void)e; (void)g; (void)sh; (void)s; (void)p; (void)x; note("cuLaunchKernel"); return env_int("STUB_CARD_OK", 0) ? 0 : 1;
+  (void)f; (void)a; (void)b; (void)c; (void)d; (void)e; (void)g; (void)sh; (void)s; (void)p; (void)x; note("cuLaunchKernel");
+  /* STUB_LAUNCH_FAIL=<error>: the card takes the module and the function and then refuses the launch with this error (701, too many resources, say) */
+  if (env_int("STUB_LAUNCH_FAIL", 0)) return env_int("STUB_LAUNCH_FAIL", 0);
+  return env_int("STUB_CARD_OK", 0) ? 0 : 1;
 }

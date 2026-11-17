@@ -218,7 +218,10 @@ inline CodeInsn::Kind classify_for_idiom(const std::string& mnemonic, const std:
 
 // ---- turbo mode: what a kernel's code is made of (docs/perf-design/12-host-gpu-turbo.md) ------------------------------------------------
 // VGPU_HOST_GPU=turbo also sends kernels to the card whose result is the card's and not the simulator's bits. Every instruction of a kernel is put in
-// one class, once, and the mode admits a kernel by the classes it holds. It stays a whitelist: a mnemonic that is not named below is Never.
+// one class, once, and the mode admits a kernel by the classes it holds. A mnemonic that is not named below is Unlisted: the card runs the cubin's own
+// words, whatever the simulator's decoder calls them, so turbo admits it (VGPU_HOST_GPU_TURBO_OFF=unlisted keeps such kernels in the simulator);
+// exact mode, whose whitelist is untouched, refuses it. Never is what the card cannot run for the simulator: it needs a table only the simulator holds
+// (textures and surfaces) or ends the card's context (BPT).
 enum class InsnClass : uint8_t {
   Exact,       // today's exact set
   Mufu,        // every MUFU form (the card's approximation is 1 to 2 ulp from the simulator's, sp44)
@@ -231,11 +234,13 @@ enum class InsnClass : uint8_t {
   AtomInt,     // integer atomics that return the old value (ADD, MIN, MAX, AND, OR, XOR, INC, DEC): memory ends the same, the returned values depend on the order
   AtomFloat,   // float atomics that return a value: admitted unless VGPU_HOST_GPU_ATOMICS=0 (an opt-in until Round sp66)
   AtomSwap,    // CAS, CAST.SPIN, EXCH: as AtomFloat; the card does not agree with itself from run to run on programs built on these (09 doc, M2)
-  Never,       // textures, surfaces, anything not named
+  Never,       // textures and surfaces (handles are indices into the simulator's tables), BPT (a trap ends the card's context), a call the scan cannot follow
+  Unlisted,    // an instruction no class names (an unnamed mnemonic, a field the decoder could not name, JMP, ATOMS.ARRIVE, the sm_90 and later tensor and
+               // tensor-memory forms ...): admitted by turbo, never by exact
 };
-inline constexpr unsigned kInsnClasses = 11;
+inline constexpr unsigned kInsnClasses = 12;
 inline const char* insn_class_name(InsnClass c) {
-  static const char* const n[kInsnClasses] = {"exact", "mufu", "half", "float-red", "call", "extra", "tensor", "atomic-int", "atomic-float", "atomic-swap", "never"};
+  static const char* const n[kInsnClasses] = {"exact", "mufu", "half", "float-red", "call", "extra", "tensor", "atomic-int", "atomic-float", "atomic-swap", "never", "unlisted"};
   return n[static_cast<unsigned>(c)];
 }
 
@@ -262,6 +267,16 @@ inline bool mods_undecoded(const std::vector<std::string>& mods) {
   return any_mod_part(mods, [](const std::string& p) { return p[0] == '('; });
 }
 
+// The texture and surface instructions: they read the simulator's own tables (the handle in the instruction or a register is an index into
+// them), so a kernel that holds one cannot run on the card: class Never, in both modes. A kernel without one does
+// not read a texture object, whatever objects exist (until Round sp66 one live texture object kept every launch of the device off the card).
+inline bool texture_mnemonic(const std::string& m) {
+  static const char* const kTex[] = {"TEX", "TEXS", "TLD", "TLDS", "TLD4", "TLD4S", "TXD", "TXQ", "TMML", "SULD", "SUST", "SUATOM", "SURED", "SUQUERY"};
+  for (const char* t : kTex)
+    if (m == t) return true;
+  return false;
+}
+
 inline InsnClass turbo_class(const std::string& mnemonic, const std::vector<std::string>& mods) {
   using C = InsnClass;
   const auto is_one_of = [&](std::initializer_list<const char*> names) {
@@ -269,7 +284,8 @@ inline InsnClass turbo_class(const std::string& mnemonic, const std::vector<std:
       if (mnemonic == n) return true;
     return false;
   };
-  if (mnemonic.empty() || mods_undecoded(mods)) return C::Never;
+  if (texture_mnemonic(mnemonic) || mnemonic == "BPT") return C::Never;
+  if (mnemonic.empty() || mods_undecoded(mods)) return C::Unlisted;
   // Reductions and atomics first, by what they do.
   if (is_one_of({"RED", "REDG"})) {
     if (mods_have(mods, "CAS") || mods_have(mods, "CAST") || mods_have(mods, "SPIN") || mods_have(mods, "EXCH")) return C::AtomSwap;
@@ -278,7 +294,7 @@ inline InsnClass turbo_class(const std::string& mnemonic, const std::vector<std:
     return mnemonic == "RED" ? C::Exact : C::Extra;   // (REDG is sm_90's spelling: the exact set never named it)
   }
   if (is_one_of({"ATOM", "ATOMG", "ATOMS"})) {
-    if (mods_have(mods, "ARRIVE")) return C::Never;   // sm_80's mbarrier.arrive
+    if (mods_have(mods, "ARRIVE")) return C::Unlisted;   // sm_80's mbarrier.arrive
     if (mods_have(mods, "CAS") || mods_have(mods, "CAST") || mods_have(mods, "SPIN") || mods_have(mods, "EXCH")) return C::AtomSwap;
     return mods_float_typed(mods) ? C::AtomFloat : C::AtomInt;
   }
@@ -293,7 +309,7 @@ inline InsnClass turbo_class(const std::string& mnemonic, const std::vector<std:
   if (is_one_of({"IDP", "VABSDIFF", "VABSDIFF4", "VIADDMNMX", "VIMNMX3", "FMNMX3", "F2IP", "FSWZADD", "REDUX", "LDGSTS", "LDGDEPBAR", "LDSM", "MOVM", "FFMA2",
                  "FMUL2", "FADD2", "B2R", "NANOSLEEP"}))
     return C::Extra;
-  return C::Never;
+  return C::Unlisted;
 }
 
 // A call stays inside the kernel when it is relative, to a label, and the label is an address of the kernel's own code section [lo, hi]. A call through a
@@ -327,16 +343,6 @@ inline const char* extern_kind_name(ExternKind k) {
 }
 inline bool extern_admitted(ExternKind k, Mode mode, bool printf_off) { return k == ExternKind::Printf && mode == Mode::Turbo && !printf_off; }
 
-// The texture and surface instructions: they read the simulator's own tables (the handle in the instruction or a register is an index into
-// them), so a kernel that holds one cannot run on the card. Neither the exact set nor any turbo class names them; a kernel without one does
-// not read a texture object, whatever objects exist (until Round sp66 one live texture object kept every launch of the device off the card).
-inline bool texture_mnemonic(const std::string& m) {
-  static const char* const kTex[] = {"TEX", "TEXS", "TLD", "TLDS", "TLD4", "TLD4S", "TXD", "TXQ", "TMML", "SULD", "SUST", "SUATOM", "SURED", "SUQUERY"};
-  for (const char* t : kTex)
-    if (m == t) return true;
-  return false;
-}
-
 // An absolute call to the first instruction of a code section of the module (Round sp66): a device function the compiler kept out of line, in a
 // section of its own (a -rdc build). The driver links the call to its own copy of the same code, so the call is followed: the callee's section is
 // classed with the kernel's. `base`, `count`: the section the target lies in (its first address, its instructions; 0 is no code).
@@ -356,7 +362,7 @@ struct TurboSwitches {
   bool printf_off = false;  // VGPU_HOST_GPU_TURBO_OFF=printf: a kernel that calls vprintf stays in the simulator (Round sp66)
 };
 
-// VGPU_HOST_GPU_TURBO_OFF=mufu,tensor,half,call,atomics,red,extra,printf (a comma list). False, with the bad name in *bad, for anything else.
+// VGPU_HOST_GPU_TURBO_OFF=mufu,tensor,half,call,atomics,red,extra,unlisted,printf (a comma list). False, with the bad name in *bad, for anything else.
 // `printf` is not a class of instructions (a kernel's call to vprintf is, once admitted, of the call class): it sets *printf_off, and is a bad
 // name when printf_off is null.
 inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad = nullptr, bool* printf_off = nullptr) {
@@ -376,6 +382,7 @@ inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad =
     else if (name == "atomics") *off |= class_bit(InsnClass::AtomInt) | class_bit(InsnClass::AtomFloat) | class_bit(InsnClass::AtomSwap);
     else if (name == "red") *off |= class_bit(InsnClass::FloatRed);
     else if (name == "extra") *off |= class_bit(InsnClass::Extra);
+    else if (name == "unlisted") *off |= class_bit(InsnClass::Unlisted);
     else if (name == "printf" && printf_off) *printf_off = true;
     else {
       if (bad) *bad = name;
@@ -388,7 +395,7 @@ inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad =
 // Why turbo mode keeps a kernel in the simulator, by the classes of its code. The first that applies, in this order.
 enum class TurboRefusal : uint8_t {
   None,      // admitted
-  Never,     // an instruction outside every class
+  Never,     // an instruction the card cannot run for the simulator (class Never: textures, surfaces, BPT, a call the scan cannot follow)
   Off,       // a class switched off with VGPU_HOST_GPU_TURBO_OFF
   Atomics,   // a float atomic with a returned value, a CAS or an EXCH, with VGPU_HOST_GPU_ATOMICS=0
 };
