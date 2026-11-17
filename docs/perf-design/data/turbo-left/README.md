@@ -55,7 +55,7 @@ since each would then be sampled about 5 ms into its process at a cost of 3 to 1
 rule only moves a launch between two paths whose bits are equal in exact mode and defined in turbo); decisions would change only for kernels
 the census names. Not built because step 1 changes the flow scan that every sampled kernel depends on, and the census (4) comes first: if it
 names more than a handful of kernels the rule is a net loss of sample time. First step when someone builds it: write the census as a mode of
-`data/sp75/census.py` that prints each kernel's weighted count beside its plain count, with no change to any decision.
+`data/sp75/census.py` that prints each kernel's weighted count beside its plain count, with no change to any decision. Done 2026-11-17 (Round r9): [../sp76/census-weighted.md](../sp76/census-weighted.md) names five kernels in four programs, and finds `initRNG`'s weight to be 7.6 times (2 turns of the counter, not 32), an estimate of 72 ms against the floor's 30 and 71.7 ms.
 
 ## Files
 
