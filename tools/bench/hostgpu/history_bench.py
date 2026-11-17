@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--corpora", default="polybench,rodinia,hecbench")
     ap.add_argument("--card", default="")   # VGPU_HOST_GPU_HISTORY_CARD for a run that has no sysfs
     ap.add_argument("--native-ld", default="/usr/local/cuda-13.0/lib64")
+    ap.add_argument("--forms", default="native,sim,turbo,hist1,hist2,hist3")   # leave sim out for a program the simulator needs minutes for
     ap.add_argument("--json", required=True)
     a = ap.parse_args()
     progs = real.manifest(os.path.abspath(a.corp), a.corpora.split(","))
@@ -46,7 +47,7 @@ def main():
     base = {k: v for k, v in os.environ.items() if not k.startswith("VGPU_")}
     sim_env = dict(base, VGPU_GPU=a.gpu, LD_LIBRARY_PATH=os.path.join(os.path.abspath(a.build), "shim"), VGPU_THREADS=a.threads, VGPU_QUIET="1")
     nat_env = dict(base, LD_LIBRARY_PATH=a.native_ld)
-    forms = ["native", "sim", "turbo", "hist1", "hist2", "hist3"]
+    forms = a.forms.split(",")
     res = {}
     for prog in progs:
         name = prog[0] + "/" + prog[1]
@@ -90,8 +91,7 @@ def main():
         finally:
             shutil.rmtree(hdir, ignore_errors=True)
         res[name] = {"wall": walls, "rc": rcs, "median": {f: round(statistics.median(walls[f]), 4) for f in forms}, "output_same_as_sim": same, "log": lines}
-        print("%-28s native %.2f sim %.2f turbo %.2f hist1 %.2f hist2 %.2f hist3 %.2f  same=%s" % (
-            (name,) + tuple(res[name]["median"][f] for f in forms) + (all(same.values()),)), flush=True)
+        print("%-28s %s  same=%s" % (name, " ".join("%s %.3f" % (f, res[name]["median"][f]) for f in forms), all(same.values())), flush=True)
     json.dump({"runs": a.runs, "gpu": a.gpu, "programs": res}, open(a.json, "w"), indent=1)
 
 

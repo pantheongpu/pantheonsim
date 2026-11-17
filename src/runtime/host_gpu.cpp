@@ -625,7 +625,7 @@ struct Runtime::Impl : CardGate {
   history::Record hist_rec;
   history::Limits hist_lim;
   std::map<std::string, history::Kernel> hist_kernels;   // this process's, by kernel
-  uint64_t hist_kept = 0;   // launches kept in the simulator by the history (a hold, or a kernel known to fail)
+  uint64_t hist_kept = 0, hist_threads = 0;   // launches kept in the simulator by the history (a hold, or a kernel known to fail)
 
   // Reads the history once (idempotent); true when the process is to hold the driver back. Called with the gate held.
   bool hist_init() {
@@ -665,17 +665,20 @@ struct Runtime::Impl : CardGate {
     return !d.start_driver;
   }
   // Why this launch stays in the simulator on the history's word, or null. Called before the launch is decided; the budget counts the simulator's launches so far.
-  const char* hist_keeps(const std::string& kernel) {
+  const char* hist_keeps(const std::string& kernel, uint64_t threads) {
     hist_init();
     if (!hist_on) return nullptr;
-    ++hist_kernels[kernel].launches;
+    history::Kernel& hk = hist_kernels[kernel];
+    ++hk.launches;
+    hk.max_threads = std::max(hk.max_threads, threads);
+    hist_threads += threads;
     if (history::known_faulted(hist_have ? &hist_rec : nullptr, kernel)) return "this kernel failed on the card in an earlier run";
     if (hist_hold && !hist_released) {
       const double left = hist_lim.budget_s - stats.sim_seconds;
-      if (left > 0 && !history::kernel_outlasts(hist_have ? &hist_rec : nullptr, kernel, left)) return "the program is known to be shorter in the simulator than the driver's start";
+      if (left > 0 && !history::kernel_outlasts(hist_have ? &hist_rec : nullptr, kernel, left, threads)) return "the program is known to be shorter in the simulator than the driver's start";
       hist_released = true;
       if (logging()) std::fprintf(stderr, "host_gpu_history: %s: the simulator has spent %.3f s of %.3f s%s; the driver starts\n", kernel.c_str(), stats.sim_seconds, hist_lim.budget_s,
-                                  left > 0 ? " and this kernel is known to take longer than what is left" : "");
+                                  left > 0 ? " and this kernel is known to take longer than what is left, or this launch is much larger than the record's" : "");
     }
     return nullptr;
   }
@@ -706,6 +709,7 @@ struct Runtime::Impl : CardGate {
     o.released = hist_released;
     o.sim_s = stats.sim_seconds;
     o.card_s = stats.card_seconds;
+    o.threads = hist_threads;
     for (const auto& [name, k] : hist_kernels) {
       history::Kernel c = k;
       c.name = name;
@@ -2083,7 +2087,7 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   // Program history (section 17): a kernel that failed on the card in an earlier run, or a program known to be shorter in the simulator than the driver's start. Asked before the kernel's
   // verdict, which in turbo mode with FIT=1 starts the driver itself (the image the card runs is chosen on the card's architecture).
   if (!forced && !im.verify) {
-    if (const char* h = im.hist_keeps(fn.name)) {
+    if (const char* h = im.hist_keeps(fn.name, uint64_t{cfg.grid[0]} * cfg.grid[1] * cfg.grid[2] * cfg.block[0] * cfg.block[1] * cfg.block[2])) {
       ++im.hist_kept;
       ++im.stats.simulated;
       if (logging()) {

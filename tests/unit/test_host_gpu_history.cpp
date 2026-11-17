@@ -37,11 +37,14 @@ void spit(const std::string& path, const std::string& text) {
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   f << text;
 }
-Kernel kernel(const char* name, uint32_t launches, double card_s, double sim_s, bool ok, bool faulted) { return Kernel{name, launches, card_s, sim_s, ok, faulted}; }
-Observed card_run(double card_s, uint32_t launches, std::vector<Kernel> ks) {
+Kernel kernel(const char* name, uint32_t launches, double card_s, double sim_s, bool ok, bool faulted, uint64_t max_threads = 0) {
+  return Kernel{name, launches, max_threads, card_s, sim_s, ok, faulted};
+}
+Observed card_run(double card_s, uint32_t launches, std::vector<Kernel> ks, uint64_t threads = 1000) {
   Observed o;
   o.card_s = card_s;
   o.launches = launches;
+  o.threads = threads;
   o.kernels = std::move(ks);
   return o;
 }
@@ -114,6 +117,15 @@ VTEST(a_long_card_run_is_not_a_candidate) {
   Record r3;
   update(&r3, card_run(0.001, 100000, {}), kLim);   // too many launches to be a short program
   VCHECK(r3.verdict == Verdict::Unknown);
+  Record r4;
+  update(&r4, card_run(0.001, 1, {}, 262144), kLim);   // one launch of 262,144 threads (PolyBench GEMM: 1.7 ms on the card, 0.44 s in the simulator)
+  VCHECK(r4.verdict == Verdict::Unknown);
+  Record r5;
+  update(&r5, card_run(0.001, 1, {}, 131072), kLim);   // the bound itself is in
+  VCHECK(r5.verdict == Verdict::Candidate);
+  Record r6;
+  update(&r6, card_run(0.005, 1, {}, 100), kLim);   // and so is the card's time bound out
+  VCHECK(r6.verdict == Verdict::Unknown);
 }
 
 VTEST(a_kernel_that_failed_on_the_card_is_kept_out_of_it_for_good) {
@@ -147,6 +159,12 @@ VTEST(a_kernel_the_history_knows_to_be_long_ends_the_hold_before_its_launch) {
   VCHECK(kernel_outlasts(&r, "big", 0.2));    // 0.2 s a launch against 0.2 s left
   VCHECK(!kernel_outlasts(&r, "big", 0.3));
   VCHECK(!kernel_outlasts(&r, "other", 0.001));
+  // a launch much larger than the record's largest ends it too: another input
+  r.kernels.push_back(kernel("small", 5, 0.0001, 0.0001, true, false, 4096));
+  VCHECK(!kernel_outlasts(&r, "small", 0.2, 4096));
+  VCHECK(!kernel_outlasts(&r, "small", 0.2, 8192));   // twice is allowed
+  VCHECK(kernel_outlasts(&r, "small", 0.2, 8193));
+  VCHECK(!kernel_outlasts(&r, "small", 0.2));          // (no threads given: only the time is asked)
 }
 
 VTEST(the_record_is_bounded) {
@@ -161,7 +179,7 @@ VTEST(the_record_is_bounded) {
 
 VTEST(a_record_goes_through_the_file_and_back) {
   Record r;
-  update(&r, card_run(0.001, 3, {kernel("alpha", 2, 0.0005, 0, true, false), kernel("beta<int>(int*, float)", 1, 0, 0.002, false, true)}), kLim);
+  update(&r, card_run(0.001, 3, {kernel("alpha", 2, 0.0005, 0, true, false, 4096), kernel("beta<int>(int*, float)", 1, 0, 0.002, false, true)}), kLim);
   const std::string key = "00112233445566aa";
   Record back;
   VCHECK(parse(serialize(key, r), key, &back));
@@ -172,6 +190,8 @@ VTEST(a_record_goes_through_the_file_and_back) {
   VCHECK(back.kernels[1].faulted);
   VCHECK(back.kernels[0].card_ok);
   VCHECK_EQ(back.launches, uint32_t{3});
+  VCHECK_EQ(back.threads_total, r.threads_total);
+  VCHECK_EQ(back.kernels[0].max_threads, r.kernels[0].max_threads);
 }
 
 VTEST(a_hit_reads_what_a_miss_does_not) {
@@ -252,16 +272,16 @@ VTEST(a_checksummed_file_with_a_malformed_field_is_a_miss) {
     h.text(body);
     return body + "sum " + hex16(h.h) + "\n";
   };
-  const std::string head = "vgpu-host-gpu-history " + std::to_string(kVersion) + "\nkey " + key + "\nruns 1\nverdict 2\ntotals 0.01 0.02 3\n";
+  const std::string head = "vgpu-host-gpu-history " + std::to_string(kVersion) + "\nkey " + key + "\nruns 1\nverdict 2\ntotals 0.01 0.02 3 99\n";
   VCHECK(parse(sealed(head), key, &out));
-  VCHECK(!parse(sealed(head + "kernel 1 0 0 2 0 name\n"), key, &out));        // card_ok is 0 or 1
-  VCHECK(!parse(sealed(head + "kernel 1 -1 0 1 0 name\n"), key, &out));       // negative seconds
-  VCHECK(!parse(sealed(head + "kernel 1 nan 0 1 0 name\n"), key, &out));
-  VCHECK(!parse(sealed(head + "kernel 1 0 0 1 0\n"), key, &out));             // no name
+  VCHECK(!parse(sealed(head + "kernel 1 5 0 0 2 0 name\n"), key, &out));        // card_ok is 0 or 1
+  VCHECK(!parse(sealed(head + "kernel 1 5 -1 0 1 0 name\n"), key, &out));       // negative seconds
+  VCHECK(!parse(sealed(head + "kernel 1 5 nan 0 1 0 name\n"), key, &out));
+  VCHECK(!parse(sealed(head + "kernel 1 5 0 0 1 0\n"), key, &out));             // no name
   VCHECK(!parse(sealed(head + "mystery 1\n"), key, &out));                    // a line no version of the writer makes
-  VCHECK(!parse(sealed("vgpu-host-gpu-history 1\nkey " + key + "\nruns 1\nverdict 9\ntotals 0 0 0\n"), key, &out));
-  VCHECK(!parse(sealed("vgpu-host-gpu-history 1\nkey " + key + "\nruns x\nverdict 1\ntotals 0 0 0\n"), key, &out));
-  VCHECK(!parse(sealed("vgpu-host-gpu-history 1\nkey " + key + "\nverdict 1\ntotals 0 0 0\n"), key, &out));   // runs missing
+  VCHECK(!parse(sealed("vgpu-host-gpu-history 1\nkey " + key + "\nruns 1\nverdict 9\ntotals 0 0 0 0\n"), key, &out));
+  VCHECK(!parse(sealed("vgpu-host-gpu-history 1\nkey " + key + "\nruns x\nverdict 1\ntotals 0 0 0 0\n"), key, &out));
+  VCHECK(!parse(sealed("vgpu-host-gpu-history 1\nkey " + key + "\nverdict 1\ntotals 0 0 0 0\n"), key, &out));   // runs missing
 }
 
 VTEST(a_file_of_another_version_is_a_miss_and_is_overwritten) {
