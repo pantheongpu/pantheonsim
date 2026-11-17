@@ -25,6 +25,18 @@ __global__ void shared_user(int* p) {
   p[threadIdx.x] = dyn[(threadIdx.x + 1) % blockDim.x];
 }
 
+// 40 KiB of static shared memory beside the dynamic kind: a launch whose TOTAL is what a profile's per-block limit is judged on (the runtime API checks the dynamic part alone).
+__global__ void shared_both(int* p) {
+  __shared__ int tile[10240];
+  tile[threadIdx.x] = static_cast<int>(threadIdx.x) * 3;
+  dyn[threadIdx.x] = tile[threadIdx.x] + 1;
+  __syncthreads();
+  p[threadIdx.x] = dyn[(threadIdx.x + 1) % blockDim.x];
+}
+
+// A kernel compiled for at most 128 threads a block, launched with 256: the simulator refuses it (launch bounds are checked by its launch validation, not by the runtime API).
+__global__ void __launch_bounds__(128) bounded(int* p) { p[threadIdx.x] = static_cast<int>(threadIdx.x) + 1; }
+
 // One instruction nothing in include/vgpu/host_gpu.hpp names: elect.sync is ELECT on sm_90 (the stand-in is told its card is an sm_90 one).
 #ifndef FIT_NO_ELECT
 __global__ void elect(int* p) {
@@ -79,6 +91,15 @@ int main(int argc, char** argv) {
     const cudaError_t sa = cudaFuncSetAttribute(shared_user, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
     shared_user<<<1, 256, bytes>>>(d);
     std::printf("set_attribute=%d launch=%d\n", static_cast<int>(sa), static_cast<int>(cudaGetLastError()));
+  } else if (!std::strcmp(mode, "bounds")) {
+    const int t = std::getenv("FIT_THREADS") ? std::atoi(std::getenv("FIT_THREADS")) : 256;
+    bounded<<<1, t>>>(d);
+    std::printf("launch=%d\n", static_cast<int>(cudaGetLastError()));
+  } else if (!std::strcmp(mode, "shared2")) {
+    const char* kb = std::getenv("FIT_SHARED_KB");
+    const int bytes = (kb ? std::atoi(kb) : 30) * 1024;
+    shared_both<<<1, 256, bytes>>>(d);
+    std::printf("launch=%d\n", static_cast<int>(cudaGetLastError()));
   } else if (!std::strcmp(mode, "grid")) {
     tiny<<<4096, 4>>>(d, n);
   } else if (!std::strcmp(mode, "qmma")) {
