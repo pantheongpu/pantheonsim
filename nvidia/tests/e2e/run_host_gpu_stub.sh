@@ -865,7 +865,8 @@ if [[ "$cc" == 86 ]]; then
   rm -rf "$work/hist"
   for n in 1 2 3; do
     PROG=fit run hi_$n tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist" || { echo "FAIL: history run $n failed"; tail -3 "$work/hi_$n.err"; fails=1; }
-    diff -q "$work/off_f_tiny.out" "$work/hi_$n.out" > /dev/null || { echo "FAIL: history run $n changes the output of fit tiny"; fails=1; }
+    # (run 1 is on the stand-in card, which computes nothing: its output is the card's. The runs in the simulator print the mode-off output.)
+    (( n == 1 )) || diff -q "$work/off_f_tiny.out" "$work/hi_$n.out" > /dev/null || { echo "FAIL: history run $n changes the output of fit tiny"; fails=1; }
   done
   grep -q '^cuInit$' "$work/hi_1.log" && grep -q '^cuLaunchKernel$' "$work/hi_1.log" && [[ "$(hline hi_1)" == before=none\ after=candidate* ]] || { echo "FAIL: the first run was not a card run that left a candidate: $(calls hi_1); $(hline hi_1)"; fails=1; }
   [[ ! -s "$work/hi_2.log" && "$(hline hi_2)" == before=candidate\ after=tiny\ held=1\ released=0* ]] || { echo "FAIL: the trial run touched the driver or did not leave tiny: $(calls hi_2); $(hline hi_2)"; fails=1; }
@@ -875,7 +876,7 @@ if [[ "$cc" == 86 ]]; then
   rm -rf "$work/hist2"
   for n in 1 2 3; do
     PROG=fit run hr_$n tiny "${hh[@]}" VGPU_HOST_GPU_START_COST=0.00001 VGPU_HOST_GPU_HISTORY="$work/hist2" || { echo "FAIL: release run $n failed"; fails=1; }
-    diff -q "$work/off_f_tiny.out" "$work/hr_$n.out" > /dev/null || { echo "FAIL: release run $n changes the output"; fails=1; }
+    (( n == 2 )) || diff -q "$work/hi_1.out" "$work/hr_$n.out" > /dev/null || { echo "FAIL: release run $n changes the output (the card's, as in run 1 of step 59)"; fails=1; }
   done
   grep -q '^cuInit$' "$work/hr_2.log" && grep -q '^cuLaunchKernel$' "$work/hr_2.log" && [[ "$(hline hr_2)" == before=candidate\ after=long\ held=1\ released=1* ]] || { echo "FAIL: the hold was not given up at its budget: $(calls hr_2); $(hline hr_2)"; fails=1; }
   grep -q '^cuInit$' "$work/hr_3.log" && [[ "$(hline hr_3)" == before=long* ]] || { echo "FAIL: a long program did not start the driver again: $(calls hr_3); $(hline hr_3)"; fails=1; }
@@ -896,15 +897,15 @@ if [[ "$cc" == 86 ]]; then
     case $bad in
       junk) head -c 3000 /dev/urandom > "$work/hist/$key.hist" ;;
       trunc) head -c 40 "$work/hist/$key.hist" > "$work/hist/$key.t" && mv "$work/hist/$key.t" "$work/hist/$key.hist" ;;
-      other) cp "$work/hist3/"*.hist "$work/hist/$key.hist" ;;
+      other) cp "$work/hist2/"*.hist "$work/hist/$key.hist" ;;
     esac
     PROG=fit run hc_$bad tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist" || { echo "FAIL: the run with a $bad history failed"; fails=1; }
     grep -q '^cuInit$' "$work/hc_$bad.log" && [[ "$(hline hc_$bad)" == before=none* ]] || { echo "FAIL: a $bad history was not read as no history: $(calls hc_$bad); $(hline hc_$bad)"; fails=1; }
-    diff -q "$work/off_f_tiny.out" "$work/hc_$bad.out" > /dev/null || { echo "FAIL: a $bad history changes the output"; fails=1; }
+    diff -q "$work/hi_1.out" "$work/hc_$bad.out" > /dev/null || { echo "FAIL: a $bad history changes the output"; fails=1; }
   done
   rm -rf "$work/hist/$key.hist"; mkdir "$work/hist/$key.hist"
   PROG=fit run hc_dir tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist" || { echo "FAIL: the run with a directory in place of the history failed"; fails=1; }
-  diff -q "$work/off_f_tiny.out" "$work/hc_dir.out" > /dev/null && grep -q '^cuInit$' "$work/hc_dir.log" || { echo "FAIL: a directory in place of the history was not no history"; fails=1; }
+  diff -q "$work/hi_1.out" "$work/hc_dir.out" > /dev/null && grep -q '^cuInit$' "$work/hc_dir.log" || { echo "FAIL: a directory in place of the history was not no history"; fails=1; }
   # ... and a history never reaches exact mode or FIT=0
   rm -rf "$work/hist4"
   for sw in "VGPU_HOST_GPU=exact" "VGPU_HOST_GPU_FIT=0"; do
