@@ -1,0 +1,4 @@
+== unit p1_no_prestart
+133/133 tests passed
+FAIL: turbo with FIT=1 did not start the driver while the program set up: 
+STUB_DONE

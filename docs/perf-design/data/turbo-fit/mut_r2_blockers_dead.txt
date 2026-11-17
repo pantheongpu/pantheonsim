@@ -1,0 +1,4 @@
+== unit r2_blockers_dead
+[ FAIL ] retargeted_ptx_is_refused_for_the_forms_the_older_card_lacks
+/home/saqib/.cache/pantheonsim-turbo-next/tests/unit/test_host_gpu_logic.cpp:3244: VCHECK(!r.refuse.empty() && r.never) failed
+132/133 tests passed

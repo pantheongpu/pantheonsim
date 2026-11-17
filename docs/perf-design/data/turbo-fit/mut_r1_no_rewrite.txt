@@ -1,0 +1,5 @@
+== unit r1_no_rewrite
+133/133 tests passed
+FAIL: plain sm_90 PTX was not given to an sm_86 card with its target rewritten: image ptx ptx_target sm_90 
+FAIL: not retargeted to an sm_80 card: image ptx ptx_target sm_90 
+STUB_DONE
