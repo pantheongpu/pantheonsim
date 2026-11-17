@@ -1,0 +1,12 @@
+COS.BF16 all 6049fa6406b1549d
+SIN.BF16 all 06d41295f0c58821
+EX2.BF16 all 70809a4dea78138a
+LG2.BF16 all 0a3892af2650f0ba
+RCP.BF16 all c08e87cddd0add75
+RSQ.BF16 all 4af594bb4efa2218
+SQRT.BF16 all bfc819af4e1744a9
+TANH.BF16 all 0483e97475bf5a09
+ex2.approx.bf16 70809a4dea78138a
+tanh.approx.bf16 0483e97475bf5a09
+ex2.approx.bf16x2 ee8f2a6f854f138a
+tanh.approx.bf16x2 b4478ab43e3b5a09

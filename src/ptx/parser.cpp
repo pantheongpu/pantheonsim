@@ -252,24 +252,22 @@ class Parser {
           m.module_shared.push_back(std::move(d));
           continue;
         }
-        // ".extern .global|.const <type> name[N];" -- a variable with no definition in this module. The real driver, loading the
-        // module as a whole program, ignores the qualifier ("Unresolved extern variable ..., ignoring extern qualifier") and
-        // gives it zeroed storage that cuModuleGetGlobal returns and the host can write: PoCL's CUDA backend declares its work
-        // offset (_global_offset_x) exactly so. An unsized array has no size to give, so it stays a declaration only.
+        // ".extern .global" / ".extern .const" with a size: nothing in a whole-program module defines it, so it becomes a zero-initialised
+        // definition (the driver does the same, with a ptxas warning). An unsized one ("x[]") has no size to give and stays skipped.
         if (peek(1).kind == Token::Kind::Word && (peek(1).text == ".global" || peek(1).text == ".const")) {
-          bool sized = true;
+          bool unsized = false;
           for (size_t k = 2; peek(k).kind != Token::Kind::End && !(peek(k).kind == Token::Kind::Punct && peek(k).text == ";"); ++k)
-            if (peek(k).kind == Token::Kind::Punct && peek(k).text == "[" && peek(k + 1).kind == Token::Kind::Punct &&
-                peek(k + 1).text == "]")
-              sized = false;
-          if (sized) {
+            if (peek(k).kind == Token::Kind::Punct && peek(k).text == "[" && peek(k + 1).kind == Token::Kind::Punct && peek(k + 1).text == "]")
+              unsized = true;
+          if (!unsized) {
             const bool is_const = peek(1).text == ".const";
             const size_t line = t.line;
             next();  // .extern
             next();  // .global or .const
-            m.globals.push_back(parse_global(line));
-            m.globals.back().is_const = is_const;
-            m.globals.back().is_extern = true;
+            GlobalVar g = parse_global(line);
+            g.is_const = is_const;
+            g.extern_decl = true;
+            m.globals.push_back(std::move(g));
             continue;
           }
         }
@@ -324,19 +322,13 @@ class Parser {
                        ".address_size .visible .weak .common .extern .global .const .entry .file .loc "
                        ".section)");
     }
-    // An .extern declaration is only a stand-in for a variable nothing defines: drop it where the module defines the name (or
-    // declares it .extern twice), so each name is allocated once.
-    {
-      std::set<std::string> defined;
-      for (const GlobalVar& g : m.globals)
-        if (!g.is_extern) defined.insert(g.name);
-      std::vector<GlobalVar> kept;
-      kept.reserve(m.globals.size());
-      for (GlobalVar& g : m.globals) {
-        if (g.is_extern && !defined.insert(g.name).second) continue;
-        kept.push_back(std::move(g));
-      }
-      m.globals = std::move(kept);
+    // An ".extern" declaration of a name the module defines (before or after it) is only the declaration: drop it, and the duplicates of it.
+    std::set<std::string> defined;
+    for (const GlobalVar& g : m.globals)
+      if (!g.extern_decl) defined.insert(g.name);
+    for (auto it = m.globals.begin(); it != m.globals.end();) {
+      if (it->extern_decl && !defined.insert(it->name).second) it = m.globals.erase(it);
+      else ++it;
     }
     return m;
   }

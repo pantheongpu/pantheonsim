@@ -1955,13 +1955,25 @@ target_compile_definitions(test_amd_gcn_same_bits PRIVATE VGPU_SOURCE_DIR="${CMA
 # registers aimed at memory against the recorded digests of the base build.
 vgpu_unit_test(test_amd_gcn_mem_facts amd/tests/unit/test_gcn_mem_facts.cpp)
 target_compile_definitions(test_amd_gcn_mem_facts PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# One process took 1866 s under ASan (the ASan job's second longest test), so it is registered as eight shards of the corpora's lines
+# (VGPU_MEM_SAME_BITS_SHARD=k/n, the test's own comment; docs/ci.md, "Shards and the compile cache").
+set(VGPU_SHARD8_SPECS 0/8 1/8 2/8 3/8 4/8 5/8 6/8 7/8)
+set(VGPU_UNIT_TEST_NO_ADD_TEST ON)
 vgpu_unit_test(test_amd_gcn_memory_same_bits amd/tests/unit/test_gcn_memory_same_bits.cpp)
+set(VGPU_UNIT_TEST_NO_ADD_TEST OFF)
 target_compile_definitions(test_amd_gcn_memory_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+vgpu_shard_tests(test_amd_gcn_memory_same_bits ENV_VAR VGPU_MEM_SAME_BITS_SHARD LIST_ENV VGPU_MEM_SAME_BITS_LIST SPECS ${VGPU_SHARD8_SPECS}
+                 COMMAND test_amd_gcn_memory_same_bits)
 # Gathers, and runs followed by a gather, against the lane-by-lane definition (tier and whole-wave memory calls on and off).
 # How many lanes of a wave make a run of consecutive addresses, four to a vector, against the lane-by-lane loop.
 vgpu_unit_test(test_amd_run_scan)
+# One process took 2461 s under ASan, the longest test of the ASan job: eight shards of the flat shapes (VGPU_GATHER_SHARD=k/n).
+set(VGPU_UNIT_TEST_NO_ADD_TEST ON)
 vgpu_unit_test(test_amd_gcn_gather_same_bits amd/tests/unit/test_gcn_gather_same_bits.cpp)
+set(VGPU_UNIT_TEST_NO_ADD_TEST OFF)
 target_compile_definitions(test_amd_gcn_gather_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+vgpu_shard_tests(test_amd_gcn_gather_same_bits ENV_VAR VGPU_GATHER_SHARD LIST_ENV VGPU_GATHER_LIST SPECS ${VGPU_SHARD8_SPECS}
+                 COMMAND test_amd_gcn_gather_same_bits)
 # The pre-decoded tier against the interpreter over the same corpora (amd/tests/unit/test_gcn_tier_same_bits.cpp).
 # One process took 680 s in the plain build and about 3400 s under ASan, a third of the unit job's CPU between this and its twin below, so it
 # is registered as eight shards of the shapes (VGPU_TIER_SHARD=k/n, the test's own comment); shard k of 8 takes every eighth shape.
@@ -2065,8 +2077,13 @@ vgpu_unit_test(test_amd_mfma_math amd/tests/unit/test_mfma_math.cpp)
 # The matrix path's tile, placed in the page and resized like a vector (amd/src/tile_buf.hpp).
 vgpu_unit_test(test_amd_tile_buf amd/tests/unit/test_tile_buf.cpp)
 # The matrix instructions on the tile path against the reference path, bit for bit, over the ISA corpora.
+# One process took 1553 s under ASan: eight shards of the matrix instructions (VGPU_MATRIX_FAST_SHARD=k/n). Its simd_base twin below is the whole test.
+set(VGPU_UNIT_TEST_NO_ADD_TEST ON)
 vgpu_unit_test(test_amd_matrix_fast amd/tests/unit/test_matrix_fast.cpp)
+set(VGPU_UNIT_TEST_NO_ADD_TEST OFF)
 target_compile_definitions(test_amd_matrix_fast PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+vgpu_shard_tests(test_amd_matrix_fast ENV_VAR VGPU_MATRIX_FAST_SHARD LIST_ENV VGPU_MATRIX_FAST_LIST SPECS ${VGPU_SHARD8_SPECS}
+                 COMMAND test_amd_matrix_fast)
 
 # The packed 16-bit float arithmetic (packed_math.hpp) against the per-lane code it replaced, and the half conversions against the compiler's.
 vgpu_unit_test(test_amd_packed_math amd/tests/unit/test_packed_math.cpp)
@@ -2848,6 +2865,8 @@ add_test(NAME lint_readme_commands COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_
 set_tests_properties(lint_readme_commands PROPERTIES TIMEOUT 120)
 # ./run against a fake simulator, unshare and package tools.
 add_test(NAME lint_run_launcher COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_run.sh)
+# ci/slowest_tests.sh, the report and the budget on how long one test may take (docs/ci.md).
+add_test(NAME lint_slowest_tests COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_slowest_tests.sh)
 add_test(NAME lint_fetch_frontend COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_fetch_frontend.sh)
 add_test(NAME lint_package_build COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_package_build.sh)
 set_tests_properties(lint_fetch_frontend PROPERTIES TIMEOUT 300)
@@ -3425,7 +3444,7 @@ if(TARGET vgpucublas)
   # and cusolverMg (solver_mg_paths.cu), which spreads a matrix over both, as
   # cuBLASXt (blas_xt_paths.cu) spreads its GEMM tiles, and cuFFT's multi-GPU
   # descriptors (fft_multigpu.cu).
-  foreach(_check IN ITEMS "driver_gaps:cuda" "driver_context_gaps:cuda" "driver_texture_gaps:cuda" "runtime_gaps:cudart" "runtime_capture_modes:cudart"
+  foreach(_check IN ITEMS "driver_gaps:cuda" "driver_extern_global:cuda" "driver_context_gaps:cuda" "driver_texture_gaps:cuda" "runtime_gaps:cudart" "runtime_capture_modes:cudart"
                           "runtime_memory_gaps:cudart" "malloc_alignment:cudart" "runtime_graph_gaps:cudart" "runtime_texture_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver" "blas_xt_paths:cublas" "fft_multigpu:cufft" "dnn_multigpu_norm:cudnn")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
@@ -4290,13 +4309,15 @@ set_tests_properties(e2e_sass_fastpath PROPERTIES
 # The pre-decoded execution tier (src/sass/tier.hpp) against the interpreter: a program of random arithmetic-breaking
 # inputs through every form the tier handles, and the other SASS test programs, run with VGPU_TIER=0 and 1; the answers
 # and every counter must be the same.
-add_test(NAME e2e_sass_tier
-         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_tier.sh)
-set_tests_properties(e2e_sass_tier PROPERTIES
-  DEPENDS vgpucudart
+# Eight shards (VGPU_SASS_TIER_SHARD=k/n, run_sass_tier.sh): the program-and-architecture runs of the script, every eighth one each, built and run by the
+# shard that has it. One process took 1830 s under ASan and 1580 s under TSan. e2e_sass_tier_shards_partition proves the shards are the whole run.
+vgpu_shard_tests(e2e_sass_tier ENV_VAR VGPU_SASS_TIER_SHARD LIST_ENV VGPU_SASS_TIER_LIST SPECS ${VGPU_SHARD8_SPECS}
+  COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_tier.sh
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-  SKIP_REGULAR_EXPRESSION "^SKIP:"
-  TIMEOUT 3600)
+  PROPERTIES DEPENDS vgpucudart SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
+# (The sanitizer jobs narrow the shards' runs with VGPU_TIER_ARCHS and VGPU_TIER_PROGRAMS, which leaves three runs for eight shards: the partition is checked on
+# the script's whole list.)
+set_property(TEST e2e_sass_tier_shards_partition APPEND PROPERTY ENVIRONMENT "VGPU_TIER_ARCHS=" "VGPU_TIER_PROGRAMS=")
 
 # Host-GPU mode (include/vgpu/host_gpu.hpp, docs/perf-design/09-host-gpu-spike.md): VGPU_HOST_GPU=exact runs eligible launches on the machine's
 # real GPU. Skips (as on every hosted runner) when the machine has no card of a model the simulator knows.
@@ -5314,8 +5335,18 @@ endforeach()
 # The longest tests start first. ctest runs tests in cost order (by number when it has no history, which a fresh CI checkout has not),
 # so the ASan job (-j2 on a hosted runner) started its 1590 s, 1180 s, 930 s and 900 s tests wherever they fell in the number order and
 # could end with one of them running alone. Costs are the seconds of the ASan job in run 42978065497; only the order changes, not what runs.
-foreach(_pair test_amd_gcn_gather_same_bits:1600 test_amd_gcn_memory_same_bits:1200 test_amd_matrix_fast:950 e2e_sass_tier:900
-              test_amd_gcn_same_bits:500 e2e_sass_archs:210 test_host_gemm:180 e2e_lowprec_lt:160 test_fastpath:140 test_ptx_mem_runs:140)
+# (The gather, memory, matrix_fast and sass_tier tests are shards now: each shard's cost is its eighth of the whole's.)
+foreach(_t test_amd_gcn_gather_same_bits:200 test_amd_gcn_memory_same_bits:150 test_amd_matrix_fast:120 e2e_sass_tier:115)
+  string(REPLACE ":" ";" _parts "${_t}")
+  list(GET _parts 0 _base)
+  list(GET _parts 1 _cost)
+  foreach(_k RANGE 0 7)
+    if(TEST ${_base}_shard_${_k}of8)
+      set_property(TEST ${_base}_shard_${_k}of8 PROPERTY COST ${_cost})
+    endif()
+  endforeach()
+endforeach()
+foreach(_pair test_amd_gcn_same_bits:500 e2e_sass_archs:210 test_host_gemm:180 e2e_lowprec_lt:160 test_fastpath:140 test_ptx_mem_runs:140)
   string(REPLACE ":" ";" _pair_parts "${_pair}")
   list(GET _pair_parts 0 _t)
   list(GET _pair_parts 1 _cost)

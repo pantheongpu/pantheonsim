@@ -227,7 +227,7 @@ enum class InsnClass : uint8_t {
   Call,        // CALL and RET (the runtime also checks that every call stays inside the kernel's own code section)
   Extra,       // plain compute and memory instructions the exact set never measured: they read and write registers, shared memory and the same global
                // addresses as LDG and STG, so the card needs nothing that only the simulator holds
-  Tensor,      // HMMA, IMMA, DMMA
+  Tensor,      // HMMA, IMMA, DMMA, BMMA (BMMA is integer popcount arithmetic: A10G measured, 12-host-gpu-turbo.md section 2)
   AtomInt,     // integer atomics that return the old value (ADD, MIN, MAX, AND, OR, XOR, INC, DEC): memory ends the same, the returned values depend on the order
   AtomFloat,   // float atomics that return a value: admitted unless VGPU_HOST_GPU_ATOMICS=0 (an opt-in until Round sp66)
   AtomSwap,    // CAS, CAST.SPIN, EXCH: as AtomFloat; the card does not agree with itself from run to run on programs built on these (09 doc, M2)
@@ -287,7 +287,7 @@ inline InsnClass turbo_class(const std::string& mnemonic, const std::vector<std:
   if (is_one_of({"HADD2", "HMUL2", "HFMA2", "HSETP2", "HSET2", "HMNMX2"})) return C::Half;
   // (LEPC: the return address of an absolute call, CUDA 13's vprintf call; the card's own program counter, used by the call and its RET alone. Round sp66.)
   if (is_one_of({"CALL", "RET", "LEPC"})) return C::Call;
-  if (is_one_of({"HMMA", "IMMA", "DMMA"})) return C::Tensor;
+  if (is_one_of({"HMMA", "IMMA", "DMMA", "BMMA"})) return C::Tensor;
   // (Round sp66: B2R reads the result of a block's BAR.RED, the same function on both sides; NANOSLEEP is a hint that a spin-wait backs off, as cub's
   // decoupled look-back does: neither touches anything the card lacks)
   if (is_one_of({"IDP", "VABSDIFF", "VABSDIFF4", "VIADDMNMX", "VIMNMX3", "FMNMX3", "F2IP", "FSWZADD", "REDUX", "LDGSTS", "LDGDEPBAR", "LDSM", "MOVM", "FFMA2",

@@ -1,0 +1,11 @@
+== bmma-exact
+== bmma-turbo-verify
+host_gpu_refused: kernel=_Z7k_tiledILi0EEvPiPKjS2_iiii class=never insn=BMMA.88128.XOR.POPC R2, R17.ROW, R18.COL, R2
+host_gpu_refused: kernel=_Z8k_stagedILi0EEvPiPKiPKjS4_iiii class=never insn=@!P0 BMMA.88128.XOR.POPC R2, R18.reuse.ROW, R19.COL, R2
+host_gpu_refused: kernel=_Z7k_splitILi0EEvPiPKjS2_iiiii class=never insn=BMMA.88128.XOR.POPC R20, R6.ROW, R11.COL, R20
+host_gpu_refused: kernel=_Z7k_tiledILi1EEvPiPKjS2_iiii class=never insn=BMMA.88128.AND.POPC R2, R17.ROW, R18.COL, R2
+host_gpu_refused: kernel=_Z8k_stagedILi1EEvPiPKiPKjS4_iiii class=never insn=@!P0 BMMA.88128.AND.POPC R8, R20.reuse.ROW, R35.COL, R8
+host_gpu_refused: kernel=_Z7k_splitILi1EEvPiPKjS2_iiiii class=never insn=BMMA.88128.AND.POPC R20, R12.ROW, R11.COL, R20
+host_gpu_verify: in_set_identical=0 in_set_different=0 other_identical=36 other_different=0
+host_gpu_turbo: mode=turbo launches_card=36 launches_sim=36 card_s=0.005024 sim_s=0.050853 words_compared=775680 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+turbo output: the same as the simulator's

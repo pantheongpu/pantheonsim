@@ -614,9 +614,29 @@ result toward zero (the one-ulp-low half results). Its NaN and infinity cases al
 the F16 bit was ignored, and the register of a half pattern was read as a float (a tiny subnormal) and the function of that
 written as a float.
 
-**Not covered**: the `BF16` forms (`MUFU.EX2.BF16`, `MUFU.TANH.BF16`; `ex2.approx.ftz.bf16` and `.bf16x2`, `tanh.approx.bf16`
-and `.bf16x2`) need an sm_90 card or later, and the local card is sm_86; the PTX interpreter keeps the host-precision result for
-them, as before, and the SASS executor's decoding of the `.BF16` instruction (an sm_90 encoding that was not looked at) is as it was.
+**The encoding changes from sm_90** (nvcc 13.0 output, `cuobjdump -sass`, the high instruction word of `MUFU`, opcode 0x108; the
+same kernels on every architecture). sm_75 to sm_89: `.F16` is instruction bit 73 (`EX2.F16` 0x...280000000a00). sm_90, sm_100 and
+sm_120: `.F16` moved to bit 72 (`EX2.F16` 0x...0900) and bit 73 is `.BF16` (`EX2.BF16` 0x...0a00, `TANH.BF16` 0x...2600); the op field
+(bits 74-77) and the `.H1` part (bits 60-61) are unchanged. The decoder reads the bits by the architecture of the cubin. Before
+2026-11-16 it read bit 73 as `.F16` everywhere, so on sm_90 and later a real `.F16` (bit 72) ran as a plain 32-bit `MUFU` on a half
+register and a real `.BF16` (bit 73) ran as `.F16`, both wrong. Evidence: the encoding is nvcc output (sm_90, sm_100, sm_120 all
+print the same words); only the H100 ran.
+
+**The BF16 forms** (measured on an H100 PCIe, 2026-11-16, driver 570.148.08; `mufu_probe --bf16`, which sets the bit-73 form on the
+sm_90 cubin, over all 2^32 register values of each of the eight sub-operations, low half and `.H1`, 0 differences):
+
+> `MUFU.<op>.BF16` is the single-precision unit run on the bfloat16 widened by a shift (`bits << 16`), the upper 16 bits of the
+> float result (so the float cut toward zero to a bfloat16). No special case: NaN, infinity and subnormal inputs agree with it
+> too. The result is in the low 16 bits, the upper 16 are zero.
+
+That is `mufu::eval_bf16` (`include/vgpu/exec/mufu_model.hpp`). The PTX forms `ex2.approx.ftz.bf16`, `.bf16x2`, `tanh.approx.bf16`
+and `.bf16x2` compile on sm_90 to `MUFU.EX2.BF16` / `MUFU.TANH.BF16` and give the SASS hashes (`tools/numerics/mufu_bf16_forms.cu`).
+The F16 forms ptxas emits for `ex2.approx.f16`, `.f16x2`, `tanh.approx.f16` and `.f16x2` on sm_90 (bit 72) give the same four hashes
+as the RTX 3060. The 12 hashes are `tools/numerics/mufu/h100.bf16.hashes.txt` (FNV-1a 64 over the 65,536 results of a step, the
+probe's `--hash16`) and `h100.f16-ptx.hashes.txt`; the SASS executor and the PTX interpreter now give them, and `test_mufu_model`
+checks it. **Blackwell: inferred** (the encoding is the same words as sm_90; the execution was not run on a Blackwell card).
+`VGPU_MUFU_EXACT=0` gives the earlier results (the PTX bf16 forms at host precision, rounded to nearest; counters do not change).
+
 **Architectures**: the half-precision forms were measured on the RTX 3060 (sm_86) only. Turing (sm_75: the forms compile there),
 Ada, Hopper and Blackwell cards were not asked; they get the model as **inferred** from the 32-bit unit, which the cards of
 those architectures were shown to share ([below](#which-devices-get-the-model-and-on-what-evidence)), and the F16 cut is
@@ -661,8 +681,8 @@ larger than the figure by an amount not measured. No other program was timed.
 - `mathfn` under a toolkit other than CUDA 13.0: an H100's CUDA 12.8 build differs on 27 lines, and no simulator run of that
   build was compared with it.
 - The half-precision forms: the F16 forms are the card's on the RTX 3060 (the previous section), measured on that card alone;
-  the bf16 forms (sm_90 and later) were not asked (no local card has them) and are the function at host precision, as they were.
-  Turing, Ada, Hopper and Blackwell were not measured for these forms.
+  Turing, Ada and Blackwell were not measured for these forms. The bf16 forms (sm_90 and later) are measured on an H100 PCIe
+  (the previous sections); Blackwell has the same encoding and is inferred.
 - The AMD math instructions (`v_rcp_f32`, `v_rsq_f32`, `v_exp_f32`, `v_log_f32`, `v_sin_f32`, `v_cos_f32`) are unchanged,
   and no AMD card has run any of this.
 - The NaN an `erf(double)` of a NaN returns, and `hypot(double)` of a signaling NaN and a zero, still differ between the
@@ -695,6 +715,9 @@ larger than the figure by an amount not measured. No other program was timed.
   halves of `ex2.approx.f16`, `tanh.approx.f16` and on the 65,536 registers of the `.f16x2` forms; `VGPU_MUFU_EXACT=0`, which
   gives the earlier results (19,417 and 14,736 patterns off the card for the two PTX forms). Mutants: [mathfn/mutants.txt](mathfn/mutants.txt)
   (six edits to the half-precision code, each failing at least one case).
+- `test_mufu_model`, the bf16 forms and the sm_90 encoding: `eval_bf16` against the H100's 12 hashes (65,536 inputs each), the
+  decoder on sm_86, sm_90 and sm_120 words (bit 72 is `.F16` and bit 73 is `.BF16` from sm_90; bit 73 is `.F16` before), the SASS
+  executor on an sm_90 cubin with the BF16 form and the F16 form (bit 72), and the PTX interpreter on the four PTX bf16 forms.
 - `test_ptx_approx_forms`: each expansion, on inputs where it differs from the function at host precision; the
   single-precision values are the card's now.
 - `test_amd_hipcc_scratch_flat`: the wave32 stack slot.

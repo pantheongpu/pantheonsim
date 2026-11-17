@@ -1,0 +1,61 @@
+host_gpu_refused: kernel=_Z7k_tiledILi0EEvPiPKjS2_iiii class=never insn=BMMA.88128.XOR.POPC R2, R17.ROW, R18.COL, R2
+host_gpu: _Z7k_tiledILi0EEvPiPKjS2_iiii: classes: exact mufu never; an instruction of no turbo class
+host_gpu: _Z7k_tiledILi0EEvPiPKjS2_iiii stays in the simulator: an instruction of no turbo class
+host_gpu_refused: kernel=_Z8k_stagedILi0EEvPiPKiPKjS4_iiii class=never insn=@!P0 BMMA.88128.XOR.POPC R2, R18.reuse.ROW, R19.COL, R2
+host_gpu: _Z8k_stagedILi0EEvPiPKiPKjS4_iiii: classes: exact call extra never; an instruction of no turbo class
+host_gpu: _Z8k_stagedILi0EEvPiPKiPKjS4_iiii stays in the simulator: an instruction of no turbo class
+host_gpu_refused: kernel=_Z7k_splitILi0EEvPiPKjS2_iiiii class=never insn=BMMA.88128.XOR.POPC R20, R6.ROW, R11.COL, R20
+host_gpu: _Z7k_splitILi0EEvPiPKjS2_iiiii: classes: exact mufu never; an instruction of no turbo class
+host_gpu: _Z7k_splitILi0EEvPiPKjS2_iiiii stays in the simulator: an instruction of no turbo class
+host_gpu_refused: kernel=_Z7k_tiledILi1EEvPiPKjS2_iiii class=never insn=BMMA.88128.AND.POPC R2, R17.ROW, R18.COL, R2
+host_gpu: _Z7k_tiledILi1EEvPiPKjS2_iiii: classes: exact mufu never; an instruction of no turbo class
+host_gpu: _Z7k_tiledILi1EEvPiPKjS2_iiii stays in the simulator: an instruction of no turbo class
+host_gpu_refused: kernel=_Z8k_stagedILi1EEvPiPKiPKjS4_iiii class=never insn=@!P0 BMMA.88128.AND.POPC R8, R20.reuse.ROW, R35.COL, R8
+host_gpu: _Z8k_stagedILi1EEvPiPKiPKjS4_iiii: classes: exact call extra never; an instruction of no turbo class
+host_gpu: _Z8k_stagedILi1EEvPiPKiPKjS4_iiii stays in the simulator: an instruction of no turbo class
+host_gpu_refused: kernel=_Z7k_splitILi1EEvPiPKjS2_iiiii class=never insn=BMMA.88128.AND.POPC R20, R12.ROW, R11.COL, R20
+host_gpu: _Z7k_splitILi1EEvPiPKjS2_iiiii: classes: exact mufu never; an instruction of no turbo class
+host_gpu: _Z7k_splitILi1EEvPiPKjS2_iiiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_tiledILi0EEvPiPKjS2_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z8k_stagedILi0EEvPiPKiPKjS4_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_splitILi0EEvPiPKjS2_iiiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_tiledILi1EEvPiPKjS2_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z8k_stagedILi1EEvPiPKiPKjS4_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_splitILi1EEvPiPKjS2_iiiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_tiledILi0EEvPiPKjS2_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z8k_stagedILi0EEvPiPKiPKjS4_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_splitILi0EEvPiPKjS2_iiiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_tiledILi1EEvPiPKjS2_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z8k_stagedILi1EEvPiPKiPKjS4_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_splitILi1EEvPiPKjS2_iiiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_tiledILi0EEvPiPKjS2_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z8k_stagedILi0EEvPiPKiPKjS4_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_splitILi0EEvPiPKjS2_iiiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_tiledILi1EEvPiPKjS2_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z8k_stagedILi1EEvPiPKiPKjS4_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_splitILi1EEvPiPKjS2_iiiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_tiledILi0EEvPiPKjS2_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z8k_stagedILi0EEvPiPKiPKjS4_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_splitILi0EEvPiPKjS2_iiiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_tiledILi1EEvPiPKjS2_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z8k_stagedILi1EEvPiPKiPKjS4_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_splitILi1EEvPiPKjS2_iiiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_tiledILi0EEvPiPKjS2_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z8k_stagedILi0EEvPiPKiPKjS4_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_splitILi0EEvPiPKjS2_iiiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_tiledILi1EEvPiPKjS2_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z8k_stagedILi1EEvPiPKiPKjS4_iiii stays in the simulator: an instruction of no turbo class
+host_gpu: _Z7k_splitILi1EEvPiPKjS2_iiiii stays in the simulator: an instruction of no turbo class
+host_gpu: 0 launches ran on the card, 36 in the simulator (36 kernels not admitted by turbo mode, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu: 0.0 MiB went to the card, 0.0 MiB came back
+host_gpu_turbo: mode=turbo launches_card=0 launches_sim=36 card_s=0.000000 sim_s=0.047310 words_compared=0 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+host_gpu_refusals: refused_never=36 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=0 too_small=0 failed=0
+host_gpu_sampled: sampled=0 sent=0 timeouts=0 cost_s=0.000000 after_driver=0 copies_running_at_exit=0 copies_left=0
+host_gpu_streak: sent=0 card_only_mib=0.0 rule=1
+host_gpu_overhead: kept_launches=36 decide_s=0.002510 scan_s=0.002297 after_s=0.000038 kernels=6
+host_gpu_kept: kernel=_Z7k_splitILi0EEvPiPKjS2_iiiii launches=6 sim_s=0.009917 reason=class never
+host_gpu_kept: kernel=_Z7k_splitILi1EEvPiPKjS2_iiiii launches=6 sim_s=0.009869 reason=class never
+host_gpu_kept: kernel=_Z7k_tiledILi0EEvPiPKjS2_iiii launches=6 sim_s=0.005449 reason=class never
+host_gpu_kept: kernel=_Z7k_tiledILi1EEvPiPKjS2_iiii launches=6 sim_s=0.005272 reason=class never
+host_gpu_kept: kernel=_Z8k_stagedILi0EEvPiPKiPKjS4_iiii launches=6 sim_s=0.007582 reason=class never
+host_gpu_kept: kernel=_Z8k_stagedILi1EEvPiPKiPKjS4_iiii launches=6 sim_s=0.009221 reason=class never

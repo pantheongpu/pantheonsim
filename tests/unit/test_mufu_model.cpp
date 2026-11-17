@@ -93,10 +93,16 @@ const std::map<std::string, std::vector<std::vector<uint64_t>>>& vectors() {
 
 // The cubin of tools/numerics/mufu_kernel.cu with every MUFU's sub-operation (bits 74-77) and operand modifiers (|x|: bit 62,
 // -x: bit 63) rewritten, as tools/numerics/mufu_probe.cu rewrites it for the card.
-std::vector<uint8_t> probe_cubin(unsigned op, bool src_abs, bool src_neg, bool f16 = false, unsigned part = 0) {
+// sm 90 and later: the cubin's architecture is patched to `sm` (e_flags) and the half bit is the one of that architecture: .F16 is
+// instruction bit 73 up to sm_89 and bit 72 from sm_90, where bit 73 is .BF16 (`bf16`).
+std::vector<uint8_t> probe_cubin(unsigned op, bool src_abs, bool src_neg, bool f16 = false, unsigned part = 0, int sm = 86, bool bf16 = false) {
   std::ifstream in(std::string(VGPU_SOURCE_DIR) + "/nvidia/tests/data/mufu/mufu_kernel.sm_86.cubin", std::ios::binary);
   if (!in) throw vtest::Failure("cannot read mufu_kernel.sm_86.cubin");
   std::vector<uint8_t> elf((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  if (sm != 86) {   // the architecture byte of e_flags (ABI version 8: bits 8-15; version 7: bits 0-7)
+    VCHECK(elf[7] != 0x33);
+    elf[0x31] = static_cast<uint8_t>(sm);
+  }
   const auto rd = [&](size_t off, int bytes) { uint64_t v = 0; std::memcpy(&v, elf.data() + off, bytes); return v; };
   const uint64_t shoff = rd(0x28, 8);
   const unsigned shentsize = rd(0x3a, 2), shnum = rd(0x3c, 2), shstrndx = rd(0x3e, 2);
@@ -110,7 +116,7 @@ std::vector<uint8_t> probe_cubin(unsigned op, bool src_abs, bool src_neg, bool f
       uint64_t lo = rd(p, 8), hi = rd(p + 8, 8);
       if ((lo & 0x1ff) != 0x108) continue;
       hi = (hi & ~(0xfull << 10)) | (static_cast<uint64_t>(op) << 10);
-      hi = (hi & ~(1ull << 9)) | (static_cast<uint64_t>(f16) << 9);   // bit 73: .F16
+      hi = (hi & ~(3ull << 8)) | (static_cast<uint64_t>(sm >= 90 ? (f16 ? 1 : 0) | (bf16 ? 2 : 0) : (f16 ? 2 : 0)) << 8);   // bit 73: .F16 (up to sm_89); bit 72 .F16, bit 73 .BF16 (sm_90 and later)
       lo = (lo & ~(3ull << 60)) | (static_cast<uint64_t>(part) << 60);   // bits 60-61: the half read (.H1)
       lo = (lo & ~(3ull << 62)) | (static_cast<uint64_t>(src_abs) << 62) | (static_cast<uint64_t>(src_neg) << 63);
       std::memcpy(elf.data() + p, &lo, 8);
@@ -124,11 +130,12 @@ std::vector<uint8_t> probe_cubin(unsigned op, bool src_abs, bool src_neg, bool f
 
 struct Sass {
   MemoryManager mem{1 << 26};
-  DeviceProfile prof = load_gpu("nvidia/rtx3060");
+  DeviceProfile prof;
   std::shared_ptr<sass::Module> m;
   uint64_t out;
-  Sass(unsigned op, bool src_abs = false, bool src_neg = false, bool f16 = false, unsigned part = 0) {
-    const std::vector<uint8_t> c = probe_cubin(op, src_abs, src_neg, f16, part);
+  Sass(unsigned op, bool src_abs = false, bool src_neg = false, bool f16 = false, unsigned part = 0, int sm = 86, bool bf16 = false) {
+    const std::vector<uint8_t> c = probe_cubin(op, src_abs, src_neg, f16, part, sm, bf16);
+    prof = load_gpu(sm >= 90 ? "nvidia/h100-pcie" : "nvidia/rtx3060");
     m = sass::load(c.data(), c.size(), mem, prof);
     out = mem.alloc(1 << 20);
   }
@@ -269,10 +276,10 @@ uint64_t fnv(const std::vector<uint32_t>& v) {
   return h;
 }
 // The card's half-precision hashes by name ("EX2.F16 all", "ex2.approx.f16x2").
-std::map<std::string, uint64_t> f16_hashes() {
-  static const auto m = [] {
-    std::ifstream in(std::string(VGPU_SOURCE_DIR) + "/tools/numerics/mufu/rtx3060.f16.hashes.txt");
-    if (!in) throw vtest::Failure("cannot read rtx3060.f16.hashes.txt");
+std::map<std::string, uint64_t> hash_file(const std::string& name) {
+  {
+    std::ifstream in(std::string(VGPU_SOURCE_DIR) + "/tools/numerics/mufu/" + name);
+    if (!in) throw vtest::Failure("cannot read " + name);
     std::map<std::string, uint64_t> r;
     for (std::string line; std::getline(in, line);) {
       if (line.empty() || line[0] == '#') continue;
@@ -282,7 +289,19 @@ std::map<std::string, uint64_t> f16_hashes() {
       r[name] = std::stoull(b.empty() ? a : b, nullptr, 16);
     }
     return r;
-  }();
+  }
+}
+std::map<std::string, uint64_t> f16_hashes() {
+  static const auto m = hash_file("rtx3060.f16.hashes.txt");
+  return m;
+}
+// The H100's: the bfloat16 forms ("EX2.BF16", "ex2.approx.bf16x2") and the f16 forms ptxas emits for sm_90 (bit 72).
+std::map<std::string, uint64_t> bf16_hashes() {
+  static const auto m = hash_file("h100.bf16.hashes.txt");
+  return m;
+}
+std::map<std::string, uint64_t> h100_f16_ptx_hashes() {
+  static const auto m = hash_file("h100.f16-ptx.hashes.txt");
   return m;
 }
 const char* const kHalfOps[] = {"COS", "SIN", "EX2", "LG2", "RCP", "RSQ", "SQRT", "TANH"};
@@ -305,11 +324,19 @@ std::vector<uint32_t> model_halves(unsigned op, bool packed) {
     r[i] = packed ? mufu::eval_f16(op, in[i] & 0xffffu) | (mufu::eval_f16(op, in[i] >> 16) << 16) : mufu::eval_f16(op, in[i]);
   return r;
 }
+std::vector<uint32_t> model_bf16(unsigned op, bool packed) {
+  std::vector<uint32_t> r(65536);
+  const std::vector<uint32_t> in = packed ? half_pairs() : all_halves();
+  for (uint32_t i = 0; i < 65536; ++i)
+    r[i] = packed ? mufu::eval_bf16(op, in[i] & 0xffffu) | (mufu::eval_bf16(op, in[i] >> 16) << 16) : mufu::eval_bf16(op, in[i]);
+  return r;
+}
 
 // out[i] = <form>(in[i]) of a half form on b16 (ex2.approx.f16) or b32 (.f16x2) registers, in the order of `in`.
-std::vector<uint32_t> run_ptx_half(const std::string& form, bool packed, const std::vector<uint32_t>& in) {
+std::vector<uint32_t> run_ptx_half(const std::string& form, bool packed, const std::vector<uint32_t>& in, const char* target = "sm_86",
+                                   const char* gpu = "nvidia/rtx3060") {
   const std::string rt = packed ? "b32" : "b16", w = packed ? "4" : "2";
-  std::string ptx = ".version 8.0\n.target sm_86\n.address_size 64\n.visible .entry k(.param .u64 pa, .param .u64 po, .param .u32 pn)\n{\n"
+  std::string ptx = ".version 8.0\n.target " + std::string(target) + "\n.address_size 64\n.visible .entry k(.param .u64 pa, .param .u64 po, .param .u32 pn)\n{\n"
                     " .reg .b32 %r<8>; .reg .b64 %rd<10>; .reg ." + rt + " %a, %c; .reg .pred %p;\n"
                     " ld.param.u64 %rd1,[pa]; ld.param.u64 %rd3,[po]; ld.param.u32 %r6,[pn];\n"
                     " mov.u32 %r1,%tid.x; mov.u32 %r2,%ctaid.x; mov.u32 %r3,%ntid.x; mad.lo.u32 %r4,%r2,%r3,%r1;\n"
@@ -318,7 +345,7 @@ std::vector<uint32_t> run_ptx_half(const std::string& form, bool packed, const s
   ptx += "%r4," + w + "; add.u64 %rd5,%rd1,%rd4; add.u64 %rd7,%rd3,%rd4;\n"
          " ld.global." + rt + " %a,[%rd5];\n " + form + " %c, %a;\n st.global." + rt + " [%rd7],%c;\ndone:\n ret;\n}\n";
   MemoryManager mem{1 << 24};
-  const DeviceProfile prof = load_gpu("nvidia/rtx3060");
+  const DeviceProfile prof = load_gpu(gpu);
   auto m = ptx::parse(ptx);
   const uint32_t n = static_cast<uint32_t>(in.size()), bytes = n * (packed ? 4u : 2u);
   const uint64_t pa = mem.alloc(bytes), po = mem.alloc(bytes);
@@ -431,6 +458,155 @@ VTEST(the_switch_restores_the_host_precision_half_results) {
     std::printf("EXACT=0 SASS MUFU.%s.F16: %zu of 65536 differ from the card\n", name, differ);
     VCHECK(fnv(r) != want.at(std::string(name) + ".F16"));
   }
+}
+
+// ---- the bfloat16 forms and the sm_90 encoding (measured on an H100 PCIe, 2026-11-16) -------------------------------------
+
+// The model against the H100's hashes: all 65,536 bfloat16 patterns of each of the eight sub-operations, and the packed PTX forms.
+VTEST(the_model_hashes_as_the_h100_over_every_bfloat16_pattern) {
+  const auto want = bf16_hashes();
+  VCHECK_EQ(want.size(), size_t{12});
+  for (const char* name : kHalfOps) {
+    const uint64_t got = fnv(model_bf16(half_op(name), false));
+    if (got != want.at(std::string(name) + ".BF16"))
+      throw vtest::Failure(std::string("MUFU.") + name + ".BF16: model " + hex(got, 16) + ", an H100 gives " + hex(want.at(std::string(name) + ".BF16"), 16));
+  }
+  VCHECK_EQ(fnv(model_bf16(mufu::OpEx2, false)), want.at("ex2.approx.bf16"));
+  VCHECK_EQ(fnv(model_bf16(mufu::OpTanh, false)), want.at("tanh.approx.bf16"));
+  VCHECK_EQ(fnv(model_bf16(mufu::OpEx2, true)), want.at("ex2.approx.bf16x2"));
+  VCHECK_EQ(fnv(model_bf16(mufu::OpTanh, true)), want.at("tanh.approx.bf16x2"));
+  // The F16 forms ptxas emits for sm_90 give the RTX 3060's hashes.
+  const auto h = h100_f16_ptx_hashes(), r = f16_hashes();
+  for (const char* f : {"ex2.approx.f16", "tanh.approx.f16", "ex2.approx.f16x2", "tanh.approx.f16x2"}) VCHECK_EQ(h.at(f), r.at(f));
+}
+
+// A few values of the model, by hand: the bfloat16 widened by a shift, the float result's upper 16 bits.
+VTEST(eval_bf16_is_the_unit_on_the_widened_value_cut_to_the_upper_half) {
+  for (const char* name : kHalfOps) {
+    const unsigned op = half_op(name);
+    for (uint32_t x : {0x0000u, 0x8000u, 0x0001u, 0x007fu, 0x0080u, 0x3f80u, 0xbf80u, 0x4000u, 0x4049u, 0x7f7fu, 0x7f80u, 0xff80u, 0x7fc0u, 0xffc1u, 0x1234u, 0xabcdu}) {
+      VCHECK_EQ(mufu::eval_bf16(op, x), mufu::eval(op, x << 16) >> 16);
+      VCHECK_EQ(mufu::eval_bf16(op, x | 0xdead0000u), mufu::eval_bf16(op, x));   // only the low 16 bits are the operand
+      VCHECK(mufu::eval_bf16(op, x) <= 0xffffu);
+    }
+  }
+  // The values the card gave (an H100, and the model they equal): the exponential and the hyperbolic tangent of one, the square root
+  // of four and the reciprocal of two.
+  VCHECK_EQ(mufu::eval_bf16(mufu::OpEx2, 0x3f80u), 0x4000u);
+  VCHECK_EQ(mufu::eval_bf16(mufu::OpTanh, 0x3f80u), 0x3f42u);
+  VCHECK_EQ(mufu::eval_bf16(mufu::OpSqrt, 0x4080u), 0x4000u);
+  VCHECK_EQ(mufu::eval_bf16(mufu::OpRcp, 0x4000u), 0x3f00u);
+  VCHECK_EQ(mufu::eval_bf16(mufu::OpEx2, 0x7fc0u), 0x7fffu);
+  VCHECK_EQ(mufu::eval_bf16(mufu::OpLg2, 0x0000u), 0xff80u);
+}
+
+// The decoder: bit 73 is .F16 up to sm_89, and from sm_90 bit 72 is .F16 and bit 73 is .BF16.
+sass::Instr mufu_word(int sm, bool b72, bool b73, unsigned op, unsigned part) {
+  sass::Word w;
+  w.lo = 0x0000000200097308ull | (static_cast<uint64_t>(part) << 60);   // MUFU R9, R2 (bits 60-61: the half)
+  w.hi = (static_cast<uint64_t>(op) << 10) | (static_cast<uint64_t>(b72) << 8) | (static_cast<uint64_t>(b73) << 9);
+  return sass::decode(w, 0, sm);
+}
+bool has_mod(const sass::Instr& i, const char* m) { return std::find(i.mods.begin(), i.mods.end(), std::string(m)) != i.mods.end(); }
+
+VTEST(the_decoder_reads_the_f16_and_bf16_bits_by_architecture) {
+  for (int sm : {75, 80, 86, 89}) {   // bit 73 is .F16, as before; bit 72 is nothing
+    const sass::Instr f = mufu_word(sm, false, true, 2, 0);
+    VCHECK_EQ(f.f[0], 2u);
+    VCHECK(f.f[1] == 1 && f.f[2] == 0);
+    VCHECK(has_mod(f, "EX2") && has_mod(f, "F16") && !has_mod(f, "BF16"));
+    const sass::Instr n = mufu_word(sm, true, false, 9, 0);   // bit 72 alone is a plain 32-bit MUFU
+    VCHECK(n.f[1] == 0 && n.f[2] == 0 && !has_mod(n, "F16") && !has_mod(n, "BF16"));
+    const sass::Instr h = mufu_word(sm, false, true, 9, 1);
+    VCHECK(h.f[1] == 1 && h.f[5] == 1 && h.src[0].suffix == ".H1");
+  }
+  for (int sm : {90, 100, 103, 120}) {   // bit 72 is .F16, bit 73 is .BF16
+    const sass::Instr f = mufu_word(sm, true, false, 2, 0);   // EX2.F16
+    VCHECK(f.f[1] == 1 && f.f[2] == 0 && has_mod(f, "F16") && !has_mod(f, "BF16"));
+    const sass::Instr t = mufu_word(sm, false, true, 9, 0);   // TANH.BF16
+    VCHECK_EQ(t.f[0], 9u);
+    VCHECK(t.f[1] == 0 && t.f[2] == 1 && has_mod(t, "TANH") && has_mod(t, "BF16") && !has_mod(t, "F16"));
+    const sass::Instr h = mufu_word(sm, false, true, 2, 1);   // EX2.BF16 R9, R2.H1
+    VCHECK(h.f[2] == 1 && h.f[5] == 1 && h.src[0].suffix == ".H1");
+    const sass::Instr hf = mufu_word(sm, true, false, 2, 1);
+    VCHECK(hf.f[1] == 1 && hf.f[5] == 1 && hf.src[0].suffix == ".H1");
+    const sass::Instr n = mufu_word(sm, false, false, 2, 0);
+    VCHECK(n.f[1] == 0 && n.f[2] == 0 && n.src[0].suffix.empty());
+  }
+  const std::string text = sass::to_text(mufu_word(90, false, true, 2, 0));
+  VCHECK(text.find("MUFU.EX2.BF16") != std::string::npos);
+}
+
+// MUFU.<op>.BF16 and .F16 as an sm_90 cubin has them (the probe's kernel with the bits of that architecture, run on the h100-pcie
+// profile): every bfloat16 pattern against the H100's hashes, the f16 form against the RTX 3060's, the high half, |x| and -x.
+static void sass_sm90_forms() {
+  const auto wbf = bf16_hashes(), wf = f16_hashes();
+  for (const char* name : kHalfOps) {
+    const unsigned op = half_op(name);
+    Sass sb(op, false, false, false, 0, 90, true);
+    const std::vector<uint32_t> rb = sb.dump(0, 65536);
+    if (fnv(rb) != wbf.at(std::string(name) + ".BF16")) {
+      for (uint32_t i = 0; i < 65536; ++i)
+        if (rb[i] != mufu::eval_bf16(op, i)) throw vtest::Failure(std::string("SASS sm_90 MUFU.") + name + ".BF16(" + hex(i, 4) + "): " + hex(rb[i]) + ", an H100 gives " + hex(mufu::eval_bf16(op, i)));
+      throw vtest::Failure(std::string("SASS sm_90 MUFU.") + name + ".BF16: the hash differs from the card's");
+    }
+    Sass sf(op, false, false, true, 0, 90, false);
+    if (fnv(sf.dump(0, 65536)) != wf.at(std::string(name) + ".F16")) throw vtest::Failure(std::string("SASS sm_90 MUFU.") + name + ".F16 (bit 72): the hash differs");
+  }
+  for (const char* name : {"EX2", "TANH", "RCP", "SIN"}) {
+    const unsigned op = half_op(name);
+    for (int mods = 0; mods < 4; ++mods) {
+      const bool ab = mods & 1, ng = mods & 2;
+      for (unsigned part : {0u, 1u})
+        for (bool bf : {false, true}) {
+          Sass s(op, ab, ng, !bf, part, 90, bf);
+          for (uint32_t h = 3; h < 65536; h += 2503) {
+            const uint32_t reg = part ? (h << 16) | 0x3c00u : (0xbc00u << 16) | h;
+            uint32_t x = h;
+            if (ab) x &= 0x7fffu;
+            if (ng) x ^= 0x8000u;
+            const uint32_t got = s.dump(reg, 1)[0], w = bf ? mufu::eval_bf16(op, x) : mufu::eval_f16(op, x);
+            if (got != w) throw vtest::Failure(std::string("SASS sm_90 MUFU.") + name + (bf ? ".BF16" : ".F16") + (part ? ".H1" : "") + " of " + hex(reg) + ": " + hex(got) + ", want " + hex(w));
+          }
+        }
+    }
+  }
+}
+VTEST(the_sass_executor_gives_the_h100s_bf16_results_on_sm_90) { sass_sm90_forms(); }
+VTEST(the_sass_executor_general_path_gives_the_h100s_bf16_results_on_sm_90) {
+  Env e("VGPU_FASTPATH", "0");
+  sass_sm90_forms();
+}
+
+// ex2.approx.ftz.bf16 / .bf16x2 and tanh.approx.bf16 / .bf16x2 on the PTX interpreter (sm_90): the H100's hashes.
+VTEST(the_ptx_interpreter_gives_the_h100s_bf16_results) {
+  const auto want = bf16_hashes();
+  for (const char* base : {"ex2.approx.ftz", "tanh.approx"})
+    for (const char* ty : {".bf16", ".bf16x2"}) {
+      const bool packed = ty[5] == 'x';
+      const std::string form = std::string(base) + ty;
+      const std::string key = std::string(base[0] == 'e' ? "ex2.approx" : "tanh.approx") + ty;
+      const std::vector<uint32_t> r = run_ptx_half(form, packed, packed ? half_pairs() : all_halves(), "sm_90", "nvidia/h100-pcie");
+      if (fnv(r) != want.at(key)) {
+        const std::vector<uint32_t> m = model_bf16(base[0] == 'e' ? mufu::OpEx2 : mufu::OpTanh, packed);
+        for (uint32_t i = 0; i < 65536; ++i)
+          if (r[i] != m[i]) throw vtest::Failure("PTX " + form + "(" + hex(packed ? half_pairs()[i] : i) + "): " + hex(r[i]) + ", an H100 gives " + hex(m[i]));
+        throw vtest::Failure("PTX " + form + ": the hash differs from the card's");
+      }
+    }
+}
+
+// VGPU_MUFU_EXACT=0: the PTX bf16 forms are the function at host precision, rounded to nearest, as before (they differ from the card).
+VTEST(the_switch_restores_the_host_precision_bf16_results) {
+  const auto want = bf16_hashes();
+  Env e("VGPU_MUFU_EXACT", "0");
+  const std::vector<uint32_t> r = run_ptx_half("ex2.approx.ftz.bf16", false, all_halves(), "sm_90", "nvidia/h100-pcie");
+  VCHECK(fnv(r) != want.at("ex2.approx.bf16"));
+  const std::vector<uint32_t> card = model_bf16(mufu::OpEx2, false);
+  size_t differ = 0;
+  for (uint32_t i = 0; i < 65536; ++i) differ += r[i] != card[i];
+  std::printf("EXACT=0 PTX ex2.approx.ftz.bf16: %zu of 65536 differ from the card\n", differ);
+  VCHECK(differ > 0);
 }
 
 VTEST(the_model_gives_the_cards_result_on_every_measured_vector) {

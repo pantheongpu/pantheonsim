@@ -121,3 +121,13 @@ half mutant 6: exec_ops.inc: the 32-lane fast path takes the F16 forms (reads th
     killed by the_sass_executor_gives_the_cards_half_precision_results
 # The tier needs no change: with the model on, its MUFU handler runs the interpreter's code for every function (h_mufu), F16 included;
 # with VGPU_MUFU_EXACT=0 the F16 forms are what they were.
+
+# The sm_90+ MUFU .F16/.BF16 work (r8-bf16, 2026-11-16), test_mufu_model, each mutant built and run on the build machine:
+mutant bf16-1: decode.cpp: bit 73 is .F16 on every architecture (the old rule)
+    killed by test_mufu_model (the_decoder_reads_the_f16_and_bf16_bits_by_architecture; both sm_90 SASS executor cases)
+mutant bf16-2: exec_ops.inc: .BF16 computed with eval_f16
+    killed by test_mufu_model (both sm_90 SASS executor cases)
+mutant bf16-3: interpreter.cpp: the PTX bf16 forms at host precision again
+    killed by test_mufu_model (the_ptx_interpreter_gives_the_h100s_bf16_results)
+mutant bf16-4: mufu_model.hpp: eval_bf16 rounds to nearest instead of cutting
+    killed by test_mufu_model (the hash test, the spot test, both sm_90 SASS cases, the PTX case)

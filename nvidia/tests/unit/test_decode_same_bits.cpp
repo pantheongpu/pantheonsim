@@ -22,6 +22,14 @@
 // only differences are that part (the f[5] field, the source selector, the ".H1" in the text); the corpora digest is UNCHANGED (no word of the
 // real-code corpora differs), and without the line the old digests came out again. ***
 //
+// *** 2026-11-16 (second): the flipped and random digests were RE-RECORDED on purpose again, for the sm_90+ MUFU half-precision encoding
+// (r8-bf16): dec_mufu reads .F16 from instruction bit 73 up to sm_89 and, from sm_90, .F16 from bit 72 and .BF16 from bit 73 (nvcc output
+// for sm_90, sm_100, sm_120; an H100 ran the BF16 form). Verified by dumping both passes (VGPU_DECODE_DUMP) from a build with the
+// architecture test and from one without it (the old rule, which gave the previous digests again) and diffing them: 108 dump lines differ
+// in "flipped" and 100 in "random" (86 distinct words), all of them MUFU words decoded for sm_90, sm_100, sm_103 or sm_120 (none for an
+// older architecture, none that is not a MUFU), and the differences are only the F16 / BF16 mod, f[1] (.F16) and f[2] (.BF16) and the
+// text they print; the corpora digest is UNCHANGED (no word of the real-code corpora differs). ***
+//
 // VGPU_DECODE_PRINT=1 prints the digests (to regenerate the table after a decoder change that is meant to change
 // them); VGPU_DECODE_DUMP=<dir> writes the full dump of every pass, so two builds can be diffed to see which
 // instruction differs; VGPU_DECODE_BENCH=1 times decode and to_text over the corpora.
@@ -174,7 +182,7 @@ VTEST(words_with_flipped_bits_decode_to_the_same_bits) {
     words.push_back({w, 16 * (rng.next() % 4096)});
   }
   const std::vector<int> archs = {75, 86, 90, 100, 120};
-  check("flipped", run_pass("flipped", words, archs), "54f449a0cd0aaceb182b05ee9225bcd3");
+  check("flipped", run_pass("flipped", words, archs), "b62dc7622b513d146b88f6c6f9bc2c55");
 }
 
 VTEST(random_opcodes_decode_to_the_same_bits) {
@@ -187,7 +195,7 @@ VTEST(random_opcodes_decode_to_the_same_bits) {
     words.push_back({w, 16 * (rng.next() % 4096)});
   }
   const std::vector<int> archs = {80, 89, 103, 120};
-  check("random", run_pass("random", words, archs), "113084eb1c0b83016ff947af2b3892fa");
+  check("random", run_pass("random", words, archs), "396dd752c0a00ae7820e00eba0e86239");
 }
 
 VTEST(bench_decode) {

@@ -7,7 +7,31 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
-- **An `.extern .global` variable that nothing in the module defines is now zeroed storage the host can see and write** (issue #681). The simulator skipped such a declaration, so a kernel reading it stopped with `CUDA_ERROR_NOT_FOUND` (`unknown symbol`) at launch, and `cuModuleGetGlobal` could not find it. PoCL's CUDA backend (OpenCL C compiled to PTX) declares its work offset, `_global_offset_x`, that way and reads it in every kernel, so no OpenCL kernel ran on a simulated NVIDIA GPU. A real driver loading the module as a whole program ignores the qualifier and gives the variable zeroed storage of the declared size; measured on an RTX 3080 Ti (driver 595.99.02), the kernel reads 0, `cuModuleGetGlobal` returns a 4-byte variable, and after the host writes 7 the kernel reads 7. The simulator does the same now, for `.global` and `.const`. An `.extern` declaration of a name the module also defines is dropped, and an unsized extern array (no size to allocate) is still only a declaration. Not changed: the JIT log line the real driver prints for it, and `cuLink*`, which still refuses an undefined extern. Test: `c_harness_extern_global`. This is the first step of #681; whether PoCL then runs a kernel end to end on the simulator is not yet checked.
+- **An undefined `.extern .global` (or `.const`) in a PTX module is a zero-initialised variable, as on NVIDIA's driver** (issue #681). A module that
+  declares `.extern .global .align 4 .u32 x;` and defines it nowhere used to fail at the first launch that read it
+  (`CUDA_ERROR_NOT_FOUND: unknown symbol`), and `cuModuleGetGlobal` could not find it. On a real RTX 3080 Ti the driver drops the qualifier in a
+  whole-program module (`ptxas warning : Unresolved extern variable`), gives the variable its declared size, zero, and lets `cuModuleGetGlobal`
+  return it and the host write it. The simulator does the same. PoCL's CUDA backend declares `_global_offset_x` this way and launches every kernel
+  with it, so OpenCL through PoCL can now launch kernels on the simulated NVIDIA GPUs. A name the module defines itself keeps its definition, and an
+  unsized `.extern .global x[]` still loads. (The simulator writes no ptxas warning: `cuModuleLoadDataEx` has no JIT log here.)
+- **CI: the longest tests are split into shards, and the slowest tests are reported** (CI work). `test_amd_gcn_gather_same_bits` (2,461 s under ASan),
+  `test_amd_gcn_memory_same_bits` (1,866 s), `test_amd_matrix_fast` (1,553 s) and `e2e_sass_tier` (1,830 s under ASan, 1,580 s under TSan) now run as
+  eight shards each, side by side (`..._shard_KofN`; each shard keeps every item's seed, and a `_shards_partition` test proves the shards are the whole
+  test). The ml job no longer re-runs the heaviest simulator-only tests that the unit job runs. Every job that runs ctest puts its 20 slowest tests
+  in the job summary (`ci/slowest_tests.sh`), and a test over 30 minutes fails the job. No check was removed.
+- **Behaviour change: MUFU .F16 and .BF16 on sm_90 and later (Hopper, Blackwell) are the card's.** From sm_90 the instruction's `.F16`
+  bit moved from instruction bit 73 to bit 72 and bit 73 became `.BF16` (nvcc output for sm_90, sm_100 and sm_120; the same words).
+  The decoder read bit 73 as `.F16` for every architecture, so on sm_90 and later a real `MUFU.<op>.F16` ran as a plain 32-bit
+  `MUFU` on a half register and a real `MUFU.<op>.BF16` ran as `.F16`. It reads them by architecture now, and `MUFU.<op>.BF16` and
+  the PTX `ex2.approx.ftz.bf16`, `.bf16x2`, `tanh.approx.bf16` and `.bf16x2` are the single-precision unit on the bfloat16 widened
+  by a shift, the upper 16 bits of the result: equal to an H100 PCIe on all 2^32 register values of all eight sub-operations.
+  **Programs for sm_90 and later that use f16 or bf16 `ex2`/`tanh` or compiler-emitted `MUFU .F16` / `.BF16` change their outputs;
+  they now equal the card's** (the PTX bf16 forms were the function at host precision, rounded to nearest). Counters do not
+  change. **To get the earlier results back:** `VGPU_MUFU_EXACT=0`. Evidence: Hopper measured (H100 PCIe); Blackwell inferred (the
+  encoding is from nvcc output, the execution was not run on a Blackwell card). Tests: `test_mufu_model`, `test_decode_same_bits`
+  (its flipped and random digests moved for the MUFU words with bit 72 set on sm_90 and later, see its header); details in
+  [docs/numerics/math-functions.md](docs/numerics/math-functions.md).
+- **`VGPU_HOST_GPU=turbo` now sends kernels that use BMMA (1-bit tensor MMA) to the card** (issue #661). They were refused (`class=never insn=BMMA.88128.XOR.POPC`). BMMA is integer popcount arithmetic: on an A10G, `bmma_gemm` (36 launches, XOR and AND) ran on the card under `VGPU_HOST_GPU_VERIFY=all` with 0 different words of 775,680, byte-identical to the simulator. Measured on the A10G only; other cards with BMMA are inferred. `VGPU_HOST_GPU=exact` is unchanged (BMMA is not in its set), and `VGPU_HOST_GPU_TURBO_OFF=tensor` refuses these kernels again. Test: `test_host_gpu_logic`.
 - **Behaviour change: the b200 and gb200 profiles sum tensor-core products by the Hopper rule by default, not sequentially.** On
   `nvidia/b200` and `nvidia/gb200` (compute capability 10.0), `wmma`, `mma.sync` and SASS `HMMA` in f16, bf16 and tf32 now add the
   products in chunks of 16 (tf32: 8) with the terms cut at 2^(top - 26), the rule of an H100, instead of one at a time in f32.
