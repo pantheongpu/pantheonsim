@@ -36,16 +36,17 @@ static const char* kUndefined = R"(
 }
 )";
 
-// Defined after its declaration, and defined before another declaration of it.
+// Defined after its declaration (.visible: an .extern declaration is resolved only by a definition with linkage; the card refuses a plain
+// one, checked in c_harness/extern_global.c), and defined before another declaration of it (that order is not measured on a card). An
+// unsized .extern array is not here: the card refuses it at load (also checked there).
 static const char* kDefined = R"(
 .version 6.3
 .target sm_75
 .address_size 64
 .extern .global .align 4 .u32 later;
-.global .align 4 .u32 later = 5;
+.visible .global .align 4 .u32 later = 5;
 .global .align 4 .u32 earlier = 6;
 .extern .global .align 4 .u32 earlier;
-.extern .global .b8 unsized[];
 .visible .entry k(.param .u64 out)
 {
   .reg .b32 %r<4>;

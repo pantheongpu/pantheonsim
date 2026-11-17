@@ -2090,6 +2090,24 @@ std::string merge_ptx(const std::vector<std::string>& inputs) {
   return out;
 }
 
+// The extern variables a PTX image declares and nothing in it defines, in declaration order: the sized ones (a whole-program load
+// gives each zeroed storage, with a ptxas warning) and the unsized arrays (a whole-program load refuses them). Empty when the
+// image is not PTX this parser reads.
+struct UnresolvedExterns {
+  std::vector<std::string> sized, unsized;
+};
+UnresolvedExterns unresolved_externs_of(const char* text, size_t len) {
+  UnresolvedExterns u;
+  try {
+    const vgpu::ptx::Module m = vgpu::ptx::parse(std::string(text, len));
+    for (const auto& g : m.globals)
+      if (g.extern_decl) u.sized.push_back(g.name);
+    u.unsized = m.unresolved_externs;
+  } catch (const vgpu::Error&) {
+  }
+  return u;
+}
+
 // Whether `data` is libcudadevrt.a: an `ar` archive (the 8-byte "!<arch>\n" magic, then members of a
 // 60-byte header and an even-padded body) whose members are all the toolkit's cuda_device_runtime
 // object. The member names come from the archive's long-name table ("//") or sit in the header
@@ -2573,9 +2591,11 @@ static CUresult cuModuleLoadDataEx_impl(CUmodule* module, const void* image, uns
   const CUresult r = cuModuleLoadData_impl(module, image);
   const int* opts = static_cast<const int*>(options);
   if (!opts || !optionValues) return r;
-  size_t info_size = 0, error_size = 0, written_error = 0;
+  size_t info_size = 0, error_size = 0, written_error = 0, written_info = 0;
   char* error_buf = nullptr;
+  char* info_buf = nullptr;
   for (unsigned i = 0; i < numOptions; ++i) {
+    if (opts[i] == 3) info_buf = static_cast<char*>(optionValues[i]);           // INFO_LOG_BUFFER
     if (opts[i] == 4) info_size = reinterpret_cast<size_t>(optionValues[i]);    // INFO_LOG_BUFFER_SIZE_BYTES
     if (opts[i] == 6) error_size = reinterpret_cast<size_t>(optionValues[i]);   // ERROR_LOG_BUFFER_SIZE_BYTES
     if (opts[i] == 5) error_buf = static_cast<char*>(optionValues[i]);          // ERROR_LOG_BUFFER
@@ -2588,6 +2608,18 @@ static CUresult cuModuleLoadDataEx_impl(CUmodule* module, const void* image, uns
     std::memcpy(error_buf, msg.data(), written_error);
     error_buf[written_error] = '\0';
   }
+  // The info log carries ptxas's warnings. The one this has: a sized .extern variable nothing defines, which the whole-program
+  // load gave zeroed storage ("Unresolved extern variable ... ignoring extern qualifier").
+  if (info_buf && info_size) {
+    std::string msg;
+    const char* text = static_cast<const char*>(image);
+    if (r == CUDA_SUCCESS && image && (text[0] == '.' || text[0] == '/' || text[0] == '\n' || text[0] == ' ' || text[0] == '\t'))
+      for (const std::string& n : unresolved_externs_of(text, std::strlen(text)).sized)
+        msg += "ptxas warning : Unresolved extern variable '" + n + "' in whole program compilation, ignoring extern qualifier\n";
+    written_info = std::min(msg.size(), info_size - 1);
+    std::memcpy(info_buf, msg.data(), written_info);
+    info_buf[written_info] = '\0';
+  }
   for (unsigned i = 0; i < numOptions; ++i) {
     switch (opts[i]) {
       case 2: {   // CU_JIT_WALL_TIME: a float, in the slot itself
@@ -2595,10 +2627,8 @@ static CUresult cuModuleLoadDataEx_impl(CUmodule* module, const void* image, uns
         std::memcpy(&optionValues[i], &ms, sizeof ms);
         break;
       }
-      case 3:     // CU_JIT_INFO_LOG_BUFFER
-        if (optionValues[i] && info_size) static_cast<char*>(optionValues[i])[0] = '\0';
-        break;
-      case 4: optionValues[i] = nullptr; break;                                   // info bytes written: none
+      case 3: break;   // CU_JIT_INFO_LOG_BUFFER: filled above
+      case 4: optionValues[i] = reinterpret_cast<void*>(written_info); break;     // info bytes written
       case 6: optionValues[i] = reinterpret_cast<void*>(written_error); break;    // error bytes written
       default: break;
     }
@@ -3809,6 +3839,21 @@ static CUresult cuLinkComplete_impl(void* state, void** imageOut, size_t* sizeOu
     if (st.inputs.empty())
       throw vgpu::Error::make(vgpu::Err::InvalidValue, "cuLinkComplete: no inputs were added");
     st.image = merge_ptx(st.inputs);
+    // A variable declared .extern that no input defines is an undefined reference to the linker, which fails with
+    // CUDA_ERROR_INVALID_SOURCE and "Undefined reference to 'x'" (an RTX 3080 Ti does); only loading the module whole,
+    // without a link, gives it zeroed storage.
+    {
+      UnresolvedExterns u = unresolved_externs_of(st.image.data(), st.image.size());
+      u.sized.insert(u.sized.end(), u.unsized.begin(), u.unsized.end());
+      if (!u.sized.empty()) {
+        std::string msg;
+        for (const std::string& n : u.sized) msg += "error   : Undefined reference to '" + n + "'\n";
+        link_log_error(st, msg);
+        report("cuLinkComplete", msg);
+        st.image.clear();
+        return static_cast<CUresult>(300);   // CUDA_ERROR_INVALID_SOURCE
+      }
+    }
     st.image.push_back('\0');  // the loader reads the image as a C string
     *imageOut = st.image.data();
     // The reported size excludes the terminator, matching how a cubin size is
