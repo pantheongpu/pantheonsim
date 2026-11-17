@@ -1,4 +1,5 @@
 == unit l1_profile_limits
 133/133 tests passed
-PASS: first launch 9 ms against a driver start of 2000 ms; driver calls in the big run:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 1 cuInit; 1 cuMemAddressReserve; 2 cuModuleLoadData; 2 image elf sm_86; 2 relocs_to_variables 0;; 
+FAIL: turbo mode sent a launch the simulator's validation refuses to the card:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 3 cuFuncGetAttribute; 1 cuInit; 1 cuLaunchKernel; 1 cuMemAddressReserve; 1 cuMemcpyHtoD; 1 cuModuleLoadData
+FAIL: turbo mode does not refuse the launch as the plain simulator does: rc 0 against 0; [vgpu] cudaLaunchKernel: VirtualGPU error [launch-config]: kernel '_Z7boundedPi' was compiled for at most 128 threads per block (__launch_bou
 STUB_DONE
