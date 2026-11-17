@@ -74,9 +74,11 @@ int main(int argc, char** argv) {
   } else if (!std::strcmp(mode, "wide")) {
     wide<<<2, 1024>>>(d, 2048);
   } else if (!std::strcmp(mode, "shared")) {
-    const int bytes = 64 * 1024;
-    cudaFuncSetAttribute(shared_user, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    const char* kb = std::getenv("FIT_SHARED_KB");   // (the profile's limit is the simulator's to enforce: tests ask for more or less than a profile allows)
+    const int bytes = (kb ? std::atoi(kb) : 64) * 1024;
+    const cudaError_t sa = cudaFuncSetAttribute(shared_user, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
     shared_user<<<1, 256, bytes>>>(d);
+    std::printf("set_attribute=%d launch=%d\n", static_cast<int>(sa), static_cast<int>(cudaGetLastError()));
   } else if (!std::strcmp(mode, "grid")) {
     tiny<<<4096, 4>>>(d, n);
   } else if (!std::strcmp(mode, "qmma")) {

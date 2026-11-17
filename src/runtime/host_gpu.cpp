@@ -1511,6 +1511,8 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
   return ordinal == 0 ? rt : nullptr;
 }
 
+bool Runtime::turbo() const { return impl_->mode == Mode::Turbo; }
+
 void Runtime::prestart(const DeviceProfile& profile, int ordinal) {
   if (ordinal != 0 || !turbo_selected()) return;
   const char* off = std::getenv("VGPU_HOST_GPU_PRESTART");

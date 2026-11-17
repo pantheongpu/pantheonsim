@@ -57,6 +57,8 @@ class Runtime {
   // Turbo mode with VGPU_HOST_GPU_FIT=1 (every fitting launch goes to the card, so the card is going to be needed): starts the real driver on its helper thread when the simulated
   // device is created, so that its 0.15 to 0.35 s overlap the program's own set-up (reading input, allocating, copying) instead of delaying the first launch. Returns at once; the
   // first launch still waits for it (to the same 10 s deadline). Does nothing in exact mode, with VGPU_HOST_GPU_FIT=0, or with VGPU_HOST_GPU_PRESTART=0.
+  // Whether this is turbo mode: the simulator then makes the launch checks of the simulated profile (Device::check_launch) before the card is asked, as a launch it runs itself would.
+  bool turbo() const;
   static void prestart(const DeviceProfile& profile, int ordinal);
 
   // Runs the launch on the card if it is eligible and worth it, and returns true; false leaves the launch to the simulator, with

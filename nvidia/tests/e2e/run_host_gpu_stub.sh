@@ -805,6 +805,21 @@ if [[ "$cc" == 86 ]]; then
   [[ "$(grep -c 'cuInit failed; mode off' "$work/ps_bad.err")" == 1 ]] || { echo "FAIL: a prestarted driver that fails was not said once: $(grep -m2 host_gpu "$work/ps_bad.err")"; fails=1; }
   ! grep -q '^cuModuleLoadData$' "$work/ps_bad.log" || { echo "FAIL: a launch reached the card after the prestarted driver failed"; fails=1; }
   diff -q "$work/off_f_tiny.out" "$work/ps_bad.out" > /dev/null || { echo "FAIL: a prestarted driver that fails changes the output"; fails=1; }
+  # 57. the limits of the SIMULATED profile are the simulator's to enforce, whatever the card allows: a T4 profile (64 KiB of shared memory a block at most) on a stand-in card that
+  # allows 99 KiB. 80 KiB of dynamic shared memory is refused by the plain simulator (error, no result), and turbo mode must refuse it the same way, before the card is asked; the
+  # same launch with 40 KiB goes to the card; and the reverse (an H100 profile, 227 KiB, on the card's 99 KiB: 120 KiB) is the simulator's to run, with the plain simulator's result.
+  env FIT_SHARED_KB=80 VGPU_GPU=nvidia/t4 VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/fit75p" shared > "$work/off_t4.out" 2> "$work/off_t4.err"; echo $? > "$work/off_t4.rc"
+  grep -q 'launch=[1-9]' "$work/off_t4.out" && grep -q 'VirtualGPU error \[launch-config\]' "$work/off_t4.err" || { echo "FAIL: the plain simulator accepted 80 KiB of shared memory on a T4 profile: $(cat "$work/off_t4.out") $(head -2 "$work/off_t4.err")"; fails=1; }
+  FIT_SHARED_KB=80 PROG=fit75p run sh_t4 shared VGPU_GPU=nvidia/t4 STUB_SM=75 STUB_MP=40 VGPU_HOST_GPU=turbo STUB_CARD_OK=1 VGPU_HOST_GPU_LOG=1; echo $? > "$work/sh_t4.rc"
+  ! grep -q '^cuLaunchKernel$' "$work/sh_t4.log" || { echo "FAIL: turbo mode sent a launch the simulated profile refuses to the card: $(calls sh_t4)"; fails=1; }
+  diff -q "$work/off_t4.rc" "$work/sh_t4.rc" > /dev/null && diff -q "$work/off_t4.out" "$work/sh_t4.out" > /dev/null && diff <(grep 'VirtualGPU error' "$work/off_t4.err") <(grep 'VirtualGPU error' "$work/sh_t4.err") > /dev/null || { echo "FAIL: turbo mode does not refuse 80 KiB on a T4 profile as the plain simulator does: rc $(cat "$work/off_t4.rc") against $(cat "$work/sh_t4.rc"); $(grep 'VirtualGPU error' "$work/off_t4.err") against $(grep 'VirtualGPU error' "$work/sh_t4.err")"; fails=1; }
+  env FIT_SHARED_KB=40 VGPU_GPU=nvidia/t4 VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/fit75p" shared > "$work/off_t40.out" 2> "$work/off_t40.err" || { echo "FAIL: the plain simulator refused 40 KiB on a T4 profile"; fails=1; }
+  FIT_SHARED_KB=40 PROG=fit75p run sh_t40 shared VGPU_GPU=nvidia/t4 STUB_SM=75 STUB_MP=40 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_VERIFY=1 STUB_CARD_OK=1 || { echo "FAIL: the turbo run of 40 KiB on a T4 profile failed"; fails=1; }
+  grep -q '^cuLaunchKernel$' "$work/sh_t40.log" || { echo "FAIL: a launch that fits the T4 profile and the card did not reach the card: $(calls sh_t40)"; fails=1; }
+  diff -q "$work/off_t40.out" "$work/sh_t40.out" > /dev/null || { echo "FAIL: turbo mode changes the output of the 40 KiB launch"; fails=1; }
+  env FIT_SHARED_KB=120 VGPU_GPU=nvidia/h100 VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/fit" shared > "$work/off_h120.out" 2> "$work/off_h120.err" || { echo "FAIL: the plain simulator refused 120 KiB on an H100 profile: $(head -2 "$work/off_h120.err")"; fails=1; }
+  FIT_SHARED_KB=120 PROG=fit run sh_h120 shared VGPU_GPU=nvidia/h100 STUB_SM=86 STUB_MP=28 VGPU_HOST_GPU=turbo STUB_CARD_OK=1 VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the turbo run of 120 KiB on an H100 profile failed"; fails=1; }
+  ! grep -q '^cuLaunchKernel$' "$work/sh_h120.log" && diff -q "$work/off_h120.out" "$work/sh_h120.out" > /dev/null || { echo "FAIL: 120 KiB on an H100 profile (over the card's 99 KiB) was not the simulator's: $(calls sh_h120)"; fails=1; }
   # 52. the notice.
   grep -q '^host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host GPU.*results may differ from the simulator' "$work/fit_tiny.err" || { echo "FAIL: turbo mode did not say that its results may differ: $(grep -m2 host_gpu "$work/fit_tiny.err")"; fails=1; }
   [[ "$(grep -c 'may differ from the simulator' "$work/fit_tiny.err")" == 1 ]] || { echo "FAIL: the notice was not said exactly once"; fails=1; }

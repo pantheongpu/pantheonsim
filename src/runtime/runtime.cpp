@@ -1279,6 +1279,10 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
     const auto cap_t0 = std::chrono::steady_clock::now();
     // VGPU_HOST_GPU=exact: the launch may run on the machine's real GPU (vgpu/host_gpu_rt.hpp); null when the mode is off.
     hostgpu::Runtime* const hg = hostgpu::Runtime::for_device(profile_, ordinal_);
+    // Turbo mode's fit check knows the CARD's limits, not the simulated profile's: a launch the simulated profile refuses (more shared memory, threads, registers or grid than
+    // it allows, a cluster it lacks) is refused as the plain simulator refuses it, with the same error, before the card is asked. (Exact mode's card is the profile.)
+    // (a grid or block with a zero dimension is the mode's own to refuse, with its own log line, and the simulator then gives its error)
+    if (hg && hg->turbo() && !hostgpu::launch_shape_empty(cfg.grid.data(), cfg.block.data())) check_launch(fn, cfg);
     if (hg && hg->try_launch(fn, cfg, args, mem_)) {
       if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(physical_), 0.0);
       return;
