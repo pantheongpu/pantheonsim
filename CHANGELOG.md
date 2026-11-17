@@ -7,6 +7,10 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **Host-GPU size rules: the first big launch of a young process is sampled** (issues #656, #659). A launch of 65,536 threads or more whose kernel has a loop is asked neither
+  the static floor nor the process's age for its sample while the process has spent nothing on samples (one sample, 3 to 14 ms). On an A10G, CUDA Samples mergeSort goes from
+  2.30 s to 0.58 s, MC_EstimatePiInlineP from 4.09 s to 0.29 s and MC_SingleAsianOptionP from 4.09 s to 0.77 s, outputs identical, 15 other programs within 6 %.
+  `VGPU_HOST_GPU_FIRST_BIG=<threads>` sets the size, 0 is the rule before (`turbof0` in `tools/bench/hostgpu/run.py`); exact mode and `VGPU_HOST_GPU_FIT=0` only, the default turbo sends every fitting launch already.
 - **CI: the playground host can take burst jobs when two of its three slots are free** (`tools/burst-runners/host-burst.sh`, docs/ci.md).
 - **A SASS `RET` with a condition predicate returns only the lanes where both predicates hold** (issue #691). On sm_90 ptxas ends a `__noinline__`
   function that returns early when two cells are equal with a `RET` whose second predicate sits in the same bits as `BRA` and `EXIT` have it; the decoder

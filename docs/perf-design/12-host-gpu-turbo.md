@@ -842,3 +842,13 @@ of a kernel never run there was a fixed 100 us, and a launch under 200 us never 
 start share of a kernel launched thousands of times was capped at 500 launches (5,000); the first card launch's time includes the module load (65 us for a
 20 us kernel) and was kept for good (the prior is kept instead, later times at their least); and one launch that was 60 us late ended the card for its kernel
 (three in a row now). JACOBI1D 2.3 s to 1.5 s, sc_gpu 0.96 s to 0.85 s; LargeKernelParameter saves 0.2 ms a launch against the 0.25 ms its start needs, and stays in the simulator.
+
+## 18. The first big launch of a young process (#656, #659; Round r11; the size rules and exact mode)
+
+A launch the size rules had no estimate for was sampled (section on sampling above) only if its static count reached a floor or the process was old enough to
+afford a sample; a first launch that counts 13 to 600 times under what it takes (mergeSort 80 ms counted, 1.4 s taken; `initRNG` 9.5 ms counted, 6 s taken) was
+neither. Since r11 a launch of `kFirstBigThreads` (65,536) threads or more with a loop is excused both while the process has spent nothing on samples, so a
+program whose big launches are all short pays one sample (3 to 14 ms) and no more. `VGPU_HOST_GPU_FIRST_BIG=<threads>` sets it, 0 is the rule before. Measured on an A10G:
+mergeSort 2.30 s to 0.58 s, MC_EstimatePiInlineP 4.09 s to 0.29 s, MC_SingleAsianOptionP 4.09 s to 0.77 s; histogram, segmentationTreeThrust, reduction, interval,
+polybench 3MM and GEMM and others take a sample that sends nothing and are within the rig's noise (`data/r11-first-launch/`). Not caught: warpAggregatedAtomicsCG, lavaMD.
+`FIT=1` never asked these rules.

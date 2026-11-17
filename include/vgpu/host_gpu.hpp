@@ -964,6 +964,7 @@ inline double sample_timeout_seconds(uint64_t live_bytes) {
 inline constexpr double kSampleStaticFloorSeconds = 0.030;
 inline constexpr double kSampleShareOfAge = 0.02;
 inline constexpr double kSampleCostGuessSeconds = 0.003;
+inline constexpr uint64_t kFirstBigThreads = 65536;   // (fitted by the card run: docs/perf-design/data/r11-first-launch/)
 inline constexpr double kSampleSecondsPerLiveByte = 6e-10;
 inline double sample_static_floor(uint64_t live_bytes) {
   return std::max(kSampleStaticFloorSeconds, 3.0 * kSampleSecondsPerLiveByte * static_cast<double>(live_bytes));
@@ -1307,7 +1308,13 @@ struct SampleCandidate {
   double bound_turns = 1;   // ... and the most turns one of them has if it runs from 0 to its bound (bound_turns), when the launch gives the bound
   bool bounded = false;     // bounded blocks are on (Round sp75; VGPU_HOST_GPU_SAMPLE_BLOCK): a small grid with no followed loop is sampled by whole blocks
   bool driver_up = false;   // the driver is up (Round sp76): the launch has no start to repay, and a whole launch of its kernel that the simulator has run is asked the floor
+  uint64_t threads = 0;      // blocks times threads per block
+  uint64_t big_threads = 0;  // a launch of this many threads is sampled whatever the floor and the process's age (kFirstBigThreads; 0: no such rule)
 };
+// A launch big enough that its sample is worth the few milliseconds it costs even in a young process (#659: mergeSort's first launch, 2 million threads,
+// took 1.4 s of a 1.9 s run and counted 80 ms). Only the process's first sample is excused, so a program whose big launches are all short pays one sample.
+// (A second one was tried: CUDA Samples warpAggregatedAtomicsCG's second big launch is sampled and not sent, 14 ms for nothing.)
+inline bool sample_big_launch(const SampleCandidate& w) { return w.big_threads != 0 && w.threads >= w.big_threads && w.spent_s == 0; }
 // Whether the launch is sampled inside its blocks (Round sp61) rather than by whole blocks: a grid too small for the latter, of a kernel with a followed loop.
 inline bool sample_inside(const SampleCandidate& w) { return sample_blocks(w.blocks) == 0 && w.followed && inblock_blocks(w.blocks) != 0; }
 // Whether the launch is sampled by bounded whole blocks of a small grid (Round sp75): a grid neither of the two above takes.
@@ -1368,7 +1375,7 @@ inline NoSample sample_refusal(const SampleCandidate& w, const Costs& c, double 
   if (!w.loop) return NoSample::NoLoop;
   if (sample_blocks(w.blocks) == 0 && !sample_inside(w) && !sample_bounded_small(w)) return NoSample::SmallGrid;
   if (w.whole_s && *w.whole_s <= sample_short_before_seconds(w, c, card_path_s)) return NoSample::ShortBefore;
-  if (!(sample_floor_estimate(w) >= sample_floor(w) || sample_affordable(w.age_s, w.spent_s, sample_expected_seconds(w)))) return NoSample::Floor;
+  if (!(sample_floor_estimate(w) >= sample_floor(w) || sample_big_launch(w) || sample_affordable(w.age_s, w.spent_s, sample_expected_seconds(w)))) return NoSample::Floor;
   return NoSample::None;
 }
 inline const char* no_sample_text(NoSample r) {
