@@ -55,6 +55,7 @@ struct Kernel {
   double sim_s = 0;        // seconds its launches took in the simulator (the last run that kept it)
   bool card_ok = false;    // a launch of it came back from the card
   bool faulted = false;    // a launch of it failed on the card (error 700, 719, ...): it is kept in the simulator from the first launch, in every later run
+  bool loop = false;       // its code has a loop (the simulator's time then is not a function of the code and the grid: aobench 0.7 s on 65,536 threads, bfs 5 ms on 106,496)
 };
 
 struct Record {
@@ -64,6 +65,7 @@ struct Record {
   double card_total_s = 0;   // seconds of the card path of the last run that used the card
   uint32_t launches = 0;     // launches of the last run
   uint64_t threads_total = 0;   // threads of all its launches
+  double loopfree_work = 0;
   std::vector<Kernel> kernels;
 };
 
@@ -75,6 +77,7 @@ struct Observed {
   double card_s = 0;       // seconds of the launches the card ran (card path, copies included)
   uint32_t launches = 0;   // all launches
   uint64_t threads = 0;    // threads of all launches (grid x block)
+  double loopfree_work = 0;   // threads x static instructions, over the launches whose kernel has no loop
   std::vector<Kernel> kernels;   // this process's: launches, card_s, sim_s, card_ok, faulted
 };
 
@@ -83,8 +86,9 @@ struct Limits {
   double budget_s = 0.25;     // a process held in the simulator gives up after this much simulator time: a wrong history costs at most one start
   double candidate_card_s = 0.005;   // a card run is a candidate when the card path took less than this in all ...
   uint32_t candidate_launches = 512;   // ... in at most this many launches ...
-  uint64_t candidate_threads = 131072;   // ... of at most this many threads in all. Not a bound on the simulator's time: a loop-heavy kernel of few threads passes, and the hold's budget
-                                         // ends the trial at the next launch (docs section 17.1 for the measured ratio of simulator seconds to card seconds, 11 to 4,200)
+  double candidate_loopfree_work = 4e8;   // ... and the threads x static instructions of the kernels without a loop at most this much (atan2 6e7 took 19 ms in the simulator, blockAccess 7e7 13 ms) ...
+  uint64_t candidate_loop_threads = 8192;   // ... and no launch of a kernel with a loop larger than this (bfs: 4,096; aobench 65,536 and bilateral 32,768 are out). Not a bound on the simulator's time (a
+                                            // loop of long trip count in a few threads passes), only on what the measured programs show (docs section 17.1)
 };
 
 inline Limits limits_for_start_cost(double start_cost_s, double candidate_card_s = 0.005) {
@@ -113,17 +117,20 @@ inline void update(Record* rec, const Observed& o, const Limits& lim) {
   ++rec->runs;
   rec->launches = o.launches;
   rec->threads_total = o.threads;
-  bool any_fault = false;
+  rec->loopfree_work = o.loopfree_work;
+  bool any_fault = false, loops_too_wide = false;
   for (const Kernel& k : o.kernels) {
     any_fault = any_fault || k.faulted;
     Kernel* m = find_kernel(rec->kernels, k.name);
     if (!m) {
       if (rec->kernels.size() >= kMaxKernels || k.name.empty() || k.name.size() > kMaxNameBytes) continue;
-      rec->kernels.push_back(Kernel{k.name, 0, 0, 0, 0, false, false});
+      rec->kernels.push_back(Kernel{k.name, 0, 0, 0, 0, false, false, false});
       m = &rec->kernels.back();
     }
     m->launches = k.launches;
     m->max_threads = k.max_threads;
+    m->loop = k.loop;
+    loops_too_wide = loops_too_wide || (k.loop && k.max_threads > lim.candidate_loop_threads);
     if (k.card_ok || k.card_s > 0) m->card_s = k.card_s;
     if (k.sim_s > 0) m->sim_s = k.sim_s;
     m->card_ok = m->card_ok || k.card_ok;
@@ -136,7 +143,7 @@ inline void update(Record* rec, const Observed& o, const Limits& lim) {
   }
   rec->card_total_s = o.card_s;
   if (rec->verdict == Verdict::Tiny || rec->verdict == Verdict::Long) return;
-  rec->verdict = !any_fault && o.card_s < lim.candidate_card_s && o.launches > 0 && o.launches <= lim.candidate_launches && o.threads <= lim.candidate_threads ? Verdict::Candidate : Verdict::Unknown;
+  rec->verdict = !any_fault && o.card_s < lim.candidate_card_s && o.launches > 0 && o.launches <= lim.candidate_launches && o.loopfree_work <= lim.candidate_loopfree_work && !loops_too_wide ? Verdict::Candidate : Verdict::Unknown;
 }
 
 // A kernel's failure on the card, noted at once (the run is counted at its end by `update`).
@@ -145,7 +152,7 @@ inline void note_fault(Record* rec, const std::string& kernel) {
   Kernel* m = find_kernel(rec->kernels, kernel);
   if (!m) {
     if (rec->kernels.size() >= kMaxKernels) return;
-    rec->kernels.push_back(Kernel{kernel, 0, 0, 0, 0, false, false});
+    rec->kernels.push_back(Kernel{kernel, 0, 0, 0, 0, false, false, false});
     m = &rec->kernels.back();
   }
   m->faulted = true;
@@ -228,19 +235,19 @@ inline std::string hex16(uint64_t v) {
 // key <16 hex>
 // runs <n>
 // verdict <0..3>
-// totals <sim_total_s> <card_total_s> <launches> <threads>
-// kernel <launches> <max_threads> <card_s> <sim_s> <card_ok> <faulted> <name>     (up to kMaxKernels)
+// totals <sim_total_s> <card_total_s> <launches> <threads> <loopfree_work>
+// kernel <launches> <max_threads> <card_s> <sim_s> <card_ok> <faulted> <loop> <name>     (up to kMaxKernels)
 // sum <16 hex>                                                         (of every byte before this line)
 inline std::string serialize(const std::string& key, const Record& r) {
   std::string body = "vgpu-host-gpu-history " + std::to_string(kVersion) + "\nkey " + key + "\nruns " + std::to_string(r.runs) + "\nverdict " +
                      std::to_string(static_cast<int>(r.verdict)) + "\n";
   char buf[320];
-  std::snprintf(buf, sizeof buf, "totals %.9g %.9g %u %llu\n", r.sim_total_s, r.card_total_s, r.launches, static_cast<unsigned long long>(r.threads_total));
+  std::snprintf(buf, sizeof buf, "totals %.9g %.9g %u %llu %.9g\n", r.sim_total_s, r.card_total_s, r.launches, static_cast<unsigned long long>(r.threads_total), r.loopfree_work);
   body += buf;
   size_t n = 0;
   for (const Kernel& k : r.kernels) {
     if (n++ >= kMaxKernels || k.name.empty() || k.name.size() > kMaxNameBytes || k.name.find('\n') != std::string::npos) continue;
-    std::snprintf(buf, sizeof buf, "kernel %u %llu %.9g %.9g %d %d ", k.launches, static_cast<unsigned long long>(k.max_threads), k.card_s, k.sim_s, k.card_ok ? 1 : 0, k.faulted ? 1 : 0);
+    std::snprintf(buf, sizeof buf, "kernel %u %llu %.9g %.9g %d %d %d ", k.launches, static_cast<unsigned long long>(k.max_threads), k.card_s, k.sim_s, k.card_ok ? 1 : 0, k.faulted ? 1 : 0, k.loop ? 1 : 0);
     body += buf + k.name + "\n";
   }
   Hasher h;
@@ -285,9 +292,10 @@ inline bool parse(const std::string& text, const std::string& key, Record* out) 
     } else if (starts("totals ")) {
       unsigned l = 0;
       unsigned long long th = 0;
-      double a = 0, b = 0;
+      double a = 0, b = 0, w = 0;
       char extra = 0;
-      if (std::sscanf(line.c_str() + 7, "%lf %lf %u %llu%c", &a, &b, &l, &th, &extra) != 4 || !(a >= 0) || !(b >= 0)) return false;
+      if (std::sscanf(line.c_str() + 7, "%lf %lf %u %llu %lf%c", &a, &b, &l, &th, &w, &extra) != 5 || !(a >= 0) || !(b >= 0) || !(w >= 0)) return false;
+      r.loopfree_work = w;
       r.sim_total_s = a;
       r.card_total_s = b;
       r.launches = l;
@@ -298,10 +306,10 @@ inline bool parse(const std::string& text, const std::string& key, Record* out) 
       unsigned l = 0;
       unsigned long long mt = 0;
       double cs = 0, ss = 0;
-      int ok = 0, f = 0, used = 0;
-      if (std::sscanf(line.c_str() + 7, "%u %llu %lf %lf %d %d %n", &l, &mt, &cs, &ss, &ok, &f, &used) != 6 || used <= 0) return false;
+      int ok = 0, f = 0, lp = 0, used = 0;
+      if (std::sscanf(line.c_str() + 7, "%u %llu %lf %lf %d %d %d %n", &l, &mt, &cs, &ss, &ok, &f, &lp, &used) != 7 || used <= 0) return false;
       const std::string name = line.substr(7 + used);
-      if (name.empty() || name.size() > kMaxNameBytes || !(cs >= 0) || !(ss >= 0) || (ok != 0 && ok != 1) || (f != 0 && f != 1) || r.kernels.size() >= kMaxKernels) return false;
+      if (name.empty() || name.size() > kMaxNameBytes || !(cs >= 0) || !(ss >= 0) || (ok != 0 && ok != 1) || (f != 0 && f != 1) || (lp != 0 && lp != 1) || r.kernels.size() >= kMaxKernels) return false;
       k.name = name;
       k.launches = l;
       k.max_threads = mt;
@@ -309,6 +317,7 @@ inline bool parse(const std::string& text, const std::string& key, Record* out) 
       k.sim_s = ss;
       k.card_ok = ok == 1;
       k.faulted = f == 1;
+      k.loop = lp == 1;
       r.kernels.push_back(std::move(k));
     } else {
       return false;

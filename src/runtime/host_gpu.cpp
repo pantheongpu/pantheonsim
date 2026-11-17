@@ -625,7 +625,8 @@ struct Runtime::Impl : CardGate {
   history::Record hist_rec;
   history::Limits hist_lim;
   std::map<std::string, history::Kernel> hist_kernels;   // this process's, by kernel
-  uint64_t hist_kept = 0, hist_threads = 0;   // launches kept in the simulator by the history (a hold, or a kernel known to fail)
+  uint64_t hist_kept = 0, hist_threads = 0;
+  double hist_loopfree_work = 0;   // threads x static instructions of the launches of kernels without a loop (the verdict was asked of them)   // launches kept in the simulator by the history (a hold, or a kernel known to fail)
 
   // Reads the history once (idempotent); true when the process is to hold the driver back. Called with the gate held.
   bool hist_init() {
@@ -710,6 +711,7 @@ struct Runtime::Impl : CardGate {
     o.sim_s = stats.sim_seconds;
     o.card_s = stats.card_seconds;
     o.threads = hist_threads;
+    o.loopfree_work = hist_loopfree_work;
     for (const auto& [name, k] : hist_kernels) {
       history::Kernel c = k;
       c.name = name;
@@ -721,9 +723,9 @@ struct Runtime::Impl : CardGate {
     history::update(&rec, o, hist_lim);
     history::store(hist_dir, hist_key, rec);
     if (logging())
-      std::fprintf(stderr, "host_gpu_history: key=%s before=%s after=%s held=%d released=%d kept_launches=%llu sim_s=%.6f card_s=%.6f launches=%u faulted_kernels=%zu\n", hist_key.c_str(),
+      std::fprintf(stderr, "host_gpu_history: key=%s before=%s after=%s held=%d released=%d kept_launches=%llu sim_s=%.6f card_s=%.6f launches=%u threads=%llu loopfree_work=%.4g faulted_kernels=%zu\n", hist_key.c_str(),
                      hist_before.c_str(), rec.verdict == history::Verdict::Tiny ? "tiny" : rec.verdict == history::Verdict::Long ? "long" : rec.verdict == history::Verdict::Candidate ? "candidate" : "unknown",
-                     hist_hold ? 1 : 0, hist_released ? 1 : 0, static_cast<unsigned long long>(hist_kept), o.sim_s, o.card_s, o.launches,
+                     hist_hold ? 1 : 0, hist_released ? 1 : 0, static_cast<unsigned long long>(hist_kept), o.sim_s, o.card_s, o.launches, static_cast<unsigned long long>(o.threads), o.loopfree_work,
                      static_cast<size_t>(std::count_if(rec.kernels.begin(), rec.kernels.end(), [](const history::Kernel& k) { return k.faulted; })));
   }
 
@@ -2104,6 +2106,11 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   const uint64_t static_instrs = dec.instrs;
   const bool runnable = dec.runnable, back_edge = dec.back_edge;
   const bool in_exact_set = dec.ok;   // (in turbo mode: admitted by its classes)
+  if (im.hist_on) {
+    const bool loop = dec.loop;   // (a real cycle in the flow: back_edge is true of every SASS kernel, which ends in a branch to itself)
+    if (!loop) im.hist_loopfree_work += static_cast<double>(cfg.grid[0]) * cfg.grid[1] * cfg.grid[2] * cfg.block[0] * cfg.block[1] * cfg.block[2] * static_cast<double>(dec.instrs);
+    im.hist_kernels[fn.name].loop = loop;
+  }
   im.last.in_set = in_exact_set;
   im.last.threads_per_block = cfg.block[0] * cfg.block[1] * cfg.block[2];
   im.last.instrs = static_instrs;
