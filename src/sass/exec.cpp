@@ -237,7 +237,7 @@ struct Warp {
 };
 // Warp::reset names every member. A member added changes this size (or not, if it fits in padding, which the debug build's
 // expect_new_warp would then catch): add it to reset() and to expect_new_warp, then change the number.
-static_assert(sizeof(Warp) == 2520, "Warp has a new member: see Warp::reset");
+static_assert(sizeof(Warp) == 2528, "Warp has a new member: see Warp::reset");
 
 // A warpgroup MMA's shared-memory operands, read by the first of its four
 // warps (exec_gmma).
@@ -1480,7 +1480,7 @@ static void expect_new_warp(const Warp& w) {
             w.ws_held == f.ws_held && same(w.wait_kind, f.wait_kind) && same(w.wait_arg, f.wait_arg) && same(w.b, f.b) &&
             w.mactive_force == f.mactive_force && same(w.bssy_stamp, f.bssy_stamp) && w.gmma_issued == f.gmma_issued &&
             w.code_hint == f.code_hint && w.budget == f.budget && w.extra == f.extra && w.local.empty() && w.steps == f.steps &&
-            w.spins == f.spins && w.give_way == f.give_way && w.spin_yields == f.spin_yields && w.forced == f.forced &&
+            w.timer_extra == f.timer_extra && w.spins == f.spins && w.give_way == f.give_way && w.spin_yields == f.spin_yields && w.forced == f.forced &&
             w.ur_saved.empty() && w.idle_yields == f.idle_yields &&
             w.yield_pc == f.yield_pc && w.slice == f.slice && w.b2r == f.b2r && w.b2r_pred == f.b2r_pred && w.yield == f.yield &&
             w.store_gate == f.store_gate && w.cga_arrived == f.cga_arrived && same(w.rare(), f.rare()) && !w.rare_dirty;
