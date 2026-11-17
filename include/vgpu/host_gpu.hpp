@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <map>
 #include <optional>
@@ -65,8 +66,16 @@ inline bool diagnostic_switched_on(const std::string& name, const char* value) {
 // inside this set agreed with the card to the bit, and every kernel that differed held one instruction outside it (MUFU, a
 // compare-and-swap, a floating-point atomic). A mnemonic that is not named here is refused: an unknown instruction is not
 // known to be exact.
+inline uint64_t pack_mnemonic(const char* s, size_t n) {
+  uint64_t k = 0;
+  std::memcpy(&k, s, n);
+  return k;
+}
 inline bool exact_mnemonic_allowed(const std::string& m) {
-  static const char* const kAllowed[] = {
+  // (every name fits 8 bytes, so a name is one integer and the lookup a binary search: a string hash of every instruction was what the scan cost)
+  static const std::vector<uint64_t> kAllowed = [] {
+    std::vector<uint64_t> keys;
+    for (const char* a : {
       // integer
       "IMAD", "IADD3", "IADD", "LOP3", "LOP", "LEA", "SHF", "SHL", "SHR", "ISETP", "IMNMX", "IABS", "POPC", "FLO", "BREV", "PRMT",
       "SEL", "MOV", "R2P", "P2R", "PLOP3", "UPLOP3", "PSETP", "ISET", "FSET", "DSET", "I2I", "I2IP", "SGXT", "BMSK", "VIADD", "VIMNMX",
@@ -83,10 +92,12 @@ inline bool exact_mnemonic_allowed(const std::string& m) {
       "SHFL", "VOTE", "MATCH",
       // integer reductions with no returned value (order of the adds does not matter)
       "RED",
-  };
-  for (const char* a : kAllowed)
-    if (m == a) return true;
-  return false;
+         })
+      keys.push_back(pack_mnemonic(a, std::strlen(a)));
+    std::sort(keys.begin(), keys.end());
+    return keys;
+  }();
+  return m.size() <= 8 && std::binary_search(kAllowed.begin(), kAllowed.end(), pack_mnemonic(m.data(), m.size()));
 }
 
 // Modifiers that turn an allowed mnemonic into an order- or implementation-dependent one: a floating-point reduction adds in
@@ -259,7 +270,9 @@ inline bool mods_float_typed(const std::vector<std::string>& mods) {
 }
 // A field the decoder could not name prints as "(9)": an instruction that carries one is not known.
 inline bool mods_undecoded(const std::vector<std::string>& mods) {
-  return any_mod_part(mods, [](const std::string& p) { return p[0] == '('; });
+  for (const std::string& m : mods)
+    if (m[0] == '(' || m.find(".(") != std::string::npos) return true;
+  return false;
 }
 
 inline InsnClass turbo_class(const std::string& mnemonic, const std::vector<std::string>& mods) {
@@ -1049,12 +1062,10 @@ inline exec::ProbeOperand probe_reg_operand(int n) {
   return o;
 }
 
-inline std::vector<FoundLoop> find_probe_loops(const std::vector<LoopCodeInsn>& code) {
-  std::vector<FoundLoop> out;
+// What the entry reaches, by flow alone.
+template <class T, class FlowOf>
+inline std::vector<uint8_t> entry_reach(const std::vector<T>& code, FlowOf flow_of) {
   const size_t n = code.size();
-  for (const LoopCodeInsn& c : code)
-    if (c.flow.indirect) return out;   // a jump through a register or a call: the flow is not all in view
-  // What the entry reaches.
   std::vector<uint8_t> reach(n, 0);
   std::vector<size_t> todo;
   if (n) {
@@ -1070,9 +1081,28 @@ inline std::vector<FoundLoop> find_probe_loops(const std::vector<LoopCodeInsn>& 
         todo.push_back(static_cast<size_t>(j));
       }
     };
-    if (code[i].flow.falls_through) go(static_cast<int64_t>(i) + 1);
-    go(code[i].flow.target);
+    if (flow_of(code[i]).falls_through) go(static_cast<int64_t>(i) + 1);
+    go(flow_of(code[i]).target);
   }
+  return reach;
+}
+
+// Whether a branch goes back from an instruction the entry reaches to one it reaches: without one the flow has no cycle and find_probe_loops finds no loop.
+inline bool has_reachable_back_edge(const std::vector<FlowInsn>& code) {
+  const std::vector<uint8_t> reach = entry_reach(code, [](const FlowInsn& f) -> const FlowInsn& { return f; });
+  for (size_t i = 0; i < code.size(); ++i) {
+    const int64_t t = code[i].target;
+    if (reach[i] && t >= 0 && static_cast<size_t>(t) <= i && reach[static_cast<size_t>(t)]) return true;
+  }
+  return false;
+}
+
+inline std::vector<FoundLoop> find_probe_loops(const std::vector<LoopCodeInsn>& code) {
+  std::vector<FoundLoop> out;
+  const size_t n = code.size();
+  for (const LoopCodeInsn& c : code)
+    if (c.flow.indirect) return out;   // a jump through a register or a call: the flow is not all in view
+  const std::vector<uint8_t> reach = entry_reach(code, [](const LoopCodeInsn& c) -> const FlowInsn& { return c.flow; });
   // Back edges, one range per loop head.
   std::map<size_t, size_t> range;   // head -> last back edge to it
   for (size_t i = 0; i < n; ++i) {

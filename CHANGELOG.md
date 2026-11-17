@@ -11,6 +11,11 @@ release says what runs and what it produces, never how fast a real GPU would run
   function that returns early when two cells are equal with a `RET` whose second predicate sits in the same bits as `BRA` and `EXIT` have it; the decoder
   dropped it, so lanes that were not equal returned without running the rest, and about a third of an atomic counter's increments were lost. The test
   is `e2e_ret_condition_predicate`.
+- **Turbo and exact host-GPU modes cost a program whose launches stay in the simulator much less** (issues #662, #660). A program of 50 distinct
+  kernels launched once each ran 1.29x slower with `VGPU_HOST_GPU=turbo` than without; it is now 1.02x, and 5,000 short launches of one kernel went from
+  1.18x to 1.07x (the same decisions, outputs and counters). The scan of each kernel's code skips the loop analysis when no loop can run, looks
+  mnemonics up as integers, and the module's call graph walk no longer builds a string per section; `VGPU_HOST_GPU_LOG` is read once.
+
 - **PTX with an `.extern` variable is judged as NVIDIA's driver judges it** (issue #681, follow-up to the entry below). The same RTX 3080 Ti was
   asked about the cases the first change did not cover, and answered differently from the simulator in four of them. Now, as on the card:
   an `.extern` variable with an initialiser (`.extern .global .u32 e = 5;`) fails the load with `CUDA_ERROR_INVALID_PTX`
