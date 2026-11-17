@@ -14,4 +14,10 @@
 
 namespace vgpu {
 inline constexpr uint64_t kGlobalTimerReadNs = 64;
+
+// The end of the SASS engine's step-budget error ("... instructions (an infinite loop?" + this + ")"), thrown from two places (the interpreter's run loop and
+// the tier's chain) that must say the same: a long wait on a clock reaches the budget too, and how to lift it (#687).
+inline constexpr const char* kSassStepBudgetHint =
+    " or a long wait on SR_CLOCK, which counts one instruction per cycle, or on SR_GLOBALTIMER, which counts one per read plus 64 ns;"
+    " --max-steps 0 lifts the budget";
 }  // namespace vgpu

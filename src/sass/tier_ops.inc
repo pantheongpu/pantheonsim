@@ -2757,7 +2757,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       }
       if (++w.steps > max_steps_)
         throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(max_steps_) +
-                                      " instructions (an infinite loop?)");
+                                      " instructions (an infinite loop?" + kSassStepBudgetHint + ")");
       const tier::MOp& op = *o;
       cur = o;
       if (o < olim && op.straight) {

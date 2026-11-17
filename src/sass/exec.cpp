@@ -2407,8 +2407,7 @@ bool Runner::step_warp(Block& blk, Warp& w) {
     }
     if (++w.steps > max_steps_)
       throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(max_steps_) +
-                                    " instructions (an infinite loop? or a long wait on SR_CLOCK, which counts one instruction per cycle, or on"
-                                    " SR_GLOBALTIMER, which counts one per read plus 64 ns; --max-steps 0 lifts the budget)");
+                                    " instructions (an infinite loop?" + kSassStepBudgetHint + ")");
     if (n < 256 && pc + 16 < end && ins->straight) {
       execute(blk, w, *ins, group, /*advance=*/false);
       pc += 16;
