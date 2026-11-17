@@ -1,0 +1,17 @@
+E1 linear handles: 1 2 3
+E1 after destroy+create: 2 (reuse of freed YES)
+E1 array tex 5 surf 6
+E3 array read via device->array copy: 0 bad of 128
+E2 substituted-value launch: 0 bad
+E2 struct-param handle: 0 bad
+E2 handle only in device memory: 0 bad (native ok)
+E2 bogus handle 0x10000000001: no error; first outputs 0 0 0 0
+E2 destroyed handle 1: no error; first outputs 0 0
+E3 surface write then array->linear: 0 bad
+E3 kind 0 (3D) dense-linear->array read back by kernel: 0 bad of 512 (no error)
+E3 kind 0 array->linear roundtrip: 0 bad
+E3 kind 1 (layered) dense-linear->array read back by kernel: 0 bad of 512 (no error)
+E3 kind 1 array->linear roundtrip: 0 bad
+E3 kind 2 (cubemap) dense-linear->array read back by kernel: 0 bad of 384 (no error)
+E3 kind 2 array->linear roundtrip: 0 bad
+E4 device->array copy of 64 MiB: 0.279 ms each (240.1 GB/s)

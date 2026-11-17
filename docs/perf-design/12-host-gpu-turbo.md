@@ -1204,3 +1204,61 @@ What is left of the 0.24 s is the driver's start and the process's end. A persis
 
 The gains need the record: a first run, a run after the record's key changed (another build of the program, another card, another switch), and a run on a machine that does not keep the directory are as slow as turbo. A second run may be a trial that loses (17.1: bounded, once per key, and none lost on the five programs tried that way). The candidate rule misses short programs with loops. Programs that load modules through the driver API
 have no key. The candidate/long judgement ignores the input. `VGPU_THREADS` is not in the key. WSL2 hosts have no turbo FIT=1 (section 15), so no history. The work-queue setting applies to every turbo process that finds the variable unset, a user's own setting is the way out.
+
+
+## 22. Texture and surface offload: what the card needs, what was measured, and why it is not built (2026-11-17)
+
+Tags: [M] measured on one A10G (sm_86, driver 595, nvcc 13.0, native CUDA, no simulator), [D] documented in the simulator's source, [I] inferred, [U] unknown. Experiment source and output:
+[data/turbo-tex/exp.cu](data/turbo-tex/exp.cu), [data/turbo-tex/out.txt](data/turbo-tex/out.txt). **Outcome: nothing is built. Texture and surface instructions stay class `never`, and a launch that
+has one stays in the simulator exactly as in section 15.** This section is the design that was checked and the reasons it was not shipped.
+
+### 17.1 What the simulator holds [D]
+
+* A texture or surface object is an entry of `exec::TextureTable` (handle to `exec::TextureDesc`, `include/vgpu/exec/texture.hpp`), made by `cuTexObjectCreate`, `cuSurfObjectCreate`
+  (`nvidia/src/driver_api.cpp make_object`) and `cudaCreateTextureObject`, `cudaCreateSurfaceObject` (`runtime_api.cpp`). The handle is `(1 << 40) + n`, a counter that never reuses a value. The launch
+  reaches the table through `LaunchConfig::textures`.
+* `TextureDesc` is already everything the card needs to rebuild the object: base address, width/height/depth, layers, cubemap, pitch, channel count and bit widths, kind, address modes, filter,
+  normalised coordinates, sRGB, border colour, `read_as_normalized_float`, `from_array`. The original `CUDA_RESOURCE_DESC`, `CUDA_TEXTURE_DESC` and view descriptor are also kept (`g_object_descs`, driver path only).
+* Linear and pitch-2D resources point into ordinary simulator memory, which turbo already mirrors at identical virtual addresses. An array is also ordinary memory in the simulator (`ArrayRec::mem`,
+  dense rows of `row` bytes, slices after each other), so its bytes are in the mirrored window too; the card's array layout is opaque, so the card needs its own array filled by a copy.
+* Legacy `texture<>` references and `cuModuleGetTexRef`: CUDA 12 and later compilers no longer emit them, and the shim does not launch with them (`driver_api.cpp TexRefRec`). Rodinia's leukocyte, kmeans,
+  hybridsort and mummergpu use them and do not build with nvcc 13; none is in the corpus [M, source grep]. Module-level texture references are therefore not a case that needs a design for CUDA 13 builds; an older cubin that has one stays refused.
+
+### 17.2 What the corpus pays [M, existing tables]
+
+The simulator time of launches kept off the card by texture or surface instructions (`data/sp66/census.md`, `data/turbo-left/README.md`): 23 programs, 0.36 s in total, the largest dct8x8 (0.24 s), then
+simpleLayeredTexture 0.08 s, simpleSurfaceWrite 0.03 s, simpleCubemapTexture; "about 1 s of the issue's 4 s" in the turbo-left census when the programs' other costs are counted. No texture program in the corpus runs for
+seconds. Under `VGPU_HOST_GPU_FIT=1` a driver start is 0.2 to 0.5 s per process (section 15, 5), which is more than every one of these programs' texture time, so sending them would make them slower, not faster. Under
+`FIT=0` the size rule would keep launches this small in the simulator anyway. A program with a large image and many launches could gain; none was found to measure [U].
+
+### 17.3 Experiments on the card [M, A10G]
+
+1. **Card handles are small counters.** Linear objects got 1, 2, 3; an array texture 5 and its surface 6; a destroyed handle's value is handed out again on the next create. The simulator's handles
+   (2^40 + n) are never valid on the card, so every handle the kernel reads must be replaced by the card's.
+2. **A wrong handle fails silently.** A kernel given `0x10000000001` (never made) or a destroyed handle returned zeros and no error. Any handle the translation misses reads as zeros, not as a fault.
+3. **Substituting the 8-byte word in a kernel parameter works**: a texture handle passed alone, and one inside a struct parameter with a pointer next to it, both read correctly (0 bad of 128).
+4. **A handle kept in device memory (a struct the program copied to the card) also works natively, and cannot be found by looking at the launch's arguments.** The translation would have to scan memory, and a
+   `__constant__` or module-variable holder would have to be patched in the constant-bank copy as well.
+5. **Arrays can be mirrored by plain copies.** A dense linear buffer copied into a card array with `cuMemcpy2D` (2D) or `cuMemcpy3D` (3D, layered, cubemap), then read by a kernel, gives 0 bad words; a
+   surface write followed by array-to-linear copy gives 0 bad words; array-to-linear round trips of 3D, layered and cubemap arrays are exact. A 64 MiB device-to-array copy took 0.28 ms (240 GB/s).
+
+### 17.4 The design these results allow
+
+For a launch whose code has texture or surface instructions: (a) find every 8-byte aligned word of the arguments that is a live handle of `cfg.textures`; (b) create, once per handle and keyed by it, the card's object from
+`TextureDesc` (linear and pitch-2D over the window at the same address; array: a card array of the same shape and channel format, `cuMemcpy2D/3D` from the window before each launch, the same copy back to the window after
+a launch that has a surface object, which is the only way an array changes on the card); (c) replace the words; (d) forget card objects whose simulator handle left the table. Pure code (descriptor translation,
+argument scan) is unit-testable; the creation and copies need the stub driver to model `cuTexObjectCreate`, `cuSurfObjectCreate`, `cuArray3DCreate` and `cuMemcpy2D/3D`.
+
+### 17.5 Why it is not built
+
+1. **A missed handle is silent wrong data (17.3, 2), and a handle held in memory cannot be found (17.3, 4).** Turbo is allowed to differ in the last bits; it is not allowed to read zeros for an unnoticed
+   texture. A guard that refuses a launch when any live object is absent from its arguments would refuse legitimate programs and still not see handles whose value sits in memory the program wrote. No sound static rule for
+   "the kernel's handles are exactly its parameters" was found: the handle register of a SASS `TEX` would need data-flow back to a parameter load [U, not attempted].
+2. **The payoff measured is small** (17.2): below the driver start of the process in all but one program.
+3. **Not bit-accurate beyond last bits** is not established for filtered fetches: the simulator's filter and the hardware's 1/256-texel fraction were not compared (no simulator was built on the rig) [U]. Mipmaps, views
+   (`apply_view_format` changes the format after the fact), block-compressed formats and cubemap filtering would each need their own card-side check; a subset that excludes them is easy to state, but the
+   subset is the corpus's own handful of programs.
+4. **The change touches the launch path every other turbo branch edits** (argument vector, push loop, post-launch step), for 0.36 s.
+
+What would change this: a real program with seconds of simulated texture time (then the subset (a) to (d) over linear, pitch-2D and 2D/3D/layered arrays with handles only as parameters, and a launch refused when a handle
+is found nowhere in the arguments but live objects exist, is the design to build, with a `refused_texture` counter), or a SASS data-flow check that proves every texture handle is a parameter.

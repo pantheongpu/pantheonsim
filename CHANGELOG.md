@@ -53,6 +53,11 @@ release says what runs and what it produces, never how fast a real GPU would run
   as a bounded trial and leaves tiny or long, the third gains; a hold ends when the simulator has spent the start cost, or at a launch much larger than the record's. A missing, corrupt, foreign, stale or concurrently written file is no history; the record never changes a result; exact mode and `VGPU_HOST_GPU_FIT=0` never read it. Turbo mode also asks the driver for one work queue
   (`CUDA_DEVICE_MAX_CONNECTIONS=1`, unless set: the driver's start and end cost about 0.24 s of every process, 0.155 s with it; turbo launches on one stream) and, with a history directory, keeps the driver's compile cache in `<directory>/cuda-cache` (PTX-only HeCBench s3d: 3.0 s of JIT on every run, 0.025 s with the cache). Unit test `test_host_gpu_history`
   (corrupt, version, concurrent writers), stub steps 58 to 63, ten mutations each caught.
+
+- **Turbo texture and surface offload: design and measurements, nothing built** (docs/perf-design/12-host-gpu-turbo.md section 22). Texture and surface instructions stay refused in turbo as before. On an A10G the card's
+  texture handles are small counters (1, 2, 3), a handle it does not know reads as zeros with no error, substituting handle words in kernel parameters and mirroring arrays with `cuMemcpy2D/3D` both work, and a handle held
+  in device memory cannot be found from a launch's arguments; with 0.36 s of simulator time in the whole corpus, below one driver start, the path was not built. Experiment source and output are under `docs/perf-design/data/turbo-tex/`.
+
 - **Turbo host-GPU mode, next round: PTX retargeting, a driver start that overlaps the program's set-up, and the simulated profile's launch limits** (follows the turbo-fit round, PR #693).
   A module whose only PTX is plain `.target sm_90` (a build with `-arch=sm_90` or `compute_90` alone) now runs on an sm_80, sm_86 or sm_87 card: its target line is rewritten to
   the card's and the driver compiles it, provided the PTX uses no form that card lacks (a text scan of the forms ptxas 13.0 rejects there: `mbarrier.try_wait`, `expect_tx`, count-form
