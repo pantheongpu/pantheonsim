@@ -79,6 +79,7 @@ int main(int argc, char** argv) {
     read_back("copy", 0, buf[0]);
   } else if (!std::strcmp(mode, "peerptr")) {
     buf[0] = make(0, 7);
+    buf[1] = make(1, 9);   // (device 1 holds live memory of its own, so a launch on it has a window to be sent in)
     cudaSetDevice(1);
     bump<<<1, 32>>>(buf[0], 4);
     std::printf("peer pointer launch: %s / %s\n", cudaGetErrorName(cudaGetLastError()), cudaGetErrorName(cudaDeviceSynchronize()));

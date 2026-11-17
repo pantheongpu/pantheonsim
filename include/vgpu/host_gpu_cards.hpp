@@ -136,6 +136,15 @@ inline CardPick pick_card(int slot, const std::vector<int>* list, const char* cv
   return p;
 }
 
+// The device slot whose launches the runtime serves, or -1 when the device is not served. Exact mode serves the device in ordinal 0 only (its window is slot 0's, on
+// the driver's device 0, whatever CUDA_VISIBLE_DEVICES made of the simulated machine: exact mode is unchanged by the several-card work). Turbo mode serves every
+// device in a window the simulator has (`physical`: the device's slot, -1 for the ordinal).
+inline int served_slot(bool turbo, int ordinal, int physical, uint64_t windows) {
+  if (!turbo) return ordinal == 0 ? 0 : -1;
+  const int slot = physical >= 0 ? physical : ordinal;
+  return slot < 0 || static_cast<uint64_t>(slot) >= windows ? -1 : slot;
+}
+
 inline const char* card_why_text(CardWhy w) {
   switch (w) {
     case CardWhy::Ok: return "ok";

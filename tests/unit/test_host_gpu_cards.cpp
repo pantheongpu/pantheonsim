@@ -111,4 +111,17 @@ VTEST(peer_pointer_rule_uses_the_simulators_window_layout) {
       VCHECK_EQ(in_other(kDeviceVaBase + a * kDeviceVaStride + 123, b), a != b);
 }
 
+VTEST(exact_mode_serves_device_zero_only_and_turbo_every_window) {
+  VCHECK_EQ(served_slot(false, 0, -1, 16), 0);
+  VCHECK_EQ(served_slot(false, 0, 1, 16), 0);   // exact mode: window 0 and device 0 whatever the slot (as before the several-card work)
+  VCHECK_EQ(served_slot(false, 1, 1, 16), -1);
+  VCHECK_EQ(served_slot(false, 3, -1, 16), -1);
+  VCHECK_EQ(served_slot(true, 0, -1, 16), 0);
+  VCHECK_EQ(served_slot(true, 2, -1, 16), 2);
+  VCHECK_EQ(served_slot(true, 0, 3, 16), 3);    // CUDA_VISIBLE_DEVICES=3: the program's device 0 is in window 3
+  VCHECK_EQ(served_slot(true, 0, 15, 16), 15);
+  VCHECK_EQ(served_slot(true, 0, 16, 16), -1);  // past the simulator's windows
+  VCHECK_EQ(served_slot(true, -2, -1, 16), -1);
+}
+
 VTEST_MAIN

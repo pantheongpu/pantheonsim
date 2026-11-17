@@ -1,0 +1,18 @@
+cards: 4
+1. card 0 reserve 0x200000000000: r=0 got=0x200000000000 SAME
+1. card 1 reserve 0x210000000000: r=0 got=0x210000000000 SAME
+1. card 2 reserve 0x220000000000: r=0 got=0x220000000000 SAME
+1. card 3 reserve 0x230000000000: r=0 got=0x230000000000 SAME
+2. card 1 reserve the address card 0 holds: r=1 got=0x0
+3. kernels on all cards launched back to back, no waiting in between: ok
+5a. through host card1->card2: g[5]=1005 (card1 value h[5]=1005) ok
+5b. cuDeviceCanAccessPeer(0,1)=0
+5c. cuMemcpyPeer card1->card0 with no P2P: r=0 (the driver stages it itself)
+    card 0 now holds g[5]=1005 (card1's h[5]=1005)
+5d. DtoH of card 3's window with card 0 current: r=1 g[5]=1005 (UVA routes by address)
+6. one stream and one event per card, cross-card cuStreamWaitEvent: ok
+7. (see timing runs in the section)
+8. cuCtxSetCurrent/GetDevice per card: ok
+9. card 0 kernel on card 1's window: launch=0 sync=700 (context DEAD)
+9b. after card 0 died, DtoH on card 2 (own context current): r=700
+9c. card 1 cuCtxSynchronize: r=700

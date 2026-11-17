@@ -1593,8 +1593,8 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal, int phys
   if (g_cfg.mode == Mode::Off) return nullptr;
   // The device's slot is its window's (a simulated device the program reaches as ordinal 0 may sit in window 1 under CUDA_VISIBLE_DEVICES). Exact mode serves the
   // device in ordinal 0 on the driver's device 0 and window 0 as before.
-  const int slot = g_cfg.mode == Mode::Turbo && physical >= 0 ? physical : ordinal;
-  if (g_cfg.mode != Mode::Turbo ? ordinal != 0 : slot < 0 || static_cast<uint64_t>(slot) >= kDeviceVaWindows) return nullptr;
+  const int slot = served_slot(g_cfg.mode == Mode::Turbo, ordinal, physical, kDeviceVaWindows);
+  if (slot < 0) return nullptr;
   std::lock_guard<std::mutex> made_lock(made_mu);
   if (auto it = made.find(slot); it != made.end()) return it->second;
   {
