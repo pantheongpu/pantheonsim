@@ -55,6 +55,7 @@
 #include <vector>
 
 #include "platform.hpp"
+#include "vgpu/host_gpu_rt.hpp"
 #include "enum_value.hpp"
 #include "func_attrs.hpp"
 #include "kept_args.hpp"
@@ -1346,6 +1347,7 @@ VGPU_EXPORT void** __cudaRegisterFatBinary(void* fatCubin) {
     ensure_init(s);
     auto rm = std::make_unique<RegisteredModule>();
     rm->fatbin = fatCubin;
+    vgpu::hostgpu::note_program_image(fatCubin);
     RegisteredModule* raw = rm.get();
     s.modules.push_back(std::move(rm));
     if (trace()) std::fprintf(stderr, "[vgpu][trace] __cudaRegisterFatBinary -> %p\n", (void*)raw);

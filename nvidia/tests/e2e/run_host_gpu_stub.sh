@@ -95,6 +95,10 @@
 #  43. `twoshort`, whose second kernel runs two rounds, is sampled with the driver up and kept (its estimate is far under the card path of 64 MiB):
 #      one launch reaches the card, and the program prints what `twoshortb` prints;
 #  44. against the stand-in that refuses every module, `two` is sampled twice, the second time with the driver up, and prints the mode-off output.
+# The program history (Round 9; include/vgpu/host_gpu_history.hpp), steps 58 to 62:
+#  58. without VGPU_HOST_GPU_HISTORY nothing is read or written; 59. run 1 (no record) uses the card and leaves a candidate, run 2 stays in the simulator and leaves tiny, run 3 keeps off the
+#      driver; 60. a hold gives up at its budget and the record says long; 61. a kernel that failed on the card is kept in the simulator from its first launch, the driver unstarted;
+#      62. a corrupt, truncated, foreign or directory-shaped file is no history, and exact mode and FIT=0 never read it. The output is the mode-off output in each.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -849,6 +853,64 @@ if [[ "$cc" == 86 ]]; then
   ! grep -q 'this host is WSL2' "$work/wsl_rules.err" || { echo "FAIL: FIT=0 was turned off for WSL"; fails=1; }
   PROG=fit run wsl_exact tiny VGPU_HOST_GPU=exact VGPU_HOST_GPU_PROC_VERSION="$work/wslver" || { echo "FAIL: the exact run failed"; fails=1; }
   ! grep -q 'this host is WSL2' "$work/wsl_exact.err" || { echo "FAIL: exact mode was turned off for WSL"; fails=1; }
+  # 58 to 62. the program history (docs/perf-design/12-host-gpu-turbo.md section 17; include/vgpu/host_gpu_history.hpp), against the stand-in driver. A card of the stand-in's making
+  # (VGPU_HOST_GPU_HISTORY_CARD) stands for the model sysfs would name; STUB_CARD_OK=1 is a card whose launches come back at once.
+  hh=(VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_HISTORY_CARD=stub-card STUB_CARD_OK=1 STUB_INIT_MS=100)
+  hline() { sed -n "s/^host_gpu_history: key=[0-9a-f]* \(before=.*\)/\1/p" "$work/$1.err" | tail -1; }
+  # 58. with no VGPU_HOST_GPU_HISTORY nothing is read or written: the directory is never made.
+  PROG=fit run hi_off tiny "${hh[@]}" || { echo "FAIL: the run without a history failed"; fails=1; }
+  [[ ! -e "$work/hist_off" ]] && ! grep -q '^host_gpu_history:' "$work/hi_off.err" || { echo "FAIL: a history appeared without VGPU_HOST_GPU_HISTORY"; fails=1; }
+  # 59. the first run (no record) starts the driver and sends its launches; it was short on the card, so it is a candidate. The second runs in the simulator (a trial: the driver is not
+  # started) and observes the simulator's seconds: tiny. The third does the same on the record. The output is the mode-off output in each.
+  rm -rf "$work/hist"
+  for n in 1 2 3; do
+    PROG=fit run hi_$n tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist" || { echo "FAIL: history run $n failed"; tail -3 "$work/hi_$n.err"; fails=1; }
+    diff -q "$work/off_f_tiny.out" "$work/hi_$n.out" > /dev/null || { echo "FAIL: history run $n changes the output of fit tiny"; fails=1; }
+  done
+  grep -q '^cuInit$' "$work/hi_1.log" && grep -q '^cuLaunchKernel$' "$work/hi_1.log" && [[ "$(hline hi_1)" == before=none\ after=candidate* ]] || { echo "FAIL: the first run was not a card run that left a candidate: $(calls hi_1); $(hline hi_1)"; fails=1; }
+  [[ ! -s "$work/hi_2.log" && "$(hline hi_2)" == before=candidate\ after=tiny\ held=1\ released=0* ]] || { echo "FAIL: the trial run touched the driver or did not leave tiny: $(calls hi_2); $(hline hi_2)"; fails=1; }
+  [[ ! -s "$work/hi_3.log" && "$(hline hi_3)" == before=tiny\ after=tiny\ held=1\ released=0* ]] || { echo "FAIL: a run of a tiny program touched the driver: $(calls hi_3); $(hline hi_3)"; fails=1; }
+  # 60. a hold gives up when the simulator has spent its budget (START_COST=0.00001 s: the budget is that, so the second launch of `tiny` ends it): the driver starts, the later launches reach
+  # the card, the record says long, and the next run starts the driver with the device again.
+  rm -rf "$work/hist2"
+  for n in 1 2 3; do
+    PROG=fit run hr_$n tiny "${hh[@]}" VGPU_HOST_GPU_START_COST=0.00001 VGPU_HOST_GPU_HISTORY="$work/hist2" || { echo "FAIL: release run $n failed"; fails=1; }
+    diff -q "$work/off_f_tiny.out" "$work/hr_$n.out" > /dev/null || { echo "FAIL: release run $n changes the output"; fails=1; }
+  done
+  grep -q '^cuInit$' "$work/hr_2.log" && grep -q '^cuLaunchKernel$' "$work/hr_2.log" && [[ "$(hline hr_2)" == before=candidate\ after=long\ held=1\ released=1* ]] || { echo "FAIL: the hold was not given up at its budget: $(calls hr_2); $(hline hr_2)"; fails=1; }
+  grep -q '^cuInit$' "$work/hr_3.log" && [[ "$(hline hr_3)" == before=long* ]] || { echo "FAIL: a long program did not start the driver again: $(calls hr_3); $(hline hr_3)"; fails=1; }
+  # 61. a kernel that failed on the card (STUB_LAUNCH_FAIL=700, an illegal address) is kept in the simulator from its first launch in the next run, and with nothing known to run on the card the
+  # driver does not start with the device; the output is the mode-off output in each.
+  rm -rf "$work/hist3"
+  PROG=fit run hf_1 tiny "${hh[@]}" STUB_LAUNCH_FAIL=700 VGPU_HOST_GPU_HISTORY="$work/hist3" || { echo "FAIL: the faulting run failed"; fails=1; }
+  grep -q 'failed on the card (error 700)' "$work/hf_1.err" || { echo "FAIL: the stand-in card's fault was not seen: $(grep -m3 host_gpu "$work/hf_1.err")"; fails=1; }
+  diff -q "$work/off_f_tiny.out" "$work/hf_1.out" > /dev/null || { echo "FAIL: the fault changes the output"; fails=1; }
+  PROG=fit run hf_2 tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist3" || { echo "FAIL: the run after a fault failed"; fails=1; }
+  [[ ! -s "$work/hf_2.log" ]] && grep -q 'history: this kernel failed on the card in an earlier run' "$work/hf_2.err" || { echo "FAIL: a kernel known to fault reached the card or the driver started: $(calls hf_2)"; fails=1; }
+  diff -q "$work/off_f_tiny.out" "$work/hf_2.out" > /dev/null || { echo "FAIL: the run after a fault changes the output"; fails=1; }
+  # 62. a history in any state is no history: junk in the file, a truncated file, a file of another key moved into place, a directory where the file is. The run is the one without a history
+  # (the driver starts, the launches reach the card), the output is the mode-off output, and the file is a good record afterwards (unless a directory is in the way).
+  key="$(sed -n 's/^host_gpu_history: key=\([0-9a-f]*\) .*/\1/p' "$work/hi_3.err" | head -1)"
+  [[ -n "$key" ]] || { echo "FAIL: no key in the history line"; fails=1; }
+  for bad in junk trunc other; do
+    case $bad in
+      junk) head -c 3000 /dev/urandom > "$work/hist/$key.hist" ;;
+      trunc) head -c 40 "$work/hist/$key.hist" > "$work/hist/$key.t" && mv "$work/hist/$key.t" "$work/hist/$key.hist" ;;
+      other) cp "$work/hist3/"*.hist "$work/hist/$key.hist" ;;
+    esac
+    PROG=fit run hc_$bad tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist" || { echo "FAIL: the run with a $bad history failed"; fails=1; }
+    grep -q '^cuInit$' "$work/hc_$bad.log" && [[ "$(hline hc_$bad)" == before=none* ]] || { echo "FAIL: a $bad history was not read as no history: $(calls hc_$bad); $(hline hc_$bad)"; fails=1; }
+    diff -q "$work/off_f_tiny.out" "$work/hc_$bad.out" > /dev/null || { echo "FAIL: a $bad history changes the output"; fails=1; }
+  done
+  rm -rf "$work/hist/$key.hist"; mkdir "$work/hist/$key.hist"
+  PROG=fit run hc_dir tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist" || { echo "FAIL: the run with a directory in place of the history failed"; fails=1; }
+  diff -q "$work/off_f_tiny.out" "$work/hc_dir.out" > /dev/null && grep -q '^cuInit$' "$work/hc_dir.log" || { echo "FAIL: a directory in place of the history was not no history"; fails=1; }
+  # ... and a history never reaches exact mode or FIT=0
+  rm -rf "$work/hist4"
+  for sw in "VGPU_HOST_GPU=exact" "VGPU_HOST_GPU_FIT=0"; do
+    PROG=fit run hx tiny "${hh[@]}" $sw VGPU_HOST_GPU_HISTORY="$work/hist4" || { echo "FAIL: the run with $sw and a history failed"; fails=1; }
+    [[ ! -e "$work/hist4" ]] && ! grep -q '^host_gpu_history:' "$work/hx.err" || { echo "FAIL: $sw read or wrote a history"; fails=1; }
+  done
 else
   echo "NOTE: turbo fit steps 45 to 52 need the rtx3060 profile (sm_86); skipped for $profile"
 fi

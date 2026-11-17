@@ -45,6 +45,10 @@ struct Stats {
 // Whether VGPU_HOST_GPU is turbo: the loaders of the shim keep every image of a fatbin only then (nvidia/src/fatbin_sass.cpp).
 bool turbo_selected();
 
+// The shim's __cudaRegisterFatBinary tells the mode about each fatbin the program registers (before main): with VGPU_HOST_GPU_HISTORY set they are hashed into the program's
+// identity (docs/perf-design/12-host-gpu-turbo.md section 17). Does nothing without it.
+void note_program_image(const void* fatbin_wrapper);
+
 // The forked copies of sampled launches (runtime.cpp): reaps the ones that have ended, waits for the rest when asked. Returns how many were
 // still running.
 size_t sample_copies_reap(bool wait);

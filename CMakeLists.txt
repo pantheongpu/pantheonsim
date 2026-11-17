@@ -1460,6 +1460,8 @@ vgpu_unit_test(test_host_gpu_tol)
 vgpu_unit_test(test_host_gpu_cards)
 vgpu_unit_test(test_card_gate)
 vgpu_unit_test(test_host_gpu_track)
+# Turbo host-GPU mode's program history (include/vgpu/host_gpu_history.hpp): header-only, no card.
+vgpu_unit_test(test_host_gpu_history)
 target_include_directories(test_check_compare PRIVATE src/cli)
 vgpu_unit_test(test_profile)
 # What every shim call does around its body: ApiCall's reports, depth and argument hand-over, the inline flags.

@@ -28,9 +28,11 @@
 #include <thread>
 
 #include <atomic>
+extern char** environ;
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/devrt.hpp"
+#include "vgpu/host_gpu_history.hpp"
 #include "vgpu/host_gpu_idiom.hpp"
 #include "vgpu/host_gpu_cards.hpp"
 #include "vgpu/host_gpu_image.hpp"
@@ -208,6 +210,73 @@ bool logging_code() {
   const char* q = std::getenv("VGPU_HOST_GPU_LOG");
   return q && std::string(q) == "2";
 }
+
+// ---- program history (docs/perf-design/12-host-gpu-turbo.md section 17; vgpu/host_gpu_history.hpp) ----
+// The fatbins the program registered, hashed in registration order by note_program_image (the shim's __cudaRegisterFatBinary, before main): the program's identity, known
+// before any module is loaded, which is when the driver would start. A program that loads its modules through the driver API after its device exists has no identity here
+// and no history (it behaves as without one).
+std::mutex g_prog_mu;
+history::Hasher g_prog_hash;
+size_t g_prog_images = 0, g_prog_bytes = 0;
+bool g_prog_unkeyed = false;
+std::string history_dir() {
+  static const std::string dir = history::directory_from(std::getenv("VGPU_HOST_GPU_HISTORY"), std::getenv("XDG_CACHE_HOME"), std::getenv("HOME"));
+  return dir;
+}
+// The card's model without the driver (that is the point): the PCI vendor and device ids of the NVIDIA display devices (sysfs), and the kernel module's version line
+// when /proc has it. [documented: sysfs ABI; measured only on the A10G rig] VGPU_HOST_GPU_HISTORY_CARD=<text> stands in for both (tests). Empty: the model cannot be
+// read, and there is no history.
+std::string card_model_text() {
+  if (const char* v = std::getenv("VGPU_HOST_GPU_HISTORY_CARD"); v && *v) return v;
+  std::vector<std::string> ids;
+  if (DIR* d = ::opendir("/sys/bus/pci/devices")) {
+    const auto word = [](const std::string& path) {
+      std::string t;
+      if (FILE* f = std::fopen(path.c_str(), "r")) {
+        char b[32];
+        if (std::fgets(b, sizeof b, f)) t = b;
+        std::fclose(f);
+      }
+      while (!t.empty() && (t.back() == '\n' || t.back() == ' ')) t.pop_back();
+      return t;
+    };
+    while (const dirent* e = ::readdir(d)) {
+      if (e->d_name[0] == '.') continue;
+      const std::string base = std::string("/sys/bus/pci/devices/") + e->d_name + "/";
+      if (word(base + "vendor") != "0x10de") continue;
+      const std::string cls = word(base + "class");
+      if (cls.compare(0, 4, "0x03") != 0) continue;
+      ids.push_back("10de:" + word(base + "device"));
+    }
+    ::closedir(d);
+  }
+  if (ids.empty()) return "";
+  std::sort(ids.begin(), ids.end());
+  std::string t;
+  for (const std::string& i : ids) t += i + ";";
+  if (FILE* f = std::fopen("/proc/driver/nvidia/version", "r")) {
+    char b[256];
+    if (std::fgets(b, sizeof b, f)) t += b;
+    std::fclose(f);
+  }
+  return t;
+}
+// What of the environment changes where a launch runs: every VGPU_HOST_GPU_* variable but the ones that only say where to write or what to print.
+uint64_t decision_env_hash() {
+  std::vector<std::string> v;
+  for (char** e = environ; e && *e; ++e) {
+    if (std::strncmp(*e, "VGPU_HOST_GPU_", 14) != 0) continue;
+    if (!std::strncmp(*e, "VGPU_HOST_GPU_HISTORY", 21) || !std::strncmp(*e, "VGPU_HOST_GPU_LOG=", 18) || !std::strncmp(*e, "VGPU_HOST_GPU_PRESTART=", 23) ||
+        !std::strncmp(*e, "VGPU_HOST_GPU_LIBCUDA=", 22) || !std::strncmp(*e, "VGPU_HOST_GPU_PROC_VERSION=", 27))
+      continue;
+    v.push_back(*e);
+  }
+  std::sort(v.begin(), v.end());
+  history::Hasher h;
+  for (const std::string& s : v) h.text(s + "\n");
+  return h.h;
+}
+bool kernel_fault_code(int r) { return r == 700 || r == 715 || r == 716 || r == 717 || r == 718 || r == 719; }   // [documented] illegal address, instruction, misaligned, address space, pc, launch failure
 
 }  // namespace
 
@@ -546,6 +615,114 @@ struct Runtime::Impl : CardGate {
     sync_tracked(res, mem, ranges);
   }
 
+  // ---- program history (section 17) ----
+  // VGPU_HOST_GPU_HISTORY: what earlier runs of this program (hist_key: its fatbins, the simulated profile, the card model, the mode's switches) learned: that the
+  // whole program is shorter in the simulator than the driver's start (the process then stays in the simulator, `hist_hold`, and gives up after hist_lim.budget_s of
+  // simulator time, `hist_released`), and which kernels fail on the card (they are kept in the simulator from their first launch). Turbo mode with FIT=1 only; a missing,
+  // stale or unreadable history is no history. It decides where a launch runs, never what it computes.
+  bool hist_init_done = false, hist_on = false, hist_have = false, hist_hold = false, hist_released = false;
+  std::string hist_dir, hist_key, hist_profile, hist_before;   // hist_before: what the record said at the start (the summary line)
+  history::Record hist_rec;
+  history::Limits hist_lim;
+  std::map<std::string, history::Kernel> hist_kernels;   // this process's, by kernel
+  uint64_t hist_kept = 0;   // launches kept in the simulator by the history (a hold, or a kernel known to fail)
+
+  // Reads the history once (idempotent); true when the process is to hold the driver back. Called with the gate held.
+  bool hist_init() {
+    if (hist_init_done) return hist_hold;
+    hist_init_done = true;
+    if (mode != Mode::Turbo || !fit || verify) return false;
+    hist_dir = history_dir();
+    if (hist_dir.empty() || !(costs.start_cost_s > 0)) return false;
+    std::string prog;
+    {
+      std::lock_guard<std::mutex> g(g_prog_mu);
+      if (g_prog_unkeyed || g_prog_images == 0) return false;
+      history::Hasher h = g_prog_hash;
+      h.word(g_prog_images);
+      prog = history::hex16(h.h);
+    }
+    const std::string card = card_model_text();
+    if (card.empty()) return false;
+    history::Hasher k;
+    k.text(prog);
+    k.text(hist_profile);
+    k.text(card);
+    k.text("turbo-fit");
+    k.word(decision_env_hash());
+    k.word(history::kVersion);
+    hist_key = history::hex16(k.h);
+    hist_lim = history::limits_for_start_cost(costs.start_cost_s);
+    hist_on = true;
+    hist_have = history::load(hist_dir, hist_key, &hist_rec);
+    const history::Decision d = history::decide_start(hist_have ? &hist_rec : nullptr);
+    hist_hold = d.hold;
+    hist_before = !hist_have ? "none" : hist_rec.verdict == history::Verdict::Tiny ? "tiny" : hist_rec.verdict == history::Verdict::Candidate ? "candidate" :
+                  hist_rec.verdict == history::Verdict::Long ? "long" : "unknown";
+    if (logging())
+      std::fprintf(stderr, "host_gpu_history: key=%s record=%s runs=%llu: %s%s\n", hist_key.c_str(), hist_before.c_str(), static_cast<unsigned long long>(hist_have ? hist_rec.runs : 0),
+                   d.why, d.start_driver ? "" : " (the driver does not start with the device)");
+    return !d.start_driver;
+  }
+  // Why this launch stays in the simulator on the history's word, or null. Called before the launch is decided; the budget counts the simulator's launches so far.
+  const char* hist_keeps(const std::string& kernel) {
+    hist_init();
+    if (!hist_on) return nullptr;
+    ++hist_kernels[kernel].launches;
+    if (history::known_faulted(hist_have ? &hist_rec : nullptr, kernel)) return "this kernel failed on the card in an earlier run";
+    if (hist_hold && !hist_released) {
+      const double left = hist_lim.budget_s - stats.sim_seconds;
+      if (left > 0 && !history::kernel_outlasts(hist_have ? &hist_rec : nullptr, kernel, left)) return "the program is known to be shorter in the simulator than the driver's start";
+      hist_released = true;
+      if (logging()) std::fprintf(stderr, "host_gpu_history: %s: the simulator has spent %.3f s of %.3f s%s; the driver starts\n", kernel.c_str(), stats.sim_seconds, hist_lim.budget_s,
+                                  left > 0 ? " and this kernel is known to take longer than what is left" : "");
+    }
+    return nullptr;
+  }
+  void hist_note_sim(const std::string& kernel, double s) {
+    if (!hist_on) return;
+    hist_kernels[kernel].sim_s += s;
+  }
+  void hist_note_card(const std::string& kernel, double kernel_s) {
+    if (!hist_on) return;
+    history::Kernel& k = hist_kernels[kernel];
+    k.card_s += kernel_s;
+    k.card_ok = true;
+  }
+  // A kernel that failed on the card: written at once (the process may not get to its exit), without counting the run.
+  void hist_note_fault(const std::string& kernel, int code) {
+    if (!hist_on || !kernel_fault_code(code)) return;
+    hist_kernels[kernel].faulted = true;
+    history::Record rec;
+    if (!history::load(hist_dir, hist_key, &rec)) rec = hist_rec;
+    history::note_fault(&rec, kernel);
+    history::store(hist_dir, hist_key, rec);
+  }
+  // At exit: this run folded into the record as it is now on disk (another process may have written since this one read it).
+  void hist_commit() {
+    if (!hist_on || verify) return;
+    history::Observed o;
+    o.held = hist_hold;
+    o.released = hist_released;
+    o.sim_s = stats.sim_seconds;
+    o.card_s = stats.card_seconds;
+    for (const auto& [name, k] : hist_kernels) {
+      history::Kernel c = k;
+      c.name = name;
+      o.launches += k.launches;
+      o.kernels.push_back(c);
+    }
+    history::Record rec;
+    if (!history::load(hist_dir, hist_key, &rec)) rec = history::Record{};
+    history::update(&rec, o, hist_lim);
+    history::store(hist_dir, hist_key, rec);
+    if (logging())
+      std::fprintf(stderr, "host_gpu_history: key=%s before=%s after=%s held=%d released=%d kept_launches=%llu sim_s=%.6f card_s=%.6f launches=%u faulted_kernels=%zu\n", hist_key.c_str(),
+                     hist_before.c_str(), rec.verdict == history::Verdict::Tiny ? "tiny" : rec.verdict == history::Verdict::Long ? "long" : rec.verdict == history::Verdict::Candidate ? "candidate" : "unknown",
+                     hist_hold ? 1 : 0, hist_released ? 1 : 0, static_cast<unsigned long long>(hist_kept), o.sim_s, o.card_s, o.launches,
+                     static_cast<size_t>(std::count_if(rec.kernels.begin(), rec.kernels.end(), [](const history::Kernel& k) { return k.faulted; })));
+  }
+
   // ---- start-up of the real driver: lazy ----
   // Loading the driver, cuInit, the primary context and the 1 TiB reservation cost 0.15 to 0.35 s (09 doc, section 5; 0.23 s on an A10G, Round sp42). Nothing happens
   // until try_launch has decided that a launch goes to the card (should_offload_with_start charges this cost in that decision): `await_start` is the only caller of
@@ -592,6 +769,7 @@ struct Runtime::Impl : CardGate {
     const char* path = std::getenv("VGPU_HOST_GPU_LIBCUDA");
     lib_path = path && *path ? path : "/usr/lib/x86_64-linux-gnu/libcuda.so.1";
     want_sm = profile.cc_major * 10 + profile.cc_minor;
+    hist_profile = profile.id + "/" + std::to_string(want_sm) + "/" + std::to_string(profile.limits.multiprocessors);
     want_mp = profile.limits.multiprocessors;
     multiprocessors = want_mp;
     va_base = base;
@@ -1681,6 +1859,7 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal, int phys
         print_summary(g_summary_impl);
         if (!g_other_impls.empty()) print_card_line(g_summary_impl);   // (with several devices the first has a line of its own too, so that the lines add up to the process)
         for (Runtime::Impl* im : g_other_impls) print_card_line(im);
+        g_summary_impl->hist_commit();
       });
     } else {
       g_other_impls.push_back(r->impl_);
@@ -1692,6 +1871,33 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal, int phys
   }
 }
 
+void note_program_image(const void* wrapper) {
+  if (history_dir().empty() || !wrapper) return;
+  std::lock_guard<std::mutex> g(g_prog_mu);
+  if (g_prog_unkeyed) return;
+  // __fatBinC_Wrapper_t { int magic = 0x466243B1; int version; const void* data; ... } and the container it points at (nvidia/src/fatbin.cpp): 0xBA55ED50, version,
+  // header_size (u16), size (u64) of the body that follows the header.
+  uint32_t magic = 0;
+  std::memcpy(&magic, wrapper, 4);
+  const unsigned char* inner = nullptr;
+  if (magic == 0x466243B1) std::memcpy(&inner, static_cast<const unsigned char*>(wrapper) + 8, sizeof inner);
+  uint16_t hs = 0;
+  uint64_t body = 0;
+  if (inner) {
+    std::memcpy(&magic, inner, 4);
+    std::memcpy(&hs, inner + 6, 2);
+    std::memcpy(&body, inner + 8, 8);
+  }
+  const uint64_t total = uint64_t{hs} + body;
+  if (!inner || magic != 0xBA55ED50 || hs < 16 || total > history::kMaxImageBytes || g_prog_bytes + total > (history::kMaxImageBytes * 2ull)) {
+    g_prog_unkeyed = true;   // no identity: the program behaves as without a history
+    return;
+  }
+  g_prog_hash.bytes(inner, static_cast<size_t>(total));
+  g_prog_bytes += static_cast<size_t>(total);
+  ++g_prog_images;
+}
+
 bool Runtime::turbo() const { return impl_->mode == Mode::Turbo; }
 
 void Runtime::prestart(const DeviceProfile& profile, int ordinal, int physical) {
@@ -1701,6 +1907,7 @@ void Runtime::prestart(const DeviceProfile& profile, int ordinal, int physical) 
   Runtime* rt = for_device(profile, ordinal, physical);
   if (!rt || rt->impl_->mode != Mode::Turbo || !rt->impl_->fit) return;
   std::lock_guard<GateLock> g(rt->impl_->mu);
+  if (rt->impl_->hist_init()) return;   // section 17: the history says the driver is not needed yet (a launch that needs it starts it then)
   rt->impl_->begin_start();   // (idempotent; the thread only touches `api` and `ctx`, which nobody reads before await_start)
 }
 
@@ -1732,6 +1939,7 @@ void Runtime::note_simulated(const ptx::EntryFn& fn, const exec::LaunchConfig& c
                              const std::vector<std::vector<uint8_t>>* args) {
   std::lock_guard<GateLock> g(impl_->mu);
   impl_->stats.sim_seconds += sim_seconds;
+  impl_->hist_note_sim(fn.name, sim_seconds);
   if (impl_->start_failed) return;   // the driver could not be used: nothing to learn for
   InternalScope internal;
   struct NoteClock {   // (VGPU_HOST_GPU_LOG: the host_gpu_overhead line)
@@ -1902,6 +2110,18 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
       std::fprintf(stderr, "host_gpu: %s stays in the simulator: %s\n", fn.name.c_str(), why);
     }
     return false;
+  }
+  // Program history (section 17): a kernel that failed on the card in an earlier run, or a program known to be shorter in the simulator than the driver's start.
+  if (!forced && !im.verify) {
+    if (const char* h = im.hist_keeps(fn.name)) {
+      ++im.hist_kept;
+      ++im.stats.simulated;
+      if (logging()) {
+        im.last.kept = std::string("history: ") + h;
+        std::fprintf(stderr, "host_gpu: %s stays in the simulator: history: %s\n", fn.name.c_str(), h);
+      }
+      return false;
+    }
   }
   // Turbo mode with VGPU_HOST_GPU_FIT=1 (the default): no performance rule is asked. The kernel passed the checks above and goes to the card when it fits
   // it (below); what the simulator would have taken is not looked for, nor the size of the launch, the start cost, the sample of its first blocks or
@@ -2125,6 +2345,7 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
       im.reset_for_simulator();
     }
     if (!quiet()) std::fprintf(stderr, "host_gpu: %s failed on the card (error %d); mode off, the simulator runs it\n", fn.name.c_str(), r);
+    im.hist_note_fault(fn.name, r);
     return false;
   }
   im.last.card_s = kernel_s;
@@ -2175,6 +2396,7 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
       std::fprintf(stderr, "host_gpu: %s pushed %.1f MiB of %.1f MiB live on each of its last %u launches: offloading it ends (traffic)\n", fn.name.c_str(),
                    push_bytes / 1048576.0, total / 1048576.0, kTrafficLaunches);
     im.card_kernel_s[fn.name] = im.keep_card_time(fn.name, kernel_s, first_card_launch, e.sim_s);
+    im.hist_note_card(fn.name, kernel_s);
     ++im.stats.offloaded;
     im.sim_times.note_offload(fn.name);
     if (first_launch_rule && logging()) std::fprintf(stderr, "host_gpu: %s: first launch decided by the static rule (loop, %llu blocks)\n", fn.name.c_str(), static_cast<unsigned long long>(blocks));
@@ -2218,6 +2440,7 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     if (logging()) std::fprintf(stderr, "host_gpu: %s took %.3f ms on the card path against an estimate of %.3f ms in the simulator: offloading it ends\n", fn.name.c_str(), total_s * 1e3, e.sim_s * 1e3);
   }
   im.card_kernel_s[fn.name] = im.keep_card_time(fn.name, kernel_s, !im.card_kernel_s.count(fn.name), e.sim_s);
+  im.hist_note_card(fn.name, kernel_s);
   ++im.stats.offloaded;
   im.sim_times.note_offload(fn.name);
   if (logging())
