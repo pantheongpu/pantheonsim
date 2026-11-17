@@ -33,7 +33,7 @@ case "${1:-}" in
   check) gate ;;
   install)
     host "sudo mkdir -p $DIR && cd $DIR && [ -x r1/config.sh ] || {
-      sudo curl -sL -o r.tgz https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-linux-x64-2.337.0.tar.gz
+      sudo curl -sL --retry 5 --retry-all-errors -o r.tgz https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-linux-x64-2.337.0.tar.gz
       for i in 1 2; do sudo mkdir -p r\$i && sudo tar xzf r.tgz -C r\$i; done; sudo rm r.tgz; }" ;;
   start)
     gate
