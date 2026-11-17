@@ -58,6 +58,7 @@ struct CUmemAllocationProp {
 struct CUmemAccessDesc { CUmemLocation location; int flags; };
 
 constexpr uint64_t kGranule = 2ull << 20;
+constexpr int kCudaErrorAssert = 710, kCudaErrorLaunchFailure = 719;   // CUDA_ERROR_ASSERT, CUDA_ERROR_LAUNCH_FAILED (cuda.h)
 constexpr int kAttrMultiprocessors = 16, kAttrCcMajor = 75, kAttrCcMinor = 76;
 constexpr int kFuncAttrMaxDynamicShared = 8;
 // (cuda.h CUdevice_attribute and CUfunction_attribute)
@@ -207,6 +208,78 @@ bool logging_code() {
 // The index of the instruction at pc (decoded with pc = 16 * index), or -1.
 static int64_t code_index(int64_t pc, size_t count) { return pc >= 0 && pc % 16 == 0 && static_cast<uint64_t>(pc) / 16 < count ? pc / 16 : -1; }
 
+// A call through a register (`CALL.ABS.NOINC Rt`) whose target register is the 64-bit load of a slot of bank 4 that the module's relocations fill with an external
+// function turbo mode admits (vgpu/host_gpu.hpp register_call_slot: how the slot is found, and what is refused). Sets *assert_seen when that function is __assertfail.
+static bool register_call_to_admitted_extern(const sass::Module& m, const sass::Code& sec, size_t call, const TurboSwitches& sw, bool* assert_seen) {
+  const sass::Instr& ci = sec.instr(call);
+  if (ci.op != sass::Op::CALL || !mods_have(ci.mods, "ABS") || ci.src.empty() || ci.src[0].kind != sass::Kind::Reg) return false;
+  std::vector<RcInsn> view(sec.count);
+  std::set<uint64_t> targets;
+  for (size_t i = 0; i < sec.count; ++i) {
+    const sass::Instr& x = sec.instr(i);
+    if (x.op == sass::Op::BRX || x.op == sass::Op::JMP) return false;   // (a jump table: any instruction can be entered)
+    for (const auto& o : x.src)
+      if (o.kind == sass::Kind::Label) targets.insert(static_cast<uint64_t>(o.imm));
+  }
+  for (size_t i = 0; i < sec.count; ++i) {
+    const sass::Instr& x = sec.instr(i);
+    RcInsn& r = view[i];
+    r.guarded = x.guard != sass::kPT || x.guard_uniform;
+    r.entry = targets.count(x.pc) != 0 || (i > 0 && sec.instr(i - 1).op == sass::Op::CALL);   // (the return of a call lands after it)
+    unsigned regs_written = 0;
+    for (const auto& d : x.dst)
+      if (d.kind == sass::Kind::Reg && d.reg != sass::kRZ) {
+        if (!regs_written++) r.dst_reg = d.reg, r.dst_n = d.width;
+        else r.dst_reg = 0, r.dst_n = 256;   // (more than one register destination: say it writes every register)
+      }
+    switch (x.op) {
+      case sass::Op::BRA: case sass::Op::BRX: case sass::Op::JMP: case sass::Op::EXIT: case sass::Op::RET: case sass::Op::BSSY: case sass::Op::BSYNC: case sass::Op::BREAK:
+        r.kind = RcInsn::Control;
+        break;
+      case sass::Op::CALL:
+        r.kind = (mods_have(x.mods, "ABS") && !x.src.empty() && x.src[0].kind == sass::Kind::Reg) ? RcInsn::CallReg : RcInsn::Control;
+        if (r.kind == RcInsn::CallReg) r.reg = x.src[0].reg;
+        break;
+      case sass::Op::MOV:
+        if (x.src.size() == 1 && x.src[0].kind == sass::Kind::Imm && !x.dst.empty() && x.dst[0].kind == sass::Kind::Reg) {
+          r.kind = RcInsn::MovImm;
+          r.reg = x.dst[0].reg;
+          r.imm = x.src[0].imm;
+        }
+        break;
+      case sass::Op::LDC:
+        if (x.src.size() == 1 && x.src[0].kind == sass::Kind::Mem && !x.dst.empty()) {
+          r.kind = RcInsn::LdcBank;
+          r.reg = x.src[0].reg;
+          r.imm = x.src[0].imm;
+          r.bank = x.f[4];
+          r.wide = mods_have(x.mods, "64");
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  const int64_t slot = register_call_slot(view, call);
+  if (slot < 0) return false;
+  const sass::CubinSection* bank4 = m.cubin.section(".nv.constant4");
+  if (!bank4) return false;
+  const sass::CubinReloc* hit = nullptr;
+  for (const sass::CubinReloc& r : bank4->relocs)
+    if (r.offset == static_cast<uint64_t>(slot)) {
+      if (hit) return false;   // (two relocations at one slot: not understood)
+      hit = &r;
+    }
+  if (!hit || hit->addend != 0 || hit->symbol_index >= m.cubin.symbols.size()) return false;
+  const sass::CubinSymbol& sym = m.cubin.symbols[hit->symbol_index];
+  if (!sym.function || !sym.section.empty()) return false;   // (a function the module defines is code the scan has to follow: not this form)
+  const bool devrt = exec::devrt::lookup(sym.name) != exec::devrt::Fn::None;
+  const ExternKind k = extern_kind(sym.name, devrt);
+  if (!extern_admitted(k, Mode::Turbo, sw.printf_off, sw.assert_off)) return false;
+  if (k == ExternKind::Assert && assert_seen) *assert_seen = true;
+  return true;
+}
+
 struct Runtime::Impl : CardGate {
   Api api;
   CUcontext ctx = nullptr;
@@ -243,6 +316,7 @@ struct Runtime::Impl : CardGate {
     const char* why = "";                       // the reason given on a later launch of the same kernel
     std::string why_text;                       // ... when it is made for this kernel (`why` then points here)
     bool printf = false;                        // it reaches vprintf (turbo mode): stdout is flushed before its launch on the card
+    bool trap = false;                          // it can assert or trap (turbo mode, section 20): a card failure with 710 or 719 is the program's own failure
   };
   // VGPU_HOST_GPU_LOG: what kept each kernel's launches in the simulator, with the simulator's seconds (one host_gpu_kept line per kernel and
   // reason at exit), for a census of what the mode still cannot send.
@@ -477,6 +551,16 @@ struct Runtime::Impl : CardGate {
     }
   }
 
+  // The card's context is dead and what only it held is gone (a kernel asserted or trapped there, section 20): every chunk is the simulator's again, as stale as
+  // it was, and nothing is pulled (the driver would refuse). A real GPU loses the same memory when its context dies; the program's next calls fail with the sticky error.
+  void discard_card_data() {
+    for (auto& [b, a] : res) {
+      if (a.slot->load(std::memory_order_relaxed) == 0) continue;
+      (void)a.r.sim_launch();
+      update_slot(a);
+    }
+  }
+
   // A sample is about to fork the process while the driver is up (Round sp76; mu held by the caller): every chunk the card alone holds comes
   // back and is then shared (Where::Both), so that the copy's blocks read the launch's real input and never ask the card for it. It is the
   // pull the simulator makes before it runs the launch itself (reset_for_simulator), made earlier; the card's copy stays valid, so a launch
@@ -691,6 +775,7 @@ struct Runtime::Impl : CardGate {
     uint64_t instrs = 0;
     bool runnable = false, back_edge = false, loop = false;
     bool printf = false;   // (Verdict::printf)
+    bool trap = false;     // (Verdict::trap)
     const exec::BlockProbe* probe = nullptr;   // the kernel's followed loops (Verdict::probe; the table of verdicts keeps it), or null
   };
 
@@ -895,6 +980,7 @@ struct Runtime::Impl : CardGate {
       d.back_edge = v.back_edge;
       d.loop = v.loop;
       d.printf = v.printf;
+      d.trap = v.trap;
       d.probe = v.probe.count ? &v.probe : nullptr;
       return d;
     };
@@ -941,13 +1027,15 @@ struct Runtime::Impl : CardGate {
         if (!devrt && !builtin && std::find(m.cubin.externs.begin(), m.cubin.externs.end(), f) == m.cubin.externs.end()) continue;   // (a device function of the module)
         const ExternKind k = extern_kind(f, devrt);
         // (a verify run runs a launch on the card and then in the simulator: a kernel that prints would print twice, so it is not sent there)
-        if (extern_admitted(k, mode, sw.printf_off) && !verify) {
-          v.printf = true;
+        if (extern_admitted(k, mode, sw.printf_off, sw.assert_off) && !(verify && k == ExternKind::Printf)) {
+          if (k == ExternKind::Printf) v.printf = true;
+          if (k == ExternKind::Assert) v.trap = true;
           continue;
         }
         ok = false;
         v.why_text = std::string("the kernel calls ") + (k == ExternKind::Other ? f : extern_kind_name(k)) +
-                     (k == ExternKind::Printf ? (!turbo ? " (turbo mode only)" : verify ? " (not under VGPU_HOST_GPU_VERIFY: it would print twice)" : " (VGPU_HOST_GPU_TURBO_OFF=printf)") : "");
+                     (k == ExternKind::Printf ? (!turbo ? " (turbo mode only)" : verify ? " (not under VGPU_HOST_GPU_VERIFY: it would print twice)" : " (VGPU_HOST_GPU_TURBO_OFF=printf)")
+                      : k == ExternKind::Assert ? (!turbo ? " (turbo mode only)" : " (VGPU_HOST_GPU_TURBO_OFF=assert)") : "");
         why = v.why_text.c_str();
         break;
       }
@@ -1015,7 +1103,9 @@ struct Runtime::Impl : CardGate {
             indirect = indirect || code_index(label, code.count) < 0;
           }
           indirect = indirect || (own && (ins.op == sass::Op::BRX || ins.op == sass::Op::CALL || ins.op == sass::Op::RET));
-          InsnClass c = turbo_class(ins.mnemonic, ins.mods);
+          const bool trap_ok = turbo && !sw.assert_off;   // (BPT.TRAP and the bounded call through a register: section 20)
+          InsnClass c = turbo_class(ins.mnemonic, ins.mods, trap_ok);
+          if (trap_ok && bpt_is_trap(ins.mnemonic, ins.mods)) v.trap = true;
           if (call_needs_scan(ins.op == sass::Op::CALL, c)) {   // (an unlisted CALL, one with a modifier the decoder cannot name, is followed like any other)
             // A call that leaves the section runs code this scan has to see. Three kinds are followed: a relative call inside the section; the absolute
             // call to vprintf, which the driver links when it loads the module (admitted above); and an absolute call to the first instruction of
@@ -1030,6 +1120,8 @@ struct Runtime::Impl : CardGate {
               const sass::Code* callee = label && !rel && target >= 0 ? m.code_at(static_cast<uint64_t>(target)) : nullptr;
               if (callee && call_to_entry(rel, label, target, callee->base, callee->count)) {
                 if (seen.insert(callee).second) todo.push_back(callee);
+              } else if (trap_ok && !label && !rel && register_call_to_admitted_extern(m, sec, i, sw, &v.trap)) {
+                // (a call through a register whose target is a slot of bank 4 that names __assertfail, or vprintf with printf admitted: section 20)
               } else {
                 c = InsnClass::Never;
               }
@@ -1450,8 +1542,8 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
         return;
       }
       std::string bad;
-      if (!parse_turbo_off(std::getenv("VGPU_HOST_GPU_TURBO_OFF"), &sw.off, &bad, &sw.printf_off)) {
-        std::fprintf(stderr, "host_gpu: VGPU_HOST_GPU_TURBO_OFF: %s is not a class (mufu, tensor, half, call, atomics, red, extra, unlisted, printf); mode off\n", bad.c_str());
+      if (!parse_turbo_off(std::getenv("VGPU_HOST_GPU_TURBO_OFF"), &sw.off, &bad, &sw.printf_off, &sw.assert_off)) {
+        std::fprintf(stderr, "host_gpu: VGPU_HOST_GPU_TURBO_OFF: %s is not a class (mufu, tensor, half, call, atomics, red, extra, unlisted, printf, assert); mode off\n", bad.c_str());
         return;
       }
       const std::pair<const char*, double*> tolerances[] = {{"VGPU_HOST_GPU_ATOL", &tol.atol}, {"VGPU_HOST_GPU_RTOL", &tol.rtol}};
@@ -1942,6 +2034,16 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     im.dead = true;
     ++im.stats.failed;
     ++im.stats.simulated;
+    // A kernel that can assert or trap (section 20), and the card says it did (710 CUDA_ERROR_ASSERT after the driver printed the assertion text to stderr, 719
+    // CUDA_ERROR_LAUNCH_FAILED for a trap) [measured, A10G]: the program's own failure, which the card has already had and the simulator may not reproduce on the
+    // data it holds. The launch fails with the error the simulator gives for the same event (Err::DeviceAssert, Err::Trap: 710 and 719 to the program, the context
+    // dead after it), whether or not the card holds data the simulator lacks: a real GPU loses it the same way.
+    if (dec.trap && (r == kCudaErrorAssert || r == kCudaErrorLaunchFailure)) {
+      if (im.resident) im.discard_card_data();
+      if (!quiet()) std::fprintf(stderr, "host_gpu: %s %s on the card (error %d); the launch fails as it does in the simulator\n", fn.name.c_str(), r == kCudaErrorAssert ? "asserted" : "trapped", r);
+      if (r == kCudaErrorAssert) throw Error(Err::DeviceAssert, "device-side assertion failed in " + fn.name + " on the card (VGPU_HOST_GPU=turbo; the card printed the assertion text above)");
+      throw Error(Err::Trap, "kernel " + fn.name + " trapped on the card (VGPU_HOST_GPU=turbo)");
+    }
     if (im.resident) {
       if (card_only_data) throw Error(Err::Internal, "host_gpu: " + fn.name + " failed on the card, which holds data from earlier launches that the simulator does not, so the simulator cannot take the launch over and the process ends. "
                          "In turbo mode this is the price of sending every launch: VGPU_HOST_GPU_FIT=0 (the size rules) or VGPU_HOST_GPU_TURBO_OFF=<class> keeps such a kernel in the simulator "
@@ -2291,8 +2393,8 @@ bool turbo_selected() {
     bool fit = true;
     if (!parse_fit(std::getenv("VGPU_HOST_GPU_FIT"), &fit)) return false;
     ClassMask off = 0;
-    bool printf_off = false;
-    if (!parse_turbo_off(std::getenv("VGPU_HOST_GPU_TURBO_OFF"), &off, nullptr, &printf_off)) return false;
+    bool printf_off = false, assert_off = false;
+    if (!parse_turbo_off(std::getenv("VGPU_HOST_GPU_TURBO_OFF"), &off, nullptr, &printf_off, &assert_off)) return false;
     if (fit) {
       std::string ver;
       const char* vp = std::getenv("VGPU_HOST_GPU_PROC_VERSION");
