@@ -107,6 +107,35 @@ VTEST(the_model_reproduces_every_conflict_a_real_card_counted) {
   if (wrong) throw vtest::Failure(std::to_string(wrong) + " of " + std::to_string(all.size()) + " rows differ; first: " + first);
 }
 
+// The 96-bit accesses at a base that is not a multiple of 16 (lds_bank_alignment.tsv): the card counts none, so alignment is a property of the
+// whole access, whether or not the stride would otherwise conflict.
+VTEST(the_model_reproduces_the_96_bit_alignment_rows_a_real_card_counted) {
+  std::ifstream in(kData + "lds_bank_alignment.tsv");
+  if (!in) throw vtest::Failure("no measurements at " + kData + "lds_bank_alignment.tsv");
+  size_t n = 0, wrong = 0;
+  std::string line, first;
+  while (std::getline(in, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    std::vector<std::string> f;
+    std::stringstream ss(line);
+    for (std::string x; std::getline(ss, x, '\t');) f.push_back(x);
+    if (f.size() != 7) throw vtest::Failure("a row that is not seven columns: " + line);
+    const uint32_t base = static_cast<uint32_t>(std::stoul(f[3])), stride = static_cast<uint32_t>(std::stoul(f[4]));
+    const uint32_t lanes = static_cast<uint32_t>(std::stoul(f[5])), card = static_cast<uint32_t>(std::stoul(f[6]));
+    const amd::gcn::LdsBankAccess a = amd::gcn::ds_bank_access(f[2]);
+    if (!a.counted) throw vtest::Failure(f[2] + " has no bank model");
+    uint32_t addr[64] = {};
+    for (uint32_t l = 0; l < lanes; ++l) addr[l] = (base + l * stride) % 65536;
+    const uint32_t got = amd::gcn::lds_bank_conflicts(addr, (1ull << lanes) - 1, a);
+    ++n;
+    if (got != card && !wrong++)
+      first = f[2] + " base " + std::to_string(base) + " stride " + std::to_string(stride) + " lanes " + std::to_string(lanes) + ": card " +
+              std::to_string(card) + ", model " + std::to_string(got);
+  }
+  VCHECK(n >= 30);
+  if (wrong) throw vtest::Failure(std::to_string(wrong) + " of " + std::to_string(n) + " rows differ; first: " + first);
+}
+
 VTEST(the_rows_cover_what_the_model_claims) {
   // The RX 6800 (the only card measured so far), both wave sizes, partial waves, reads, writes, atomics and the two-address forms: a regeneration that lost one fails.
   std::map<std::string, size_t> seen;

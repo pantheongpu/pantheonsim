@@ -8,6 +8,10 @@
 // is still counted (the instruction asked for it), and so is a flat access whose lanes reach LDS (it is a vector memory
 // instruction). An atomic counts as written bytes, as it counts as a write in vmem_wr, whether or not it returns a value.
 //
+// Checked against a card only through the instruction counts these bytes are built from (an RX 6800: the memory-side counters of RDNA2 are
+// not readable there): FLAT, VALU and SMEM instructions per wave match for streaming, wide-load, half-lane and cache-reuse kernels. The bytes
+// themselves are what the lanes ask for, so a kernel that reuses data reads far more here than its memory system fetches.
+//
 // What is NOT counted, and reads as zero: image and tensor instructions, formatted buffer accesses (their size is the
 // format's), loads and async copies to LDS, scalar memory, and the LDS instructions that move no data to or from LDS
 // memory (swizzle, permute, bpermute, the global wave sync and the counters of ds_append and ds_consume).
