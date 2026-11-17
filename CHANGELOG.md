@@ -35,8 +35,17 @@ release says what runs and what it produces, never how fast a real GPU would run
   in the simulator; exact mode and the plain simulator are unchanged. A PTX module is refused only for a variable some statement of it can name (`.extern`, `.visible`, `.weak`, `.managed`, unreadable declarations and any
   name that occurs outside its declaration count as named); the libcu++ marker objects nvcc declares in every module that includes `<cuda/std/...>` no longer keep it off the card (`VGPU_HOST_GPU_PTX_VARIABLES=all` restores the old rule). Tests: unit tests of the scan and the register-call bound, stub step 59, `tools/turbo-census` follows both rules.
 
-- **Turbo refusal census** (`tools/turbo-census`, `test_turbo_census`, [docs/perf-design/data/turbo-census/](docs/perf-design/data/turbo-census/README.md), `12-host-gpu-turbo.md` section 17): a CPU-only tool that says, for every kernel of built binaries and libraries, which image
+- **Turbo refusal census** (`tools/turbo-census`, `test_turbo_census`, [docs/perf-design/data/turbo-census/](docs/perf-design/data/turbo-census/README.md), `12-host-gpu-turbo.md` section 18): a CPU-only tool that says, for every kernel of built binaries and libraries, which image
   turbo would give each host card (sm_75, sm_86, sm_89, sm_90) under the a10g and h100 profiles and why a kernel stays in the simulator, using the runtime's own image choice, PTX scan and instruction classes. Turbo itself is unchanged.
+
+- **Turbo host-GPU mode on a machine with several cards: simulated device N runs on host card N.** Until now the card path served simulated device 0 on the real driver's device 0 only. With
+  `VGPU_HOST_GPU=turbo` each simulated device now has its own card, context, window (the simulator's own per-device address, reserved on that card), module cache and residency; devices beyond the
+  host's card count stay in the simulator (said once per device), and a device with a peer link, or a launch with a pointer into another device's memory, stays in the simulator too. With more than one simulated device the
+  launches on cards are queued and not waited for, so the cards run at the same time. `CUDA_VISIBLE_DEVICES` now picks the card of the slot it shows (the simulated device in window 1 used the card path's window
+  0 before), and `VGPU_HOST_GPU_DEVICES=a,b,..` chooses the real devices by hand. Exact mode and single-device programs are unchanged. Measured on four Tesla T4 (AWS g4dn.12xlarge), 4 simulated T4s, a
+  fused-multiply-add kernel on each: 31 s in the simulator, 20 s with turbo as before (one card), 0.93 s with four cards, same output; the time stays flat from 1 to 4 devices. Details, the measurements on the
+  card (what a process can do with several cards) and the known limit (a read-back that waits for one card holds the shim's API lock): `docs/perf-design/12-host-gpu-turbo.md` section 19.
+
 - **Turbo host-GPU mode, next round: PTX retargeting, a driver start that overlaps the program's set-up, and the simulated profile's launch limits** (follows the turbo-fit round, PR #693).
   A module whose only PTX is plain `.target sm_90` (a build with `-arch=sm_90` or `compute_90` alone) now runs on an sm_80, sm_86 or sm_87 card: its target line is rewritten to
   the card's and the driver compiles it, provided the PTX uses no form that card lacks (a text scan of the forms ptxas 13.0 rejects there: `mbarrier.try_wait`, `expect_tx`, count-form

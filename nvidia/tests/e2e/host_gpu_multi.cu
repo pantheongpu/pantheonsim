@@ -9,6 +9,7 @@
 //             (the card has only its own window; an access outside it is a fault, which kills every context of the process).
 //   peeron    peer access enabled between devices 0 and 1 (the simulated machine's profile allows it), then the bumps of `dp` on both: launches on devices
 //             linked by peer access stay in the simulator (MemoryManager::card_blocker).
+//   solo      one device (run with one simulated device): three launches and a read-back; the launches are waited for, as without several devices.
 //   mixed     `dp`, then a program-level cudaMemcpyPeer from the LAST device to device 0 and one more bump on device 0: the last device may be the one with no card.
 #include <cstdio>
 #include <cstdlib>
@@ -39,11 +40,17 @@ static void read_back(const char* tag, int d, int* p) {
 }
 
 int main(int argc, char** argv) {
+  int* buf[8] = {};
   const char* mode = argc > 1 ? argv[1] : "dp";
   cudaGetDeviceCount(&g_n);
   std::printf("devices %d\n", g_n);
+  if (!std::strcmp(mode, "solo")) {   // one device, the usual program: three launches, read back
+    buf[0] = make(0, 5);
+    for (int i = 0; i < 3; ++i) bump<<<1, 32>>>(buf[0], 4);
+    read_back("solo", 0, buf[0]);
+    return 0;
+  }
   if (g_n < 2) return 0;
-  int* buf[8] = {};
   if (!std::strcmp(mode, "dp") || !std::strcmp(mode, "mixed") || !std::strcmp(mode, "peeron")) {
     if (!std::strcmp(mode, "peeron")) {
       cudaSetDevice(0);

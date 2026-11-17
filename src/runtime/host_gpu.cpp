@@ -27,6 +27,8 @@
 #include <set>
 #include <thread>
 
+#include <atomic>
+
 #include "vgpu/error.hpp"
 #include "vgpu/exec/devrt.hpp"
 #include "vgpu/host_gpu_idiom.hpp"
@@ -211,6 +213,12 @@ bool logging_code() {
 
 // The index of the instruction at pc (decoded with pc = 16 * index), or -1.
 static int64_t code_index(int64_t pc, size_t count) { return pc >= 0 && pc % 16 == 0 && static_cast<uint64_t>(pc) / 16 < count ? pc / 16 : -1; }
+
+namespace {
+// How many simulated devices have a runtime (turbo mode with several cards). With more than one, a launch on a card is not waited for (Impl::settle): the cards of the
+// different devices then run at the same time. With one device a launch is waited for, as it always was.
+std::atomic<int> g_runtimes{0};
+}  // namespace
 
 struct Runtime::Impl : CardGate {
   Api api;
@@ -429,9 +437,29 @@ struct Runtime::Impl : CardGate {
     if (old > 0 && v == 0) gate_mem->card_resident_count().fetch_sub(1, std::memory_order_relaxed);
   }
 
+  // A launch on this card that nobody waited for (turbo mode with several simulated devices, `async_ok`): the launch was queued on the card's default stream and the
+  // call returned, so that the cards of other devices run at the same time. Everything that reads or writes the card's memory afterwards (copies on the same stream)
+  // is ordered after it by the driver (documented: the legacy default stream), so the data needs nothing; what is left is the error of a kernel that failed, the
+  // watchdog, and the process's end. settle() waits for it. mu held by the caller, or no other thread using this card (exit).
+  bool inflight = false;
+  std::string inflight_kernel;
+  void settle() {
+    if (!inflight) return;
+    inflight = false;
+    api.cuCtxSetCurrent(ctx);
+    const CUresult r = api.cuCtxSynchronize();
+    watchdog.disarm();
+    if (r) {
+      dead = true;
+      throw Error(Err::Internal, "host_gpu: " + inflight_kernel + " failed on the card (error " + std::to_string(r) + ") after its launch had returned, and the card holds data the simulator does not, so the process ends "
+                  "(several simulated devices queue their launches on the cards; VGPU_HOST_GPU_DEVICES=<one device> or VGPU_DEVICE_COUNT=1 waits for each launch)");
+    }
+  }
+
   // Copies chunks the card alone holds into the simulator's memory (not in a verify run, where the simulator's memory is the truth already).
   void pull_chunks(Res& a, const std::vector<uint64_t>& idx) {
     if (idx.empty() || verify) return;
+    settle();
     // A sample's copy of the process never calls the driver (Round sp76: its process pulled these chunks before the fork, and the copy made
     // them its own; one that comes here all the same ends without an answer).
     if (exec::g_sample_copy.load(std::memory_order_relaxed)) throw Error(Err::Internal, "host_gpu: a sample's copy of the process does not call the driver");
@@ -1469,7 +1497,7 @@ void print_summary(Runtime::Impl* im) {
   }
 }
 Runtime::Impl* g_summary_impl = nullptr;
-std::vector<Runtime::Impl*> g_other_impls;   // the runtimes of the other simulated devices (turbo mode with several cards), in the order they were made
+std::vector<Runtime::Impl*> g_other_impls, g_all_impls;   // the runtimes of the other simulated devices (turbo mode with several cards), in the order they were made
 // One line for a simulated device beyond the first one the mode served: which card it ran on and what it did (the lines above are the first device's; a script
 // that wants the process's totals adds these). Nothing when its driver could not be used or it never launched.
 void print_card_line(Runtime::Impl* im) {
@@ -1647,6 +1675,7 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal, int phys
       g_summary_impl = r->impl_;
       std::atexit([] {
         g_summary_impl->copies_running_at_exit = sample_copies_reap(true);   // (no child is left behind, whatever the summary prints)
+        for (Runtime::Impl* im : g_all_impls) try { im->settle(); } catch (...) {}   // (a launch no one waited for: its kernel ends before the process does)
         for (Runtime::Impl* im : g_other_impls) im->settle_start();
         g_summary_impl->settle_start();
         print_summary(g_summary_impl);
@@ -1656,7 +1685,9 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal, int phys
     } else {
       g_other_impls.push_back(r->impl_);
     }
+    g_all_impls.push_back(r->impl_);
     made[slot] = r;
+    g_runtimes.fetch_add(1, std::memory_order_relaxed);
     return r;
   }
 }
@@ -2059,11 +2090,19 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   std::vector<std::vector<uint8_t>> keep = args;
   for (auto& a : keep) params.push_back(a.data());
   const auto k0 = std::chrono::steady_clock::now();
+  // Several simulated devices (g_runtimes > 1; the usual one-device program never takes this path): the launch is queued and not waited for, so that the cards of
+  // different devices run at the same time. Not with a kernel that prints (the driver prints at the synchronisation), not in a verify run or with the write-through
+  // path (they read the card's memory straight after), and not with the performance rules (VGPU_HOST_GPU_FIT=0), which time the card path.
+  const bool queue = turbo && fit_send && im.resident && !im.verify && !dec.printf && g_runtimes.load(std::memory_order_relaxed) > 1;
   im.watchdog.arm(fn.name);
   CUresult r = im.api.cuLaunchKernel(f, cfg.grid[0], cfg.grid[1], cfg.grid[2], cfg.block[0], cfg.block[1], cfg.block[2], cfg.shared_bytes, nullptr,
                                      params.data(), nullptr);
-  if (!r) r = im.api.cuCtxSynchronize();
-  im.watchdog.disarm();
+  if (!r && !queue) r = im.api.cuCtxSynchronize();
+  if (!queue || r) im.watchdog.disarm();
+  if (queue && !r) {   // (the watchdog stays armed until settle: a queued kernel that never ends is still caught)
+    im.inflight = true;
+    im.inflight_kernel = fn.name;
+  }
   const double kernel_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - k0).count();
   if (r) {   // a failed kernel poisons the context (an illegal address): the mode ends, the simulator takes this launch
     im.dead = true;

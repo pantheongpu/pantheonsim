@@ -91,6 +91,7 @@ int cuDevicePrimaryCtxRetain(void** c, int d) {
 int cuCtxSetCurrent(void* c) { g_cur = c ? ctx_card(c) : -1; return 0; }
 /* STUB_SYNC_MS: the wait for the kernel takes this long (a kernel that does not come back, for the mode's VGPU_HOST_GPU_TIMEOUT). */
 int cuCtxSynchronize(void) {
+  { char l[48]; snprintf(l, sizeof l, "sync on %d", g_cur); note(l); }
   const int ms = env_int("STUB_SYNC_MS", 0);
   if (ms > 0) { struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000L}; nanosleep(&t, 0); }
   return 0;

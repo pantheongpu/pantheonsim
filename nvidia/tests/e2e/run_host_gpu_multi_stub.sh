@@ -14,7 +14,8 @@
 #   8. peer access between devices 0 and 1 keeps their launches in the simulator (devices 2 and 3 still use their cards);
 #   9. a copy from a device with no card to one with a card (4 devices, 3 cards);
 #  10. exact mode serves device 0 only, on the driver's device 0, whatever the machine holds;
-#  11. the summary: one host_gpu_card line for each device that used a card.
+#  11. the summary: one host_gpu_card line for each device that used a card;
+#  12. launches on the cards of several devices are queued, not waited for (so the cards run at the same time); a single device's launches are each waited for.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -122,5 +123,16 @@ has mixed "launch on 0"; has mixed "launch on 2"; lacks mixed "launch on 3" "a d
 run ex dp 4 4 VGPU_HOST_GPU=exact VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=0
 same ex dp
 lacks ex "ctx_retain 1" "exact mode serves device 0 only"; lacks ex "launch on 1" "exact mode serves device 0 only"; lacks ex "reserve $(win 1)" "exact mode serves device 0 only"
+# 12. several devices queue their launches on the cards and do not wait (the cards run at the same time); one device waits for each launch, as before. The stand-in logs
+# every cuCtxSynchronize: with four devices none comes before the last launch (the read-backs, at the end, are where the queue is waited for), with one device each launch is
+# followed by its own.
+first_sync="$(grep -n '^sync on' "$work/dp4.log" | head -1 | cut -d: -f1)"
+last_launch="$(grep -n '^launch on' "$work/dp4.log" | tail -1 | cut -d: -f1)"
+[[ -n "$first_sync$last_launch" && "${first_sync:-0}" -gt "${last_launch:-0}" ]] || { echo "FAIL: dp4: a launch was waited for although four devices queue theirs (first sync at line ${first_sync:-none}, last launch at line ${last_launch:-none})"; fails=1; }
+off solo solo 1
+run solo solo 1 1
+same solo solo
+seq="$(grep -E '^(launch|sync) on' "$work/solo.log" | tr '\n' ',')"
+[[ "$seq" == "launch on 0,sync on 0,launch on 0,sync on 0,launch on 0,sync on 0," ]] || { echo "FAIL: a single device's launches were not each waited for: $seq"; fails=1; }
 if (( fails )); then echo "FAIL: the multi-card stand-in tests"; exit 1; fi
 echo "PASS: turbo mode on several cards (stand-in driver)"

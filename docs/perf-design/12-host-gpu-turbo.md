@@ -844,7 +844,7 @@ start share of a kernel launched thousands of times was capped at 500 launches (
 (three in a row now). JACOBI1D 2.3 s to 1.5 s, sc_gpu 0.96 s to 0.85 s; LargeKernelParameter saves 0.2 ms a launch against the 0.25 ms its start needs, and stays in the simulator.
 
 
-## 17. Turbo refusal census: what still stays in the simulator, and why (2026-11-17)
+## 18. Turbo refusal census: what still stays in the simulator, and why (2026-11-17)
 
 Tags: [M] measured by `tools/turbo-census` (CPU only, no card) over the files named; [I] inferred; [U] unknown. Data, method and the list of what is the runtime's own code and what the tool wrote again:
 [data/turbo-census/README.md](data/turbo-census/README.md). Nothing in turbo changed.
@@ -867,7 +867,7 @@ Tags: [M] measured (A10G, sm_86, driver 595, CUDA 13.0 toolkit, the rig of 2026-
 Nothing is claimed for Hopper or Blackwell: no sm_90 or sm_100 card was used, and the sm_90 PTX below is run on the sm_86 card after the section 15 retarget.
 Exact mode, the plain simulator and its counters are unchanged: every rule here is turbo only (`mode == Turbo`), and `VGPU_HOST_GPU=exact` is tested to refuse the same kernels as before.
 
-Two refusals that the census (section 17) found to be the largest levers outside the corpus were taken apart: what turbo kept in the simulator because a failed `assert` or a trap ends a real context, and what it kept
+Two refusals that the census (section 18) found to be the largest levers outside the corpus were taken apart: what turbo kept in the simulator because a failed `assert` or a trap ends a real context, and what it kept
 out of the card because a PTX module declares a variable.
 
 ### 20.1 What a card does when an assert fires or a trap executes [M, A10G]
@@ -976,3 +976,118 @@ maps its memory with `cuMemMap` ("virtual memory mappings hold device memory the
 * `moe-align`'s 222,918,083 differing words (none outside the tolerance), `kurtosis`'s 3.1 s, `determinant`'s window refusal and rotary's memory kill were seen and not investigated.
 * Nothing is claimed for Hopper or Blackwell cards: the sm_90 runs above are sm_90 PTX retargeted onto the sm_86 card.
 
+
+
+## 19. Several host cards: simulated device N runs on host card N (2026-11-17)
+
+Tags: [M] measured (the card or rig named), [D] documented (NVIDIA or the code), [I] inferred, [U] unknown.
+
+Before this section the host-GPU runtime answered for the simulated device in ordinal 0 only, on the real driver's device 0, with one context, one module cache, one residency
+table and one window per process (section 15's survey, section 7). A machine with four cards used one. Turbo mode (not exact mode, which is unchanged) now gives every simulated
+device its own card.
+
+### 17.1 What a process can do with several cards [M, four Tesla T4 (sm_75), native Linux, CUDA 13.0, `tools/multicard/va_probe.cu`, output in `data/multicard/va_probe.out`]
+
+* One process holds a primary context on each of the four cards and reserves a different window on each with `cuMemAddressReserve` at the simulator's own per-device address
+  (`kDeviceVaBase + slot * 1 TiB`: 0x200000000000, 0x210000000000, ...): all four reservations returned the address asked for. The simulator's windows are disjoint by construction
+  (`MemoryManager::va_base`, one 1 TiB window per device slot, 16 slots), so the card path needs nothing but "device slot S is reserved on card S".
+* The same address cannot be reserved on a second card: the second `cuMemAddressReserve` of an address another card's context holds returns error 1. Unified addressing is one VA space
+  for the process. Giving one simulated device two cards, or mirroring one window on two cards, is not possible; this is why the unit is "one device, one card".
+* Kernels on the four cards, launched back to back with no wait in between, all ran. A copy of memory between two cards works through the host (`cuMemcpyDtoH`, `cuMemcpyHtoD`; the four
+  T4s report `cuDeviceCanAccessPeer` 0, no peer-to-peer), and `cuMemcpyPeer` works too (the driver stages it). Streams and events per card, and a `cuStreamWaitEvent` on another card's event, worked.
+* A copy of a window's memory must be issued with the owning card's context current: a device-to-host copy of card 3's window with card 0's context current returned error 1.
+* **A kernel on card 0 that touches card 1's window kills card 0's context (error 700) and every other context of the process**: after it, a copy on card 2 and a synchronise on card 1
+  returned 700 too. This is the one rule that shapes the design: a launch that could reach another device's memory must never go to a card (17.3).
+* Real-driver `CUDA_VISIBLE_DEVICES=2,3` on the four cards: the driver reports two devices [M]; which machine card is its device 0 is [D] (the list's order).
+
+### 17.2 Design
+
+One `Runtime::Impl` per simulated device slot instead of one per process: each has its own driver `Api`, context, window (`va_base = kDeviceVaBase + slot * kDeviceVaStride`), module cache,
+residency table, launch lock (`GateLock mu`), watchdog, statistics and `CardGate`. The per-launch code is unchanged; it simply finds its own `Impl`. `Runtime::for_device(profile, ordinal,
+physical)` takes the device's slot (`Device::physical_`, the window the memory manager is in) and makes the runtime of that slot on first use.
+
+* Which card [I for the rule, M for the effect on four T4s; pure code in `include/vgpu/host_gpu_cards.hpp`, `pick_card`]: slot S uses the machine's card S when the real driver shows it.
+  A simulated machine bigger than the host's card count keeps the devices without a card in the simulator: the runtime of that slot ends its driver start with one line
+  (`host_gpu: simulated device 2 has no host card ...; so it stays in the simulator`, once per device, not "mode off"), and every launch on it is the plain simulator's.
+  Mixed placement (devices 0 and 1 on cards, device 2 simulated) is allowed because coherence is per device (17.3).
+* `VGPU_HOST_GPU_DEVICES=a,b,c` (turbo): slot 0 uses the real driver's device a, slot 1 its device b; a slot past the list stays simulated. Numbers are the driver's own (CUDA_VISIBLE_DEVICES
+  is not applied on top). A list that is not different decimal numbers turns the mode off with a message (said even under VGPU_QUIET), as the other switches do.
+* `CUDA_VISIBLE_DEVICES`: the simulator reads it in `shared_runtime.cpp` to choose among the SIMULATED machine's devices, and the real driver loaded in the same process reads the same
+  string at `cuInit`. [I] The numbers in it name the machine's cards, so the simulated device in slot S is the machine's card S, and the real driver numbers that card by its place in the
+  list: with `CUDA_VISIBLE_DEVICES=2,3` slot 2 uses the driver's device 0 and slot 3 its device 1, and slots 0 and 1 have no card (hidden). A string that is not a list of decimal numbers (UUIDs) is
+  not read: the driver then chose, and slot S is its device S. Before this change a program started with `CUDA_VISIBLE_DEVICES=1` had its device 0 in window 1 and the card path reserved window 0
+  (every launch then failed to map a window that did not contain its memory: the mode silently did nothing); it now follows the slot.
+* Exact mode: `served_slot` serves ordinal 0 only, window 0, the driver's device 0, exactly as before; with one host card turbo behaves as before for slot 0, and slot 1 and up stay simulated.
+* The first Runtime made prints the summary lines scripts read; with more than one runtime every device that started a card adds `host_gpu_card: device_slot=S card=C launches_card=.. launches_sim=..
+  card_s=.. sim_s=.. mib_to_card=.. mib_back=..`, so a script adds them up. `host_gpu_turbo:` and the lines under it describe the first device only.
+
+### 17.3 Coherence with several devices [D for the mechanisms, M for the stub tests, U where said]
+
+Each device's memory has its own window, residency table and gate, so a launch on card S flips only device S's chunks to Card; nothing else changes hands.
+
+* Copies between devices (`cudaMemcpyPeer`, a `cudaMemcpy` device to device, a copy from a device with a card to one without): the runtime performs them through the simulator's memory managers,
+  whose gate pulls the chunks only a card holds first (the existing `before_access` path); no card-to-card copy is made. Test: `copy` and `mixed` in `run_host_gpu_multi_stub.sh` use a stand-in
+  card that adds 1 to four ints, and the printed values are the mode-off values, so a missing pull would show.
+* Peer access (`cudaDeviceEnablePeerAccess`): `MemoryManager::card_blocker()` already refused every launch on a device with a peer link, from or to it; that now applies per device, so devices
+  0 and 1 with a link stay simulated while 2 and 3 keep their cards (test `peeron`).
+* A pointer into another device's window in a launch's arguments (a peer pointer without peer access: the simulator's invalid-pointer error): refused by the card path, as a fault on the
+  card would kill every context of the process (17.1). Not recognised: such a pointer reached through memory (a table of device pointers), which on a card faults and ends the process.
+  [U] how common; the simulator itself reports the error for it without peer access, so the program is wrong on a real machine too.
+* NCCL-like patterns: the simulator's collectives go through its own communicators and the memory managers, so what they read and write is pulled and pushed like any copy [I, not tested];
+  a program that allreduces between launches simply alternates, with the pulls of 4 devices' chunks. [U] no NCCL program was run this round.
+* Streams and events: the card path still launches on the default stream and does not create events; the simulator's streams and events are unchanged.
+
+### 17.4 Launches are queued when there are several devices [M, 4x T4]
+
+A launch on a card used to be waited for (`cuCtxSynchronize` inside the launch), so a second device's launch could not start before the first card finished. With more than one simulated
+device (`g_runtimes > 1`) turbo with `VGPU_HOST_GPU_FIT=1` now queues the launch on the card's default stream and returns: copies on the same stream are ordered after it by the driver [D],
+so the data needs no change, and `Impl::settle()` waits (and checks the kernel's error) where the card's memory is pulled, and at exit. The watchdog stays armed until then. Not queued: with one
+device (the usual program: the launch is waited for, as before; test `solo`), kernels that print, verify runs, write-through, `VGPU_HOST_GPU_FIT=0`.
+**Known limit [M]:** the shim holds one API lock per call, and a read-back that waits for a card (the pull) holds it, so a program whose thread for device 0 reads its results back before the
+thread for device 3 has launched serializes the cards behind it (pattern 2 below). Launch on all devices, then read back (patterns 0 and 1) overlaps them. Releasing that lock while a card is waited for
+needs the shim's lock discipline reviewed and was not attempted.
+
+### 17.5 Measurements (AWS g4dn.12xlarge, four Tesla T4, 48 vCPU; `tools/multicard/multibench.cu`, `bench.sh`; raw output in `data/multicard/`)
+
+`multibench <devices> <pattern> 1048576 <iters> 2`: per device 1M floats, 2 launches of a kernel doing `iters` iterations of a multiply and two fused multiply-adds (no libm, so the card and the
+simulator agree bit for bit), a checksum per device printed. Pattern 0: one thread launches on every device, then reads all back; 1: a thread per device with a barrier after the launches; 2: a thread per
+device reading back as soon as it has launched. Simulated machine: `VGPU_GPU=nvidia/t4`, 4 devices. Every run below printed the same bytes (a hash of stdout is in the data files).
+
+| 4 devices, iters 65536, wall seconds | pattern 0 | pattern 1 | pattern 2 |
+|---|---|---|---|
+| plain simulator | 31.4 | 32.2 | 32.9 |
+| turbo, a card for device 0 only (`VGPU_HOST_GPU_DEVICES=0`: what turbo did before) | 19.9 | 26.7 | 28.0 |
+| turbo, 4 cards | 0.93 | 0.92 | 1.15 |
+
+(34x the simulator and 21 to 29x the old turbo for patterns 0 and 1.) Scaling with the number of devices, 1M iterations, turbo, each device on its card (two runs each, seconds):
+
+| devices | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| pattern 0 | 2.11 | 2.12 | 2.13 | 2.14 |
+| pattern 1 | 2.11 | 2.12 | 2.13 | 2.13 |
+| pattern 2 | 2.12 | 2.13 | 4.71 | 6.00 |
+
+The same program on the real driver with no simulator (`multibench` built against the real cudart): 1.70 s with 1 device, 2.11 to 2.20 s with 4 for every pattern; the 0.4 s over it with 1 device is the
+simulator's start and the driver start. Before queueing launches the same turbo runs grew by about 1.3 s per device (2.1, 3.4, 4.7, 6.0 s), the cards running one after another.
+
+SINGLE_DEVICE_TABLE
+
+### 17.6 Tests
+
+* `tests/unit/test_host_gpu_cards.cpp` (hosted CI, no card): the card choice (`pick_card`, `driver_cards`, `parse_card_list`, `served_slot`, `addr_in_other_window`), including CUDA_VISIBLE_DEVICES
+  renumbering and hiding, a list that ends early, UUID strings, VGPU_HOST_GPU_DEVICES, devices beyond the cards, exact mode serving slot 0 only, and the windows being disjoint.
+* `nvidia/tests/e2e/run_host_gpu_multi_stub.sh` (CTest `e2e_host_gpu_multi_stub`; stand-in driver `host_gpu_stub_driver.c` extended to show `STUB_DEVICES` cards, read `CUDA_VISIBLE_DEVICES` as a
+  driver does, give each card its own context, and compute `bump` with `STUB_CARD_BUMP=1`): twelve checks, listed in the script's header, every output equal to the mode-off output.
+* Mutation evidence (`tools/multicard/mutate.sh`, output `data/multicard/mutations.txt`): each mutation below is killed. M1 every slot uses window 0: 25 e2e failures; M2 every device uses
+  driver device 0: 32; M3 a peer pointer argument not looked at: the peerptr output and its "no launch" check fail; M4 one runtime for all devices: 32; M5 CUDA_VISIBLE_DEVICES not read: unit
+  `visible_devices_renumber_the_real_driver_not_the_slot` and 7 e2e; M6 exact mode serves every device: unit `exact_mode_serves_device_zero_only_and_turbo_every_window`; M7 a device without a card uses the
+  first card: 2 unit and 4 e2e; M8 launches always waited for and M9 always queued: see the file for the failing checks.
+
+### 17.7 What is left
+
+* Releasing the shim's API lock while a card is waited for (pattern 2 above); needs a review of what the lock protects. [U]
+* Device-to-device copies still go through the host and the simulator's memory (a card-to-card path with `cuMemcpyPeer` for two devices that both hold Card chunks would save the round trip; not
+  needed for correctness). [U for the gain]
+* NCCL-style collectives and torch DDP were not run; a peer pointer reached through memory ends the process (17.3). [U]
+* A mixed machine (cards of different architectures: each runtime has its own `host_sm`, the module images are chosen per card) is untested on real hardware; the unit tests cover the choice only. [U]
+* Not run on a card of another architecture than sm_75; only the four T4s were available this round.

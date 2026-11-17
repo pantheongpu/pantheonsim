@@ -42,4 +42,8 @@ echo "== M7 a device without a card is served by the first card instead of stayi
 patch include/vgpu/host_gpu_cards.hpp '  p.why = (cvd && *cvd) ? CardWhy::Hidden : CardWhy::NoCard;
   return p;' '  p.index = 0; p.why = CardWhy::Ok;
   return p;'; run M7; restore
+echo "== M8 every launch is waited for (the queue is off)"
+patch src/runtime/host_gpu.cpp 'g_runtimes.load(std::memory_order_relaxed) > 1;' 'false;'; run M8; restore
+echo "== M9 launches are queued with one device too"
+patch src/runtime/host_gpu.cpp 'g_runtimes.load(std::memory_order_relaxed) > 1;' 'true;'; run M9; restore
 echo "== done"; run RESTORED
