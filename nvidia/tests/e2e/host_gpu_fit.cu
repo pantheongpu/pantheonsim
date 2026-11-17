@@ -102,6 +102,14 @@ int main(int argc, char** argv) {
     std::printf("launch=%d\n", static_cast<int>(cudaGetLastError()));
   } else if (!std::strcmp(mode, "grid")) {
     tiny<<<4096, 4>>>(d, n);
+  } else if (!std::strcmp(mode, "hostmap")) {   // the kernel writes pinned host memory the program mapped (zero-copy)
+    int *h = nullptr, *dh = nullptr;
+    if (cudaHostAlloc(&h, 32 * sizeof(int), cudaHostAllocMapped) != cudaSuccess || cudaHostGetDevicePointer(&dh, h, 0) != cudaSuccess) return 2;
+    std::memset(h, 0, 32 * sizeof(int));
+    tiny<<<1, 32>>>(dh, 32);
+    cudaDeviceSynchronize();
+    std::printf("hostsum=%lld\n", sum(h, 32));
+    cudaFreeHost(h);
   } else if (!std::strcmp(mode, "qmma")) {
 #ifndef FIT_NO_ELECT
     qmma<<<1, 32>>>(d);

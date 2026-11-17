@@ -61,7 +61,8 @@ constexpr uint64_t kGranule = 2ull << 20;
 constexpr int kAttrMultiprocessors = 16, kAttrCcMajor = 75, kAttrCcMinor = 76;
 constexpr int kFuncAttrMaxDynamicShared = 8;
 // (cuda.h CUdevice_attribute and CUfunction_attribute)
-constexpr int kAttrMaxThreads = 1, kAttrMaxBlockX = 2, kAttrMaxGridX = 5, kAttrMaxRegisters = 12, kAttrSharedOptin = 97;
+constexpr int kAttrMaxThreads = 1, kAttrMaxBlockX = 2, kAttrMaxGridX = 5, kAttrMaxRegisters = 12, kAttrSharedOptin = 97, kAttrCooperative = 95;
+constexpr unsigned kHostRegisterDeviceMap = 2;   // CU_MEMHOSTREGISTER_DEVICEMAP
 constexpr int kFuncAttrMaxThreads = 0, kFuncAttrSharedSize = 1, kFuncAttrNumRegs = 4;
 
 struct Api {
@@ -87,6 +88,12 @@ struct Api {
   CUresult (*cuModuleGetGlobal)(CUdeviceptr*, size_t*, CUmodule, const char*) = nullptr;   // (a module's __constant__ banks, Round sp66)
   CUresult (*cuMemcpyDtoD)(CUdeviceptr, CUdeviceptr, size_t) = nullptr;
   CUresult (*cuFuncGetAttribute)(int*, int, CUfunction) = nullptr;   // (turbo mode's fit check; not required: without it nothing is sent in turbo mode)
+  // (turbo mode's cooperative launches and mapped host memory; not required: without one of them those launches stay in the simulator)
+  CUresult (*cuLaunchCooperativeKernel)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void*, void**) = nullptr;
+  CUresult (*cuOccupancyMaxActiveBlocksPerMultiprocessor)(int*, CUfunction, int, size_t) = nullptr;
+  CUresult (*cuMemHostRegister)(void*, size_t, unsigned) = nullptr;
+  CUresult (*cuMemHostUnregister)(void*) = nullptr;
+  CUresult (*cuMemHostGetDevicePointer)(CUdeviceptr*, void*, unsigned) = nullptr;
 
   bool load(const char* path) {
     lib = dlopen(path, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
@@ -105,6 +112,11 @@ struct Api {
 #undef VGPU_HG_SYM
 #undef VGPU_HG_SYM_V2
     cuFuncGetAttribute = reinterpret_cast<decltype(cuFuncGetAttribute)>(dlsym(lib, "cuFuncGetAttribute"));
+    cuLaunchCooperativeKernel = reinterpret_cast<decltype(cuLaunchCooperativeKernel)>(dlsym(lib, "cuLaunchCooperativeKernel"));
+    cuOccupancyMaxActiveBlocksPerMultiprocessor = reinterpret_cast<decltype(cuOccupancyMaxActiveBlocksPerMultiprocessor)>(dlsym(lib, "cuOccupancyMaxActiveBlocksPerMultiprocessor"));
+    cuMemHostRegister = reinterpret_cast<decltype(cuMemHostRegister)>(dlsym(lib, "cuMemHostRegister_v2"));
+    cuMemHostUnregister = reinterpret_cast<decltype(cuMemHostUnregister)>(dlsym(lib, "cuMemHostUnregister"));
+    cuMemHostGetDevicePointer = reinterpret_cast<decltype(cuMemHostGetDevicePointer)>(dlsym(lib, "cuMemHostGetDevicePointer_v2"));
     return true;
   }
 };
@@ -243,6 +255,7 @@ struct Runtime::Impl : CardGate {
     const char* why = "";                       // the reason given on a later launch of the same kernel
     std::string why_text;                       // ... when it is made for this kernel (`why` then points here)
     bool printf = false;                        // it reaches vprintf (turbo mode): stdout is flushed before its launch on the card
+    bool trap_only = false;                     // class never only by BPT, and admitted otherwise: a cooperative launch runs it (grid.sync() traps only outside one)
   };
   // VGPU_HOST_GPU_LOG: what kept each kernel's launches in the simulator, with the simulator's seconds (one host_gpu_kept line per kernel and
   // reason at exit), for a census of what the mode still cannot send.
@@ -585,6 +598,7 @@ struct Runtime::Impl : CardGate {
           }
           L.shared_optin = get(kAttrSharedOptin);
           L.regs_per_block = get(kAttrMaxRegisters);
+          L.cooperative = get(kAttrCooperative) != 0;
         }
         if (self->api.cuDevicePrimaryCtxRetain(&self->ctx, d) || self->api.cuCtxSetCurrent(self->ctx)) { why = "no context"; break; }
         if (!exact_gate) {
@@ -682,6 +696,40 @@ struct Runtime::Impl : CardGate {
   // VGPU_HOST_GPU_WIDER=0: the safety rules before Round sp66, for A/B runs: any variable, external function or device-side launch in a module refuses all its
   // kernels, a live texture object and a graph's launch refuse every launch, and turbo mode's float atomics with a value, CAS and EXCH are an opt-in (VGPU_HOST_GPU_ATOMICS=1).
   bool wider = true;
+  // Turbo mode (docs/perf-design/12-host-gpu-turbo.md section 18): a cooperative launch goes to the card as one (VGPU_HOST_GPU_COOP=0 keeps it in the
+  // simulator), and so does a launch with an argument into mapped host memory, which the card is given at the same address (VGPU_HOST_GPU_HOSTMAP=0).
+  bool coop = true;
+  bool hostmap = true;
+  std::map<uint64_t, uint64_t> pinned;   // host buffers registered with the driver, by address, with their length
+  uint64_t pinned_unmaps = 0;            // MemoryManager::host_unmaps() when they were registered
+
+  // Registers every host buffer the simulator has mapped with the driver, so that a pointer into one, in an argument or in memory, means the same
+  // there. Registered with DEVICEMAP, a buffer's device pointer is its host pointer (measured, A10G, driver 595: checked here, for every buffer).
+  // False: a buffer could not be given, and the launch stays in the simulator.
+  bool pin_host_maps(MemoryManager& mem) {
+    if (!api.cuMemHostRegister || !api.cuMemHostUnregister || !api.cuMemHostGetDevicePointer) return false;
+    if (const uint64_t n = mem.host_unmaps(); n != pinned_unmaps) {   // (a buffer freed and mapped again at its address is other memory)
+      for (const auto& [base, len] : pinned) api.cuMemHostUnregister(reinterpret_cast<void*>(base));
+      pinned.clear();
+      pinned_unmaps = n;
+    }
+    for (const MemoryManager::HostSpan& sp : mem.host_spans()) {
+      if (sp.base != reinterpret_cast<uint64_t>(sp.host) || sp.len == 0) return false;
+      if (const auto it = pinned.find(sp.base); it != pinned.end()) {
+        if (it->second == sp.len) continue;
+        api.cuMemHostUnregister(sp.host);
+        pinned.erase(it);
+      }
+      CUdeviceptr dev = 0;
+      if (api.cuMemHostRegister(sp.host, sp.len, kHostRegisterDeviceMap)) return false;
+      if (api.cuMemHostGetDevicePointer(&dev, sp.host, 0) || dev != sp.base) {
+        api.cuMemHostUnregister(sp.host);
+        return false;
+      }
+      pinned[sp.base] = sp.len;
+    }
+    return true;
+  }
 
   struct Decision {
     bool ok = false;
@@ -691,6 +739,7 @@ struct Runtime::Impl : CardGate {
     uint64_t instrs = 0;
     bool runnable = false, back_edge = false, loop = false;
     bool printf = false;   // (Verdict::printf)
+    bool host_args = false;   // an argument points into mapped host memory (turbo mode: the card is given it before the launch)
     const exec::BlockProbe* probe = nullptr;   // the kernel's followed loops (Verdict::probe; the table of verdicts keeps it), or null
   };
 
@@ -861,7 +910,7 @@ struct Runtime::Impl : CardGate {
     };
     const bool turbo = mode == Mode::Turbo;
     if (!turbo && (!fn.sass || fn.sass->image.empty())) return unsafe("not a SASS module");
-    if (cfg.cooperative || cfg.cluster != std::array<uint32_t, 3>{0, 0, 0} || fn.req_cluster != std::array<uint32_t, 3>{0, 0, 0}) return unsafe("cooperative or cluster launch");
+    if ((cfg.cooperative && !(turbo && coop)) || cfg.cluster != std::array<uint32_t, 3>{0, 0, 0} || fn.req_cluster != std::array<uint32_t, 3>{0, 0, 0}) return unsafe("cooperative or cluster launch");
     // (Texture objects: a kernel reads one only through a texture or surface instruction, which neither the exact set nor any turbo class admits,
     // so a launch is no longer refused because the device has one; until Round sp66 one live texture object kept every launch off the card.)
     if (!wider && cfg.textures) return unsafe("texture objects");
@@ -876,7 +925,10 @@ struct Runtime::Impl : CardGate {
       for (size_t i = 0; i + 8 <= a.size(); i += 8) {
         uint64_t v;
         std::memcpy(&v, &a[i], 8);
-        if (v && mem.host_map_possible(v) && mem.is_host_mapped(v)) return unsafe("argument points into mapped host memory");
+        if (v && mem.host_map_possible(v) && mem.is_host_mapped(v)) {
+          if (!(turbo && hostmap)) return unsafe("argument points into mapped host memory");
+          d.host_args = true;
+        }
       }
     // Device memory that is not in the allocation table (VMM mappings, IPC, the kernel heap) is not on the card: a pointer to it, from an argument or from
     // memory, would read what the card never got. Not cached: a mapping can appear between two launches of one kernel.
@@ -886,7 +938,7 @@ struct Runtime::Impl : CardGate {
     if (turbo && fit && !host_known && !await_start()) return unsafe("the host GPU could not be started");
     const auto key = std::make_pair(module_key(fn), fn.name);
     const auto decision_of = [&](const Verdict& v) {
-      d.ok = v.ok;
+      d.ok = v.ok || (v.trap_only && cfg.cooperative && coop);   // (the trap of grid.sync() is for a launch that is not cooperative)
       d.why = v.why;
       d.kind = v.kind;
       d.rr = v.rr;
@@ -976,7 +1028,7 @@ struct Runtime::Impl : CardGate {
       v.kind = turbo && image_refusal ? Refused::Image : Refused::Safety;
       v.why = why;   // (before the reason was kept, a later launch of such a kernel was said, and counted, as "not in the exact set")
     }
-    ClassMask classes = 0;
+    ClassMask classes = 0, classes_but_trap = 0;
     bool indirect = false;   // a jump through a register, a call or a return, or a branch to nowhere in the code (the flow's `indirect`)
     std::string first_never, first_gated;   // the text of the first instruction of no class, and of the first one a switch refuses
     if (ok && mcard.is_ptx) {
@@ -1036,6 +1088,7 @@ struct Runtime::Impl : CardGate {
             }
           }
           classes |= class_bit(c);
+          if (!(c == InsnClass::Never && ins.mnemonic == "BPT")) classes_but_trap |= class_bit(c);
           if (c == InsnClass::Never && first_never.empty()) first_never = sass::to_text(ins);
           const ClassMask gated = sw.off | (sw.atomics ? 0 : class_bit(InsnClass::AtomFloat) | class_bit(InsnClass::AtomSwap));
           if ((class_bit(c) & gated) && first_gated.empty()) first_gated = sass::to_text(ins);
@@ -1099,6 +1152,7 @@ struct Runtime::Impl : CardGate {
     if (runnable_here) {
       const bool exact_ok = ok;
       v.rr = exact_ok ? TurboRefusal::None : turbo_refusal(classes, sw);
+      v.trap_only = turbo && v.rr == TurboRefusal::Never && !mcard.is_ptx && turbo_refusal(classes_but_trap, sw) == TurboRefusal::None;
       if (turbo) ok = v.rr == TurboRefusal::None;   // (a kernel of the exact set, the division idiom included, is admitted whatever is switched off)
       if (!ok) {
         v.kind = Refused::Code;
@@ -1118,7 +1172,7 @@ struct Runtime::Impl : CardGate {
           for (unsigned c = 0; c < kInsnClasses; ++c)
             if (classes & (ClassMask{1} << c)) held += std::string(held.empty() ? "" : " ") + insn_class_name(static_cast<InsnClass>(c));
           std::fprintf(stderr, "host_gpu: %s: card image %s%s; classes: %s; %s\n", fn.name.c_str(), mcard.what.c_str(), mcard.same_as_sim ? "" : " (not the simulator's image)",
-                       held.c_str(), ok ? (exact_ok ? "admitted (exact set)" : "admitted") : why);
+                       held.c_str(), ok ? (exact_ok ? "admitted (exact set)" : "admitted") : v.trap_only ? "never by a trap only: admitted in a cooperative launch" : why);
         }
       }
     }
@@ -1489,6 +1543,8 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
     r->impl_->tol = tol;
     r->impl_->watchdog.limit_s = timeout_s;
     r->impl_->wider = wider;
+    if (const char* v = std::getenv("VGPU_HOST_GPU_COOP"); v && std::string(v) == "0") r->impl_->coop = false;
+    if (const char* v = std::getenv("VGPU_HOST_GPU_HOSTMAP"); v && std::string(v) == "0") r->impl_->hostmap = false;
     r->impl_->fit = fit;
     // Turbo mode does not return the simulator's bits: said once, when the mode comes on (not under VGPU_QUIET, which silences the prose).
     if (mode == Mode::Turbo && !quiet()) std::fprintf(stderr, "%s\n", turbo_notice());
@@ -1878,6 +1934,14 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     const FitRefusal fr = fits_card(im.limits, im.attrs_of(f), cfg.grid.data(), cfg.block.data(), cfg.shared_bytes, hi > base ? hi - base : 0);
     if (fr != FitRefusal::None) return fit_refuse(fr);
     if (cfg.shared_bytes > 48 * 1024 && im.api.cuFuncSetAttribute(f, kFuncAttrMaxDynamicShared, static_cast<int>(cfg.shared_bytes))) return fit_refuse(FitRefusal::SharedAttribute);
+    if (cfg.cooperative) {
+      int per_sm = 0;
+      if (!im.limits.cooperative || !im.api.cuLaunchCooperativeKernel || !im.api.cuOccupancyMaxActiveBlocksPerMultiprocessor ||
+          im.api.cuOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, f, static_cast<int>(cfg.block[0] * cfg.block[1] * cfg.block[2]), cfg.shared_bytes) ||
+          !coop_fits(blocks, static_cast<uint32_t>(std::max(per_sm, 0)), im.host_mp))
+        return fit_refuse(FitRefusal::Cooperative);
+    }
+    if (dec.host_args && !im.pin_host_maps(mem)) return fit_refuse(FitRefusal::HostMemory);
   }
   std::vector<uint8_t>& buf = im.push_buf;
   bool card_only_data = false;   // chunks only the card holds, from earlier launches: lost if the card fails now
@@ -1931,10 +1995,13 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   std::vector<void*> params;
   std::vector<std::vector<uint8_t>> keep = args;
   for (auto& a : keep) params.push_back(a.data());
+  std::vector<std::vector<uint8_t>> host_before;   // a verify run: the mapped host memory as the simulator will run on it, which the card changes in place
+  if (im.verify && dec.host_args)
+    for (const auto& [base, len] : im.pinned) host_before.emplace_back(reinterpret_cast<uint8_t*>(base), reinterpret_cast<uint8_t*>(base) + len);
   const auto k0 = std::chrono::steady_clock::now();
   im.watchdog.arm(fn.name);
-  CUresult r = im.api.cuLaunchKernel(f, cfg.grid[0], cfg.grid[1], cfg.grid[2], cfg.block[0], cfg.block[1], cfg.block[2], cfg.shared_bytes, nullptr,
-                                     params.data(), nullptr);
+  CUresult r = cfg.cooperative ? im.api.cuLaunchCooperativeKernel(f, cfg.grid[0], cfg.grid[1], cfg.grid[2], cfg.block[0], cfg.block[1], cfg.block[2], cfg.shared_bytes, nullptr, params.data())
+                               : im.api.cuLaunchKernel(f, cfg.grid[0], cfg.grid[1], cfg.grid[2], cfg.block[0], cfg.block[1], cfg.block[2], cfg.shared_bytes, nullptr, params.data(), nullptr);
   if (!r) r = im.api.cuCtxSynchronize();
   im.watchdog.disarm();
   const double kernel_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - k0).count();
@@ -1983,6 +2050,14 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
       to.resize(rs);   // (the buffer of the last launch's range i: no new memory when the ranges did not grow)
       for (uint64_t at = 0; at < rs; at += (32ull << 20))
         if (im.api.cuMemcpyDtoH(to.data() + at, rb + at, std::min<uint64_t>(rs - at, 32ull << 20))) { im.pending.reset(); return false; }
+    }
+    size_t held = 0;
+    for (const auto& [base, len] : im.pinned) {   // (the card's bytes of the host memory are compared too; the simulator then gets its own)
+      if (held == host_before.size()) break;
+      uint8_t* const h = reinterpret_cast<uint8_t*>(base);
+      im.pending.ranges.emplace_back(base, len);
+      im.pending.card.emplace_back(h, h + len);
+      std::memcpy(h, host_before[held++].data(), len);
     }
     im.verify_card_ran = true;
     ++im.stats.simulated;

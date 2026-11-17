@@ -42,6 +42,7 @@ int cuDeviceGetAttribute(int* v, int attr, int d) {
     case 16: *v = env_int("STUB_MP", 28); break;
     case 75: *v = env_int("STUB_SM", 86) / 10; break;
     case 76: *v = env_int("STUB_SM", 86) % 10; break;
+    case 95: *v = env_int("STUB_COOP", 1); break;
     case 97: *v = env_int("STUB_SHARED_OPTIN", 101376); break;
     default: *v = 0;
   }
@@ -196,3 +197,31 @@ int cuLaunchKernel(void* f, unsigned a, unsigned b, unsigned c, unsigned d, unsi
   if (env_int("STUB_LAUNCH_FAIL", 0)) return env_int("STUB_LAUNCH_FAIL", 0);
   return env_int("STUB_CARD_OK", 0) ? 0 : 1;
 }
+
+/* A cooperative launch (STUB_OCC: the blocks of the function one SM holds at once), and mapped host memory: a registration is logged, an overlap is refused as
+ * the real driver does (712), STUB_HOSTREG_FAIL refuses every one, and STUB_HOSTPTR_SHIFT makes a device pointer differ from the host pointer. */
+int cuLaunchCooperativeKernel(void* f, unsigned a, unsigned b, unsigned c, unsigned d, unsigned e, unsigned g, unsigned sh, void* s, void** p) {
+  (void)f; (void)a; (void)b; (void)c; (void)d; (void)e; (void)g; (void)sh; (void)s; (void)p; note("cuLaunchCooperativeKernel");
+  return env_int("STUB_CARD_OK", 0) ? 0 : 1;
+}
+int cuOccupancyMaxActiveBlocksPerMultiprocessor(int* n, void* f, int threads, size_t shared) { (void)f; (void)threads; (void)shared; note("cuOccupancyMaxActiveBlocksPerMultiprocessor"); *n = env_int("STUB_OCC", 4); return 0; }
+static struct { char* lo; size_t n; } g_pins[32];
+static int g_npins;
+int cuMemHostRegister_v2(void* p, size_t n, unsigned flags) {
+  (void)flags;
+  note("cuMemHostRegister");
+  if (env_int("STUB_HOSTREG_FAIL", 0)) return 801;
+  for (int i = 0; i < g_npins; ++i)
+    if (g_pins[i].n && (char*)p < g_pins[i].lo + g_pins[i].n && g_pins[i].lo < (char*)p + n) return 712;
+  if (g_npins == 32) return 2;
+  g_pins[g_npins].lo = p;
+  g_pins[g_npins++].n = n;
+  return 0;
+}
+int cuMemHostUnregister(void* p) {
+  note("cuMemHostUnregister");
+  for (int i = 0; i < g_npins; ++i)
+    if (g_pins[i].n && g_pins[i].lo == (char*)p) { g_pins[i].n = 0; return 0; }
+  return 713;
+}
+int cuMemHostGetDevicePointer_v2(u64* d, void* p, unsigned flags) { (void)flags; *d = (u64)p + (u64)env_int("STUB_HOSTPTR_SHIFT", 0); return 0; }
