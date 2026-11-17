@@ -754,7 +754,7 @@ What changed in turbo mode, and why:
    first blocks, no first-launch rule, no start cost, no bans, no streak rule, and not the 2 GiB `VGPU_HOST_GPU_MAX_MIB` pipe cap (the card's capacity is what is checked). The card is
    started at the first launch that passes the cheap checks, since the image depends on it. **Why it is the default:** "every kernel the card can run" cannot hold with the size rule
    (a one-warp launch would stay in the simulator), and the owner asked for it. The cost is real for small programs (a driver start in every process, and a push or
-   pull of memory whenever the simulator and the card alternate): measured on an A10G, 2DCONV 0.93 s to 2.0 s and 0.01 to 0.06 s programs 0.24 to 0.5 s, while the long ones are as fast or faster (below). On a WSL2 host turbo with FIT=1 turns itself off at once with a notice (the driver start never returns there). `VGPU_HOST_GPU_FIT=0` keeps every earlier rule (and the lazy driver start; the verdicts are redone
+   pull of memory whenever the simulator and the card alternate): measured on an A10G, 2DCONV 0.93 s to 2.0 s and 0.01 to 0.06 s programs 0.24 to 0.5 s, while the long ones are as fast or faster (below). On a WSL2 host turbo with FIT=1 turns itself off at once with a notice (the driver start never returns there). `VGPU_HOST_GPU_FIT=0` keeps every earlier rule (including section 17's short-launch rule, #660, which is now what FIT=0 and exact mode use: a kernel's card time prior of a twentieth of the simulator's estimate, a 40 us floor, three slow launches in a row before a ban, `VGPU_HOST_GPU_SHORT=0` for the rule before it; under FIT=1 none of it is asked, because every fitting launch goes to the card whatever it would save) (and the lazy driver start; the verdicts are redone
    when the card turns out to be of another architecture than the profile).
 6. **Kept as they were** (safety, not bit-exactness): cooperative and cluster launches (the card path is a plain `cuLaunchKernel`), host-mapped arguments, VMM, IPC and managed memory, module
    variables the patch cannot apply, externs other than `vprintf`, texture objects, no code section, the diagnostics that need the simulator, and the watchdog.
@@ -833,3 +833,12 @@ Turbo's fit check knows the card's limits, not the simulated profile's, and the 
 
 Retargeted modules inherit section 15's limits and add: the 10 s driver start deadline does not bound the module compile; one failing module compile is counted once per kernel launch that meets it (`failed` and `refused_image`); a PTX module's classes are those of the whole module.
 
+## 17. Very short launches (#660; both modes; merged after sections 15 and 16 were written, so numbered after them)
+
+A10G, 2026-11-17 (`data/turbo-left/card-short-launch.sh`, results in `data/turbo-left/card-2026-11-17-short/`): an empty kernel costs 2.8 us per asynchronous
+launch and 8 us with a sync, so the "no gain above 50 us of latency" outcome did not apply. JACOBI1D (20,000 launches of 0.1 ms in the simulator) was never
+sent, for four reasons, each now a member of `Costs::short_launches()` (what the runtime uses; `VGPU_HOST_GPU_SHORT=0` is the rule before): the card time
+of a kernel never run there was a fixed 100 us, and a launch under 200 us never went, so the prior stayed (now at most `sim_s / 20`, floor 40 us); the
+start share of a kernel launched thousands of times was capped at 500 launches (5,000); the first card launch's time includes the module load (65 us for a
+20 us kernel) and was kept for good (the prior is kept instead, later times at their least); and one launch that was 60 us late ended the card for its kernel
+(three in a row now). JACOBI1D 2.3 s to 1.5 s, sc_gpu 0.96 s to 0.85 s; LargeKernelParameter saves 0.2 ms a launch against the 0.25 ms its start needs, and stays in the simulator.

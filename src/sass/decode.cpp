@@ -2100,6 +2100,9 @@ void dec_ret(Instr& ins, const Word& w) {
   ins.src.push_back(Txt("R" + std::to_string(r) + " " + signed_hex(static_cast<int64_t>(branch_target(w, ins.pc, ins.sm)))));
   ins.src.back().reg = r;
   ins.src.back().imm = static_cast<int64_t>(branch_target(w, ins.pc, ins.sm));
+  // Like BRA and EXIT, a condition predicate beside the guard: only the lanes where both hold return.
+  const unsigned cond = static_cast<unsigned>(w.field(87, 3));
+  if (cond != kPT || w.bit(90)) ins.src.push_back(pred_src(w, 87, 90));
 }
 
 // BRX jumps to the next instruction's address plus the register plus the

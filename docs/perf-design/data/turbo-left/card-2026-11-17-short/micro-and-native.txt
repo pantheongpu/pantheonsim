@@ -1,0 +1,23 @@
+micro: async launch 2.76 us, launch+sync 7.96 us, launch+4B copy 10.36 us, 1 MiB push 85.5 us (12.3 GB/s), pull 86.2 us (12.2 GB/s)
+native JACOBI1D: best of 5 0.45244884490966797 s
+host_gpu: 0 launches ran on the card, 20000 in the simulator (0 kernels not admitted by turbo mode, 19996 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu_turbo: mode=turbo launches_card=0 launches_sim=20000 card_s=0.000000 sim_s=2.202250 words_compared=0 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+host_gpu_refusals: refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=0 too_small=19996 failed=0
+JACOBI1D launches kept by the size rule: 19996
+host_gpu: _Z21runJacobiCUDA_kernel1iPfS_ stays in the simulator (sim 0.111 ms, card path 0.110 ms without the driver start, 0.0 MiB, 0.0 MiB only on the card)
+host_gpu: _Z21runJacobiCUDA_kernel2iPfS_ stays in the simulator (sim 0.091 ms, card path 0.110 ms without the driver start, 0.0 MiB, 0.0 MiB only on the card)
+native sc_gpu: best of 5 0.5291521549224854 s
+host_gpu: 0 launches ran on the card, 1432 in the simulator (0 kernels not admitted by turbo mode, 1430 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu_turbo: mode=turbo launches_card=0 launches_sim=1432 card_s=0.000000 sim_s=0.867684 words_compared=0 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+host_gpu_refusals: refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=0 too_small=1430 failed=0
+sc_gpu launches kept by the size rule: 1430
+host_gpu: _Z19kernel_compute_costiilP5PointiiPfS1_PiPb stays in the simulator (sim 0.665 ms, card path 0.146 ms without the driver start, 0.4 MiB, 0.0 MiB only on the card)
+host_gpu: _Z19kernel_compute_costiilP5PointiiPfS1_PiPb stays in the simulator (sim 0.540 ms, card path 0.146 ms without the driver start, 0.4 MiB, 0.0 MiB only on the card)
+native LargeKernelParameter: best of 5 0.3901338577270508 s
+host_gpu: 0 launches ran on the card, 2002 in the simulator (0 kernels not admitted by turbo mode, 1998 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu_turbo: mode=turbo launches_card=0 launches_sim=2002 card_s=0.000000 sim_s=0.376591 words_compared=0 words_different=0 words_outside=0 words_subnormal=0 kernels_outside=0 max_abs=0 max_rel=0
+host_gpu_refusals: refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=0 too_small=1998 failed=0
+LargeKernelParameter launches kept by the size rule: 1998
+host_gpu: _Z13kernelDefault7param_tPi stays in the simulator (sim 0.223 ms, card path 0.109 ms without the driver start, 0.0 MiB, 0.0 MiB only on the card)
+host_gpu: _Z13kernelDefault7param_tPi stays in the simulator (sim 0.219 ms, card path 0.109 ms without the driver start, 0.0 MiB, 0.0 MiB only on the card)
+nsys not found: skip reading 3 (use ncu --metrics gpu__time_duration.sum on one launch instead)

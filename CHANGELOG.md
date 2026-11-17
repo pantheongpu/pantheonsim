@@ -7,6 +7,18 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **A SASS `RET` with a condition predicate returns only the lanes where both predicates hold** (issue #691). On sm_90 ptxas ends a `__noinline__`
+  function that returns early when two cells are equal with a `RET` whose second predicate sits in the same bits as `BRA` and `EXIT` have it; the decoder
+  dropped it, so lanes that were not equal returned without running the rest, and about a third of an atomic counter's increments were lost. The test
+  is `e2e_ret_condition_predicate`.
+- **Turbo and exact host-GPU modes cost a program whose launches stay in the simulator much less** (issues #662, #660). A program of 50 distinct
+  kernels launched once each ran 1.29x slower with `VGPU_HOST_GPU=turbo` than without; it is now 1.02x, and 5,000 short launches of one kernel went from
+  1.18x to 1.07x (the same decisions, outputs and counters). The scan of each kernel's code skips the loop analysis when no loop can run, looks
+  mnemonics up as integers, and the module's call graph walk no longer builds a string per section; `VGPU_HOST_GPU_LOG` is read once.
+- **Turbo mode sends very short launches to the card when it clearly wins** (issue #660). On an A10G an empty launch plus its sync costs 8 us, so the
+  size rule now takes the card's time for a kernel it has not run as a twentieth of the simulator's estimate (at most 100 us, as before), lets a
+  launch of 40 us or more be sent (was 200 us), and lets a kernel launched thousands of times repay the driver start at 50 us saved a launch.
+  The simulator's results do not change, only which path a launch takes. `VGPU_HOST_GPU_SHORT=0` restores the old rule.
 - **Turbo host-GPU mode, next round: PTX retargeting, a driver start that overlaps the program's set-up, and the simulated profile's launch limits** (follows the turbo-fit round, PR #693).
   A module whose only PTX is plain `.target sm_90` (a build with `-arch=sm_90` or `compute_90` alone) now runs on an sm_80, sm_86 or sm_87 card: its target line is rewritten to
   the card's and the driver compiles it, provided the PTX uses no form that card lacks (a text scan of the forms ptxas 13.0 rejects there: `mbarrier.try_wait`, `expect_tx`, count-form

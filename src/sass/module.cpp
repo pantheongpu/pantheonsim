@@ -563,8 +563,9 @@ std::vector<std::string> reachable(const Module& m, const std::string& kernel) {
       if (caller == f) add(callee);
     // CUDA 12.0's cubins name a call to malloc, free or vprintf only in the
     // relocation of its CALL.ABS.NOINC, not in the call graph.
+    const std::string text = ".text." + f;
     for (const CubinSection& s : m.cubin.sections)
-      if (s.name == ".text." + f)
+      if (s.name == text)
         for (const CubinReloc& r : s.relocs)
           if (r.type == 58 || r.type == 75) add(r.symbol);
   }

@@ -709,7 +709,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       accept(Form::Call);
       return;
     case Op::RET:         // back to the address a register pair holds
-      if (ins.src.empty() || ins.src[0].reg >= kRZ - 1) return;
+      if (ins.src.size() != 1 || ins.src[0].reg >= kRZ - 1) return;   // a condition predicate is the interpreter's
       m.dst = static_cast<uint16_t>(ins.src[0].reg);
       accept(Form::Ret);
       return;
