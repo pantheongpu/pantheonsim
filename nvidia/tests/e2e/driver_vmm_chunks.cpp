@@ -3,6 +3,8 @@
 // copy over it works. The simulator checked a bulk access against the first mapping only, and a copy over two or more chunks failed with
 // "device memory read of N bytes ... runs past the end of the 2097152-byte mapping" (pantheonsim issue #686; all four copies of the issue's
 // reproducer return 0 on an RTX 3080 Ti, driver 595.99.02). A gap in the range, or a chunk nothing mapped, must still be refused.
+// VGPU_E2E_EXPECTS_REFUSALS: the last check makes a copy that must be refused, and the simulator says so on stderr ("VirtualGPU error [out-of-bounds]"),
+// which run_lib_check.sh would otherwise take for a call the program should not have made.
 #include <cuda.h>
 
 #include <algorithm>
