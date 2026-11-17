@@ -37,3 +37,15 @@ Mutations (each applied alone, rebuilt, unit test and stub script run; every one
 | M4 performance rules back under FIT (`fit_send = false`) | src/runtime/host_gpu.cpp | stub: the one-warp launch stays in the simulator (`mut_m4_rules.txt`, 22 FAIL) |
 | M6 `host_is_wsl` never true | include/vgpu/host_gpu_source.hpp | unit: `wsl_is_read_from_the_kernel_version` (`mut_m6_wsl.txt`) |
 | M5 `fits_card` shared-memory bound `>` to `>=` | include/vgpu/host_gpu_source.hpp | unit: `a_launch_fits_the_card_by_its_limits` (boundary); stub: `fl_shared_ok` |
+
+## Review fixes (PR #693 review), mutations 2026-11-17 (unit run and, for M11, the stub script, on server3; each alone, each fails)
+
+| mutation | file | caught by |
+|---|---|---|
+| M7 an unlisted CALL skips the call-target scan (`call_needs_scan` only for class Call) | include/vgpu/host_gpu.hpp | unit `a_call_is_scanned_whatever_its_class` (`mut_m7_call_unscanned.txt`) |
+| M8 TMA forms admitted again (names removed from `unmeasured_private_mnemonic`) | include/vgpu/host_gpu.hpp | unit `turbo_classes_every_kind_of_instruction`, `unlisted_is_turbo_only` (`mut_m8_tma_unlisted.txt`) |
+| M9 variable layout never mismatches | include/vgpu/host_gpu_image.hpp | unit `the_card_image_must_lay_variables_out_as_the_simulator_s_does` (`mut_m9_layout_ignored.txt`) |
+| M10 parameter sizes never mismatch | include/vgpu/host_gpu_image.hpp | unit `the_card_image_must_take_the_simulator_s_arguments` (`mut_m10_params_ignored.txt`) |
+| M11 PTX classes not used by the verdict | src/runtime/host_gpu.cpp | stub step 54 (ATOMICS=0 and TURBO_OFF=atomics both reach the card with a PTX float atomic); unit passes (the verdict is a call) (`mut_m11_ptx_classes.txt`) |
+
+The stub steps added: QMMA (sm_89) admitted as unlisted, `TURBO_OFF=unlisted` keeps it out, ELECT (sm_90) class never, the PTX switches (54), variables in an sm_80 card image that is not the simulator's image (55, positive path: layout agrees, no relocation against a variable left). The negative path (a layout that disagrees) is the unit test: nvcc does not produce two builds that disagree.
