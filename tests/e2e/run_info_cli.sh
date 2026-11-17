@@ -52,23 +52,31 @@ expect "h100-pcie is the measured one" "tensor_sum: hopper [measured]" "$("$vgpu
 
 # ---- Blackwell: b200 and gb200 sum by the Hopper rule, inferred from data others recorded on a B200 (RE-RECORDED 2026-11-16; before: ------
 # ---- sequential, unknown, with the published model named as not in force); the other Blackwell profiles stay sequential, unknown ---------
-for gpu in b200 gb200; do
+for gpu in b200 gb200 rtx5090 rtx-pro-4500 rtx-pro-6000 rtx-pro-6000-max-q; do
   out=$("$vgpu" info --gpu nvidia/$gpu 2>&1)
   expect "$gpu: hopper, inferred" "tensor_sum: hopper [inferred]" "$(line 'tensor_sum:' <<<"$out")"
   expect "$gpu: chunk 16" "tensor_sum_chunk: 16 [inferred]" "$(line 'tensor_sum_chunk:' <<<"$out")"
   expect "$gpu: tf32 chunk 8" "tensor_sum_chunk_tf32: 8 [inferred]" "$(line 'tensor_sum_chunk_tf32:' <<<"$out")"
   expect "$gpu: grid 26" "tensor_sum_grid: 26 [inferred]" "$(line 'tensor_sum_grid:' <<<"$out")"
   lacks "$gpu: nothing left to opt in to" "tensor_sum_published" "$out"
+done
+for gpu in b200 gb200; do
+  out=$("$vgpu" info --gpu nvidia/$gpu 2>&1)
   contains "$gpu: the evidence says whose data it is" "NOT run by us on a card" "$out"
 done
-for gpu in b300 vr200 thor gb10 rtx5090 rtx-pro-6000; do
+# The compute capability 12.0 profiles (2026-11-17): the server edition's card was run, the rest are inferred from it.
+out=$("$vgpu" info --gpu nvidia/rtx-pro-6000-server 2>&1)
+expect "rtx-pro-6000-server: hopper, measured" "tensor_sum: hopper [measured]" "$(line 'tensor_sum:' <<<"$out")"
+expect "rtx-pro-6000-server: chunk 16" "tensor_sum_chunk: 16 [measured]" "$(line 'tensor_sum_chunk:' <<<"$out")"
+lacks "rtx-pro-6000-server: nothing left to opt in to" "tensor_sum_published" "$out"
+contains "rtx-pro-6000-server: the card, the driver and the date" "driver: 595.112.07" "$out"
+out=$("$vgpu" info --gpu nvidia/rtx5090 2>&1)
+contains "rtx5090: inferred from the card that was run" "Inferred from the same compute capability (12.0)" "$out"
+for gpu in b300 vr200 thor gb10; do
   out=$("$vgpu" info --gpu nvidia/$gpu 2>&1)
   expect "$gpu: sequential, unknown" "tensor_sum: sequential [unknown]" "$(line 'tensor_sum:' <<<"$out")"
   lacks "$gpu: no chunk is printed for the sequential sum" "tensor_sum_chunk" "$out"
 done
-out=$("$vgpu" info --gpu nvidia/rtx5090 2>&1)
-expect "rtx5090: the published model is still opt-in" "tensor_sum_published: hopper [inferred] (not in force: VGPU_TC_EXACT=published)" \
-  "$(line 'tensor_sum_published:' <<<"$out")"
 out=$("$vgpu" info --gpu nvidia/b300 2>&1)
 lacks "b300: nothing published" "tensor_sum_published" "$out"
 

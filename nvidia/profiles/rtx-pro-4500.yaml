@@ -49,11 +49,11 @@ telemetry:
 # from here. `provenance` gives each value one class (measured | documented | inferred | unknown) and `evidence` what the class
 # rests on. Schema: nvidia/docs/profiles.md. The rule and every card run: docs/matrix-numerics.md.
 numerics:
-  tensor_sum: sequential           # sequential | ampere | hopper
-  tensor_sum_published: hopper     # a published model exists; NOT in force by default: VGPU_TC_EXACT=published turns it on
+  tensor_sum: hopper               # sequential | ampere | hopper
+  tensor_sum_chunk: 16             # products to a chunk, f16 and bf16
+  tensor_sum_chunk_tf32: 8         # ... tf32
+  tensor_sum_grid: 26              # a chunk's terms are cut at 2^(top - 26)
 provenance:
-  unknown: [numerics.tensor_sum]
-  inferred: [numerics.tensor_sum_published]
+  inferred: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]
 evidence:
-  numerics.tensor_sum: "no card of compute capability 12.0 has been run by us. The sequential f32 sum is what the simulator does until one is, not a claim about the card. docs/matrix-numerics.md"
-  numerics.tensor_sum_published: "published, not measured by us: MMA-Sim (Xie et al., arXiv 2511.10909) and Khattak and Mikaitis (arXiv 2512.07004) give B200 and RTX PRO 6000 Blackwell the hopper numbers (chunks of 16, tf32 8, grid 26) for f16, bf16 and tf32; applied to compute capability 10.0 and 12.0. Opt-in only. docs/matrix-numerics.md"
+  numerics: "not run on this model. Inferred from the same compute capability (12.0) as the card that was run on 2026-11-17: an RTX PRO 6000 Blackwell Server Edition (nvidia/profiles/rtx-pro-6000-server.yaml), whose tensor cores sum by the hopper rule bit for bit on every probe. docs/matrix-numerics.md"

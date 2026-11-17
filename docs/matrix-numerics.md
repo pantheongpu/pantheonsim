@@ -49,7 +49,7 @@ and sm_90 builds of the same program, and an RTX 3060 its own for sm_75 and sm_8
 | 8.9 (Ada) | l4, l40, l40s, rtx4080, rtx4090, rtx6000-ada | `Ampere` | measured | L4, L40S |
 | 9.0 (Hopper) | h100, h100-pcie, h100-nvl, h200, h200-nvl, gh200-480gb | `Hopper` | measured | H100 PCIe |
 | 10.0 (Blackwell) | b200, gb200 | `Hopper` by default (since 2026-11-16; before: `Sequential`) | inferred: data recorded by others on a B200, not run by us | Khattak-Mikaitis's 20,000 B200 vectors: 0 mismatches with `Hopper`, 8,020 with `Sequential`; MMA-Sim gives Blackwell the same numbers |
-| 12.0 (Blackwell) | rtx5090, rtx-pro-4500, rtx-pro-6000, -server, -max-q | `Sequential` by default; `Hopper` with `VGPU_TC_EXACT=published` | published, not measured by us | MMA-Sim gives RTX PRO 6000 Blackwell the Hopper numbers; the recorded vectors contain no sm_120 card |
+| 12.0 (Blackwell) | rtx5090, rtx-pro-4500, rtx-pro-6000, rtx-pro-6000-server, rtx-pro-6000-max-q | `Hopper` by default (since 2026-11-17; before: `Sequential`, with `Hopper` opt-in) | measured on rtx-pro-6000-server (RTX PRO 6000 Blackwell Server Edition); inferred on the other four | both probes print the H100's lines, FTTN width 16 and 191.875, the six corners and 8,388,608 of 8,388,608 dump results are the `Hopper` rule's; MMA-Sim gives RTX PRO 6000 Blackwell the same numbers |
 | 10.3, 10.7, 11.0, 12.1, 8.7 | b300, vr200, thor, gb10 | `Sequential` | unmeasured | no source covers them |
 | 7.0 (Volta) | no profile | - | published | block 4, no extra bit (`G` 24); a V100 profile would be new, and CUDA 13 cannot build sm_70 |
 
@@ -60,9 +60,9 @@ is `inferred`; a profile whose capability no card of ours has run is `unknown` a
 
 | Class of `numerics.tensor_sum` in the profile | Profiles |
 |---|---|
-| `measured` | rtx3060, a10g, t4 (its tf32 chunk is `inferred`: no tf32 form on Turing), l4, l40s, a100-sxm4-40gb, h100-pcie |
-| `inferred` | rtx2080ti; a100, a100-80gb-pcie, a30; a10, a40, rtx-a5000, rtx-a6000, rtx3070, rtx3080ti, rtx3090; l40, rtx4080, rtx4090, rtx6000-ada; h100 (the default profile), h100-nvl, h200, h200-nvl, gh200-480gb; **b200, gb200** (`hopper`, from the B200 vectors recorded by Khattak and Mikaitis, 2026-11-16: not a card run of ours, and not run on a GB200) |
-| `unknown` | rtx5090, rtx-pro-4500, rtx-pro-6000, rtx-pro-6000-server, rtx-pro-6000-max-q (each with `numerics.tensor_sum_published: hopper`, class `inferred`: the published model, opt-in); b300, vr200, thor, gb10 (nothing published) |
+| `measured` | rtx3060, a10g, t4 (its tf32 chunk is `inferred`: no tf32 form on Turing), l4, l40s, a100-sxm4-40gb, h100-pcie, **rtx-pro-6000-server** (`hopper`, 2026-11-17) |
+| `inferred` | rtx2080ti; a100, a100-80gb-pcie, a30; a10, a40, rtx-a5000, rtx-a6000, rtx3070, rtx3080ti, rtx3090; l40, rtx4080, rtx4090, rtx6000-ada; h100 (the default profile), h100-nvl, h200, h200-nvl, gh200-480gb; **b200, gb200** (`hopper`, from the B200 vectors recorded by Khattak and Mikaitis, 2026-11-16: not a card run of ours, and not run on a GB200); **rtx5090, rtx-pro-4500, rtx-pro-6000, rtx-pro-6000-max-q** (`hopper`, 2026-11-17: from the RTX PRO 6000 Blackwell Server Edition that was run; the same compute capability, other models) |
+| `unknown` | b300, vr200, thor, gb10 (nothing published, no card, no recorded data) |
 
 Everywhere: the f64 form (DMMA) is a chain of IEEE double fused multiply-adds in the order of K, which is what FTTN's fp64
 program prints on every card we ran it on (RTX 3060, A10G, L4, L40S, A100, H100: three extra bits, round to nearest even, sticky
@@ -78,7 +78,9 @@ All built with `-cudart shared`; the two probes are `nvidia/tests/e2e/simd_lane_
 | Card | Where | Driver | Toolkit | Date | What it printed |
 |---|---|---|---|---|---|
 | RTX 3060 (sm_86) | local | - | CUDA 13.0 | before 2026-10 and 2026-11-15 | 106,496 element-by-element results that fixed the rule; both probe files; FTTN; the two corner inputs S1 and S2 |
-| Tesla T4 (sm_75) | AWS | 595.112.07 | CUDA 13.0 | 2026-11-15 | simd_lane_forms built `-DNO80`: the RTX 3060's 56 remaining lines, the four wmma f16 lines among them (`simd_lane_forms.t4.txt`); FTTN fp16. float_half_forms has not run on it |
+| Tesla T4 (sm_75) | AWS | 595.112.07 | CUDA 13.0 | 2026-11-15 | simd_lane_forms built `-DNO80`: the RTX 3060's 56 remaining lines, the four wmma f16 lines among them (`simd_lane_forms.t4.txt`); FTTN fp16 |
+| Tesla T4 (sm_75) | AWS g4dn.xlarge | 595.112.07 | nvcc 13.0.88 and 13.2.51 | 2026-11-17 | float_half_forms built `-DNO80`: all 156 lines of that build are the RTX 3060's, `half_form_30` (the HMUL2.F32 line) and the f16 `mma_` lines among them; simd_lane_forms 56 of 56 again; FTTN fp16 and the motivating example (0); the corners S1 `0x0000` and R4 `0x0000` (f16 only); all ten approximate-math operations over 2^32 inputs and the 65,536-pattern half forms, the same as the RTX 3060; `mathfn` lines |
+| RTX PRO 6000 Blackwell Server Edition (sm_120) | AWS g7e.2xlarge (us-east-2) | 595.112.07 | nvcc 13.0.88 and 13.2.51 | 2026-11-17 | both probes print the **H100's** lines, 60 of 60 and 169 of 169 (`simd_lane_forms.h100.txt`, `float_half_forms.h100.txt`), the same from sm_86, sm_90, sm_100 and sm_120 builds; FTTN fp16 width 16, bf16 width 10 as FTTN prints it (16), tf32 width 4, fp64 as every card, motivating example 191.875, the same from every cubin architecture; the six corners; a dump of 8,388,608 wmma results, every one the `Hopper` rule's (`tc_dump_check`; `fit_tc_model.py` agrees: chunk 16, grid 26, cut trunc, final rz; the `Ampere` rule 8,366,093); the ten approximate-math operations over 2^32 inputs, the same as the RTX 3060; `mathfn` lines |
 | A10G (sm_86) | AWS | 595.112.07 | CUDA 13.0 | 2026-11-15 | both probes: the RTX 3060's lines, 60 of 60 and 169 of 169; FTTN |
 | L4, L40S (sm_89) | AWS | 595.112.07 | CUDA 13.0 | 2026-11-15 | both probes, sm_86 and sm_89 builds: the RTX 3060's lines; FTTN |
 | A100-SXM4-40GB (sm_80) | Lambda | 570.148.08 | nvcc 12.8.93 | 2026-11-15 | both probes: the RTX 3060's lines; FTTN; a dump of 8,388,608 wmma results, every one the `Ampere` rule's |
@@ -102,10 +104,10 @@ published models have them; found by comparing the two, pantheonsim issue #664):
 
 | | Corner | Before | Now | Card |
 |---|---|---|---|---|
-| R1 | an f32 result below 2^-126 | rounded to nearest onto the subnormal grid | cut toward zero onto it | RTX 3060, input S2 (needs R1 and R2): 0x00000041 |
-| R2 | a chunk that starts from a zero accumulator, all products tiny | aligned at the largest product | `top` has a floor | RTX 3060, input S1: 0x0000 |
-| R3 | a subnormal accumulator | positioned by its own leading bit | counts at 2^-126 (f16: 2^-14) | published models only |
-| R4 | a negative sum that rounds to zero | -0 | +0 | published models only |
+| R1 | an f32 result below 2^-126 | rounded to nearest onto the subnormal grid | cut toward zero onto it | RTX 3060, input S2 (needs R1 and R2): 0x00000041; RTX PRO 6000 Blackwell: R1 `0x006b1f35` (cut) |
+| R2 | a chunk that starts from a zero accumulator, all products tiny | aligned at the largest product | `top` has a floor | RTX 3060, input S1: 0x0000; Tesla T4 S1 `0x0000`; RTX PRO 6000 Blackwell: S1 `0x0001` and S2 `0x00000042` (the `Hopper` floors), R2 `0x00000000` |
+| R3 | a subnormal accumulator | positioned by its own leading bit | counts at 2^-126 (f16: 2^-14) | RTX PRO 6000 Blackwell (the `Hopper` rule): `0x00411fcc`, where the `Ampere` rule gives `0x00411fcd` |
+| R4 | a negative sum that rounds to zero | -0 | +0 | Tesla T4 and RTX PRO 6000 Blackwell: `0x0000` (+0) |
 
 They change results only for operands near the bottom of a format. The vector kernels keep the tiles where none can arise; a
 tile with an f16 accumulator, or with bf16 / tf32 operands small enough for a product below 2^-125, goes to the scalar code.
@@ -115,7 +117,7 @@ tile with an f16 accumulator, or with bf16 / tf32 operands small enough for a pr
 
 `VGPU_TC_EXACT`: unset, each device sums by its model. `0`: the sequential f32 sum on every device, as the earliest releases
 (bit for bit; pinned by `simd_lane_forms.*.tcseq.txt`). `force`: a device without a measured model takes `Ampere`.
-`published`: a device without a model in force takes the published one where there is one (the sm_120 Blackwell profiles: `Hopper`; b200 and gb200 have `Hopper` in force already, so it changes nothing there).
+`published`: a device without a model in force takes the published one where there is one (none is left: b200, gb200 and the sm_120 Blackwell profiles have `Hopper` in force, so it changes nothing).
 **The way back for b200 and gb200** is `VGPU_TC_EXACT=0`, the existing switch: the earlier sequential sum, bit for bit, on them and on every other device (there is no per-device opt-out and none was added).
 In the profile's terms: `0` ignores `numerics.tensor_sum`; `force` and `published` act only on a profile whose `tensor_sum` is
 `sequential`, giving it `ampere` or its `numerics.tensor_sum_published`.
@@ -130,8 +132,17 @@ the PTX engine always did) and an sm_75 / sm_80 / sm_89 cubin on an 8.6 profile;
 f32 sum to the Hopper rule by default, so the outputs of a program that uses those instructions on the b200 or gb200 profile change
 (not `tcgen05.mma`, `wgmma`, the sparse, FP8 and f64 forms: unchanged). Evidence: the 20,000 vectors Khattak and Mikaitis recorded on
 a B200 are reproduced bit for bit by the Hopper rule and 8,020 of them are not by the sequential sum; class `inferred` (others' data,
-not a run of ours). `VGPU_TC_EXACT=0` gives the old results back. b300, vr200, thor, gb10 and the sm_120 profiles are unchanged:
+not a run of ours). `VGPU_TC_EXACT=0` gives the old results back. b300, vr200, thor, gb10 and (until 2026-11-17, below) the sm_120 profiles were unchanged:
 no recorded vectors cover them.
+
+**2026-11-17: the compute capability 12.0 Blackwell profiles changed too** (rtx5090, rtx-pro-4500, rtx-pro-6000, rtx-pro-6000-server,
+rtx-pro-6000-max-q). Their tensor-core sums (f16, bf16, tf32: wmma, `mma.sync`, SASS `HMMA`) went from the sequential f32 sum to the Hopper
+rule by default, so the outputs of a program that uses those instructions on these profiles change (not `wgmma`, the sparse, FP8 and f64
+forms: unchanged; sm_120 has no `tcgen05.mma`). Evidence: an RTX PRO 6000 Blackwell Server Edition of ours (AWS g7e.2xlarge, driver 595.112.07, nvcc
+13.0.88 and 13.2.51) prints the H100's lines in both probes, the Hopper rule's FTTN rows, the Hopper rule's answer to all six corners and 8,388,608
+of 8,388,608 wmma results; the sequential sum is not the card's (6 of the 60 and 13 of the 169 probe lines differ from it, FTTN's motivating example
+gives 0 where the card gives 191.875). `rtx-pro-6000-server` is `measured`, the other four are `inferred` from it. `VGPU_TC_EXACT=0` gives the
+old results back. b300, vr200, thor and gb10 are unchanged: nothing covers them.
 
 ## AMD profiles
 
@@ -223,7 +234,8 @@ The motivating example (`D = C - A x B`, the real-number answer is 191.984375):
 | t4, rtx3060, a10g, a100, l4, l40s | A100, V100: 0 | 0 | 0 | 0 on all six |
 | h100 | 191.875 | 0 | 191.875 | 191.875 |
 | b200 | - | 0 | 191.875 (from 2026-11-16; 0 with `VGPU_TC_EXACT=0`) | none |
-| rtx-pro-6000, rtx5090 | - | 0 | 0 (191.875 with `VGPU_TC_EXACT=published`) | none |
+| rtx-pro-6000-server | - | 0 | 191.875 (from 2026-11-17; 0 with `VGPU_TC_EXACT=0`) | 191.875 (RTX PRO 6000 Blackwell Server Edition) |
+| rtx-pro-6000, rtx5090, rtx-pro-4500, rtx-pro-6000-max-q | - | 0 | 191.875 (from 2026-11-17; 0 with `VGPU_TC_EXACT=0`) | none of these models (the server edition's card says the same of the compute capability) |
 | mi250x | 0 | 192 | 192 (0 with `VGPU_MFMA_CDNA2=fttn`) | none |
 | mi300x, mi325x, rx7900xtx, rx9070xt | - | 192 | 192 | none |
 
@@ -245,7 +257,7 @@ Fasi et al. (PeerJ CS 2021), Khattak and Mikaitis (arXiv 2512.07004, HPEC 2025) 
 5,000-vector validation sets Khattak and Mikaitis recorded on A100, A2, Ada, L40S, H100 and H200 cards are reproduced bit for bit by
 the profile of that card, and a **B200's** by the Hopper rule (0 of 20,000 vectors, against 8,020 mismatches from the sequential sum
 the b200 profile had until 2026-11-16, and has again with `VGPU_TC_EXACT=0`), so the b200 and gb200 profiles now use that rule by default
-(sm_120 stays on the sequential sum: their data has no RTX PRO 6000). FPRev's summation trees of the tensor-core loops are the 9-way (8+1) and 17-way (16+1) fused sums the paper reports
+(the sm_120 profiles were on the sequential sum until 2026-11-17, because their data has no RTX PRO 6000; a card of ours has since been run, see the card runs above). FPRev's summation trees of the tensor-core loops are the 9-way (8+1) and 17-way (16+1) fused sums the paper reports
 for an A100 and an H100. The one measured disagreement is the simulator's cuBLAS, which adds every product type in one sequential chain
 where the card's does not. CI: `e2e_tcpapers` (`nvidia/tests/e2e/run_tcpapers.sh`, pinned files in `nvidia/tests/data/tcpapers/`).
 
@@ -260,8 +272,6 @@ class `measured` and the run as its evidence, and into the other profiles of its
 | Card | Why |
 |---|---|
 | B200 (sm_100) | no run of ours; the Hopper rule is in force on b200 and gb200 as `inferred` from others' recorded vectors, until a card of ours says `measured` (tcgen05 and the GB200 itself are unmeasured) |
-| RTX PRO 6000 Blackwell (sm_120) | no run of ours; the published model is opt-in until then |
-| Tesla T4 | `float_half_forms -DNO80` (the open `HMUL2.F32` line; the m16n8k8 mma lines) |
 | any Ampere, Ada or Hopper card | the corners R1, R3, R4 (S1 and S2 are on the RTX 3060 only; an H100's S1 and S2 are the published model's word) |
 | V100 (sm_70) | block 4 and no extra bit are published; needs a CUDA 12 toolkit and a new profile |
 | MI250X, MI300X, MI100 | everything AMD |
@@ -272,7 +282,7 @@ The matrix instructions are not the only arithmetic a card does its own way. The
 are library code over the `MUFU` instructions (NVIDIA) and `v_exp/v_log/v_sin/v_cos/v_rcp/v_rsq` (AMD), which a card reads
 from tables. The simulator computes the NVIDIA ones as an RTX 3060 does, bit for bit over every operand (measured; a Tesla
 T4, an L4 and an A10G print the same math-library results, and an A10G and an H100 PCIe the same instruction results over
-every operand; Blackwell inferred; `VGPU_MUFU_EXACT=0` gives the
+every operand, and an RTX PRO 6000 Blackwell Server Edition the same on all ten as well; `VGPU_MUFU_EXACT=0` gives the
 function at host precision, as before), and the AMD ones at the host's precision. What was compared, against which
 published results and which cards, what the simulator's own two engines disagreed on, the probe and the model:
 [numerics/math-functions.md](numerics/math-functions.md).

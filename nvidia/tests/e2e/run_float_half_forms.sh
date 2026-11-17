@@ -12,10 +12,14 @@
 # a100 must print them too, on both engines. An H100 PCIe prints its own file (nvidia/tests/data/float_half_forms.h100.txt): the 14
 # mma_ lines of random operands differ from the RTX 3060's (its tensor core sums in chunks of 16 and cuts one bit lower), the 30 mma_edge
 # cases and every other line are the same; an sm_90 build on the h100 profile must print that file. An sm_75 build (-DNO80: the program without what
-# sm_75 lacks) on the t4 profile must print the lines that remain. No Turing card has run this program yet: its sm_75 lines are the
-# simulator's two engines against the RTX 3060's file, and one line is known to be open -- half_form_30, where ptxas for sm_75 folds
-# __hmul2 and __half2float into one HMUL2.F32 and the SASS executor's answer differs from the PTX engine's and the RTX 3060's line. It
-# is left out of the sm_75 SASS comparison until a T4 says which is right (tools/fttn/card-run.sh runs this with --card).
+# sm_75 lacks) on the t4 profile must print the lines that remain. A Tesla T4 ran this program on 2026-11-17 (AWS g4dn.xlarge, driver 595.112.07,
+# nvcc 13.0.88 and 13.2.51): all 156 lines of its build are the RTX 3060's, half_form_30 among them. That line is where ptxas for sm_75 folds
+# __hmul2 and __half2float into one HMUL2.F32: the card says the RTX 3060's value (and the PTX engine's) is right, and the SASS executor's
+# answer for it is wrong. It stays out of the sm_75 SASS comparison until the executor is fixed: this is a known simulator bug, not an open
+# question about the card.
+# The compute capability 12.0 profiles print the H100's file (2026-11-17: an RTX PRO 6000 Blackwell Server Edition printed it, 169 of 169
+# lines, from sm_86, sm_90, sm_100 and sm_120 builds; rtx-pro-6000-server measured, rtx5090, rtx-pro-4500, rtx-pro-6000 and rtx-pro-6000-max-q
+# inferred from it).
 #
 #   run_float_half_forms.sh                    simulator vs the card file
 #   run_float_half_forms.sh --card [--update]  NVIDIA's runtime on a real GPU vs the card file (or rewrite it). Built for the card's own
@@ -54,7 +58,7 @@ if [[ "${1:-}" == --card ]]; then
     (( cap == 86 )) || { echo "--update rewrites the RTX 3060's file: run it on an sm_86 card (this one is sm_$cap)"; exit 1; }
     cp "$out/card.txt" "$data/float_half_forms.rtx3060.txt"; echo "wrote float_half_forms.rtx3060.txt"; exit 0
   fi
-  card_file="$data/float_half_forms.rtx3060.txt"; (( cap == 90 )) && card_file="$data/float_half_forms.h100.txt"
+  card_file="$data/float_half_forms.rtx3060.txt"; (( cap == 90 || cap == 120 )) && card_file="$data/float_half_forms.h100.txt"
   lines_for "$cap" "$card_file" > "$out/want.txt"
   lines_for "$cap" "$out/card.txt" > "$out/card1.txt"
   diff "$out/want.txt" "$out/card1.txt" && { echo "PASS (card, sm_$cap, $(wc -l < "$out/card1.txt") lines, $(basename "$card_file"))"; exit 0; }
@@ -93,10 +97,10 @@ for engine in sass ptx; do
   done
 done
 # The other architectures whose cards print these lines (sm_80: the paper), default SIMD level, both engines.
-for pair in 75:t4 80:a100 86:a10g 89:l4 89:l40s 90:h100; do
+for pair in 75:t4 80:a100 86:a10g 89:l4 89:l40s 90:h100 120:rtx-pro-6000-server 120:rtx5090; do
   a="${pair%%:*}"; gpu="${pair##*:}"
   card="$data/float_half_forms.rtx3060.txt"
-  [[ $gpu == h100 ]] && card="$data/float_half_forms.h100.txt"
+  [[ $gpu == h100 || $gpu == rtx-pro-6000-server || $gpu == rtx5090 ]] && card="$data/float_half_forms.h100.txt"
   if ! build_arch "$a" "$out/app$a" $(shim_sanitizer_nvcc_flags "$shim") 2> "$out/build$a.txt"; then
     echo "SKIP sm_$a: this toolkit does not build it ($(head -1 "$out/build$a.txt"))"; continue
   fi
@@ -108,7 +112,7 @@ for pair in 75:t4 80:a100 86:a10g 89:l4 89:l40s 90:h100; do
     fi
     drop=(-e '^\[vgpu\]')
     [[ $engine == ptx ]] && drop+=(-e 'sassonly_')
-    [[ $a == 75 && $engine == sass ]] && drop+=(-e '^half_form_30 ')   # (open: HMUL2.F32 on sm_75, see the head of this file)
+    [[ $a == 75 && $engine == sass ]] && drop+=(-e '^half_form_30 ')   # (a known SASS executor bug: HMUL2.F32 on sm_75, see the head of this file)
     lines_for "$a" "$card" | grep -v "${drop[@]}" > "$out/want.txt"
     lines_for "$a" "$out/sim.txt" | grep -v "${drop[@]}" > "$out/sim1.txt" || true
     if diff "$out/want.txt" "$out/sim1.txt" > "$out/d.txt"; then

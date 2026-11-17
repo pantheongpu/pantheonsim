@@ -66,7 +66,8 @@ for prog in fprev_probe tc_features; do
     [[ -x "$bin/sm80/$prog" ]] && { run $prog 80 a100 $eng "$out/o.txt"; expect "$name sm_80 a100 $eng (the RTX 3060's lines)" "$data/$name.rtx3060.txt" "$out/o.txt"; }
     [[ -x "$bin/sm90/$prog" ]] && { run $prog 90 h100 $eng "$out/o.txt"; expect "$name sm_90 h100 $eng" "$data/$name.h100.txt" "$out/o.txt"; }
     [[ -x "$bin/sm100/$prog" ]] && { run $prog 100 b200 $eng "$out/o.txt"; expect "$name sm_100 b200 (default: the Hopper rule, inferred from a B200's recorded vectors) $eng (the h100's lines)" "$data/$name.h100.txt" "$out/o.txt"; }
-    [[ -x "$bin/sm120/$prog" ]] && { run $prog 120 rtx-pro-6000 $eng "$out/o.txt" VGPU_TC_EXACT=published; expect "$name sm_120 rtx-pro-6000 VGPU_TC_EXACT=published $eng (the h100's lines)" "$data/$name.h100.txt" "$out/o.txt"; }
+    # (RE-RECORDED 2026-11-17: the sm_120 profiles sum by the Hopper rule by default, measured on an RTX PRO 6000 Blackwell Server Edition; it needed VGPU_TC_EXACT=published.)
+    [[ -x "$bin/sm120/$prog" ]] && { run $prog 120 rtx-pro-6000-server $eng "$out/o.txt"; expect "$name sm_120 rtx-pro-6000-server (default: the Hopper rule, measured on the card) $eng (the h100's lines)" "$data/$name.h100.txt" "$out/o.txt"; }
   done
 done
 # the switches reach the programs: the sequential sum is not the card's, and b200 with VGPU_TC_EXACT=0 (the way back to the earlier
