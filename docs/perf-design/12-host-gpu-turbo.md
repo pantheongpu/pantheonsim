@@ -864,3 +864,13 @@ runs the launch on that memory (unknown how often this matters; the same hazard 
 `simpleZeroCopy` 1 of 1 on the card, 0.25 s (sim 0.06 s: the driver start; with `HOSTMAP=0` the run aborts in a glibc mutex assertion, a failure of the old rule not
 looked into). `VGPU_HOST_GPU_VERIFY=all`: 0 words different (1.6 G, 20 M and 3 M words compared). ATAX, GEMM, MVT, hotspot, bfs and nn: turbo within 3 % of the
 switches-off forms (no program slower). A launch with no device allocation (a zero-copy program) used to fail "could not back the window up to 0x0"; fixed here.
+
+## 19. The first big launch of a young process (#656, #659; Round r11; the size rules and exact mode)
+
+A launch the size rules had no estimate for was sampled (section on sampling above) only if its static count reached a floor or the process was old enough to
+afford a sample; a first launch that counts 13 to 600 times under what it takes (mergeSort 80 ms counted, 1.4 s taken; `initRNG` 9.5 ms counted, 6 s taken) was
+neither. Since r11 a launch of `kFirstBigThreads` (65,536) threads or more with a loop is excused both while the process has spent nothing on samples, so a
+program whose big launches are all short pays one sample (3 to 14 ms) and no more. `VGPU_HOST_GPU_FIRST_BIG=<threads>` sets it, 0 is the rule before. Measured on an A10G:
+mergeSort 2.30 s to 0.58 s, MC_EstimatePiInlineP 4.09 s to 0.29 s, MC_SingleAsianOptionP 4.09 s to 0.77 s; histogram, segmentationTreeThrust, reduction, interval,
+polybench 3MM and GEMM and others take a sample that sends nothing and are within the rig's noise (`data/r11-first-launch/`). Not caught: warpAggregatedAtomicsCG, lavaMD.
+`FIT=1` never asked these rules.

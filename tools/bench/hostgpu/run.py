@@ -28,7 +28,8 @@ history, the rule before Round sp69), and exactb0 and turbob0 (with VGPU_HOST_GP
 whole blocks however long, the rule before Round sp75), and exactd0 and turbod0 (with VGPU_HOST_GPU_SAMPLE_STARTED=0: no
 launch is sampled once the driver's start has begun, the rule before Round sp76), and turboc0 and turbom0 (turbo with the default rules and
 VGPU_HOST_GPU_COOP=0, or VGPU_HOST_GPU_HOSTMAP=0: a cooperative launch, or one with an argument into mapped host memory, stays in the simulator, the
-rule before #661) are timed
+rule before #661) , and turbof0 (with VGPU_HOST_GPU_FIRST_BIG=0: a big
+launch is not sampled in a young process, the rule before #659) are timed
 --runs times each, interleaved; a program whose first sim run takes longer
 than --long-secs gets --long-runs runs of each.
 exact prints its machine-readable lines only with VGPU_HOST_GPU_LOG, which
@@ -64,8 +65,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "real"))
 import real  # noqa: E402  (tools/bench/real/real.py: the corpus manifest and the timing-line filter)
 
-FORMS = ("sim", "exact", "exact0", "exactw", "exactn", "exactw0", "exactl0", "exactr0", "exactb0", "exactd0", "exactdiv", "exacti", "turbo", "turborules", "turbo0", "turbow", "turbon", "turbow0", "turbol0", "turbor0", "turbob0", "turbod0", "turbos0", "turboc0", "turbom0", "verify")
-CARD_FORMS = ("exact", "exact0", "exactw", "exactn", "exactw0", "exactl0", "exactr0", "exactb0", "exactd0", "exactdiv", "exacti", "turbo", "turborules", "turbo0", "turbow", "turbon", "turbow0", "turbol0", "turbor0", "turbob0", "turbod0", "turbos0", "turboc0", "turbom0")   # the timed forms that use the card, in the table's order
+FORMS = ("sim", "exact", "exact0", "exactw", "exactn", "exactw0", "exactl0", "exactr0", "exactb0", "exactd0", "exactdiv", "exacti", "turbo", "turborules", "turbo0", "turbow", "turbon", "turbow0", "turbol0", "turbor0", "turbob0", "turbod0", "turbof0", "turbos0", "turboc0", "turbom0", "verify")
+CARD_FORMS = ("exact", "exact0", "exactw", "exactn", "exactw0", "exactl0", "exactr0", "exactb0", "exactd0", "exactdiv", "exacti", "turbo", "turborules", "turbo0", "turbow", "turbon", "turbow0", "turbol0", "turbor0", "turbob0", "turbod0", "turbof0", "turbos0", "turboc0", "turbom0")   # the timed forms that use the card, in the table's order
 # lines the simulator or the mode prints: never part of the program's output
 OURS = re.compile(r"^(host_gpu[a-z_]*:|\[vgpu\]|vgpu:)")
 # A word of the output is a number when all of it is one and it has a fraction or an exponent: an integer (a count, an index, a checksum printed in
@@ -232,7 +233,7 @@ def form_env(form, a):
             env["VGPU_HOST_GPU_DIV"] = "1"   # the IEEE division sequence joins the exact set (docs/cli.md)
         if form == "exacti":
             env["VGPU_HOST_GPU_SQRT"] = "1"   # and the IEEE square root sequence (Round sp68): exact with both opt-in idioms
-    elif form in ("turbo", "turborules", "turbo0", "turbow", "turbon", "turbow0", "turbol0", "turbor0", "turbob0", "turbod0", "turbos0", "turboc0", "turbom0", "verify"):
+    elif form in ("turbo", "turborules", "turbo0", "turbow", "turbon", "turbow0", "turbol0", "turbor0", "turbob0", "turbod0", "turbof0", "turbos0", "turboc0", "turbom0", "verify"):
         env["VGPU_HOST_GPU"] = "turbo"
         env["VGPU_HOST_GPU_ATOL"] = repr(a.atol)
         env["VGPU_HOST_GPU_RTOL"] = repr(a.rtol)
@@ -240,7 +241,7 @@ def form_env(form, a):
         env["VGPU_HOST_GPU_VERIFY"] = "all"
     # Turbo's default is VGPU_HOST_GPU_FIT=1 since 2026-11-17 (every fitting kernel goes to the card: none of the performance rules below is asked). `turbo` and `verify`
     # measure that; `turborules` and every turbo form that is an A/B of one of the rules run with VGPU_HOST_GPU_FIT=0, the rules turbo had before.
-    if form == "turborules" or form in ("turbo0", "turbow", "turbon", "turbow0", "turbol0", "turbor0", "turbob0", "turbod0", "turbos0"):
+    if form == "turborules" or form in ("turbo0", "turbow", "turbon", "turbow0", "turbol0", "turbor0", "turbob0", "turbod0", "turbof0", "turbos0"):
         env["VGPU_HOST_GPU_FIT"] = "0"
     if form in ("exact0", "turbo0"):
         env["VGPU_HOST_GPU_SAMPLE"] = "0"   # no launch is sampled: the size rule as it was before Round sp60b, for A/B runs
@@ -260,6 +261,8 @@ def form_env(form, a):
         env["VGPU_HOST_GPU_COOP"] = "0"   # a cooperative launch stays in the simulator: the rule before #661, for its A/B runs
     if form == "turbom0":
         env["VGPU_HOST_GPU_HOSTMAP"] = "0"   # a launch with an argument into mapped host memory stays in the simulator: the rule before #661
+    if form == "turbof0":
+        env["VGPU_HOST_GPU_FIRST_BIG"] = "0"   # a big launch is not sampled in a young process: the rule before #659, for its A/B runs
     if form == "turbos0":
         env["VGPU_HOST_GPU_SHORT"] = "0"   # the size rule before #660 (fixed 100 us card prior, 200 us floor), for its A/B runs
     if form in ("exactw0", "turbow0"):
@@ -743,6 +746,8 @@ def selftest():
     check(form_env("turbod0", B)["VGPU_HOST_GPU"] == "turbo" and form_env("turbod0", B)["VGPU_HOST_GPU_SAMPLE_STARTED"] == "0" and
           "VGPU_HOST_GPU_SAMPLE_STARTED" not in form_env("turbo", B) and "VGPU_HOST_GPU_SAMPLE_STARTED" not in form_env("turbob0", B) and
           "VGPU_HOST_GPU_SAMPLE_BLOCK" not in form_env("turbod0", B), "turbod0 env")
+    check(form_env("turbof0", B)["VGPU_HOST_GPU_FIRST_BIG"] == "0" and form_env("turbof0", B)["VGPU_HOST_GPU_FIT"] == "0" and
+          "VGPU_HOST_GPU_FIRST_BIG" not in form_env("turborules", B), "turbof0 env")
     check(form_env("turbos0", B)["VGPU_HOST_GPU_SHORT"] == "0" and "VGPU_HOST_GPU_SHORT" not in form_env("turbo", B), "turbos0 env")
     check(form_env("turboc0", B)["VGPU_HOST_GPU"] == "turbo" and form_env("turboc0", B)["VGPU_HOST_GPU_COOP"] == "0" and "VGPU_HOST_GPU_FIT" not in form_env("turboc0", B) and
           "VGPU_HOST_GPU_COOP" not in form_env("turbo", B) and "VGPU_HOST_GPU_HOSTMAP" not in form_env("turboc0", B), "turboc0 env")

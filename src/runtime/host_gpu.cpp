@@ -389,7 +389,8 @@ struct Runtime::Impl : CardGate {
   enum class SampleMode : uint8_t { On, Off, Log, Always, Whole } sample_mode = SampleMode::On;
   size_t copies_running_at_exit = 0;   // sampled copies that had answered and not yet ended when the process came to its end (they were waited for)
   bool sample_block = true;       // bounded blocks (Round sp75); VGPU_HOST_GPU_SAMPLE_BLOCK=0: the copy runs whole blocks, however long (the rule before)
-  bool sample_started = true;     // a launch is sampled with the driver up too (Round sp76; sample_allowed); VGPU_HOST_GPU_SAMPLE_STARTED=0: never once the start has begun (the rule before)
+  uint64_t big_threads = kFirstBigThreads;   // VGPU_HOST_GPU_FIRST_BIG=<threads>; 0: the rule before #659 (a big launch is not sampled in a young process)
+  bool sample_started = true;   // a launch is sampled with the driver up too (Round sp76; sample_allowed); VGPU_HOST_GPU_SAMPLE_STARTED=0: never once the start has begun (the rule before)
   double sample_spent_s = 0;      // what the samples of this process have cost
   double sample_dearest_s = 0;    // the dearest of them
   struct Decision;
@@ -1561,6 +1562,7 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
                               std::string(v) == "always" ? Impl::SampleMode::Always : std::string(v) == "whole" ? Impl::SampleMode::Whole : Impl::SampleMode::On;
     if (const char* v = std::getenv("VGPU_HOST_GPU_SAMPLE_BLOCK"); v && std::string(v) == "0") r->impl_->sample_block = false;   // the copy runs whole blocks (the rule before Round sp75)
     if (const char* v = std::getenv("VGPU_HOST_GPU_SAMPLE_STARTED"); v && std::string(v) == "0") r->impl_->sample_started = false;   // no sample once the driver's start has begun (the rule before Round sp76)
+    if (const char* v = std::getenv("VGPU_HOST_GPU_FIRST_BIG"); v && *v) r->impl_->big_threads = std::strtoull(v, nullptr, 10);
     if (const char* v = std::getenv("VGPU_HOST_GPU_SHORT"); v && std::string(v) == "0") r->impl_->costs = Costs{};   // the size rule before #660: a fixed 100 us card prior, 200 us floor
     if (const char* v = std::getenv("VGPU_HOST_GPU_STATIC"); v && *v && *v != '0') r->impl_->static_estimate = true;
     if (const char* v = std::getenv("VGPU_HOST_GPU_START_COST"); v && *v) {   // seconds; 0: do not charge the driver start (the rule before sp43)
@@ -2160,6 +2162,8 @@ const char* Runtime::Impl::consider_sample(const ptx::EntryFn& fn, const exec::L
   c.age_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_loaded).count();
   c.spent_s = sample_spent_s;
   c.expected_s = std::max(sample_dearest_s, kSampleCostGuessSeconds + kSampleSecondsPerLiveByte * static_cast<double>(live));
+  c.threads = blocks * cfg.block[0] * cfg.block[1] * cfg.block[2];
+  c.big_threads = big_threads;
   c.static_s = static_sim_seconds(blocks, cfg.block[0] * cfg.block[1] * cfg.block[2], dec.instrs, costs);
   c.followed = dec.probe != nullptr && sample_mode != SampleMode::Whole;
   c.bounded = sample_block && sample_mode != SampleMode::Whole;   // (`whole` is the rule of sp60b: no small grid is sampled)
@@ -2185,7 +2189,7 @@ const char* Runtime::Impl::consider_sample(const ptx::EntryFn& fn, const exec::L
       if (b) c.bound_turns = std::max(c.bound_turns, bound_turns(*b, l.step));
     }
   }
-  const bool affordable = c.loop && (sample_floor_estimate(c) >= sample_floor(c) || sample_affordable(c.age_s, c.spent_s, sample_expected_seconds(c)));
+  const bool affordable = c.loop && (sample_floor_estimate(c) >= sample_floor(c) || sample_big_launch(c) || sample_affordable(c.age_s, c.spent_s, sample_expected_seconds(c)));
   if (sample_mode != SampleMode::On && sample_mode != SampleMode::Whole) {   // (log, always: neither the loop, nor the floor, nor the process's age is asked)
     c.age_s = 1e18;
     c.loop = true;

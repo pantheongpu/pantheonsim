@@ -1615,6 +1615,29 @@ VTEST(sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it) {
   VCHECK(!worth_sampling(w, c, 0.26));
 }
 
+VTEST(a_big_launch_is_sampled_in_a_young_process) {
+  const Costs c;
+  SampleCandidate w = old_enough(4096);
+  w.age_s = 0.02;                                  // mergeSort's first launch: 4096 blocks of 512 threads, 20 ms into the process
+  w.threads = 4096ull * 512;
+  w.static_s = 0.003;                              // (histogram256Kernel's count; under the floor of 30 ms)
+  VCHECK(!worth_sampling(w, c, 0.26));             // the rule off: too young
+  w.big_threads = kFirstBigThreads;
+  VCHECK(worth_sampling(w, c, 0.26));
+  w.threads = kFirstBigThreads - 1;
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.threads = kFirstBigThreads;
+  VCHECK(worth_sampling(w, c, 0.26));
+  w.spent_s = 0.004;                               // only the process's first sample is excused
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.spent_s = 0;
+  w.loop = false;                                  // it does not lift the other conditions
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.loop = true;
+  w.whole_s = 0.003;
+  VCHECK(!worth_sampling(w, c, 0.26));
+}
+
 VTEST(sim_time_table_peeks_at_one_sample_and_takes_an_extrapolation_as_history) {
   SimTimeTable t;
   VCHECK(!t.peek("k", 100).has_value());

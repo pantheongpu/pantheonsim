@@ -38,7 +38,7 @@
 #  18. ... and when the card takes it, the card is sent the memory as it was before the launch: against a stand-in that keeps memory and computes nothing
 #      (STUB_CARD_OK=1 STUB_KEEP_MEMORY=1) the program prints what the program that launches nothing prints;
 #  19. a launch its first blocks say is short stays in the simulator and the driver is never touched;
-#  20. a process too young to afford a sample is not sampled (the default), and VGPU_HOST_GPU_SAMPLE=log sends nothing.
+#  20. a process too young to afford a sample is not sampled (VGPU_HOST_GPU_FIRST_BIG=0; by default only a launch of 65,536 threads or more is, once), and VGPU_HOST_GPU_SAMPLE=log sends nothing.
 #  21. progress inside the blocks (Round sp61): a launch on 8 blocks whose threads loop long is sampled inside its blocks (its line says inside=1) and
 #      sent; the stand-in refuses it and the output is the mode-off output;
 #  22. ... against a stand-in that keeps memory and computes nothing, the program prints what the program that launches nothing prints;
@@ -359,9 +359,19 @@ read -r smp_n smp_sent <<< "$(sampled_of smp_big)"
 [[ ! -s "$work/smp_big.log" ]] || { echo "FAIL: a short launch reached the driver after its sample: $(calls smp_big)"; fails=1; }
 diff -q "$work/off_big.out" "$work/smp_big.out" > /dev/null || { echo "FAIL: sampling changes the output of big"; fails=1; }
 # 20. by default a process this young is not sampled at all; and `log` samples but sends nothing, even a launch worth sending.
-run smp_young acct VGPU_HOST_GPU=exact VGPU_HOST_GPU_SAMPLE=1 VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=1000 || { echo "FAIL: the default run of acct failed"; fails=1; }
+run smp_young acct VGPU_HOST_GPU=exact VGPU_HOST_GPU_SAMPLE=1 VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=1000 VGPU_HOST_GPU_FIRST_BIG=0 || { echo "FAIL: the default run of acct failed"; fails=1; }
 read -r smp_n smp_sent <<< "$(sampled_of smp_young)"
 [[ "${smp_n:-x}" == 0 ]] || { echo "FAIL: a process a few milliseconds old was sampled: $(grep host_gpu_sampled "$work/smp_young.err")"; fails=1; }
+# 20b. (#659) ... unless its launch is big (acct: 262,144 threads): the process's first sample is taken whatever its age, and not the second (the sample of a
+# short launch spends the excuse); VGPU_HOST_GPU_FIRST_BIG=0 is the rule above, and a threshold over the launch is too.
+run smp_bigyoung acct VGPU_HOST_GPU=exact VGPU_HOST_GPU_SAMPLE=1 VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=1000 || { echo "FAIL: the default run of acct failed"; fails=1; }
+read -r smp_n smp_sent <<< "$(sampled_of smp_bigyoung)"
+[[ "${smp_n:-x}" == 1 ]] || { echo "FAIL: the big launch of a young process was not sampled exactly once: $(grep host_gpu_sampled "$work/smp_bigyoung.err")"; fails=1; }
+[[ ! -s "$work/smp_bigyoung.log" ]] || { echo "FAIL: the sample of a big launch started the driver: $(calls smp_bigyoung)"; fails=1; }
+run smp_bigabove acct VGPU_HOST_GPU=exact VGPU_HOST_GPU_SAMPLE=1 VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=1000 VGPU_HOST_GPU_FIRST_BIG=262145 || { echo "FAIL: the run of acct failed"; fails=1; }
+read -r smp_n smp_sent <<< "$(sampled_of smp_bigabove)"
+[[ "${smp_n:-x}" == 0 ]] || { echo "FAIL: a launch under the threshold was sampled: $(grep host_gpu_sampled "$work/smp_bigabove.err")"; fails=1; }
+diff -q "$work/smp_young.out" "$work/smp_bigyoung.out" > /dev/null || { echo "FAIL: the sample of a big launch changes the output of acct"; fails=1; }
 run smp_log acct VGPU_HOST_GPU=exact VGPU_HOST_GPU_SAMPLE=log VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_START_COST=1000 || { echo "FAIL: the log run of acct failed"; fails=1; }
 grep -q '^host_gpu_sample: ' "$work/smp_log.err" || { echo "FAIL: VGPU_HOST_GPU_SAMPLE=log printed no host_gpu_sample line"; fails=1; }
 [[ ! -s "$work/smp_log.log" ]] || { echo "FAIL: a log run reached the driver: $(calls smp_log)"; fails=1; }
