@@ -2522,6 +2522,13 @@ target_include_directories(link_devrt PRIVATE nvidia/include)
 target_link_libraries(link_devrt PRIVATE vgpucuda)
 add_test(NAME c_harness_link_devrt COMMAND link_devrt)
 set_tests_properties(c_harness_link_devrt PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100")
+# An .extern .global variable nothing in the module defines is zeroed storage the host can write, as the real driver
+# makes it (PoCL's CUDA backend declares its work offset that way), and one the module does define stays one variable.
+add_executable(extern_global nvidia/tests/c_harness/extern_global.c)
+target_include_directories(extern_global PRIVATE nvidia/include)
+target_link_libraries(extern_global PRIVATE vgpucuda)
+add_test(NAME c_harness_extern_global COMMAND extern_global)
+set_tests_properties(c_harness_extern_global PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100")
 
 # PTX the driver takes or refuses -- ld.weak, 70,000 declared registers, the JIT error log, a .version too
 # new, malformed input to cuLinkAddData -- and the NVRTC floating-point options, each as an RTX 3060 does.
