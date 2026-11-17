@@ -1444,6 +1444,13 @@ endfunction()
 vgpu_unit_test(test_yamlish)
 vgpu_unit_test(test_check_compare)
 vgpu_unit_test(test_host_gpu_logic)
+# The turbo refusal census (tools/turbo-census, docs/perf-design/data/turbo-census/README.md): which image turbo gives the card and why a kernel stays in the simulator, over built
+# binaries, CPU only. The unit test holds its walk to turbo's own classifier on hand-made modules.
+vgpu_unit_test(test_turbo_census)
+target_include_directories(test_turbo_census PRIVATE tools/turbo-census)
+add_executable(turbo_census tools/turbo-census/turbo_census.cpp nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
+target_link_libraries(turbo_census PRIVATE vgpu ${CMAKE_DL_LIBS})
+target_include_directories(turbo_census PRIVATE tools/turbo-census nvidia/src)
 vgpu_unit_test(test_host_gpu_ref)
 # The square root idiom of host-GPU exact mode (include/vgpu/host_gpu_idiom.hpp), on real nvcc SASS (tests/unit/host_gpu_idiom_sass.inc): no card.
 vgpu_unit_test(test_host_gpu_idiom)
