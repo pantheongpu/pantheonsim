@@ -358,8 +358,11 @@ uint64_t MemoryManager::mapped_run(uint64_t addr, uint64_t len) const {
   if (mu == maps_.begin()) return 0;
   const auto prev = std::prev(mu);
   if (addr - prev->first >= prev->second.size) return 0;
-  const uint64_t remaining = prev->first + prev->second.size - addr;
-  return len > remaining ? remaining : 0;
+  const uint64_t end = prev->first + prev->second.size;
+  const uint64_t remaining = end - addr;
+  if (len <= remaining) return 0;
+  // Only when the next mapping starts where this one ends: past a gap the range is an overrun of this mapping, as before.
+  return mu != maps_.end() && mu->first == end ? remaining : 0;
 }
 
 const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t len, const char* op,

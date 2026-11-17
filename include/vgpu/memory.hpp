@@ -924,10 +924,10 @@ class MemoryManager {
                                    bool writing) const;
   // Copies `len` bytes at offset `off` in allocation `a` out to `d`.
   void read_chunks(const Allocation& a, uint64_t off, uint8_t* d, uint64_t len) const;
-  // How many leading bytes of [addr, addr + len) lie in the one cuMemMap mapping that holds `addr`, when the range runs on past it; 0 when
-  // the range needs no splitting (not in a mapping, or ends inside it). Each mapping is an allocation of its own, so a bulk read, write
+  // How many leading bytes of [addr, addr + len) lie in the one cuMemMap mapping that holds `addr`, when the range runs on past it into a
+  // mapping that starts where this one ends; 0 when the range needs no splitting (not in a mapping, ends inside it, or runs into a gap). Each mapping is an allocation of its own, so a bulk read, write
   // or fill over several back-to-back mappings of one reserved range (PyTorch's expandable segments, vLLM's sleep mode) is made a piece
-  // at a time (#686); a gap or an unmapped piece is refused by the piece that reaches it, with its own diagnosis.
+  // at a time (#686); a range that runs into a gap is an overrun of the mapping before it, as it was.
   uint64_t mapped_run(uint64_t addr, uint64_t len) const;
   Allocation& resolve_mut(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out);
 
