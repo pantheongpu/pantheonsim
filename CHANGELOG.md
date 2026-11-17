@@ -16,13 +16,52 @@ release says what runs and what it produces, never how fast a real GPU would run
   fitting kernel goes to the card; `VGPU_HOST_GPU_FIT=0` keeps the earlier rules.** Turbo prints a notice that its results may differ from the simulator's; the summary gains
   `bits_different=` and a `host_gpu_fit:` line. Details, measurements and mutation evidence: `docs/perf-design/12-host-gpu-turbo.md` section 15, `docs/perf-design/data/turbo-fit/`.
 
+- **PTX with an `.extern` variable is judged as NVIDIA's driver judges it** (issue #681, follow-up to the entry below). The same RTX 3080 Ti was
+  asked about the cases the first change did not cover, and answered differently from the simulator in four of them. Now, as on the card:
+  an `.extern` variable with an initialiser (`.extern .global .u32 e = 5;`) fails the load with `CUDA_ERROR_INVALID_PTX`
+  ("No initial value is allowed for external symbol"); so does an unsized `.extern` array (`x[]`) that the module does not define
+  ("Unresolved extern variable ... in whole program compilation"; linking another module that defines it is fine); so does an `.extern`
+  whose only definition is a plain one without `.visible`, `.weak` or `.common` (".extern variable cannot be resolved by a .static");
+  `cuLinkComplete` on an input with an undefined `.extern` variable fails with `CUDA_ERROR_INVALID_SOURCE` and "Undefined reference to 'x'" in the
+  error log (it linked before, and gave the variable zeroed storage), while the same input linked with one that defines it works; and the info log
+  of `cuModuleLoadDataEx` carries the `ptxas warning : Unresolved extern variable 'x' in whole program compilation, ignoring extern qualifier`
+  that the card prints for the zeroed-storage case. Not changed: a plain definition **before** an `.extern` declaration of the same name (the order
+  not measured on the card). Tests: `c_harness_extern_global` (its second module had a plain definition, which the card refuses; it is `.visible` now)
+  and `e2e_driver_extern_global` (same fix, and the unsized array it loaded is gone, since the card refuses it).
+- **LDS: the 12-byte case of a 96-bit access is measured** (follow-up to the bank-conflict rule). `ds_read_b96` and `ds_write_b96` at a base that
+  is a multiple of 12 but not of 16 count no conflicts on an RX 6800, like 4 and 8, and the alignment is a property of the whole access (a stride
+  of 12 gives no conflicts although lane 0 is aligned), so the model's 16-byte rule stands. 32 rows are in `amd/tests/data/lds_bank_alignment.tsv`,
+  checked by `test_amd_gcn_lds_banks`. Also measured: on the RX 6800 only the SQ counters work under `rocprofv2` (no TA, TCP or L2 counters), and
+  `rocprofv3 --pmc` aborts there even with the iGPU hidden, so the bytes counters can be checked against the card only through the instruction counts
+  they are built from (copy, triad, float4 copy, half-lane and reuse kernels: FLAT, VALU and SMEM per wave match the simulator exactly), not
+  against a memory counter.
+- **A program that `dlopen`s libcuda after libcudart has started finds the driver initialised** (issue #685). On a card the runtime brings the driver up, so a
+  program that links only libcudart and loads `libcuda.so.1` itself (cedana-samples' `jit_modules` and `vmm_pools`) can call `cuCtxGetDevice` with no
+  `cuInit` of its own. The driver shim kept its own flag, and the runtime's lookup of `cuInit` cannot see a library opened `RTLD_LOCAL` or opened late:
+  the call answered `CUDA_ERROR_NOT_INITIALIZED`. The shim now initialises itself on its first call when the runtime has started, and the thread gets the
+  runtime's primary context as it does on a card.
+- **A copy, memset or device-to-device copy over several back-to-back `cuMemMap` chunks of one reserved range works** (issue #686). Each mapping is an
+  allocation of its own and a bulk access was checked against the first one, so a copy of two chunks or more failed with "runs past the end of the
+  2097152-byte mapping" (PyTorch's expandable segments, vLLM's sleep mode). A read, write or fill is now made a mapping at a time where the next mapping
+  starts where the last ended; a range that runs into a gap is still an overrun.
+- **Behaviour change: a read of `%globaltimer` costs 64 ns of the simulated clock, so a busy-wait on it no longer runs out of steps** (issue #687). `%clock`,
+  `%clock64` and `%globaltimer` count one per warp instruction, so a kernel that waited two seconds on `%globaltimer` (cedana-samples' `stream_race`
+  does, to keep a stream busy) ran about two billion instructions, reached the default step budget (1,073,741,824) and stopped as a possible infinite
+  loop, after some twenty seconds of host time; on an RTX 3080 Ti it just runs 2 s. A read of the timer is slow on a card, and now charges 64 on top of the
+  instruction (once per warp read, not per lane; `%globaltimer`, `%globaltimer_lo` and SR_GLOBALTIMERLO, in the PTX and SASS engines, the SASS tier too):
+  a wait of N ns is about N / 68 passes of a four-instruction loop, so two seconds is some 125 million instructions and the wait has to last about
+  seventeen seconds to reach the budget. The 64 is a modelled latency, not a measured one. What changes for a program: `%globaltimer` values grow
+  faster, by 64 per read, and `%clock64` is unchanged in the SASS engine (in the PTX engine both read one counter, as before, so `%clock64` moves by the
+  same 64 when the timer is read). A wait on `%clock64` still costs one instruction per cycle. The step-budget error now says a long wait on a clock reaches
+  it and that `--max-steps 0` lifts it, and `docs/status.md` describes both.
+- **CI: the CUDA toolkits workflow retries its apt steps.** NVIDIA's mirror is sometimes mid-sync (`File has unexpected size ... Mirror sync in progress?`),
+  which failed `build + tests, CUDA 12.4` on a pull request that changed nothing there; the install now tries each network step three times.
 - **An undefined `.extern .global` (or `.const`) in a PTX module is a zero-initialised variable, as on NVIDIA's driver** (issue #681). A module that
   declares `.extern .global .align 4 .u32 x;` and defines it nowhere used to fail at the first launch that read it
   (`CUDA_ERROR_NOT_FOUND: unknown symbol`), and `cuModuleGetGlobal` could not find it. On a real RTX 3080 Ti the driver drops the qualifier in a
   whole-program module (`ptxas warning : Unresolved extern variable`), gives the variable its declared size, zero, and lets `cuModuleGetGlobal`
   return it and the host write it. The simulator does the same. PoCL's CUDA backend declares `_global_offset_x` this way and launches every kernel
-  with it, so OpenCL through PoCL can now launch kernels on the simulated NVIDIA GPUs. A name the module defines itself keeps its definition, and an
-  unsized `.extern .global x[]` still loads. (The simulator writes no ptxas warning: `cuModuleLoadDataEx` has no JIT log here.)
+  with it, so OpenCL through PoCL can now launch kernels on the simulated NVIDIA GPUs. A name the module defines itself keeps its definition.
 - **CI: the longest tests are split into shards, and the slowest tests are reported** (CI work). `test_amd_gcn_gather_same_bits` (2,461 s under ASan),
   `test_amd_gcn_memory_same_bits` (1,866 s), `test_amd_matrix_fast` (1,553 s) and `e2e_sass_tier` (1,830 s under ASan, 1,580 s under TSan) now run as
   eight shards each, side by side (`..._shard_KofN`; each shard keeps every item's seed, and a `_shards_partition` test proves the shards are the whole

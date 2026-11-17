@@ -47,6 +47,7 @@ asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.skip 2816\n.popsection")
 #include <optional>
 #include <unordered_map>
 
+#include "vgpu/clock_model.hpp"
 #include "vgpu/exec/host_fp.hpp"
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/libm.hpp"
@@ -3662,7 +3663,8 @@ class Interpreter {
       if (++w.steps > cfg_.max_steps)
         ctx_fail(ins, -1, Err::ExecLimit,
                  "exceeded the step budget (" + std::to_string(cfg_.max_steps) +
-                     " instructions in one warp) — possible infinite loop; block (" +
+                     " instructions in one warp) — possible infinite loop (or a long wait on %clock64, which counts one instruction"
+                     " per cycle, or on %globaltimer, which counts one per read plus 64 ns; --max-steps 0 lifts the budget); block (" +
                      std::to_string(ctx.ctaid[0]) + "," + std::to_string(ctx.ctaid[1]) + "," +
                      std::to_string(ctx.ctaid[2]) + "), warp " + std::to_string(cur_warp_) +
                      warp_positions(ctx));
@@ -4967,6 +4969,11 @@ class Interpreter {
       case Sreg::NctaidX: same = ctx.nctaid[0]; break;
       case Sreg::NctaidY: same = ctx.nctaid[1]; break;
       case Sreg::NctaidZ: same = ctx.nctaid[2]; break;
+      // A read of the global timer takes a card's time (vgpu/clock_model.hpp): the clock moves on once per warp read, not once per lane.
+      case Sreg::GlobalTimer:
+      case Sreg::GlobalTimerLo:
+        if (ctx.clock) *ctx.clock += kGlobalTimerReadNs;
+        [[fallthrough]];
       default:
         for (uint32_t lane = 0; lane < W_; ++lane)
           scratch[lane] = sreg_value(sr.reg, sr.index, w, ctx, lane);

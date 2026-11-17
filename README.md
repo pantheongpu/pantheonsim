@@ -6,7 +6,7 @@ PantheonSim runs CUDA and HIP programs on a CPU, with no GPU. It supplies fake d
 
 ## Limits
 
-- There is no timing. Timings mean nothing, and `%clock` and `%globaltimer` count instructions. It is also much slower than a GPU.
+- There is no timing. Timings mean nothing, and `%clock` and `%globaltimer` count instructions (a read of `%globaltimer` also costs 64 ns of it, so a busy-wait on it does not run out of steps). It is also much slower than a GPU.
 - CUDA programs must be built with `nvcc -cudart shared`. Static cudart (CuPy, for example) does not work.
 - Kernels run to completion inside the launch call, so an event recorded behind a kernel is complete at once ([#523](https://github.com/pantheongpu/pantheonsim/issues/523)); `cudaLaunchHostFunc` and `cuLaunchHostFunc` are asynchronous ([#487](https://github.com/pantheongpu/pantheonsim/issues/487)).
 - The v0.2.0 release has two bugs, both fixed in v0.2.1: `shfl.sync` returned 0 for a lane still in a long loop, with no error ([#488](https://github.com/pantheongpu/pantheonsim/issues/488)), and a kernel could not read another simulated GPU's memory after `cudaDeviceEnablePeerAccess` ([#598](https://github.com/pantheongpu/pantheonsim/issues/598)). Use v0.2.1 or later.

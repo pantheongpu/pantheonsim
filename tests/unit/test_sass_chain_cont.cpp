@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "vgpu/clock_model.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
 #include "vgpu/memory.hpp"
@@ -119,6 +120,8 @@ std::string make_cubin(const std::vector<Insn>& code) {
 Insn s2r_lane(unsigned d) { return make(0x000e220000000000ull, lo_of(0x7919, d, 0, 0), "S2R " + reg(d) + ", SR_LANEID"); }
 // CS2R Rd, SR_CLOCKLO
 Insn cs2r_clock(unsigned d) { return make(0x000fca0000015000ull, lo_of(0x7805, d, 0, 0), "CS2R " + reg(d) + ", SR_CLOCKLO"); }
+// CS2R Rd, SR_GLOBALTIMERLO (the 64-bit read, Rd and Rd+1)
+Insn cs2r_timer(unsigned d) { return make(0x000fca0000015200ull, lo_of(0x7805, d, 0, 0), "CS2R " + reg(d) + ", SR_GLOBALTIMERLO"); }
 // LDG.E Rd, [Ra.64]
 Insn ldg(unsigned d, unsigned a) { return make(0x000ea2000c1e1900ull, lo_of(0x7981, d, a, 4), "LDG.E " + reg(d) + ", [" + reg(a) + ".64]"); }
 // @P0 BRA to the instruction at index `to`, from the one at index `from` (the offset is from the next instruction)
@@ -667,6 +670,32 @@ VTEST(a_kept_section_waits_for_its_lookup_and_its_threshold_on_the_plain_loop_an
   VCHECK(s.waits.load() >= w0 + 3);
   VCHECK(s.wait_ends.load() >= e0 + 6);
   VCHECK(s.units_ready.load() >= r0 + 3);
+}
+
+// Reading the global timer takes a card's time (vgpu/clock_model.hpp, issue #687): two reads of SR_GLOBALTIMERLO in a row differ by the instruction and the
+// read's latency, and two reads of SR_CLOCKLO by the instruction alone. The tier's handler (h_cs2r) and the interpreter's (exec_ops.inc) must charge the
+// same: compare() holds one to the other for every word and counter.
+VTEST(a_read_of_the_global_timer_costs_its_latency_in_the_interpreter_and_in_the_tier) {
+  std::vector<Insn> c;
+  c.push_back(s2r_tid(0));
+  c.push_back(make(0x000fc60000000f00ull, 0x0000580000007a02ull | uint64_t{12} << 16, "MOV R12, c[0x0][0x160]"));
+  c.push_back(make(0x000fc60000000f00ull, 0x0000590000007a02ull | uint64_t{13} << 16, "MOV R13, c[0x0][0x164]"));
+  c.push_back(imad_wide_i(14, 0, kStride, 12));
+  c.push_back(cs2r_timer(2));
+  c.push_back(cs2r_timer(4));
+  c.push_back(cs2r_clock(6));
+  c.push_back(cs2r_clock(8));
+  c.push_back(stg(14, 2, 0));
+  c.push_back(stg(14, 4, 4));
+  c.push_back(stg(14, 6, 8));
+  c.push_back(stg(14, 8, 12));
+  c.push_back(exit_());
+  const Result r = compare(c, 32, "global timer");
+  // Lane 0's four words (every lane reads the same).
+  VCHECK_EQ(r.out[1] - r.out[0], 1u + static_cast<uint32_t>(kGlobalTimerReadNs));
+  VCHECK_EQ(r.out[3] - r.out[2], 1u);
+  // The last lane's, too: the charge is once per warp read, not once per lane.
+  VCHECK_EQ(r.out[31 * 4 + 1] - r.out[31 * 4], 1u + static_cast<uint32_t>(kGlobalTimerReadNs));
 }
 
 VTEST_MAIN
