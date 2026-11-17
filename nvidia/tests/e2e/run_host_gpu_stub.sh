@@ -128,6 +128,7 @@ if [[ "$cc" == 86 ]]; then
   "$nvcc_bin" "${nvf[@]}" -arch=sm_86 "$fitsrc" -o "$work/fit" || { echo "FAIL: host_gpu_fit.cu does not compile for sm_86"; exit 1; }
   "$nvcc_bin" "${nvf[@]}" -arch=sm_90 "$fitsrc" -o "$work/fit90" || { echo "FAIL: host_gpu_fit.cu does not compile for sm_90"; exit 1; }
   "$nvcc_bin" "${nvf[@]}" -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 "$root/nvidia/tests/e2e/host_gpu_vars.cu" -o "$work/vars80" || { echo "FAIL: host_gpu_vars.cu does not compile for sm_80 and sm_86"; exit 1; }
+  "$nvcc_bin" "${nvf[@]}" -arch=sm_86 "$root/nvidia/tests/e2e/host_gpu_coop.cu" -o "$work/coop" || { echo "FAIL: host_gpu_coop.cu does not compile for sm_86"; exit 1; }
   "$nvcc_bin" "${nvf[@]}" -arch=sm_89 "$fitsrc" -o "$work/fit89" || { echo "FAIL: host_gpu_fit.cu does not compile for sm_89"; exit 1; }
   "$nvcc_bin" "${nvf[@]}" -DFIT_NO_ELECT -gencode arch=compute_90,code=compute_90 "$fitsrc" -o "$work/fit90p" || { echo "FAIL: host_gpu_fit.cu does not compile as PTX for compute_90"; exit 1; }
   "$nvcc_bin" "${nvf[@]}" -arch=sm_80 "$fitsrc" -o "$work/fit80" || { echo "FAIL: host_gpu_fit.cu does not compile for sm_80"; exit 1; }
@@ -685,6 +686,55 @@ if [[ "$cc" == 86 ]]; then
   lim fl_grid_ok grid sent STUB_MAX_GRID_X=4096
   lim fl_mem mem refused STUB_TOTAL_MIB=4
   lim fl_mem_ok mem sent STUB_TOTAL_MIB=4096
+  # 46b. a cooperative launch goes to the card as one, when the card can hold the grid at once (#661); VGPU_HOST_GPU_COOP=0 and exact mode keep it
+  # in the simulator. A launch with an argument into mapped host memory goes with the memory registered at its own address; VGPU_HOST_GPU_HOSTMAP=0,
+  # exact mode, a registration the driver refuses, and a device pointer that is not the host pointer keep it in the simulator.
+  PROG=coop fitoff coop
+  fitoff hostmap
+  turbo_field() { grep -m1 '^host_gpu_turbo:' "$work/$1.err" | grep -o "$2=[0-9]*" | cut -d= -f2; }
+  coop_case() {   # <tag> <sent|kept> [env...]
+    local tag=$1 want=$2
+    shift 2
+    PROG=coop run "$tag" coop VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_VERIFY=1 STUB_CARD_OK=1 "$@" || { echo "FAIL: the $tag run failed"; tail -5 "$work/$tag.err"; fails=1; }
+    ! grep -q '^cuLaunchKernel$' "$work/$tag.log" || { echo "FAIL: $tag: a cooperative launch was made with cuLaunchKernel: $(calls "$tag")"; fails=1; }
+    if [[ $want == sent ]]; then
+      grep -q '^cuLaunchCooperativeKernel$' "$work/$tag.log" || { echo "FAIL: $tag: a cooperative launch that fits the card was not sent: $(calls "$tag"); $(grep -m2 host_gpu "$work/$tag.err")"; fails=1; }
+    else
+      ! grep -q '^cuLaunchCooperativeKernel$' "$work/$tag.log" || { echo "FAIL: $tag: a cooperative launch that must stay was sent: $(calls "$tag")"; fails=1; }
+    fi
+    grep -q 'launch=0' "$work/$tag.out" || { echo "FAIL: $tag: the simulator did not run the launch: $(cat "$work/$tag.out")"; fails=1; }
+    grep -q '; mode off\|failed on the card (error' "$work/$tag.err" && { echo "FAIL: $tag: the mode ended: $(grep -m1 '; mode off\|failed on the card (error' "$work/$tag.err")"; fails=1; }
+  }
+  coop_case co_sent sent
+  coop_case co_off kept VGPU_HOST_GPU_COOP=0
+  coop_case co_exact kept VGPU_HOST_GPU=exact
+  coop_case co_fits sent FIT_COOP_BLOCKS=40 STUB_OCC=2
+  coop_case co_big kept FIT_COOP_BLOCKS=40 STUB_OCC=1
+  coop_case co_nocoop kept STUB_COOP=0
+  grep -q 'cooperative grid that the card cannot hold' "$work/co_big.err" || { echo "FAIL: co_big: the log does not say the grid is too large for the card: $(grep -m2 host_gpu "$work/co_big.err")"; fails=1; }
+  (( $(fitline co_big refused_fit) >= 1 )) || { echo "FAIL: co_big: refused_fit is not counted"; fails=1; }
+  hostmap_case() {   # <tag> <sent|kept> [env...]
+    local tag=$1 want=$2
+    shift 2
+    PROG=fit run "$tag" hostmap VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_VERIFY=1 STUB_CARD_OK=1 "$@" || { echo "FAIL: the $tag run failed"; tail -5 "$work/$tag.err"; fails=1; }
+    diff -q "$work/off_f_hostmap.out" "$work/$tag.out" > /dev/null || { echo "FAIL: $tag changes the output of fit hostmap: $(cat "$work/$tag.out")"; fails=1; }
+    if [[ $want == sent ]]; then
+      grep -q '^cuLaunchKernel$' "$work/$tag.log" && grep -q '^cuMemHostRegister$' "$work/$tag.log" || { echo "FAIL: $tag: a launch with a mapped host argument was not sent with its memory registered: $(calls "$tag"); $(grep -m2 host_gpu "$work/$tag.err")"; fails=1; }
+      # (the stand-in card computes nothing, so the card's bytes of the host buffer are zeros and the simulator's are not: the compare must have seen the buffer)
+      (( $(turbo_field "$tag" words_different) >= 32 )) || { echo "FAIL: $tag: the verify compare did not include the mapped host buffer: $(grep -m1 '^host_gpu_turbo' "$work/$tag.err")"; fails=1; }
+    else
+      ! grep -q '^cuLaunchKernel$' "$work/$tag.log" || { echo "FAIL: $tag: a launch with a mapped host argument that must stay was sent: $(calls "$tag")"; fails=1; }
+    fi
+    grep -q '; mode off\|failed on the card (error' "$work/$tag.err" && { echo "FAIL: $tag: the mode ended: $(grep -m1 '; mode off\|failed on the card (error' "$work/$tag.err")"; fails=1; }
+  }
+  hostmap_case hm_sent sent
+  hostmap_case hm_off kept VGPU_HOST_GPU_HOSTMAP=0
+  ! grep -q '^cuMemHostRegister$' "$work/hm_off.log" || { echo "FAIL: hm_off: memory was registered with the switch off"; fails=1; }
+  hostmap_case hm_exact kept VGPU_HOST_GPU=exact
+  hostmap_case hm_regfail kept STUB_HOSTREG_FAIL=1
+  (( $(fitline hm_regfail refused_fit) >= 1 )) && grep -q 'mapped host memory at its own address' "$work/hm_regfail.err" || { echo "FAIL: hm_regfail: the refusal is not counted and said: $(grep -m2 host_gpu "$work/hm_regfail.err")"; fails=1; }
+  hostmap_case hm_shift kept STUB_HOSTPTR_SHIFT=4096
+  grep -q '^cuMemHostUnregister$' "$work/hm_shift.log" || { echo "FAIL: hm_shift: a registration whose device pointer is not the host pointer was kept: $(calls hm_shift)"; fails=1; }
   # 47.
   # (QMMA, FP8 tensor cores, sm_89: no class names it, and a card that has it runs it)
   PROG=fit89 fitoff qmma nvidia/rtx4090

@@ -367,4 +367,25 @@ VTEST(the_ordinary_batch_declines_every_warp_the_host_batch_takes) {
   }
 }
 
+// The host-GPU mode registers the mapped buffers with the real driver (src/runtime/host_gpu.cpp pin_host_maps): it lists them, and it re-registers when a
+// buffer was unmapped, since one freed and mapped again at the same address is other memory.
+VTEST(the_mapped_buffers_are_listed_and_unmaps_are_counted) {
+  MemoryManager mem{1 << 20};
+  Buf a(4096, 1), b(8192, 2);
+  VCHECK(mem.host_spans().empty());
+  VCHECK_EQ(mem.host_unmaps(), uint64_t{0});
+  mem.map_host(a.addr(), a.p, a.n);
+  mem.map_host(b.addr(), b.p, b.n, /*read_only=*/true);
+  const auto spans = mem.host_spans();
+  VCHECK_EQ(spans.size(), size_t{2});
+  VCHECK(spans[0].base == a.addr() && spans[0].len == a.n && spans[0].host == a.p && !spans[0].read_only);
+  VCHECK(spans[1].base == b.addr() && spans[1].len == b.n && spans[1].read_only);
+  VCHECK_EQ(mem.host_unmaps(), uint64_t{0});   // mapping is not unmapping
+  mem.unmap_host(a.addr());
+  VCHECK_EQ(mem.host_unmaps(), uint64_t{1});
+  VCHECK_EQ(mem.host_spans().size(), size_t{1});
+  mem.unmap_host(a.addr());   // not mapped any more: nothing was removed
+  VCHECK_EQ(mem.host_unmaps(), uint64_t{1});
+}
+
 VTEST_MAIN

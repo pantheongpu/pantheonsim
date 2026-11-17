@@ -85,7 +85,7 @@ send every launch: `aop`, `atomicPerf`, `bh`) and finished, with the programs' o
 
 ## 3. What is shared with exact mode, unchanged
 
-Everything except the class scan: the launch-shape checks (cooperative and cluster launches, warp size), arguments that point into mapped host memory, device memory outside the allocation table, what a kernel needs of its module (section 10:
+Everything except the class scan: the launch-shape checks (cluster launches and warp size; cooperative launches and mapped host memory are turbo's own since section 18), device memory outside the allocation table, what a kernel needs of its module (section 10:
 its variables, which the card is given at the simulator's addresses, and the external functions it calls, of which turbo mode alone admits
 `vprintf`), the size rule and its start cost, the first-launch rule, the sample of a launch's first blocks (section 8), the bans, the
 64 KiB residency protocol, the list of diagnostics that switch the mode off, and `VGPU_HOST_GPU_MAX_MIB`.
@@ -460,10 +460,7 @@ calls either is kept in the simulator by what it calls; so a graph's other kerne
 
 **What was not lifted, and why.** The device heap and device-side launches (above); memory mapped with `cuMemMap` or shared with another
 process (the window mirrors the allocation table: an alias of one physical page at two addresses, or another process's memory, cannot be made the
-same on the card without mirroring the mappings themselves); arguments that point into mapped or managed host memory (the card could reach that
-memory through `cuMemHostRegister` at the same address where the device says so, `CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM`, but
-the mode would have to register every such range before a launch and the residency protocol does not cover memory the card reads over the bus; in
-the census 3.4 s are behind it, nearly all of them HeCBench `zerocopy`, a program written to time zero-copy access); cooperative and cluster launches and warp size (launch shapes the card path does not build). `VGPU_HOST_GPU_WIDER=0` restores the safety rules and the atomics opt-in of before the round, for A/B runs (the benchmark's forms `exactn` and `turbon`); the class scan's additions (calls into another section, `B2R`, `NANOSLEEP`, `LEPC`) are not switched by it.
+same on the card without mirroring the mappings themselves); arguments that point into mapped or managed host memory and cooperative launches (turbo mode sends both since section 18; exact mode still refuses them); cluster launches and warp size (launch shapes the card path does not build). `VGPU_HOST_GPU_WIDER=0` restores the safety rules and the atomics opt-in of before the round, for A/B runs (the benchmark's forms `exactn` and `turbon`); the class scan's additions (calls into another section, `B2R`, `NANOSLEEP`, `LEPC`) are not switched by it.
 
 ## 11. The driver start of a program of many short launches (Round sp69; both modes)
 
@@ -756,7 +753,7 @@ What changed in turbo mode, and why:
    (a one-warp launch would stay in the simulator), and the owner asked for it. The cost is real for small programs (a driver start in every process, and a push or
    pull of memory whenever the simulator and the card alternate): measured on an A10G, 2DCONV 0.93 s to 2.0 s and 0.01 to 0.06 s programs 0.24 to 0.5 s, while the long ones are as fast or faster (below). On a WSL2 host turbo with FIT=1 turns itself off at once with a notice (the driver start never returns there). `VGPU_HOST_GPU_FIT=0` keeps every earlier rule (including section 17's short-launch rule, #660, which is now what FIT=0 and exact mode use: a kernel's card time prior of a twentieth of the simulator's estimate, a 40 us floor, three slow launches in a row before a ban, `VGPU_HOST_GPU_SHORT=0` for the rule before it; under FIT=1 none of it is asked, because every fitting launch goes to the card whatever it would save) (and the lazy driver start; the verdicts are redone
    when the card turns out to be of another architecture than the profile).
-6. **Kept as they were** (safety, not bit-exactness): cooperative and cluster launches (the card path is a plain `cuLaunchKernel`), host-mapped arguments, VMM, IPC and managed memory, module
+6. **Kept as they were** (safety, not bit-exactness): cluster launches, VMM, IPC (cooperative launches and host-mapped arguments are sent by turbo since section 18), module
    variables the patch cannot apply, externs other than `vprintf`, texture objects, no code section, the diagnostics that need the simulator, and the watchdog.
 
 Built later, narrowly, in section 16.3 (this paragraph described it as not built): retargeting `.target sm_90` PTX to the card's architecture (rewrite the target, let the driver compile what the card's ISA accepts; blockers are `wgmma`, clusters, TMA, `elect`,
@@ -842,3 +839,28 @@ of a kernel never run there was a fixed 100 us, and a launch under 200 us never 
 start share of a kernel launched thousands of times was capped at 500 launches (5,000); the first card launch's time includes the module load (65 us for a
 20 us kernel) and was kept for good (the prior is kept instead, later times at their least); and one launch that was 60 us late ended the card for its kernel
 (three in a row now). JACOBI1D 2.3 s to 1.5 s, sc_gpu 0.96 s to 0.85 s; LargeKernelParameter saves 0.2 ms a launch against the 0.25 ms its start needs, and stays in the simulator.
+
+## 18. Cooperative launches and mapped host memory (#661; turbo only)
+
+**Cooperative.** A cooperative launch goes to the card with `cuLaunchCooperativeKernel`, when the card reports `COOPERATIVE_LAUNCH` and
+`cuOccupancyMaxActiveBlocksPerMultiprocessor` times the SM count holds the whole grid (else `refused_fit`, "a cooperative grid that the card cannot hold
+at once"). `cg::this_grid().sync()` ends in a `BPT.TRAP` for a launch that is not cooperative, which made every such kernel class `never`; a kernel that is
+`never` by `BPT` alone is now admitted in a cooperative launch (an `assert` or `__trap` in such a kernel is admitted with it: a failure on the card ends the
+mode as any failed launch does). `VGPU_HOST_GPU_COOP=0` restores the refusal (bench form `turboc0`).
+
+**Mapped host memory.** The simulator maps pinned, registered and managed host memory at its own host address. When an argument points into one, every
+mapped buffer is registered with the driver (`cuMemHostRegister`, DEVICEMAP) and its device pointer must equal the host pointer, so pointers in arguments
+and in memory mean the same on the card; a buffer that is not mapped at its own address (IPC) or that the driver refuses keeps the launch in the simulator
+(`refused_fit`, "mapped host memory at its own address"). Registrations are dropped when the simulator unmaps a buffer. Measured on the A10G (driver
+595.112.07): an unaligned malloc range registers, its device pointer is its host pointer, an overlapping range fails (712), READ_ONLY is unsupported (801).
+Under `VGPU_HOST_GPU_VERIFY` the host buffers are saved before the card runs, compared with the simulator's result, and restored for the simulator.
+`VGPU_HOST_GPU_HOSTMAP=0` restores the refusal (bench form `turbom0`). A card that fails midway leaves host memory it already wrote: the simulator then
+runs the launch on that memory (unknown how often this matters; the same hazard as card-held data).
+
+**Textures and surfaces** stay refused: `14-turbo-textures-design.md`.
+
+**Measured, A10G (g5.xlarge), 5 interleaved runs, medians, output identical in every form** (2026-11-17): HeCBench `zerocopy` 28 of 28 launches on the card, 20.4 s against
+25.1 s with `VGPU_HOST_GPU_HOSTMAP=0` (sim 24.9 s); `simpleAWBarrier` 1 of 1 on the card, 0.34 s against 1.22 s with `VGPU_HOST_GPU_COOP=0` (sim 1.08 s);
+`simpleZeroCopy` 1 of 1 on the card, 0.25 s (sim 0.06 s: the driver start; with `HOSTMAP=0` the run aborts in a glibc mutex assertion, a failure of the old rule not
+looked into). `VGPU_HOST_GPU_VERIFY=all`: 0 words different (1.6 G, 20 M and 3 M words compared). ATAX, GEMM, MVT, hotspot, bfs and nn: turbo within 3 % of the
+switches-off forms (no program slower). A launch with no device allocation (a zero-copy program) used to fail "could not back the window up to 0x0"; fixed here.

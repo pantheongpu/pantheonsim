@@ -590,6 +590,16 @@ class MemoryManager {
   void unmap_host(uint64_t addr);
   // True when `addr` falls in a mapped host buffer rather than device VA.
   bool is_host_mapped(uint64_t addr) const;
+  // The host buffers mapped now (the card path registers them with the real driver), and how many mappings were ever removed (a buffer freed and
+  // mapped again at the same address is new memory).
+  struct HostSpan {
+    uint64_t base;
+    uint64_t len;
+    uint8_t* host;
+    bool read_only;
+  };
+  std::vector<HostSpan> host_spans() const;
+  uint64_t host_unmaps() const;
   // Where [addr, addr + len) is in host memory, when one mapped host buffer
   // holds all of it; null otherwise. An atomic on host memory the host also
   // updates has to be made with the CPU's own atomics, there.
@@ -1035,6 +1045,7 @@ class MemoryManager {
     // value no HostMaps has had before (process-wide counter), so an entry cached for a destroyed manager whose
     // HostMaps lived at the same address can never be taken for a current one.
     std::atomic<uint64_t> gen;
+    std::atomic<uint64_t> unmaps{0};
     HostMaps();
     // The range alone is not enough: a PIE program's heap (0x55...) and the
     // mmap area (0x7f...) sit either side of the device windows, so a pinned
