@@ -767,6 +767,22 @@ if [[ "$cc" == 86 ]]; then
   PROG=vars80 run va_80 vars STUB_SM=80 STUB_MP=108 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the sm_80 card vars run failed"; tail -3 "$work/va_80.err"; fails=1; }
   grep -q '^image elf sm_80$' "$work/va_80.log" && grep -q '^relocs_to_variables 0$' "$work/va_80.log" || { echo "FAIL: the sm_80 cubin of a module with variables was not given to the sm_80 card with the simulator's addresses: $(calls va_80); $(grep -m3 host_gpu "$work/va_80.err")"; fails=1; }
   diff -q "$work/off_vvars.out" "$work/va_80.out" > /dev/null || { echo "FAIL: the sm_80 card changes the output of host_gpu_vars vars"; fails=1; }
+  # 56. the driver starts while the program sets up (VGPU_HOST_GPU_FIT=1): a program that allocates and launches nothing has touched the stand-in driver by exit; with
+  # VGPU_HOST_GPU_FIT=0, VGPU_HOST_GPU_PRESTART=0 or in exact mode it has not. The output is the mode-off output in each. The first launch of `tiny` finds the driver up.
+  fitoff none
+  PROG=fit run ps_on none VGPU_HOST_GPU=turbo || { echo "FAIL: the prestart run failed"; fails=1; }
+  grep -q '^cuInit$' "$work/ps_on.log" || { echo "FAIL: turbo with FIT=1 did not start the driver while the program set up: $(calls ps_on)"; fails=1; }
+  for sw in "VGPU_HOST_GPU=turbo VGPU_HOST_GPU_FIT=0" "VGPU_HOST_GPU=turbo VGPU_HOST_GPU_PRESTART=0" "VGPU_HOST_GPU=exact"; do
+    PROG=fit run ps_off none $sw || { echo "FAIL: the run with $sw failed"; fails=1; }
+    [[ ! -s "$work/ps_off.log" ]] || { echo "FAIL: $sw started the driver without a launch worth a card: $(calls ps_off)"; fails=1; }
+    diff -q "$work/off_f_none.out" "$work/ps_off.out" > /dev/null || { echo "FAIL: $sw changes the output of fit none"; fails=1; }
+  done
+  diff -q "$work/off_f_none.out" "$work/ps_on.out" > /dev/null || { echo "FAIL: the prestart changes the output of fit none"; fails=1; }
+  # ... a driver that cannot start (cuInit fails): said once, the mode is off, the output is the mode-off output, and no launch is held up
+  PROG=fit run ps_bad tiny VGPU_HOST_GPU=turbo STUB_FAIL_INIT=1 || { echo "FAIL: the run with a driver that cannot start failed"; fails=1; }
+  [[ "$(grep -c 'cuInit failed; mode off' "$work/ps_bad.err")" == 1 ]] || { echo "FAIL: a prestarted driver that fails was not said once: $(grep -m2 host_gpu "$work/ps_bad.err")"; fails=1; }
+  ! grep -q '^cuModuleLoadData$' "$work/ps_bad.log" || { echo "FAIL: a launch reached the card after the prestarted driver failed"; fails=1; }
+  diff -q "$work/off_f_tiny.out" "$work/ps_bad.out" > /dev/null || { echo "FAIL: a prestarted driver that fails changes the output"; fails=1; }
   # 52. the notice.
   grep -q '^host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host GPU.*results may differ from the simulator' "$work/fit_tiny.err" || { echo "FAIL: turbo mode did not say that its results may differ: $(grep -m2 host_gpu "$work/fit_tiny.err")"; fails=1; }
   [[ "$(grep -c 'may differ from the simulator' "$work/fit_tiny.err")" == 1 ]] || { echo "FAIL: the notice was not said exactly once"; fails=1; }

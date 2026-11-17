@@ -1492,6 +1492,16 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
   return ordinal == 0 ? rt : nullptr;
 }
 
+void Runtime::prestart(const DeviceProfile& profile, int ordinal) {
+  if (ordinal != 0 || !turbo_selected()) return;
+  const char* off = std::getenv("VGPU_HOST_GPU_PRESTART");
+  if (off && std::string(off) == "0") return;
+  Runtime* rt = for_device(profile, ordinal);
+  if (!rt || rt->impl_->mode != Mode::Turbo || !rt->impl_->fit) return;
+  std::lock_guard<GateLock> g(rt->impl_->mu);
+  rt->impl_->begin_start();   // (idempotent; the thread only touches `api` and `ctx`, which nobody reads before await_start)
+}
+
 void Runtime::before_simulated(MemoryManager& mem) {
   if (mem.card_resident_count().load(std::memory_order_relaxed) <= 0) {
     impl_->verify_card_ran = false;
