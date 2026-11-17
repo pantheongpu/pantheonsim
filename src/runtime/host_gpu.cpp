@@ -30,6 +30,7 @@
 #include "vgpu/error.hpp"
 #include "vgpu/exec/devrt.hpp"
 #include "vgpu/host_gpu_idiom.hpp"
+#include "vgpu/host_gpu_cards.hpp"
 #include "vgpu/host_gpu_image.hpp"
 #include "vgpu/host_gpu_regcall.hpp"
 #include "vgpu/host_gpu_source.hpp"
@@ -70,6 +71,7 @@ struct Api {
   void* lib = nullptr;
   CUresult (*cuInit)(unsigned) = nullptr;
   CUresult (*cuDeviceGet)(CUdevice*, int) = nullptr;
+  CUresult (*cuDeviceGetCount)(int*) = nullptr;   // (turbo mode with several cards; not required: without it the card count is unknown and only slot 0 is served)
   CUresult (*cuDeviceGetAttribute)(int*, int, CUdevice) = nullptr;
   CUresult (*cuDevicePrimaryCtxRetain)(CUcontext*, CUdevice) = nullptr;
   CUresult (*cuCtxSetCurrent)(CUcontext) = nullptr;
@@ -107,6 +109,7 @@ struct Api {
 #undef VGPU_HG_SYM
 #undef VGPU_HG_SYM_V2
     cuFuncGetAttribute = reinterpret_cast<decltype(cuFuncGetAttribute)>(dlsym(lib, "cuFuncGetAttribute"));
+    cuDeviceGetCount = reinterpret_cast<decltype(cuDeviceGetCount)>(dlsym(lib, "cuDeviceGetCount"));
     return true;
   }
 };
@@ -535,6 +538,17 @@ struct Runtime::Impl : CardGate {
   uint32_t want_mp = 0;
   uint64_t va_base = 0;
   std::string lib_path;
+  // Several cards (turbo mode; docs/perf-design/12-host-gpu-turbo.md section 17): one Impl per simulated device slot, each with its own context, window,
+  // residency, module cache and launch lock. `slot` is the device's window (va_base = kDeviceVaBase + slot * kDeviceVaStride); `card_dev` the real driver's device
+  // it runs on, chosen by the start thread (pick_card); `multi` is false in exact mode, which serves slot 0 on the driver's device 0 as it always did.
+  int slot = 0;
+  bool multi = false;
+  bool has_list = false;
+  std::vector<int> card_list;      // VGPU_HOST_GPU_DEVICES
+  std::string cvd;                 // CUDA_VISIBLE_DEVICES as the process had it (cvd_set: whether it was set)
+  bool cvd_set = false;
+  int card_dev = 0;
+  bool no_card = false;            // the machine has no card for this slot (a device beyond the host's cards): it stays in the simulator, said once
   // Turbo mode's card (filled by the start thread before `done`): its architecture, SM count and launch limits. Until the driver is up the images are
   // chosen for the simulated profile's architecture (`want_sm`), which is the card's whenever the two agree; await_start redoes the verdicts when not.
   bool fit = true;            // VGPU_HOST_GPU_FIT (turbo mode): see vgpu/host_gpu_source.hpp parse_fit
@@ -545,7 +559,8 @@ struct Runtime::Impl : CardGate {
   std::map<CUfunction, FuncAttrs> func_attrs;
   int image_sm() const { return host_known ? host_sm : want_sm; }
 
-  void configure_start(const DeviceProfile& profile, uint64_t base) {
+  void configure_start(const DeviceProfile& profile, uint64_t base, int slot_in = 0) {
+    slot = slot_in;
     const char* path = std::getenv("VGPU_HOST_GPU_LIBCUDA");
     lib_path = path && *path ? path : "/usr/lib/x86_64-linux-gnu/libcuda.so.1";
     want_sm = profile.cc_major * 10 + profile.cc_minor;
@@ -573,7 +588,22 @@ struct Runtime::Impl : CardGate {
         if (!self->api.load(lib.c_str())) { why = "cannot load the real driver " + lib; break; }
         if (self->api.cuInit(0)) { why = "cuInit failed"; break; }
         CUdevice d;
-        if (self->api.cuDeviceGet(&d, 0)) { why = "no device 0"; break; }
+        int dev = 0;
+        if (self->multi) {   // (turbo mode: the slot's own card; exact mode asks for the driver's device 0 as before)
+          int count = 0;
+          if (self->api.cuDeviceGetCount) self->api.cuDeviceGetCount(&count);
+          else count = self->slot == 0 ? 1 : 0;
+          const CardPick pick = pick_card(self->slot, self->has_list ? &self->card_list : nullptr, self->cvd_set ? self->cvd.c_str() : nullptr, count);
+          if (pick.index < 0) {
+            self->no_card = true;
+            why = "simulated device " + std::to_string(self->slot) + " has no host card (" + card_why_text(pick.why) + "; the driver shows " + std::to_string(count) +
+                  "), so it stays in the simulator";
+            break;
+          }
+          dev = pick.index;
+        }
+        self->card_dev = dev;
+        if (self->api.cuDeviceGet(&d, dev)) { why = "no device " + std::to_string(dev); break; }
         int mp = 0, cmaj = 0, cmin = 0;
         self->api.cuDeviceGetAttribute(&mp, kAttrMultiprocessors, d);
         self->api.cuDeviceGetAttribute(&cmaj, kAttrCcMajor, d);
@@ -630,7 +660,7 @@ struct Runtime::Impl : CardGate {
       return false;
     }
     if (!sh->ok) {
-      if (!quiet()) std::fprintf(stderr, "host_gpu: %s; mode off\n", sh->why.c_str());
+      if (!quiet()) std::fprintf(stderr, "host_gpu: %s%s\n", sh->why.c_str(), no_card ? "" : "; mode off");
       start_failed = dead = true;
       return false;
     }
@@ -667,7 +697,7 @@ struct Runtime::Impl : CardGate {
     CUmemAllocationProp prop = {};
     prop.type = 1;   // CU_MEM_ALLOCATION_TYPE_PINNED
     prop.location.type = 1;   // CU_MEM_LOCATION_TYPE_DEVICE
-    prop.location.id = 0;
+    prop.location.id = card_dev;
     CUhandle h;
     CUresult r = api.cuMemCreate(&h, size, &prop, 0);
     if (!r) r = api.cuMemMap(lo, size, 0, h, 0);
@@ -891,6 +921,10 @@ struct Runtime::Impl : CardGate {
         uint64_t v;
         std::memcpy(&v, &a[i], 8);
         if (v && mem.host_map_possible(v) && mem.is_host_mapped(v)) return unsafe("argument points into mapped host memory");
+        // Several cards: a card holds its own device's window and nothing of another simulated device's, so a pointer into another window (a peer pointer: documented
+        // CUDA, it needs peer access, which card_blocker below already keeps off the card) would fault there, and a fault kills every context of the process (measured,
+        // tools/multicard/va_probe.cu step 9). The simulator answers such a launch as it always did. Not in exact mode, which has the one device.
+        if (multi && addr_in_other_window(v, slot, kDeviceVaBase, kDeviceVaStride, kDeviceVaWindows)) return unsafe("argument points into another simulated device's memory");
       }
     // Device memory that is not in the allocation table (VMM mappings, IPC, the kernel heap) is not on the card: a pointer to it, from an argument or from
     // memory, would read what the card never got. Not cached: a mapping can appear between two launches of one kernel.
@@ -1435,11 +1469,40 @@ void print_summary(Runtime::Impl* im) {
   }
 }
 Runtime::Impl* g_summary_impl = nullptr;
+std::vector<Runtime::Impl*> g_other_impls;   // the runtimes of the other simulated devices (turbo mode with several cards), in the order they were made
+// One line for a simulated device beyond the first one the mode served: which card it ran on and what it did (the lines above are the first device's; a script
+// that wants the process's totals adds these). Nothing when its driver could not be used or it never launched.
+void print_card_line(Runtime::Impl* im) {
+  if (!im || im->start_failed || !im->start_ready) return;
+  if (quiet() && !im->verify && !logging()) return;
+  const Stats& s = im->stats;
+  std::fprintf(stderr, "host_gpu_card: device_slot=%d card=%d launches_card=%llu launches_sim=%llu card_s=%.6f sim_s=%.6f mib_to_card=%.1f mib_back=%.1f\n", im->slot, im->card_dev,
+               static_cast<unsigned long long>(s.card_runs), static_cast<unsigned long long>(s.simulated), s.card_seconds, s.sim_seconds, s.pushed_bytes / 1048576.0,
+               s.pulled_bytes / 1048576.0);
+}
 }  // namespace
 
-Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
+namespace {
+// What the environment says, read once for the process: every device's runtime is made from it.
+struct SharedConfig {
+  Mode mode = Mode::Off;   // Off: the mode is not on, or could not be started (said once)
+  TurboSwitches sw;
+  Tolerance tol;
+  bool fit = true;
+  double timeout_s = 0;
+  bool wider = true;
+  bool has_list = false;   // VGPU_HOST_GPU_DEVICES (turbo mode)
+  std::vector<int> list;
+  bool cvd_set = false;
+  std::string cvd;
+};
+SharedConfig g_cfg;
+}  // namespace
+
+Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal, int physical) {
   static std::once_flag once;
-  static Runtime* rt = nullptr;
+  static std::mutex made_mu;
+  static std::map<int, Runtime*> made;   // by device slot (the window): the simulated devices the mode has been asked for
   std::call_once(once, [&] {
     const char* mode_text = std::getenv("VGPU_HOST_GPU");
     if (!mode_text_is_known(mode_text)) std::fprintf(stderr, "host_gpu: VGPU_HOST_GPU=%s is not a mode (off, exact or turbo); mode off\n", mode_text);
@@ -1507,17 +1570,50 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
         return;
       }
     }
-    auto* r = new Runtime;
-    r->impl_->mode = mode;
-    r->impl_->sw = sw;
-    r->impl_->tol = tol;
-    r->impl_->watchdog.limit_s = timeout_s;
-    r->impl_->wider = wider;
-    r->impl_->fit = fit;
+    // Several cards (turbo mode only; exact mode serves device 0 as it always did): which real devices the simulated ones use (vgpu/host_gpu_cards.hpp).
+    if (mode == Mode::Turbo) {
+      if (!parse_card_list(std::getenv("VGPU_HOST_GPU_DEVICES"), &g_cfg.list, &g_cfg.has_list)) {
+        std::fprintf(stderr, "host_gpu: VGPU_HOST_GPU_DEVICES=%s is not a list of different device numbers (for example 0,1); mode off\n", std::getenv("VGPU_HOST_GPU_DEVICES"));
+        return;
+      }
+      if (const char* c = std::getenv("CUDA_VISIBLE_DEVICES")) {
+        g_cfg.cvd_set = true;
+        g_cfg.cvd = c;
+      }
+    }
+    g_cfg.mode = mode;
+    g_cfg.sw = sw;
+    g_cfg.tol = tol;
+    g_cfg.fit = fit;
+    g_cfg.timeout_s = timeout_s;
+    g_cfg.wider = wider;
     // Turbo mode does not return the simulator's bits: said once, when the mode comes on (not under VGPU_QUIET, which silences the prose).
     if (mode == Mode::Turbo && !quiet()) std::fprintf(stderr, "%s\n", turbo_notice());
+  });
+  if (g_cfg.mode == Mode::Off) return nullptr;
+  // The device's slot is its window's (a simulated device the program reaches as ordinal 0 may sit in window 1 under CUDA_VISIBLE_DEVICES). Exact mode serves the
+  // device in ordinal 0 on the driver's device 0 and window 0 as before.
+  const int slot = g_cfg.mode == Mode::Turbo && physical >= 0 ? physical : ordinal;
+  if (g_cfg.mode != Mode::Turbo ? ordinal != 0 : slot < 0 || static_cast<uint64_t>(slot) >= kDeviceVaWindows) return nullptr;
+  std::lock_guard<std::mutex> made_lock(made_mu);
+  if (auto it = made.find(slot); it != made.end()) return it->second;
+  {
+    const Mode mode = g_cfg.mode;
+    const SharedConfig& cfg = g_cfg;
+    auto* r = new Runtime;
+    r->impl_->mode = mode;
+    r->impl_->sw = cfg.sw;
+    r->impl_->tol = cfg.tol;
+    r->impl_->watchdog.limit_s = cfg.timeout_s;
+    r->impl_->wider = cfg.wider;
+    r->impl_->fit = cfg.fit;
+    r->impl_->multi = mode == Mode::Turbo;
+    r->impl_->has_list = cfg.has_list;
+    r->impl_->card_list = cfg.list;
+    r->impl_->cvd_set = cfg.cvd_set;
+    r->impl_->cvd = cfg.cvd;
     // The driver is not started here: see Impl::begin_start. The switches are read now so that they do not depend on whether it came up.
-    r->impl_->configure_start(profile, kDeviceVaBase);
+    r->impl_->configure_start(profile, mode == Mode::Turbo ? kDeviceVaBase + static_cast<uint64_t>(slot) * kDeviceVaStride : kDeviceVaBase, mode == Mode::Turbo ? slot : 0);
     if (const char* v = std::getenv("VGPU_HOST_GPU_VERIFY"); v && *v && *v != '0') r->impl_->verify = std::string(v) == "all" ? 2 : 1;
     if (const char* v = std::getenv("VGPU_HOST_GPU_WRITE_THROUGH"); v && *v && *v != '0') r->impl_->resident = false;
     if (const char* v = std::getenv("VGPU_HOST_GPU_STREAK"); v && std::string(v) == "0") r->impl_->streak_rule = false;
@@ -1547,24 +1643,30 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
       if (end != v && n >= 0) r->impl_->costs.start_repeats = n;
     }
     if (const char* mb = std::getenv("VGPU_HOST_GPU_MAX_MIB")) r->impl_->max_bytes = std::strtoull(mb, nullptr, 10) << 20;
-    g_summary_impl = r->impl_;
-    std::atexit([] {
-      g_summary_impl->copies_running_at_exit = sample_copies_reap(true);   // (no child is left behind, whatever the summary prints)
-      g_summary_impl->settle_start();
-      print_summary(g_summary_impl);
-    });
-    rt = r;
-  });
-  return ordinal == 0 ? rt : nullptr;
+    if (!g_summary_impl) {   // (the first device's runtime prints the summary lines scripts read; the others add one line each: print_card_line)
+      g_summary_impl = r->impl_;
+      std::atexit([] {
+        g_summary_impl->copies_running_at_exit = sample_copies_reap(true);   // (no child is left behind, whatever the summary prints)
+        for (Runtime::Impl* im : g_other_impls) im->settle_start();
+        g_summary_impl->settle_start();
+        print_summary(g_summary_impl);
+        for (Runtime::Impl* im : g_other_impls) print_card_line(im);
+      });
+    } else {
+      g_other_impls.push_back(r->impl_);
+    }
+    made[slot] = r;
+    return r;
+  }
 }
 
 bool Runtime::turbo() const { return impl_->mode == Mode::Turbo; }
 
-void Runtime::prestart(const DeviceProfile& profile, int ordinal) {
-  if (ordinal != 0 || !turbo_selected()) return;
+void Runtime::prestart(const DeviceProfile& profile, int ordinal, int physical) {
+  if (!turbo_selected()) return;   // (turbo mode starts every simulated device's card; slot 0 alone in exact mode, which never prestarts)
   const char* off = std::getenv("VGPU_HOST_GPU_PRESTART");
   if (off && std::string(off) == "0") return;
-  Runtime* rt = for_device(profile, ordinal);
+  Runtime* rt = for_device(profile, ordinal, physical);
   if (!rt || rt->impl_->mode != Mode::Turbo || !rt->impl_->fit) return;
   std::lock_guard<GateLock> g(rt->impl_->mu);
   rt->impl_->begin_start();   // (idempotent; the thread only touches `api` and `ctx`, which nobody reads before await_start)
