@@ -14,6 +14,7 @@ asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.popsection");
 //
 // Every instruction completes before the next: the control bits' stall counts
 // and scoreboards are timing, which VirtualGPU does not model.
+#include "vgpu/clock_model.hpp"
 #include "vgpu/exec/devrt.hpp"
 #include "vgpu/exec/host_fp.hpp"
 #include "vgpu/exec/launch_env.hpp"
@@ -129,6 +130,8 @@ struct Warp {
   std::vector<uint8_t> local;         // per-lane local memory, local_size bytes each
   uint32_t local_size = 0;
   uint64_t steps = 0;
+  // What the reads of the global timer have charged this warp on top of its instructions (vgpu/clock_model.hpp): SR_GLOBALTIMER is steps + this.
+  uint64_t timer_extra = 0;
   // Fairness: how many backward branches the running group has taken while
   // other lanes waited to run.
   uint32_t spins = 0;
@@ -208,6 +211,7 @@ struct Warp {
     budget = extra = 0;
     local.clear();
     steps = 0;
+    timer_extra = 0;
     spins = 0;
     give_way = false;
     spin_yields = 0;
@@ -1290,7 +1294,8 @@ uint32_t Runner::sreg(const Block& blk, const Warp& w, unsigned idx, unsigned la
     case 0x50: case 0x51: case 0x52: case 0x53: case 0x01: {
       // The clocks: a count of instructions this warp has run, which is the
       // only honest clock a functional simulator has.
-      const uint64_t t = w.steps;
+      // (The global timer, 0x52 and 0x53, is the same count plus what its reads have been charged.)
+      const uint64_t t = (idx == 0x52 || idx == 0x53) ? w.steps + w.timer_extra : w.steps;
       return (idx == 0x51 || idx == 0x53) ? static_cast<uint32_t>(t >> 32) : static_cast<uint32_t>(t);
     }
     case 0x32: return static_cast<uint32_t>(smemsz_);                   // SR_SMEMSZ
@@ -2402,8 +2407,8 @@ bool Runner::step_warp(Block& blk, Warp& w) {
     }
     if (++w.steps > max_steps_)
       throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(max_steps_) +
-                                    " instructions (an infinite loop? or a long wait: the clocks count one instruction per cycle or ns, so a"
-                                    " wait of about a second reaches it; --max-steps 0 lifts the budget)");
+                                    " instructions (an infinite loop? or a long wait on SR_CLOCK, which counts one instruction per cycle, or on"
+                                    " SR_GLOBALTIMER, which counts one per read plus 64 ns; --max-steps 0 lifts the budget)");
     if (n < 256 && pc + 16 < end && ins->straight) {
       execute(blk, w, *ins, group, /*advance=*/false);
       pc += 16;

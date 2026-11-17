@@ -16,10 +16,16 @@ release says what runs and what it produces, never how fast a real GPU would run
   allocation of its own and a bulk access was checked against the first one, so a copy of two chunks or more failed with "runs past the end of the
   2097152-byte mapping" (PyTorch's expandable segments, vLLM's sleep mode). A read, write or fill is now made a mapping at a time where the next mapping
   starts where the last ended; a range that runs into a gap is still an overrun.
-- **The step-budget error says a long clock wait reaches it** (issue #687). `%clock64` and `%globaltimer` count one instruction per cycle or ns, so a kernel that
-  busy-waits two seconds on `%globaltimer` runs about two billion instructions and stops at the default budget (1,073,741,824) as a possible infinite loop.
-  The message (PTX and SASS engines) now names the long wait and `--max-steps 0`, and `docs/status.md` says the same. The wait itself still costs its
-  instructions: a modelled read latency for the timer is not done.
+- **Behaviour change: a read of `%globaltimer` costs 64 ns of the simulated clock, so a busy-wait on it no longer runs out of steps** (issue #687). `%clock`,
+  `%clock64` and `%globaltimer` count one per warp instruction, so a kernel that waited two seconds on `%globaltimer` (cedana-samples' `stream_race`
+  does, to keep a stream busy) ran about two billion instructions, reached the default step budget (1,073,741,824) and stopped as a possible infinite
+  loop, after some twenty seconds of host time; on an RTX 3080 Ti it just runs 2 s. A read of the timer is slow on a card, and now charges 64 on top of the
+  instruction (once per warp read, not per lane; `%globaltimer`, `%globaltimer_lo` and SR_GLOBALTIMERLO, in the PTX and SASS engines, the SASS tier too):
+  a wait of N ns is about N / 68 passes of a four-instruction loop, so two seconds is some 125 million instructions and the wait has to last about
+  seventeen seconds to reach the budget. The 64 is a modelled latency, not a measured one. What changes for a program: `%globaltimer` values grow
+  faster, by 64 per read, and `%clock64` is unchanged in the SASS engine (in the PTX engine both read one counter, as before, so `%clock64` moves by the
+  same 64 when the timer is read). A wait on `%clock64` still costs one instruction per cycle. The step-budget error now says a long wait on a clock reaches
+  it and that `--max-steps 0` lifts it, and `docs/status.md` describes both.
 - **CI: the CUDA toolkits workflow retries its apt steps.** NVIDIA's mirror is sometimes mid-sync (`File has unexpected size ... Mirror sync in progress?`),
   which failed `build + tests, CUDA 12.4` on a pull request that changed nothing there; the install now tries each network step three times.
 - **An undefined `.extern .global` (or `.const`) in a PTX module is a zero-initialised variable, as on NVIDIA's driver** (issue #681). A module that
