@@ -7,6 +7,7 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **CI: the playground host can take burst jobs when two of its three slots are free** (`tools/burst-runners/host-burst.sh`, docs/ci.md).
 - **A SASS `RET` with a condition predicate returns only the lanes where both predicates hold** (issue #691). On sm_90 ptxas ends a `__noinline__`
   function that returns early when two cells are equal with a `RET` whose second predicate sits in the same bits as `BRA` and `EXIT` have it; the decoder
   dropped it, so lanes that were not equal returned without running the rest, and about a third of an atomic counter's increments were lost. The test
