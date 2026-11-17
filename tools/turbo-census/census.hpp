@@ -94,12 +94,49 @@ inline std::string never_group(const std::string& m) {
 // "never:<group>/<MNEMONIC>": the group says what building it would mean, the mnemonic is what the scan met first.
 inline std::string never_reason(const std::string& m) { return never_group(m) + "/" + m; }
 
+// Census only, not the runtime's rule: of the `.global` and `.const` variables a PTX text declares, whether any is named anywhere else in the text (a use). The runtime
+// refuses a module for declaring a variable at all (hostgpu::scan_ptx_for_card); the programs of the corpus declare `cuda::std::__cpo::begin` and the like (1-byte objects
+// no kernel names), so the split says how much a "refuse only a referenced variable" rule (docs/perf-design/12-host-gpu-turbo.md section 16.3 rule 2) would unlock.
+inline bool ptx_has_referenced_variable(const std::string& text) {
+  const auto ident = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$' || c == '.'; };
+  size_t line_start = 0;
+  while (line_start < text.size()) {
+    size_t eol = text.find('\n', line_start);
+    if (eol == std::string::npos) eol = text.size();
+    std::string line = text.substr(line_start, eol - line_start);
+    line_start = eol + 1;
+    size_t b = line.find_first_not_of(" \t");
+    if (b == std::string::npos) continue;
+    line = line.substr(b);
+    for (const char* q : {".visible ", ".extern ", ".weak ", ".hidden "})
+      if (line.rfind(q, 0) == 0) line = line.substr(std::strlen(q));
+    if (line.rfind(".global", 0) != 0 && line.rfind(".const", 0) != 0) continue;
+    if (line.find(".texref") != std::string::npos || line.find(".surfref") != std::string::npos || line.find(".samplerref") != std::string::npos) continue;
+    size_t end = line.find_first_of("[=;");
+    if (end == std::string::npos) end = line.size();
+    while (end > 0 && std::isspace(static_cast<unsigned char>(line[end - 1]))) --end;
+    size_t begin = end;
+    while (begin > 0 && ident(line[begin - 1])) --begin;
+    if (begin == end) continue;
+    const std::string name = line.substr(begin, end - begin);
+    size_t uses = 0;
+    for (size_t at = text.find(name); at != std::string::npos; at = text.find(name, at + name.size())) {
+      const bool left = at == 0 || !ident(text[at - 1]);
+      const bool right = at + name.size() >= text.size() || !ident(text[at + name.size()]);
+      if (left && right) ++uses;
+    }
+    if (uses > 1) return true;   // (one occurrence is the declaration itself)
+  }
+  return false;
+}
+
 // The reason group of the text a PTX scan refused with (hostgpu::scan_ptx_for_card's messages).
-inline std::string ptx_reason(const hostgpu::PtxScan& s) {
+inline std::string ptx_reason(const hostgpu::PtxScan& s, const std::string& text = {}) {
   const std::string& r = s.refuse;
   const auto has = [&](const char* t) { return r.find(t) != std::string::npos; };
   if (has("texture or surface")) return "ptx:texture-surface";
-  if (has("module variable")) return std::string("ptx:module-variable/") + (has("(.const)") ? ".const" : ".global");
+  if (has("module variable"))
+    return std::string("ptx:module-variable/") + (has("(.const)") ? ".const" : ".global") + (text.empty() ? "" : ptx_has_referenced_variable(text) ? ".referenced" : ".unreferenced");
   if (has("trap") || has("brkpt")) return "ptx:trap";
   if (has("through a pointer")) return "ptx:indirect-call";
   if (has("cluster directive")) return "ptx:cluster-directive";
@@ -221,8 +258,8 @@ inline std::vector<KernelCell> classify_module(const std::vector<CardCandidate>&
     for (KernelCell& k : out) {
       k.image = im;
       k.classes = ps.classes;
-      if (!ps.refuse.empty() && !ps.never) k.blockers.push_back(ptx_reason(ps));   // (kernel_eligible: only a refusal that is not class never is a Safety refusal ...)
-      if (ps.never) k.blockers.push_back(ptx_reason(ps));                          // ... and a Never one is the Code refusal; both keep the kernel in the simulator
+      if (!ps.refuse.empty() && !ps.never) k.blockers.push_back(ptx_reason(ps, pc.bytes));   // (kernel_eligible: only a refusal that is not class never is a Safety refusal ...)
+      if (ps.never) k.blockers.push_back(ptx_reason(ps, pc.bytes));                          // ... and a Never one is the Code refusal; both keep the kernel in the simulator
       if (const ClassMask gated = opt.sw.off | (opt.sw.atomics ? 0 : class_bit(InsnClass::AtomFloat) | class_bit(InsnClass::AtomSwap)); (ps.classes & gated) && k.blockers.empty())
         k.blockers.push_back("switch:turbo-off-or-atomics");
       k.admitted = k.blockers.empty();
@@ -247,7 +284,16 @@ inline std::vector<KernelCell> classify_module(const std::vector<CardCandidate>&
       if (simm && simm->symbol_va.count(sym.name) && simm->section_va.count(sym.section)) sections.insert(sym.section);
     }
     if (!same) {
-      if (any_variable && !simm) refuse = "module:variables-sim-runs-ptx";
+      if (any_variable && !simm) {
+        // (census only: whether any relocation of the cubin names a variable, i.e. whether the card's code can reach one; the runtime refuses on the variable alone)
+        std::set<std::string> vars;
+        for (const sass::CubinSymbol& sym : view->cubin.symbols)
+          if (!sym.function && !sym.name.empty() && sym.name[0] != '.') vars.insert(sym.name);
+        bool used = false;
+        for (const sass::CubinSection& sec : view->cubin.sections)
+          for (const sass::CubinReloc& r : sec.relocs) used = used || vars.count(r.symbol);
+        refuse = std::string("module:variables-sim-runs-ptx/") + (used ? "referenced" : "unreferenced");
+      }
       else if (simm && !variable_layout_mismatch(view->cubin, simm->cubin).empty()) refuse = "module:variable-layout";
     }
     if (refuse.empty() && !sections.empty()) {

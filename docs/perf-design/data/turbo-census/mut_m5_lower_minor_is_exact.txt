@@ -1,0 +1,19 @@
+mutation m5_lower_minor_is_exact: replace
+  const Image im = pc.arch == host_sm ? Image::Exact : Image::LowerMinor;
+with
+  const Image im = Image::Exact;
+
+[ FAIL ] census_plain_kernel_runs_where_its_image_does
+/tmp/census-src/tests/unit/test_turbo_census.cpp:124: VCHECK_EQ(std::string(census::image_name(k.image)), std::string("lower-minor")) failed
+  left:  exact
+  right: lower-minor
+[ FAIL ] census_picks_the_image_as_the_runtime_does
+/tmp/census-src/tests/unit/test_turbo_census.cpp:139: VCHECK_EQ(std::string(census::image_name(k.image)), std::string(expect)) failed
+  left:  exact
+  right: lower-minor
+[ PASS ] census_never_instructions_follow_turbo_class
+[ PASS ] census_admits_what_turbo_admits
+[ PASS ] census_ptx_follows_the_text_scan
+[ PASS ] census_retarget_forms_and_sm90a
+[ PASS ] census_cubin_module_variable_rules
+5/7 tests passed

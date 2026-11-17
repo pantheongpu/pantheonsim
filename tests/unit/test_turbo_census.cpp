@@ -203,8 +203,9 @@ VTEST(census_ptx_follows_the_text_scan) {
   const std::string head = ".visible .entry k(.param .u64 p)\n{\n";
   const Case cases[] = {
       {".visible .entry k(.param .u64 p)\n{\nret;\n}\n", ""},
-      {".global .align 4 .u32 v;\n.visible .entry k(.param .u64 p)\n{\nret;\n}\n", "ptx:module-variable/.global"},
-      {".const .align 4 .b8 c[16];\n.visible .entry k(.param .u64 p)\n{\nret;\n}\n", "ptx:module-variable/.const"},
+      {".global .align 4 .u32 v;\n.visible .entry k(.param .u64 p)\n{\nret;\n}\n", "ptx:module-variable/.global.unreferenced"},
+      {".const .align 4 .b8 c[16];\n.visible .entry k(.param .u64 p)\n{\nret;\n}\n", "ptx:module-variable/.const.unreferenced"},
+      {".global .align 4 .u32 v;\n.visible .entry k(.param .u64 p)\n{\n.reg .b64 a;\nmov.u64 a, v;\nret;\n}\n", "ptx:module-variable/.global.referenced"},
       {".visible .entry k(.param .u64 p)\n{\n.reg .f32 f<4>;\ntex.2d.v4.f32.f32 {f0,f1,f2,f3}, [t, {f0,f1}];\nret;\n}\n", "ptx:texture-surface"},
       {".visible .entry k(.param .u64 p)\n{\ntrap;\nret;\n}\n", "ptx:trap"},
       {".visible .entry k(.param .u64 p)\n{\ncp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [a], [b, {c, d}], [e];\nret;\n}\n", "ptx:tma"},
