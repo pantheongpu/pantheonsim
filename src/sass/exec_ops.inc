@@ -5712,6 +5712,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       // code address a relocation wrote (a -G build, where every function
       // has its own section and the caller passes its own address plus the
       // return point's offset).
+      ex = with_condition(ex);
       each_lane(group, [&](unsigned l) {
         if (!((ex >> l) & 1)) {
           w.pc[l] += 16;
