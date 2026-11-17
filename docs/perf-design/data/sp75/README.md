@@ -13,6 +13,7 @@ and deleted with it (as in Round sp69).
 | file | what |
 |---|---|
 | `census.py` | runs programs once per form in turbo mode with `VGPU_HOST_GPU_LOG=1` against the stand-in driver and keeps what the mode said: the summary, the `host_gpu_kept` reasons, the samples, the `host_gpu_nosample` lines; `--cut N` ends a run once N decisions are logged |
+| (`census.py --weighted`, `--report`) | Round r9, #656: per kernel the plain static count beside the loop-weighted one (a loop's body weighed by its turns where the bound is an immediate), and the launches the floor keeps whose weighted estimate would reach it; changes no decision. Result: [../sp76/census-weighted.md](../sp76/census-weighted.md) |
 | `table.py` | the tables of a census: programs whose decisions differ between two forms, samples whose copy did not answer, the small grids, wall times, reasons |
 | `census.md` | `table.py` over the census of the corpus (124 programs): `old` (commit 6cf503d3) against `new` (this round), and the follow-up of 31 programs under one build with the switch off and on |
 | `rerun.py`, `rerun.md` | wall times of the programs with a sampled launch, a changed decision or a small grid, the switch off against on, 9 runs a form interleaved (the stand-in driver: every launch simulated in both) |
