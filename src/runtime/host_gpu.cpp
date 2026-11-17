@@ -204,6 +204,14 @@ struct Runtime::Impl : CardGate {
   Costs costs = Costs::short_launches();
   SimTimeTable sim_times;
   std::map<std::string, double> card_kernel_s;
+  std::map<std::string, unsigned> slow_launches;   // per kernel: card launches in a row that did not pay off (offload_ends)
+  std::map<std::string, double> card_real_s;   // the least time of a launch after the first (card_time_to_keep)
+  double keep_card_time(const std::string& kernel, double measured_s, bool first, double sim_s) {
+    const auto it = card_real_s.find(kernel);
+    const double t = card_time_to_keep(measured_s, first, it == card_real_s.end() ? std::nullopt : std::optional<double>(it->second), sim_s, costs);
+    if (!first && costs.kernel_prior_ratio > 0) card_real_s[kernel] = t;
+    return t;
+  }
   TrafficTable traffic;
   std::set<std::string> banned;   // kernels whose offloaded launch took longer than the simulator was expected to
   std::map<const sass::Module*, CUmodule> modules;
@@ -1636,14 +1644,14 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   if (im.resident) {   // nothing comes back now: the simulator's memory is stale where the card wrote, and the gate pulls it when it is read
     const double total_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     const bool first_card_launch = im.card_kernel_s.count(fn.name) == 0;
-    if (!first_card_launch && !offload_paid_off(total_s, ref_s)) {
+    if (!first_card_launch && offload_ends(im.slow_launches[fn.name], offload_paid_off(total_s, ref_s), im.costs)) {
       im.banned.insert(fn.name);
       if (logging()) std::fprintf(stderr, "host_gpu: %s took %.3f ms on the card path against an estimate of %.3f ms in the simulator: offloading it ends\n", fn.name.c_str(), total_s * 1e3, ref_s * 1e3);
     }
     if (im.traffic.record(fn.name, push_bytes, total, total_s, ref_s, !first_card_launch) && im.banned.insert(fn.name).second && logging())
       std::fprintf(stderr, "host_gpu: %s pushed %.1f MiB of %.1f MiB live on each of its last %u launches: offloading it ends (traffic)\n", fn.name.c_str(),
                    push_bytes / 1048576.0, total / 1048576.0, kTrafficLaunches);
-    im.card_kernel_s[fn.name] = kernel_s;
+    im.card_kernel_s[fn.name] = im.keep_card_time(fn.name, kernel_s, first_card_launch, e.sim_s);
     ++im.stats.offloaded;
     im.sim_times.note_offload(fn.name);
     if (first_launch_rule && logging()) std::fprintf(stderr, "host_gpu: %s: first launch decided by the static rule (loop, %llu blocks)\n", fn.name.c_str(), static_cast<unsigned long long>(blocks));
@@ -1682,11 +1690,11 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     }
   const double total_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   // The first launch of a kernel on the card also pays the module's load: not held against the estimate.
-  if (im.card_kernel_s.count(fn.name) && !offload_paid_off(total_s, e.sim_s)) {
+  if (im.card_kernel_s.count(fn.name) && offload_ends(im.slow_launches[fn.name], offload_paid_off(total_s, e.sim_s), im.costs)) {
     im.banned.insert(fn.name);
     if (logging()) std::fprintf(stderr, "host_gpu: %s took %.3f ms on the card path against an estimate of %.3f ms in the simulator: offloading it ends\n", fn.name.c_str(), total_s * 1e3, e.sim_s * 1e3);
   }
-  im.card_kernel_s[fn.name] = kernel_s;
+  im.card_kernel_s[fn.name] = im.keep_card_time(fn.name, kernel_s, !im.card_kernel_s.count(fn.name), e.sim_s);
   ++im.stats.offloaded;
   im.sim_times.note_offload(fn.name);
   if (logging())
