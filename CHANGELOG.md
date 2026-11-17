@@ -14,6 +14,7 @@ release says what runs and what it produces, never how fast a real GPU would run
   `VGPU_TC_EXACT=0` gives the earlier results back; the `tensor_sum_published` key is no longer used by any profile. A Tesla T4 also ran `float_half_forms`:
   every line of its sm_75 build is the RTX 3060's, so the SASS executor's answer for `half_form_30` (HMUL2.F32 on sm_75) is the one that is wrong; it is still left
   out of the sm_75 SASS comparison. docs/matrix-numerics.md.
+- **OpenCL on the MI455X is documented as an upstream ROCm limit, and `amd_opencl` expects it** (issue #651). ROCm's `libamdocl64`, 7.1.0 and 7.2.4 alike, logs `Unsupported HSA device gfx1250` and drops the device although the simulator offers both agents; the other nine GPUs list both devices and pass. `amd/mi455x` is back in the test's cases and passes only when the runtime says exactly that (a missing device with any other reason still fails); if a ROCm release lists the device its checks run. The CI job unpacks ROCm 7.2.4's OpenCL runtime now (`fetch-rocm-opencl.sh DIR [VERSION]`).
 - **CI: the playground host can take burst jobs when two of its three slots are free** (`tools/burst-runners/host-burst.sh`, docs/ci.md).
 - **A SASS `RET` with a condition predicate returns only the lanes where both predicates hold** (issue #691). On sm_90 ptxas ends a `__noinline__`
   function that returns early when two cells are equal with a `RET` whose second predicate sits in the same bits as `BRA` and `EXIT` have it; the decoder
