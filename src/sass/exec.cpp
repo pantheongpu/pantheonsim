@@ -14,6 +14,7 @@ asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.popsection");
 //
 // Every instruction completes before the next: the control bits' stall counts
 // and scoreboards are timing, which VirtualGPU does not model.
+#include "vgpu/clock_model.hpp"
 #include "vgpu/exec/devrt.hpp"
 #include "vgpu/exec/host_fp.hpp"
 #include "vgpu/exec/launch_env.hpp"
@@ -129,6 +130,8 @@ struct Warp {
   std::vector<uint8_t> local;         // per-lane local memory, local_size bytes each
   uint32_t local_size = 0;
   uint64_t steps = 0;
+  // What the reads of the global timer have charged this warp on top of its instructions (vgpu/clock_model.hpp): SR_GLOBALTIMER is steps + this.
+  uint64_t timer_extra = 0;
   // Fairness: how many backward branches the running group has taken while
   // other lanes waited to run.
   uint32_t spins = 0;
@@ -208,6 +211,7 @@ struct Warp {
     budget = extra = 0;
     local.clear();
     steps = 0;
+    timer_extra = 0;
     spins = 0;
     give_way = false;
     spin_yields = 0;
@@ -233,7 +237,7 @@ struct Warp {
 };
 // Warp::reset names every member. A member added changes this size (or not, if it fits in padding, which the debug build's
 // expect_new_warp would then catch): add it to reset() and to expect_new_warp, then change the number.
-static_assert(sizeof(Warp) == 2520, "Warp has a new member: see Warp::reset");
+static_assert(sizeof(Warp) == 2528, "Warp has a new member: see Warp::reset");
 
 // A warpgroup MMA's shared-memory operands, read by the first of its four
 // warps (exec_gmma).
@@ -1290,7 +1294,8 @@ uint32_t Runner::sreg(const Block& blk, const Warp& w, unsigned idx, unsigned la
     case 0x50: case 0x51: case 0x52: case 0x53: case 0x01: {
       // The clocks: a count of instructions this warp has run, which is the
       // only honest clock a functional simulator has.
-      const uint64_t t = w.steps;
+      // (The global timer, 0x52 and 0x53, is the same count plus what its reads have been charged.)
+      const uint64_t t = (idx == 0x52 || idx == 0x53) ? w.steps + w.timer_extra : w.steps;
       return (idx == 0x51 || idx == 0x53) ? static_cast<uint32_t>(t >> 32) : static_cast<uint32_t>(t);
     }
     case 0x32: return static_cast<uint32_t>(smemsz_);                   // SR_SMEMSZ
@@ -1475,7 +1480,7 @@ static void expect_new_warp(const Warp& w) {
             w.ws_held == f.ws_held && same(w.wait_kind, f.wait_kind) && same(w.wait_arg, f.wait_arg) && same(w.b, f.b) &&
             w.mactive_force == f.mactive_force && same(w.bssy_stamp, f.bssy_stamp) && w.gmma_issued == f.gmma_issued &&
             w.code_hint == f.code_hint && w.budget == f.budget && w.extra == f.extra && w.local.empty() && w.steps == f.steps &&
-            w.spins == f.spins && w.give_way == f.give_way && w.spin_yields == f.spin_yields && w.forced == f.forced &&
+            w.timer_extra == f.timer_extra && w.spins == f.spins && w.give_way == f.give_way && w.spin_yields == f.spin_yields && w.forced == f.forced &&
             w.ur_saved.empty() && w.idle_yields == f.idle_yields &&
             w.yield_pc == f.yield_pc && w.slice == f.slice && w.b2r == f.b2r && w.b2r_pred == f.b2r_pred && w.yield == f.yield &&
             w.store_gate == f.store_gate && w.cga_arrived == f.cga_arrived && same(w.rare(), f.rare()) && !w.rare_dirty;
@@ -2402,7 +2407,7 @@ bool Runner::step_warp(Block& blk, Warp& w) {
     }
     if (++w.steps > max_steps_)
       throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(max_steps_) +
-                                    " instructions (an infinite loop?)");
+                                    " instructions (an infinite loop?" + kSassStepBudgetHint + ")");
     if (n < 256 && pc + 16 < end && ins->straight) {
       execute(blk, w, *ins, group, /*advance=*/false);
       pc += 16;
