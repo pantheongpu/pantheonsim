@@ -90,6 +90,29 @@ inline int pick_card_image(const std::vector<CardCandidate>& c, int host_sm) {
   return best;
 }
 
+// Retargeting (turbo fit, docs/perf-design/12-host-gpu-turbo.md section 15): a module that holds PTX only for `.target sm_90` (a build with -arch=sm_90, or compute_90 alone) runs on
+// an sm_80, sm_86 or sm_87 card when its `.target` line is rewritten to the card's and the driver compiles it, provided it uses no form that architecture lacks (scan_ptx_for_card
+// with retarget). Measured with ptxas 13.0: 125 of 130 PTX files of the corpus assemble for sm_86 after the rewrite alone. The `.version` is never lowered.
+inline bool retarget_host(int host_sm) { return host_sm == 80 || host_sm == 86 || host_sm == 87; }
+inline int pick_retarget_image(const std::vector<CardCandidate>& c, int host_sm) {
+  if (!retarget_host(host_sm)) return -1;
+  for (size_t i = 0; i < c.size(); ++i)
+    if (c[i].kind == CardCandidate::Ptx && c[i].arch == 90 && c[i].suffix == 0) return static_cast<int>(i);
+  return -1;
+}
+// The text with its `.target sm_90` line rewritten to `sm_<host_sm>` (empty when it has none: not plain sm_90 PTX).
+inline std::string retarget_ptx_text(const std::string& text, int host_sm) {
+  for (size_t at = text.find(".target"); at != std::string::npos; at = text.find(".target", at + 7)) {
+    const size_t eol = text.find('\n', at);
+    const size_t sm = text.find("sm_90", at);
+    if (sm == std::string::npos || (eol != std::string::npos && sm > eol)) continue;
+    const size_t after = sm + 5;
+    if (after < text.size() && (std::isalnum(static_cast<unsigned char>(text[after])) || text[after] == '_')) return {};   // sm_90a, sm_90f, sm_900: not plain sm_90
+    return text.substr(0, sm) + "sm_" + std::to_string(host_sm) + text.substr(after);
+  }
+  return {};
+}
+
 // What a module holds, for the reason a module no image of which runs on the card stays in the simulator: "SASS sm_75, sm_90, PTX sm_90".
 inline std::string describe_candidates(const std::vector<CardCandidate>& c) {
   std::string sass, ptx;
@@ -115,7 +138,7 @@ struct PtxScan {
   bool printf = false;     // it calls vprintf (admitted in turbo mode unless switched off)
   ClassMask classes = 0;   // the classes of its instructions (vgpu/host_gpu.hpp InsnClass bits), so that the turbo switches (TURBO_OFF, ATOMICS) apply to PTX as to SASS
 };
-inline PtxScan scan_ptx_for_card(const std::string& text, bool printf_off) {
+inline PtxScan scan_ptx_for_card(const std::string& text, bool printf_off, bool retarget = false) {
   PtxScan out;
   const auto refuse = [&](std::string why, bool never) {
     if (out.refuse.empty()) {
@@ -197,6 +220,8 @@ inline PtxScan scan_ptx_for_card(const std::string& text, bool printf_off) {
     if (i < w.size() && w[i][0] == '@') ++i;               // a guard
     if (i >= w.size()) continue;
     const std::string op = w[i];
+    if (retarget && op[0] == '.' && (op == ".reqnctapercluster" || op == ".maxclusterrank" || op == ".explicitcluster"))
+      refuse("the PTX has the cluster directive " + op + ", which the card's architecture lacks", true);
     if (op[0] == '.') {   // a directive: a declaration of something the card's own module would keep a second copy of
       size_t k = i;
       while (k < w.size() && (w[k] == ".visible" || w[k] == ".extern" || w[k] == ".weak" || w[k] == ".common" || w[k] == ".hidden")) ++k;
@@ -228,6 +253,21 @@ inline PtxScan scan_ptx_for_card(const std::string& text, bool printf_off) {
           base == "getctarank" || op.rfind("barrier.cluster", 0) == 0 || op.rfind("st.async", 0) == 0 || op.rfind("red.async", 0) == 0 || has(".cluster") || st.find("%cluster") != std::string::npos ||
           st.find("%is_explicit_cluster") != std::string::npos)
         refuse("the PTX uses an sm_90 or later form (" + op + ") that turbo does not send to the card", true);
+    }
+    if (retarget) {   // PTX for sm_90 compiled for an older card: each form ptxas rejects there (micro-tests of docs/perf-design/12-host-gpu-turbo.md section 15: "requires .target sm_90 or higher")
+      const auto has = [&](const char* part) { return op.find(part) != std::string::npos; };
+      const char* why = nullptr;
+      if (op.rfind("mbarrier.try_wait", 0) == 0) why = "mbarrier.try_wait";
+      else if (has("expect_tx") || has("complete_tx")) why = "mbarrier expect_tx/complete_tx";
+      else if (op.rfind("mbarrier.arrive", 0) == 0 && w.size() - i - 1 >= 3) why = "mbarrier.arrive with a count";
+      else if ((base == "atom" || base == "red") && (has(".v2") || has(".v4") || has(".v8") || has(".b128"))) why = "a vector or 128-bit atomic";
+      else if (op.rfind("fence.proxy.async", 0) == 0) why = "fence.proxy.async";
+      else if (st.find("%aggr_smem_size") != std::string::npos) why = "%aggr_smem_size";
+      else if ((base == "max" || base == "min") && has(".relu")) why = "min/max with .relu";
+      else if ((base == "add" || base == "sub" || base == "min" || base == "max") && (has(".s16x2") || has(".u16x2"))) why = "packed 16-bit integer arithmetic";
+      else if (base == "cvt" && (has(".e4m3") || has(".e5m2") || has(".e2m1") || has(".ue8m0"))) why = "an fp8/fp4 convert";
+      else if (base == "mma" && (has(".e4m3") || has(".e5m2"))) why = "an fp8 mma";
+      if (why) refuse(std::string("the PTX uses ") + why + ", which the card's architecture lacks", true);
     }
     if (base == "tex" || base == "tld4" || base == "txq" || base == "suld" || base == "sust" || base == "sured" || base == "suq") refuse("the PTX has a texture or surface instruction (" + base + ")", true);
     else if (base == "trap" || base == "brkpt") refuse("the PTX has " + base + ", which ends the card's context", true);

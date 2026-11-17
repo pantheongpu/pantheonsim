@@ -126,6 +126,7 @@ if [[ "$cc" == 86 ]]; then
   "$nvcc_bin" "${nvf[@]}" -arch=sm_90 "$fitsrc" -o "$work/fit90" || { echo "FAIL: host_gpu_fit.cu does not compile for sm_90"; exit 1; }
   "$nvcc_bin" "${nvf[@]}" -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 "$root/nvidia/tests/e2e/host_gpu_vars.cu" -o "$work/vars80" || { echo "FAIL: host_gpu_vars.cu does not compile for sm_80 and sm_86"; exit 1; }
   "$nvcc_bin" "${nvf[@]}" -arch=sm_89 "$fitsrc" -o "$work/fit89" || { echo "FAIL: host_gpu_fit.cu does not compile for sm_89"; exit 1; }
+  "$nvcc_bin" "${nvf[@]}" -DFIT_NO_ELECT -gencode arch=compute_90,code=compute_90 "$fitsrc" -o "$work/fit90p" || { echo "FAIL: host_gpu_fit.cu does not compile as PTX for compute_90"; exit 1; }
   "$nvcc_bin" "${nvf[@]}" -arch=sm_80 "$fitsrc" -o "$work/fit80" || { echo "FAIL: host_gpu_fit.cu does not compile for sm_80"; exit 1; }
   "$nvcc_bin" "${nvf[@]}" -gencode arch=compute_75,code=compute_75 "$fitsrc" -o "$work/fit75p" || { echo "FAIL: host_gpu_fit.cu does not compile as PTX for compute_75"; exit 1; }
   "$nvcc_bin" "${nvf[@]}" -gencode arch=compute_86,code=compute_86 "$root/nvidia/tests/e2e/host_gpu_vars.cu" -o "$work/varsp" || { echo "FAIL: host_gpu_vars.cu does not compile as PTX"; exit 1; }
@@ -740,9 +741,30 @@ if [[ "$cc" == 86 ]]; then
   fitoff tiny nvidia/h100
   PROG=fit90 fitoff tiny nvidia/h100
   img_h() { PROG=fit90 run "$1" tiny VGPU_GPU=nvidia/h100 STUB_SM="$2" STUB_MP=28 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the $1 run failed"; fails=1; }; }
+  # (the sm_90 build holds an ELECT kernel, so its PTX is refused for the card; the reason is the form, not a missing image)
   img_h im_90_on_86 86
-  ! grep -q '^cuModuleLoadData$' "$work/im_90_on_86.log" && grep -q 'no image of the module runs on the card (sm_86): it holds SASS sm_90, PTX sm_90' "$work/im_90_on_86.err" || { echo "FAIL: an sm_90-only build reached an sm_86 card: $(calls im_90_on_86); $(grep -m2 host_gpu "$work/im_90_on_86.err")"; fails=1; }
+  ! grep -q '^cuModuleLoadData$' "$work/im_90_on_86.log" && grep -q 'compute_90 PTX could be retargeted to sm_86 but the PTX uses an sm_90 or later form (elect' "$work/im_90_on_86.err" || { echo "FAIL: an sm_90 build with an ELECT kernel reached an sm_86 card: $(calls im_90_on_86); $(grep -m2 host_gpu "$work/im_90_on_86.err")"; fails=1; }
   diff -q "$work/off_f_tiny.out" "$work/im_90_on_86.out" > /dev/null || { echo "FAIL: the sm_90 build under an H100 profile changes its output on an sm_86 card"; fails=1; }
+  # ... and the one without it (PTX for compute_90 only) is retargeted: the driver is given `.target sm_86`, and the card path is reached; not on an sm_90 card (the PTX is its own),
+  # not on sm_75 or sm_89 (the rule is for sm_80, 86 and 87), and VGPU_HOST_GPU_FIT=0 does the same (the rule is the image's, not the size rule's)
+  PROG=fit90p fitoff tiny nvidia/h100
+  rt90() { PROG=fit90p run "$1" tiny VGPU_GPU=nvidia/h100 STUB_SM="$2" STUB_MP=28 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 STUB_CARD_OK=1 VGPU_HOST_GPU_VERIFY=1 "${@:3}" || { echo "FAIL: the $1 run failed"; fails=1; }; }
+  rt90 rt_86 86
+  grep -q '^image ptx$' "$work/rt_86.log" && grep -q '^ptx_target sm_86$' "$work/rt_86.log" || { echo "FAIL: plain sm_90 PTX was not given to an sm_86 card with its target rewritten: $(grep -E '^image|^ptx_target' "$work/rt_86.log" | tr '\n' ' ')"; fails=1; }
+  [[ "$(fitline rt_86 retargeted)" == 1 ]] || { echo "FAIL: no retargeted module counted: $(grep '^host_gpu_fit' "$work/rt_86.err")"; fails=1; }
+  diff -q "$work/off_f_tiny.out" "$work/rt_86.out" > /dev/null || { echo "FAIL: a retargeted module changes the output"; fails=1; }
+  rt90 rt_80 80
+  grep -q '^ptx_target sm_80$' "$work/rt_80.log" || { echo "FAIL: not retargeted to an sm_80 card: $(grep -E '^image|^ptx_target' "$work/rt_80.log" | tr '\n' ' ')"; fails=1; }
+  rt90 rt_90 90 STUB_MP=132
+  grep -q '^ptx_target sm_90$' "$work/rt_90.log" && [[ "$(fitline rt_90 retargeted)" == 0 ]] || { echo "FAIL: an sm_90 card was given a retargeted module: $(grep -E '^image|^ptx_target' "$work/rt_90.log" | tr '\n' ' ')"; fails=1; }
+  for sm in 75 89; do
+    rt90 rt_$sm $sm
+    ! grep -q '^cuModuleLoadData$' "$work/rt_$sm.log" || { echo "FAIL: plain sm_90 PTX was retargeted for an sm_$sm card"; fails=1; }
+  done
+  # a card that refuses the compiled module (the driver's JIT fails): the module stays in the simulator, the mode goes on, the output is the mode-off output
+  rt90 rt_jit 86 STUB_CARD_OK=0
+  [[ "$(grep -c '^cuModuleLoadData$' "$work/rt_jit.log")" == 1 ]] && grep -q 'cuModuleLoadData failed (1) for the card.s compute_90 PTX retargeted to sm_86' "$work/rt_jit.err" || { echo "FAIL: a failed JIT of a retargeted module was not said once or was retried: $(calls rt_jit); $(grep -m3 host_gpu "$work/rt_jit.err")"; fails=1; }
+  ! grep -q 'mode off' "$work/rt_jit.err" || { echo "FAIL: a failed JIT ended turbo mode: $(grep -m1 'mode off' "$work/rt_jit.err")"; fails=1; }
   # 50. PTX with module variables is not given to the card.
   env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/varsp" vars > "$work/off_varsp.out" 2> "$work/off_varsp.err" || { echo "FAIL: the PTX build of host_gpu_vars with the mode off failed"; tail -5 "$work/off_varsp.err"; exit 1; }
   PROG=varsp run vp_ptx vars STUB_SM=90 STUB_MP=132 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the PTX-only vars run failed"; tail -5 "$work/vp_ptx.err"; fails=1; }

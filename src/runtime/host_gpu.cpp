@@ -706,6 +706,8 @@ struct Runtime::Impl : CardGate {
     std::string what;                       // "sm_86 cubin", "compute_75 PTX": for the log
     PtxScan ptx;                            // is_ptx: what the text scan found
     bool same_as_sim = true;
+    bool retargeted = false;                // turbo: plain sm_90 PTX given to an older card with its target line rewritten (pick_retarget_image)
+    bool counted_retarget = false;
     bool load_failed = false;               // the driver did not load the image (said once; its kernels stay in the simulator)
   };
   std::map<const void*, ModuleCard> module_cards;
@@ -791,14 +793,26 @@ struct Runtime::Impl : CardGate {
     };
     if (!cands) return refuse_image("the module has no image the card can load");
     const int sm = image_sm();
-    const int pick = pick_card_image(*cands, sm);
+    int pick = pick_card_image(*cands, sm);
+    bool retarget = false;
+    if (pick < 0 && (pick = pick_retarget_image(*cands, sm)) >= 0) retarget = true;   // (plain sm_90 PTX for an sm_80/86/87 card: the target line is rewritten, below)
     if (pick < 0) return refuse_image("no image of the module runs on the card (sm_" + std::to_string(sm) + "): it holds " + describe_candidates(*cands));
     const CardCandidate& c = (*cands)[static_cast<size_t>(pick)];
     if (c.kind == CardCandidate::Ptx) {
       mc.is_ptx = true;
       mc.what = "compute_" + std::to_string(c.arch) + (c.suffix ? std::string(1, c.suffix) : std::string()) + " PTX";
-      mc.ptx = scan_ptx_for_card(c.bytes, sw.printf_off);
+      mc.ptx = scan_ptx_for_card(c.bytes, sw.printf_off, retarget);
       mc.own = c.bytes;
+      if (retarget) {
+        mc.retargeted = true;
+        mc.what += " retargeted to sm_" + std::to_string(sm);
+        mc.own = retarget_ptx_text(c.bytes, sm);
+        if (mc.own.empty()) return refuse_image("the PTX has no plain `.target sm_90` line to retarget");
+        if (!mc.ptx.refuse.empty()) {
+          ++stats.retarget_refused;
+          return refuse_image(std::string("compute_90 PTX could be retargeted to sm_") + std::to_string(sm) + " but " + mc.ptx.refuse);
+        }
+      }
       mc.use_own = true;
       mc.same_as_sim = false;
       return mc;
@@ -1306,6 +1320,11 @@ struct Runtime::Impl : CardGate {
         }
         mc.copies.push_back({va, cs->size, base});
       }
+      if (mc.retargeted && !mc.counted_retarget) {
+        mc.counted_retarget = true;
+        ++stats.retargeted;
+        if (logging()) std::fprintf(stderr, "host_gpu: the driver compiled the card's %s\n", mc.what.c_str());
+      }
       modules[key] = mod;
     }
     CUfunction f = nullptr;
@@ -1350,8 +1369,8 @@ void print_summary(Runtime::Impl* im) {
                  turbo ? "turbo" : "exact", ull(s.card_runs), ull(s.simulated), s.card_seconds, s.sim_seconds, ull(s.tol.words), ull(s.tol.different), ull(s.tol.outside),
                  ull(s.tol.subnormal), ull(kernels_outside), s.tol.max_abs, s.tol.max_rel, ull(s.tol.bits));
     if (turbo)   // (a line of its own: the two above keep their fields for the scripts that read them)
-      std::fprintf(stderr, "host_gpu_fit: policy=%s card_sm=%d card_sms=%u refused_image=%llu refused_fit=%llu\n", im->fit ? "fit" : "rules", im->host_known ? im->host_sm : 0,
-                   im->host_known ? im->host_mp : 0u, ull(s.refused_image), ull(s.refused_fit));
+      std::fprintf(stderr, "host_gpu_fit: policy=%s card_sm=%d card_sms=%u refused_image=%llu refused_fit=%llu retargeted=%llu retarget_refused=%llu\n", im->fit ? "fit" : "rules", im->host_known ? im->host_sm : 0,
+                   im->host_known ? im->host_mp : 0u, ull(s.refused_image), ull(s.refused_fit), ull(s.retargeted), ull(s.retarget_refused));
     std::fprintf(stderr, "host_gpu_refusals: refused_never=%llu refused_atomics=%llu refused_off=%llu refused_exact=%llu refused_safety=%llu too_small=%llu failed=%llu\n",
                  ull(s.refused_never), ull(s.refused_atomics), ull(s.refused_off), ull(s.refused_exact), ull(s.refused_launch), ull(s.refused_size), ull(s.failed));
     std::fprintf(stderr, "host_gpu_sampled: sampled=%llu sent=%llu timeouts=%llu cost_s=%.6f after_driver=%llu copies_running_at_exit=%zu copies_left=%zu\n", ull(s.sampled),

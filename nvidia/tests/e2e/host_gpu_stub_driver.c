@@ -142,6 +142,12 @@ int cuModuleLoadData(void** m, const void* image) {
   g_img = (const unsigned char*)image;
   if (memcmp(g_img, "\x7f" "ELF", 4) != 0) {   /* PTX text: the driver compiles it (turbo mode gives the card PTX when no cubin of its own runs) */
     note("image ptx");
+    {   /* the target line the driver is given: a retargeted module says sm_86 on an sm_86 card */
+      const char* t = strstr((const char*)image, ".target");
+      char line[48] = "ptx_target ?";
+      if (t) { int i = 0; const char* e = t + 7; while (*e == ' ') ++e; while (e[i] && e[i] != '\n' && e[i] != ',' && i < 20) ++i; snprintf(line, sizeof line, "ptx_target %.*s", i, e); }
+      note(line);
+    }
     g_img = 0;
     if (env_int("STUB_CARD_OK", 0)) { *m = (void*)0x2000; return 0; }
     return 1;

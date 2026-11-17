@@ -26,6 +26,7 @@ __global__ void shared_user(int* p) {
 }
 
 // One instruction nothing in include/vgpu/host_gpu.hpp names: elect.sync is ELECT on sm_90 (the stand-in is told its card is an sm_90 one).
+#ifndef FIT_NO_ELECT
 __global__ void elect(int* p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   unsigned is = 0;
@@ -35,6 +36,8 @@ __global__ void elect(int* p) {
   p[threadIdx.x] = 1;
 #endif
 }
+
+#endif
 
 // An FP8 tensor-core multiply (QMMA on sm_89): an instruction no turbo class names, which runs on an sm_89 card.
 __global__ void qmma(int* p) {
@@ -78,7 +81,9 @@ int main(int argc, char** argv) {
   } else if (!std::strcmp(mode, "qmma")) {
     qmma<<<1, 32>>>(d);
   } else if (!std::strcmp(mode, "elect")) {
+#ifndef FIT_NO_ELECT
     elect<<<1, 32>>>(d);
+#endif
   }
   if (cudaDeviceSynchronize() != cudaSuccess) {
     std::fprintf(stderr, "launch failed: %s\n", cudaGetErrorString(cudaGetLastError()));

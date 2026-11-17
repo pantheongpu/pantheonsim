@@ -3209,4 +3209,54 @@ VTEST(the_card_image_must_take_the_simulator_s_arguments) {
   VCHECK(parameter_sizes_agree(vgpu::sass::CubinKernel{}, {}));
 }
 
+VTEST(plain_sm_90_ptx_is_retargeted_for_an_older_card) {
+  const auto ptx = [](int arch, char suffix) {
+    CardCandidate c;
+    c.kind = CardCandidate::Ptx;
+    c.arch = arch;
+    c.suffix = suffix;
+    c.bytes = ".version 9.0\n.target sm_" + std::to_string(arch) + (suffix ? std::string(1, suffix) : std::string()) + "\n.address_size 64\n";
+    return c;
+  };
+  for (int host : {80, 86, 87}) VCHECK_EQ(pick_retarget_image({ptx(90, 0)}, host), 0);
+  for (int host : {70, 75, 89, 90, 100, 120}) VCHECK_EQ(pick_retarget_image({ptx(90, 0)}, host), -1);   // only the sm_80 family has been measured
+  VCHECK_EQ(pick_retarget_image({ptx(90, 'a')}, 86), -1);       // sm_90a PTX has wgmma and setmaxnreg: no plain sibling, no retarget
+  VCHECK_EQ(pick_retarget_image({ptx(100, 0)}, 86), -1);        // another architecture's PTX
+  VCHECK_EQ(pick_retarget_image({ptx(90, 'a'), ptx(90, 0)}, 86), 1);   // the plain sm_90 PTX of an sm_90a build
+  VCHECK_EQ(pick_retarget_image({}, 86), -1);
+  VCHECK(pick_card_image({ptx(90, 0)}, 86) < 0);   // (it is the fallback: the ordinary choice finds nothing)
+  // the rewrite: the target line only, the version untouched
+  VCHECK(retarget_ptx_text(".version 9.0\n.target sm_90\n.address_size 64\n", 86) == ".version 9.0\n.target sm_86\n.address_size 64\n");
+  VCHECK(retarget_ptx_text(".version 9.0\n.target sm_90, debug\n", 80) == ".version 9.0\n.target sm_80, debug\n");
+  VCHECK(retarget_ptx_text(".target sm_90\n.visible .entry k(){ // sm_90 here\n}", 87) == ".target sm_87\n.visible .entry k(){ // sm_90 here\n}");
+  VCHECK(retarget_ptx_text(".target sm_90a\n", 86).empty() && retarget_ptx_text(".target sm_900\n", 86).empty() && retarget_ptx_text(".target sm_86\n", 80).empty() && retarget_ptx_text("", 86).empty());
+}
+
+// The forms ptxas 13.0 rejects for sm_86 in a module retargeted from sm_90 ("requires .target sm_90 or higher", micro-tests of the experiment), and the ones it takes.
+VTEST(retargeted_ptx_is_refused_for_the_forms_the_older_card_lacks) {
+  const std::string head = ".version 9.0\n.target sm_90\n.address_size 64\n";
+  const auto scan = [&](const char* body, bool retarget = true) { return scan_ptx_for_card(head + ".visible .entry k()\n{\n" + body + "\nret;\n}\n", false, retarget); };
+  for (const char* ins : {"mbarrier.try_wait.shared::cta.b64 %p1, [%rd1], %rd2;", "mbarrier.try_wait.parity.shared::cta.b64 %p1, [%rd1], %r2;", "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%rd1], %r2;",
+                          "mbarrier.arrive.shared::cta.b64 %rd2, [%rd1], %r3;", "atom.global.v2.f32.add {%f1, %f2}, [%rd1], {%f3, %f4};", "red.global.add.noftz.v4.f16x2 [%rd1], {%r1, %r2, %r3, %r4};",
+                          "atom.global.exch.b128 %rq1, [%rd1], %rq2;", "fence.proxy.async.shared::cta;", "mov.u32 %r1, %aggr_smem_size;", "max.s32.relu %r1, %r2, %r3;",
+                          "add.s16x2 %r1, %r2, %r3;", "min.u16x2 %r1, %r2, %r3;", "cvt.rn.satfinite.e4m3x2.f32 %rs1, %f1, %f2;", "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%f1,%f2,%f3,%f4}, {%r1,%r2,%r3,%r4}, {%r5,%r6}, {%f1,%f2,%f3,%f4};"}) {
+    const PtxScan r = scan(ins);
+    VCHECK(!r.refuse.empty() && r.never);
+  }
+  for (const char* d : {".reqnctapercluster 2, 1, 1;", ".maxclusterrank 4;", ".explicitcluster;"}) {
+    const PtxScan r = scan_ptx_for_card(head + ".visible .entry k()\n" + d + "\n{\nret;\n}\n", false, true);
+    VCHECK(!r.refuse.empty() && r.never);
+  }
+  // what assembles for sm_86 in the experiment (ptxas 13.0): basic mbarrier, ldmatrix, fences, mma.sync, bf16 and cp.async
+  for (const char* ins : {"mbarrier.init.shared::cta.b64 [%rd1], 1;", "mbarrier.arrive.shared::cta.b64 %rd2, [%rd1];", "mbarrier.test_wait.shared::cta.b64 %p1, [%rd1], %rd2;", "ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%r1}, [%r2];",
+                          "fence.sc.gpu;", "fence.acq_rel.gpu;", "membar.gl;", "cp.async.ca.shared.global [%r1], [%rd1], 16;", "cp.async.commit_group;", "cvt.rn.bf16x2.f32 %r1, %f1, %f2;",
+                          "redux.sync.add.s32 %r1, %r2, 0xffffffff;", "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%f1,%f2,%f3,%f4}, {%r1,%r2,%r3,%r4}, {%r5,%r6}, {%f1,%f2,%f3,%f4};",
+                          "shfl.sync.bfly.b32 %r1, %r2, 1, 31, 0xffffffff;", "nanosleep.u32 100;", "add.f16x2 %r1, %r2, %r3;"})
+    VCHECK(scan(ins).refuse.empty());
+  VCHECK(scan("mbarrier.try_wait.shared::cta.b64 %p1, [%rd1], %rd2;", false).refuse.empty());   // (without the flag only the ordinary rules apply)
+  // a variable still keeps a retargeted module out (rule 1: the card's JIT module has its own copy)
+  const PtxScan v = scan_ptx_for_card(head + ".global .align 4 .u32 g;\n", false, true);
+  VCHECK(!v.refuse.empty() && !v.never);
+}
+
 VTEST_MAIN

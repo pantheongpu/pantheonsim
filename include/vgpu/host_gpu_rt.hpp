@@ -30,6 +30,7 @@ struct Stats {
   // Turbo mode (docs/perf-design/12-host-gpu-turbo.md "Turbo fit"): launches kept in the simulator because no image of their module runs on the card
   // (or the card's image cannot be given the simulator's variables), and because the launch does not fit the card.
   uint64_t refused_image = 0, refused_fit = 0;
+  uint64_t retargeted = 0, retarget_refused = 0;   // modules of plain sm_90 PTX the driver compiled for an older card (loaded), and ones the scan refused for a form that card lacks
   TolReport tol;   // turbo mode's verify: every compared launch
   // Sampled launches (vgpu/host_gpu.hpp "The first blocks of a launch, timed"): how many, how many of them the card then ran (`sample_sent`, also
   // in `offloaded`), how many copies did not answer in time, and what the samples cost the process in wall seconds (the fork and the wait).
