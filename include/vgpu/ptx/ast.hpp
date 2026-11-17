@@ -1622,6 +1622,10 @@ struct GlobalVar {
   // A .const variable (__constant__): module constant memory, which cudaFuncGetAttributes counts as
   // constSizeBytes. Everything else is a .global.
   bool is_const = false;
+  // Declared ".extern" and defined nowhere in the module. A whole-program JIT (cuModuleLoadData) ignores the qualifier and gives
+  // the variable zeroed storage of the declared size, which cuModuleGetGlobal returns and the host can write; the parser does the
+  // same. An .extern declaration whose name the module defines is dropped, so only the definition is left.
+  bool is_extern = false;
   // A pointer-valued global can be initialised with another symbol's address
   // ("= my_array;"), and an array of them with a list ("= {f, g, h};") -- a
   // table of function pointers is exactly that. Addresses are not known until
