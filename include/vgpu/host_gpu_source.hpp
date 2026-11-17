@@ -113,6 +113,7 @@ struct PtxScan {
   std::string refuse;      // why the card cannot be given this PTX for the simulator; empty: it can
   bool never = false;      // ... and the reason is class Never (an instruction that needs the simulator's tables, a trap, an indirect call)
   bool printf = false;     // it calls vprintf (admitted in turbo mode unless switched off)
+  ClassMask classes = 0;   // the classes of its instructions (vgpu/host_gpu.hpp InsnClass bits), so that the turbo switches (TURBO_OFF, ATOMICS) apply to PTX as to SASS
 };
 inline PtxScan scan_ptx_for_card(const std::string& text, bool printf_off) {
   PtxScan out;
@@ -206,6 +207,28 @@ inline PtxScan scan_ptx_for_card(const std::string& text, bool printf_off) {
       continue;
     }
     const std::string base = op.substr(0, op.find('.'));
+    {   // the classes (the PTX spelling of vgpu/host_gpu.hpp turbo_class)
+      const auto has = [&](const char* part) { return op.find(part) != std::string::npos; };
+      const bool is_float = has(".f16") || has(".f32") || has(".f64") || has(".bf16");
+      if (base == "atom" || base == "red") {
+        if (has(".cas") || has(".exch")) out.classes |= class_bit(InsnClass::AtomSwap);
+        else if (is_float) out.classes |= class_bit(base == "red" ? InsnClass::FloatRed : InsnClass::AtomFloat);
+        else if (base == "atom") out.classes |= class_bit(InsnClass::AtomInt);
+      } else if (base == "mma" || base == "wmma") {
+        out.classes |= class_bit(InsnClass::Tensor);
+      } else if (has(".approx") && (base == "sin" || base == "cos" || base == "ex2" || base == "lg2" || base == "rcp" || base == "rsqrt" || base == "sqrt" || base == "tanh" || base == "div")) {
+        out.classes |= class_bit(InsnClass::Mufu);
+      } else if ((has(".f16x2") || has(".bf16x2")) && (base == "add" || base == "sub" || base == "mul" || base == "fma" || base == "min" || base == "max" || base == "set" || base == "setp")) {
+        out.classes |= class_bit(InsnClass::Half);
+      }
+      if (base == "call") out.classes |= class_bit(InsnClass::Call);
+      // sm_90 and later forms (vgpu/host_gpu.hpp unmeasured_private_mnemonic): the tensor-map descriptor is the simulator's own, the rest has no card evidence
+      if (op.rfind("cp.async.bulk", 0) == 0 || op.rfind("cp.reduce.async.bulk", 0) == 0 || op.rfind("prefetch.tensormap", 0) == 0 || op.rfind("tensormap.", 0) == 0 ||
+          op.rfind("wgmma", 0) == 0 || base == "setmaxnreg" || base == "elect" || base == "stmatrix" || base == "griddepcontrol" || base == "multimem" || base == "mapa" ||
+          base == "getctarank" || op.rfind("barrier.cluster", 0) == 0 || op.rfind("st.async", 0) == 0 || op.rfind("red.async", 0) == 0 || has(".cluster") || st.find("%cluster") != std::string::npos ||
+          st.find("%is_explicit_cluster") != std::string::npos)
+        refuse("the PTX uses an sm_90 or later form (" + op + ") that turbo does not send to the card", true);
+    }
     if (base == "tex" || base == "tld4" || base == "txq" || base == "suld" || base == "sust" || base == "sured" || base == "suq") refuse("the PTX has a texture or surface instruction (" + base + ")", true);
     else if (base == "trap" || base == "brkpt") refuse("the PTX has " + base + ", which ends the card's context", true);
     else if (base == "call") {

@@ -234,8 +234,9 @@ enum class InsnClass : uint8_t {
   AtomInt,     // integer atomics that return the old value (ADD, MIN, MAX, AND, OR, XOR, INC, DEC): memory ends the same, the returned values depend on the order
   AtomFloat,   // float atomics that return a value: admitted unless VGPU_HOST_GPU_ATOMICS=0 (an opt-in until Round sp66)
   AtomSwap,    // CAS, CAST.SPIN, EXCH: as AtomFloat; the card does not agree with itself from run to run on programs built on these (09 doc, M2)
-  Never,       // textures and surfaces (handles are indices into the simulator's tables), BPT (a trap ends the card's context), a call the scan cannot follow
-  Unlisted,    // an instruction no class names (an unnamed mnemonic, a field the decoder could not name, JMP, ATOMS.ARRIVE, the sm_90 and later tensor and
+  Never,       // textures and surfaces (handles are indices into the simulator's tables), BPT (a trap ends the card's context), the sm_90+ forms of
+               // unmeasured_private_mnemonic (TMA, warpgroup, cluster, ...), a call the scan cannot follow
+  Unlisted,    // an instruction no class names (an unnamed mnemonic, a field the decoder could not name, ATOMS.ARRIVE, QMMA, the
                // tensor-memory forms ...): admitted by turbo, never by exact
 };
 inline constexpr unsigned kInsnClasses = 12;
@@ -277,6 +278,23 @@ inline bool texture_mnemonic(const std::string& m) {
   return false;
 }
 
+// sm_90 and later instructions turbo does not admit as `unlisted`: they touch state the simulator keeps in its own format or has no card evidence for.
+// The tensor-memory-access forms read a 128-byte tensor map, and the shim's CUtensorMap is the simulator's own layout ("GPUTMAP1", vgpu/exec/tensormap.hpp),
+// not the hardware descriptor; the warpgroup, cluster, distributed-shared-memory, register-reconfiguration, tensor-memory and work-stealing forms (and JMP, which
+// can leave the section the scan read) have not been run on a card by this mode. They are class Never until a card run shows one safe.
+inline bool unmeasured_private_mnemonic(const std::string& m) {
+  static const char* const k[] = {"UTMALDG", "UTMASTG", "UTMAREDG", "UTMAPF", "UTMACMDFLUSH", "UBLKRED", "UBLKCP", "UCGABAR", "HGMMA", "IGMMA", "BGMMA", "QGMMA", "WARPGROUP",
+                                  "SYNCS", "ELECT", "USETMAXREG", "LDGMC", "ENDCOLLECTIVE", "STSM", "STAS", "REDAS", "ARRIVES", "UGETNEXTWORKID", "RPCMOV", "LDTM", "STTM",
+                                  "UTCSHIFT", "UTCMMA", "UTCBAR", "UTCCP", "UTCATOMSWS", "JMP"};
+  for (const char* t : k)
+    if (m == t) return true;
+  return false;
+}
+
+// Whether the scan must follow a CALL instruction's target: whatever class its mnemonic and modifiers made of it, an instruction that is a CALL runs code (an
+// undecodable modifier makes it Unlisted, which must not skip the scan).
+inline bool call_needs_scan(bool is_call_op, InsnClass c) { return is_call_op && (c == InsnClass::Call || c == InsnClass::Unlisted); }
+
 inline InsnClass turbo_class(const std::string& mnemonic, const std::vector<std::string>& mods) {
   using C = InsnClass;
   const auto is_one_of = [&](std::initializer_list<const char*> names) {
@@ -284,7 +302,7 @@ inline InsnClass turbo_class(const std::string& mnemonic, const std::vector<std:
       if (mnemonic == n) return true;
     return false;
   };
-  if (texture_mnemonic(mnemonic) || mnemonic == "BPT") return C::Never;
+  if (texture_mnemonic(mnemonic) || mnemonic == "BPT" || unmeasured_private_mnemonic(mnemonic)) return C::Never;
   if (mnemonic.empty() || mods_undecoded(mods)) return C::Unlisted;
   // Reductions and atomics first, by what they do.
   if (is_one_of({"RED", "REDG"})) {

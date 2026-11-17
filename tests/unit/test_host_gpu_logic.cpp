@@ -1159,17 +1159,37 @@ VTEST(turbo_classes_every_kind_of_instruction) {
     VCHECK(turbo_class(m, {"(9)"}) == C::Never);   // (an undecoded field does not make it merely unlisted)
   }
   // unlisted (turbo fit): what nobody named, what is not an instruction, the sm_90 and later forms; the card runs the cubin's own words
-  for (const char* m : {"QMMA", "OMMA", "HGMMA", "JMP", "SYNCS", "STSM", "UTCMMA", "LDTM", "STTM", "UTMALDG", "VPRINTF", "", "mufu", "Unknown"})
-    VCHECK(turbo_class(m, {}) == C::Unlisted);
+  for (const char* m : {"QMMA", "OMMA", "VPRINTF", "", "mufu", "Unknown"}) VCHECK(turbo_class(m, {}) == C::Unlisted);
+  // never: the sm_90 and later forms that touch state the simulator keeps in its own format (the tensor-map descriptor, "GPUTMAP1") or that no card run has shown safe
+  for (const char* m : {"UTMALDG", "UTMASTG", "UTMAREDG", "UTMAPF", "UTMACMDFLUSH", "UBLKCP", "UBLKRED", "UCGABAR", "HGMMA", "IGMMA", "BGMMA", "QGMMA", "WARPGROUP", "SYNCS", "ELECT",
+                        "USETMAXREG", "LDGMC", "ENDCOLLECTIVE", "STSM", "STAS", "REDAS", "ARRIVES", "UGETNEXTWORKID", "RPCMOV", "LDTM", "STTM", "UTCSHIFT", "UTCMMA", "UTCBAR", "UTCCP",
+                        "UTCATOMSWS", "JMP"}) {
+    VCHECK(unmeasured_private_mnemonic(m));
+    VCHECK(turbo_class(m, {}) == C::Never);
+    VCHECK(turbo_class(m, {"(9)"}) == C::Never);
+    VCHECK(!exact_opcode_allowed(m, {}));
+  }
+  VCHECK(!unmeasured_private_mnemonic("QMMA") && !unmeasured_private_mnemonic("IMAD") && !unmeasured_private_mnemonic("UTMAL"));
+}
+
+// An unlisted CALL (a modifier the decoder cannot name) must still go through the call-target scan; a call is a call whatever class its modifiers made of it.
+VTEST(a_call_is_scanned_whatever_its_class) {
+  using C = InsnClass;
+  VCHECK(turbo_class("CALL", {"REL", "(7)"}) == C::Unlisted);
+  VCHECK(call_needs_scan(true, turbo_class("CALL", {"REL", "(7)"})));
+  VCHECK(call_needs_scan(true, turbo_class("CALL", {"ABS", "NOINC"})));
+  VCHECK(!call_needs_scan(false, C::Unlisted) && !call_needs_scan(false, C::Call));
+  VCHECK(!call_needs_scan(true, C::Never) && !call_needs_scan(true, C::Exact));
 }
 
 // Turbo mode takes an unlisted instruction and exact mode never did: the exact whitelist is not touched by the new class.
 VTEST(unlisted_is_turbo_only) {
   using C = InsnClass;
-  for (const char* m : {"QMMA", "JMP", "STSM", "UTMALDG", "Unknown", ""}) {
+  for (const char* m : {"QMMA", "OMMA", "Unknown", ""}) {
     VCHECK(turbo_class(m, {}) == C::Unlisted);
     VCHECK(!exact_opcode_allowed(m, {}));
   }
+  for (const char* m : {"JMP", "STSM", "UTMALDG", "UBLKCP", "HGMMA", "SYNCS"}) VCHECK(turbo_class(m, {}) == C::Never);   // (TMA reads the simulator's own descriptor)
   VCHECK(!exact_opcode_allowed("ATOMS", {"ARRIVE", "64"}) && turbo_class("ATOMS", {"ARRIVE", "64"}) == C::Unlisted);
   const TurboSwitches def;
   VCHECK(turbo_refusal(class_bit(C::Unlisted), def) == TurboRefusal::None);
@@ -1203,9 +1223,9 @@ VTEST(turbo_whitelist_covers_the_decoder_and_nothing_unnamed) {
   // Never is only what the card cannot run for the simulator: the texture and surface instructions the decoder names, and BPT. Every other mnemonic the
   // decoder knows and no class names is Unlisted (turbo fit: admitted).
   unsigned never_names = 0;
-  for (const std::string& m : names) never_names += texture_mnemonic(m) || m == "BPT";
+  for (const std::string& m : names) never_names += texture_mnemonic(m) || m == "BPT" || unmeasured_private_mnemonic(m);
   VCHECK_EQ(n[InsnClass::Never], never_names);
-  VCHECK(n[InsnClass::Unlisted] >= 20);
+  VCHECK(n[InsnClass::Unlisted] >= 1);   // (QMMA, OMMA ...: what is left once the sm_90+ private forms are Never)
   for (unsigned c = 0; c < kInsnClasses; ++c) VCHECK(std::string(insn_class_name(static_cast<InsnClass>(c))).size() > 3);
   VCHECK(std::string(insn_class_name(InsnClass::Never)) == "never" && std::string(insn_class_name(InsnClass::Exact)) == "exact");
 }
@@ -3096,6 +3116,97 @@ VTEST(wsl_is_read_from_the_kernel_version) {
   VCHECK(host_is_wsl("Linux version 6.8.0-1021-aws (buildd@lcy02) (gcc 13.3.0)", true));   // /dev/dxg
   VCHECK(!host_is_wsl("Linux version 6.8.0-1021-aws (buildd@lcy02) (gcc 13.3.0)", false));
   VCHECK(!host_is_wsl("", false));
+}
+
+VTEST(ptx_classes_follow_the_switches) {
+  const std::string head = ".version 8.5\n.target sm_75\n.address_size 64\n";
+  const auto scan = [&](const char* body) { return scan_ptx_for_card(head + ".visible .entry k()\n{\n" + body + "\nret;\n}\n", false); };
+  using C = InsnClass;
+  VCHECK(scan("atom.global.add.u32 %r1, [%rd1], 1;").classes == class_bit(C::AtomInt));
+  VCHECK(scan("atom.global.cas.b32 %r1, [%rd1], 1, 2;").classes == class_bit(C::AtomSwap));
+  VCHECK(scan("atom.global.exch.b32 %r1, [%rd1], 2;").classes == class_bit(C::AtomSwap));
+  VCHECK(scan("atom.global.add.f32 %f1, [%rd1], %f2;").classes == class_bit(C::AtomFloat));
+  VCHECK(scan("red.global.add.f32 [%rd1], %f2;").classes == class_bit(C::FloatRed));
+  VCHECK(scan("ex2.approx.ftz.f32 %f1, %f2;").classes == class_bit(C::Mufu));
+  VCHECK(scan("fma.rn.f16x2 %r1, %r2, %r3, %r4;").classes == class_bit(C::Half));
+  VCHECK(scan("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%f1,%f2,%f3,%f4}, {%r1,%r2,%r3,%r4}, {%r5,%r6}, {%f1,%f2,%f3,%f4};").classes == class_bit(C::Tensor));
+  VCHECK(scan("add.s32 %r1, %r2, %r3;").classes == 0);
+  // the turbo switches decide on those classes: ATOMICS=0 keeps swaps and float atomics out, TURBO_OFF=atomics all atomics, =mufu the approximations
+  TurboSwitches no;
+  no.atomics = false;
+  VCHECK(turbo_refusal(scan("atom.global.cas.b32 %r1, [%rd1], 1, 2;").classes, no) == TurboRefusal::Atomics);
+  VCHECK(turbo_refusal(scan("atom.global.add.f32 %f1, [%rd1], %f2;").classes, no) == TurboRefusal::Atomics);
+  VCHECK(turbo_refusal(scan("atom.global.add.u32 %r1, [%rd1], 1;").classes, no) == TurboRefusal::None);
+  TurboSwitches off;
+  VCHECK(parse_turbo_off("atomics", &off.off));
+  VCHECK(turbo_refusal(scan("atom.global.add.u32 %r1, [%rd1], 1;").classes, off) == TurboRefusal::Off);
+  VCHECK(parse_turbo_off("mufu", &off.off));
+  VCHECK(turbo_refusal(scan("ex2.approx.ftz.f32 %f1, %f2;").classes, off) == TurboRefusal::Off);
+  // sm_90 and later forms (the tensor-map descriptor is the simulator's own): never
+  for (const char* ins : {"cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%r1], [%rd1, {%r2, %r3}], [%r4];", "wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%f1}, %rd1, %rd2, 1, 1, 1, 0, 0;",
+                          "setmaxnreg.inc.sync.aligned.u32 240;", "elect.sync %r1|%p1, 0xffffffff;", "barrier.cluster.arrive;", "mapa.shared::cluster.u64 %rd1, %rd2, %r1;",
+                          "prefetch.tensormap [%rd1];", "mov.u32 %r1, %clusterid.x;", "stmatrix.sync.aligned.m8n8.x1.shared.b16 [%r1], {%r2};"}) {
+    const PtxScan r = scan(ins);
+    VCHECK(!r.refuse.empty() && r.never);
+  }
+}
+
+namespace {
+vgpu::sass::Cubin cubin_with(std::initializer_list<std::tuple<const char*, const char*, uint64_t, uint64_t>> vars, uint64_t global_size = 64, uint64_t const3_size = 32) {
+  vgpu::sass::Cubin c;
+  for (const char* name : {".nv.global", ".nv.constant3"}) {
+    vgpu::sass::CubinSection s;
+    s.name = name;
+    s.size = std::string(name) == ".nv.global" ? global_size : const3_size;
+    c.section_index[name] = c.sections.size();
+    c.sections.push_back(s);
+  }
+  for (const auto& [name, section, value, size] : vars) {
+    vgpu::sass::CubinSymbol y;
+    y.name = name;
+    y.section = section;
+    y.value = value;
+    y.size = size;
+    c.symbols.push_back(y);
+  }
+  return c;
+}
+}  // namespace
+
+VTEST(the_card_image_must_lay_variables_out_as_the_simulator_s_does) {
+  const vgpu::sass::Cubin sim = cubin_with({{"a", ".nv.global", 0, 16}, {"b", ".nv.global", 16, 8}, {"c", ".nv.constant3", 0, 4}});
+  VCHECK(variable_layout_mismatch(sim, sim).empty());
+  VCHECK(variable_layout_mismatch(cubin_with({{"c", ".nv.constant3", 0, 4}, {"b", ".nv.global", 16, 8}, {"a", ".nv.global", 0, 16}}), sim).empty());   // (the order is not compared)
+  VCHECK(!variable_layout_mismatch(cubin_with({{"a", ".nv.global", 0, 16}, {"b", ".nv.global", 24, 8}, {"c", ".nv.constant3", 0, 4}}), sim).empty());   // an offset
+  VCHECK(!variable_layout_mismatch(cubin_with({{"a", ".nv.global", 0, 16}, {"b", ".nv.global", 16, 12}, {"c", ".nv.constant3", 0, 4}}), sim).empty());  // a size
+  VCHECK(!variable_layout_mismatch(cubin_with({{"a", ".nv.global", 0, 16}, {"b", ".nv.constant3", 16, 8}, {"c", ".nv.constant3", 0, 4}}), sim).empty());  // a section
+  VCHECK(!variable_layout_mismatch(cubin_with({{"a", ".nv.global", 0, 16}, {"b", ".nv.global", 16, 8}, {"c", ".nv.constant3", 0, 4}}, 128), sim).empty());  // a section's size
+  VCHECK(!variable_layout_mismatch(cubin_with({{"a", ".nv.global", 0, 16}, {"c", ".nv.constant3", 0, 4}}), sim).empty());   // a variable the card's image lacks
+  VCHECK(!variable_layout_mismatch(cubin_with({{"a", ".nv.global", 0, 16}, {"b", ".nv.global", 16, 8}, {"c", ".nv.constant3", 0, 4}, {"d", ".nv.global", 24, 4}}), sim).empty());   // one the simulator lacks
+  // not variables: functions, names that start with '.', symbols of other sections (static shared memory) are not compared
+  vgpu::sass::Cubin card = sim;
+  vgpu::sass::CubinSymbol sh;
+  sh.name = "tile";
+  sh.section = ".nv.shared.k";
+  sh.size = 4096;
+  card.symbols.push_back(sh);
+  VCHECK(variable_layout_mismatch(card, sim).empty());
+  vgpu::sass::CubinSymbol fn;
+  fn.name = "f";
+  fn.function = true;
+  fn.section = ".text.f";
+  card.symbols.push_back(fn);
+  VCHECK(variable_layout_mismatch(card, sim).empty());
+}
+
+VTEST(the_card_image_must_take_the_simulator_s_arguments) {
+  vgpu::sass::CubinKernel k;
+  k.params = {{0, 0, 8}, {1, 8, 4}};
+  VCHECK(parameter_sizes_agree(k, {8, 4}));
+  VCHECK(!parameter_sizes_agree(k, {8, 8}));   // a size
+  VCHECK(!parameter_sizes_agree(k, {8}));      // a count
+  VCHECK(!parameter_sizes_agree(k, {8, 4, 4}));
+  VCHECK(parameter_sizes_agree(vgpu::sass::CubinKernel{}, {}));
 }
 
 VTEST_MAIN

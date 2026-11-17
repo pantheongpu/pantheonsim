@@ -310,7 +310,9 @@ struct Runtime::Impl : CardGate {
         cv.wait_until(lk, until);
         if (armed && deadline == until && std::chrono::steady_clock::now() >= until) {
           std::fprintf(stderr,
-                       "host_gpu: %s has been on the card for more than %g s (VGPU_HOST_GPU_TIMEOUT): a kernel on the card cannot be cancelled and its memory cannot be read back; the process ends\n",
+                       "host_gpu: %s has been on the card for more than %g s (VGPU_HOST_GPU_TIMEOUT): a kernel on the card cannot be cancelled and its memory cannot be read back; the process ends. "
+                       "A kernel that waits for blocks the card cannot hold at once (a persistent or spin-barrier kernel sized for a larger simulated profile) or for another stream "
+                       "hangs this way; VGPU_HOST_GPU_FIT=0 keeps such kernels in the simulator (docs/perf-design/12-host-gpu-turbo.md section 15)\n",
                        kernel.c_str(), limit_s);
           std::fflush(nullptr);
           _exit(124);
@@ -735,30 +737,10 @@ struct Runtime::Impl : CardGate {
         return;
       }
       if (sim) {
-        for (const sass::CubinSymbol& sym : view.cubin.symbols) {
-          if (sym.function || sym.name.empty() || sym.name[0] == '.') continue;
-          const auto va = sim->symbol_va.find(sym.name);
-          const auto sz = sim->symbol_size.find(sym.name);
-          const sass::CubinSection* a = view.cubin.section(sym.section);
-          const sass::CubinSection* b = sim->cubin.section(sym.section);
-          const sass::CubinSymbol* other = nullptr;
-          for (const sass::CubinSymbol& o : sim->cubin.symbols)
-            if (!o.function && o.name == sym.name) other = &o;
-          if (va == sim->symbol_va.end() || sz == sim->symbol_size.end() || !other || other->section != sym.section || other->value != sym.value || other->size != sym.size ||
-              !a || !b || a->size != b->size) {
-            mc.refuse = "module variables: " + sym.name + " is laid out differently in the card's image than in the simulator's";
-            return;
-          }
+        if (const std::string why = variable_layout_mismatch(view.cubin, sim->cubin); !why.empty()) {
+          mc.refuse = "module variables: " + why;
+          return;
         }
-        for (const sass::CubinSymbol& o : sim->cubin.symbols)   // (a variable of the simulator's that the card's image lacks cannot be mirrored)
-          if (!o.function && !o.name.empty() && o.name[0] != '.' && sim->symbol_va.count(o.name)) {
-            bool found = false;
-            for (const sass::CubinSymbol& v : view.cubin.symbols) found = found || (!v.function && v.name == o.name);
-            if (!found) {
-              mc.refuse = "module variables: " + o.name + " is not in the card's image";
-              return;
-            }
-          }
       }
     }
     if (sections.empty()) return;
@@ -950,8 +932,9 @@ struct Runtime::Impl : CardGate {
       // be where the simulator's cubin has it.
       if (ok && !mcard.same_as_sim) {
         const auto kit = mv->kernel_index.find(fn.name);
-        bool same = kit != mv->kernel_index.end() && kit->second < mv->cubin.kernels.size() && mv->cubin.kernels[kit->second].params.size() == args.size();
-        for (size_t i = 0; same && i < args.size(); ++i) same = mv->cubin.kernels[kit->second].params[i].size == args[i].size();
+        std::vector<size_t> sizes;
+        for (const auto& a : args) sizes.push_back(a.size());
+        const bool same = kit != mv->kernel_index.end() && kit->second < mv->cubin.kernels.size() && parameter_sizes_agree(mv->cubin.kernels[kit->second], sizes);
         if (!same) {
           ok = false;
           image_refusal = true;
@@ -968,10 +951,13 @@ struct Runtime::Impl : CardGate {
     ClassMask classes = 0;
     std::string first_never, first_gated;   // the text of the first instruction of no class, and of the first one a switch refuses
     if (ok && mcard.is_ptx) {
+      classes |= pscan.classes;   // (the PTX's own classes: TURBO_OFF and VGPU_HOST_GPU_ATOMICS=0 apply to it as to SASS)
       if (pscan.never) {
         classes |= class_bit(InsnClass::Never);
         first_never = pscan.refuse;
       }
+      if (const ClassMask gated = sw.off | (sw.atomics ? 0 : class_bit(InsnClass::AtomFloat) | class_bit(InsnClass::AtomSwap)); (pscan.classes & gated) && first_gated.empty())
+        first_gated = "PTX (class " + std::string((pscan.classes & gated & class_bit(InsnClass::AtomSwap)) ? "atomic-swap" : (pscan.classes & gated & class_bit(InsnClass::AtomFloat)) ? "atomic-float" : "switched off") + ")";
       ok = false;   // (PTX has no exact set: the verdict below is turbo mode's)
     }
     if (ok) {
@@ -994,7 +980,7 @@ struct Runtime::Impl : CardGate {
             for (const auto& o : ins.src)
               if (o.kind == sass::Kind::Label) branches.emplace_back(ins.pc, static_cast<uint64_t>(o.imm));
           InsnClass c = turbo_class(ins.mnemonic, ins.mods);
-          if (ins.op == sass::Op::CALL && c == InsnClass::Call) {
+          if (call_needs_scan(ins.op == sass::Op::CALL, c)) {   // (an unlisted CALL, one with a modifier the decoder cannot name, is followed like any other)
             // A call that leaves the section runs code this scan has to see. Three kinds are followed: a relative call inside the section; the absolute
             // call to vprintf, which the driver links when it loads the module (admitted above); and an absolute call to the first instruction of
             // another code section of the module, a device function kept out of line (a -rdc build), whose code is then classed too. A call through a
@@ -1903,7 +1889,9 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     ++im.stats.failed;
     ++im.stats.simulated;
     if (im.resident) {
-      if (card_only_data) throw Error(Err::Internal, "host_gpu: " + fn.name + " failed on the card, which holds data from earlier launches that the simulator does not");
+      if (card_only_data) throw Error(Err::Internal, "host_gpu: " + fn.name + " failed on the card, which holds data from earlier launches that the simulator does not, so the simulator cannot take the launch over and the process ends. "
+                         "In turbo mode this is the price of sending every launch: VGPU_HOST_GPU_FIT=0 (the size rules) or VGPU_HOST_GPU_TURBO_OFF=<class> keeps such a kernel in the simulator "
+                         "(docs/perf-design/12-host-gpu-turbo.md section 15, known limits)");
       im.reset_for_simulator();
     }
     if (!quiet()) std::fprintf(stderr, "host_gpu: %s failed on the card (error %d); mode off, the simulator runs it\n", fn.name.c_str(), r);
@@ -2239,8 +2227,31 @@ bool Runtime::sample_decide(const ptx::EntryFn& fn, const exec::LaunchConfig& cf
 }  // namespace vgpu::hostgpu
 
 namespace vgpu::hostgpu {
+// Whether turbo mode will actually run: the shim keeps every image of a fatbin only then, so that a mode that ends up off (a diagnostic that needs the simulator, a bad value,
+// a WSL host with FIT=1) copies nothing. The same checks as Runtime::for_device, without its messages.
 bool turbo_selected() {
-  static const bool on = mode_from_text(std::getenv("VGPU_HOST_GPU")) == Mode::Turbo;
+  static const bool on = [] {
+    if (mode_from_text(std::getenv("VGPU_HOST_GPU")) != Mode::Turbo) return false;
+    for (const char* v : kIncompatibleVars)
+      if (diagnostic_switched_on(v, std::getenv(v))) return false;
+    bool fit = true;
+    if (!parse_fit(std::getenv("VGPU_HOST_GPU_FIT"), &fit)) return false;
+    ClassMask off = 0;
+    bool printf_off = false;
+    if (!parse_turbo_off(std::getenv("VGPU_HOST_GPU_TURBO_OFF"), &off, nullptr, &printf_off)) return false;
+    if (fit) {
+      std::string ver;
+      const char* vp = std::getenv("VGPU_HOST_GPU_PROC_VERSION");
+      if (FILE* f = std::fopen(vp && *vp ? vp : "/proc/version", "r")) {
+        char b[512];
+        const size_t n = std::fread(b, 1, sizeof b - 1, f);
+        ver.assign(b, n);
+        std::fclose(f);
+      }
+      if (host_is_wsl(ver, !(vp && *vp) && access("/dev/dxg", F_OK) == 0)) return false;
+    }
+    return true;
+  }();
   return on;
 }
 }  // namespace vgpu::hostgpu
