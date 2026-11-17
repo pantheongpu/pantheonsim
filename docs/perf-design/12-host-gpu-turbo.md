@@ -1016,7 +1016,7 @@ physical)` takes the device's slot (`Device::physical_`, the window the memory m
   string at `cuInit`. [I] The numbers in it name the machine's cards, so the simulated device in slot S is the machine's card S, and the real driver numbers that card by its place in the
   list: with `CUDA_VISIBLE_DEVICES=2,3` slot 2 uses the driver's device 0 and slot 3 its device 1, and slots 0 and 1 have no card (hidden). A string that is not a list of decimal numbers (UUIDs) is
   not read: the driver then chose, and slot S is its device S. Before this change a program started with `CUDA_VISIBLE_DEVICES=1` had its device 0 in window 1 and the card path reserved window 0
-  (every launch then failed to map a window that did not contain its memory: the mode silently did nothing); it now follows the slot.
+  ([I]: every launch then failed to map a window that did not contain its memory, so the mode did nothing; not run); it now follows the slot.
 * Exact mode: `served_slot` serves ordinal 0 only, window 0, the driver's device 0, exactly as before; with one host card turbo behaves as before for slot 0, and slot 1 and up stay simulated.
 * The first Runtime made prints the summary lines scripts read; with more than one runtime every device that started a card adds `host_gpu_card: device_slot=S card=C launches_card=.. launches_sim=..
   card_s=.. sim_s=.. mib_to_card=.. mib_back=..`, so a script adds them up. `host_gpu_turbo:` and the lines under it describe the first device only.
@@ -1070,7 +1070,9 @@ device reading back as soon as it has launched. Simulated machine: `VGPU_GPU=nvi
 The same program on the real driver with no simulator (`multibench` built against the real cudart): 1.70 s with 1 device, 2.11 to 2.20 s with 4 for every pattern; the 0.4 s over it with 1 device is the
 simulator's start and the driver start. Before queueing launches the same turbo runs grew by about 1.3 s per device (2.1, 3.4, 4.7, 6.0 s), the cards running one after another.
 
-SINGLE_DEVICE_TABLE
+**A single-device program does not change [M, T4, 3 runs each, `data/multicard/single_device_before_after.txt`]:** `multibench 1 0 1048576 65536 2` with one simulated T4: the plain simulator 6.2 to 6.4 s on the
+origin of this branch (cd30dd20) and 6.3 to 6.4 s on this one; turbo 0.46 to 0.47 s on both; a short run (1024 iterations) 0.39 to 0.40 s on both; the printed bytes have the same hash in every run
+(8a8abf77 and f8c143d2), and `run_host_gpu_stub.sh` (the existing stand-in suite, exact and turbo) passes on this branch.
 
 ### 17.6 Tests
 
@@ -1081,7 +1083,7 @@ SINGLE_DEVICE_TABLE
 * Mutation evidence (`tools/multicard/mutate.sh`, output `data/multicard/mutations.txt`): each mutation below is killed. M1 every slot uses window 0: 25 e2e failures; M2 every device uses
   driver device 0: 32; M3 a peer pointer argument not looked at: the peerptr output and its "no launch" check fail; M4 one runtime for all devices: 32; M5 CUDA_VISIBLE_DEVICES not read: unit
   `visible_devices_renumber_the_real_driver_not_the_slot` and 7 e2e; M6 exact mode serves every device: unit `exact_mode_serves_device_zero_only_and_turbo_every_window`; M7 a device without a card uses the
-  first card: 2 unit and 4 e2e; M8 launches always waited for and M9 always queued: see the file for the failing checks.
+  first card: 2 unit and 4 e2e; M8 launches always waited for: the `dp4` queue check fails; M9 launches always queued: the `solo` check fails.
 
 ### 17.7 What is left
 

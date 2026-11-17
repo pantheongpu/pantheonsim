@@ -16,7 +16,7 @@ FAIL: peerptr: the output is not the mode-off output:
 FAIL: peerptr: the driver was told 'launch on' (a launch whose argument is another device's pointer)
 FAIL: the multi-card stand-in tests
 == M4 one runtime for every simulated device (device 0's)
-M4: unit failures=0 e2e FAIL lines=32
+M4: unit failures=0 e2e FAIL lines=33
 FAIL: dp4: the driver was never told 'ctx_retain 1':  1 ctx_retain 0; 1 cuDeviceGet; 1 cuDeviceGetCount; 1 cuDevicePrimaryCtxRetain; 3 cuFuncGetAttribute; 1 cuInit; 3 cuLaunchKernel; 1 cuMemAddressReserve; 1 cuMemcpyHtoD
 FAIL: dp4: the driver was never told 'launch on 1':  1 ctx_retain 0; 1 cuDeviceGet; 1 cuDeviceGetCount; 1 cuDevicePrimaryCtxRetain; 3 cuFuncGetAttribute; 1 cuInit; 3 cuLaunchKernel; 1 cuMemAddressReserve; 1 cuMemcpyHtoD;
 FAIL: dp4: the driver was never told 'reserve 0x210000000000 on 1':  1 ctx_retain 0; 1 cuDeviceGet; 1 cuDeviceGetCount; 1 cuDevicePrimaryCtxRetain; 3 cuFuncGetAttribute; 1 cuInit; 3 cuLaunchKernel; 1 cuMemAddressReserve;
@@ -36,5 +36,13 @@ FAIL: dp2: no message for device 3, which has no card: host_gpu: VGPU_HOST_GPU=t
 FAIL: dp2: the no-card message is not said once per device
 [ FAIL ] slots_beyond_the_machines_cards_stay_simulated
 [ FAIL ] visible_devices_renumber_the_real_driver_not_the_slot
+== M8 every launch is waited for (the queue is off)
+M8: unit failures=0 e2e FAIL lines=2
+FAIL: dp4: a launch was waited for although four devices queue theirs (first sync at line 40, last launch at line 99)
+FAIL: the multi-card stand-in tests
+== M9 launches are queued with one device too
+M9: unit failures=0 e2e FAIL lines=2
+FAIL: a single device's launches were not each waited for: launch on 0,launch on 0,launch on 0,sync on 0,
+FAIL: the multi-card stand-in tests
 == done
 RESTORED: unit failures=0 e2e FAIL lines=0
