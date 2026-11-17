@@ -98,7 +98,9 @@
 # The program history (Round 9; include/vgpu/host_gpu_history.hpp), steps 58 to 62:
 #  58. without VGPU_HOST_GPU_HISTORY nothing is read or written; 59. run 1 (no record) uses the card and leaves a candidate, run 2 stays in the simulator and leaves tiny, run 3 keeps off the
 #      driver; 60. a hold gives up at its budget and the record says long; 61. a kernel that failed on the card is kept in the simulator from its first launch, the driver unstarted;
-#      62. a corrupt, truncated, foreign or directory-shaped file is no history, and exact mode and FIT=0 never read it. The output is the mode-off output in each.
+#      62. a corrupt, truncated, foreign or directory-shaped file is no history, and exact mode and FIT=0 never read it. The output is the mode-off output in each;
+#  63. turbo mode asks the driver for one work queue (CUDA_DEVICE_MAX_CONNECTIONS=1) and, with a history directory, keeps the driver's compile cache beside it, each unless the user set the
+#      variable (the stand-in driver writes what it reads at cuInit to $STUB_LOG.env); exact mode does neither.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -152,6 +154,7 @@ run() {   # <tag> <program argument> [env...]: stdout in $work/<tag>.out, stderr
   local tag=$1 arg=$2
   shift 2
   : > "$work/$tag.log"
+  rm -f "$work/$tag.log.env"
   # (VGPU_HOST_GPU_SAMPLE=0: steps 1 to 16 pin the rules that decide BEFORE a launch runs, as they were before launches were sampled; steps 17 to 20
   # switch the sampling back on, their own assignment coming later on the command line.)
   env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" STUB_LOG="$work/$tag.log" STUB_SM="$cc" STUB_MP="$mp" STUB_INIT_MS=$init_ms \
@@ -912,6 +915,24 @@ if [[ "$cc" == 86 ]]; then
     PROG=fit run hx tiny "${hh[@]}" $sw VGPU_HOST_GPU_HISTORY="$work/hist4" || { echo "FAIL: the run with $sw and a history failed"; fails=1; }
     [[ ! -e "$work/hist4" ]] && ! grep -q '^host_gpu_history:' "$work/hx.err" || { echo "FAIL: $sw read or wrote a history"; fails=1; }
   done
+  # 63. what the driver is told (section 17.2, 17.3): turbo mode asks for one work queue (CUDA_DEVICE_MAX_CONNECTIONS=1: half the driver's start, measured) unless the user has set the variable;
+  # exact mode does not touch it. With a history directory the driver's compile cache is kept beside it (CUDA_CACHE_PATH=<dir>/cuda-cache), unless the user has set CUDA_CACHE_PATH or CUDA_CACHE_DISABLE.
+  denv() { sed -n 's/^connections=\(.*\) cache=\(.*\)$/\1 \2/p' "$work/$1.log.env" | head -1; }
+  PROG=fit run de_turbo tiny VGPU_HOST_GPU=turbo || { echo "FAIL: the turbo run failed"; fails=1; }
+  [[ "$(denv de_turbo)" == "1 (unset)" ]] || { echo "FAIL: turbo mode did not ask for one work queue, or touched the compile cache: '$(denv de_turbo)'"; fails=1; }
+  PROG=fit run de_user tiny VGPU_HOST_GPU=turbo CUDA_DEVICE_MAX_CONNECTIONS=4 || { echo "FAIL: the run with a queue count of the user's failed"; fails=1; }
+  [[ "$(denv de_user)" == "4 (unset)" ]] || { echo "FAIL: turbo mode overrode the user's CUDA_DEVICE_MAX_CONNECTIONS: '$(denv de_user)'"; fails=1; }
+  PROG=prog run de_exact big VGPU_HOST_GPU=exact "${reachx[@]}" || { echo "FAIL: the exact run failed"; fails=1; }
+  [[ -s "$work/de_exact.log.env" && "$(denv de_exact)" == "(unset) (unset)" ]] || { echo "FAIL: exact mode did not start the driver, or set CUDA_DEVICE_MAX_CONNECTIONS: '$(denv de_exact)'"; fails=1; }
+  rm -rf "$work/hist5"
+  PROG=fit run de_hist tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist5" || { echo "FAIL: the history run for the cache failed"; fails=1; }
+  [[ "$(denv de_hist)" == "1 $work/hist5/cuda-cache" && -d "$work/hist5/cuda-cache" ]] || { echo "FAIL: the compile cache did not go beside the history: '$(denv de_hist)'"; fails=1; }
+  PROG=fit run de_hist_user tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist6" CUDA_CACHE_PATH="$work/mycache" || { echo "FAIL: the run with a cache path of the user's failed"; fails=1; }
+  [[ "$(denv de_hist_user)" == "1 $work/mycache" ]] || { echo "FAIL: the user's CUDA_CACHE_PATH was overridden: '$(denv de_hist_user)'"; fails=1; }
+  PROG=fit run de_hist_off tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist7" CUDA_CACHE_DISABLE=1 || { echo "FAIL: the run with the cache disabled failed"; fails=1; }
+  [[ "$(denv de_hist_off)" == "1 (unset)" ]] || { echo "FAIL: CUDA_CACHE_DISABLE=1 was not respected: '$(denv de_hist_off)'"; fails=1; }
+  PROG=fit run de_nohist tiny "${hh[@]}" || { echo "FAIL: the run without a history failed"; fails=1; }
+  [[ "$(denv de_nohist)" == "1 (unset)" ]] || { echo "FAIL: the compile cache moved without a history directory: '$(denv de_nohist)'"; fails=1; }
 else
   echo "NOTE: turbo fit steps 45 to 52 need the rtx3060 profile (sm_86); skipped for $profile"
 fi

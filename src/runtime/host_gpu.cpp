@@ -276,6 +276,16 @@ uint64_t decision_env_hash() {
   for (const std::string& s : v) h.text(s + "\n");
   return h.h;
 }
+// Turbo mode runs every card launch on the null stream, one at a time, so the driver's work queues (CUDA_DEVICE_MAX_CONNECTIONS, 8 by default [documented]) are not used for
+// concurrency, and creating and tearing them down is most of the driver's fixed cost: on an A10G (driver 595) cuDevicePrimaryCtxRetain took 95 ms with the variable unset, 47 ms with
+// 1, and a whole bfs process 0.24 s against 0.155 s [measured, docs section 17.3]. Set to 1 when turbo is selected, unless the user has set it (the driver reads it at its first call,
+// which is why this runs when the library loads, before main: setenv from a later thread could race the program's own getenv calls). Children of the process inherit it. [inferred: no
+// effect on results, the launches are serialised by the mode's gate; every output of the benchmark programs equalled the simulator's with it set, section 17.3]
+__attribute__((constructor)) void tune_driver_environment() {
+  const char* m = std::getenv("VGPU_HOST_GPU");
+  if (!m || std::string(m) != "turbo" || std::getenv("CUDA_DEVICE_MAX_CONNECTIONS")) return;
+  setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1", 0);
+}
 bool kernel_fault_code(int r) { return r == 700 || r == 715 || r == 716 || r == 717 || r == 718 || r == 719; }   // [documented] illegal address, instruction, misaligned, address space, pc, launch failure
 
 }  // namespace
@@ -634,7 +644,14 @@ struct Runtime::Impl : CardGate {
     hist_init_done = true;
     if (mode != Mode::Turbo || !fit || verify) return false;
     hist_dir = history_dir();
-    if (hist_dir.empty() || !(costs.start_cost_s > 0)) return false;
+    if (hist_dir.empty()) return false;
+    // The driver's compile cache beside the history (section 17.2): the PTX a retargeted module is compiled from costs 3 s on a large module (HeCBench s3d, A10G) and 0.025 s when the cache
+    // has it; the default cache is under $HOME, which an ephemeral runner loses, while the history directory is the one a runner is told to keep. Never over a setting of the user's.
+    if (!std::getenv("CUDA_CACHE_PATH") && !std::getenv("CUDA_CACHE_DISABLE")) {
+      const std::string cache = hist_dir + "/cuda-cache";
+      if (history::make_dirs(cache)) setenv("CUDA_CACHE_PATH", cache.c_str(), 0);
+    }
+    if (!(costs.start_cost_s > 0)) return false;
     std::string prog;
     {
       std::lock_guard<std::mutex> g(g_prog_mu);

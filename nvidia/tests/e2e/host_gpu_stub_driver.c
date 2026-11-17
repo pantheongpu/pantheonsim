@@ -21,6 +21,18 @@ static int env_int(const char* n, int d) { const char* v = getenv(n); return v &
 int cuInit(unsigned flags) {
   (void)flags;
   note("cuInit");
+  /* What the real driver would read from the environment at this point (docs/perf-design/12-host-gpu-turbo.md section 17): written beside the call log, one line a call. */
+  if (getenv("STUB_LOG")) {
+    char path[4096];
+    snprintf(path, sizeof path, "%s.env", getenv("STUB_LOG"));
+    FILE* o = fopen(path, "a");
+    if (o) {
+      const char* a = getenv("CUDA_DEVICE_MAX_CONNECTIONS");
+      const char* b = getenv("CUDA_CACHE_PATH");
+      fprintf(o, "connections=%s cache=%s\n", a ? a : "(unset)", b ? b : "(unset)");
+      fclose(o);
+    }
+  }
   const int ms = env_int("STUB_INIT_MS", 0);
   if (ms > 0) { struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000L}; nanosleep(&t, 0); }
   return env_int("STUB_FAIL_INIT", 0) ? 100 : 0;
