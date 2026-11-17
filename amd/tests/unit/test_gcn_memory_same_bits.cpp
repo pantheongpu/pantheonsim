@@ -27,6 +27,7 @@
 
 #include "vgpu/amd_exec.hpp"
 #include "vgpu/amd_gcn.hpp"
+#include "shard.hpp"
 #include "vtest.hpp"
 
 using namespace vgpu;
@@ -44,6 +45,14 @@ const Corpus kCorpora[] = {
     {"isa_corpus_gfx1030.txt", amd::gcn::Target::Gfx1030},
 };
 constexpr uint32_t kModes = 12;
+
+// VGPU_MEM_SAME_BITS_SHARD=k/n: every nth line of each corpus (CMakeLists.txt registers eight shards, test_amd_gcn_memory_same_bits_shard_KofN). A line keeps
+// the seed it has in the whole run (its place in the corpus), and every line still decides what the family counts below take (the cheap part), so the
+// shards together run exactly the runs of the whole test. The digest of a line another shard has is 0 here, and no test below looks at it.
+const vtest::Shard& shard() {
+  static const vtest::Shard s("VGPU_MEM_SAME_BITS_SHARD", "VGPU_MEM_SAME_BITS_LIST");
+  return s;
+}
 
 std::vector<std::string> lines_of(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
@@ -123,6 +132,12 @@ void digest_corpus(const Corpus& c, std::vector<uint32_t>* digests, std::vector<
   for (const std::string& line : lines_of(std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/" + c.file)) {
     if (line[0] == '#') continue;
     const size_t tab = line.find('\t');
+    if (shard().list) {   // (the lines this shard takes, and nothing run)
+      if (shard().mine(digests->size())) std::printf("%s:%zu\n", c.file, digests->size());
+      digests->push_back(0);
+      texts->push_back(line.substr(tab + 1));
+      continue;
+    }
     std::vector<uint8_t> code;
     std::istringstream words(line.substr(0, tab));
     for (std::string w; words >> w;) {
@@ -141,10 +156,13 @@ void digest_corpus(const Corpus& c, std::vector<uint32_t>* digests, std::vector<
       if (is_memory(in) && in.name != "ds_nop" && in.name != "ds_consume" &&
           in.name != "ds_append" && in.name != "s_memtime" && in.name != "s_memrealtime") {   // (the last two read a clock)
         const uint64_t seed = digests->size();
-        for (uint32_t mode = 0; mode < kModes; ++mode) d = d * 0x9E3779B97F4A7C15ull + amd::digest_memory_instruction(in, c.target, seed, mode);
-        for (const amd::gcn::Inst& v : variants(in, &seen))
-          for (uint32_t mode = 0; mode < kModes; ++mode) d = d * 0x9E3779B97F4A7C15ull + amd::digest_memory_instruction(v, c.target, seed, mode);
-        d ^= d >> 32;
+        const bool mine = shard().mine(seed);
+        if (mine)
+          for (uint32_t mode = 0; mode < kModes; ++mode) d = d * 0x9E3779B97F4A7C15ull + amd::digest_memory_instruction(in, c.target, seed, mode);
+        for (const amd::gcn::Inst& v : variants(in, &seen))   // (called for every line: it counts the members of each family seen)
+          if (mine)
+            for (uint32_t mode = 0; mode < kModes; ++mode) d = d * 0x9E3779B97F4A7C15ull + amd::digest_memory_instruction(v, c.target, seed, mode);
+        if (mine) d ^= d >> 32;
       }
     } catch (const std::exception&) {
     }
@@ -187,6 +205,8 @@ VTEST(every_memory_instruction_of_the_isa_corpora_gives_the_recorded_bits) {
     if (digests.size() != n) throw vtest::Failure(std::string(c.file) + " has a different number of instructions than the digests");
     size_t wrong = 0;
     for (size_t i = 0; i < n; ++i, ++at) {
+      if (!shard().mine(i)) continue;   // (another shard's line)
+      if (shard().list) continue;
       char buf[16];
       std::snprintf(buf, sizeof buf, "%08x", digests[i]);
       ++checked;
@@ -196,12 +216,14 @@ VTEST(every_memory_instruction_of_the_isa_corpora_gives_the_recorded_bits) {
     }
     wrong_total += wrong;
   }
-  VCHECK(nonzero > 1000);   // the memory shapes ran (or threw a definite error)
+  if (shard().list) return;
+  VCHECK(nonzero > shard().at_least(1000));   // the memory shapes ran (or threw a definite error)
   if (wrong_total)
     throw vtest::Failure(std::to_string(wrong_total) + " of " + std::to_string(checked) + " instructions differ from the recorded bits:" + report);
 }
 
 VTEST(the_wave_wide_memory_paths_give_the_bits_lane_by_lane_gives) {
+  if (shard().list) return;   // (the first test lists the lines)
   // The same instructions in the same twelve ways, run with the memory manager's whole-wave calls on (the batches of lanes that
   // make no run, the runs, the single-lookup atomics) and off (amd::set_fast_paths, which sends every lane down the calls it
   // made before), digest against digest: this holds the fast paths to the old ones without a recording to trust.
@@ -225,12 +247,13 @@ VTEST(the_wave_wide_memory_paths_give_the_bits_lane_by_lane_gives) {
     }
   }
   amd::set_fast_paths(true, true);
-  VCHECK(nonzero > 1000);
+  VCHECK(nonzero > shard().at_least(1000));
   if (!report.empty()) throw vtest::Failure("the whole-wave paths differ from the lane-by-lane ones:" + report);
   VCHECK(compared > 1000);
 }
 
 VTEST(the_tier_gives_the_interpreters_bits_for_every_memory_instruction_in_every_way) {
+  if (shard().list) return;   // (the first test lists the lines)
   // The same instructions in the same twelve ways with the pre-decoded tier off and on (the byte and halfword LDS accesses have handlers
   // of their own: an access past the LDS, a half-off wave, the same address in every lane, a misaligned one), digest against digest.
   size_t compared = 0, nonzero = 0;
@@ -254,7 +277,7 @@ VTEST(the_tier_gives_the_interpreters_bits_for_every_memory_instruction_in_every
     }
   }
   amd::gcn::tier::set_enabled(was_on);
-  VCHECK(nonzero > 1000);
+  VCHECK(nonzero > shard().at_least(1000));
   if (!report.empty()) throw vtest::Failure("the tier differs from the interpreter:" + report);
   VCHECK(compared > 1000);
 }
