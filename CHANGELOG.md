@@ -7,6 +7,8 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **CI: the playground host can take burst jobs** (`tools/burst-runners/host-burst.sh`, docs/ci.md). A gate counts the host as three slots and uses it only
+  when two are free; `start` registers two runners with their own label and routes the burst jobs to them, `stop` restores the variables and unregisters.
 - **An undefined `.extern .global` (or `.const`) in a PTX module is a zero-initialised variable, as on NVIDIA's driver** (issue #681). A module that
   declares `.extern .global .align 4 .u32 x;` and defines it nowhere used to fail at the first launch that read it
   (`CUDA_ERROR_NOT_FOUND: unknown symbol`), and `cuModuleGetGlobal` could not find it. On a real RTX 3080 Ti the driver drops the qualifier in a

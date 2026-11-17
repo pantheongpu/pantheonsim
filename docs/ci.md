@@ -241,6 +241,29 @@ that sets `runs-on` from the runner list; a scheduled workflow with
 `issues: write` that opens an issue when jobs have waited over two hours with no
 job in progress on the label.
 
+## The playground host as a burst runner (`tools/burst-runners/host-burst.sh`)
+
+When the pull request backlog is long and the playground host is idle it can take the burst jobs (SASS, ASan + UBSan,
+ThreadSanitizer, ollama). It is run by hand from a maintainer's machine, so no GitHub token is kept on the host:
+
+    tools/burst-runners/host-burst.sh check        # can it take jobs now? (exit 3: no)
+    tools/burst-runners/host-burst.sh install      # once: the runner software in /opt/hostburst; nothing registered or running
+    tools/burst-runners/host-burst.sh start        # gate, register two runners (label pantheonsim-hostburst), route the jobs
+    tools/burst-runners/host-burst.sh stop         # restore the variables, wait for a busy runner, unregister and stop
+
+The host is counted as three slots of 8/3 vCPUs and takes jobs only when at least two are free; with one free it does
+not (the gate prints what it saw). A slot is in use when the ML job is running (4 vCPUs), by a playground session each
+(1 vCPU), or by load. The gate is read at `start`: a job already running is not stopped when a session arrives, but its
+container is limited to CPUs 0-3, 2.6 vCPUs, 9 GB and a low CPU weight, so the playground wins any contention.
+`start` sets `BURST_RUNS_ON` to the host's own label, not `pantheonsim-burst`, so the jobs do not also go to
+`server1-sim` or `server2-*`; it sets `BURST_CONTAINER_OPTIONS`, `BURST_JOBS_MAX` and `BURST_MEM_LIMIT_GIB` for the host and
+`stop` puts all four back as they were. `start --no-route` brings the runners up without routing (for a check).
+A job queued before `start` keeps the label it had: cancel and re-run it, as in the section below. While the variable
+names the host's label and the runners are down, burst jobs wait: run `stop`.
+
+A slot of this size is smaller than a hosted runner (4 vCPUs, 16 GB): the ASan and TSan jobs, which took 30 to 40 minutes
+in their longest test on a hosted runner, would take longer here and may not fit 9 GB. Measure one before routing them.
+
 ## The burst pool is offline: recovery
 
 `scripts/ci-pool.sh` (read-only; `--queued` also counts waiting jobs) says
