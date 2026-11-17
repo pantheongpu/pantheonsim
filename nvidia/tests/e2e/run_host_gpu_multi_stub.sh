@@ -14,7 +14,7 @@
 #   8. peer access between devices 0 and 1 keeps their launches in the simulator (devices 2 and 3 still use their cards);
 #   9. a copy from a device with no card to one with a card (4 devices, 3 cards);
 #  10. exact mode serves device 0 only, on the driver's device 0, whatever the machine holds;
-#  11. the summary: one host_gpu_card line for each device after the first that used a card.
+#  11. the summary: one host_gpu_card line for each device that used a card.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -71,9 +71,10 @@ for d in 0 1 2 3; do
   has dp4 "ctx_retain $d"; has dp4 "launch on $d"; has dp4 "reserve $(win $d) on $d"; has dp4 "mem_create on $d for $d"; has dp4 "module_load on $d"
 done
 lacks dp4 "reserve $(win 1) on 0" "device 1's window was reserved on card 0"
-# 11. the summary (the first device's lines are the ones scripts read; each other device that used a card adds one).
+# 11. the summary (the first device's lines are the ones scripts read; with several devices each one that started a card adds a host_gpu_card line).
 n="$(grep -c '^host_gpu_card: ' "$work/dp4.err")"
-(( n == 3 )) || { echo "FAIL: expected 3 host_gpu_card lines (devices 1 to 3), got $n: $(grep -m4 '^host_gpu' "$work/dp4.err")"; fails=1; }
+(( n == 4 )) || { echo "FAIL: expected 4 host_gpu_card lines (one per device), got $n: $(grep -m4 '^host_gpu' "$work/dp4.err")"; fails=1; }
+grep -q '^host_gpu_card: device_slot=0 card=0 launches_card=3 ' "$work/dp4.err" || { echo "FAIL: device 0's summary line is wrong: $(grep '^host_gpu_card: device_slot=0' "$work/dp4.err")"; fails=1; }
 grep -q '^host_gpu_card: device_slot=2 card=2 launches_card=3 ' "$work/dp4.err" || { echo "FAIL: device 2's summary line is wrong: $(grep '^host_gpu_card: device_slot=2' "$work/dp4.err")"; fails=1; }
 # 2. four devices, two cards.
 run dp2 dp 4 2

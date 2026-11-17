@@ -1650,6 +1650,7 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal, int phys
         for (Runtime::Impl* im : g_other_impls) im->settle_start();
         g_summary_impl->settle_start();
         print_summary(g_summary_impl);
+        if (!g_other_impls.empty()) print_card_line(g_summary_impl);   // (with several devices the first has a line of its own too, so that the lines add up to the process)
         for (Runtime::Impl* im : g_other_impls) print_card_line(im);
       });
     } else {

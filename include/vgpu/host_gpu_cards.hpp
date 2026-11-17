@@ -139,7 +139,7 @@ inline CardPick pick_card(int slot, const std::vector<int>* list, const char* cv
 inline const char* card_why_text(CardWhy w) {
   switch (w) {
     case CardWhy::Ok: return "ok";
-    case CardWhy::NoCard: return "the real driver shows no card for it";
+    case CardWhy::NoCard: return "the machine has no card with its number";
     case CardWhy::Hidden: return "CUDA_VISIBLE_DEVICES keeps its card from the real driver";
     case CardWhy::ListShort: return "VGPU_HOST_GPU_DEVICES does not name it";
   }
