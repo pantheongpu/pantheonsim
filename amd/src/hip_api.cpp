@@ -1010,8 +1010,9 @@ void note_dispatch_stats(const Kernel& kernel, int ordinal, const vgpu::amd::Dis
     const int m = std::snprintf(line + n, sizeof line - static_cast<size_t>(n), fmt, args...);
     n = m < 0 ? m : n + m;
   };
-  append(" vmem_bytes_rd=%llu vmem_bytes_wr=%llu lds_bytes_rd=%llu lds_bytes_wr=%llu lds_bank_conflicts=%llu", u(c.vmem_bytes_rd),
-         u(c.vmem_bytes_wr), u(c.lds_bytes_rd), u(c.lds_bytes_wr), u(c.lds_bank_conflicts));
+  append(" vmem_bytes_rd=%llu vmem_bytes_wr=%llu lds_bytes_rd=%llu lds_bytes_wr=%llu lds_bank_conflicts=%llu vmem_lines_rd=%llu vmem_lines_wr=%llu",
+         u(c.vmem_bytes_rd), u(c.vmem_bytes_wr), u(c.lds_bytes_rd), u(c.lds_bytes_wr), u(c.lds_bank_conflicts), u(c.vmem_lines_rd),
+         u(c.vmem_lines_wr));
   append("%s", " mix=");
   bool any = false;
   for (int i = 1; i < static_cast<int>(vgpu::amd::gcn::Mix::Count); ++i)
@@ -1133,6 +1134,7 @@ hipError_t run_launch(const LaunchJob& job) {
                          std::max(static_cast<uint32_t>(d.profile().limits.multiprocessors) / dies, 1u)};
     }
     dispatch.count_lds_banks = dispatch_stats_target() != nullptr;   // (a profiler's counters do not offer it yet)
+    dispatch.count_lines = dispatch.count_lds_banks;
     if (prof) {
       launch.device = ordinal;
       launch.kernel_id = kernel_id(module, kernel);

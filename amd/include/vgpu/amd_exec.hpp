@@ -67,6 +67,8 @@ struct Dispatch {
   // Count LDS bank conflicts (InstructionCounts::lds_bank_conflicts): set where something reads them, because it costs a pass over every
   // lane's address on each LDS instruction.
   bool count_lds_banks = false;
+  // Count the cache lines vector memory accesses touch (InstructionCounts::vmem_lines_*), for the same reason.
+  bool count_lines = false;
   // The grid in work-items, where it is not a whole number of work-groups
   // (an HSA dispatch packet may ask for that; HIP never does): the last
   // work-group in a dimension then has only what is left over. Zero is a
@@ -162,6 +164,9 @@ struct InstructionCounts {
   // The passes through LDS's banks beyond the first an access needed (SQC_LDS_BANK_CONFLICT on RDNA2: vgpu/amd_memtraffic.hpp says
   // how and what was checked). Counted only when Dispatch::count_lds_banks is set, since it reads every lane's address: 0 otherwise.
   uint64_t lds_bank_conflicts = 0;
+  // The vector L1 cache lines the active lanes of global and flat accesses touch, reads and writes (an atomic counts as a write):
+  // MODELLED, not checked against a card (vgpu/amd_memtraffic.hpp). Counted only when Dispatch::count_lines is set: 0 otherwise.
+  uint64_t vmem_lines_rd = 0, vmem_lines_wr = 0;
 };
 
 // What a dispatch did, which is what a launch reports and what the tests
@@ -190,6 +195,7 @@ struct DispatchStats {
     c.vmem_rd += a.vmem_rd, c.vmem_wr += a.vmem_wr;
     c.vmem_bytes_rd += a.vmem_bytes_rd, c.vmem_bytes_wr += a.vmem_bytes_wr;
     c.lds_bytes_rd += a.lds_bytes_rd, c.lds_bytes_wr += a.lds_bytes_wr, c.lds_bank_conflicts += a.lds_bank_conflicts;
+    c.vmem_lines_rd += a.vmem_lines_rd, c.vmem_lines_wr += a.vmem_lines_wr;
     waves_lt16 += o.waves_lt16, waves_lt32 += o.waves_lt32, waves_lt48 += o.waves_lt48;
     waves_lt64 += o.waves_lt64, waves_eq64 += o.waves_eq64;
   }
@@ -204,6 +210,7 @@ struct DispatchStats {
     for (uint64_t& v : c.mops) v *= n;
     c.vmem_rd *= n, c.vmem_wr *= n;
     c.vmem_bytes_rd *= n, c.vmem_bytes_wr *= n, c.lds_bytes_rd *= n, c.lds_bytes_wr *= n, c.lds_bank_conflicts *= n;
+    c.vmem_lines_rd *= n, c.vmem_lines_wr *= n;
     waves_lt16 *= n, waves_lt32 *= n, waves_lt48 *= n, waves_lt64 *= n, waves_eq64 *= n;
   }
 };

@@ -2226,6 +2226,8 @@ target_compile_definitions(test_amd_gcn_memtraffic PRIVATE VGPU_SOURCE_DIR="${CM
 # LDS bank conflicts against what an RX 6800 and an RX 6700 XT counted, in the model and in the executor.
 vgpu_unit_test(test_amd_gcn_lds_banks amd/tests/unit/test_gcn_lds_banks.cpp)
 target_compile_definitions(test_amd_gcn_lds_banks PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+vgpu_unit_test(test_amd_gcn_cache_lines amd/tests/unit/test_gcn_cache_lines.cpp)
+target_compile_definitions(test_amd_gcn_cache_lines PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # rocprofiler-sdk's interface from a tool's side: the test is the tool, and
 # runs a HIP program through libamdhip64.
 add_executable(test_amd_rocprofiler amd/tests/unit/test_rocprofiler.cpp)
