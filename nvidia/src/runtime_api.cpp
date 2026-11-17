@@ -1344,10 +1344,11 @@ VGPU_EXPORT void** __cudaRegisterFatBinary(void* fatCubin) {
   State& s = st();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
   try {
+    // (before ensure_init: the simulated device, and with it the driver's start, may be created there; the program's identity for the history is the fatbins registered by then)
+    vgpu::hostgpu::note_program_image(fatCubin);
     ensure_init(s);
     auto rm = std::make_unique<RegisteredModule>();
     rm->fatbin = fatCubin;
-    vgpu::hostgpu::note_program_image(fatCubin);
     RegisteredModule* raw = rm.get();
     s.modules.push_back(std::move(rm));
     if (trace()) std::fprintf(stderr, "[vgpu][trace] __cudaRegisterFatBinary -> %p\n", (void*)raw);

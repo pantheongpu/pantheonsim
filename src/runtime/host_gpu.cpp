@@ -2080,6 +2080,19 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     }
     return false;
   }
+  // Program history (section 17): a kernel that failed on the card in an earlier run, or a program known to be shorter in the simulator than the driver's start. Asked before the kernel's
+  // verdict, which in turbo mode with FIT=1 starts the driver itself (the image the card runs is chosen on the card's architecture).
+  if (!forced && !im.verify) {
+    if (const char* h = im.hist_keeps(fn.name)) {
+      ++im.hist_kept;
+      ++im.stats.simulated;
+      if (logging()) {
+        im.last.kept = std::string("history: ") + h;
+        std::fprintf(stderr, "host_gpu: %s stays in the simulator: history: %s\n", fn.name.c_str(), h);
+      }
+      return false;
+    }
+  }
   const auto scan_t0 = std::chrono::steady_clock::now();
   Impl::Decision dec = im.kernel_eligible(fn, cfg, args, mem);
   if (logging()) im.log_scan_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - scan_t0).count();
@@ -2110,18 +2123,6 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
       std::fprintf(stderr, "host_gpu: %s stays in the simulator: %s\n", fn.name.c_str(), why);
     }
     return false;
-  }
-  // Program history (section 17): a kernel that failed on the card in an earlier run, or a program known to be shorter in the simulator than the driver's start.
-  if (!forced && !im.verify) {
-    if (const char* h = im.hist_keeps(fn.name)) {
-      ++im.hist_kept;
-      ++im.stats.simulated;
-      if (logging()) {
-        im.last.kept = std::string("history: ") + h;
-        std::fprintf(stderr, "host_gpu: %s stays in the simulator: history: %s\n", fn.name.c_str(), h);
-      }
-      return false;
-    }
   }
   // Turbo mode with VGPU_HOST_GPU_FIT=1 (the default): no performance rule is asked. The kernel passed the checks above and goes to the card when it fits
   // it (below); what the simulator would have taken is not looked for, nor the size of the launch, the start cost, the sample of its first blocks or
