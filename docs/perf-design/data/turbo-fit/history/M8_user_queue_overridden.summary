@@ -1,0 +1,2 @@
+unit rc=0 0 FAIL lines; first: 
+stub rc=1 1 FAIL lines; first: FAIL: turbo mode overrode the user's CUDA_DEVICE_MAX_CONNECTIONS: '1 (unset)'

@@ -1,0 +1,2 @@
+unit rc=1 1 FAIL lines; first: [ FAIL ] a_corrupt_file_is_a_miss_in_every_way_it_can_be_corrupt
+stub rc=1 1 FAIL lines; first: FAIL: a other history was not read as no history:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 3 cuFuncGetAttribute; 1 cuInit; 3 cuLaunchKernel; 1 cuMemAddressReserve; 1 cuMemcpyHtoD; 1 cuModuleLoadDat

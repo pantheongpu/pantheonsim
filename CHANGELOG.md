@@ -46,6 +46,13 @@ release says what runs and what it produces, never how fast a real GPU would run
   fused-multiply-add kernel on each: 31 s in the simulator, 20 s with turbo as before (one card), 0.93 s with four cards, same output; the time stays flat from 1 to 4 devices. Details, the measurements on the
   card (what a process can do with several cards) and the known limit (a read-back that waits for one card holds the shim's API lock): `docs/perf-design/12-host-gpu-turbo.md` section 19.
 
+
+- **Turbo host-GPU mode: a program history, a cheaper driver start, the driver's compile cache beside the history** (follows PR #693; [section 21](docs/perf-design/12-host-gpu-turbo.md)).
+  `VGPU_HOST_GPU_HISTORY=<directory>` (off by default) keeps a small checksummed record per program, card model and switch set: a program whose last run in the simulator took under half the driver's start stays in the simulator and never starts the driver
+  (Rodinia bfs 0.24 s to 0.014 s, HeCBench backprop 0.24 s to 0.013 s, attention 0.25 s to 0.036 s on an A10G), and a kernel that faulted on the card (error 700, 715 to 719) is kept in the simulator from its first launch (Rodinia srad_v2 0.37 s to 0.064 s). A first run leaves a candidate, the second runs in the simulator
+  as a bounded trial and leaves tiny or long, the third gains; a hold ends when the simulator has spent the start cost, or at a launch much larger than the record's. A missing, corrupt, foreign, stale or concurrently written file is no history; the record never changes a result; exact mode and `VGPU_HOST_GPU_FIT=0` never read it. Turbo mode also asks the driver for one work queue
+  (`CUDA_DEVICE_MAX_CONNECTIONS=1`, unless set: the driver's start and end cost about 0.24 s of every process, 0.155 s with it; turbo launches on one stream) and, with a history directory, keeps the driver's compile cache in `<directory>/cuda-cache` (PTX-only HeCBench s3d: 3.0 s of JIT on every run, 0.025 s with the cache). Unit test `test_host_gpu_history`
+  (corrupt, version, concurrent writers), stub steps 58 to 63, ten mutations each caught.
 - **Turbo host-GPU mode, next round: PTX retargeting, a driver start that overlaps the program's set-up, and the simulated profile's launch limits** (follows the turbo-fit round, PR #693).
   A module whose only PTX is plain `.target sm_90` (a build with `-arch=sm_90` or `compute_90` alone) now runs on an sm_80, sm_86 or sm_87 card: its target line is rewritten to
   the card's and the driver compiles it, provided the PTX uses no form that card lacks (a text scan of the forms ptxas 13.0 rejects there: `mbarrier.try_wait`, `expect_tx`, count-form

@@ -276,11 +276,11 @@ uint64_t decision_env_hash() {
   for (const std::string& s : v) h.text(s + "\n");
   return h.h;
 }
-// Turbo mode runs every card launch on the null stream, one at a time, so the driver's work queues (CUDA_DEVICE_MAX_CONNECTIONS, 8 by default [documented]) are not used for
-// concurrency, and creating and tearing them down is most of the driver's fixed cost: on an A10G (driver 595) cuDevicePrimaryCtxRetain took 95 ms with the variable unset, 47 ms with
-// 1, and a whole bfs process 0.24 s against 0.155 s [measured, docs section 17.3]. Set to 1 when turbo is selected, unless the user has set it (the driver reads it at its first call,
-// which is why this runs when the library loads, before main: setenv from a later thread could race the program's own getenv calls). Children of the process inherit it. [inferred: no
-// effect on results, the launches are serialised by the mode's gate; every output of the benchmark programs equalled the simulator's with it set, section 17.3]
+// Turbo mode runs every card launch on the null stream, one at a time, so the driver's work queues (CUDA_DEVICE_MAX_CONNECTIONS) are not used for concurrency, and creating and tearing them
+// down is most of the driver's fixed cost: on an A10G (driver 595) a bfs process took 0.24 s with the variable unset, 0.155 s with 1 (0.175 with 2, 0.21 with 4, 0.28 with 8, 0.76 with 32), of
+// which cuDevicePrimaryCtxRetain 95 ms against 47 ms [measured, docs section 17.3]. Set to 1 when turbo is selected, unless the user has set it (the driver reads it at its first call, which is
+// why this runs when the library loads, before main: setenv from a later thread could race the program's own getenv calls). Children of the process inherit it. [inferred: no effect on
+// results, the launches are serialised by the mode's gate; every output of the benchmark programs equalled the simulator's with it set, section 17.3]
 __attribute__((constructor)) void tune_driver_environment() {
   const char* m = std::getenv("VGPU_HOST_GPU");
   if (!m || std::string(m) != "turbo" || std::getenv("CUDA_DEVICE_MAX_CONNECTIONS")) return;

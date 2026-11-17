@@ -1093,3 +1093,114 @@ origin of this branch (cd30dd20) and 6.3 to 6.4 s on this one; turbo 0.46 to 0.4
 * NCCL-style collectives and torch DDP were not run; a peer pointer reached through memory ends the process (17.3). [U]
 * A mixed machine (cards of different architectures: each runtime has its own `host_sm`, the module images are chosen per card) is untested on real hardware; the unit tests cover the choice only. [U]
 * Not run on a card of another architecture than sm_75; only the four T4s were available this round.
+
+
+
+## 21. Program history, the driver's compile cache, and the fixed cost of a turbo process (2026-11-17)
+
+Tags: [M] measured on one A10G (sm_86, 80 SMs, driver 595.112, CUDA 13.0 toolkit, native Linux, g5.xlarge, 4 vCPUs, `VGPU_THREADS=4`, profile a10g unless said); [D] documented; [I] inferred; [U] unknown. Rows and raw
+outputs: [data/turbo-fit/history-results.md](data/turbo-fit/history-results.md). Wall times are medians of 5 runs (3 for FDTD-2D and LU), the runs of the forms interleaved.
+
+What this section answers: with `VGPU_HOST_GPU_FIT=1` the card's driver starts in every process (section 16.2), 0.15 to 0.24 s of wall time whatever the program is. A program whose whole simulation takes 14 ms (Rodinia bfs) pays 0.24 s, and
+Rodinia srad_v2, whose kernel faults on the card (error 700) and ends the mode, pays 0.44 s for a launch the simulator runs in 0.06 s. Three things were looked at: a record of what earlier runs of the same program learned (17.1), the driver's own compile cache
+for retargeted PTX (17.2), and where the 0.24 s of a process goes (17.3).
+
+### 17.1 Program history (`VGPU_HOST_GPU_HISTORY`) [M, the rule fitted on 45 programs of the corpus]
+
+**Opt-in, off by default.** `VGPU_HOST_GPU_HISTORY=<directory>` (or `1`: `$XDG_CACHE_HOME/pantheonsim/host-gpu-history`, else `~/.cache/pantheonsim/host-gpu-history`). Why not on by default: a simulator that writes files nobody asked for is a surprise on a
+read-only home or an ephemeral runner; a record can only ever be right about the program, the profile and the card it was made on; and what it saves is one start of the driver (0.1 to 0.2 s) per short program. Exact mode and `VGPU_HOST_GPU_FIT=0` never read or write it; neither does
+`VGPU_HOST_GPU_VERIFY`. **It decides where a launch runs, never what it computes.** A missing, stale, corrupt, foreign, oversized or concurrently written file is read as no history, and the process then does what it did before (unit and stub tests below).
+
+*The key* (16 hex digits, one file `<key>.hist` per key, so unrelated programs never contend): a hash of the fatbins the program registered (nvcc's `__cudaRegisterFatBinary`, before `main`: the program's identity is known before any module is loaded, which is when the driver would
+start; a program that loads its modules through the driver API after its device exists has no key and no history), the simulated profile (id, compute capability, SM count), the card model (the NVIDIA display devices' PCI vendor and device ids from sysfs, and the kernel module's version line from
+`/proc/driver/nvidia/version` when it exists: read without the driver, which is the point; no id of a particular host, and a machine whose sysfs shows no NVIDIA device has no history), the mode (`turbo-fit`) and every `VGPU_HOST_GPU_*` setting except the ones that only say where to write or what to print (`HISTORY*`, `LOG`, `PRESTART`, `LIBCUDA`,
+`PROC_VERSION`), and the file format's version. The input of the program is not in the key (see the limits). `VGPU_HOST_GPU_HISTORY_CARD=<text>` stands in for the card model (tests, hosts with no sysfs entry).
+
+*The file* (`include/vgpu/host_gpu_history.hpp`, at most 16 KiB, a text record): version, key, runs, a verdict (unknown, candidate, tiny, long), totals of the last run, and up to 48 kernels with launches, the largest launch's threads, the seconds on the card and in
+the simulator, whether a launch came back from the card, whether it failed there, and whether its code has a loop; a checksum over every byte before it. Written to a temporary file of its own name and renamed over the key's file (a reader sees the old file or the new, never half of one; two writers leave one of their
+records); re-read just before the write, so a record another process wrote meanwhile is the one updated; the directory keeps at most 256 history files (the oldest by modification time are removed), and temporary files older than an hour. Nothing in it identifies the host or the user.
+
+*What a process does with a record* (`decide_start`, `update`):
+* **A kernel that failed on the card** (error 700, 715 to 719: an illegal address, instruction, misaligned or invalid-address-space access, an invalid pc or a launch failure [D: the driver's error list]) is noted at once, and is kept in the simulator from its first launch in every later run (`host_gpu: ... stays in the simulator: history: this kernel failed on the card in an earlier run`). If every kernel the record knows failed and none came back, the driver is not started with the device either (a kernel the
+  record does not know starts it when it is launched). srad_v2: 0.37 s to 0.064 s, simulator 0.063 s.
+* **A program known to be shorter in the simulator than the driver's start.** The process stays in the simulator (the driver is not started with the device, and the verdict of a kernel, which in turbo mode with FIT=1 starts the driver itself to know the card's architecture, is not asked) until the simulator has spent the budget (`VGPU_HOST_GPU_START_COST`, 0.25 s) in launches, or a launch is of a kernel the record knows
+  to take that long per launch, or of more than twice the threads of the record's largest launch (another input): then the driver starts and the process is turbo as before (a launch cannot be stopped, so the loss of a wrong record is at most one launch more than the budget). The record's verdict says *tiny* when a run that stayed in the simulator observed less simulator time than half the start (0.125 s),
+  *long* when it observed more or gave up; a tiny record keeps the next runs in the simulator and is re-observed each time. The simulator seconds are those of the launches (the host's own work is the same in both worlds).
+* **A first run has no simulator time to observe**, because it ran on the card. It leaves a *candidate* when the card path took under 5 ms in at most 512 launches, no kernel failed, the kernels without a loop total at most 4e8 threads x static instructions, and no launch of a kernel with a loop is larger than 8,192 threads; the second run is then the trial (in the simulator, bounded as above) that
+  observes the simulator, and leaves tiny or long. So the third run is the first to gain; the second gains too when the trial was right.
+
+*Why the rule has the loop clause* [M]: the card seconds do not say how long the simulator needs (simulator seconds over card-path seconds, 174 rows of the earlier rig runs: median 158, up to 4,219 for HeCBench aidw and 2,115 for bilateral). A first rule (card path under 3 ms, at most 131,072 threads) made aobench (1 ms on the card, 0.71 s in the simulator), bilateral (0.9 ms, 1.47 s) and GEMM (1.7 ms, 0.74 s) candidates, and their trial run cost 0.47, 0.52 and 0.21 s more than turbo
+once. Static instruction counts did not separate them either (lavaMD 1e7 threads x instructions took 1.5 s, adam 6e6 took 28 ms): what did is whether the kernel has a loop and how many threads it runs. With the rule as it is, none of the five programs tried that way (aobench, bilateral, lavaMD, perplexity, bh) became a candidate and none lost anything. The rule is a measured heuristic, not a bound: a kernel of few threads with a long loop and a card
+path under 5 ms passes it, and the trial then costs the simulator's time for one launch (once per key); [U] how often that happens outside this corpus.
+
+*Measured* (a10g profile; wall seconds; "before" is turbo with the driver's own work-queue count and no history, "turbo" is turbo with no history after 17.3, "run 1/2/3" are the first three runs with a fresh history directory; sim is the mode off):
+
+| program | sim | before | turbo | run 1 | run 2 | run 3 | kept by the history |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Rodinia bfs | 0.014 | 0.240 | 0.175 | 0.176 | 0.014 | 0.014 | tiny after run 2 |
+| HeCBench backprop-cuda | 0.013 | 0.239 | 0.177 | 0.176 | 0.013 | 0.013 | tiny |
+| HeCBench attention | 0.035 | 0.246 | 0.183 | 0.183 | 0.036 | 0.036 | tiny |
+| Rodinia srad_v2 | 0.063 | 0.443 | 0.374 | 0.373 | 0.064 | 0.064 | its kernel faulted on the card |
+| HeCBench atan2 | 0.029 | 0.245 | 0.186 | 0.182 | 0.181 | 0.182 | not a candidate (loop kernel, 100,096 threads) |
+| PolyBench 2DCONV | 0.939 | 0.746 | 0.727 | 0.724 | 0.725 | 0.724 | no |
+| PolyBench ATAX | 1.091 | 0.321 | 0.256 | 0.259 | 0.260 | 0.259 | no |
+| PolyBench GEMM | 0.740 | 0.559 | 0.455 | 0.466 | 0.468 | 0.462 | no (a loop kernel on 262,144 threads) |
+| PolyBench FDTD-2D (no sim run) | - | 4.257 | 4.205 | 4.167 | 4.181 | 4.185 | no |
+| PolyBench LU (no sim run) | - | 1.052 | 0.957 | 0.937 | 1.005 | 0.971 | no |
+
+The cost of the history itself: run 1 against the same program with no history is +0.000 to +0.011 s (bfs 0.176 against 0.175, ATAX 0.259 against 0.256, GEMM 0.466 against 0.455, srad_v2 0.373 against 0.374: inside the spread of three to five runs; under strace the read, the temporary file, the rename and the directory scan lie within 3 ms); a held run
+against the simulator with the mode off: bfs 0.014 against 0.014, backprop-cuda 0.013 against 0.013, attention 0.036 against 0.035 (under 1 ms). Output: every run of every program above that has a simulator run printed what the simulator printed (the programs' own timing lines apart); the record changes no result by construction (it chooses a side) and by test (below).
+The programs not captured (atan2, nn, adam, bgmv, blockAccess: 14 to 37 ms in the simulator) are the price of the loop clause; a program with long loops and few threads is not told apart from them by anything the first run sees [U].
+
+*Limits.* The key does not contain the program's input: a program that is tiny on one input and long on another has one record; a launch of more than twice the recorded threads ends a hold, and the budget ends it otherwise, so a wrong record costs at most a start's worth of simulator time plus one launch, and turns into *long* (which is then not retried). A record made on one card is not used on another (the card model is in the key); one made with one `VGPU_THREADS` is
+used with another (the simulator seconds scale with it, and a tiny program at 4 threads is tiny at 1: [I] not measured). A host that wipes its cache directory between jobs gets no gain (the first run of each job is run 1); keep the directory (a CI cache of `VGPU_HOST_GPU_HISTORY`'s path) to get it.
+
+### 17.2 The driver's compile cache for retargeted PTX [M]
+
+The cost section 16.3 named ("GEMM built as PTX only spent 2.5 s of card time on the first launch") was measured again, with PolyBench GEMM, ATAX and a large module (HeCBench s3d, 54 kernels, built as PTX only for compute_90, run on the h100 profile on the A10G card, so the PTX is retargeted and compiled by the driver):
+* The driver's default cache is `~/.nv/ComputeCache` (it existed on the rig; `CUDA_CACHE_PATH`, `CUDA_CACHE_DISABLE`, `CUDA_CACHE_MAXSIZE` were unset). With it, the second process is as fast as the first without any JIT: s3d 3.82 s to 0.85 s of wall time (card path 3.0 s to 0.025 s), GEMM 0.60 s (a first run in a fresh directory) to 0.53 s. A fresh `CUDA_CACHE_PATH` directory behaves like an empty
+  default cache (first run compiles, the second hits; 2.9 MB for s3d); `CUDA_CACHE_DISABLE=1` compiles every time (s3d 4.17 and 3.82 s of wall time, 3.28 and 3.02 s on the card).
+* **The 2.5 s of GEMM was mostly not the compile.** With the page cache warm and the cache disabled GEMM's compile is 21 ms on the card path (0.023 s), a cache hit 1.8 ms; after `drop_caches` 0.171 s (the driver's JIT library read from disk), and a cache hit then 6.5 ms. The first run of a fresh rig took 3.9 s of wall time: the first read of the driver's files from a new EBS volume [I: first-touch of a volume made from a snapshot; not isolated]. The compile
+  is expensive for a large module (s3d: 3.0 s), and that is where the cache pays.
+* `CUDA_CACHE_MAXSIZE=4096` (bytes) turned the cache off in effect (GEMM: second run no faster); the default maximum was not reached by anything measured [U: its value on this driver].
+* What survives on an ephemeral runner: nothing of `~/.nv` unless the runner's home persists (a runner that is started per job loses it with the instance) [I].
+
+*Implemented, because the numbers justify it* (3.0 s against 0.025 s for a large module on every run after the first): when `VGPU_HOST_GPU_HISTORY` names a directory and neither `CUDA_CACHE_PATH` nor `CUDA_CACHE_DISABLE` is set, the driver's cache goes to `<directory>/cuda-cache`, so that the one directory a runner is told to keep carries both. Never over a setting of the user's (stub step 63); the variable is set before the driver's first call, in the process's environment (children
+inherit it). Without a history directory nothing changes; `CUDA_CACHE_MAXSIZE` is not touched (nothing measured needed it).
+
+### 17.3 Where the 0.24 s of a turbo process goes, and one cheap win [M]
+
+Rodinia bfs, a10g profile: the mode off 0.014 to 0.016 s; native 0.24 s (the real runtime, no simulator); turbo 0.24 s (`VGPU_HOST_GPU_PRESTART=0` 0.245 s: the prestart hides nothing for a program with no set-up). A standalone program that makes the driver's calls in the order of `begin_start` (libcuda opened with and without `RTLD_DEEPBIND`; three runs each, the spread under 5 ms):
+
+| step | ms |
+|---|---:|
+| `dlopen` of libcuda | 1.5 |
+| `cuInit` | 48 |
+| `cuDeviceGet`, twelve `cuDeviceGetAttribute` | 0.0 |
+| `cuDevicePrimaryCtxRetain` | 92 to 98 |
+| `cuMemGetInfo`, `cuMemAddressReserve` of 1 TiB at the simulator's base | 0.0 |
+| inside the program | 141 to 149 |
+| the whole process, wall | 234 to 242 |
+
+So the driver start is 0.145 s, and about 0.09 s more is the process's end: the wall time of the standalone program is 0.09 s longer than its calls, and under strace the last thread of a process that used the card exits 85 to 90 ms after `exit_group` (the driver's context is torn down when the device files are closed) [M for the gap, I for its cause]. Native pays the same two things, which is why native and turbo are both 0.24 s: **the fixed cost of a turbo process is the driver's, and the mode adds nothing measurable to it** (the library
+load is 1 to 4 ms in both, the 1 TiB reservation costs nothing, the module load and first launch are inside the program's 14 ms). Not affecting it [M, 3 runs each]: `CUDA_MODULE_LOADING` LAZY or EAGER (cuDevicePrimaryCtxRetain 91 to 98 ms either way), `CUDA_CACHE_DISABLE`, `CUDA_VISIBLE_DEVICES`, and the driver's persistence mode (`nvidia-smi -pm`: 141 to 151 ms of calls with it off, 142 to 147 ms with it on).
+
+**What did: the driver's work queues.** `CUDA_DEVICE_MAX_CONNECTIONS` (the number of hardware work queues the driver sets up for the context [D]) changes both the context's creation and its teardown. Rodinia bfs under turbo, six runs each, wall seconds: unset 0.232 to 0.245, 1 0.148 to 0.162, 2 0.170 to 0.185, 4 0.204 to 0.216, 8 0.274 to 0.281, 32 0.751 to 0.773; `cuDevicePrimaryCtxRetain` 95 ms unset, 47 ms with 1. Turbo sends every card launch on the null stream, one at a time under the launch gate, so it does not use the queues for concurrency [I]. **Implemented:** when turbo is
+selected (`VGPU_HOST_GPU=turbo`, FIT=0 or 1) and the variable is unset, the library sets it to 1 when it loads (before `main`: a `setenv` from a later thread could race the program's own `getenv`); a value the user set, an empty one included, is left alone (an empty value is how to get the driver's own count back); exact mode is untouched (stub step 63). The processes' children inherit it, which only matters to a child that runs the real CUDA with several streams.
+Effect on the table of 17.1: turbo bfs 0.240 to 0.175 s, ATAX 0.321 to 0.256, GEMM 0.559 to 0.455, atan2 0.245 to 0.186, aobench 0.244 to 0.176, bilateral 0.333 to 0.277 (a 0.06 to 0.1 s gain in every process that starts the driver), FDTD-2D 4.257 to 4.205 s. Outputs: the 13 programs of the tables that have a simulator run printed what the simulator printed in every run (the programs' timing lines apart; `VGPU_HOST_GPU_VERIFY` was not rerun with it: [U] whether any program that depends on stream concurrency of the real
+device exists in the corpus; the mode's launches are serialised either way).
+
+What is left of the 0.24 s is the driver's start and the process's end. A persistent process that owns the card context (a daemon the simulator connects to) would remove both for every run after the first; a large change, not built [U: its cost per launch].
+
+### 17.4 Tests, and what they pin
+
+* `tests/unit/test_host_gpu_history.cpp` (20 tests, no card; wired into ctest as `test_host_gpu_history`): the record's life (miss, the candidate that a trial makes tiny or long, a hold given up at its budget, a kernel that failed is kept out for good, the bounds of a candidate, a launch much larger than the record's), the file (a record through the file and back; a hit and a miss; a directory made on demand; **corrupt**: every truncation and every byte flipped of a good file, junk, an empty file, an oversized file, a record of another key, a directory or a symlink in its place, a checksummed file with a malformed field; **a version that changed** is a miss and is overwritten; **four writers and a reader** at once leave whole records of one writer, never a mixture, and no temporary file behind; the directory stays under its bound; a stale temporary file is cleaned and a fresh one is not touched), the variable's forms, the hash.
+* `nvidia/tests/e2e/run_host_gpu_stub.sh` steps 58 to 63 (stand-in driver, no card): no variable, no file; the first run starts the driver and leaves a candidate, the second runs in the simulator with the driver untouched and leaves tiny, the third the same; a hold gives up at its budget (`VGPU_HOST_GPU_START_COST=0.00001`: the driver starts, the later launches reach the card, the record says long, the next run starts the driver again); a kernel that failed with error 700 on the stand-in is kept in the simulator, driver unstarted, from its first launch in the next run; junk, a truncated file, another key's file and a directory in the file's place are no history (the driver starts as before) and the output is
+  unchanged; exact mode and FIT=0 neither read nor write; the queue count and the compile cache path the stand-in driver reads at `cuInit` (it writes them beside its call log): turbo sets 1 and `<directory>/cuda-cache`, a user's value is kept, `CUDA_CACHE_DISABLE=1` is respected, exact mode sets nothing.
+* Mutations (each alone, rebuilt, the unit test and steps 58 to 63 run on the rig; every one fails; outputs in the data directory): M1 a tiny record never holds (unit + stub), M2 a fault is forgotten (unit + stub), M3 the checksum is not checked (unit), M4 a hold is never given up (stub), M5 the tiny boundary `<` made `<=` (unit), M6 a fault is not sticky (unit), M7 the key inside a file is not checked (unit + stub), M8 turbo overrides the user's work-queue count (stub),
+  M9 exact mode sets it too (stub), M10 the user's `CUDA_CACHE_PATH` is overridden (stub).
+
+### 17.5 Known limits
+
+The gains need the record: a first run, a run after the record's key changed (another build of the program, another card, another switch), and a run on a machine that does not keep the directory are as slow as turbo. A second run may be a trial that loses (17.1: bounded, once per key, and none lost on the five programs tried that way). The candidate rule misses short programs with loops. Programs that load modules through the driver API
+have no key. The candidate/long judgement ignores the input. `VGPU_THREADS` is not in the key. WSL2 hosts have no turbo FIT=1 (section 15), so no history. The work-queue setting applies to every turbo process that finds the variable unset, a user's own setting is the way out.

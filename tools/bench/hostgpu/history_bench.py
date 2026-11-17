@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Program history A/B for turbo mode (docs/perf-design/12-host-gpu-turbo.md section 17), on a machine with the card.
 
-Per program and repetition, interleaved: native (the real runtime), sim (the mode off), turbo (VGPU_HOST_GPU=turbo, no history), then the first, second and third run
+Per program and repetition, interleaved: native (the real runtime), sim (the mode off), turbo_old (turbo with the driver's own work-queue count, as before section 17.3), turbo (VGPU_HOST_GPU=turbo, no history), then the first, second and third run
 with VGPU_HOST_GPU_HISTORY pointing at a directory made fresh for the repetition.  Median wall seconds over --runs repetitions.  One untimed run of each history form with
 VGPU_HOST_GPU_LOG=1 gives the history line (what the record said before and after, held/released) and the exit status.  Output text is compared with the sim run's
 (timing lines dropped, as run.py does).
@@ -38,7 +38,7 @@ def main():
     ap.add_argument("--corpora", default="polybench,rodinia,hecbench")
     ap.add_argument("--card", default="")   # VGPU_HOST_GPU_HISTORY_CARD for a run that has no sysfs
     ap.add_argument("--native-ld", default="/usr/local/cuda-13.0/lib64")
-    ap.add_argument("--forms", default="native,sim,turbo,hist1,hist2,hist3")   # leave sim out for a program the simulator needs minutes for
+    ap.add_argument("--forms", default="native,sim,turbo_old,turbo,hist1,hist2,hist3")   # leave sim out for a program the simulator needs minutes for
     ap.add_argument("--json", required=True)
     a = ap.parse_args()
     progs = real.manifest(os.path.abspath(a.corp), a.corpora.split(","))
@@ -65,6 +65,8 @@ def main():
                     else:
                         if f != "sim":
                             env["VGPU_HOST_GPU"] = "turbo"
+                        if f == "turbo_old":   # the driver's own work-queue count, as before section 17.3 (an empty value is the user's setting: turbo leaves it alone)
+                            env["CUDA_DEVICE_MAX_CONNECTIONS"] = ""
                         if f.startswith("hist"):
                             env["VGPU_HOST_GPU_HISTORY"] = hdir
                             if a.card:

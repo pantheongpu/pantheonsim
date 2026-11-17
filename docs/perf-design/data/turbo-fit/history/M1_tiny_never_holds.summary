@@ -1,0 +1,2 @@
+unit rc=1 1 FAIL lines; first: [ FAIL ] the_first_short_card_run_makes_the_program_a_candidate_and_the_simulator_run_confirms_it
+stub rc=1 2 FAIL lines; first: FAIL: history run 3 changes the output of fit tiny
