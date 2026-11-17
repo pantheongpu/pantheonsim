@@ -2871,4 +2871,75 @@ VTEST(with_the_driver_up_a_whole_launch_over_the_floor_stands_in_for_the_static_
   VCHECK(sample_refusal(g, c, up100) == NoSample::ShortBefore);
 }
 
+// The scan's shortcuts (pantheonsim #662) must give what the plain code gave.
+VTEST(exact_mnemonic_lookup_is_the_name_list) {
+  static const char* const kNames[] = {"IMAD", "IADD3", "IADD", "LOP3", "LOP", "LEA", "SHF", "SHL", "SHR", "ISETP", "IMNMX", "IABS", "POPC", "FLO", "BREV", "PRMT",
+      "SEL", "MOV", "R2P", "P2R", "PLOP3", "UPLOP3", "PSETP", "ISET", "FSET", "DSET", "I2I", "I2IP", "SGXT", "BMSK", "VIADD", "VIMNMX", "FADD", "FMUL", "FFMA",
+      "FSETP", "FSEL", "FMNMX", "DADD", "DMUL", "DFMA", "DSETP", "DMNMX", "I2F", "I2FP", "F2I", "F2F", "F2FP", "FRND", "FCHK", "LDG", "STG", "LDS", "STS", "LDL",
+      "STL", "LD", "ST", "LDC", "ULDC", "S2R", "S2UR", "CS2R", "UMOV", "UIADD3", "UIMAD", "ULOP3", "USHF", "ULEA", "UISETP", "USEL", "UPRMT", "UFLO", "UPOPC",
+      "UP2UR", "R2UR", "VOTEU", "BRA", "BRX", "BSSY", "BSYNC", "BREAK", "BMOV", "EXIT", "NOP", "YIELD", "WARPSYNC", "BAR", "MEMBAR", "ERRBAR", "DEPBAR", "CCTL",
+      "SHFL", "VOTE", "MATCH", "RED"};
+  std::set<std::string> names(std::begin(kNames), std::end(kNames));
+  for (const std::string& n : names) {
+    VCHECK(exact_mnemonic_allowed(n));
+    // what is not a name: a prefix, a longer name, another case, the name with a letter more or fewer
+    VCHECK(names.count(n + "X") || !exact_mnemonic_allowed(n + "X"));
+    VCHECK(names.count(n.substr(0, n.size() - 1)) || !exact_mnemonic_allowed(n.substr(0, n.size() - 1)));
+    VCHECK(!exact_mnemonic_allowed(n + "ABCDEFGHI"));
+    std::string low = n;
+    for (char& c : low) c = static_cast<char>(c | 0x20);
+    VCHECK(!exact_mnemonic_allowed(low));
+  }
+  VCHECK(!exact_mnemonic_allowed(""));
+  VCHECK(!exact_mnemonic_allowed("MUFU") && !exact_mnemonic_allowed("ATOM") && !exact_mnemonic_allowed("HMMA") && !exact_mnemonic_allowed("TEX"));
+}
+
+VTEST(undecoded_modifier_by_its_parts) {
+  VCHECK(!mods_undecoded({}));
+  VCHECK(!mods_undecoded({"", "F32.FTZ.RN", "U32"}));
+  VCHECK(mods_undecoded({"(9)"}));
+  VCHECK(mods_undecoded({"U32", "F32.(3)"}));
+  VCHECK(mods_undecoded({"E.(0).X"}));
+  VCHECK(!mods_undecoded({"E(0)"}));   // (not the start of a part)
+}
+
+VTEST(reachable_back_edge_is_what_a_loop_needs) {
+  const auto flow = [](std::initializer_list<std::pair<int64_t, bool>> l) {   // (target, falls through)
+    std::vector<FlowInsn> v;
+    for (const auto& [t, f] : l) {
+      FlowInsn x;
+      x.target = t;
+      x.falls_through = f;
+      v.push_back(x);
+    }
+    return v;
+  };
+  // the compilers' kernel: work, EXIT, and a branch to itself nothing reaches
+  auto tail = flow({{-1, true}, {-1, true}, {-1, false}, {3, false}});
+  VCHECK(!has_reachable_back_edge(tail) && !code_has_loop(tail));
+  // a counted loop: body, back branch (conditional), EXIT
+  auto loop = flow({{-1, true}, {-1, true}, {1, true}, {-1, false}});
+  VCHECK(has_reachable_back_edge(loop) && code_has_loop(loop));
+  // a branch to itself the entry reaches
+  auto spin = flow({{-1, true}, {1, false}});
+  VCHECK(has_reachable_back_edge(spin) && code_has_loop(spin));
+  // random flows: with no reachable back edge there is no cycle, and no loop to follow
+  std::mt19937 rng(7);
+  for (int round = 0; round < 3000; ++round) {
+    const size_t n = 1 + rng() % 10;
+    std::vector<LoopCodeInsn> lc(n);
+    std::vector<FlowInsn> f(n);
+    for (size_t i = 0; i < n; ++i) {
+      f[i].target = rng() % 3 ? static_cast<int64_t>(rng() % n) : -1;
+      f[i].falls_through = rng() % 2;
+      lc[i].flow = f[i];
+    }
+    if (!has_reachable_back_edge(f)) {
+      VCHECK(!code_has_loop(f));
+      VCHECK(find_probe_loops(lc).empty());
+    }
+    if (code_has_loop(f)) VCHECK(has_reachable_back_edge(f));
+  }
+}
+
 VTEST_MAIN

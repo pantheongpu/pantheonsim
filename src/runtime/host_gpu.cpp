@@ -183,9 +183,12 @@ bool quiet() {
   const char* q = std::getenv("VGPU_QUIET");
   return q && *q && *q != '0';
 }
-bool logging() {
-  const char* q = std::getenv("VGPU_HOST_GPU_LOG");
-  return q && *q && *q != '0';
+bool logging() {   // (read once: every launch asks several times, and a getenv is a scan of the environment)
+  static const bool on = [] {
+    const char* q = std::getenv("VGPU_HOST_GPU_LOG");
+    return q && *q && *q != '0';
+  }();
+  return on;
 }
 // VGPU_HOST_GPU_LOG=2: also the SASS text of a kernel the exact set refuses for an SFU instruction (to read what the instruction is part of).
 bool logging_code() {
@@ -194,6 +197,9 @@ bool logging_code() {
 }
 
 }  // namespace
+
+// The index of the instruction at pc (decoded with pc = 16 * index), or -1.
+static int64_t code_index(int64_t pc, size_t count) { return pc >= 0 && pc % 16 == 0 && static_cast<uint64_t>(pc) / 16 < count ? pc / 16 : -1; }
 
 struct Runtime::Impl : CardGate {
   Api api;
@@ -764,6 +770,7 @@ struct Runtime::Impl : CardGate {
       v.why = why;   // (before the reason was kept, a later launch of such a kernel was said, and counted, as "not in the exact set")
     }
     ClassMask classes = 0;
+    bool indirect = false;   // a jump through a register, a call or a return, or a branch to nowhere in the code (the flow's `indirect`)
     std::string first_never, first_gated;   // the text of the first instruction of no class, and of the first one a switch refuses
     if (ok) {
       const sass::Code& code = m.code[ci->second];
@@ -780,9 +787,16 @@ struct Runtime::Impl : CardGate {
         const uint64_t code_lo = sec.count ? sec.instr(0).pc : 0, code_hi = sec.count ? sec.instr(sec.count - 1).pc : 0;
         for (size_t i = 0; i < sec.count; ++i) {
           const sass::Instr& ins = sec.instr(i);
-          if (own && ins.op == sass::Op::BRA)
+          if (own && ins.op == sass::Op::BRA) {
+            int64_t label = -1;
             for (const auto& o : ins.src)
-              if (o.kind == sass::Kind::Label) branches.emplace_back(ins.pc, static_cast<uint64_t>(o.imm));
+              if (o.kind == sass::Kind::Label) {
+                branches.emplace_back(ins.pc, static_cast<uint64_t>(o.imm));
+                label = o.imm;
+              }
+            indirect = indirect || code_index(label, code.count) < 0;
+          }
+          indirect = indirect || (own && (ins.op == sass::Op::BRX || ins.op == sass::Op::CALL || ins.op == sass::Op::RET));
           InsnClass c = turbo_class(ins.mnemonic, ins.mods);
           if (ins.op == sass::Op::CALL && c == InsnClass::Call) {
             // A call that leaves the section runs code this scan has to see. Three kinds are followed: a relative call inside the section; the absolute
@@ -812,7 +826,9 @@ struct Runtime::Impl : CardGate {
       // The exact set's scan; the idioms (VGPU_HOST_GPU_DIV, VGPU_HOST_GPU_SQRT) are checked once, at the first instruction outside the set that one of them
       // could explain.
       bool idiom_checked = false, idiom_ok = false;
-      for (size_t i = 0; i < code.count && ok; ++i) {
+      // (turbo mode admits a kernel its classes admit, in the exact set or not: the scan could only change what exact mode says)
+      const bool exact_needed = !turbo || turbo_refusal(classes, sw) != TurboRefusal::None;
+      for (size_t i = 0; i < code.count && ok && exact_needed; ++i) {
         const sass::Instr& ins = code.instr(i);
         if (!exact_opcode_allowed(ins.mnemonic, ins.mods)) {
           if ((div_idiom || sqrt_idiom) && (ins.op == sass::Op::MUFU || ins.op == sass::Op::CALL || ins.op == sass::Op::RET)) {
@@ -892,10 +908,8 @@ struct Runtime::Impl : CardGate {
     v.back_edge = has_back_edge(branches);
     if (runnable_here) {
       const sass::Code& code = m.code[ci->second];
-      std::map<uint64_t, int64_t> index_of;
-      for (size_t i = 0; i < code.count; ++i) index_of[code.instr(i).pc] = static_cast<int64_t>(i);
-      std::vector<FlowInsn> flow(code.count);
-      for (size_t i = 0; i < code.count; ++i) {
+      std::vector<FlowInsn> flow(v.back_edge ? code.count : 0);   // (no back edge: a loop is only an indirect jump, which the class scan saw)
+      for (size_t i = 0; i < flow.size(); ++i) {
         const sass::Instr& ins = code.instr(i);
         const bool always = ins.guard == sass::kPT;
         if (ins.op == sass::Op::BRA) {
@@ -905,9 +919,8 @@ struct Runtime::Impl : CardGate {
             if (o.kind == sass::Kind::Label) label = o.imm;
             else other = true;
           }
-          const auto it = index_of.find(static_cast<uint64_t>(label));
-          if (label < 0 || it == index_of.end()) flow[i].indirect = true;
-          else flow[i].target = it->second;
+          if (const int64_t to = code_index(label, code.count); to < 0) flow[i].indirect = true;
+          else flow[i].target = to;
           flow[i].falls_through = !always || other;
         } else if (ins.op == sass::Op::BRX || ins.op == sass::Op::CALL || ins.op == sass::Op::RET) {
           flow[i].indirect = true;
@@ -915,9 +928,10 @@ struct Runtime::Impl : CardGate {
           flow[i].falls_through = !always;
         }
       }
-      v.loop = code_has_loop(flow);
+      const bool cycles = has_reachable_back_edge(flow);   // (the compilers end a kernel with a branch to itself: a back edge no loop runs)
+      v.loop = indirect || (cycles && code_has_loop(flow));
       // The counted loops a sample inside the blocks follows (vgpu/host_gpu.hpp find_probe_loops).
-      std::vector<LoopCodeInsn> lc(code.count);
+      std::vector<LoopCodeInsn> lc(cycles ? code.count : 0);
       const unsigned urz = code.sm >= 100 ? 255u : 63u;
       const auto reg_of = [urz](const sass::Operand& o) { return o.kind == sass::Kind::Reg ? (o.reg == sass::kRZ ? -1 : static_cast<int>(o.reg))
                                                             : o.kind == sass::Kind::UReg ? (o.reg >= urz ? -1 : 256 + static_cast<int>(o.reg)) : -1; };
@@ -942,7 +956,7 @@ struct Runtime::Impl : CardGate {
         }
         return q;
       };
-      for (size_t i = 0; i < code.count; ++i) {
+      for (size_t i = 0; i < lc.size(); ++i) {
         const sass::Instr& ins = code.instr(i);
         LoopCodeInsn& c = lc[i];
         c.flow = flow[i];
