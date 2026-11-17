@@ -136,6 +136,11 @@ jobs:
         # tests at -j2 already.
         run: ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 6 -m 4)" -E '^(pantheon_workloads|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'
 
+      - name: Slowest tests
+        # The longest tests of the run above, in the job's summary; a test over 25 minutes warns and one over 30 fails (ci/slowest_tests.sh).
+        if: always()
+        run: ci/slowest_tests.sh build
+
       - name: Keep the CUTLASS test binaries
         # Only after every test passed, so the directory holds both tests'
         # binaries, and only when the restore missed (a key cannot be rewritten).
@@ -720,6 +725,11 @@ jobs:
           grep -q "amd_hip .* Passed" out
           grep -q "amd_hipcc .* Passed" out
 
+      - name: Slowest tests
+        # The longest tests of the run above, in the job's summary; a test over 25 minutes warns and one over 30 fails (ci/slowest_tests.sh).
+        if: always()
+        run: ci/slowest_tests.sh build
+
       - name: Clean the runner
         if: always()
         uses: ./.github/actions/clean-runner
@@ -774,6 +784,11 @@ jobs:
           if grep -E '\*\*\*Skipped|Not Run' ml.log; then
             echo "::error::an ML test skipped; the runner's image should have what it needs"; exit 1
           fi
+
+      - name: Slowest tests of PyTorch, rocBLAS and hipSPARSELt
+        # The longest tests of the run above, in the job's summary; a test over 25 minutes warns and one over 30 fails (ci/slowest_tests.sh).
+        if: always()
+        run: ci/slowest_tests.sh build
 
       - name: The rest of the suite, where ROCm is installed
         # GitHub's hosted runners have no ROCm, so every test that runs ROCm's
@@ -833,8 +848,12 @@ jobs:
           RUNNER_SKIPS_OK: '^(e2e_sass_jit_full|bench_amd_counters(_blocks)?|e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_packed_int_forms|e2e_runtime_132|e2e_rdc_clones|e2e_host_gpu|e2e_npp_stream_context|amd_rocprofiler_pcsampling|amd_rvs)$'
         run: |
           set -o pipefail
+          # The heaviest tests that need nothing from this runner's image (the SASS tier and JIT legs, the AMD executor's same-bits digests: pure
+          # simulator, the same on every host) are run by the build + unit tests job on every pull request, and ran here a second time, 20
+          # minutes of it. They are left to that job; whatever needs ROCm or this image still runs here.
+          already_run='e2e_sass_jit_shard_.*|e2e_sass_tier_shard_.*|test_sass_alu_runs_jit.*|test_jit_resid|test_amd_gcn_(gather|memory|tier)_same_bits.*'
           ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 4 -m 4)" \
-            -E '^(pantheon_workloads|.*ollama.*|e2e_cutlass.*|e2e_.*cute.*|e2e_tma.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm.*|e2e_pytorch_sweep_full|e2e_pytorch_dist_full)$' \
+            -E "^(pantheon_workloads|.*ollama.*|e2e_cutlass.*|e2e_.*cute.*|e2e_tma.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm.*|e2e_pytorch_sweep_full|e2e_pytorch_dist_full|$already_run)\$" \
             2>&1 | tee rest.log
           skipped=$(grep -oE 'Test +#[0-9]+: [A-Za-z0-9_]+ \.+\*\*\*(Skipped|Not Run)' rest.log \
                     | sed -E 's/Test +#[0-9]+: ([A-Za-z0-9_]+).*/\1/' || true)
@@ -849,6 +868,11 @@ jobs:
             echo "::error::tests skipped on the runner, which should run them: $(tr '\n' ' ' <<<"$unexpected")"
             exit 1
           fi
+
+      - name: Slowest tests of the rest of the suite
+        # The longest tests of the run above, in the job's summary; a test over 25 minutes warns and one over 30 fails (ci/slowest_tests.sh).
+        if: always() && inputs.ml_tests == ''
+        run: ci/slowest_tests.sh build
 
       - name: Clean the runner
         if: always()
@@ -928,6 +952,11 @@ jobs:
         # tests at -j2 on every run, and the tests that take the nvcc_memory lock
         # (CMakeLists.txt) still run one at a time.
         run: ctest --test-dir build-san --output-on-failure -j"$(ci/jobs.sh -g 6 -m 4)" -E pantheon_workloads
+
+      - name: Slowest tests
+        # The longest tests of the run above, in the job's summary; a test over 25 minutes warns and one over 30 fails (ci/slowest_tests.sh).
+        if: always()
+        run: ci/slowest_tests.sh build-san
 
       # The peak of the whole job, build included (so an upper bound on the test step above), to choose the -g of its ctest -j with (docs/ci.md). It reads the
       # container's own memory counter, cgroup v2's memory.peak or v1's max_usage_in_bytes, and never fails the job.
@@ -1030,8 +1059,13 @@ jobs:
           VGPU_TIER_ARCHS: "sm_80 sm_90"
           VGPU_TIER_PROGRAMS: "sass_tier_steps:75"
         run: |
-          single_thread='test_amd_gcn_same_bits|test_amd_gcn_gather_same_bits|test_amd_gcn_tier_same_bits(_shard_[0-9]+of[0-9]+)?|test_amd_gcn_memory_same_bits|test_amd_gcn_packed_same_bits|test_amd_matrix_fast|test_decode_same_bits|test_hevc_decode|test_h264_decode|test_mpeg2_decode|test_nvenc_.*'
+          single_thread='test_amd_gcn_same_bits|test_amd_gcn_gather_same_bits(_shard_[0-9]+of[0-9]+)?|test_amd_gcn_tier_same_bits(_shard_[0-9]+of[0-9]+)?|test_amd_gcn_memory_same_bits(_shard_[0-9]+of[0-9]+)?|test_amd_gcn_packed_same_bits|test_amd_matrix_fast(_shard_[0-9]+of[0-9]+)?|test_decode_same_bits|test_hevc_decode|test_h264_decode|test_mpeg2_decode|test_nvenc_.*'
           setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -j"$(ci/jobs.sh -g 6 -m 4)" -E "^(pantheon_workloads|$single_thread)$"
+
+      - name: Slowest tests
+        # The longest tests of the run above, in the job's summary; a test over 25 minutes warns and one over 30 fails (ci/slowest_tests.sh).
+        if: always()
+        run: ci/slowest_tests.sh build-tsan
 
       # The peak of the whole job, build included (so an upper bound on the test step above), to choose the -g of its ctest -j with (docs/ci.md). It reads the
       # container's own memory counter, cgroup v2's memory.peak or v1's max_usage_in_bytes, and never fails the job.

@@ -18,6 +18,7 @@
 
 #include "vgpu/amd_exec.hpp"
 #include "vgpu/amd_gcn.hpp"
+#include "shard.hpp"
 #include "vtest.hpp"
 
 using namespace vgpu;
@@ -45,6 +46,9 @@ std::vector<std::string> lines_of(const std::string& path) {
 
 VTEST(a_gather_or_a_run_then_a_gather_gives_the_bits_lane_by_lane_gives) {
   const char* only = std::getenv("VGPU_GATHER_ONLY");   // (a substring of the instructions to run)
+  // VGPU_GATHER_SHARD=k/n: every nth flat shape (CMakeLists.txt registers eight shards, test_amd_gcn_gather_same_bits_shard_KofN). A shape keeps
+  // the seed it has in the whole run (it is made from the shape's number), so the shards together run exactly the runs of the whole test.
+  const vtest::Shard shard("VGPU_GATHER_SHARD", "VGPU_GATHER_LIST");
   const bool tier_was = amd::gcn::tier::enabled();
   size_t shapes = 0, runs = 0, wrong = 0, nonzero = 0;
   std::string report;
@@ -68,6 +72,11 @@ VTEST(a_gather_or_a_run_then_a_gather_gives_the_bits_lane_by_lane_gives) {
       }
       if (in.enc != amd::gcn::Enc::Flat) continue;
       ++shapes;
+      if (!shard.mine(shapes - 1)) continue;   // (another shard's shape; shapes still counts it, as the seeds below need)
+      if (shard.list) {
+        std::printf("%s:%zu\n", c.file, shapes);
+        continue;
+      }
       for (uint64_t seed = 0; seed < 12; ++seed) {
         for (const uint32_t flavour : {14u, 15u, 21u, 22u, 23u, 24u, 25u, 34u, 35u}) {
           amd::gcn::tier::set_enabled(false);
@@ -87,10 +96,11 @@ VTEST(a_gather_or_a_run_then_a_gather_gives_the_bits_lane_by_lane_gives) {
   }
   amd::gcn::tier::set_enabled(tier_was);
   amd::set_fast_paths(true, true);
+  if (shard.list) return;
   std::fprintf(stderr, "gather: %zu flat shapes, %zu runs\n", shapes, runs);
   if (wrong) throw vtest::Failure(std::to_string(wrong) + " runs differ from the lane-by-lane bits:" + report);
   VCHECK(only || shapes > 60);
-  VCHECK(only || nonzero > 1000);
+  VCHECK(only || nonzero > shard.at_least(1000));
 }
 
 // A load into LDS whose LDS address is below zero (M0 0, offset -16, lane 0: 2^64 - 16) must be refused, not written. The bound was
@@ -98,6 +108,8 @@ VTEST(a_gather_or_a_run_then_a_gather_gives_the_bits_lane_by_lane_gives) {
 // ("double free or corruption", seen as VGPU_GATHER_ONLY=dwordx4 aborting the test above). Every register is zero (flavour 16), so
 // M0 is 0 and lane 0 is the lane that wraps. The refusal is read from the error itself: the corruption is silent until a free().
 VTEST(a_load_into_lds_below_address_zero_is_refused) {
+  const vtest::Shard shard("VGPU_GATHER_SHARD", "VGPU_GATHER_LIST");
+  if (shard.list || shard.k != 0) return;   // (a quick check: the first shard, or the whole test, makes it)
   size_t seen = 0;
   for (const Corpus& c : kCorpora) {
     for (const std::string& line : lines_of(std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/" + c.file)) {
