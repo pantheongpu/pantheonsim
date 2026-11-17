@@ -25,11 +25,37 @@ int cuInit(unsigned flags) {
   if (ms > 0) { struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000L}; nanosleep(&t, 0); }
   return env_int("STUB_FAIL_INIT", 0) ? 100 : 0;
 }
-int cuDeviceGet(int* d, int i) { note("cuDeviceGet"); *d = i; return 0; }
+/* Several cards (run_host_gpu_multi_stub.sh): STUB_DEVICES machine cards (default 1), each its own context. The stand-in reads CUDA_VISIBLE_DEVICES as the real
+ * driver does at cuInit (a list of decimal numbers, which ends at the first entry that is not a card of the machine or repeats one), and numbers the cards it shows
+ * by their place in it. STUB_SM_<n> gives machine card n another architecture than STUB_SM. Every context call that tells the test which card was used is logged on a
+ * line of its own ("ctx_retain n", "reserve 0x.. on n", "launch on n": n is the machine's card, not the driver's number). */
+static int g_vis[64], g_nvis = -1;
+static void vis_init(void) {
+  if (g_nvis >= 0) return;
+  const int machine = env_int("STUB_DEVICES", 1);
+  const char* c = getenv("CUDA_VISIBLE_DEVICES");
+  g_nvis = 0;
+  if (!c) { for (int i = 0; i < machine && i < 64; ++i) g_vis[g_nvis++] = i; return; }
+  const char* p = c;
+  while (*p) {
+    char* e; long v = strtol(p, &e, 10);
+    if (e == p || (*e && *e != ',') || v < 0 || v >= machine) break;
+    int dup = 0; for (int k = 0; k < g_nvis; ++k) dup |= g_vis[k] == v;
+    if (dup || g_nvis == 64) break;
+    g_vis[g_nvis++] = (int)v;
+    p = *e ? e + 1 : e;
+  }
+}
+static int g_cur = -1;   /* the machine card of the current context */
+static int ctx_card(void* c) { return (int)(((unsigned long)c - 0x1000) / 0x10); }
+int cuDeviceGetCount(int* n) { note("cuDeviceGetCount"); vis_init(); *n = g_nvis; return 0; }
+int cuDeviceGet(int* d, int i) { note("cuDeviceGet"); vis_init(); if (i < 0 || i >= g_nvis) return 101; *d = g_vis[i]; return 0; }
 /* The card's launch limits (turbo mode's fit check): an sm_86 card's by default (RTX 3060: 1024 threads a block, dimensions 1024 x 1024 x 64, a grid of
  * 2^31-1 x 65535 x 65535, 99 KiB of shared memory a block with the opt-in, 65536 registers a block), each overridable to put a launch outside the card. */
 int cuDeviceGetAttribute(int* v, int attr, int d) {
-  (void)d;
+  char sm_name[16];
+  snprintf(sm_name, sizeof sm_name, "STUB_SM_%d", d);
+  const int sm = env_int(sm_name, env_int("STUB_SM", 86));
   switch (attr) {
     case 1: *v = env_int("STUB_MAX_THREADS", 1024); break;
     case 2: *v = env_int("STUB_MAX_BLOCK_X", 1024); break;
@@ -40,8 +66,8 @@ int cuDeviceGetAttribute(int* v, int attr, int d) {
     case 7: *v = 65535; break;
     case 12: *v = env_int("STUB_REGS_PER_BLOCK", 65536); break;
     case 16: *v = env_int("STUB_MP", 28); break;
-    case 75: *v = env_int("STUB_SM", 86) / 10; break;
-    case 76: *v = env_int("STUB_SM", 86) % 10; break;
+    case 75: *v = sm / 10; break;
+    case 76: *v = sm % 10; break;
     case 97: *v = env_int("STUB_SHARED_OPTIN", 101376); break;
     default: *v = 0;
   }
@@ -54,16 +80,38 @@ int cuFuncGetAttribute(int* v, int attr, void* f) {
   *v = attr == 0 ? env_int("STUB_FUNC_MAX_THREADS", 1024) : attr == 1 ? env_int("STUB_FUNC_SHARED", 0) : attr == 4 ? env_int("STUB_FUNC_REGS", 32) : 0;
   return 0;
 }
-int cuDevicePrimaryCtxRetain(void** c, int d) { (void)d; note("cuDevicePrimaryCtxRetain"); *c = (void*)0x1000; return 0; }
-int cuCtxSetCurrent(void* c) { (void)c; return 0; }
+int cuDevicePrimaryCtxRetain(void** c, int d) {
+  char l[48];
+  note("cuDevicePrimaryCtxRetain");
+  snprintf(l, sizeof l, "ctx_retain %d", d);
+  note(l);
+  *c = (void*)(0x1000ul + 0x10ul * (unsigned long)d);
+  return 0;
+}
+int cuCtxSetCurrent(void* c) { g_cur = c ? ctx_card(c) : -1; return 0; }
 /* STUB_SYNC_MS: the wait for the kernel takes this long (a kernel that does not come back, for the mode's VGPU_HOST_GPU_TIMEOUT). */
 int cuCtxSynchronize(void) {
   const int ms = env_int("STUB_SYNC_MS", 0);
   if (ms > 0) { struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000L}; nanosleep(&t, 0); }
   return 0;
 }
-int cuMemAddressReserve(u64* p, size_t size, size_t align, u64 addr, u64 flags) { (void)size; (void)align; (void)flags; note("cuMemAddressReserve"); *p = addr; return 0; }
-int cuMemCreate(u64* h, size_t size, const void* prop, u64 flags) { (void)size; (void)prop; (void)flags; *h = 1; return 0; }
+int cuMemAddressReserve(u64* p, size_t size, size_t align, u64 addr, u64 flags) {
+  char l[64];
+  (void)size; (void)align; (void)flags;
+  note("cuMemAddressReserve");
+  snprintf(l, sizeof l, "reserve 0x%llx on %d", addr, g_cur);
+  note(l);
+  *p = addr;
+  return 0;
+}
+int cuMemCreate(u64* h, size_t size, const void* prop, u64 flags) {
+  char l[64];
+  (void)size; (void)flags;
+  snprintf(l, sizeof l, "mem_create on %d for %d", g_cur, ((const int*)prop)[3]);   /* CUmemAllocationProp.location.id */
+  note(l);
+  *h = 1;
+  return 0;
+}
 /* STUB_KEEP_MEMORY=1: the card has memory. Every mapped range is backed (zeros, as the mode fills a new mapping), copies to the card are kept and copies
  * from it give them back. With STUB_CARD_OK=1 this is a card whose kernels compute nothing: after a launch "on the card" the program reads exactly what
  * was pushed for it, which is how run_host_gpu_stub.sh sees WHICH bytes the mode pushed for a launch it moved from the simulator. */
@@ -138,6 +186,7 @@ static void count_relocs(const unsigned char* img) {
   note(line);
 }
 int cuModuleLoadData(void** m, const void* image) {
+  { char l[48]; snprintf(l, sizeof l, "module_load on %d", g_cur); note(l); }
   note("cuModuleLoadData");
   g_img = (const unsigned char*)image;
   if (memcmp(g_img, "\x7f" "ELF", 4) != 0) {   /* PTX text: the driver compiles it (turbo mode gives the card PTX when no cubin of its own runs) */
@@ -192,6 +241,13 @@ int cuModuleGetFunction(void** f, void* m, const char* name) { (void)m; (void)na
 int cuFuncSetAttribute(void* f, int a, int v) { (void)f; (void)a; (void)v; return 0; }
 int cuLaunchKernel(void* f, unsigned a, unsigned b, unsigned c, unsigned d, unsigned e, unsigned g, unsigned sh, void* s, void** p, void** x) {
   (void)f; (void)a; (void)b; (void)c; (void)d; (void)e; (void)g; (void)sh; (void)s; (void)p; (void)x; note("cuLaunchKernel");
+  { char l[48]; snprintf(l, sizeof l, "launch on %d", g_cur); note(l); }
+  /* STUB_CARD_BUMP=1 (with STUB_KEEP_MEMORY=1 and STUB_CARD_OK=1): the card "computes" host_gpu_multi.cu's `bump`: it adds 1 to the first four ints of the first pointer
+   * argument, in its own memory, so what the program prints shows whether the card held the memory it was sent and whether the simulator pulled it back. */
+  if (env_int("STUB_CARD_BUMP", 0) && p && p[0]) {
+    unsigned char* b = backing(*(u64*)p[0], 16);
+    if (b) { int* v = (int*)b; for (int i = 0; i < 4; ++i) v[i] += 1; }
+  }
   /* STUB_LAUNCH_FAIL=<error>: the card takes the module and the function and then refuses the launch with this error (701, too many resources, say) */
   if (env_int("STUB_LAUNCH_FAIL", 0)) return env_int("STUB_LAUNCH_FAIL", 0);
   return env_int("STUB_CARD_OK", 0) ? 0 : 1;

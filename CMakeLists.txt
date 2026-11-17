@@ -1456,6 +1456,8 @@ vgpu_unit_test(test_host_gpu_ref)
 vgpu_unit_test(test_host_gpu_idiom)
 # Turbo host-GPU mode's compare by tolerance (include/vgpu/host_gpu_tol.hpp): header-only, no card.
 vgpu_unit_test(test_host_gpu_tol)
+# Turbo host-GPU mode on a machine with several cards (include/vgpu/host_gpu_cards.hpp): which card a simulated device uses, no card needed.
+vgpu_unit_test(test_host_gpu_cards)
 vgpu_unit_test(test_card_gate)
 vgpu_unit_test(test_host_gpu_track)
 target_include_directories(test_check_compare PRIVATE src/cli)
@@ -4347,6 +4349,15 @@ set_tests_properties(e2e_host_gpu PROPERTIES
 add_test(NAME e2e_host_gpu_stub
          COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_gpu_stub.sh)
 set_tests_properties(e2e_host_gpu_stub PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 600)
+
+# Turbo mode on a machine with several cards (docs/perf-design/12-host-gpu-turbo.md section 17), with the stand-in driver told to show several: any machine.
+add_test(NAME e2e_host_gpu_multi_stub
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_gpu_multi_stub.sh)
+set_tests_properties(e2e_host_gpu_multi_stub PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
