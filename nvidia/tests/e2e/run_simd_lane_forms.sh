@@ -33,14 +33,16 @@
 # print the card's lines on the t4 / rtx2080ti, a100 and l4 / l40s profiles on both engines, and the sequential pins with
 # VGPU_TC_EXACT=0. An sm_90 build on the h100 profile must print the H100's lines, and so must an sm_86 build there: the device chooses
 # the sum, not what the cubin was built for. The b200 and gb200 profiles sum by the Hopper rule by default (inferred from data recorded by
-# others on a B200, 2026-11-16) and print the H100's lines; the profiles that keep the sequential sum (rtx-pro-6000 and the rest of Blackwell:
-# no recorded vectors) print the sequential pins by default and the RTX 3060's lines with VGPU_TC_EXACT=force.
+# others on a B200, 2026-11-16) and print the H100's lines. So do the compute capability 12.0 profiles since 2026-11-17: an RTX PRO 6000
+# Blackwell Server Edition (AWS g7e.2xlarge, driver 595.112.07, nvcc 13.0 and 13.2) printed the H100's 60 lines, the same from sm_86, sm_90,
+# sm_100 and sm_120 builds (rtx-pro-6000-server: measured; rtx5090, rtx-pro-4500, rtx-pro-6000, rtx-pro-6000-max-q: inferred from it).
+# Only b300, vr200, thor and gb10 keep the sequential sum (no recorded vectors, no card) and print the sequential pins by default.
 #
 #   run_simd_lane_forms.sh                  simulator vs the pinned files, with the tensor-core model on (the default) and off
 #   run_simd_lane_forms.sh --card [--update]   NVIDIA's runtime on a real GPU vs the card file (or rewrite it). The program is built for
 #                                              the card's own architecture (nvidia-smi's compute_cap; VGPU_CARD_ARCH=86 overrides), with
 #                                              -DNO80 below sm_80, where the four bf16 and tf32 lines are left out of the comparison;
-#                                              an sm_90 card is held to the H100's file. $VGPU_CARD_OUT, if set, receives the card's lines.
+#                                              an sm_90 or sm_120 card is held to the H100's file. $VGPU_CARD_OUT, if set, receives the card's lines.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -72,7 +74,7 @@ if [[ "${1:-}" == --card ]]; then
     cp "$out/card.txt" "$data/simd_lane_forms.rtx3060.txt"; echo "wrote simd_lane_forms.rtx3060.txt"; exit 0
   fi
   [[ -n "${VGPU_CARD_OUT:-}" ]] && cp "$out/card.txt" "$VGPU_CARD_OUT"
-  card_file="$data/simd_lane_forms.rtx3060.txt"; (( cap == 90 )) && card_file="$data/simd_lane_forms.h100.txt"
+  card_file="$data/simd_lane_forms.rtx3060.txt"; (( cap == 90 || cap == 120 )) && card_file="$data/simd_lane_forms.h100.txt"
   want_for "$cap" "$card_file" > "$out/want.txt"
   diff "$out/want.txt" "$out/card.txt" && { echo "PASS (card, sm_$cap, $(wc -l < "$out/card.txt") lines, $(basename "$card_file"))"; exit 0; }
   echo "FAIL: the card (sm_$cap) disagrees with $(basename "$card_file")"; exit 1
@@ -180,13 +182,17 @@ for pair in 100:b200 86:b200 100:gb200; do
     run_case "VGPU_TC_EXACT=force (its own rule still)" "$out/app$a" "$a" "$gpu" "$engine" "$data/simd_lane_forms.h100.txt" VGPU_TC_EXACT=force
   done
 done
-# Not measured, and no recorded vectors: the sequential sum by default, the RTX 3060's rule only when forced.
-for pair in 120:rtx-pro-6000; do
+# Compute capability 12.0 (2026-11-17): measured on an RTX PRO 6000 Blackwell Server Edition (rtx-pro-6000-server), inferred for the other
+# profiles of the compute capability. The H100's lines by default and with VGPU_TC_EXACT=force, the sequential pins with VGPU_TC_EXACT=0. Before
+# 2026-11-17 these profiles printed the sequential pins by default (6 of the 60 lines and 13 of the 169 of float_half_forms were not the card's).
+for pair in 120:rtx-pro-6000-server 86:rtx-pro-6000-server 120:rtx-pro-6000 120:rtx5090 120:rtx-pro-4500 120:rtx-pro-6000-max-q; do
   a="${pair%%:*}"; gpu="${pair##*:}"
   [[ -x "$out/app$a" ]] || continue
   for engine in sass ptx; do
-    run_case "sequential by default" "$out/app$a" "$a" "$gpu" "$engine" "$data/simd_lane_forms.$engine.tcseq.txt"
-    run_case "VGPU_TC_EXACT=force" "$out/app$a" "$a" "$gpu" "$engine" "$data/simd_lane_forms.rtx3060.txt" VGPU_TC_EXACT=force
+    run_case "hopper by default (card: an RTX PRO 6000 Blackwell Server Edition)" "$out/app$a" "$a" "$gpu" "$engine" "$data/simd_lane_forms.h100.txt"
+    run_case "VGPU_TC_EXACT=0" "$out/app$a" "$a" "$gpu" "$engine" "$data/simd_lane_forms.$engine.tcseq.txt" VGPU_TC_EXACT=0
+    run_case "VGPU_TC_EXACT=force (its own rule still)" "$out/app$a" "$a" "$gpu" "$engine" "$data/simd_lane_forms.h100.txt" VGPU_TC_EXACT=force
   done
 done
+
 (( fails == 0 )) && echo PASS || { echo FAIL; exit 1; }

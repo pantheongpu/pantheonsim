@@ -314,7 +314,7 @@ different generations agree with each other.
 | L4 | sm_89 (Ada) | 595.112.07 | a rented card |
 | A10G | sm_86 (Ampere) | 595.112.07 | a rented card |
 
-No Blackwell card ran any of this: everything below about them is *inferred* or *unmeasured*. An H100 PCIe (sm_90, a rented
+One Blackwell card ran part of this (2026-11-17, an RTX PRO 6000 Blackwell Server Edition, sm_120: the section "Blackwell measured" at the end of this page); everything below about the other Blackwell parts (sm_100, sm_103) is *inferred* or *unmeasured*. An H100 PCIe (sm_90, a rented
 card, driver 570.148.08, nvcc 12.8.93, 2026-11-15) ran the probe's hash pass (the same as the RTX 3060 on all ten operations, see
 "Which devices get the model") and `mathfn` built with its own toolkit: 302 of the 329 lines are the four cards', in both builds
 and in the default and the `-use_fast_math` program; the 27 others are acosh, asinh, atan2 and cbrt in single precision and asin,
@@ -652,7 +652,8 @@ another architecture decides it in seconds. `VGPU_MUFU_EXACT=0` gives the earlie
 | Tesla T4 (sm_75), L4 (sm_89), A10G (sm_86) | `mathfn` and `mathfn_fast`: 329 + 329 lines of 131,072 results a class identical to the RTX 3060's, with the card's own build and the sm_75 build. The probe did not run on them | measured through the math library; the instruction-level run (`mufu-card-run.sh`) is still to make |
 | every other Turing, Ampere and Ada profile | the same architectures as the four | inferred from the four |
 | the other Hopper profiles (h100, h100-nvl, h200, h200-nvl, gh200) | the same architecture as the H100 PCIe | inferred from the H100 PCIe |
-| Blackwell (sm_100, sm_103, sm_120 profiles) | none: no card of these ran `mathfn` or the probe | **inferred (measured on Turing, Ampere, Ada, Hopper)** |
+| Blackwell sm_120 (RTX PRO 6000 Blackwell Server Edition) | `mathfn` (329 lines, both builds) and all ten operations over 2^32 inputs, 2026-11-17 | **measured** (see "Blackwell measured") |
+| Blackwell (sm_100, sm_103 profiles) | none: no card of these ran `mathfn` or the probe | **inferred (measured on Turing, Ampere, Ada, Hopper and sm_120)** |
 
 The model is not in the profiles: every device gets it. If a Blackwell card prints other hashes, the model
 becomes a profile property, as the tensor-core sum is (`numerics.tensor_sum`, matrix-numerics.md).
@@ -674,7 +675,7 @@ larger than the figure by an amount not measured. No other program was timed.
 
 ## What is not done
 
-- Blackwell: no card ran `mathfn` or the probe. Its profiles get the model as *inferred*; a Blackwell card's
+- Blackwell: an sm_120 card ran `mathfn` and the probe (below); the sm_100 and sm_103 profiles get the model as *inferred*; a Blackwell card's
   `mufu-card-run.sh` output decides it.
 - The probe ran on the RTX 3060, and its hash pass on an A10G and an H100 PCIe. The T4 and the L4 are measured through the
   math library (329 + 329 lines), not instruction by instruction.
@@ -745,3 +746,23 @@ agree; its one failure on the build machine, `runtime_conformance` for sm_75, is
 without the driver shim and fails the same way with `VGPU_MUFU_EXACT=0`). `numerics_cases.txt` did not change (the cards
 print it); `numerics_engines.txt` changed in its comment only. The rest of the e2e suite (it needs nvcc on the build machine)
 was not run for this change: CI is the check, and `VGPU_MUFU_EXACT=0` shows whether a difference is this change's.
+
+## Blackwell measured (RTX PRO 6000 Blackwell Server Edition, 2026-11-17)
+
+AWS g7e.2xlarge (us-east-2), driver 595.112.07, nvcc 13.0.88 and 13.2.51 (both present on the image). Issue #664.
+
+- `tools/numerics/mufu-card-run.sh`: all ten approximate-math operations (COS, SIN, EX2, LG2, RCP, RSQ, RCP64H, RSQ64H, SQRT, TANH) give the
+  RTX 3060's hashes on all 2^32 inputs. With the A10G and the H100 PCIe that is Ampere, Hopper and now Blackwell (sm_120) on which the model is exact. The
+  PTX-level half forms (`ex2.approx.f16`, `.f16x2`, `tanh.approx.f16`, `.f16x2`) are the RTX 3060's too. The script's eight raw `MUFU.<op>.F16`
+  rows say "DIFFER" on this card, and that is the probe, not the card: it rewrites the opcode bits of an sm_86 encoding, and on sm_120 the same bits
+  decode as `MUFU.<op>.BF16` (disassembled: `MUFU.EX2.BF16`), so what was hashed is the bf16 form. The probe needs an sm_120 encoding for the F16 rows before
+  they say anything about this card. (nvdisasm was not on the image; it was installed with `apt-get install cuda-nvdisasm-13-0`.)
+- `mathfn`, CUDA 13.0, `--n 4096`, own-architecture (sm_120) build and sm_75 build: the default build is 329 of 329 lines of the pinned file
+  (`nvidia/tests/data/numerics_mathfn.txt`) in both; `-use_fast_math` is 329 of 329 from the sm_75 build (the driver compiles the PTX) and **326 of 329 from the
+  sm_120 build**: `log`, `log2` and `log10` in double, class `edges`. The inputs are the negative subnormals (-5e-324, -1e-323): nvcc's sm_120
+  code returns NaN (log of a negative number), the sm_75 build's JIT result is -inf. Same three lines with CUDA 13.2 at `--n 131072`; a Tesla T4 (sm_75 build)
+  and this card's sm_75 build print the same 329 lines in both builds. This is the compiler's code for the double `log` under fast-math, not an
+  instruction of the card; the simulator's SASS executor runs the sm_120 cubin and prints the card's 329 of 329 for both programs on `rtx-pro-6000-server`
+  (the PTX interpreter 326: the three NaN-payload lines of `numerics_engines.txt`). No test pins an sm_120 build's lines.
+- `fp_examples`, `fp_examples_nofma` and `varity_cases` (-O0, -O3) print the same lines on this card and on the T4. The generated Varity programs
+  differ between runs (the generator is not seeded in `card-run.sh`), so their 900 lines a build are not compared across cards.

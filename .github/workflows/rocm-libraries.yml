@@ -161,7 +161,7 @@ jobs:
       - name: Unpack ROCm's LLVM and OpenCL runtime
         run: |
           amd/tests/openmp/fetch-rocm-llvm.sh "$HOME/rocm-llvm"
-          amd/tests/opencl/fetch-rocm-opencl.sh "$HOME/rocm-opencl"
+          amd/tests/opencl/fetch-rocm-opencl.sh "$HOME/rocm-opencl" 7.2.4
 
       - name: Build the HIP shim
         run: |
@@ -179,6 +179,6 @@ jobs:
       - name: OpenCL
         run: |
           set -o pipefail
-          VGPU_ROCM_PATH="$HOME/rocm-opencl/opt/rocm-7.1.0" \
+          VGPU_ROCM_PATH="$HOME/rocm-opencl/opt/rocm-7.2.4" \
             ctest --test-dir build --output-on-failure --timeout 1800 -R '^amd_opencl$' 2>&1 | tee ctest.log
           if grep -q 'Skipped' ctest.log; then echo "the test skipped: something it needs is missing"; exit 1; fi

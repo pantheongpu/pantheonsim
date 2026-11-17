@@ -43,14 +43,29 @@ if command -v objdump >/dev/null; then
   preload=$(objdump -p "$shim/libhsa-runtime64.so.1" 2>/dev/null | awk '/NEEDED/ && /lib(asan|tsan)\.so/ {print $2}')
 fi
 
-# amd/mi455x (gfx1250) is not here: the installed ROCm OpenCL runtime (7.1.0) answers "Unsupported HSA device gfx1250"
-# and drops it, whatever the simulator offers (#651). Set VGPU_OPENCL_GPUS=amd/mi455x to see it.
-cases="amd/mi300x amd/mi250x amd/mi350x amd/rx7900xtx amd/rx9070xt amd/rx6900xt amd/rx6800 amd/rx6700xt"
+# Known limits of ROCm's OpenCL runtime, not of the simulator (issue #651): its libamdocl64 answers "Unsupported HSA device
+# gfx1250 (PCI ID 1250)" and drops the MI455X on ROCm 7.1.0 and 7.2.4, though the simulator offers both agents. For a GPU in
+# this list the test expects exactly that message from the runtime and reports "unsupported by ROCm's OpenCL runtime"; it
+# does not fail. If a ROCm release lists the device, the case runs like any other (and the entry should go).
+declare -A unsupported=([amd/mi455x]=gfx1250)
+cases="amd/mi300x amd/mi250x amd/mi350x amd/mi455x amd/rx7900xtx amd/rx9070xt amd/rx6900xt amd/rx6800 amd/rx6700xt"
 [[ -n "${VGPU_OPENCL_GPUS:-}" ]] && cases="$VGPU_OPENCL_GPUS"
 for gpu in $cases; do
   out=$(LD_PRELOAD="$preload" VGPU_QUIET=1 VGPU_GPU="$gpu" VGPU_DEVICE_COUNT=2 OCL_ICD_VENDORS="$tmp/vendors" \
         ROCM_PATH="$rocm" LD_LIBRARY_PATH="$shim:$rocm/lib" timeout 900 "$tmp/cl" 2>&1)
   status=$?
+  arch="${unsupported[$gpu]:-}"
+  if [[ -n "$arch" ]] && ! grep -q '^devices 2' <<< "$out"; then
+    log=$(LD_PRELOAD="$preload" VGPU_QUIET=1 VGPU_GPU="$gpu" VGPU_DEVICE_COUNT=2 OCL_ICD_VENDORS="$tmp/vendors" AMD_LOG_LEVEL=4 \
+          ROCM_PATH="$rocm" LD_LIBRARY_PATH="$shim:$rocm/lib" timeout 300 "$tmp/cl" 2>&1)
+    if grep -q "Unsupported HSA device $arch" <<< "$log"; then
+      echo "KNOWN $gpu: unsupported by ROCm's OpenCL runtime (libamdocl64: $(grep -o "Unsupported HSA device $arch (PCI ID [0-9A-Fa-f]*)" <<< "$log" | head -1)); not a simulator fault (#651)"
+      continue
+    fi
+    echo "FAIL  $gpu: no OpenCL device, and the runtime did not say it is unsupported ($arch); it was expected to"
+    grep -i -E 'gfx|isa|device|agent|unsupported' <<< "$log" | head -20 | sed 's/^/        /'
+    fail=1; continue
+  fi
   grep -E '^(FAIL|build log)' <<< "$out" | sed 's/^/      /'
   expect "$gpu: it runs to the end" "0" "$status"
   expect "$gpu: both simulated devices are OpenCL devices" "devices 2" "$(grep -o '^devices [0-9]*' <<< "$out")"

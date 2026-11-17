@@ -8,8 +8,8 @@
 #   1. FTTN's four programs and the motivating example, built for the card's own architecture (and for every older one the toolkit
 #      has, since a card runs older cubins): <out>/fttn/sm_<N>-<test>.txt. The summary row and D.
 #   2. nvidia/tests/e2e/run_simd_lane_forms.sh --card and run_float_half_forms.sh --card: the card's lines of the two probes against
-#      the pinned file of its architecture (the RTX 3060's; the H100's for sm_90). <out>/probe/*.txt hold the card's own lines; the
-#      exit status of each is recorded. For a Blackwell card (sm_100, sm_120) there is no pinned file yet: expect FAIL, and keep the lines.
+#      the pinned file of its architecture (the RTX 3060's; the H100's for sm_90 and sm_120). <out>/probe/*.txt hold the card's own lines; the
+#      exit status of each is recorded. For an sm_100 card there is no pinned file of its own (expect the H100's lines; FAIL otherwise): keep the lines.
 #   3. The million-result dump (simd_lane_forms.cu -DTC_DUMP -DTILES=4096) into <out>/dump/t4096/dump: the data a rule is fitted
 #      to. Afterwards, anywhere with python3 and numpy:   tools/fttn/fit_tc_model.py <out>/dump/t4096/dump
 #      and, with a simulator build:   tc_dump_check <out>/dump/t4096/dump hopper     (tools/fttn/tc_dump_check.cpp)
@@ -17,8 +17,9 @@
 #      the four that are the published models' word only (R1, R2, R3, R4). <out>/corners.txt.
 #
 # Cards still wanted (AWS names; nothing here launches them):
-#   B200 / RTX PRO 6000 Blackwell (g7e, p6-b200)  sm_100 / sm_120: no card run of ours; the published model (the Hopper numbers) is opt-in
-#   Tesla T4 (g4dn)                               float_half_forms -DNO80 has not run on a Turing card (half_form_30: HMMA.1688 beside HMUL2.F32)
+#   B200 (p6-b200)                                sm_100: no card run of ours; the Hopper rule is in force as `inferred` from others' recorded vectors
+#   (done 2026-11-17: an RTX PRO 6000 Blackwell Server Edition, g7e.2xlarge, sm_120: the Hopper rule, measured; a Tesla T4, g4dn.xlarge:
+#    float_half_forms -DNO80 prints the RTX 3060's lines, half_form_30 among them)
 #   any Ampere / Ada / Hopper card                step 4 (R1, R3, R4 have no card run; S1, S2 only on the RTX 3060)
 #   V100 (p3)                                     sm_70 needs a CUDA 12 toolkit; the simulator has no V100 profile yet
 set -uo pipefail

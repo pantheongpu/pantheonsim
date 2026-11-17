@@ -467,6 +467,7 @@ Still open, each with the reason:
   offload bundles need zlib or zstd and refuse other methods (amd/src/bundle.cpp:43-146); graphics interop
   (`hsa_amd_image_create`, `hsa_amd_interop_map_buffer`, `hsa_amd_interop_unmap_buffer`,
   `hsa_executable_agent_global_variable_define`, amd/src/hsa_api.cpp:1984-1991).
+- OpenCL on the MI455X (gfx1250): none. ROCm's own OpenCL runtime (`libamdocl64`, 7.1.0 and 7.2.4) logs "Unsupported HSA device gfx1250" and drops the device; the simulator offers both agents. An upstream limit, not modelled around: `amd_opencl` expects the message for `amd/mi455x` and reports it as known (`amd/tests/e2e/run_opencl.sh`, issue #651).
 - Profiling: PC sampling is host-trap only and by instruction count (no clock); no stochastic PC sampling, thread trace or HSA trace, and no records of the runtime's internal kernels
   (amd/README.md:576).
 - Workloads and frameworks: `fused_attention` does not build for AMD (needs a 64-bit mask on wave64); `rt_virus`

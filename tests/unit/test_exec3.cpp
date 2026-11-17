@@ -801,9 +801,19 @@ SumModel legacy_sum_model(int mode, int cc_major, int cc_minor) {
 // Hopper rule (0 mismatches) and not by the sequential sum (8,020 mismatches); docs/numerics/tcpapers.md. The class is `inferred`: data
 // recorded by others, not a card run by us. No other pin moved. The two names below are the only places the pin may differ from the old
 // compute-capability table (legacy_device_sum_model), and legacy_sum_model is held to that in every mode.
+// RE-RECORDED PINS (2026-11-17): the five compute capability 12.0 profiles (rtx5090, rtx-pro-4500, rtx-pro-6000, rtx-pro-6000-server,
+// rtx-pro-6000-max-q) went from {Sequential, published Hopper} to {Hopper, nothing published}. Reason: a card of ours, an RTX PRO 6000
+// Blackwell Server Edition, was run (driver 595.112.07, nvcc 13.0 and 13.2): both probes print the H100's lines, FTTN and all six corners
+// are the Hopper rule's, and a dump of 8,388,608 wmma results is reproduced by it bit for bit (tools/fttn/tc_dump_check.cpp). The class is
+// `measured` on rtx-pro-6000-server (this model's card) and `inferred` on the other four. No other pin moved.
 bool is_b200_class(const std::string& id) { return id == "nvidia/b200" || id == "nvidia/gb200"; }
+bool is_sm120_class(const std::string& id) {
+  return id == "nvidia/rtx5090" || id == "nvidia/rtx-pro-4500" || id == "nvidia/rtx-pro-6000" || id == "nvidia/rtx-pro-6000-server" ||
+         id == "nvidia/rtx-pro-6000-max-q";
+}
+bool is_hopper_blackwell(const std::string& id) { return is_b200_class(id) || is_sm120_class(id); }
 SumModel expected_by_old_table(const std::string& id, int mode, int cc_major, int cc_minor) {
-  if (is_b200_class(id)) return mode == vgpu::exec::tc86::kModeOff ? SumModel::Sequential : SumModel::Hopper;   // the deliberate departure
+  if (is_hopper_blackwell(id)) return mode == vgpu::exec::tc86::kModeOff ? SumModel::Sequential : SumModel::Hopper;   // the deliberate departures
   return legacy_sum_model(mode, cc_major, cc_minor);
 }
 struct TensorSumPin {
@@ -825,8 +835,8 @@ constexpr TensorSumPin kTensorSumPins[] = {
     {"nvidia/h200", kHop, kSeq},         {"nvidia/h200-nvl", kHop, kSeq},       {"nvidia/gh200-480gb", kHop, kSeq},
     {"nvidia/b200", kHop, kSeq},         {"nvidia/gb200", kHop, kSeq},                                                        // 10.0: Hopper by default since 2026-11-16, see below
     {"nvidia/b300", kSeq, kSeq},         {"nvidia/vr200", kSeq, kSeq},          {"nvidia/thor", kSeq, kSeq},                  // 10.3, 10.7, 11.0
-    {"nvidia/rtx5090", kSeq, kHop},      {"nvidia/rtx-pro-4500", kSeq, kHop},   {"nvidia/rtx-pro-6000", kSeq, kHop},          // 12.0
-    {"nvidia/rtx-pro-6000-server", kSeq, kHop}, {"nvidia/rtx-pro-6000-max-q", kSeq, kHop},
+    {"nvidia/rtx5090", kHop, kSeq},      {"nvidia/rtx-pro-4500", kHop, kSeq},   {"nvidia/rtx-pro-6000", kHop, kSeq},          // 12.0: Hopper by default since 2026-11-17, see below
+    {"nvidia/rtx-pro-6000-server", kHop, kSeq}, {"nvidia/rtx-pro-6000-max-q", kHop, kSeq},
     {"nvidia/gb10", kSeq, kSeq}};                                                                                             // 12.1
 }  // namespace
 
@@ -911,11 +921,10 @@ VTEST(tc_exact_switch_changes_only_sm86_tensor_sums) {
     // By default each profile sums as its cards do; forced, a profile without a measured model takes the RTX 3060's.
     VCHECK(on == (c.model == SumModel::Ampere ? card : c.model == SumModel::Hopper ? hopper : sequential));
     VCHECK(forced == (c.model == SumModel::Hopper ? hopper : card));
-    // `published`: a Blackwell profile takes the published model (the Hopper numbers); nothing else moves.
-    // (b200 and gb200 are no longer here: their Hopper rule is in force by default, and they publish nothing further.)
-    const bool blackwell = c.published == SumModel::Hopper;
-    VCHECK(blackwell == (std::string(c.gpu) == "nvidia/rtx5090" || std::string(c.gpu).rfind("nvidia/rtx-pro-", 0) == 0));
-    VCHECK(run_mode(c.gpu, "published", false) == (blackwell ? hopper : on));
+    // `published`: no profile has a published model left to opt in to (b200 and gb200 since 2026-11-16, the compute capability 12.0 profiles
+    // since 2026-11-17: their Hopper rule is in force by default), so the mode moves nothing.
+    VCHECK(c.published == SumModel::Sequential);
+    VCHECK(run_mode(c.gpu, "published", false) == on);
     VCHECK(run(c.gpu, true, true) == run(c.gpu, false, true));   // and no other arithmetic moves
     VCHECK(run_mode(c.gpu, "force", true) == run(c.gpu, false, true));
   }
@@ -944,9 +953,10 @@ VTEST(tc_exact_switch_changes_only_sm86_tensor_sums) {
   }
 }
 
-// The Blackwell profiles by default (2026-11-16). b200 and gb200 (sm_100) sum by the Hopper rule, `inferred` from the 20,000 vectors
-// recorded on a B200 (docs/numerics/tcpapers.md); every other Blackwell profile keeps the sequential sum, `unknown`, because no vector set
-// covers it. VGPU_TC_EXACT=0 is the opt-out that gives the earlier sequential sum back on b200 and gb200 too.
+// The Blackwell profiles by default (2026-11-16, 2026-11-17). b200 and gb200 (sm_100) sum by the Hopper rule, `inferred` from the 20,000 vectors
+// recorded on a B200 (docs/numerics/tcpapers.md); the compute capability 12.0 profiles sum by it too, `measured` on rtx-pro-6000-server (an
+// RTX PRO 6000 Blackwell Server Edition was run, test below) and `inferred` on the other four; b300, vr200, thor and gb10 keep the
+// sequential sum, `unknown`, because nothing covers them. VGPU_TC_EXACT=0 is the opt-out that gives the earlier sequential sum back everywhere.
 // MUTATION: set b200.yaml back to `tensor_sum: sequential` (and drop the chunk keys) and this test fails at the first VCHECK.
 VTEST(blackwell_b200_gb200_default_to_the_hopper_rule_and_the_rest_do_not) {
   using namespace vgpu::exec::tc86;
@@ -963,13 +973,46 @@ VTEST(blackwell_b200_gb200_default_to_the_hopper_rule_and_the_rest_do_not) {
     VCHECK(sum_model(p) == SumModel::Sequential && sum_rule(p) == nullptr);
     refresh_exact(nullptr);
   }
-  for (const char* gpu : {"nvidia/b300", "nvidia/vr200", "nvidia/thor", "nvidia/gb10", "nvidia/rtx5090", "nvidia/rtx-pro-4500", "nvidia/rtx-pro-6000",
-                          "nvidia/rtx-pro-6000-server", "nvidia/rtx-pro-6000-max-q"}) {
+  for (const char* gpu : {"nvidia/b300", "nvidia/vr200", "nvidia/thor", "nvidia/gb10"}) {
     const DeviceProfile p = load_gpu(gpu);
-    if (p.numerics.tensor_sum != vgpu::TensorSum::Sequential) throw vtest::Failure(std::string(gpu) + ": numerics.tensor_sum is not sequential: its set has no recorded vectors");
+    if (p.numerics.tensor_sum != vgpu::TensorSum::Sequential) throw vtest::Failure(std::string(gpu) + ": numerics.tensor_sum is not sequential: nothing covers it");
     VCHECK(p.provenance_of("numerics.tensor_sum") == vgpu::Provenance::Unknown);
     VCHECK(sum_model(p) == SumModel::Sequential);
   }
+}
+
+// The compute capability 12.0 profiles (2026-11-17): the Hopper rule by default. An RTX PRO 6000 Blackwell Server Edition (AWS g7e.2xlarge,
+// driver 595.112.07, nvcc 13.0.88 and 13.2.51) was run: simd_lane_forms and float_half_forms print the H100's lines (60 of 60, 169 of 169),
+// FTTN prints width 16 and the motivating example 191.875, the six corners of the subnormal range are the Hopper rule's, and 8,388,608 wmma
+// results are reproduced by it bit for bit (the Ampere rule: 8,366,093). So rtx-pro-6000-server is `measured`; the other four profiles of
+// the compute capability are `inferred` from it. VGPU_TC_EXACT=0 is the way back to the earlier sequential sum.
+// MUTATION: set rtx-pro-6000-server.yaml back to `tensor_sum: sequential` (and drop the chunk keys) and this test fails at the first check.
+VTEST(compute_capability_12_0_blackwell_sums_by_the_hopper_rule_measured_on_the_rtx_pro_6000_server) {
+  using namespace vgpu::exec::tc86;
+  refresh_exact(nullptr);
+  for (const char* gpu : {"nvidia/rtx-pro-6000-server", "nvidia/rtx-pro-6000", "nvidia/rtx-pro-6000-max-q", "nvidia/rtx-pro-4500", "nvidia/rtx5090"}) {
+    const DeviceProfile p = load_gpu(gpu);
+    VCHECK_EQ(p.cc_major, 12);
+    VCHECK_EQ(p.cc_minor, 0);
+    if (p.numerics.tensor_sum != vgpu::TensorSum::Hopper) throw vtest::Failure(std::string(gpu) + ": numerics.tensor_sum is not hopper");
+    VCHECK(p.numerics.tensor_sum_chunk == 16 && p.numerics.tensor_sum_chunk_tf32 == 8 && p.numerics.tensor_sum_grid == 26);
+    VCHECK(p.numerics.tensor_sum_published == vgpu::TensorSum::Sequential);   // nothing is left to opt in to
+    const bool card = std::string(gpu) == "nvidia/rtx-pro-6000-server";      // this model's card was run; the others are its compute capability
+    VCHECK(p.provenance_of("numerics.tensor_sum") == (card ? vgpu::Provenance::Measured : vgpu::Provenance::Inferred));
+    VCHECK(sum_model(p) == SumModel::Hopper && sum_rule(p) == &kHopperRule);
+    for (const char* mode : {"published", "force", "1"}) { refresh_exact(mode); VCHECK(sum_model(p) == SumModel::Hopper); }
+    refresh_exact("0");
+    VCHECK(sum_model(p) == SumModel::Sequential && sum_rule(p) == nullptr);
+    refresh_exact(nullptr);
+  }
+  // What the card was held to: the evidence names the card, the driver, the toolkit and the date, and the files of the probes it printed.
+  const std::string ev = load_gpu("nvidia/rtx-pro-6000-server").evidence_of("numerics.tensor_sum");
+  VCHECK_CONTAINS(ev, "card: NVIDIA RTX PRO 6000 Blackwell Server Edition (this model)");
+  VCHECK_CONTAINS(ev, "driver: 595.112.07");
+  VCHECK_CONTAINS(ev, "date: 2026-11-17");
+  VCHECK_CONTAINS(ev, "8,388,608");
+  // The card's six corners are the Hopper rule's, and R3 tells the two rules apart (the Ampere rule gives 0x00411fcd, the card 0x00411fcc).
+  VCHECK_CONTAINS(ev, "0x00411fcc");
 }
 
 // The table itself: which profile takes which model. It is read from the profiles (numerics.tensor_sum), and every profile is held to
@@ -997,7 +1040,7 @@ VTEST(tc_model_devices) {
     if (!pin) throw vtest::Failure(id + " has no pin in kTensorSumPins");
     if (device_sum_model(p) != pin->model) throw vtest::Failure(id + ": numerics.tensor_sum is not the pinned model");
     if (published_sum_model(p) != pin->published) throw vtest::Failure(id + ": numerics.tensor_sum_published is not the pinned model");
-    if (pin->model != (is_b200_class(id) ? SumModel::Hopper : legacy_device_sum_model(p.cc_major, p.cc_minor))) throw vtest::Failure(id + ": the pin is not what the compute-capability table gave");
+    if (pin->model != (is_hopper_blackwell(id) ? SumModel::Hopper : legacy_device_sum_model(p.cc_major, p.cc_minor))) throw vtest::Failure(id + ": the pin is not what the compute-capability table gave");
     if (pin->published != (pin->model == SumModel::Sequential ? legacy_published_sum_model(p.cc_major, p.cc_minor) : SumModel::Sequential))
       throw vtest::Failure(id + ": the published pin is not what the compute-capability table gave");
     // The numbers written in the profile are the model's.
@@ -1043,8 +1086,9 @@ VTEST(tc_model_devices) {
   VCHECK(legacy_published_sum_model(10, 0) == SumModel::Hopper && legacy_published_sum_model(12, 0) == SumModel::Hopper);
   for (const auto& cc : {std::pair{7, 0}, std::pair{8, 7}, std::pair{10, 3}, std::pair{10, 7}, std::pair{11, 0}, std::pair{12, 1}})
     VCHECK(legacy_published_sum_model(cc.first, cc.second) == SumModel::Sequential);
-  VCHECK(published_sum_model(load_gpu("nvidia/rtx-pro-6000")) == SumModel::Hopper && published_sum_model(load_gpu("nvidia/rtx5090")) == SumModel::Hopper);
-  for (const char* gpu : {"nvidia/b200", "nvidia/gb200", "nvidia/b300", "nvidia/vr200", "nvidia/thor", "nvidia/gb10", "nvidia/h100", "nvidia/rtx3060"})
+  // (The old table's published Hopper numbers for 10.0 and 12.0 are in force by default now: no profile has one left to opt in to.)
+  for (const char* gpu : {"nvidia/b200", "nvidia/gb200", "nvidia/rtx-pro-6000", "nvidia/rtx-pro-6000-server", "nvidia/rtx5090", "nvidia/b300", "nvidia/vr200",
+                          "nvidia/thor", "nvidia/gb10", "nvidia/h100", "nvidia/rtx3060"})
     VCHECK(published_sum_model(load_gpu(gpu)) == SumModel::Sequential);
 }
 
