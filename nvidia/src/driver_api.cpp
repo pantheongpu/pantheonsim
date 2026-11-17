@@ -324,6 +324,7 @@ static void drop_ctx_stack(void* p) {
 }
 }  // namespace
 extern "C" int vgpu_driver_bind_primary_v1(int dev);
+static CUresult cuInit_impl(unsigned int flags);   // (defined below; api() brings the driver up when the runtime already has, #685)
 namespace {
 // A thread the runtime has used before this library was loaded (cudaGetDriverEntryPoint loads it on first use, for a
 // program that does not link libcuda: #604) has the runtime's primary context current on the card, as every thread the
@@ -544,6 +545,16 @@ bool current_context_dead(ShimState& s) { return !ctx_stack().empty() && context
 // (vgpu_driver_thread_has_context_v1) takes no lock in a program that never destroys one.
 std::atomic<bool> g_context_destroyed{false};
 
+namespace {
+// Whether libcudart is loaded and has started. Looked up at each call that finds the driver uninitialised (a program that links no
+// libcudart has nothing to find, and a runtime loaded later is found then).
+bool runtime_has_started() {
+  using Fn = int (*)();
+  const Fn started = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "vgpu_runtime_started_v1"));
+  return started && started();
+}
+}  // namespace
+
 // Wraps an API body: locks, checks init, catches and maps errors.
 template <class F>
 CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
@@ -553,6 +564,9 @@ CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
   }
   ShimState& s = state();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
+  // The runtime has already brought the driver up, on a card (#685): a program that loads libcuda itself after the runtime started
+  // (dlopen, which the runtime's own lookup for cuInit cannot see) calls it without a cuInit of its own.
+  if (needs_init && !s.initialized && runtime_has_started()) cuInit_impl(0);
   if (needs_init && !s.initialized) {
     report(name, "cuInit has not been called");
     return CUDA_ERROR_NOT_INITIALIZED;

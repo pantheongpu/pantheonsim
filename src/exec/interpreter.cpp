@@ -3662,7 +3662,8 @@ class Interpreter {
       if (++w.steps > cfg_.max_steps)
         ctx_fail(ins, -1, Err::ExecLimit,
                  "exceeded the step budget (" + std::to_string(cfg_.max_steps) +
-                     " instructions in one warp) — possible infinite loop; block (" +
+                     " instructions in one warp) — possible infinite loop (or a long wait: %clock64 and %globaltimer count one"
+                     " instruction per cycle or ns, so a wait of about a second reaches it; --max-steps 0 lifts the budget); block (" +
                      std::to_string(ctx.ctaid[0]) + "," + std::to_string(ctx.ctaid[1]) + "," +
                      std::to_string(ctx.ctaid[2]) + "), warp " + std::to_string(cur_warp_) +
                      warp_positions(ctx));

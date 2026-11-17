@@ -504,6 +504,9 @@ VTEST(max_steps_env_raises_the_budget) {
   ::unsetenv("VGPU_MAX_STEPS");
   auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, mem, prof));
   VCHECK(err.code() == Err::ExecLimit);
+  // The message says a long wait on a clock reaches the budget too, and how to lift it (#687).
+  VCHECK_CONTAINS(err.what(), "%globaltimer");
+  VCHECK_CONTAINS(err.what(), "--max-steps 0");
 
   g.set("100000");  // now it fits
   exec::launch(m.entries[0], cfg, {}, mem, prof);

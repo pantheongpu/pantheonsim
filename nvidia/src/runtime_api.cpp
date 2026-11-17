@@ -8111,6 +8111,12 @@ static cudaError_t cudaGetDriverEntryPoint_traced(const char* symbol, void** fun
 // have current had the driver been loaded when the runtime used it, or -1.
 VGPU_EXPORT int vgpu_runtime_thread_device_v1() { return t_unbound_device; }
 
+// For the driver shim (api() in driver_api.cpp): whether the runtime has started. A program that links only libcudart and loads libcuda itself
+// (dlopen, so the driver is in no scope the runtime looks in, or loaded after the runtime started) has a driver nobody has initialised. On a
+// card the runtime brought the driver up when it started, so the program's first driver call finds it initialised; the shim does the same
+// when it is first called (#685).
+VGPU_EXPORT int vgpu_runtime_started_v1() { return st().initialized.load(std::memory_order_acquire) ? 1 : 0; }
+
 VGPU_EXPORT cudaError_t cudaGetDriverEntryPoint(const char* symbol, void** funcPtr, unsigned long long flags, cudaDriverEntryPointQueryResult* driverStatus) {
   return traced_call("cudaGetDriverEntryPoint", cudaGetDriverEntryPoint_traced, symbol, funcPtr, flags, driverStatus);
 }
