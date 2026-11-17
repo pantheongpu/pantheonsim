@@ -85,6 +85,7 @@ def main():
     ap.add_argument("--timing-dir", default="docs/perf-design/data")
     ap.add_argument("--out", default=None)
     ap.add_argument("--markdown", default=None)
+    ap.add_argument("--program-cells", default=None, help="comma list of cells for programs.tsv (default: all)")
     a = ap.parse_args()
     cells, modules, kernels = parse(a.census)
     timing = load_timing(a.timing_dir)
@@ -177,10 +178,11 @@ def main():
                     top = sorted(d["progs"], key=lambda p: -sum(1 for r in progs[p][name] if not r[1] and any(reason_key(b) == key.split(" [")[0] for b in r[3])))[:5]
                     f.write("\t".join(map(str, [name, key, d["any"], d["first"], d["sole"], len(d["progs"]), len(d["sole_progs"]), "%.1f" % d["sec"], "%.1f" % d["sole_sec"], ";".join(top), ";".join("%s=%d" % kv for kv in d["detail"].most_common(5))])) + "\n")
         with open(os.path.join(a.out, "programs.tsv"), "w") as f:
-            f.write("program\tsim_seconds\tkernels\t" + "\t".join(cells) + "\n")
+            pcells = a.program_cells.split(",") if a.program_cells else cells
+            f.write("program\tsim_seconds\tkernels\t" + "\t".join(pcells) + "\n")
             for p in allprogs:
                 row = [p, "%.2f" % timing[p] if p in timing else "-", str(len(progs[p][cells[0]]))]
-                for name in cells:
+                for name in pcells:
                     rs_ = progs[p][name]
                     n_ok = sum(1 for r in rs_ if r[1])
                     if n_ok == len(rs_):

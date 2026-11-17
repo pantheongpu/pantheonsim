@@ -842,3 +842,21 @@ of a kernel never run there was a fixed 100 us, and a launch under 200 us never 
 start share of a kernel launched thousands of times was capped at 500 launches (5,000); the first card launch's time includes the module load (65 us for a
 20 us kernel) and was kept for good (the prior is kept instead, later times at their least); and one launch that was 60 us late ended the card for its kernel
 (three in a row now). JACOBI1D 2.3 s to 1.5 s, sc_gpu 0.96 s to 0.85 s; LargeKernelParameter saves 0.2 ms a launch against the 0.25 ms its start needs, and stays in the simulator.
+
+
+## 17. Turbo refusal census: what still stays in the simulator, and why (2026-11-17)
+
+Tags: [M] measured by `tools/turbo-census` (CPU only, no card) over the files named; [I] inferred; [U] unknown. Data, method and the list of what is the runtime's own code and what the tool wrote again:
+[data/turbo-census/README.md](data/turbo-census/README.md). Nothing in turbo changed.
+
+For every kernel of 654 corpus binaries (PolyBench, Rodinia, HeCBench, CUDA Samples 13.0: 613 programs, 3,321 kernels) and of libtorch_cuda.so (21,614) and Ollama's two libggml-cuda.so (4,530 each), for hosts sm_75, sm_86, sm_89
+and sm_90 and the profiles a10g and h100, the tool reports the image turbo would give the card and, for a kernel that stays in the simulator, every reason, using `pick_card_image`, `scan_ptx_for_card`, `turbo_class`
+and the other functions of this mode. Its walk over a kernel's code is a copy of `Impl::kernel_eligible`'s (that function needs a live `Impl`); `test_turbo_census` holds the copy to the runtime's functions, with five mutations shown failing.
+* [M] a10g profile on an sm_86 card: 3,115 of 3,321 kernels (93.8 %), 577 of 613 programs, and 2,484 of the 2,485 simulator seconds that exist for 120 of the programs, are admitted whole. h100 profile on the same card 71.8 %; sm_90 card 67.2 %.
+  Corpus caveat: every corpus was built for sm_86 (no sm_90-only build, no PTX-only build), so the retarget route of section 16.3 saw no kernel, and the sm_75 cell (15.4 %) measures the corpus.
+* [M] the reasons by weight: a module whose image is PTX, or whose simulator image is PTX, and which declares a variable (24 % of kernels on an sm_90 card, 21 % for the h100 profile on sm_86; 427 of the 804 refused on the sm_90 card
+  declare only unreferenced `cuda::std::__cpo` objects); `ENDCOLLECTIVE` in sm_90 cubins (215 kernels, 73.8 s); texture and surface (24 kernels, 12 programs, 1.0 s); `__managed__`, BPT, a register call, `__assertfail`: under 4 % together.
+* [M] libraries (a10g profile, sm_86 card): libtorch 73.5 % (`__assertfail` 25 %, a call through a register 26 %), Ollama cuda_v12 90.6 % (BPT and a register call 9.4 %), **Ollama cuda_v13 0 %** (PTX only, every module declares a variable;
+  45 % of its kernels only declare unreferenced ones).
+* The recommendation (build: admit `__assertfail` and the trap; refuse a PTX module only for a referenced variable; one H100 run for `ENDCOLLECTIVE`; do not build texture on the card, TMA translation or multi-card on this data) is in the round's report;
+  limits: 120 of 613 programs have a simulator time, launch-time refusals (fit, host-mapped memory, cooperative) are invisible to a static scan, and a PTX module reports only its first blocker.

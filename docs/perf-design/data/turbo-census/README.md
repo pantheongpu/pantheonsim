@@ -27,7 +27,7 @@ sample, first launch, start cost, bans, streak). A PTX module reports only its f
 
 * `cells.tsv`: per cell, kernels admitted, how many by the `unlisted` class, which image kind, programs fully admitted.
 * `reasons.tsv`: per cell, every refusal reason: kernels (as any reason / as the runtime's first reason / as the only reason), programs, simulator seconds of the timed programs that have it, top 5 programs.
-* `programs.tsv`: per program, simulator seconds (median over the tables of this directory's parent, blank when none) and per cell `all` or `<n> ok;<reason>=<kernels>`.
+* `programs.tsv`: per program, simulator seconds (median over the tables of this directory's parent, `-` when none) and for the four cells a10g:sm_86, h100:sm_86, a10g:sm_90, h100:sm_90 `all` or `<n> ok;<reason>=<kernels>`.
 * `libs.tsv`: the same reasons for libtorch_cuda.so (PyTorch 2.10+cu130) and the Ollama cuda_v13 libggml-cuda.so, where no timing exists.
 * `mut_*.txt`: the mutations of the tool, each shown failing in `test_turbo_census`.
 
@@ -36,6 +36,6 @@ sample, first launch, start cost, bans, streak). A PTX module reports only its f
 ```
 cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DVGPU_LTO=OFF -S . -B build && ninja -C build turbo_census test_turbo_census
 build/turbo_census --out census.tsv <binaries or .so files>
-python3 tools/turbo-census/aggregate.py census.tsv --out docs/perf-design/data/turbo-census --markdown summary.txt
+python3 tools/turbo-census/aggregate.py census.tsv --out docs/perf-design/data/turbo-census --markdown summary.txt --program-cells p86:h86,p90:h86,p86:h90,p90:h90
 ```
 Build on a machine with no other load (server3 rules of the round brief); the 654 corpus binaries (648 MB) take 18 s, libtorch_cuda.so plus libggml-cuda.so a few minutes and 2.7 GB of memory.

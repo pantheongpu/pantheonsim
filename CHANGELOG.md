@@ -28,6 +28,9 @@ release says what runs and what it produces, never how fast a real GPU would run
   size rule now takes the card's time for a kernel it has not run as a twentieth of the simulator's estimate (at most 100 us, as before), lets a
   launch of 40 us or more be sent (was 200 us), and lets a kernel launched thousands of times repay the driver start at 50 us saved a launch.
   The simulator's results do not change, only which path a launch takes. `VGPU_HOST_GPU_SHORT=0` restores the old rule.
+
+- **Turbo refusal census** (`tools/turbo-census`, `test_turbo_census`, [docs/perf-design/data/turbo-census/](docs/perf-design/data/turbo-census/README.md), `12-host-gpu-turbo.md` section 17): a CPU-only tool that says, for every kernel of built binaries and libraries, which image
+  turbo would give each host card (sm_75, sm_86, sm_89, sm_90) under the a10g and h100 profiles and why a kernel stays in the simulator, using the runtime's own image choice, PTX scan and instruction classes. Turbo itself is unchanged.
 - **Turbo host-GPU mode, next round: PTX retargeting, a driver start that overlaps the program's set-up, and the simulated profile's launch limits** (follows the turbo-fit round, PR #693).
   A module whose only PTX is plain `.target sm_90` (a build with `-arch=sm_90` or `compute_90` alone) now runs on an sm_80, sm_86 or sm_87 card: its target line is rewritten to
   the card's and the driver compiles it, provided the PTX uses no form that card lacks (a text scan of the forms ptxas 13.0 rejects there: `mbarrier.try_wait`, `expect_tx`, count-form

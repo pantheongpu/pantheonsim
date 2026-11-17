@@ -1,0 +1,93 @@
+cell	reason	kernels_any	kernels_first	kernels_sole	programs	programs_sole	timed_seconds_with_reason	timed_seconds_sole	top_programs	detail
+p86:h75	image:none	2571	2571	2571	508	508	1865.8	1865.8	hecbench/attentionMultiHeadKVCache-cuda;hecbench/logic-rewrite-cuda;hecbench/tsne-cuda;hecbench/s3d-cuda;hecbench/scan-cuda	
+p86:h75	module:variable-layout	190	190	190	8	8	47.2	47.2	samples/segmentationTreeThrust;samples/cdpQuadtree;samples/cdpAdvancedQuicksort;samples/cdpSimplePrint;samples/radixSortThrust	
+p86:h75	never:texture-surface	23	23	23	11	11	1.0	1.0	samples/convolutionFFT2D;samples/HSOpticalFlow;samples/simplePitchLinearTexture;samples/dct8x8;samples/convolutionTexture	TEX=17;TLD=5;SUST=1
+p86:h75	never:call-unfollowed	9	0	0	5	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpBezierTessellation;samples/simpleAssert;samples/cdpSimpleQuicksort;samples/newdelete	
+p86:h75	extern:malloc-free	5	3	0	2	0	0.0	0.0	samples/newdelete;samples/cdpBezierTessellation	
+p86:h75	extern:other	6	4	0	3	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpSimpleQuicksort;samples/cdpBezierTessellation	
+p86:h75	extern:device-launch	3	3	0	2	0	0.0	0.0	samples/cdpBezierTessellation;samples/cdpSimpleQuicksort	
+p86:h75	never:call-through-register	13	11	11	2	1	0.0	0.0	samples/simpleCUFFT_callback;samples/newdelete	
+p86:h75	extern:assert	1	1	0	1	0	0.0	0.0	samples/simpleAssert	
+p86:h75	never:bpt	3	3	3	3	3	0.0	0.0	samples/conjugateGradientMultiBlockCG;samples/reductionMultiBlockCG;samples/conjugateGradientMultiDeviceCG	BPT=3
+p86:h86	never:texture-surface	24	24	24	12	12	1.0	1.0	samples/convolutionFFT2D;samples/HSOpticalFlow;samples/simplePitchLinearTexture;samples/dct8x8;samples/convolutionTexture	TEX=18;TLD=5;SUST=1
+p86:h86	never:bpt	4	4	4	4	4	0.4	0.4	samples/conjugateGradientMultiBlockCG;samples/simpleAWBarrier;samples/reductionMultiBlockCG;samples/conjugateGradientMultiDeviceCG	BPT=4
+p86:h86	never:call-unfollowed	13	0	0	9	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpBezierTessellation;samples/cdpQuadtree;samples/cdpAdvancedQuicksort;samples/simpleAssert	
+p86:h86	extern:other	9	4	0	6	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpQuadtree;samples/cdpBezierTessellation;samples/cdpAdvancedQuicksort;samples/cdpSimpleQuicksort	
+p86:h86	extern:device-launch	6	6	0	5	0	0.0	0.0	samples/cdpBezierTessellation;samples/cdpQuadtree;samples/cdpAdvancedQuicksort;samples/cdpSimpleQuicksort;samples/cdpSimplePrint	
+p86:h86	extern:malloc-free	6	4	0	3	0	0.0	0.0	samples/newdelete;samples/cdpBezierTessellation;hecbench/logic-rewrite-cuda	
+p86:h86	never:call-through-register	46	21	21	9	3	0.0	0.0	hecbench/logic-rewrite-cuda;samples/simpleCUFFT_callback;samples/newdelete;hecbench/assert-cuda;hecbench/gemv-cuda	
+p86:h86	extern:assert	25	24	0	7	0	0.0	0.0	hecbench/logic-rewrite-cuda;hecbench/assert-cuda;hecbench/warpsort-cuda;samples/simpleAssert;hecbench/moe-cuda	
+p86:h86	module:managed	116	116	116	2	1	0.0	0.0	hecbench/logic-rewrite-cuda;hecbench/hungarian-cuda	
+p86:h86	never:arrives-syncs-endcollective	3	3	3	2	2	0.0	0.0	samples/globalToShmemAsyncCopy;hecbench/awbarrier-cuda	ARRIVES=3
+p86:h89	never:texture-surface	24	24	24	12	12	1.0	1.0	samples/convolutionFFT2D;samples/HSOpticalFlow;samples/simplePitchLinearTexture;samples/dct8x8;samples/convolutionTexture	TEX=18;TLD=5;SUST=1
+p86:h89	never:bpt	4	4	4	4	4	0.4	0.4	samples/conjugateGradientMultiBlockCG;samples/simpleAWBarrier;samples/reductionMultiBlockCG;samples/conjugateGradientMultiDeviceCG	BPT=4
+p86:h89	never:call-unfollowed	11	0	0	7	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpBezierTessellation;samples/cdpQuadtree;samples/simpleAssert;samples/cdpSimpleQuicksort	
+p86:h89	extern:other	7	4	0	4	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpSimpleQuicksort;samples/cdpQuadtree;samples/cdpBezierTessellation	
+p86:h89	extern:device-launch	4	4	0	3	0	0.0	0.0	samples/cdpBezierTessellation;samples/cdpSimpleQuicksort;samples/cdpQuadtree	
+p86:h89	extern:malloc-free	6	4	0	3	0	0.0	0.0	samples/newdelete;samples/cdpBezierTessellation;hecbench/logic-rewrite-cuda	
+p86:h89	never:call-through-register	46	21	21	9	3	0.0	0.0	hecbench/logic-rewrite-cuda;samples/simpleCUFFT_callback;samples/newdelete;hecbench/assert-cuda;hecbench/gemv-cuda	
+p86:h89	module:variable-layout	69	69	69	2	2	0.0	0.0	samples/cdpAdvancedQuicksort;samples/cdpSimplePrint	
+p86:h89	extern:assert	25	24	0	7	0	0.0	0.0	hecbench/logic-rewrite-cuda;hecbench/assert-cuda;hecbench/warpsort-cuda;samples/simpleAssert;hecbench/moe-cuda	
+p86:h89	module:managed	116	116	116	2	1	0.0	0.0	hecbench/logic-rewrite-cuda;hecbench/hungarian-cuda	
+p86:h89	never:arrives-syncs-endcollective	3	3	3	2	2	0.0	0.0	samples/globalToShmemAsyncCopy;hecbench/awbarrier-cuda	ARRIVES=3
+p86:h90	never:arrives-syncs-endcollective	215	210	209	19	13	73.8	73.4	samples/reduction;samples/radixSortThrust;samples/segmentationTreeThrust;samples/eigenvalues;samples/newdelete	ENDCOLLECTIVE=215;SYNCS=1
+p86:h90	ptx:module-variable [ptx-jit]	804	804	804	100	100	9.8	9.8	hecbench/logic-rewrite-cuda;hecbench/tsne-cuda;hecbench/minmax-cuda;hecbench/attention-paged-cuda;hecbench/radixsort2-cuda	.global.unreferenced=427;.global.referenced=335;.const.referenced=42
+p86:h90	never:texture-surface	24	24	24	12	11	1.0	1.0	samples/convolutionFFT2D;samples/HSOpticalFlow;samples/simplePitchLinearTexture;samples/dct8x8;samples/convolutionTexture	TEX=18;TLD=5;SUST=1
+p86:h90	never:bpt	4	3	1	4	1	0.4	0.0	samples/conjugateGradientMultiBlockCG;samples/simpleAWBarrier;samples/reductionMultiBlockCG;samples/conjugateGradientMultiDeviceCG	BPT=4
+p86:h90	never:call-unfollowed	10	0	0	6	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpBezierTessellation;samples/cdpQuadtree;samples/simpleAssert;samples/cdpSimpleQuicksort	
+p86:h90	extern:other	7	4	0	4	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpSimpleQuicksort;samples/cdpQuadtree;samples/cdpBezierTessellation	
+p86:h90	extern:device-launch	4	4	0	3	0	0.0	0.0	samples/cdpBezierTessellation;samples/cdpSimpleQuicksort;samples/cdpQuadtree	
+p86:h90	extern:malloc-free	5	3	0	2	0	0.0	0.0	samples/newdelete;samples/cdpBezierTessellation	
+p86:h90	never:call-through-register	13	11	10	2	1	0.0	0.0	samples/simpleCUFFT_callback;samples/newdelete	
+p86:h90	module:variable-layout	77	77	77	3	3	0.0	0.0	samples/cdpAdvancedQuicksort;samples/cdpSimplePrint;samples/globalToShmemAsyncCopy	
+p86:h90	extern:assert	1	1	0	1	0	0.0	0.0	samples/simpleAssert	
+p86:h90	image:none	10	10	10	5	5	0.0	0.0	hecbench/ans-cuda;hecbench/merkle-cuda;hecbench/si-cuda;hecbench/fresnel-cuda;hecbench/logan-cuda	
+p86:h90	ptx:indirect-call [ptx-jit]	10	10	10	7	7	0.0	0.0	hecbench/sph-cuda;hecbench/rushlarsen-cuda;hecbench/feynman-kac-cuda;hecbench/myocyte-cuda;hecbench/vanGenuchten-cuda	
+p90:h75	image:none	2571	2571	2571	508	508	1865.8	1865.8	hecbench/attentionMultiHeadKVCache-cuda;hecbench/logic-rewrite-cuda;hecbench/tsne-cuda;hecbench/s3d-cuda;hecbench/scan-cuda	
+p90:h75	module:variable-layout	190	190	190	8	8	47.2	47.2	samples/segmentationTreeThrust;samples/cdpQuadtree;samples/cdpAdvancedQuicksort;samples/cdpSimplePrint;samples/radixSortThrust	
+p90:h75	never:texture-surface	23	23	23	11	11	1.0	1.0	samples/convolutionFFT2D;samples/HSOpticalFlow;samples/simplePitchLinearTexture;samples/dct8x8;samples/convolutionTexture	TEX=17;TLD=5;SUST=1
+p90:h75	never:call-unfollowed	9	0	0	5	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpBezierTessellation;samples/simpleAssert;samples/cdpSimpleQuicksort;samples/newdelete	
+p90:h75	extern:malloc-free	5	3	0	2	0	0.0	0.0	samples/newdelete;samples/cdpBezierTessellation	
+p90:h75	extern:other	6	4	0	3	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpSimpleQuicksort;samples/cdpBezierTessellation	
+p90:h75	extern:device-launch	3	3	0	2	0	0.0	0.0	samples/cdpBezierTessellation;samples/cdpSimpleQuicksort	
+p90:h75	never:call-through-register	13	11	11	2	1	0.0	0.0	samples/simpleCUFFT_callback;samples/newdelete	
+p90:h75	extern:assert	1	1	0	1	0	0.0	0.0	samples/simpleAssert	
+p90:h75	never:bpt	3	3	3	3	3	0.0	0.0	samples/conjugateGradientMultiBlockCG;samples/reductionMultiBlockCG;samples/conjugateGradientMultiDeviceCG	BPT=3
+p90:h86	module:variables-sim-runs-ptx	691	691	691	102	101	9.8	9.8	hecbench/logic-rewrite-cuda;hecbench/tsne-cuda;hecbench/minmax-cuda;hecbench/attention-paged-cuda;hecbench/radixsort2-cuda	referenced=650;unreferenced=41
+p90:h86	never:texture-surface	24	24	24	12	12	1.0	1.0	samples/convolutionFFT2D;samples/HSOpticalFlow;samples/simplePitchLinearTexture;samples/dct8x8;samples/convolutionTexture	TEX=18;TLD=5;SUST=1
+p90:h86	never:bpt	4	4	4	4	4	0.4	0.4	samples/conjugateGradientMultiBlockCG;samples/simpleAWBarrier;samples/reductionMultiBlockCG;samples/conjugateGradientMultiDeviceCG	BPT=4
+p90:h86	never:call-unfollowed	10	0	0	6	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpBezierTessellation;samples/cdpQuadtree;samples/simpleAssert;samples/cdpSimpleQuicksort	
+p90:h86	extern:other	7	4	0	4	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpSimpleQuicksort;samples/cdpQuadtree;samples/cdpBezierTessellation	
+p90:h86	extern:device-launch	4	4	0	3	0	0.0	0.0	samples/cdpBezierTessellation;samples/cdpSimpleQuicksort;samples/cdpQuadtree	
+p90:h86	extern:malloc-free	5	3	0	2	0	0.0	0.0	samples/newdelete;samples/cdpBezierTessellation	
+p90:h86	never:call-through-register	13	11	11	2	1	0.0	0.0	samples/simpleCUFFT_callback;samples/newdelete	
+p90:h86	module:variable-layout	77	77	77	3	3	0.0	0.0	samples/cdpAdvancedQuicksort;samples/cdpSimplePrint;samples/globalToShmemAsyncCopy	
+p90:h86	extern:assert	1	1	0	1	0	0.0	0.0	samples/simpleAssert	
+p90:h86	module:managed	116	116	116	2	1	0.0	0.0	hecbench/logic-rewrite-cuda;hecbench/hungarian-cuda	
+p90:h86	never:arrives-syncs-endcollective	1	1	1	1	1	0.0	0.0	hecbench/awbarrier-cuda	ARRIVES=1
+p90:h89	module:variables-sim-runs-ptx	691	691	691	102	101	9.8	9.8	hecbench/logic-rewrite-cuda;hecbench/tsne-cuda;hecbench/minmax-cuda;hecbench/attention-paged-cuda;hecbench/radixsort2-cuda	referenced=650;unreferenced=41
+p90:h89	never:texture-surface	24	24	24	12	12	1.0	1.0	samples/convolutionFFT2D;samples/HSOpticalFlow;samples/simplePitchLinearTexture;samples/dct8x8;samples/convolutionTexture	TEX=18;TLD=5;SUST=1
+p90:h89	never:bpt	4	4	4	4	4	0.4	0.4	samples/conjugateGradientMultiBlockCG;samples/simpleAWBarrier;samples/reductionMultiBlockCG;samples/conjugateGradientMultiDeviceCG	BPT=4
+p90:h89	never:call-unfollowed	10	0	0	6	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpBezierTessellation;samples/cdpQuadtree;samples/simpleAssert;samples/cdpSimpleQuicksort	
+p90:h89	extern:other	7	4	0	4	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpSimpleQuicksort;samples/cdpQuadtree;samples/cdpBezierTessellation	
+p90:h89	extern:device-launch	4	4	0	3	0	0.0	0.0	samples/cdpBezierTessellation;samples/cdpSimpleQuicksort;samples/cdpQuadtree	
+p90:h89	extern:malloc-free	5	3	0	2	0	0.0	0.0	samples/newdelete;samples/cdpBezierTessellation	
+p90:h89	never:call-through-register	13	11	11	2	1	0.0	0.0	samples/simpleCUFFT_callback;samples/newdelete	
+p90:h89	module:variable-layout	77	77	77	3	3	0.0	0.0	samples/cdpAdvancedQuicksort;samples/cdpSimplePrint;samples/globalToShmemAsyncCopy	
+p90:h89	extern:assert	1	1	0	1	0	0.0	0.0	samples/simpleAssert	
+p90:h89	module:managed	116	116	116	2	1	0.0	0.0	hecbench/logic-rewrite-cuda;hecbench/hungarian-cuda	
+p90:h89	never:arrives-syncs-endcollective	1	1	1	1	1	0.0	0.0	hecbench/awbarrier-cuda	ARRIVES=1
+p90:h90	never:arrives-syncs-endcollective	217	212	210	20	13	73.8	73.4	samples/reduction;samples/radixSortThrust;samples/segmentationTreeThrust;samples/eigenvalues;samples/globalToShmemAsyncCopy	ENDCOLLECTIVE=216;SYNCS=3;ARRIVES=1
+p90:h90	ptx:module-variable [ptx-jit]	804	804	804	100	100	9.8	9.8	hecbench/logic-rewrite-cuda;hecbench/tsne-cuda;hecbench/minmax-cuda;hecbench/attention-paged-cuda;hecbench/radixsort2-cuda	.global.unreferenced=427;.global.referenced=335;.const.referenced=42
+p90:h90	never:texture-surface	24	24	24	12	11	1.0	1.0	samples/convolutionFFT2D;samples/HSOpticalFlow;samples/simplePitchLinearTexture;samples/dct8x8;samples/convolutionTexture	TEX=18;TLD=5;SUST=1
+p90:h90	never:bpt	4	3	1	4	1	0.4	0.0	samples/conjugateGradientMultiBlockCG;samples/simpleAWBarrier;samples/reductionMultiBlockCG;samples/conjugateGradientMultiDeviceCG	BPT=4
+p90:h90	never:call-unfollowed	12	0	0	8	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpBezierTessellation;samples/cdpQuadtree;samples/cdpAdvancedQuicksort;samples/simpleAssert	
+p90:h90	extern:other	9	4	0	6	0	0.0	0.0	samples/graphConditionalNodes;samples/cdpQuadtree;samples/cdpBezierTessellation;samples/cdpAdvancedQuicksort;samples/cdpSimpleQuicksort	
+p90:h90	extern:device-launch	6	6	0	5	0	0.0	0.0	samples/cdpBezierTessellation;samples/cdpQuadtree;samples/cdpAdvancedQuicksort;samples/cdpSimpleQuicksort;samples/cdpSimplePrint	
+p90:h90	extern:malloc-free	5	3	0	2	0	0.0	0.0	samples/newdelete;samples/cdpBezierTessellation	
+p90:h90	never:call-through-register	13	11	10	2	1	0.0	0.0	samples/simpleCUFFT_callback;samples/newdelete	
+p90:h90	extern:assert	1	1	0	1	0	0.0	0.0	samples/simpleAssert	
+p90:h90	image:none	10	10	10	5	5	0.0	0.0	hecbench/ans-cuda;hecbench/merkle-cuda;hecbench/si-cuda;hecbench/fresnel-cuda;hecbench/logan-cuda	
+p90:h90	ptx:indirect-call [ptx-jit]	10	10	10	7	7	0.0	0.0	hecbench/sph-cuda;hecbench/rushlarsen-cuda;hecbench/feynman-kac-cuda;hecbench/myocyte-cuda;hecbench/vanGenuchten-cuda	
+p90:h90	never:elect	1	0	0	1	0	0.0	0.0	samples/globalToShmemAsyncCopy	ELECT=1
+p90:h90	never:tma	1	0	0	1	0	0.0	0.0	samples/globalToShmemAsyncCopy	UBLKCP=1

@@ -1,0 +1,614 @@
+program	sim_seconds	kernels	p86:h86	p90:h86	p86:h90	p90:h90
+hecbench/accuracy-cuda	-	3	all	0 ok;module:variables-sim-runs-ptx=3	0 ok;ptx:module-variable=3	0 ok;ptx:module-variable=3
+hecbench/ace-cuda	-	6	all	all	all	all
+hecbench/adam-cuda	0.03	1	all	all	all	all
+hecbench/adamw-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/addBiasQKV-cuda	-	1	all	all	all	all
+hecbench/addBiasResidualLayerNorm-cuda	-	12	all	all	all	all
+hecbench/adjacent-cuda	-	6	all	0 ok;module:variables-sim-runs-ptx=6	0 ok;ptx:module-variable=6	0 ok;ptx:module-variable=6
+hecbench/adv-cuda	-	1	all	all	all	all
+hecbench/aes-cuda	-	2	all	all	all	all
+hecbench/affine-cuda	-	1	all	all	all	all
+hecbench/aidw-cuda	77.60	2	all	all	all	all
+hecbench/aligned-types-cuda	-	26	all	all	all	all
+hecbench/all-pairs-distance-cuda	-	4	all	0 ok;module:variables-sim-runs-ptx=4	0 ok;ptx:module-variable=4	0 ok;ptx:module-variable=4
+hecbench/amgmk-cuda	-	1	all	all	all	all
+hecbench/ans-cuda	-	5	all	all	0 ok;image:none=5	0 ok;image:none=5
+hecbench/aobench-cuda	0.54	1	all	all	all	all
+hecbench/aop-cuda	1.86	11	all	all	all	all
+hecbench/asmooth-cuda	0.23	3	all	all	all	all
+hecbench/assert-cuda	-	3	0 ok;extern:assert=3	0 ok;module:variables-sim-runs-ptx=3	0 ok;ptx:module-variable=3	0 ok;ptx:module-variable=3
+hecbench/asta-cuda	-	1	all	all	all	all
+hecbench/asyncAllocation-cuda	3.60	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/atan2-cuda	0.03	3	all	all	all	all
+hecbench/atomicAggregate-cuda	3.58	1	all	all	all	all
+hecbench/atomicCAS-cuda	-	9	all	all	all	all
+hecbench/atomicCost-cuda	-	6	all	all	all	all
+hecbench/atomicIntrinsics-cuda	0.18	2	all	all	all	all
+hecbench/atomicPerf-cuda	1.12	18	all	all	all	all
+hecbench/atomicReduction-cuda	288.01	5	all	all	all	all
+hecbench/atomicSystemWide-cuda	-	1	all	all	all	all
+hecbench/attention-cuda	0.03	8	all	0 ok;module:variables-sim-runs-ptx=8	0 ok;ptx:module-variable=8	0 ok;ptx:module-variable=8
+hecbench/attention-paged-cuda	-	21	all	0 ok;module:variables-sim-runs-ptx=21	0 ok;ptx:module-variable=21	0 ok;ptx:module-variable=21
+hecbench/attentionMergeState-cuda	-	6	all	all	all	all
+hecbench/attentionMultiHead-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/attentionMultiHeadKVCache-cuda	-	252	all	all	all	all
+hecbench/awbarrier-cuda	-	2	1 ok;never:arrives-syncs-endcollective=1	1 ok;never:arrives-syncs-endcollective=1	all	all
+hecbench/axpby-cuda	0.41	1	all	all	all	all
+hecbench/b+tree-cuda	-	2	all	all	all	all
+hecbench/babelstream-cuda	364.20	14	all	all	all	all
+hecbench/background-subtract-cuda	0.00	4	all	all	all	all
+hecbench/backprop-cuda	0.01	2	all	all	all	all
+hecbench/base64e-cuda	307.95	1	all	all	all	all
+hecbench/bezier-surface-cuda	-	1	all	all	all	all
+hecbench/bfs-cuda	-	2	all	all	all	all
+hecbench/bgmv-cuda	0.02	19	all	0 ok;module:variables-sim-runs-ptx=19	0 ok;ptx:module-variable=19	0 ok;ptx:module-variable=19
+hecbench/bh-cuda	0.87	9	all	all	all	all
+hecbench/bilateral-cuda	1.20	3	all	all	all	all
+hecbench/bincount-cuda	-	2	all	all	all	all
+hecbench/binomial-cuda	-	1	all	all	all	all
+hecbench/binomial-small	-	2	all	all	all	all
+hecbench/bitcracker-cuda	-	2	all	1 ok;module:variables-sim-runs-ptx=1	1 ok;ptx:module-variable=1	1 ok;ptx:module-variable=1
+hecbench/bitonic-sort-cuda	0.29	1	all	all	all	all
+hecbench/bitpacking-cuda	-	24	all	all	all	all
+hecbench/bitpermute-cuda	-	2	all	all	all	all
+hecbench/black-scholes-cuda	24.90	1	all	all	all	all
+hecbench/blas-gemm-cuda	-	3	all	all	all	all
+hecbench/blockAccess-cuda	0.02	2	all	all	all	all
+hecbench/blockScan-cuda	-	18	all	0 ok;module:variables-sim-runs-ptx=18	0 ok;ptx:module-variable=18	0 ok;ptx:module-variable=18
+hecbench/bm3d-cuda	-	7	all	all	all	all
+hecbench/bmf-cuda	-	4	all	all	all	all
+hecbench/bn-cuda	-	2	all	all	all	all
+hecbench/bonds-cuda	-	1	all	all	all	all
+hecbench/boxfilter-cuda	-	2	all	all	all	all
+hecbench/bscan-cuda	-	1	all	all	all	all
+hecbench/bsearch-cuda	-	4	all	all	all	all
+hecbench/bspline-vgh-cuda	-	1	all	all	all	all
+hecbench/bsw-cuda	-	1	all	all	all	all
+hecbench/btree-cuda	-	3	all	all	all	all
+hecbench/burger-cuda	-	4	all	all	all	all
+hecbench/bwt-cuda	-	3	all	all	all	all
+hecbench/car-cuda	-	1	all	all	all	all
+hecbench/cbsfil-cuda	-	2	all	all	all	all
+hecbench/cc-cuda	-	5	all	0 ok;module:variables-sim-runs-ptx=5	0 ok;ptx:module-variable=5	0 ok;ptx:module-variable=5
+hecbench/ccs-cuda	-	1	all	all	all	all
+hecbench/ccsd-trpdrv-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/ced-cuda	-	4	all	0 ok;module:variables-sim-runs-ptx=4	0 ok;ptx:module-variable=4	0 ok;ptx:module-variable=4
+hecbench/cfd-cuda	-	5	all	all	all	all
+hecbench/chacha20-cuda	-	1	all	all	all	all
+hecbench/channelShuffle-cuda	-	5	all	all	all	all
+hecbench/channelSum-cuda	-	6	all	0 ok;module:variables-sim-runs-ptx=6	0 ok;ptx:module-variable=6	0 ok;ptx:module-variable=6
+hecbench/che-cuda	-	4	all	all	all	all
+hecbench/chemv-cuda	-	2	all	all	all	all
+hecbench/chi2-cuda	-	1	all	all	all	all
+hecbench/clenergy-cuda	-	1	all	all	all	all
+hecbench/clink-cuda	-	1	all	all	all	all
+hecbench/clock-cuda	-	1	all	all	all	all
+hecbench/cm-cuda	-	3	all	all	all	all
+hecbench/cmembench-cuda	-	3	all	0 ok;module:variables-sim-runs-ptx=3	0 ok;ptx:module-variable=3	0 ok;ptx:module-variable=3
+hecbench/cmp-cuda	-	4	all	all	all	all
+hecbench/cobahh-cuda	-	1	all	all	all	all
+hecbench/collision-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/colorwheel-cuda	-	1	all	all	all	all
+hecbench/columnarSolver-cuda	-	2	all	all	all	all
+hecbench/complex-cuda	-	4	all	all	all	all
+hecbench/compute-score-cuda	-	2	all	all	all	all
+hecbench/concat-cuda	-	1	all	all	all	all
+hecbench/concurrentKernels-cuda	-	2	all	all	all	all
+hecbench/contract-cuda	-	2	all	all	all	all
+hecbench/conversion-cuda	-	30	all	all	all	all
+hecbench/convolution1D-cuda	-	9	all	0 ok;module:variables-sim-runs-ptx=9	0 ok;ptx:module-variable=9	0 ok;ptx:module-variable=9
+hecbench/convolution3D-cuda	-	3	all	all	all	all
+hecbench/convolutionSeparable-cuda	-	2	all	all	all	all
+hecbench/cooling-cuda	-	1	all	all	0 ok;ptx:indirect-call=1	0 ok;ptx:indirect-call=1
+hecbench/coordinates-cuda	-	7	all	0 ok;module:variables-sim-runs-ptx=7	0 ok;ptx:module-variable=7	0 ok;ptx:module-variable=7
+hecbench/crc64-cuda	-	1	all	all	all	all
+hecbench/cross-cuda	-	6	all	all	all	all
+hecbench/crossEntropy-cuda	-	3	all	all	all	all
+hecbench/crs-cuda	-	20	all	all	all	all
+hecbench/d2q9-bgk-cuda	-	1	all	all	all	all
+hecbench/d3q19-bgk-cuda	-	4	all	0 ok;module:variables-sim-runs-ptx=4	0 ok;ptx:module-variable=4	0 ok;ptx:module-variable=4
+hecbench/damage-cuda	-	3	all	0 ok;module:variables-sim-runs-ptx=3	0 ok;ptx:module-variable=3	0 ok;ptx:module-variable=3
+hecbench/dct8x8-cuda	-	2	all	all	all	all
+hecbench/ddbp-cuda	-	8	all	0 ok;module:variables-sim-runs-ptx=8	0 ok;ptx:module-variable=8	0 ok;ptx:module-variable=8
+hecbench/degrid-cuda	-	1	all	all	all	all
+hecbench/dense-embedding-cuda	-	3	all	all	all	all
+hecbench/depixel-cuda	-	2	all	all	all	all
+hecbench/deredundancy-cuda	-	14	all	all	all	all
+hecbench/determinant-cuda	-	7	all	0 ok;module:variables-sim-runs-ptx=7	0 ok;ptx:module-variable=7	0 ok;ptx:module-variable=7
+hecbench/dispatch-cuda	-	1	all	all	all	all
+hecbench/distort-cuda	-	1	all	all	all	all
+hecbench/divergence-cuda	-	1	all	all	all	all
+hecbench/doh-cuda	-	1	all	all	all	all
+hecbench/dp4a-cuda	-	5	all	0 ok;module:variables-sim-runs-ptx=5	0 ok;ptx:module-variable=5	0 ok;ptx:module-variable=5
+hecbench/dpid-cuda	-	2	all	all	all	all
+hecbench/dropout-cuda	-	3	all	0 ok;module:variables-sim-runs-ptx=3	0 ok;ptx:module-variable=3	0 ok;ptx:module-variable=3
+hecbench/dslash-cuda	-	2	all	all	all	all
+hecbench/dxtc2-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/easyWave-cuda	-	4	all	all	all	all
+hecbench/ecdh-cuda	-	2	all	all	all	all
+hecbench/egs-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/eigenvalue-cuda	-	2	all	all	all	all
+hecbench/eikonal-cuda	-	3	all	all	all	all
+hecbench/entropy-cuda	-	2	all	all	all	all
+hecbench/epistasis-cuda	-	1	all	all	all	all
+hecbench/ert-cuda	-	3	all	all	all	all
+hecbench/expdist-cuda	-	4	all	all	all	all
+hecbench/extrema-cuda	-	8	all	all	all	all
+hecbench/f16atomic-cuda	-	2	all	all	all	all
+hecbench/f16max-cuda	-	2	all	all	all	all
+hecbench/f16sp-cuda	-	7	all	0 ok;module:variables-sim-runs-ptx=7	0 ok;ptx:module-variable=7	0 ok;ptx:module-variable=7
+hecbench/f8cast-cuda	-	4	all	all	all	all
+hecbench/face-cuda	-	1	all	all	all	all
+hecbench/fdtd3d-cuda	-	1	all	all	all	all
+hecbench/feynman-kac-cuda	-	1	all	all	0 ok;ptx:indirect-call=1	0 ok;ptx:indirect-call=1
+hecbench/fft-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/fhd-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/filter-cuda	-	2	all	all	all	all
+hecbench/flame-cuda	-	3	all	0 ok;module:variables-sim-runs-ptx=3	0 ok;ptx:module-variable=3	0 ok;ptx:module-variable=3
+hecbench/flip-cuda	-	2	all	all	all	all
+hecbench/floydwarshall-cuda	-	1	all	all	all	all
+hecbench/floydwarshall2-cuda	-	5	all	all	all	all
+hecbench/fluidSim-cuda	-	1	all	all	all	all
+hecbench/fma-cuda	-	8	all	all	all	all
+hecbench/fpc-cuda	-	2	all	all	all	all
+hecbench/fpdc-cuda	5.00	1	all	all	all	all
+hecbench/fresnel-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;image:none=1	0 ok;image:none=1
+hecbench/frna-cuda	-	10	all	all	all	all
+hecbench/fsm-cuda	-	2	all	all	all	all
+hecbench/fwt-cuda	-	3	all	all	all	all
+hecbench/ga-cuda	-	1	all	all	all	all
+hecbench/gabor-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/gamma-correction-cuda	-	1	all	all	all	all
+hecbench/gaussian-cuda	-	2	all	all	all	all
+hecbench/gc-cuda	-	3	all	all	all	all
+hecbench/gd-cuda	-	4	all	0 ok;module:variables-sim-runs-ptx=4	0 ok;ptx:module-variable=4	0 ok;ptx:module-variable=4
+hecbench/ge-spmm-cuda	-	4	all	all	all	all
+hecbench/geglu-cuda	-	6	all	all	all	all
+hecbench/gelu-cuda	-	2	all	all	all	all
+hecbench/gemv-cuda	-	6	3 ok;never:call-through-register=3	0 ok;module:variables-sim-runs-ptx=6	0 ok;ptx:module-variable=6	0 ok;ptx:module-variable=6
+hecbench/geodesic-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/gibbs-cuda	-	3	all	0 ok;module:variables-sim-runs-ptx=3	0 ok;ptx:module-variable=3	0 ok;ptx:module-variable=3
+hecbench/glu-cuda	-	1	all	all	all	all
+hecbench/gmm-cuda	-	8	all	all	all	all
+hecbench/goulash-cuda	-	1	all	all	all	all
+hecbench/gpp-cuda	-	1	all	all	all	all
+hecbench/graphB+-cuda	-	16	all	0 ok;module:variables-sim-runs-ptx=16	0 ok;ptx:module-variable=16	0 ok;ptx:module-variable=16
+hecbench/graphExecution-cuda	-	2	all	all	all	all
+hecbench/grep-cuda	-	1	all	all	all	all
+hecbench/groupnorm-cuda	-	3	all	0 ok;module:variables-sim-runs-ptx=3	0 ok;ptx:module-variable=3	0 ok;ptx:module-variable=3
+hecbench/grrt-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/gru-cuda	-	1	all	all	all	all
+hecbench/gru2-cuda	-	1	all	all	all	all
+hecbench/haccmk-cuda	-	1	all	all	all	all
+hecbench/hadamard-cuda	-	39	all	all	all	all
+hecbench/halo-finder-cuda	-	1	all	all	all	all
+hecbench/hausdorff-cuda	-	1	all	all	all	all
+hecbench/haversine-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/hbc-cuda	-	1	all	all	all	all
+hecbench/heartwall-cuda	-	1	all	all	all	all
+hecbench/heat-cuda	-	3	all	0 ok;module:variables-sim-runs-ptx=3	0 ok;ptx:module-variable=3	0 ok;ptx:module-variable=3
+hecbench/heat2d-cuda	-	1	all	all	all	all
+hecbench/hellinger-cuda	-	1	all	all	all	all
+hecbench/henry-cuda	-	1	all	all	0 ok;ptx:indirect-call=1	0 ok;ptx:indirect-call=1
+hecbench/hexciton-cuda	-	25	all	all	all	all
+hecbench/histogram-cuda	-	10	all	all	all	all
+hecbench/hmm-cuda	-	1	all	all	all	all
+hecbench/hogbom-cuda	-	2	all	all	all	all
+hecbench/hotspot-cuda	-	1	all	all	all	all
+hecbench/hotspot3D-cuda	-	1	all	all	all	all
+hecbench/hungarian-cuda	-	16	0 ok;module:managed=16	0 ok;module:managed=16	0 ok;ptx:module-variable=16	0 ok;ptx:module-variable=16
+hecbench/hwt1d-cuda	-	1	all	all	all	all
+hecbench/hybridsort-cuda	-	7	all	all	all	all
+hecbench/hypterm-cuda	-	3	all	all	all	all
+hecbench/idivide-cuda	-	5	all	all	all	all
+hecbench/interleave-cuda	-	2	all	all	all	all
+hecbench/interval-cuda	-	1	all	all	all	all
+hecbench/intrinsics-cast-cuda	-	2	all	all	all	all
+hecbench/intrinsics-simd-cuda	-	1	all	all	all	all
+hecbench/inversek2j-cuda	-	1	all	all	all	all
+hecbench/is-cuda	-	11	all	all	all	all
+hecbench/ising-cuda	-	3	all	all	all	all
+hecbench/iso2dfd-cuda	-	1	all	all	all	all
+hecbench/jaccard-cuda	-	8	all	all	all	all
+hecbench/jacobi-cuda	-	1	all	all	all	all
+hecbench/jacobian-cuda	-	2	all	all	all	all
+hecbench/jenkins-hash-cuda	-	1	all	all	all	all
+hecbench/kalman-cuda	-	1	all	all	all	all
+hecbench/keccaktreehash-cuda	-	1	all	all	all	all
+hecbench/keogh-cuda	-	1	all	all	all	all
+hecbench/kernelLaunch-cuda	-	3	all	all	all	all
+hecbench/kiss-cuda	-	1	0 ok;extern:assert=1	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/kmeans-cuda	-	2	all	all	all	all
+hecbench/knn-cuda	-	3	all	all	all	all
+hecbench/kurtosis-cuda	-	12	all	0 ok;module:variables-sim-runs-ptx=12	0 ok;ptx:module-variable=12	0 ok;ptx:module-variable=12
+hecbench/lanczos-cuda	-	8	all	all	all	all
+hecbench/langevin-cuda	-	3	all	all	all	all
+hecbench/langford-cuda	-	5	all	all	all	all
+hecbench/laplace-cuda	-	6	all	0 ok;module:variables-sim-runs-ptx=6	0 ok;ptx:module-variable=6	0 ok;ptx:module-variable=6
+hecbench/laplace3d-cuda	-	1	all	all	all	all
+hecbench/lavaMD-cuda	-	1	all	all	all	all
+hecbench/layout-cuda	-	2	all	all	all	all
+hecbench/lci-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/lda-cuda	-	1	all	all	all	all
+hecbench/ldpc-cuda	-	6	all	all	all	all
+hecbench/lebesgue-cuda	-	1	all	all	all	all
+hecbench/leukocyte-cuda	-	3	all	all	all	all
+hecbench/lfib4-cuda	-	4	all	all	all	all
+hecbench/libor-cuda	-	2	all	all	all	all
+hecbench/lid-driven-cavity-cuda	-	11	all	all	all	all
+hecbench/lif-cuda	-	1	all	all	all	all
+hecbench/linearprobing-cuda	-	3	all	all	all	all
+hecbench/local-ht-cuda	-	1	0 ok;never:call-through-register=1	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/log2-cuda	-	1	all	all	all	all
+hecbench/logan-cuda	-	1	0 ok;extern:assert=1	0 ok;module:variables-sim-runs-ptx=1	0 ok;image:none=1	0 ok;image:none=1
+hecbench/logic-rewrite-cuda	-	195	73 ok;extern:assert=15;extern:malloc-free=1;module:managed=100;never:call-through-register=6	0 ok;module:managed=100;module:variables-sim-runs-ptx=95	0 ok;ptx:module-variable=195	0 ok;ptx:module-variable=195
+hecbench/logprob-cuda	-	2	all	all	all	all
+hecbench/lombscargle-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/loopback-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/lr-cuda	-	2	all	all	all	all
+hecbench/lrn-cuda	-	2	all	all	all	all
+hecbench/lsqt-cuda	-	14	all	all	all	all
+hecbench/lud-cuda	-	3	all	all	all	all
+hecbench/lulesh-cuda	-	15	all	all	all	all
+hecbench/lut-gemm-cuda	-	16	all	all	all	all
+hecbench/lzss-cuda	-	6	all	0 ok;module:variables-sim-runs-ptx=6	0 ok;ptx:module-variable=6	0 ok;ptx:module-variable=6
+hecbench/mandelbrot-cuda	-	1	all	all	all	all
+hecbench/marchingCubes-cuda	-	5	all	all	all	all
+hecbench/mask-cuda	-	6	all	all	all	all
+hecbench/match-cuda	-	10	all	all	all	all
+hecbench/matern-cuda	-	1	all	all	all	all
+hecbench/matrix-rotate-cuda	-	1	all	all	all	all
+hecbench/matrixT-cuda	-	9	all	all	all	all
+hecbench/maxFlops-cuda	-	32	all	all	all	all
+hecbench/maxpool3d-cuda	-	1	all	all	all	all
+hecbench/mcmd-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/mcpr-cuda	-	3	all	all	all	all
+hecbench/md-cuda	-	1	all	all	all	all
+hecbench/md5hash-cuda	-	1	all	all	all	all
+hecbench/mdh-cuda	-	3	all	all	all	all
+hecbench/meanshift-cuda	-	2	all	all	all	all
+hecbench/medianfilter-cuda	-	1	all	all	all	all
+hecbench/memtest-cuda	-	10	all	all	all	all
+hecbench/merge-cuda	-	8	all	all	all	all
+hecbench/mergeVS-cuda	-	1	all	all	all	all
+hecbench/merkle-cuda	-	2	all	all	0 ok;image:none=2	0 ok;image:none=2
+hecbench/metropolis-cuda	-	6	all	all	all	all
+hecbench/michalewicz-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/miniFE-cuda	-	11	all	all	all	all
+hecbench/minibude-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/minimap2-cuda	-	1	all	all	all	all
+hecbench/minimod-cuda	-	3	all	all	all	all
+hecbench/minisweep-cuda	-	4	all	all	all	all
+hecbench/minkowski-cuda	-	1	all	all	all	all
+hecbench/minmax-cuda	-	21	all	0 ok;module:variables-sim-runs-ptx=21	0 ok;ptx:module-variable=21	0 ok;ptx:module-variable=21
+hecbench/mis-cuda	-	2	all	all	all	all
+hecbench/mixbench-cuda	-	1	all	all	all	all
+hecbench/mlaDecode-cuda	-	1	all	all	all	all
+hecbench/mmcsf-cuda	-	7	all	all	all	all
+hecbench/mnist-cuda	-	19	all	all	all	all
+hecbench/moe-align-cuda	-	4	all	0 ok;module:variables-sim-runs-ptx=4	0 ok;ptx:module-variable=4	0 ok;ptx:module-variable=4
+hecbench/moe-cuda	-	3	2 ok;extern:assert=1	0 ok;module:variables-sim-runs-ptx=3	0 ok;ptx:module-variable=3	0 ok;ptx:module-variable=3
+hecbench/moe-sum-cuda	-	6	all	all	all	all
+hecbench/morphology-cuda	-	4	all	all	all	all
+hecbench/mpc-cuda	-	2	all	all	all	all
+hecbench/mr-cuda	-	2	all	all	all	all
+hecbench/mrc-cuda	-	3	all	all	all	all
+hecbench/mriQ-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/mt-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/mtf-cuda	-	8	all	0 ok;module:variables-sim-runs-ptx=8	0 ok;ptx:module-variable=8	0 ok;ptx:module-variable=8
+hecbench/multimaterial-cuda	-	15	all	all	all	all
+hecbench/multinomial-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/muon-cuda	-	8	all	all	all	all
+hecbench/murmurhash3-cuda	-	1	all	all	all	all
+hecbench/mxfp4-cuda	-	2	all	all	all	all
+hecbench/myocyte-cuda	-	1	all	all	0 ok;ptx:indirect-call=1	0 ok;ptx:indirect-call=1
+hecbench/nbnxm-cuda	-	1	all	all	all	all
+hecbench/nbody-cuda	-	3	all	all	all	all
+hecbench/ne-cuda	-	1	all	all	all	all
+hecbench/nlll-cuda	-	10	all	all	all	all
+hecbench/nms-cuda	-	2	all	all	all	all
+hecbench/nn-cuda	-	1	all	all	all	all
+hecbench/nonzero-cuda	-	19	all	0 ok;module:variables-sim-runs-ptx=19	0 ok;ptx:module-variable=19	0 ok;ptx:module-variable=19
+hecbench/nosync-cuda	-	12	all	0 ok;module:variables-sim-runs-ptx=12	0 ok;ptx:module-variable=12	0 ok;ptx:module-variable=12
+hecbench/nqueen-cuda	-	1	all	all	all	all
+hecbench/ntt-cuda	-	1	all	all	all	all
+hecbench/nw-cuda	-	2	all	all	all	all
+hecbench/opticalFlow-cuda	-	6	all	all	all	all
+hecbench/overlap-cuda	-	1	all	all	all	all
+hecbench/overlay-cuda	-	1	all	all	all	all
+hecbench/oziMMU-cuda	-	3	all	all	all	all
+hecbench/p4-cuda	-	1	all	all	all	all
+hecbench/pad-cuda	-	1	all	all	all	all
+hecbench/page-rank-cuda	-	2	all	all	all	all
+hecbench/particle-diffusion-cuda	-	1	all	all	all	all
+hecbench/particlefilter-cuda	-	4	all	0 ok;module:variables-sim-runs-ptx=4	0 ok;ptx:module-variable=4	0 ok;ptx:module-variable=4
+hecbench/particles-cuda	-	9	all	all	all	all
+hecbench/pathfinder-cuda	-	1	all	all	all	all
+hecbench/pcc-cuda	-	2	all	all	all	all
+hecbench/perlin-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/permutate-cuda	-	4	all	all	all	all
+hecbench/permute-cuda	-	1	all	all	all	all
+hecbench/perplexity-cuda	0.34	1	all	all	all	all
+hecbench/phmm-cuda	-	1	all	all	all	all
+hecbench/pitch-cuda	-	4	all	all	all	all
+hecbench/pnpoly-cuda	-	8	all	all	all	all
+hecbench/pns-cuda	-	1	all	all	all	all
+hecbench/pointerchase-cuda	-	1	all	all	all	all
+hecbench/pointwise-cuda	-	2	all	all	all	all
+hecbench/pool-cuda	-	1	all	all	all	all
+hecbench/popcount-cuda	-	6	all	0 ok;module:variables-sim-runs-ptx=6	0 ok;ptx:module-variable=6	0 ok;ptx:module-variable=6
+hecbench/prefetch-cuda	-	1	all	all	all	all
+hecbench/present-cuda	-	1	all	all	all	all
+hecbench/prna-cuda	-	9	all	all	all	all
+hecbench/projectile-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/pso-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/qem-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/qkv-cuda	-	3	all	all	all	all
+hecbench/qrg-cuda	-	2	all	all	all	all
+hecbench/qtclustering-cuda	-	5	all	all	all	all
+hecbench/quant3MatMul-cuda	-	2	all	all	all	all
+hecbench/quantAQLM-cuda	-	1	all	all	all	all
+hecbench/quantBnB-cuda	-	1	all	all	all	all
+hecbench/quantVLLM-cuda	-	13	all	0 ok;module:variables-sim-runs-ptx=13	0 ok;ptx:module-variable=13	0 ok;ptx:module-variable=13
+hecbench/quicksort-cuda	-	6	all	all	all	all
+hecbench/radixsort-cuda	-	6	all	all	all	all
+hecbench/radixsort2-cuda	3.02	21	all	0 ok;module:variables-sim-runs-ptx=21	0 ok;ptx:module-variable=21	0 ok;ptx:module-variable=21
+hecbench/rainflow-cuda	-	1	all	all	all	all
+hecbench/randomAccess-cuda	-	2	all	all	all	all
+hecbench/rayleighBenardConvection-cuda	-	7	all	all	all	all
+hecbench/reaction-cuda	-	9	all	all	all	all
+hecbench/recursiveGaussian-cuda	-	3	all	all	all	all
+hecbench/relu-cuda	-	4	all	all	all	all
+hecbench/remap-cuda	-	12	all	0 ok;module:variables-sim-runs-ptx=12	0 ok;ptx:module-variable=12	0 ok;ptx:module-variable=12
+hecbench/reshapeKVCache-cuda	-	2	all	all	all	all
+hecbench/resize-cuda	-	6	all	all	all	all
+hecbench/resnet-kernels-cuda	-	10	all	all	all	all
+hecbench/reverse-cuda	-	1	all	all	all	all
+hecbench/reverse2D-cuda	-	17	all	all	all	all
+hecbench/rfs-cuda	-	2	all	all	all	all
+hecbench/rle-cuda	-	4	all	0 ok;module:variables-sim-runs-ptx=4	0 ok;ptx:module-variable=4	0 ok;ptx:module-variable=4
+hecbench/rmsnorm-cuda	-	2	all	all	all	all
+hecbench/rng-wallace-cuda	-	1	all	all	all	all
+hecbench/rodrigues-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/romberg-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/rotary-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/rowwiseMoments-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/rsbench-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;ptx:module-variable=1	0 ok;ptx:module-variable=1
+hecbench/rsc-cuda	-	1	all	all	all	all
+hecbench/rsmt-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/rtm8-cuda	-	1	all	all	all	all
+hecbench/rushlarsen-cuda	-	1	all	all	0 ok;ptx:indirect-call=1	0 ok;ptx:indirect-call=1
+hecbench/s3d-cuda	0.35	54	all	all	all	all
+hecbench/s8n-cuda	-	3	all	all	all	all
+hecbench/sa-cuda	-	18	all	0 ok;module:variables-sim-runs-ptx=18	0 ok;ptx:module-variable=18	0 ok;ptx:module-variable=18
+hecbench/sampling-cuda	-	2	all	all	all	all
+hecbench/sc-cuda	-	1	all	all	all	all
+hecbench/scan-cuda	-	40	all	all	all	all
+hecbench/scan2-cuda	-	3	all	all	all	all
+hecbench/scan3-cuda	-	5	all	0 ok;module:variables-sim-runs-ptx=5	0 ok;ptx:module-variable=5	0 ok;ptx:module-variable=5
+hecbench/scatter-cuda	-	20	all	all	all	all
+hecbench/scatterAdd-cuda	-	2	all	all	all	all
+hecbench/scatterThrust-cuda	-	13	all	0 ok;module:variables-sim-runs-ptx=13	0 ok;ptx:module-variable=13	0 ok;ptx:module-variable=13
+hecbench/scel-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/schur-complement-cuda	-	2	all	all	all	all
+hecbench/score-cuda	-	1	all	all	all	all
+hecbench/secp256k1-cuda	-	1	all	all	all	all
+hecbench/segment-reduce-cuda	-	5	all	0 ok;module:variables-sim-runs-ptx=5	0 ok;ptx:module-variable=5	0 ok;ptx:module-variable=5
+hecbench/segsort-cuda	-	32	all	all	all	all
+hecbench/sheath-cuda	-	3	all	all	all	all
+hecbench/shmembench-cuda	4.86	1	all	all	all	all
+hecbench/shuffle-cuda	-	7	all	all	all	all
+hecbench/si-cuda	-	1	all	0 ok;module:variables-sim-runs-ptx=1	0 ok;image:none=1	0 ok;image:none=1
+hecbench/silu-cuda	0.52	5	all	all	all	all
+hecbench/simpleMultiDevice-cuda	-	1	all	all	all	all
+hecbench/simpleSpmv-cuda	-	7	all	all	all	all
+hecbench/simplemoc-cuda	-	1	all	all	all	all
+hecbench/snake-cuda	-	1	all	all	all	all
+hecbench/sobel-cuda	-	1	all	all	all	all
+hecbench/sobol-cuda	-	1	all	all	all	all
+hecbench/softmax-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/softmax-fused-cuda	-	22	all	all	all	all
+hecbench/softmax-online-cuda	-	5	all	0 ok;module:variables-sim-runs-ptx=5	0 ok;ptx:module-variable=5	0 ok;ptx:module-variable=5
+hecbench/sort-cuda	-	8	all	0 ok;module:variables-sim-runs-ptx=8	0 ok;ptx:module-variable=8	0 ok;ptx:module-variable=8
+hecbench/sortKV-cuda	0.24	17	all	0 ok;module:variables-sim-runs-ptx=17	0 ok;ptx:module-variable=17	0 ok;ptx:module-variable=17
+hecbench/sosfil-cuda	-	2	all	all	all	all
+hecbench/sph-cuda	-	4	all	all	0 ok;ptx:indirect-call=4	0 ok;ptx:indirect-call=4
+hecbench/split-cuda	-	1	all	all	all	all
+hecbench/spm-cuda	-	1	all	all	all	all
+hecbench/spmv-cuda	-	1	all	all	all	all
+hecbench/sptrsv-cuda	-	1	all	all	all	all
+hecbench/srad-cuda	-	6	all	all	all	all
+hecbench/ss-cuda	-	2	all	all	all	all
+hecbench/ssim-cuda	-	8	all	0 ok;module:variables-sim-runs-ptx=8	0 ok;ptx:module-variable=8	0 ok;ptx:module-variable=8
+hecbench/ssm-cuda	-	10	all	0 ok;module:variables-sim-runs-ptx=10	0 ok;ptx:module-variable=10	0 ok;ptx:module-variable=10
+hecbench/sss-cuda	-	2	all	all	all	all
+hecbench/sssp-cuda	-	1	all	all	all	all
+hecbench/stddev-cuda	-	2	all	all	all	all
+hecbench/stencil1d-cuda	-	1	all	all	all	all
+hecbench/stencil3d-cuda	-	1	all	all	all	all
+hecbench/storeKVCache-cuda	-	4	all	all	all	all
+hecbench/streamOrderedAllocation-cuda	-	1	all	all	all	all
+hecbench/streamPriority-cuda	-	4	all	0 ok;module:variables-sim-runs-ptx=4	0 ok;ptx:module-variable=4	0 ok;ptx:module-variable=4
+hecbench/streamcluster-cuda	-	1	all	all	all	all
+hecbench/su3-cuda	-	1	all	all	all	all
+hecbench/sundials-cuda	-	6	all	all	all	all
+hecbench/surfel-cuda	-	2	all	all	all	all
+hecbench/svd3x3-cuda	-	1	all	all	all	all
+hecbench/sw4ck-cuda	-	5	all	all	all	all
+hecbench/tensorAccessor-cuda	-	2	all	all	all	all
+hecbench/tensorT-cuda	-	1	all	all	all	all
+hecbench/thomas-cuda	-	1	all	all	all	all
+hecbench/threadcpy-cuda	-	15	all	all	all	all
+hecbench/threadfence-cuda	-	1	all	all	all	all
+hecbench/tissue-cuda	-	1	all	all	all	all
+hecbench/tonemapping-cuda	-	1	all	all	all	all
+hecbench/topk-cuda	-	5	all	0 ok;module:variables-sim-runs-ptx=5	0 ok;ptx:module-variable=5	0 ok;ptx:module-variable=5
+hecbench/tpacf-cuda	-	4	all	0 ok;module:variables-sim-runs-ptx=4	0 ok;ptx:module-variable=4	0 ok;ptx:module-variable=4
+hecbench/tqs-cuda	-	1	all	all	all	all
+hecbench/triad-cuda	-	1	all	all	all	all
+hecbench/tridiagonal-cuda	-	8	all	all	all	all
+hecbench/tsa-cuda	-	2	all	all	all	all
+hecbench/tsne-cuda	-	78	all	0 ok;module:variables-sim-runs-ptx=78	0 ok;ptx:module-variable=78	0 ok;ptx:module-variable=78
+hecbench/tsp-cuda	-	1	all	all	all	all
+hecbench/unfold-cuda	-	1	all	all	all	all
+hecbench/upsample-cuda	-	4	all	all	all	all
+hecbench/urng-cuda	-	1	all	all	all	all
+hecbench/vadd-cuda	-	3	all	all	all	all
+hecbench/vanGenuchten-cuda	-	1	all	all	0 ok;ptx:indirect-call=1	0 ok;ptx:indirect-call=1
+hecbench/vmc-cuda	-	5	all	all	all	all
+hecbench/vol2col-cuda	-	2	all	all	all	all
+hecbench/vote-cuda	-	3	all	all	all	all
+hecbench/voxelization-cuda	-	3	all	all	all	all
+hecbench/warpexchange-cuda	-	1	all	all	all	all
+hecbench/warpsort-cuda	-	2	0 ok;extern:assert=2	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/wedford-cuda	-	1	all	all	all	all
+hecbench/wenofv-cuda	-	7	all	all	all	all
+hecbench/winograd-cuda	-	1	all	all	all	all
+hecbench/wlcpow-cuda	-	1	all	all	all	all
+hecbench/wmma-cuda	-	2	all	all	all	all
+hecbench/word2vec-cuda	-	2	all	0 ok;module:variables-sim-runs-ptx=2	0 ok;ptx:module-variable=2	0 ok;ptx:module-variable=2
+hecbench/wordcount-cuda	-	7	all	0 ok;module:variables-sim-runs-ptx=7	0 ok;ptx:module-variable=7	0 ok;ptx:module-variable=7
+hecbench/wsm5-cuda	-	1	all	all	all	all
+hecbench/wyllie-cuda	-	1	all	all	all	all
+hecbench/xsbench-cuda	-	1	all	all	all	all
+hecbench/zerocopy-cuda	3.33	1	all	all	all	all
+hecbench/zeropoint-cuda	-	1	all	all	all	all
+hecbench/zmddft-cuda	-	3	all	0 ok;module:variables-sim-runs-ptx=3	0 ok;ptx:module-variable=3	0 ok;ptx:module-variable=3
+hecbench/zoom-cuda	-	3	all	all	all	all
+polybench/2DCONV	0.95	1	all	all	all	all
+polybench/2MM	196.81	2	all	all	all	all
+polybench/3DCONV	0.76	1	all	all	all	all
+polybench/3MM	2.33	3	all	all	all	all
+polybench/ADI	0.39	6	all	all	all	all
+polybench/ATAX	1.08	2	all	all	all	all
+polybench/BICG	0.26	2	all	all	all	all
+polybench/CORR	63.83	4	all	all	all	all
+polybench/COVAR	63.37	3	all	all	all	all
+polybench/FDTD-2D	103.87	3	all	all	all	all
+polybench/GEMM	0.83	1	all	all	all	all
+polybench/GEMVER	0.65	3	all	all	all	all
+polybench/GESUMMV	0.38	1	all	all	all	all
+polybench/GRAMSCHM	269.41	3	all	all	all	all
+polybench/JACOBI1D	2.41	2	all	all	all	all
+polybench/JACOBI2D	0.61	2	all	all	all	all
+polybench/LU	30.75	2	all	all	all	all
+polybench/MVT	1.23	2	all	all	all	all
+polybench/SYR2K	9.76	1	all	all	all	all
+polybench/SYRK	5.18	1	all	all	all	all
+rodinia/backprop	0.61	2	all	all	all	all
+rodinia/bfs	0.01	2	all	all	all	all
+rodinia/gaussian	4.09	2	all	all	all	all
+rodinia/hotspot	1.18	1	all	all	all	all
+rodinia/lavaMD	1.76	1	all	all	all	all
+rodinia/lud	3.52	3	all	all	all	all
+rodinia/needle	0.36	2	all	all	all	all
+rodinia/nn	0.02	1	all	all	all	all
+rodinia/particlefilter_float	2.92	4	all	0 ok;module:variables-sim-runs-ptx=4	0 ok;ptx:module-variable=4	0 ok;ptx:module-variable=4
+rodinia/pathfinder	1.06	1	all	all	all	all
+rodinia/sc_gpu	1.01	1	all	all	all	all
+rodinia/srad_v2	0.06	2	all	all	all	all
+samples/BlackScholes	-	1	all	all	all	all
+samples/FDTD3d	-	1	all	all	all	all
+samples/HSOpticalFlow	-	6	2 ok;never:texture-surface=4	2 ok;never:texture-surface=4	2 ok;never:texture-surface=4	2 ok;never:texture-surface=4
+samples/LargeKernelParameter	0.21	2	all	all	all	all
+samples/MC_EstimatePiInlineP	3.13	3	all	all	all	all
+samples/MC_EstimatePiInlineQ	-	4	all	all	all	all
+samples/MC_EstimatePiP	0.00	2	all	all	all	all
+samples/MC_EstimatePiQ	-	2	all	all	all	all
+samples/MC_SingleAsianOptionP	1.78	5	all	all	3 ok;never:arrives-syncs-endcollective=2	3 ok;never:arrives-syncs-endcollective=2
+samples/MonteCarloMultiGPU	-	2	all	all	1 ok;never:arrives-syncs-endcollective=1	1 ok;never:arrives-syncs-endcollective=1
+samples/NV12toBGRandResize	-	4	2 ok;never:texture-surface=2	2 ok;never:texture-surface=2	2 ok;never:texture-surface=2	2 ok;never:texture-surface=2
+samples/SobolQRNG	-	1	all	all	all	all
+samples/StreamPriorities	1.27	1	all	all	all	all
+samples/UnifiedMemoryPerf	-	2	all	all	all	all
+samples/alignedTypes	67.59	12	all	all	all	all
+samples/asyncAPI	0.11	1	all	all	all	all
+samples/bf16TensorCoreGemm	157.15	3	all	all	all	all
+samples/binaryPartitionCG	0.01	1	all	all	0 ok;never:arrives-syncs-endcollective=1	0 ok;never:arrives-syncs-endcollective=1
+samples/binomialOptions	-	1	all	all	all	all
+samples/cdpAdvancedQuicksort	-	36	35 ok;extern:device-launch=1	0 ok;module:variable-layout=36	0 ok;module:variable-layout=36	35 ok;extern:device-launch=1
+samples/cdpBezierTessellation	0.01	35	33 ok;extern:device-launch=2	33 ok;extern:device-launch=2	33 ok;extern:device-launch=2	33 ok;extern:device-launch=2
+samples/cdpQuadtree	0.01	36	35 ok;extern:device-launch=1	35 ok;extern:device-launch=1	35 ok;extern:device-launch=1	35 ok;extern:device-launch=1
+samples/cdpSimplePrint	0.01	33	32 ok;extern:device-launch=1	0 ok;module:variable-layout=33	0 ok;module:variable-layout=33	32 ok;extern:device-launch=1
+samples/cdpSimpleQuicksort	0.01	33	32 ok;extern:device-launch=1	32 ok;extern:device-launch=1	32 ok;extern:device-launch=1	32 ok;extern:device-launch=1
+samples/clock	0.00	1	all	all	all	all
+samples/conjugateGradientCudaGraphs	-	3	all	all	all	all
+samples/conjugateGradientMultiBlockCG	-	1	0 ok;never:bpt=1	0 ok;never:bpt=1	0 ok;never:bpt=1	0 ok;never:bpt=1
+samples/conjugateGradientMultiDeviceCG	-	1	0 ok;never:bpt=1	0 ok;never:bpt=1	0 ok;never:bpt=1	0 ok;never:bpt=1
+samples/convolutionFFT2D	-	6	1 ok;never:texture-surface=5	1 ok;never:texture-surface=5	1 ok;never:texture-surface=5	1 ok;never:texture-surface=5
+samples/convolutionSeparable	10.04	2	all	all	all	all
+samples/convolutionTexture	-	2	0 ok;never:texture-surface=2	0 ok;never:texture-surface=2	0 ok;never:texture-surface=2	0 ok;never:texture-surface=2
+samples/cudaCompressibleMemory	-	2	all	all	all	all
+samples/cudaGraphsPerfScaling	0.01	4	all	all	all	all
+samples/cudaOpenMP	0.00	1	all	all	all	all
+samples/cudaTensorCoreGemm	16.02	2	all	all	all	all
+samples/dct8x8	0.71	8	6 ok;never:texture-surface=2	6 ok;never:texture-surface=2	6 ok;never:texture-surface=2	6 ok;never:texture-surface=2
+samples/dmmaTensorCoreGemm	-	4	all	all	3 ok;never:arrives-syncs-endcollective=1	3 ok;never:arrives-syncs-endcollective=1
+samples/dwtHaar1D	-	2	all	all	all	all
+samples/dxtc	-	1	all	all	0 ok;never:arrives-syncs-endcollective=1	0 ok;never:arrives-syncs-endcollective=1
+samples/eigenvalues	-	4	all	all	0 ok;never:arrives-syncs-endcollective=4	0 ok;never:arrives-syncs-endcollective=4
+samples/fastWalshTransform	-	3	all	all	all	all
+samples/fp16ScalarProduct	0.02	2	all	all	all	all
+samples/globalToShmemAsyncCopy	-	8	6 ok;never:arrives-syncs-endcollective=2	0 ok;module:variable-layout=8	0 ok;module:variable-layout=8	6 ok;never:arrives-syncs-endcollective=2
+samples/graphConditionalNodes	-	12	8 ok;extern:other=4	8 ok;extern:other=4	8 ok;extern:other=4	8 ok;extern:other=4
+samples/graphMemoryFootprint	-	1	all	all	all	all
+samples/graphMemoryNodes	-	3	all	all	all	all
+samples/histogram	11.58	4	all	all	all	all
+samples/immaTensorCoreGemm	3.52	2	all	all	all	all
+samples/inlinePTX	0.00	1	all	all	all	all
+samples/interval	13.88	1	all	all	all	all
+samples/jacobiCudaGraphs	17.75	2	all	all	1 ok;never:arrives-syncs-endcollective=1	1 ok;never:arrives-syncs-endcollective=1
+samples/lineOfSight	-	8	7 ok;never:texture-surface=1	7 ok;never:texture-surface=1	5 ok;never:arrives-syncs-endcollective=2;never:texture-surface=1	5 ok;never:arrives-syncs-endcollective=2;never:texture-surface=1
+samples/matrixMul	-	2	all	all	all	all
+samples/mergeSort	6.99	7	all	all	all	all
+samples/newdelete	0.01	6	0 ok;extern:malloc-free=3;never:call-through-register=3	0 ok;extern:malloc-free=3;never:call-through-register=3	0 ok;extern:malloc-free=3;never:call-through-register=3	0 ok;extern:malloc-free=3;never:call-through-register=3
+samples/p2pBandwidthLatencyTest	-	2	all	all	all	all
+samples/quasirandomGenerator	-	2	all	all	all	all
+samples/radixSortThrust	31.29	21	all	all	11 ok;never:arrives-syncs-endcollective=10	11 ok;never:arrives-syncs-endcollective=10
+samples/reduction	5.76	213	all	all	39 ok;never:arrives-syncs-endcollective=174	39 ok;never:arrives-syncs-endcollective=174
+samples/reductionMultiBlockCG	-	1	0 ok;never:bpt=1	0 ok;never:bpt=1	0 ok;never:bpt=1	0 ok;never:bpt=1
+samples/scalarProd	0.05	1	all	all	all	all
+samples/scan	-	3	all	all	all	all
+samples/segmentationTreeThrust	15.48	47	all	all	38 ok;never:arrives-syncs-endcollective=9	38 ok;never:arrives-syncs-endcollective=9
+samples/shfl_scan	0.07	4	all	all	3 ok;never:arrives-syncs-endcollective=1	3 ok;never:arrives-syncs-endcollective=1
+samples/simpleAWBarrier	0.42	1	0 ok;never:bpt=1	0 ok;never:bpt=1	0 ok;never:arrives-syncs-endcollective=1	0 ok;never:arrives-syncs-endcollective=1
+samples/simpleAssert	0.00	1	0 ok;extern:assert=1	0 ok;extern:assert=1	0 ok;extern:assert=1	0 ok;extern:assert=1
+samples/simpleAtomicIntrinsics	0.01	1	all	all	all	all
+samples/simpleAttributes	-	1	all	all	all	all
+samples/simpleCUFFT	-	1	all	all	all	all
+samples/simpleCUFFT_2d_MGPU	-	1	all	all	all	all
+samples/simpleCUFFT_MGPU	-	1	all	all	all	all
+samples/simpleCUFFT_callback	-	8	0 ok;never:call-through-register=8	0 ok;never:call-through-register=8	0 ok;never:call-through-register=8	0 ok;never:call-through-register=8
+samples/simpleCallback	0.01	1	all	all	all	all
+samples/simpleCooperativeGroups	0.00	1	all	all	0 ok;never:arrives-syncs-endcollective=1	0 ok;never:arrives-syncs-endcollective=1
+samples/simpleCubemapTexture	0.01	1	0 ok;never:texture-surface=1	0 ok;never:texture-surface=1	0 ok;never:texture-surface=1	0 ok;never:texture-surface=1
+samples/simpleCudaGraphs	1.27	2	all	all	1 ok;never:arrives-syncs-endcollective=1	1 ok;never:arrives-syncs-endcollective=1
+samples/simpleHyperQ	22.61	3	all	all	all	all
+samples/simpleIPC	0.17	1	all	all	all	all
+samples/simpleLayeredTexture	0.15	1	0 ok;never:texture-surface=1	0 ok;never:texture-surface=1	0 ok;never:texture-surface=1	0 ok;never:texture-surface=1
+samples/simpleMPI	-	1	all	all	all	all
+samples/simpleMultiCopy	-	1	all	all	all	all
+samples/simpleMultiGPU	0.53	1	all	all	all	all
+samples/simpleOccupancy	0.01	1	all	all	all	all
+samples/simpleP2P	-	1	all	all	all	all
+samples/simplePitchLinearTexture	-	2	0 ok;never:texture-surface=2	0 ok;never:texture-surface=2	0 ok;never:texture-surface=2	0 ok;never:texture-surface=2
+samples/simplePrintf	0.00	1	all	all	all	all
+samples/simpleStreams	-	1	all	all	all	all
+samples/simpleSurfaceWrite	0.08	2	0 ok;never:texture-surface=2	0 ok;never:texture-surface=2	0 ok;never:texture-surface=2	0 ok;never:texture-surface=2
+samples/simpleTemplates	0.00	2	all	all	all	all
+samples/simpleTexture	-	1	0 ok;never:texture-surface=1	0 ok;never:texture-surface=1	0 ok;never:texture-surface=1	0 ok;never:texture-surface=1
+samples/simpleVoteIntrinsics	0.00	3	all	all	all	all
+samples/simpleZeroCopy	0.04	1	all	all	all	all
+samples/sortingNetworks	11.43	4	all	all	all	all
+samples/stereoDisparity	-	1	0 ok;never:texture-surface=1	0 ok;never:texture-surface=1	0 ok;never:texture-surface=1	0 ok;never:texture-surface=1
+samples/streamOrderedAllocation	0.20	1	all	all	all	all
+samples/streamOrderedAllocationIPC	-	1	all	all	all	all
+samples/streamOrderedAllocationP2P	-	1	all	all	all	all
+samples/systemWideAtomics	-	1	all	all	all	all
+samples/template	0.00	1	all	all	all	all
+samples/tf32TensorCoreGemm	208.59	3	all	all	all	all
+samples/threadFenceReduction	0.29	40	all	all	all	all
+samples/transpose	7.36	8	all	all	all	all
+samples/vectorAdd	0.00	1	all	all	all	all
+samples/warpAggregatedAtomicsCG	1.81	3	all	all	all	all

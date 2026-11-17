@@ -1,0 +1,99 @@
+# per library: first the cells (kernels, admitted, ...), then every refusal reason; timing columns are 0 (no simulator seconds exist for a library)
+library	table	row
+libtorch_cuda.so (PyTorch 2.10+cu130)	cells	cell	kernels	admitted	unlisted_only	exact	lower_minor	ptx_jit	retarget	programs	programs_fully_admitted	timed_programs	timed_seconds_fully_admitted
+libtorch_cuda.so (PyTorch 2.10+cu130)	cells	p86:h75	21614	13893	236	13893	0	0	0	1	0	0	0.0
+libtorch_cuda.so (PyTorch 2.10+cu130)	cells	p86:h86	21614	15894	237	15894	0	0	0	1	0	0	0.0
+libtorch_cuda.so (PyTorch 2.10+cu130)	cells	p86:h89	21614	15894	297	216	15678	0	0	1	0	0	0.0
+libtorch_cuda.so (PyTorch 2.10+cu130)	cells	p86:h90	21614	14600	357	14600	0	0	0	1	0	0	0.0
+libtorch_cuda.so (PyTorch 2.10+cu130)	cells	p90:h75	21614	13881	236	13881	0	0	0	1	0	0	0.0
+libtorch_cuda.so (PyTorch 2.10+cu130)	cells	p90:h86	21614	15764	236	15764	0	0	0	1	0	0	0.0
+libtorch_cuda.so (PyTorch 2.10+cu130)	cells	p90:h89	21614	15764	296	216	15548	0	0	1	0	0	0.0
+libtorch_cuda.so (PyTorch 2.10+cu130)	cells	p90:h90	21614	14717	462	14717	0	0	0	1	0	0	0.0
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h75	never:call-through-register	5547	57	0	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h75	extern:assert	5473	5473	0	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h75	module:variable-layout	2153	2153	2153	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h75	never:bpt	80	23	6	1	0	BPT=80
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h75	code:no-section	15	15	15	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h86	never:call-through-register	5714	209	152	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h86	extern:assert	5488	5488	0	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h86	never:bpt	80	23	6	1	0	BPT=80
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h89	never:call-through-register	5714	209	152	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h89	extern:assert	5488	5488	0	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h89	never:bpt	80	23	6	1	0	BPT=80
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h90	never:call-through-register	5632	155	152	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h90	extern:assert	5477	5477	0	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h90	never:arrives-syncs-endcollective	1374	1038	1038	1	0	ENDCOLLECTIVE=1326;SYNCS=104
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h90	module:variable-layout	234	234	234	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h90	never:elect	104	104	0	1	0	ELECT=104
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h90	never:warpgroup	104	0	0	1	0	WARPGROUP=104;QGMMA=96;USETMAXREG=56;HGMMA=8
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h90	never:tma	104	0	0	1	0	UTMACMDFLUSH=104;UTMASTG=104;UTMALDG=104
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h90	never:stsm	104	0	0	1	0	STSM=104
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p86:h90	never:bpt	9	6	6	1	0	BPT=9
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h75	never:call-through-register	5458	3	0	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h75	extern:assert	5455	5455	0	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h75	module:variable-layout	2254	2254	2254	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h75	code:no-section	15	15	15	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h75	never:bpt	9	6	6	1	0	BPT=9
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h86	never:call-through-register	5610	155	152	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h86	extern:assert	5455	5455	0	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h86	module:variable-layout	234	234	234	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h86	never:bpt	9	6	6	1	0	BPT=9
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h89	never:call-through-register	5610	155	152	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h89	extern:assert	5455	5455	0	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h89	module:variable-layout	234	234	234	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h89	never:bpt	9	6	6	1	0	BPT=9
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h90	never:call-through-register	5727	171	152	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h90	extern:assert	5495	5495	0	1	0	
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h90	never:arrives-syncs-endcollective	1445	1038	1038	1	0	ENDCOLLECTIVE=1397;SYNCS=175
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h90	never:elect	175	175	0	1	0	ELECT=175
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h90	never:tma	175	0	0	1	0	UTMALDG=175;UTMASTG=175;UTMACMDFLUSH=175
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h90	never:stsm	175	0	0	1	0	STSM=175
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h90	never:warpgroup	114	0	0	1	0	WARPGROUP=114;QGMMA=104;USETMAXREG=66;HGMMA=10
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h90	never:bpt	86	6	6	1	0	BPT=86
+libtorch_cuda.so (PyTorch 2.10+cu130)	reasons	p90:h90	never:cluster-dsmem	12	12	12	1	0	LDGMC=12
+libggml-cuda.so (Ollama cuda_v13)	cells	cell	kernels	admitted	unlisted_only	exact	lower_minor	ptx_jit	retarget	programs	programs_fully_admitted	timed_programs	timed_seconds_fully_admitted
+libggml-cuda.so (Ollama cuda_v13)	cells	p86:h75	4530	0	0	0	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v13)	cells	p86:h86	4530	0	0	0	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v13)	cells	p86:h89	4530	0	0	0	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v13)	cells	p86:h90	4530	0	0	0	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v13)	cells	p90:h75	4530	0	0	0	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v13)	cells	p90:h86	4530	0	0	0	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v13)	cells	p90:h89	4530	0	0	0	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v13)	cells	p90:h90	4530	0	0	0	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v13)	reasons	p86:h75	ptx:module-variable [ptx-jit]	4530	4530	4530	1	1	.global.referenced=3644;.global.unreferenced=886
+libggml-cuda.so (Ollama cuda_v13)	reasons	p86:h86	ptx:module-variable [ptx-jit]	4530	4530	4530	1	1	.global.referenced=2492;.global.unreferenced=2038
+libggml-cuda.so (Ollama cuda_v13)	reasons	p86:h89	ptx:module-variable [ptx-jit]	4530	4530	4530	1	1	.global.referenced=2492;.global.unreferenced=2038
+libggml-cuda.so (Ollama cuda_v13)	reasons	p86:h90	ptx:module-variable [ptx-jit]	4530	4530	4530	1	1	.global.referenced=2492;.global.unreferenced=2038
+libggml-cuda.so (Ollama cuda_v13)	reasons	p90:h75	ptx:module-variable [ptx-jit]	4530	4530	4530	1	1	.global.referenced=3644;.global.unreferenced=886
+libggml-cuda.so (Ollama cuda_v13)	reasons	p90:h86	ptx:module-variable [ptx-jit]	4530	4530	4530	1	1	.global.referenced=2492;.global.unreferenced=2038
+libggml-cuda.so (Ollama cuda_v13)	reasons	p90:h89	ptx:module-variable [ptx-jit]	4530	4530	4530	1	1	.global.referenced=2492;.global.unreferenced=2038
+libggml-cuda.so (Ollama cuda_v13)	reasons	p90:h90	ptx:module-variable [ptx-jit]	4530	4530	4530	1	1	.global.referenced=2492;.global.unreferenced=2038
+libggml-cuda.so (Ollama cuda_v12)	cells	cell	kernels	admitted	unlisted_only	exact	lower_minor	ptx_jit	retarget	programs	programs_fully_admitted	timed_programs	timed_seconds_fully_admitted
+libggml-cuda.so (Ollama cuda_v12)	cells	p86:h75	4530	2537	28	2537	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v12)	cells	p86:h86	4530	4106	28	4106	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v12)	cells	p86:h89	4530	4106	28	4106	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v12)	cells	p86:h90	4530	3689	0	3689	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v12)	cells	p90:h75	4530	2537	28	2537	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v12)	cells	p90:h86	4530	4106	28	4106	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v12)	cells	p90:h89	4530	4106	28	4106	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v12)	cells	p90:h90	4530	3689	0	3689	0	0	0	1	0	0	0.0
+libggml-cuda.so (Ollama cuda_v12)	reasons	p86:h75	module:variable-layout	1641	1641	1641	1	0	
+libggml-cuda.so (Ollama cuda_v12)	reasons	p86:h75	never:call-through-register	352	352	0	1	0	
+libggml-cuda.so (Ollama cuda_v12)	reasons	p86:h75	never:bpt	352	0	0	1	0	BPT=352
+libggml-cuda.so (Ollama cuda_v12)	reasons	p86:h86	never:call-through-register	424	424	0	1	0	
+libggml-cuda.so (Ollama cuda_v12)	reasons	p86:h86	never:bpt	424	0	0	1	0	BPT=424
+libggml-cuda.so (Ollama cuda_v12)	reasons	p86:h89	never:call-through-register	424	424	0	1	0	
+libggml-cuda.so (Ollama cuda_v12)	reasons	p86:h89	never:bpt	424	0	0	1	0	BPT=424
+libggml-cuda.so (Ollama cuda_v12)	reasons	p86:h90	never:call-through-register	424	424	0	1	0	
+libggml-cuda.so (Ollama cuda_v12)	reasons	p86:h90	never:bpt	424	0	0	1	0	BPT=424
+libggml-cuda.so (Ollama cuda_v12)	reasons	p86:h90	never:arrives-syncs-endcollective	417	417	417	1	0	ENDCOLLECTIVE=417
+libggml-cuda.so (Ollama cuda_v12)	reasons	p90:h75	module:variable-layout	1641	1641	1641	1	0	
+libggml-cuda.so (Ollama cuda_v12)	reasons	p90:h75	never:call-through-register	352	352	0	1	0	
+libggml-cuda.so (Ollama cuda_v12)	reasons	p90:h75	never:bpt	352	0	0	1	0	BPT=352
+libggml-cuda.so (Ollama cuda_v12)	reasons	p90:h86	never:call-through-register	424	424	0	1	0	
+libggml-cuda.so (Ollama cuda_v12)	reasons	p90:h86	never:bpt	424	0	0	1	0	BPT=424
+libggml-cuda.so (Ollama cuda_v12)	reasons	p90:h89	never:call-through-register	424	424	0	1	0	
+libggml-cuda.so (Ollama cuda_v12)	reasons	p90:h89	never:bpt	424	0	0	1	0	BPT=424
+libggml-cuda.so (Ollama cuda_v12)	reasons	p90:h90	never:call-through-register	424	424	0	1	0	
+libggml-cuda.so (Ollama cuda_v12)	reasons	p90:h90	never:bpt	424	0	0	1	0	BPT=424
+libggml-cuda.so (Ollama cuda_v12)	reasons	p90:h90	never:arrives-syncs-endcollective	417	417	417	1	0	ENDCOLLECTIVE=417
