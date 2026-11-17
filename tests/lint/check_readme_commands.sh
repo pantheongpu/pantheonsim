@@ -138,7 +138,10 @@ while read -r target; do
   [[ -z $path ]] && file=$readme
   if [[ ! -e $file ]]; then bad "README links to '$target', but $file does not exist"; continue; fi
   if [[ -n $anchor && $file == *.md ]]; then
-    slugs "$file" | grep -qxF -- "$anchor" || bad "README links to '$target', but $file has no heading or anchor '$anchor'"
+    # Read the slugs into a file first: with `pipefail`, `slugs | grep -q` fails when grep exits at an early
+    # match and slugs is killed by SIGPIPE, which reported a heading that exists as missing.
+    slugs "$file" > "$tmp/slugs.txt"
+    grep -qxF -- "$anchor" "$tmp/slugs.txt" || bad "README links to '$target', but $file has no heading or anchor '$anchor'"
   fi
 done < <(grep -oE '\]\([^)[:space:]]+\)' "$readme" | sed -E 's/^\]\((.*)\)$/\1/' | sort -u)
 
