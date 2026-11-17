@@ -1,6 +1,6 @@
 # Card measurements, 2026-11-17 (one run each, VGPU_THREADS=4, programs from the sp22 corpus built for sm_86)
 
-Every number is measured on the card named in its heading. "x sim" = simulator seconds / turbo seconds. Native = the same binary run natively on that card. The simulator and native columns of different rigs differ by machine.
+Every number is measured on the card named in its heading. "x sim" = simulator seconds / turbo seconds. Native = the same binary run natively on that card. The simulator and native columns of different rigs differ by machine. The geometric mean under each table is computed from its rows.
 
 ## A. A10G (rig 1), profile nvidia/a10g, THIS BRANCH, turbo FIT=1 (default)
 
@@ -21,6 +21,8 @@ Every number is measured on the card named in its heading. "x sim" = simulator s
 | hecbench/black-scholes-cuda | 28.16 | 5.93 | 1 / 1 | identical | 0 / 0 (abs 0, rel 0) | identical | 5.28 | 4.75x |
 | hecbench/silu-cuda | 0.65 | 0.34 | 50 / 50 | identical | 0 / 0 (abs 0, rel 0) | identical | 0.27 | 1.93x |
 
+Geometric mean x sim 1.79 over 14 programs; launches on the card / all launches: 7705 / 7708.
+
 ## B. A10G (rig 2), profile nvidia/a10g, origin/main turbo (before)
 
 | program | simulator s | turbo s | launches on card / all | turbo output vs simulator | verify words different / outside (largest abs, rel) | verify output | native s | x sim |
@@ -40,11 +42,28 @@ Every number is measured on the card named in its heading. "x sim" = simulator s
 | hecbench/black-scholes-cuda | 28.19 | 6.01 | 1 / 1 | identical | 0 / 0 (abs 0, rel 0) | identical | 5.28 | 4.69x |
 | hecbench/silu-cuda | 0.65 | 0.59 | 25 / 50 | identical | 0 / 0 (abs 0, rel 0) | identical | 0.27 | 1.11x |
 
-## C. A10G (rig 1), profile nvidia/a10g, THIS BRANCH, VGPU_HOST_GPU_FIT=0 (rules kept; no verify form)
+Geometric mean x sim 2.09 over 14 programs; launches on the card / all launches: 7370 / 7708.
+
+## C. A10G (rig 1), profile nvidia/a10g, THIS BRANCH, VGPU_HOST_GPU_FIT=0 (rules kept; sim and turbo only, no verify pass)
 
 | program | simulator s | turbo s | launches on card / all | turbo output vs simulator | verify words different / outside (largest abs, rel) | verify output | native s | x sim |
 |---|---:|---:|---:|---|---|---|---:|---:|
+| polybench/2DCONV | 0.93 | 0.93 | 0 / 1 | identical | - | - | 0.85 | 1.00x |
+| polybench/ATAX | 1.07 | 1.07 | 0 / 2 | identical | - | - | 0.33 | 1.00x |
+| polybench/FDTD-2D | 92.65 | 4.74 | 1494 / 1500 | identical | - | - | 4.19 | 19.56x |
+| polybench/GEMM | 0.79 | 0.74 | 0 / 1 | identical | - | - | 0.66 | 1.07x |
+| polybench/LU | 28.15 | 1.32 | 4083 / 4096 | identical | - | - | 0.94 | 21.33x |
+| rodinia/backprop | 0.67 | 0.79 | 1 / 2 | identical | - | - | 0.40 | 0.85x |
+| rodinia/gaussian | 3.73 | 0.53 | 985 / 1022 | identical | - | - | 0.30 | 7.03x |
+| rodinia/srad_v2 | 0.07 | 0.06 | 0 / 1 | identical | - | - | 0.30 | 1.03x |
+| rodinia/hotspot | 1.33 | 0.56 | 780 / 1000 | identical | - | - | 0.24 | 2.39x |
+| rodinia/bfs | 0.01 | 0.01 | 0 / 26 | identical | - | - | 0.24 | 1.01x |
+| hecbench/atan2-cuda | 0.03 | 0.03 | 0 / 3 | identical | - | - | 0.24 | 0.99x |
+| hecbench/bilateral-cuda | 1.47 | 1.48 | 0 / 3 | identical | - | - | 0.33 | 0.99x |
+| hecbench/black-scholes-cuda | 28.20 | 6.00 | 1 / 1 | identical | - | - | 5.28 | 4.70x |
+| hecbench/silu-cuda | 0.65 | 0.58 | 25 / 50 | identical | - | - | 0.27 | 1.11x |
 
+Geometric mean x sim 2.11 over 14 programs; launches on the card / all launches: 7369 / 7708.
 
 ## D. A10G (rig 1), profile nvidia/h100 (sm_90 simulated on an sm_86 card), THIS BRANCH, FIT=1
 
@@ -65,11 +84,28 @@ Every number is measured on the card named in its heading. "x sim" = simulator s
 | hecbench/black-scholes-cuda | 19.46 | 5.95 | 1 / 1 | identical | 0 / 0 (abs 0, rel 0) | identical | 5.28 | 3.27x |
 | hecbench/silu-cuda | 0.62 | 0.29 | 50 / 50 | identical | 0 / 0 (abs 0, rel 0) | identical | 0.27 | 2.17x |
 
-## E. A10G (rig 2), profile nvidia/h100, origin/main turbo (before: no card path)
+Geometric mean x sim 2.61 over 14 programs; launches on the card / all launches: 7705 / 7708.
+
+## E. A10G (rig 2), profile nvidia/h100, origin/main turbo (before: no card path; sim and turbo only)
 
 | program | simulator s | turbo s | launches on card / all | turbo output vs simulator | verify words different / outside (largest abs, rel) | verify output | native s | x sim |
 |---|---:|---:|---:|---|---|---|---:|---:|
+| polybench/2DCONV | 1.34 | 1.37 | 0 / 1 | identical | - | - | 0.85 | 0.98x |
+| polybench/ATAX | 2.45 | 2.42 | 0 / 2 | identical | - | - | 0.33 | 1.01x |
+| polybench/FDTD-2D | 191.53 | 198.22 | 0 / 1500 | identical | - | - | 4.19 | 0.97x |
+| polybench/GEMM | 1.39 | 1.41 | 0 / 1 | identical | - | - | 0.66 | 0.99x |
+| polybench/LU | 62.91 | 63.22 | 0 / 4096 | identical | - | - | 0.94 | 0.99x |
+| rodinia/backprop | 1.03 | 1.02 | 0 / 2 | identical | - | - | 0.40 | 1.00x |
+| rodinia/gaussian | 8.29 | 8.47 | 0 / 1022 | identical | - | - | 0.30 | 0.98x |
+| rodinia/srad_v2 | 0.07 | 0.07 | 0 / 1 | identical | - | - | 0.30 | 1.04x |
+| rodinia/hotspot | 1.92 | 1.93 | 0 / 1000 | identical | - | - | 0.24 | 0.99x |
+| rodinia/bfs | 0.02 | 0.02 | 0 / 26 | identical | - | - | 0.24 | 1.03x |
+| hecbench/atan2-cuda | 0.03 | 0.03 | 0 / 3 | identical | - | - | 0.24 | 1.01x |
+| hecbench/bilateral-cuda | 0.75 | 0.74 | 0 / 3 | identical | - | - | 0.33 | 1.00x |
+| hecbench/black-scholes-cuda | 19.57 | 19.63 | 0 / 1 | identical | - | - | 5.28 | 1.00x |
+| hecbench/silu-cuda | 0.61 | 0.62 | 0 / 50 | identical | - | - | 0.27 | 0.99x |
 
+Geometric mean x sim 1.00 over 14 programs; launches on the card / all launches: 0 / 7708.
 
 ## F. L4 (rig 3, sm_89, 58 SMs), profile nvidia/h100, THIS BRANCH, FIT=1
 
@@ -90,6 +126,8 @@ Every number is measured on the card named in its heading. "x sim" = simulator s
 | hecbench/black-scholes-cuda | 16.35 | 4.98 | 1 / 1 | identical | 0 / 0 (abs 0, rel 0) | identical | 4.51 | 3.28x |
 | hecbench/silu-cuda | 0.52 | 0.27 | 50 / 50 | identical | 0 / 0 (abs 0, rel 0) | identical | 0.26 | 1.92x |
 
+Geometric mean x sim 2.45 over 14 programs; launches on the card / all launches: 7705 / 7708.
+
 ## G. L4 (rig 3, sm_89), profile nvidia/a10g (80 SMs simulated on a 58-SM card), THIS BRANCH, FIT=1
 
 | program | simulator s | turbo s | launches on card / all | turbo output vs simulator | verify words different / outside (largest abs, rel) | verify output | native s | x sim |
@@ -108,4 +146,6 @@ Every number is measured on the card named in its heading. "x sim" = simulator s
 | hecbench/bilateral-cuda | 1.15 | 0.31 | 3 / 3 | identical | 0 / 0 (abs 0, rel 0) | identical | 0.30 | 3.73x |
 | hecbench/black-scholes-cuda | 22.67 | 5.03 | 1 / 1 | identical | 0 / 0 (abs 0, rel 0) | identical | 4.51 | 4.50x |
 | hecbench/silu-cuda | 0.52 | 0.27 | 50 / 50 | identical | 0 / 0 (abs 0, rel 0) | identical | 0.26 | 1.93x |
+
+Geometric mean x sim 1.69 over 14 programs; launches on the card / all launches: 7705 / 7708.
 

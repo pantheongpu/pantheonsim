@@ -76,6 +76,7 @@ if [[ -x "$work/exact" ]]; then
   diff="$(echo "$line" | sed -n 's/.*in_set_different=\([0-9]*\).*/\1/p')"
   (( ${same:-0} >= 2 )) || { echo "FAIL: fewer than 2 kernels of the exact set compared"; fails=1; }
   (( ${diff:-1} == 0 )) || { echo "FAIL: a kernel of the exact set differs on the card"; fails=1; }
+  # (a verify run asks no performance rule, so turbo's default VGPU_HOST_GPU_FIT=1 changes nothing here; FIT=0 would not either)
   say "turbo verify run, machine-readable summary"
   VGPU_GPU="nvidia/$id" VGPU_THREADS=4 LD_LIBRARY_PATH="$build/shim" "$work/exact" > "$work/off.out" 2> "$work/off.err"
   ecard="$(grep '^host_gpu_verify:' "$work/v.err" | tail -1 | sed -n 's/.*in_set_identical=\([0-9]*\) in_set_different=\([0-9]*\).*/\1 \2/p' | awk '{ print $1 + $2 }')"

@@ -12,7 +12,7 @@ Measured (see results.md for every row):
   (PolyBench FDTD-2D 92.3 s to 4.3 s, LU 28.2 s to 1.0 s, Rodinia gaussian 3.7 s to 0.27 s; native 4.2 s, 0.94 s and 0.30 s).
 * **The price of FIT=1 is paid by the small programs**: every program starts the driver, so 2DCONV 0.93 s to 2.0 s (the driver start of that process), bfs, atan2 and srad_v2 0.01 to 0.06 s become 0.24 to 0.5 s.
   The size rule (before, or `FIT=0`) kept those in the simulator. That is why the geometric mean is lower than before although every long program is as fast or faster.
-* A10G with the **H100 profile** (sm_90 simulated on the sm_86 card; before: no card path at all, 0 of 17,000+ launches, "not a SASS module"): FDTD-2D 198 s to 4.3 s, LU 63 s to 1.1 s, gaussian 8.4 s to 0.27 s, black-scholes 19.5 s to 6.0 s; geometric mean 2.62x
+* A10G with the **H100 profile** (sm_90 simulated on the sm_86 card; before: no card path at all, 0 of 7,708 launches, "not a SASS module"): FDTD-2D 198 s to 4.3 s, LU 63 s to 1.1 s, gaussian 8.4 s to 0.27 s, black-scholes 19.5 s to 6.0 s; geometric mean 2.61x
   (before: 1.00x). On the L4 (sm_89, so the lower-minor rule: the card runs the sm_86 cubin) with the H100 profile 2.45x and with the a10g profile (80 simulated SMs on a 58-SM card, which exact mode refuses) 1.69x.
 * **Differences from the simulator: none observed.** In all 14 programs on every card and profile, `VGPU_HOST_GPU_VERIFY=all` compared every launch the card ran and found 0 words different (so 0 bits, largest difference 0), and the turbo output equals the simulator's. A single
   summary line read directly (L4, H100 profile, PolyBench GEMM): `host_gpu_turbo: ... words_compared=786432 words_different=0 ... bits_different=0` and `host_gpu_fit: policy=fit card_sm=89 card_sms=58`,
