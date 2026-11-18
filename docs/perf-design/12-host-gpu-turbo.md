@@ -435,7 +435,7 @@ would read in the simulator, at the addresses it would read them.
 **External functions, by the kernel.** The external functions a kernel can reach are its call graph's and its own code's call relocations
 (`sass::reachable`), and only those decide, by kind (`extern_kind`, `include/vgpu/host_gpu.hpp`): a kernel that calls `malloc` or `free` stays in
 the simulator (the card's heap is the card's own, outside the window: a pointer from it kept in memory means nothing to the simulator), so does one
-that calls `assert` (a failed assert on the card loses the context, and with it data only the card holds), one that launches kernels (the child
+that calls `assert` (a failed assert on the card loses the context, and with it data only the card holds; in exact mode: turbo mode admits it since section 20), one that launches kernels (the child
 grids, their code and their addresses would be the card's, and the scan has not seen them), and one that calls anything else not named. A kernel
 of the same module that calls none of them is judged by its own code. Turbo mode admits a kernel that calls `vprintf`: the absolute call to it is
 the one call that may leave the kernel's section (the driver links it at load). The card writes the arguments to its printf buffer and the driver
@@ -840,7 +840,426 @@ start share of a kernel launched thousands of times was capped at 500 launches (
 20 us kernel) and was kept for good (the prior is kept instead, later times at their least); and one launch that was 60 us late ended the card for its kernel
 (three in a row now). JACOBI1D 2.3 s to 1.5 s, sc_gpu 0.96 s to 0.85 s; LargeKernelParameter saves 0.2 ms a launch against the 0.25 ms its start needs, and stays in the simulator.
 
-## 18. Cooperative launches and mapped host memory (#661; turbo only)
+
+## 18. Turbo refusal census: what still stays in the simulator, and why (2026-11-17)
+
+Tags: [M] measured by `tools/turbo-census` (CPU only, no card) over the files named; [I] inferred; [U] unknown. Data, method and the list of what is the runtime's own code and what the tool wrote again:
+[data/turbo-census/README.md](data/turbo-census/README.md). Nothing in turbo changed.
+
+For every kernel of 654 corpus binaries (PolyBench, Rodinia, HeCBench, CUDA Samples 13.0: 613 programs, 3,321 kernels) and of libtorch_cuda.so (21,614) and Ollama's two libggml-cuda.so (4,530 each), for hosts sm_75, sm_86, sm_89
+and sm_90 and the profiles a10g and h100, the tool reports the image turbo would give the card and, for a kernel that stays in the simulator, every reason, using `pick_card_image`, `scan_ptx_for_card`, `turbo_class`
+and the other functions of this mode. Its walk over a kernel's code is a copy of `Impl::kernel_eligible`'s (that function needs a live `Impl`); `test_turbo_census` holds the copy to the runtime's functions, with five mutations shown failing.
+* [M] a10g profile on an sm_86 card: 3,115 of 3,321 kernels (93.8 %), 577 of 613 programs, and 2,484 of the 2,485 simulator seconds that exist for 120 of the programs, are admitted whole. h100 profile on the same card 71.8 %; sm_90 card 67.2 %.
+  Corpus caveat: every corpus was built for sm_86 (no sm_90-only build, no PTX-only build), so the retarget route of section 16.3 saw no kernel, and the sm_75 cell (15.4 %) measures the corpus.
+* [M] the reasons by weight: a module whose image is PTX, or whose simulator image is PTX, and which declares a variable (24 % of kernels on an sm_90 card, 21 % for the h100 profile on sm_86; 427 of the 804 refused on the sm_90 card
+  declare only unreferenced `cuda::std::__cpo` objects); `ENDCOLLECTIVE` in sm_90 cubins (215 kernels, 73.8 s); texture and surface (24 kernels, 12 programs, 1.0 s); `__managed__`, BPT, a register call, `__assertfail`: under 4 % together.
+* [M] libraries (a10g profile, sm_86 card): libtorch 73.5 % (`__assertfail` 25 %, a call through a register 26 %), Ollama cuda_v12 90.6 % (BPT and a register call 9.4 %), **Ollama cuda_v13 0 %** (PTX only, every module declares a variable;
+  45 % of its kernels only declare unreferenced ones).
+* The recommendation (build: admit `__assertfail` and the trap; refuse a PTX module only for a referenced variable; one H100 run for `ENDCOLLECTIVE`; do not build texture on the card, TMA translation or multi-card on this data) is in the round's report;
+  limits: 120 of 613 programs have a simulator time, launch-time refusals (fit, host-mapped memory, cooperative) are invisible to a static scan, and a PTX module reports only its first blocker.
+
+## 20. Turbo admits assert and trap, and a PTX module whose variables nothing names (2026-11-17)
+
+Tags: [M] measured (A10G, sm_86, driver 595, CUDA 13.0 toolkit, the rig of 2026-11-17: data in [data/turbo-admit/](data/turbo-admit/README.md)); [D] documented; [I] inferred; [U] unknown.
+Nothing is claimed for Hopper or Blackwell: no sm_90 or sm_100 card was used, and the sm_90 PTX below is run on the sm_86 card after the section 15 retarget.
+Exact mode, the plain simulator and its counters are unchanged: every rule here is turbo only (`mode == Turbo`), and `VGPU_HOST_GPU=exact` is tested to refuse the same kernels as before.
+
+Two refusals that the census (section 18) found to be the largest levers outside the corpus were taken apart: what turbo kept in the simulator because a failed `assert` or a trap ends a real context, and what it kept
+out of the card because a PTX module declares a variable.
+
+### 20.1 What a card does when an assert fires or a trap executes [M, A10G]
+
+`data/turbo-admit/native-fail.txt` (programs `fail.cu`, `fatal.cu`, `hang.cu`, built `-arch=sm_86`, run natively; every row is a runtime-API call and the code it returned):
+
+| event | kernel launch call | `cudaDeviceSynchronize` | message | later calls |
+|---|---|---|---|---|
+| `assert(false)` in thread 3 | 0 | 710 `cudaErrorAssert` | the driver prints `file:line: kernel: block: [..], thread: [..] Assertion `cond` failed.` to stderr at the synchronisation | `cudaGetLastError`, `cudaMemcpy` (device to host), `cudaMalloc`, the next `cudaDeviceSynchronize`: all 710 |
+| `__trap()` | 0 | 719 `cudaErrorLaunchFailure` | none | all 719 |
+| `__brkpt()` | 0 | 719 | none | all 719 |
+
+* The context is dead: after the failure no copy works, so **memory the card held and the host did not is gone, as it is on a real GPU** (`cudaMemcpy` returns 710 or 719, the data is not read). `cudaDeviceReset` returns 0 and the process's next allocation then returns 46
+  (`cudaErrorDevicesUnavailable`): the runtime of this process does not recover on the card.
+* The process does not exit by itself: a program that does not look at the codes goes on (`fatal.cu`: exit status 0, `sync=710 copy=710`).
+* A kernel whose other warps wait does not hang: a block with warp 1 at `__syncthreads()` or spinning on a flag that never comes, and warp 0 asserting or trapping, ends at once with the same codes (`hang.cu`: 0.3 s and 0.5 s).
+* SASS: `__trap()` and `__brkpt()` both compile to `BPT.TRAP 0x1`; the assert is `CALL.ABS.NOINC R` to a function the driver links, which does not return [M: `cuobjdump -sass`].
+* What the simulator does for the same programs (`data/turbo-admit/sim-fail.txt`): the same codes at the same calls (710 for the assert, 719 for the trap and `__brkpt`), the message in its own words (`[vgpu] ... VirtualGPU error [device-assert]: ... device-side assertion failed: <expression>`), and a context that is
+  dead the same way; it differs after `cudaDeviceReset`, which recovers (the simulator's allocation returns 0, the card's 46). The simulator's errors are `Err::DeviceAssert` and `Err::Trap`; the shim turns them into 710 and 719.
+
+### 20.2 The policy
+
+A kernel that can assert or trap is admitted in turbo mode, **because a fired assert or trap ends the real program's context on the card exactly as it ends the simulated one**, and the simulator is the specification of what the program was
+promised: turbo keeps the codes and the sticky error, and loses only what a dead context loses anyway. What the mode does when the card says it fired (`launch()` in `host_gpu.cpp`, `dec.trap`):
+
+* the card's launch returned 710 (kernel can assert) or 719 (kernel can trap or assert): the card has already printed the assertion text. The launch is failed with the simulator's own error (`Err::DeviceAssert` / `Err::Trap`), so the program sees 710 / 719 at the same calls as
+  under the plain simulator and every later call fails with the sticky error; stderr says `host_gpu: <kernel> asserted|trapped on the card (error N); the launch fails as it does in the simulator`. The card's copy of the memory is discarded (`discard_card_data`: the simulator's bytes become the truth again, nothing is pulled from a dead context). This happens
+  **whether or not the card held data the simulator lacks**: there is no fall back to the simulator after such a failure, because a real GPU has no way back either, and a fall back that re-ran the kernel in the simulator could produce a different outcome from the one the card had (turbo is not bit-accurate), which would be a
+  silently different program. (Before this change the same failure with card-only data ended the process with `Err::Internal` ("failed on the card, which holds data the simulator does not"), the message of a launch that failed for a reason of the mode's own.)
+* any other card error from a kernel that can assert (700, 701, a hang killed by the watchdog) is not the program's failure: it keeps the old handling (mode off; the simulator takes the launch; `Err::Internal` when the card holds data).
+* `VGPU_HOST_GPU_TURBO_OFF=assert` keeps such kernels in the simulator (the reason is printed: `the kernel calls __assertfail (VGPU_HOST_GPU_TURBO_OFF=assert)`); exact mode never sends them (its promise is the simulator's bits, and a card is not told how to fire the simulator's way).
+* What is admitted, and how it is found: (1) the extern `__assertfail` (class `ExternKind::Assert` in `extern_admitted`), (2) `BPT.TRAP` and only it (`bpt_is_trap`; `DRAIN`, `CAL`, `PAUSE`, `INT` and a form the decoder cannot name stay class never), counted in class `unlisted` (so `TURBO_OFF=unlisted` also keeps them out), (3) a PTX `trap`, `brkpt`
+  or a call to `__assertfail` (a PTX module that asserts is still refused, for the reasons in 20.4).
+
+### 20.3 The call through a register [M, I]
+
+nvcc 13 does not call `__assertfail` with a relative or absolute label: it emits `MOV Rx, 0x0 ; LDC.64 Rt, c[0x4][Rx+off] ; ... ; CALL.ABS.NOINC Rt`, and `.nv.constant4` is a table of 8-byte slots the module's `.rel.nv.constant4` relocations fill (slot 0 `__assertfail`, the others the message strings) [M: readelf of
+HeCBench assert-cuda, sm_86]. That is the "call through a register" the scan refused (and counted as 5,714 libtorch kernels). It is **followed only when it can be bounded** (`register_call_slot`, `register_call_to_admitted_extern`, `host_gpu_regcall.hpp`):
+
+* the target register is, in straight-line code, written last by an unguarded 64-bit `LDC` from bank 4 whose index register was last written by a `MOV` immediate (or is `RZ`): the slot is the immediate plus the load's offset;
+* nothing between those instructions writes either half of the target, branches, calls, returns or is a place another path can enter (branch and `BSSY` targets, the instruction after a call), and the section has no `BRX` or `JMP`;
+* `.rel.nv.constant4` has exactly one relocation at that slot, naming an **undefined function** of the module (`__assertfail`, or `vprintf` when printf is admitted), and that function is one `extern_admitted` takes.
+
+Anything else (a load whose index comes from memory, a function pointer in a register, a slot naming a defined function or a variable, a guarded load, a join point) is refused as before, with `never:call-through-register`; the unit test `a_call_through_a_register_is_followed_only_when_its_target_slot_is_known` has 17 such cases and 4 mutations. [U] other
+toolchains' spelling of the same call (CUDA 12, `IMAD.MOV.U32 Rx, RZ, RZ, imm` for the index) is not recognised and is refused, which is the safe side; it was not measured here.
+
+### 20.4 A PTX module is refused only for a variable something can reach [M, D]
+
+Section 15's rule (a JIT-compiled module has its own copy of every variable, so a module that declares one cannot be shared with the simulator's) is kept for every variable a **statement of the module can name**. `scan_ptx_for_card` now declares a variable *unreferenced*, and admits the module, only when
+none of these holds: any statement other than its own declaration holds its name as a whole identifier (instruction operands of every kind, `cvta`, `mov`, call arguments, another function, another variable's initialiser, a directive; the part of a declaration before `=` does not count); it is `.extern`, `.visible`, `.weak`, `.common` or `.hidden`
+(another module or the host may name it); `.managed`; the declaration cannot be read (a declaration list `.global .u32 a, b;`, no name); a piece of its name (split at `.`) occurs. Over-counting is the safe side (a name inside a `.pragma` string counts).
+A reason names the variable: `the PTX declares a module variable (.global) that the module can reach (name)`. `VGPU_HOST_GPU_PTX_VARIABLES=all` brings the section 15 rule back (any variable refuses).
+
+Why the rest is safe [D, I]: the card's module has its own copy of a variable the code never reads, so nothing the kernels compute depends on it. A host write to it (`cudaMemcpyToSymbol`) goes to the simulator's copy, which no card kernel reads; an address handed to a kernel as an argument (`cudaGetSymbolAddress`) is an address in the simulator's
+window, which the card reaches through the mirror like any allocation. The 600 or so `.global .align 1 .b8 _ZN4cuda3std3__45__cpo5beginE[1]` objects nvcc emits for `<cuda/std/...>` are of this kind. What is **not** admitted: nvcc's printf and assert message strings are variables the kernel reads, so a PTX module that prints or asserts keeps being refused.
+
+### 20.5 Measurements [M, A10G, 2026-11-17]
+
+**Static, the census tool** (`build/turbo_census`, the runtime's own scan; "before" is `--assert-off --ptx-variables-all`, "after" the defaults; the file `data/turbo-admit/census.md` has the commands):
+
+| input | cell | before | after |
+|---|---|---|---|
+| 78 HeCBench programs built `-arch=compute_90` (PTX only; 293 kernels), simulated as an H100 | sm_86 card (retarget) | 0 kernels, 0 programs | **176 kernels (60 %), 33 programs** whole; the other 117 kernels reference a variable (77 `.global`, 40 `.const`) |
+| Ollama 0.40.16 `cuda_v12/libggml-cuda.so` (7,263 kernels, SASS) | sm_86 card | 5,476 (75.4 %) | **7,263 (100.0 %)** |
+| same | sm_90 card (static only) | 3,823 (52.6 %) | 5,609 (77.2 %); the rest is `ENDCOLLECTIVE` (1,654), not changed here |
+| Ollama 0.40.16 `cuda_v13/libggml-cuda.so` (7,254 kernels, PTX only) | sm_86 card | **0** | **1,479 (20.4 %)**; 5,775 reference a variable (message strings of `GGML_ABORT`/`GGML_ASSERT` and lookup tables) |
+| same | sm_90 card (static only) | 0 | 228 (3.1 %): 1,251 more hold sm_90 cluster forms |
+
+The libtorch figure of the census (74 % to about 99 %) was **not measured here**: no libtorch was on the rig [U]; it rests on the census' count of 5,488 `__assertfail` kernels and the 26 % call-through-register class being the same pattern as measured on HeCBench and ggml.
+
+**Real runs, HeCBench** (`data/turbo-admit/programs.tsv`, `src/run_admit.sh`, `src/agg.py`): 31 programs of the 33 that are admitted whole after the change, built `-arch=compute_90` (PTX only, so on the sm_86 card turbo retargets the PTX, section 15), with reduced arguments, simulated as an `nvidia/h100`
+(the plain simulator cannot run sm_90 PTX as an sm_86 profile). Five forms each: native (the sm_86 build on the card), plain simulator, turbo with the rule before (`VGPU_HOST_GPU_PTX_VARIABLES=all`), turbo after, turbo after with `VGPU_HOST_GPU_VERIFY=all`. 60 s cap on every form (150 s for accuracy and adjacent, which ran first and finished in far less); a capped time is a lower bound.
+
+* **before**: 0 launches on the card in every program (the module's variables).
+* **after**: 28 of 31 programs run **every launch on the card** (determinant: the card cannot back the H100 profile's window, `could not back the simulator's window`, a section 15 limit; laplace and topk: no form finished in 60 s). Output lines other than timings equal the plain simulator's in all 21 programs where both finished.
+* **wall seconds, plain simulator to turbo after** (native sm_86 build in brackets): accuracy 9.0 to 2.9 [0.8]; dp4a 23.6 to 0.34 [0.31]; moe-align 34.0 to 2.4 [0.91]; multinomial 25.3 to 2.8 [2.7]; scel 26.0 to 8.3 [8.1]; channelSum 2.95 to 1.7 [1.6]; remap 1.7 to 1.05 [0.29]; rowwiseMoments 7.8 to 4.7 [5.3];
+  rotary 37.9 to 27.9 [26.7]; attention 7.5 to 6.3 [5.5]; rle 1.5 to 1.6 [1.1]; and where the simulator hit the cap: all-pairs-distance >60 to 0.42 [0.57], sort >60 to 0.96 [0.49], ssim >60 to 4.0 [3.6], ssm >60 to 9.6 [9.1], segment-reduce >60 to 26.2 [22.9], softmax-online >60 to 31.6 [29.8], f16sp >60 to 38.2 [37.2].
+  Short programs get **slower** (the driver start and the first window push, section 15, FIT=1 sends everything): damage 0.02 to 0.28, attentionMultiHead 0.04 to 0.30, groupnorm 0.06 to 0.37, nosync 0.10 to 0.67, ccsd-trpdrv 0.02 to 0.28, dropout 0.31 to 0.56, mtf 0.69 to 0.97, kurtosis 0.28 to 3.1 (not looked into [U]).
+* **verify=all** (every launch on the card and in the simulator, compared word by word with the default tolerance): 19 programs finished, **0 words outside the tolerance in all of them**; words that differ at all: attention 1 of 805,711,995, ccsd-trpdrv 1 of 26,240, groupnorm 36 of 788,796, the other 16 programs 0. moe-align was cut at 60 s with 222,918,083 of
+  1,014,840,000 words different and none outside the tolerance [U: it is atomics-bound; not investigated]. rotary's verify run was killed for memory (137), several others hit the cap.
+
+**Real runs, assert and trap** (`native-fail.txt`, `sim-fail.txt`, `turbo-fail.txt`; `src/fail.cu`, `fatal.cu`, `hang.cu`): the three transcripts are the same at every call (codes 710 and 719, the sticky error, the copies refused). Differences: the simulator and turbo recover after `cudaDeviceReset` and the card does not; the message
+text is the driver's in turbo (printed before the failure is reported) and the simulator's own in the simulator. `VGPU_HOST_GPU_TURBO_OFF=assert` gives the simulator's run of the same program. The kernels that failed were launched on the card (`launches_card` counts them as simulated: the launch was handed to the simulator's error).
+
+**Ollama 0.40.16 with SmolLM2-135M** (`src/run_ollama.sh`: `ollama serve` under the shims of this build, `VGPU_GPU=nvidia/a10g`, the A10G card, three greedy tokens of "The capital of France is"): Ollama picks `cuda_v13`. All four forms reply `The capital of` as the CPU backend does: plain simulator 27.7 s, turbo with the old rules 28.2 s,
+turbo after 29.0 s and 30.1 s (two runs), turbo after with verify=all 29.0 s. **Turbo gains nothing here**: of about 2,530 launches three reached the card (`rms_norm_f32`, `rope_norm` twice: PTX modules whose variables no instruction names, now admitted; 364 MiB of window pushed for the first), then every launch stays in the simulator because ggml
+maps its memory with `cuMemMap` ("virtual memory mappings hold device memory the card copy would lack", a rule of section 10 that is not touched here), and two kernels (`mul_mat_f`, `k_set_rows`) keep their PTX module off the card for a variable they read (`__unnamed_1`, `kvalues_iq4nl`). So the static 20.4 % is an upper bound of what Ollama's v13 library can use, not a speed-up, until the VMM rule is lifted.
+
+
+### 20.6 Tests and mutations
+
+* Unit, `tests/unit/test_host_gpu_logic.cpp` (CTest `test_host_gpu_logic`, no card, hosted CI): `ptx_variables_that_no_instruction_names_do_not_keep_a_module_off_the_card` (the markers admitted and counted; the old rule by argument; 11 ways an instruction names a variable; another function and an initialiser; 7 linkage and unreadable forms; part-of-an-identifier is not a reference, a `.pragma`
+  string is; data bytes are not names; textures stay never), `assert_and_trap_are_admitted_by_turbo_only_and_not_when_switched_off` (the extern, `BPT` forms, the switch, PTX `trap`/`brkpt`/`__assertfail`), `a_call_through_a_register_is_followed_only_when_its_target_slot_is_known` (the measured nvcc sequence and its offsets; 17 refusals). `test_turbo_census` follows the new rules.
+* Stub e2e, `nvidia/tests/e2e/run_host_gpu_stub.sh` step 59 with `host_gpu_trap.cu` (CI job `e2e_host_gpu_stub`; the stand-in driver fails the launch with `STUB_LAUNCH_FAIL=710` or `719`): the program prints the same lines under the plain simulator and under turbo against a card that fails; an assert kernel is sent in turbo and not in exact mode or with `TURBO_OFF=assert`; 701 is not taken for the program's failure; PTX with a variable only the host names is given to the card, one whose kernel reads it, or
+  one with `VGPU_HOST_GPU_PTX_VARIABLES=all`, or an assert, is not; a PTX trap is sent and its failure told. The whole stub test passes on the A10G rig (380 s).
+* Mutations: `data/turbo-admit/mutations.txt` has each mutation, the file it changes and the failing check. 13 unit mutations (every one caught; one, `name pieces not checked`, was first NOT caught and a test was added) and 4 runtime mutations (assert and trap never admitted; a card assert treated as an ordinary failure; any card error taken for the program's own; PTX variables always refuse), each failing step 59, and the unmutated step passes.
+
+### 20.7 Not done, and not known
+
+* **libtorch** (74 % to about 99 % in the census) was not measured; no PyTorch ran on the rig [U]. The code path is the one measured on HeCBench and ggml; a launch of a torch assert kernel that fires was not exercised.
+* **The Ollama run gains nothing** (the VMM rule, section 10, stops the card path after three launches; the variable-reading kernels stay). Lifting it is a design question of its own (the card would need the device memory `cuMemMap` maps) and was not attempted.
+* **Referenced variables are still refused** (5,775 of Ollama v13's 7,254 kernels; 117 of 293 HeCBench kernels). The common referenced cases are message strings that only `vprintf` or `__assertfail` read; admitting a constant byte array whose every use is such a call's argument was **not** done: it needs the same reference analysis per use, and a wrong guess reads a second copy.
+* The bound on the call through a register recognises the measured nvcc 13 sequence only (`MOV` immediate, 64-bit `LDC` from bank 4, `CALL.ABS.NOINC`); other toolchains' spelling is refused (safe). A **function pointer in a register stays refused**: its target set cannot be bounded statically, and no attempt was made.
+* After a card assert the card is not asked to recover (`cudaDeviceReset` on it returns 0 and the next call 46); turbo does not try either, and the simulator's recovery after a reset is its own behaviour.
+* A kernel whose assert fires **because turbo is not bit-accurate** (the card's approximate result trips a check the simulator's would pass) now ends the program with the card's text, as it would on a real GPU; `TURBO_OFF=assert` is the way back. How often this happens in real use is unknown [U].
+* `moe-align`'s 222,918,083 differing words (none outside the tolerance), `kurtosis`'s 3.1 s, `determinant`'s window refusal and rotary's memory kill were seen and not investigated.
+* Nothing is claimed for Hopper or Blackwell cards: the sm_90 runs above are sm_90 PTX retargeted onto the sm_86 card.
+
+
+
+## 19. Several host cards: simulated device N runs on host card N (2026-11-17)
+
+Tags: [M] measured (the card or rig named), [D] documented (NVIDIA or the code), [I] inferred, [U] unknown.
+
+Before this section the host-GPU runtime answered for the simulated device in ordinal 0 only, on the real driver's device 0, with one context, one module cache, one residency
+table and one window per process (section 15's survey, section 7). A machine with four cards used one. Turbo mode (not exact mode, which is unchanged) now gives every simulated
+device its own card.
+
+### 17.1 What a process can do with several cards [M, four Tesla T4 (sm_75), native Linux, CUDA 13.0, `tools/multicard/va_probe.cu`, output in `data/multicard/va_probe.out`]
+
+* One process holds a primary context on each of the four cards and reserves a different window on each with `cuMemAddressReserve` at the simulator's own per-device address
+  (`kDeviceVaBase + slot * 1 TiB`: 0x200000000000, 0x210000000000, ...): all four reservations returned the address asked for. The simulator's windows are disjoint by construction
+  (`MemoryManager::va_base`, one 1 TiB window per device slot, 16 slots), so the card path needs nothing but "device slot S is reserved on card S".
+* The same address cannot be reserved on a second card: the second `cuMemAddressReserve` of an address another card's context holds returns error 1. Unified addressing is one VA space
+  for the process. Giving one simulated device two cards, or mirroring one window on two cards, is not possible; this is why the unit is "one device, one card".
+* Kernels on the four cards, launched back to back with no wait in between, all ran. A copy of memory between two cards works through the host (`cuMemcpyDtoH`, `cuMemcpyHtoD`; the four
+  T4s report `cuDeviceCanAccessPeer` 0, no peer-to-peer), and `cuMemcpyPeer` works too (the driver stages it). Streams and events per card, and a `cuStreamWaitEvent` on another card's event, worked.
+* A copy of a window's memory must be issued with the owning card's context current: a device-to-host copy of card 3's window with card 0's context current returned error 1.
+* **A kernel on card 0 that touches card 1's window kills card 0's context (error 700) and every other context of the process**: after it, a copy on card 2 and a synchronise on card 1
+  returned 700 too. This is the one rule that shapes the design: a launch that could reach another device's memory must never go to a card (17.3).
+* Real-driver `CUDA_VISIBLE_DEVICES=2,3` on the four cards: the driver reports two devices [M]; which machine card is its device 0 is [D] (the list's order).
+
+### 17.2 Design
+
+One `Runtime::Impl` per simulated device slot instead of one per process: each has its own driver `Api`, context, window (`va_base = kDeviceVaBase + slot * kDeviceVaStride`), module cache,
+residency table, launch lock (`GateLock mu`), watchdog, statistics and `CardGate`. The per-launch code is unchanged; it simply finds its own `Impl`. `Runtime::for_device(profile, ordinal,
+physical)` takes the device's slot (`Device::physical_`, the window the memory manager is in) and makes the runtime of that slot on first use.
+
+* Which card [I for the rule, M for the effect on four T4s; pure code in `include/vgpu/host_gpu_cards.hpp`, `pick_card`]: slot S uses the machine's card S when the real driver shows it.
+  A simulated machine bigger than the host's card count keeps the devices without a card in the simulator: the runtime of that slot ends its driver start with one line
+  (`host_gpu: simulated device 2 has no host card ...; so it stays in the simulator`, once per device, not "mode off"), and every launch on it is the plain simulator's.
+  Mixed placement (devices 0 and 1 on cards, device 2 simulated) is allowed because coherence is per device (17.3).
+* `VGPU_HOST_GPU_DEVICES=a,b,c` (turbo): slot 0 uses the real driver's device a, slot 1 its device b; a slot past the list stays simulated. Numbers are the driver's own (CUDA_VISIBLE_DEVICES
+  is not applied on top). A list that is not different decimal numbers turns the mode off with a message (said even under VGPU_QUIET), as the other switches do.
+* `CUDA_VISIBLE_DEVICES`: the simulator reads it in `shared_runtime.cpp` to choose among the SIMULATED machine's devices, and the real driver loaded in the same process reads the same
+  string at `cuInit`. [I] The numbers in it name the machine's cards, so the simulated device in slot S is the machine's card S, and the real driver numbers that card by its place in the
+  list: with `CUDA_VISIBLE_DEVICES=2,3` slot 2 uses the driver's device 0 and slot 3 its device 1, and slots 0 and 1 have no card (hidden). A string that is not a list of decimal numbers (UUIDs) is
+  not read: the driver then chose, and slot S is its device S. Before this change a program started with `CUDA_VISIBLE_DEVICES=1` had its device 0 in window 1 and the card path reserved window 0
+  ([I]: every launch then failed to map a window that did not contain its memory, so the mode did nothing; not run); it now follows the slot.
+* Exact mode: `served_slot` serves ordinal 0 only, window 0, the driver's device 0, exactly as before; with one host card turbo behaves as before for slot 0, and slot 1 and up stay simulated.
+* The first Runtime made prints the summary lines scripts read; with more than one runtime every device that started a card adds `host_gpu_card: device_slot=S card=C launches_card=.. launches_sim=..
+  card_s=.. sim_s=.. mib_to_card=.. mib_back=..`, so a script adds them up. `host_gpu_turbo:` and the lines under it describe the first device only.
+
+### 17.3 Coherence with several devices [D for the mechanisms, M for the stub tests, U where said]
+
+Each device's memory has its own window, residency table and gate, so a launch on card S flips only device S's chunks to Card; nothing else changes hands.
+
+* Copies between devices (`cudaMemcpyPeer`, a `cudaMemcpy` device to device, a copy from a device with a card to one without): the runtime performs them through the simulator's memory managers,
+  whose gate pulls the chunks only a card holds first (the existing `before_access` path); no card-to-card copy is made. Test: `copy` and `mixed` in `run_host_gpu_multi_stub.sh` use a stand-in
+  card that adds 1 to four ints, and the printed values are the mode-off values, so a missing pull would show.
+* Peer access (`cudaDeviceEnablePeerAccess`): `MemoryManager::card_blocker()` already refused every launch on a device with a peer link, from or to it; that now applies per device, so devices
+  0 and 1 with a link stay simulated while 2 and 3 keep their cards (test `peeron`).
+* A pointer into another device's window in a launch's arguments (a peer pointer without peer access: the simulator's invalid-pointer error): refused by the card path, as a fault on the
+  card would kill every context of the process (17.1). Not recognised: such a pointer reached through memory (a table of device pointers), which on a card faults and ends the process.
+  [U] how common; the simulator itself reports the error for it without peer access, so the program is wrong on a real machine too.
+* NCCL-like patterns: the simulator's collectives go through its own communicators and the memory managers, so what they read and write is pulled and pushed like any copy [I, not tested];
+  a program that allreduces between launches simply alternates, with the pulls of 4 devices' chunks. [U] no NCCL program was run this round.
+* Streams and events: the card path still launches on the default stream and does not create events; the simulator's streams and events are unchanged.
+
+### 17.4 Launches are queued when there are several devices [M, 4x T4]
+
+A launch on a card used to be waited for (`cuCtxSynchronize` inside the launch), so a second device's launch could not start before the first card finished. With more than one simulated
+device (`g_runtimes > 1`) turbo with `VGPU_HOST_GPU_FIT=1` now queues the launch on the card's default stream and returns: copies on the same stream are ordered after it by the driver [D],
+so the data needs no change, and `Impl::settle()` waits (and checks the kernel's error) where the card's memory is pulled, and at exit. The watchdog stays armed until then. Not queued: with one
+device (the usual program: the launch is waited for, as before; test `solo`), kernels that print, verify runs, write-through, `VGPU_HOST_GPU_FIT=0`.
+**Known limit [M]:** the shim holds one API lock per call, and a read-back that waits for a card (the pull) holds it, so a program whose thread for device 0 reads its results back before the
+thread for device 3 has launched serializes the cards behind it (pattern 2 below). Launch on all devices, then read back (patterns 0 and 1) overlaps them. Releasing that lock while a card is waited for
+needs the shim's lock discipline reviewed and was not attempted.
+
+### 17.5 Measurements (AWS g4dn.12xlarge, four Tesla T4, 48 vCPU; `tools/multicard/multibench.cu`, `bench.sh`; raw output in `data/multicard/`)
+
+`multibench <devices> <pattern> 1048576 <iters> 2`: per device 1M floats, 2 launches of a kernel doing `iters` iterations of a multiply and two fused multiply-adds (no libm, so the card and the
+simulator agree bit for bit), a checksum per device printed. Pattern 0: one thread launches on every device, then reads all back; 1: a thread per device with a barrier after the launches; 2: a thread per
+device reading back as soon as it has launched. Simulated machine: `VGPU_GPU=nvidia/t4`, 4 devices. Every run below printed the same bytes (a hash of stdout is in the data files).
+
+| 4 devices, iters 65536, wall seconds | pattern 0 | pattern 1 | pattern 2 |
+|---|---|---|---|
+| plain simulator | 31.4 | 32.2 | 32.9 |
+| turbo, a card for device 0 only (`VGPU_HOST_GPU_DEVICES=0`: what turbo did before) | 19.9 | 26.7 | 28.0 |
+| turbo, 4 cards | 0.93 | 0.92 | 1.15 |
+
+(34x the simulator and 21 to 29x the old turbo for patterns 0 and 1.) Scaling with the number of devices, 1M iterations, turbo, each device on its card (two runs each, seconds):
+
+| devices | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| pattern 0 | 2.11 | 2.12 | 2.13 | 2.14 |
+| pattern 1 | 2.11 | 2.12 | 2.13 | 2.13 |
+| pattern 2 | 2.12 | 2.13 | 4.71 | 6.00 |
+
+The same program on the real driver with no simulator (`multibench` built against the real cudart): 1.70 s with 1 device, 2.11 to 2.20 s with 4 for every pattern; the 0.4 s over it with 1 device is the
+simulator's start and the driver start. Before queueing launches the same turbo runs grew by about 1.3 s per device (2.1, 3.4, 4.7, 6.0 s), the cards running one after another.
+
+**A single-device program does not change [M, T4, 3 runs each, `data/multicard/single_device_before_after.txt`]:** `multibench 1 0 1048576 65536 2` with one simulated T4: the plain simulator 6.2 to 6.4 s on the
+origin of this branch (cd30dd20) and 6.3 to 6.4 s on this one; turbo 0.46 to 0.47 s on both; a short run (1024 iterations) 0.39 to 0.40 s on both; the printed bytes have the same hash in every run
+(8a8abf77 and f8c143d2), and `run_host_gpu_stub.sh` (the existing stand-in suite, exact and turbo) passes on this branch.
+
+### 17.6 Tests
+
+* `tests/unit/test_host_gpu_cards.cpp` (hosted CI, no card): the card choice (`pick_card`, `driver_cards`, `parse_card_list`, `served_slot`, `addr_in_other_window`), including CUDA_VISIBLE_DEVICES
+  renumbering and hiding, a list that ends early, UUID strings, VGPU_HOST_GPU_DEVICES, devices beyond the cards, exact mode serving slot 0 only, and the windows being disjoint.
+* `nvidia/tests/e2e/run_host_gpu_multi_stub.sh` (CTest `e2e_host_gpu_multi_stub`; stand-in driver `host_gpu_stub_driver.c` extended to show `STUB_DEVICES` cards, read `CUDA_VISIBLE_DEVICES` as a
+  driver does, give each card its own context, and compute `bump` with `STUB_CARD_BUMP=1`): twelve checks, listed in the script's header, every output equal to the mode-off output.
+* Mutation evidence (`tools/multicard/mutate.sh`, output `data/multicard/mutations.txt`): each mutation below is killed. M1 every slot uses window 0: 25 e2e failures; M2 every device uses
+  driver device 0: 32; M3 a peer pointer argument not looked at: the peerptr output and its "no launch" check fail; M4 one runtime for all devices: 32; M5 CUDA_VISIBLE_DEVICES not read: unit
+  `visible_devices_renumber_the_real_driver_not_the_slot` and 7 e2e; M6 exact mode serves every device: unit `exact_mode_serves_device_zero_only_and_turbo_every_window`; M7 a device without a card uses the
+  first card: 2 unit and 4 e2e; M8 launches always waited for: the `dp4` queue check fails; M9 launches always queued: the `solo` check fails.
+
+### 17.7 What is left
+
+* Releasing the shim's API lock while a card is waited for (pattern 2 above); needs a review of what the lock protects. [U]
+* Device-to-device copies still go through the host and the simulator's memory (a card-to-card path with `cuMemcpyPeer` for two devices that both hold Card chunks would save the round trip; not
+  needed for correctness). [U for the gain]
+* NCCL-style collectives and torch DDP were not run; a peer pointer reached through memory ends the process (17.3). [U]
+* A mixed machine (cards of different architectures: each runtime has its own `host_sm`, the module images are chosen per card) is untested on real hardware; the unit tests cover the choice only. [U]
+* Not run on a card of another architecture than sm_75; only the four T4s were available this round.
+
+
+
+## 21. Program history, the driver's compile cache, and the fixed cost of a turbo process (2026-11-17)
+
+Tags: [M] measured on one A10G (sm_86, 80 SMs, driver 595.112, CUDA 13.0 toolkit, native Linux, g5.xlarge, 4 vCPUs, `VGPU_THREADS=4`, profile a10g unless said); [D] documented; [I] inferred; [U] unknown. Rows and raw
+outputs: [data/turbo-fit/history-results.md](data/turbo-fit/history-results.md). Wall times are medians of 5 runs (3 for FDTD-2D and LU), the runs of the forms interleaved.
+
+What this section answers: with `VGPU_HOST_GPU_FIT=1` the card's driver starts in every process (section 16.2), 0.15 to 0.24 s of wall time whatever the program is. A program whose whole simulation takes 14 ms (Rodinia bfs) pays 0.24 s, and
+Rodinia srad_v2, whose kernel faults on the card (error 700) and ends the mode, pays 0.44 s for a launch the simulator runs in 0.06 s. Three things were looked at: a record of what earlier runs of the same program learned (17.1), the driver's own compile cache
+for retargeted PTX (17.2), and where the 0.24 s of a process goes (17.3).
+
+### 17.1 Program history (`VGPU_HOST_GPU_HISTORY`) [M, the rule fitted on 45 programs of the corpus]
+
+**Opt-in, off by default.** `VGPU_HOST_GPU_HISTORY=<directory>` (or `1`: `$XDG_CACHE_HOME/pantheonsim/host-gpu-history`, else `~/.cache/pantheonsim/host-gpu-history`). Why not on by default: a simulator that writes files nobody asked for is a surprise on a
+read-only home or an ephemeral runner; a record can only ever be right about the program, the profile and the card it was made on; and what it saves is one start of the driver (0.1 to 0.2 s) per short program. Exact mode and `VGPU_HOST_GPU_FIT=0` never read or write it; neither does
+`VGPU_HOST_GPU_VERIFY`. **It decides where a launch runs, never what it computes.** A missing, stale, corrupt, foreign, oversized or concurrently written file is read as no history, and the process then does what it did before (unit and stub tests below).
+
+*The key* (16 hex digits, one file `<key>.hist` per key, so unrelated programs never contend): a hash of the fatbins the program registered (nvcc's `__cudaRegisterFatBinary`, before `main`: the program's identity is known before any module is loaded, which is when the driver would
+start; a program that loads its modules through the driver API after its device exists has no key and no history), the simulated profile (id, compute capability, SM count), the card model (the NVIDIA display devices' PCI vendor and device ids from sysfs, and the kernel module's version line from
+`/proc/driver/nvidia/version` when it exists: read without the driver, which is the point; no id of a particular host, and a machine whose sysfs shows no NVIDIA device has no history), the mode (`turbo-fit`) and every `VGPU_HOST_GPU_*` setting except the ones that only say where to write or what to print (`HISTORY*`, `LOG`, `PRESTART`, `LIBCUDA`,
+`PROC_VERSION`), and the file format's version. The input of the program is not in the key (see the limits). `VGPU_HOST_GPU_HISTORY_CARD=<text>` stands in for the card model (tests, hosts with no sysfs entry).
+
+*The file* (`include/vgpu/host_gpu_history.hpp`, at most 16 KiB, a text record): version, key, runs, a verdict (unknown, candidate, tiny, long), totals of the last run, and up to 48 kernels with launches, the largest launch's threads, the seconds on the card and in
+the simulator, whether a launch came back from the card, whether it failed there, and whether its code has a loop; a checksum over every byte before it. Written to a temporary file of its own name and renamed over the key's file (a reader sees the old file or the new, never half of one; two writers leave one of their
+records); re-read just before the write, so a record another process wrote meanwhile is the one updated; the directory keeps at most 256 history files (the oldest by modification time are removed), and temporary files older than an hour. Nothing in it identifies the host or the user.
+
+*What a process does with a record* (`decide_start`, `update`):
+* **A kernel that failed on the card** (error 700, 715 to 719: an illegal address, instruction, misaligned or invalid-address-space access, an invalid pc or a launch failure [D: the driver's error list]) is noted at once, and is kept in the simulator from its first launch in every later run (`host_gpu: ... stays in the simulator: history: this kernel failed on the card in an earlier run`). If every kernel the record knows failed and none came back, the driver is not started with the device either (a kernel the
+  record does not know starts it when it is launched). srad_v2: 0.37 s to 0.064 s, simulator 0.063 s.
+* **A program known to be shorter in the simulator than the driver's start.** The process stays in the simulator (the driver is not started with the device, and the verdict of a kernel, which in turbo mode with FIT=1 starts the driver itself to know the card's architecture, is not asked) until the simulator has spent the budget (`VGPU_HOST_GPU_START_COST`, 0.25 s) in launches, or a launch is of a kernel the record knows
+  to take that long per launch, or of more than twice the threads of the record's largest launch (another input): then the driver starts and the process is turbo as before (a launch cannot be stopped, so the loss of a wrong record is at most one launch more than the budget). The record's verdict says *tiny* when a run that stayed in the simulator observed less simulator time than half the start (0.125 s),
+  *long* when it observed more or gave up; a tiny record keeps the next runs in the simulator and is re-observed each time. The simulator seconds are those of the launches (the host's own work is the same in both worlds).
+* **A first run has no simulator time to observe**, because it ran on the card. It leaves a *candidate* when the card path took under 5 ms in at most 512 launches, no kernel failed, the kernels without a loop total at most 4e8 threads x static instructions, and no launch of a kernel with a loop is larger than 8,192 threads; the second run is then the trial (in the simulator, bounded as above) that
+  observes the simulator, and leaves tiny or long. So the third run is the first to gain; the second gains too when the trial was right.
+
+*Why the rule has the loop clause* [M]: the card seconds do not say how long the simulator needs (simulator seconds over card-path seconds, 174 rows of the earlier rig runs: median 158, up to 4,219 for HeCBench aidw and 2,115 for bilateral). A first rule (card path under 3 ms, at most 131,072 threads) made aobench (1 ms on the card, 0.71 s in the simulator), bilateral (0.9 ms, 1.47 s) and GEMM (1.7 ms, 0.74 s) candidates, and their trial run cost 0.47, 0.52 and 0.21 s more than turbo
+once. Static instruction counts did not separate them either (lavaMD 1e7 threads x instructions took 1.5 s, adam 6e6 took 28 ms): what did is whether the kernel has a loop and how many threads it runs. With the rule as it is, none of the five programs tried that way (aobench, bilateral, lavaMD, perplexity, bh) became a candidate and none lost anything. The rule is a measured heuristic, not a bound: a kernel of few threads with a long loop and a card
+path under 5 ms passes it, and the trial then costs the simulator's time for one launch (once per key); [U] how often that happens outside this corpus.
+
+*Measured* (a10g profile; wall seconds; "before" is turbo with the driver's own work-queue count and no history, "turbo" is turbo with no history after 17.3, "run 1/2/3" are the first three runs with a fresh history directory; sim is the mode off):
+
+| program | sim | before | turbo | run 1 | run 2 | run 3 | kept by the history |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Rodinia bfs | 0.014 | 0.240 | 0.175 | 0.176 | 0.014 | 0.014 | tiny after run 2 |
+| HeCBench backprop-cuda | 0.013 | 0.239 | 0.177 | 0.176 | 0.013 | 0.013 | tiny |
+| HeCBench attention | 0.035 | 0.246 | 0.183 | 0.183 | 0.036 | 0.036 | tiny |
+| Rodinia srad_v2 | 0.063 | 0.443 | 0.374 | 0.373 | 0.064 | 0.064 | its kernel faulted on the card |
+| HeCBench atan2 | 0.029 | 0.245 | 0.186 | 0.182 | 0.181 | 0.182 | not a candidate (loop kernel, 100,096 threads) |
+| PolyBench 2DCONV | 0.939 | 0.746 | 0.727 | 0.724 | 0.725 | 0.724 | no |
+| PolyBench ATAX | 1.091 | 0.321 | 0.256 | 0.259 | 0.260 | 0.259 | no |
+| PolyBench GEMM | 0.740 | 0.559 | 0.455 | 0.466 | 0.468 | 0.462 | no (a loop kernel on 262,144 threads) |
+| PolyBench FDTD-2D (no sim run) | - | 4.257 | 4.205 | 4.167 | 4.181 | 4.185 | no |
+| PolyBench LU (no sim run) | - | 1.052 | 0.957 | 0.937 | 1.005 | 0.971 | no |
+
+The cost of the history itself: run 1 against the same program with no history is +0.000 to +0.011 s (bfs 0.176 against 0.175, ATAX 0.259 against 0.256, GEMM 0.466 against 0.455, srad_v2 0.373 against 0.374: inside the spread of three to five runs; under strace the read, the temporary file, the rename and the directory scan lie within 3 ms); a held run
+against the simulator with the mode off: bfs 0.014 against 0.014, backprop-cuda 0.013 against 0.013, attention 0.036 against 0.035 (under 1 ms). Output: every run of every program above that has a simulator run printed what the simulator printed (the programs' own timing lines apart); the record changes no result by construction (it chooses a side) and by test (below).
+The programs not captured (atan2, nn, adam, bgmv, blockAccess: 14 to 37 ms in the simulator) are the price of the loop clause; a program with long loops and few threads is not told apart from them by anything the first run sees [U].
+
+*Limits.* The key does not contain the program's input: a program that is tiny on one input and long on another has one record; a launch of more than twice the recorded threads ends a hold, and the budget ends it otherwise, so a wrong record costs at most a start's worth of simulator time plus one launch, and turns into *long* (which is then not retried). A record made on one card is not used on another (the card model is in the key); one made with one `VGPU_THREADS` is
+used with another (the simulator seconds scale with it, and a tiny program at 4 threads is tiny at 1: [I] not measured). A host that wipes its cache directory between jobs gets no gain (the first run of each job is run 1); keep the directory (a CI cache of `VGPU_HOST_GPU_HISTORY`'s path) to get it.
+
+### 17.2 The driver's compile cache for retargeted PTX [M]
+
+The cost section 16.3 named ("GEMM built as PTX only spent 2.5 s of card time on the first launch") was measured again, with PolyBench GEMM, ATAX and a large module (HeCBench s3d, 54 kernels, built as PTX only for compute_90, run on the h100 profile on the A10G card, so the PTX is retargeted and compiled by the driver):
+* The driver's default cache is `~/.nv/ComputeCache` (it existed on the rig; `CUDA_CACHE_PATH`, `CUDA_CACHE_DISABLE`, `CUDA_CACHE_MAXSIZE` were unset). With it, the second process is as fast as the first without any JIT: s3d 3.82 s to 0.85 s of wall time (card path 3.0 s to 0.025 s), GEMM 0.60 s (a first run in a fresh directory) to 0.53 s. A fresh `CUDA_CACHE_PATH` directory behaves like an empty
+  default cache (first run compiles, the second hits; 2.9 MB for s3d); `CUDA_CACHE_DISABLE=1` compiles every time (s3d 4.17 and 3.82 s of wall time, 3.28 and 3.02 s on the card).
+* **The 2.5 s of GEMM was mostly not the compile.** With the page cache warm and the cache disabled GEMM's compile is 21 ms on the card path (0.023 s), a cache hit 1.8 ms; after `drop_caches` 0.171 s (the driver's JIT library read from disk), and a cache hit then 6.5 ms. The first run of a fresh rig took 3.9 s of wall time: the first read of the driver's files from a new EBS volume [I: first-touch of a volume made from a snapshot; not isolated]. The compile
+  is expensive for a large module (s3d: 3.0 s), and that is where the cache pays.
+* `CUDA_CACHE_MAXSIZE=4096` (bytes) turned the cache off in effect (GEMM: second run no faster); the default maximum was not reached by anything measured [U: its value on this driver].
+* What survives on an ephemeral runner: nothing of `~/.nv` unless the runner's home persists (a runner that is started per job loses it with the instance) [I].
+
+*Implemented, because the numbers justify it* (3.0 s against 0.025 s for a large module on every run after the first): when `VGPU_HOST_GPU_HISTORY` names a directory and neither `CUDA_CACHE_PATH` nor `CUDA_CACHE_DISABLE` is set, the driver's cache goes to `<directory>/cuda-cache`, so that the one directory a runner is told to keep carries both. Never over a setting of the user's (stub step 63); the variable is set before the driver's first call, in the process's environment (children
+inherit it). Without a history directory nothing changes; `CUDA_CACHE_MAXSIZE` is not touched (nothing measured needed it).
+
+### 17.3 Where the 0.24 s of a turbo process goes, and one cheap win [M]
+
+Rodinia bfs, a10g profile: the mode off 0.014 to 0.016 s; native 0.24 s (the real runtime, no simulator); turbo 0.24 s (`VGPU_HOST_GPU_PRESTART=0` 0.245 s: the prestart hides nothing for a program with no set-up). A standalone program that makes the driver's calls in the order of `begin_start` (libcuda opened with and without `RTLD_DEEPBIND`; three runs each, the spread under 5 ms):
+
+| step | ms |
+|---|---:|
+| `dlopen` of libcuda | 1.5 |
+| `cuInit` | 48 |
+| `cuDeviceGet`, twelve `cuDeviceGetAttribute` | 0.0 |
+| `cuDevicePrimaryCtxRetain` | 92 to 98 |
+| `cuMemGetInfo`, `cuMemAddressReserve` of 1 TiB at the simulator's base | 0.0 |
+| inside the program | 141 to 149 |
+| the whole process, wall | 234 to 242 |
+
+So the driver start is 0.145 s, and about 0.09 s more is the process's end: the wall time of the standalone program is 0.09 s longer than its calls, and under strace the last thread of a process that used the card exits 85 to 90 ms after `exit_group` (the driver's context is torn down when the device files are closed) [M for the gap, I for its cause]. Native pays the same two things, which is why native and turbo are both 0.24 s: **the fixed cost of a turbo process is the driver's, and the mode adds nothing measurable to it** (the library
+load is 1 to 4 ms in both, the 1 TiB reservation costs nothing, the module load and first launch are inside the program's 14 ms). Not affecting it [M, 3 runs each]: `CUDA_MODULE_LOADING` LAZY or EAGER (cuDevicePrimaryCtxRetain 91 to 98 ms either way), `CUDA_CACHE_DISABLE`, `CUDA_VISIBLE_DEVICES`, and the driver's persistence mode (`nvidia-smi -pm`: 141 to 151 ms of calls with it off, 142 to 147 ms with it on).
+
+**What did: the driver's work queues.** `CUDA_DEVICE_MAX_CONNECTIONS` (the number of hardware work queues the driver sets up for the context [D]) changes both the context's creation and its teardown. Rodinia bfs under turbo, six runs each, wall seconds: unset 0.232 to 0.245, 1 0.148 to 0.162, 2 0.170 to 0.185, 4 0.204 to 0.216, 8 0.274 to 0.281, 32 0.751 to 0.773; `cuDevicePrimaryCtxRetain` 95 ms unset, 47 ms with 1. Turbo sends every card launch on the null stream, one at a time under the launch gate, so it does not use the queues for concurrency [I]. **Implemented:** when turbo is
+selected (`VGPU_HOST_GPU=turbo`, FIT=0 or 1) and the variable is unset, the library sets it to 1 when it loads (before `main`: a `setenv` from a later thread could race the program's own `getenv`); a value the user set, an empty one included, is left alone (an empty value is how to get the driver's own count back); exact mode is untouched (stub step 63). The processes' children inherit it, which only matters to a child that runs the real CUDA with several streams.
+Effect on the table of 17.1: turbo bfs 0.240 to 0.175 s, ATAX 0.321 to 0.256, GEMM 0.559 to 0.455, atan2 0.245 to 0.186, aobench 0.244 to 0.176, bilateral 0.333 to 0.277 (a 0.06 to 0.1 s gain in every process that starts the driver), FDTD-2D 4.257 to 4.205 s. Outputs: the 13 programs of the tables that have a simulator run printed what the simulator printed in every run (the programs' timing lines apart; `VGPU_HOST_GPU_VERIFY` was not rerun with it: [U] whether any program that depends on stream concurrency of the real
+device exists in the corpus; the mode's launches are serialised either way).
+
+What is left of the 0.24 s is the driver's start and the process's end. A persistent process that owns the card context (a daemon the simulator connects to) would remove both for every run after the first; a large change, not built [U: its cost per launch].
+
+### 17.4 Tests, and what they pin
+
+* `tests/unit/test_host_gpu_history.cpp` (20 tests, no card; wired into ctest as `test_host_gpu_history`): the record's life (miss, the candidate that a trial makes tiny or long, a hold given up at its budget, a kernel that failed is kept out for good, the bounds of a candidate, a launch much larger than the record's), the file (a record through the file and back; a hit and a miss; a directory made on demand; **corrupt**: every truncation and every byte flipped of a good file, junk, an empty file, an oversized file, a record of another key, a directory or a symlink in its place, a checksummed file with a malformed field; **a version that changed** is a miss and is overwritten; **four writers and a reader** at once leave whole records of one writer, never a mixture, and no temporary file behind; the directory stays under its bound; a stale temporary file is cleaned and a fresh one is not touched), the variable's forms, the hash.
+* `nvidia/tests/e2e/run_host_gpu_stub.sh` steps 58 to 63 (stand-in driver, no card): no variable, no file; the first run starts the driver and leaves a candidate, the second runs in the simulator with the driver untouched and leaves tiny, the third the same; a hold gives up at its budget (`VGPU_HOST_GPU_START_COST=0.00001`: the driver starts, the later launches reach the card, the record says long, the next run starts the driver again); a kernel that failed with error 700 on the stand-in is kept in the simulator, driver unstarted, from its first launch in the next run; junk, a truncated file, another key's file and a directory in the file's place are no history (the driver starts as before) and the output is
+  unchanged; exact mode and FIT=0 neither read nor write; the queue count and the compile cache path the stand-in driver reads at `cuInit` (it writes them beside its call log): turbo sets 1 and `<directory>/cuda-cache`, a user's value is kept, `CUDA_CACHE_DISABLE=1` is respected, exact mode sets nothing.
+* Mutations (each alone, rebuilt, the unit test and steps 58 to 63 run on the rig; every one fails; outputs in the data directory): M1 a tiny record never holds (unit + stub), M2 a fault is forgotten (unit + stub), M3 the checksum is not checked (unit), M4 a hold is never given up (stub), M5 the tiny boundary `<` made `<=` (unit), M6 a fault is not sticky (unit), M7 the key inside a file is not checked (unit + stub), M8 turbo overrides the user's work-queue count (stub),
+  M9 exact mode sets it too (stub), M10 the user's `CUDA_CACHE_PATH` is overridden (stub).
+
+### 17.5 Known limits
+
+The gains need the record: a first run, a run after the record's key changed (another build of the program, another card, another switch), and a run on a machine that does not keep the directory are as slow as turbo. A second run may be a trial that loses (17.1: bounded, once per key, and none lost on the five programs tried that way). The candidate rule misses short programs with loops. Programs that load modules through the driver API
+have no key. The candidate/long judgement ignores the input. `VGPU_THREADS` is not in the key. WSL2 hosts have no turbo FIT=1 (section 15), so no history. The work-queue setting applies to every turbo process that finds the variable unset, a user's own setting is the way out.
+
+
+## 22. Texture and surface offload: what the card needs, what was measured, and why it is not built (2026-11-17)
+
+Tags: [M] measured on one A10G (sm_86, driver 595, nvcc 13.0, native CUDA, no simulator), [D] documented in the simulator's source, [I] inferred, [U] unknown. Experiment source and output:
+[data/turbo-tex/exp.cu](data/turbo-tex/exp.cu), [data/turbo-tex/out.txt](data/turbo-tex/out.txt). **Outcome: nothing is built. Texture and surface instructions stay class `never`, and a launch that
+has one stays in the simulator exactly as in section 15.** This section is the design that was checked and the reasons it was not shipped.
+
+### 17.1 What the simulator holds [D]
+
+* A texture or surface object is an entry of `exec::TextureTable` (handle to `exec::TextureDesc`, `include/vgpu/exec/texture.hpp`), made by `cuTexObjectCreate`, `cuSurfObjectCreate`
+  (`nvidia/src/driver_api.cpp make_object`) and `cudaCreateTextureObject`, `cudaCreateSurfaceObject` (`runtime_api.cpp`). The handle is `(1 << 40) + n`, a counter that never reuses a value. The launch
+  reaches the table through `LaunchConfig::textures`.
+* `TextureDesc` is already everything the card needs to rebuild the object: base address, width/height/depth, layers, cubemap, pitch, channel count and bit widths, kind, address modes, filter,
+  normalised coordinates, sRGB, border colour, `read_as_normalized_float`, `from_array`. The original `CUDA_RESOURCE_DESC`, `CUDA_TEXTURE_DESC` and view descriptor are also kept (`g_object_descs`, driver path only).
+* Linear and pitch-2D resources point into ordinary simulator memory, which turbo already mirrors at identical virtual addresses. An array is also ordinary memory in the simulator (`ArrayRec::mem`,
+  dense rows of `row` bytes, slices after each other), so its bytes are in the mirrored window too; the card's array layout is opaque, so the card needs its own array filled by a copy.
+* Legacy `texture<>` references and `cuModuleGetTexRef`: CUDA 12 and later compilers no longer emit them, and the shim does not launch with them (`driver_api.cpp TexRefRec`). Rodinia's leukocyte, kmeans,
+  hybridsort and mummergpu use them and do not build with nvcc 13; none is in the corpus [M, source grep]. Module-level texture references are therefore not a case that needs a design for CUDA 13 builds; an older cubin that has one stays refused.
+
+### 17.2 What the corpus pays [M, existing tables]
+
+The simulator time of launches kept off the card by texture or surface instructions (`data/sp66/census.md`, `data/turbo-left/README.md`): 23 programs, 0.36 s in total, the largest dct8x8 (0.24 s), then
+simpleLayeredTexture 0.08 s, simpleSurfaceWrite 0.03 s, simpleCubemapTexture; "about 1 s of the issue's 4 s" in the turbo-left census when the programs' other costs are counted. No texture program in the corpus runs for
+seconds. Under `VGPU_HOST_GPU_FIT=1` a driver start is 0.2 to 0.5 s per process (section 15, 5), which is more than every one of these programs' texture time, so sending them would make them slower, not faster. Under
+`FIT=0` the size rule would keep launches this small in the simulator anyway. A program with a large image and many launches could gain; none was found to measure [U].
+
+### 17.3 Experiments on the card [M, A10G]
+
+1. **Card handles are small counters.** Linear objects got 1, 2, 3; an array texture 5 and its surface 6; a destroyed handle's value is handed out again on the next create. The simulator's handles
+   (2^40 + n) are never valid on the card, so every handle the kernel reads must be replaced by the card's.
+2. **A wrong handle fails silently.** A kernel given `0x10000000001` (never made) or a destroyed handle returned zeros and no error. Any handle the translation misses reads as zeros, not as a fault.
+3. **Substituting the 8-byte word in a kernel parameter works**: a texture handle passed alone, and one inside a struct parameter with a pointer next to it, both read correctly (0 bad of 128).
+4. **A handle kept in device memory (a struct the program copied to the card) also works natively, and cannot be found by looking at the launch's arguments.** The translation would have to scan memory, and a
+   `__constant__` or module-variable holder would have to be patched in the constant-bank copy as well.
+5. **Arrays can be mirrored by plain copies.** A dense linear buffer copied into a card array with `cuMemcpy2D` (2D) or `cuMemcpy3D` (3D, layered, cubemap), then read by a kernel, gives 0 bad words; a
+   surface write followed by array-to-linear copy gives 0 bad words; array-to-linear round trips of 3D, layered and cubemap arrays are exact. A 64 MiB device-to-array copy took 0.28 ms (240 GB/s).
+
+### 17.4 The design these results allow
+
+For a launch whose code has texture or surface instructions: (a) find every 8-byte aligned word of the arguments that is a live handle of `cfg.textures`; (b) create, once per handle and keyed by it, the card's object from
+`TextureDesc` (linear and pitch-2D over the window at the same address; array: a card array of the same shape and channel format, `cuMemcpy2D/3D` from the window before each launch, the same copy back to the window after
+a launch that has a surface object, which is the only way an array changes on the card); (c) replace the words; (d) forget card objects whose simulator handle left the table. Pure code (descriptor translation,
+argument scan) is unit-testable; the creation and copies need the stub driver to model `cuTexObjectCreate`, `cuSurfObjectCreate`, `cuArray3DCreate` and `cuMemcpy2D/3D`.
+
+### 17.5 Why it is not built
+
+1. **A missed handle is silent wrong data (17.3, 2), and a handle held in memory cannot be found (17.3, 4).** Turbo is allowed to differ in the last bits; it is not allowed to read zeros for an unnoticed
+   texture. A guard that refuses a launch when any live object is absent from its arguments would refuse legitimate programs and still not see handles whose value sits in memory the program wrote. No sound static rule for
+   "the kernel's handles are exactly its parameters" was found: the handle register of a SASS `TEX` would need data-flow back to a parameter load [U, not attempted].
+2. **The payoff measured is small** (17.2): below the driver start of the process in all but one program.
+3. **Not bit-accurate beyond last bits** is not established for filtered fetches: the simulator's filter and the hardware's 1/256-texel fraction were not compared (no simulator was built on the rig) [U]. Mipmaps, views
+   (`apply_view_format` changes the format after the fact), block-compressed formats and cubemap filtering would each need their own card-side check; a subset that excludes them is easy to state, but the
+   subset is the corpus's own handful of programs.
+4. **The change touches the launch path every other turbo branch edits** (argument vector, push loop, post-launch step), for 0.36 s.
+
+What would change this: a real program with seconds of simulated texture time (then the subset (a) to (d) over linear, pitch-2D and 2D/3D/layered arrays with handles only as parameters, and a launch refused when a handle
+is found nowhere in the arguments but live objects exist, is the design to build, with a `refused_texture` counter), or a SASS data-flow check that proves every texture handle is a parameter.
+## 23. Cooperative launches and mapped host memory (#661; turbo only)
 
 **Cooperative.** A cooperative launch goes to the card with `cuLaunchCooperativeKernel`, when the card reports `COOPERATIVE_LAUNCH` and
 `cuOccupancyMaxActiveBlocksPerMultiprocessor` times the SM count holds the whole grid (else `refused_fit`, "a cooperative grid that the card cannot hold
@@ -865,7 +1284,7 @@ runs the launch on that memory (unknown how often this matters; the same hazard 
 looked into). `VGPU_HOST_GPU_VERIFY=all`: 0 words different (1.6 G, 20 M and 3 M words compared). ATAX, GEMM, MVT, hotspot, bfs and nn: turbo within 3 % of the
 switches-off forms (no program slower). A launch with no device allocation (a zero-copy program) used to fail "could not back the window up to 0x0"; fixed here.
 
-## 19. The first big launch of a young process (#656, #659; Round r11; the size rules and exact mode)
+## 24. The first big launch of a young process (#656, #659; Round r11; the size rules and exact mode)
 
 A launch the size rules had no estimate for was sampled (section on sampling above) only if its static count reached a floor or the process was old enough to
 afford a sample; a first launch that counts 13 to 600 times under what it takes (mergeSort 80 ms counted, 1.4 s taken; `initRNG` 9.5 ms counted, 6 s taken) was

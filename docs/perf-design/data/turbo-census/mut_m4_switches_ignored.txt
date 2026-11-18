@@ -1,0 +1,14 @@
+mutation m4_switches_ignored: replace
+  if (rr == TurboRefusal::Off) add("switch:turbo-off");
+with
+  (void)rr;
+
+[ PASS ] census_plain_kernel_runs_where_its_image_does
+[ PASS ] census_picks_the_image_as_the_runtime_does
+[ PASS ] census_never_instructions_follow_turbo_class
+[ FAIL ] census_admits_what_turbo_admits
+/tmp/census-src/tests/unit/test_turbo_census.cpp:193: VCHECK(!o.admitted) failed
+[ PASS ] census_ptx_follows_the_text_scan
+[ PASS ] census_retarget_forms_and_sm90a
+[ PASS ] census_cubin_module_variable_rules
+6/7 tests passed

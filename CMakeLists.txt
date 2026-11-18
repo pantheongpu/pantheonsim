@@ -1444,13 +1444,24 @@ endfunction()
 vgpu_unit_test(test_yamlish)
 vgpu_unit_test(test_check_compare)
 vgpu_unit_test(test_host_gpu_logic)
+# The turbo refusal census (tools/turbo-census, docs/perf-design/data/turbo-census/README.md): which image turbo gives the card and why a kernel stays in the simulator, over built
+# binaries, CPU only. The unit test holds its walk to turbo's own classifier on hand-made modules.
+vgpu_unit_test(test_turbo_census)
+target_include_directories(test_turbo_census PRIVATE tools/turbo-census)
+add_executable(turbo_census tools/turbo-census/turbo_census.cpp nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
+target_link_libraries(turbo_census PRIVATE vgpu ${CMAKE_DL_LIBS})
+target_include_directories(turbo_census PRIVATE tools/turbo-census nvidia/src)
 vgpu_unit_test(test_host_gpu_ref)
 # The square root idiom of host-GPU exact mode (include/vgpu/host_gpu_idiom.hpp), on real nvcc SASS (tests/unit/host_gpu_idiom_sass.inc): no card.
 vgpu_unit_test(test_host_gpu_idiom)
 # Turbo host-GPU mode's compare by tolerance (include/vgpu/host_gpu_tol.hpp): header-only, no card.
 vgpu_unit_test(test_host_gpu_tol)
+# Turbo host-GPU mode on a machine with several cards (include/vgpu/host_gpu_cards.hpp): which card a simulated device uses, no card needed.
+vgpu_unit_test(test_host_gpu_cards)
 vgpu_unit_test(test_card_gate)
 vgpu_unit_test(test_host_gpu_track)
+# Turbo host-GPU mode's program history (include/vgpu/host_gpu_history.hpp): header-only, no card.
+vgpu_unit_test(test_host_gpu_history)
 target_include_directories(test_check_compare PRIVATE src/cli)
 vgpu_unit_test(test_profile)
 # What every shim call does around its body: ApiCall's reports, depth and argument hand-over, the inline flags.
@@ -4342,6 +4353,15 @@ set_tests_properties(e2e_host_gpu PROPERTIES
 add_test(NAME e2e_host_gpu_stub
          COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_gpu_stub.sh)
 set_tests_properties(e2e_host_gpu_stub PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 600)
+
+# Turbo mode on a machine with several cards (docs/perf-design/12-host-gpu-turbo.md section 17), with the stand-in driver told to show several: any machine.
+add_test(NAME e2e_host_gpu_multi_stub
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_gpu_multi_stub.sh)
+set_tests_properties(e2e_host_gpu_multi_stub PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"

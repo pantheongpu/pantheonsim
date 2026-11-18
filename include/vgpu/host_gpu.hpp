@@ -308,13 +308,20 @@ inline bool unmeasured_private_mnemonic(const std::string& m) {
 // undecodable modifier makes it Unlisted, which must not skip the scan).
 inline bool call_needs_scan(bool is_call_op, InsnClass c) { return is_call_op && (c == InsnClass::Call || c == InsnClass::Unlisted); }
 
-inline InsnClass turbo_class(const std::string& mnemonic, const std::vector<std::string>& mods) {
+// BPT.TRAP, the instruction `__trap()`, the failure branch of `assert` and a cooperative-groups failure compile to. [measured, A10G, 2026-11-17,
+// docs/perf-design/12-host-gpu-turbo.md section 20: on the card it ends the kernel with error 719 (assert: 710 from the __assertfail before it), and the
+// context is dead after it, as the simulator's Err::Trap and Err::DeviceAssert are.] Only the TRAP form: the debugger forms (DRAIN, CAL, PAUSE, INT) and any
+// BPT the decoder could not name stay class Never.
+inline bool bpt_is_trap(const std::string& mnemonic, const std::vector<std::string>& mods) { return mnemonic == "BPT" && mods.size() == 1 && mods[0] == "TRAP"; }
+
+inline InsnClass turbo_class(const std::string& mnemonic, const std::vector<std::string>& mods, bool trap_ok = false) {
   using C = InsnClass;
   const auto is_one_of = [&](std::initializer_list<const char*> names) {
     for (const char* n : names)
       if (mnemonic == n) return true;
     return false;
   };
+  if (trap_ok && bpt_is_trap(mnemonic, mods)) return C::Unlisted;   // (admitted by turbo mode as the unlisted class: the card ends the kernel as the simulator would)
   if (texture_mnemonic(mnemonic) || mnemonic == "BPT" || unmeasured_private_mnemonic(mnemonic)) return C::Never;
   if (mnemonic.empty() || mods_undecoded(mods)) return C::Unlisted;
   // Reductions and atomics first, by what they do.
@@ -349,6 +356,58 @@ inline bool call_stays_inside(bool relative, bool to_label, int64_t target, uint
   return relative && to_label && target >= 0 && static_cast<uint64_t>(target) >= lo && static_cast<uint64_t>(target) <= hi;
 }
 
+// ---- a call through a register whose target the scan can bound (section 20) ----------------------------------------------------------------
+// nvcc 13 calls `__assertfail` (and vprintf in some builds) as `MOV Rx, 0x0 ; LDC.64 Rt, c[0x4][Rx+off] ; ... ; CALL.ABS.NOINC Rt`: bank 4 is a table of 8-byte
+// slots the module's relocations fill (`.rel.nv.constant4`: slot 0 `__assertfail`, the others the assert's string variables) [measured: cuobjdump and readelf of
+// HeCBench assert-cuda, sm_86, 2026-11-17]. A call through a register is otherwise a function pointer from memory, which the scan cannot follow. It is followed here
+// only when the target register is, in straight-line code, the 64-bit load from bank 4 of a slot whose index is a MOV immediate (or RZ), and nothing between the load and
+// the call writes it, jumps, or is a place another path can enter: then the target is the symbol the relocation names at that slot, which the caller checks against the
+// externals turbo admits. Anything else (a load whose index comes from elsewhere, a guarded load, a join point) is not bounded. `RcInsn` is the part of a decoded
+// instruction this needs, so that the function is pure.
+struct RcInsn {
+  enum Kind : uint8_t { Other, MovImm, LdcBank, CallReg, Control };   // Control: a branch, call, return, exit or convergence instruction
+  Kind kind = Other;
+  uint32_t dst_reg = 0, dst_n = 0;   // the registers it writes: dst_reg .. dst_reg + dst_n - 1 (dst_n 0: none)
+  uint32_t reg = 0;                  // MovImm: the register written; LdcBank: the index register (255, RZ, for none); CallReg: the target register
+  int64_t imm = 0;                   // MovImm: the value; LdcBank: the offset added to the index
+  uint32_t bank = 0;                 // LdcBank
+  bool guarded = false;              // it runs only under a predicate
+  bool wide = false;                 // LdcBank: a 64-bit load
+  bool entry = false;                // another path can arrive at this instruction (a branch or convergence target)
+};
+inline constexpr uint32_t kRcRZ = 255;
+inline bool rc_writes(const RcInsn& x, uint32_t r) { return x.dst_n && r >= x.dst_reg && r < x.dst_reg + x.dst_n; }
+// The slot (byte offset in bank 4) the call at v[call] takes its target from, or -1.
+inline int64_t register_call_slot(const std::vector<RcInsn>& v, size_t call) {
+  if (call >= v.size() || v[call].kind != RcInsn::CallReg || v[call].reg == kRcRZ || v[call].entry) return -1;
+  const uint32_t t = v[call].reg;
+  size_t ldc = call;
+  for (size_t j = call; j-- > 0;) {   // the last write of the target's two registers
+    const RcInsn& x = v[j];
+    if (x.kind == RcInsn::Control) return -1;
+    if (rc_writes(x, t) || rc_writes(x, t + 1)) {
+      if (x.kind != RcInsn::LdcBank || x.guarded || !x.wide || x.bank != 4 || x.dst_reg != t || x.dst_n != 2) return -1;
+      ldc = j;
+      break;
+    }
+    if (x.entry) return -1;   // a join point between the load and the call
+  }
+  if (ldc == call) return -1;
+  const RcInsn& l = v[ldc];
+  if (l.reg == kRcRZ) return l.imm >= 0 ? l.imm : -1;
+  for (size_t j = ldc; j-- > 0;) {   // the last write of the index register
+    const RcInsn& x = v[j];
+    if (x.kind == RcInsn::Control) return -1;
+    if (v[j + 1].entry && j + 1 <= ldc) return -1;   // (a place to enter between the index and the load)
+    if (rc_writes(x, l.reg)) {
+      if (x.kind != RcInsn::MovImm || x.guarded || x.reg != l.reg || x.dst_n != 1) return -1;
+      const int64_t slot = x.imm + l.imm;
+      return slot >= 0 ? slot : -1;
+    }
+  }
+  return -1;
+}
+
 // ---- what a kernel reaches besides its code (Round sp66) ----------------------------------------------------------------------------
 // A function the module calls but does not define (Cubin::externs): the driver links it when it loads the module on the card, the simulator runs a
 // builtin in its place. What each kind needs on the card, and so whether a kernel that reaches one can go there:
@@ -372,7 +431,11 @@ inline const char* extern_kind_name(ExternKind k) {
   static const char* const n[] = {"vprintf", "__assertfail", "malloc/free", "device-side launch", "an unknown external function"};
   return n[static_cast<unsigned>(k)];
 }
-inline bool extern_admitted(ExternKind k, Mode mode, bool printf_off) { return k == ExternKind::Printf && mode == Mode::Turbo && !printf_off; }
+// __assertfail (section 20): admitted in turbo mode, because a failed assert ends the kernel on the card as it does in the simulator (error 710, the card's own
+// assertion text on stderr, a context that is dead after it). VGPU_HOST_GPU_TURBO_OFF=assert keeps such kernels in the simulator.
+inline bool extern_admitted(ExternKind k, Mode mode, bool printf_off, bool assert_off = true) {
+  return mode == Mode::Turbo && ((k == ExternKind::Printf && !printf_off) || (k == ExternKind::Assert && !assert_off));
+}
 
 // An absolute call to the first instruction of a code section of the module (Round sp66): a device function the compiler kept out of line, in a
 // section of its own (a -rdc build). The driver links the call to its own copy of the same code, so the call is followed: the callee's section is
@@ -391,14 +454,17 @@ struct TurboSwitches {
   bool atomics = true;
   ClassMask off = 0;        // VGPU_HOST_GPU_TURBO_OFF: classes switched off for an experiment
   bool printf_off = false;  // VGPU_HOST_GPU_TURBO_OFF=printf: a kernel that calls vprintf stays in the simulator (Round sp66)
+  bool ptx_vars_unreferenced = true;   // a PTX module's variables that no instruction names are admitted (VGPU_HOST_GPU_PTX_VARIABLES=all: refuse any variable; section 20)
+  bool assert_off = false;  // VGPU_HOST_GPU_TURBO_OFF=assert: a kernel that can assert or trap stays in the simulator (section 20)
 };
 
 // VGPU_HOST_GPU_TURBO_OFF=mufu,tensor,half,call,atomics,red,extra,unlisted,printf (a comma list). False, with the bad name in *bad, for anything else.
 // `printf` is not a class of instructions (a kernel's call to vprintf is, once admitted, of the call class): it sets *printf_off, and is a bad
 // name when printf_off is null.
-inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad = nullptr, bool* printf_off = nullptr) {
+inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad = nullptr, bool* printf_off = nullptr, bool* assert_off = nullptr) {
   *off = 0;
   if (printf_off) *printf_off = false;
+  if (assert_off) *assert_off = false;
   if (!text) return true;
   const std::string t(text);
   for (size_t at = 0; at <= t.size();) {
@@ -415,6 +481,7 @@ inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad =
     else if (name == "extra") *off |= class_bit(InsnClass::Extra);
     else if (name == "unlisted") *off |= class_bit(InsnClass::Unlisted);
     else if (name == "printf" && printf_off) *printf_off = true;
+    else if (name == "assert" && assert_off) *assert_off = true;   // (`assert` also keeps out BPT.TRAP and the bounded call through a register: section 20)
     else {
       if (bad) *bad = name;
       return false;

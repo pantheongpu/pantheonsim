@@ -2,7 +2,7 @@
 # Host-GPU mode (docs/perf-design/09-host-gpu-spike.md): VGPU_HOST_GPU=exact runs launches whose kernels are in the exact set on the machine's
 # real GPU, and the program has to print what it prints with the mode off. Needs a card of the model the simulator is told to be, so it
 # SKIPs without one (no hosted CI machine has one). host_gpu_exact.cu runs kernels of every kind: integer and FFMA kernels (on the card),
-# an expf kernel (MUFU: stays in the simulator), a tiny launch (too small), a kernel that calls assert (refused).
+# an expf kernel (MUFU: stays in the simulator), a tiny launch (too small), a kernel that calls assert (refused in exact mode; sent in turbo mode since section 20).
 #   1. mode off and mode exact print the same lines;
 #   2. the exact run reports launches on the card, and a kernel outside the set, a launch too small and a refused launch;
 #   3. the card copy outlives a launch (the default; VGPU_HOST_GPU_WRITE_THROUGH=1 is the older mode): the program touches memory between launches in every
@@ -108,7 +108,13 @@ rline="$(grep '^host_gpu_turbo: mode=turbo ' "$work/rel.err" | tail -1)"
 rcard="$(echo "$rline" | sed -n 's/.* launches_card=\([0-9]*\) .*/\1/p')"
 (( ${rcard:-0} > ${onc:-0} )) || { echo "FAIL: turbo mode ran ${rcard:-no} launches on the card, exact $onc: the expf launches should add to them: $rline"; fails=1; }
 fline="$(grep '^host_gpu_refusals: ' "$work/rel.err" | tail -1)"
-echo "$fline" | grep -q 'refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=[1-9]' || { echo "FAIL: turbo mode's refusals: $fline"; fails=1; }
+# (section 20: the kernel that calls assert, which exact mode refuses, runs on the card in turbo mode; its assert does not fire, so the output is the mode-off output above)
+echo "$fline" | grep -q 'refused_never=0 refused_atomics=0 refused_off=0 refused_exact=0 refused_safety=0' || { echo "FAIL: turbo mode's refusals: $fline"; fails=1; }
+grep -q 'uses_global[^ ]* on the card' "$work/rel.err" || { echo "FAIL: the kernel that calls assert did not run on the card in turbo mode: $(grep -m3 'uses_global' "$work/rel.err")"; fails=1; }
+# ... and VGPU_HOST_GPU_TURBO_OFF=assert keeps it in the simulator, with the output of the mode-off run
+run "$work/ra.out" "$work/ra.err" VGPU_HOST_GPU=turbo VGPU_HOST_GPU_TURBO_OFF=assert VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the turbo run with assert off failed"; tail -5 "$work/ra.err"; fails=1; }
+grep '^host_gpu_refusals: ' "$work/ra.err" | tail -1 | grep -q 'refused_safety=[1-9]' || { echo "FAIL: TURBO_OFF=assert did not keep the kernel that calls assert in the simulator: $(grep '^host_gpu_refusals: ' "$work/ra.err" | tail -1)"; fails=1; }
+diff -u <(no_expf "$work/off.out") <(no_expf "$work/ra.out") > "$work/d.txt" || { echo "FAIL: turbo mode with assert off changes output that does not come from expf:"; head -20 "$work/d.txt"; fails=1; }
 # 6. turbo verify.
 run "$work/rv.out" "$work/rv.err" VGPU_HOST_GPU=turbo VGPU_HOST_GPU_VERIFY=1 VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the turbo verify run failed"; tail -5 "$work/rv.err"; fails=1; }
 cmp -s "$work/off.out" "$work/rv.out" || { echo "FAIL: the turbo verify run changed the program's output"; fails=1; }

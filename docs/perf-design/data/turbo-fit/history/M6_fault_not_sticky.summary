@@ -1,0 +1,2 @@
+unit rc=1 1 FAIL lines; first: [ FAIL ] a_kernel_that_failed_on_the_card_is_kept_out_of_it_for_good
+stub rc=0 0 FAIL lines; first: 

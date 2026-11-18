@@ -1,0 +1,2 @@
+unit rc=0 0 FAIL lines; first: 
+stub rc=1 1 FAIL lines; first: FAIL: exact mode did not start the driver, or set CUDA_DEVICE_MAX_CONNECTIONS: '1 (unset)'

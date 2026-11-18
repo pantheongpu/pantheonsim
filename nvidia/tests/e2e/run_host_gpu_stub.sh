@@ -95,6 +95,12 @@
 #  43. `twoshort`, whose second kernel runs two rounds, is sampled with the driver up and kept (its estimate is far under the card path of 64 MiB):
 #      one launch reaches the card, and the program prints what `twoshortb` prints;
 #  44. against the stand-in that refuses every module, `two` is sampled twice, the second time with the driver up, and prints the mode-off output.
+# The program history (Round 9; include/vgpu/host_gpu_history.hpp), steps 58 to 62:
+#  58. without VGPU_HOST_GPU_HISTORY nothing is read or written; 59. run 1 (no record) uses the card and leaves a candidate, run 2 stays in the simulator and leaves tiny, run 3 keeps off the
+#      driver; 60. a hold gives up at its budget and the record says long; 61. a kernel that failed on the card is kept in the simulator from its first launch, the driver unstarted;
+#      62. a corrupt, truncated, foreign or directory-shaped file is no history, and exact mode and FIT=0 never read it. The output is the mode-off output in each;
+#  63. turbo mode asks the driver for one work queue (CUDA_DEVICE_MAX_CONNECTIONS=1) and, with a history directory, keeps the driver's compile cache beside it, each unless the user set the
+#      variable (the stand-in driver writes what it reads at cuInit to $STUB_LOG.env); exact mode does neither.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -135,6 +141,11 @@ if [[ "$cc" == 86 ]]; then
   "$nvcc_bin" "${nvf[@]}" -arch=sm_80 "$fitsrc" -o "$work/fit80" || { echo "FAIL: host_gpu_fit.cu does not compile for sm_80"; exit 1; }
   "$nvcc_bin" "${nvf[@]}" -gencode arch=compute_75,code=compute_75 "$fitsrc" -o "$work/fit75p" || { echo "FAIL: host_gpu_fit.cu does not compile as PTX for compute_75"; exit 1; }
   "$nvcc_bin" "${nvf[@]}" -gencode arch=compute_86,code=compute_86 "$root/nvidia/tests/e2e/host_gpu_vars.cu" -o "$work/varsp" || { echo "FAIL: host_gpu_vars.cu does not compile as PTX"; exit 1; }
+  trapsrc="$root/nvidia/tests/e2e/host_gpu_trap.cu"
+  "$nvcc_bin" "${nvf[@]}" -arch=sm_86 "$trapsrc" -o "$work/trap" || { echo "FAIL: host_gpu_trap.cu does not compile"; exit 1; }
+  "$nvcc_bin" "${nvf[@]}" -gencode arch=compute_86,code=compute_86 "$trapsrc" -o "$work/trapall" || { echo "FAIL: host_gpu_trap.cu does not compile as PTX"; exit 1; }
+  "$nvcc_bin" "${nvf[@]}" -DNO_ASSERT -gencode arch=compute_86,code=compute_86 "$trapsrc" -o "$work/trapp" || { echo "FAIL: host_gpu_trap.cu does not compile as PTX"; exit 1; }
+  "$nvcc_bin" "${nvf[@]}" -DNO_ASSERT -DREFERENCE_VAR -gencode arch=compute_86,code=compute_86 "$trapsrc" -o "$work/trappr" || { echo "FAIL: host_gpu_trap.cu does not compile as PTX with a referenced variable"; exit 1; }
 fi
 "$nvcc_bin" -std=c++17 -arch="sm_$cc" -cudart shared -w -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$root/nvidia/tests/e2e/host_gpu_overhead.cu" -o "$work/ovh" || { echo "FAIL: host_gpu_overhead.cu does not compile"; exit 1; }
 "$cc_bin" -shared -fPIC -O1 -o "$work/libstubcuda.so" "$root/nvidia/tests/e2e/host_gpu_stub_driver.c" || { echo "FAIL: the stand-in driver does not compile"; exit 1; }
@@ -145,6 +156,7 @@ run() {   # <tag> <program argument> [env...]: stdout in $work/<tag>.out, stderr
   local tag=$1 arg=$2
   shift 2
   : > "$work/$tag.log"
+  rm -f "$work/$tag.log.env"
   # (VGPU_HOST_GPU_SAMPLE=0: steps 1 to 16 pin the rules that decide BEFORE a launch runs, as they were before launches were sampled; steps 17 to 20
   # switch the sampling back on, their own assignment coming later on the command line.)
   env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" STUB_LOG="$work/$tag.log" STUB_SM="$cc" STUB_MP="$mp" STUB_INIT_MS=$init_ms \
@@ -910,8 +922,135 @@ if [[ "$cc" == 86 ]]; then
   ! grep -q 'this host is WSL2' "$work/wsl_rules.err" || { echo "FAIL: FIT=0 was turned off for WSL"; fails=1; }
   PROG=fit run wsl_exact tiny VGPU_HOST_GPU=exact VGPU_HOST_GPU_PROC_VERSION="$work/wslver" || { echo "FAIL: the exact run failed"; fails=1; }
   ! grep -q 'this host is WSL2' "$work/wsl_exact.err" || { echo "FAIL: exact mode was turned off for WSL"; fails=1; }
+  # 58 to 62. the program history (docs/perf-design/12-host-gpu-turbo.md section 17; include/vgpu/host_gpu_history.hpp), against the stand-in driver. A card of the stand-in's making
+  # (VGPU_HOST_GPU_HISTORY_CARD) stands for the model sysfs would name; STUB_CARD_OK=1 is a card whose launches come back at once.
+  hh=(VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_HISTORY_CARD=stub-card STUB_CARD_OK=1 STUB_INIT_MS=100)
+  hline() { sed -n "s/^host_gpu_history: key=[0-9a-f]* \(before=.*\)/\1/p" "$work/$1.err" | tail -1; }
+  # 58. with no VGPU_HOST_GPU_HISTORY nothing is read or written: the directory is never made.
+  PROG=fit run hi_off tiny "${hh[@]}" || { echo "FAIL: the run without a history failed"; fails=1; }
+  [[ ! -e "$work/hist_off" ]] && ! grep -q '^host_gpu_history:' "$work/hi_off.err" || { echo "FAIL: a history appeared without VGPU_HOST_GPU_HISTORY"; fails=1; }
+  # 59. the first run (no record) starts the driver and sends its launches; it was short on the card, so it is a candidate. The second runs in the simulator (a trial: the driver is not
+  # started) and observes the simulator's seconds: tiny. The third does the same on the record. The output is the mode-off output in each.
+  rm -rf "$work/hist"
+  for n in 1 2 3; do
+    PROG=fit run hi_$n tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist" || { echo "FAIL: history run $n failed"; tail -3 "$work/hi_$n.err"; fails=1; }
+    # (run 1 is on the stand-in card, which computes nothing: its output is the card's. The runs in the simulator print the mode-off output.)
+    (( n == 1 )) || diff -q "$work/off_f_tiny.out" "$work/hi_$n.out" > /dev/null || { echo "FAIL: history run $n changes the output of fit tiny"; fails=1; }
+  done
+  grep -q '^cuInit$' "$work/hi_1.log" && grep -q '^cuLaunchKernel$' "$work/hi_1.log" && [[ "$(hline hi_1)" == before=none\ after=candidate* ]] || { echo "FAIL: the first run was not a card run that left a candidate: $(calls hi_1); $(hline hi_1)"; fails=1; }
+  [[ ! -s "$work/hi_2.log" && "$(hline hi_2)" == before=candidate\ after=tiny\ held=1\ released=0* ]] || { echo "FAIL: the trial run touched the driver or did not leave tiny: $(calls hi_2); $(hline hi_2)"; fails=1; }
+  [[ ! -s "$work/hi_3.log" && "$(hline hi_3)" == before=tiny\ after=tiny\ held=1\ released=0* ]] || { echo "FAIL: a run of a tiny program touched the driver: $(calls hi_3); $(hline hi_3)"; fails=1; }
+  # 60. a hold gives up when the simulator has spent its budget (START_COST=0.00001 s: the budget is that, so the second launch of `tiny` ends it): the driver starts, the later launches reach
+  # the card, the record says long, and the next run starts the driver with the device again.
+  rm -rf "$work/hist2"
+  for n in 1 2 3; do
+    PROG=fit run hr_$n tiny "${hh[@]}" VGPU_HOST_GPU_START_COST=0.00001 VGPU_HOST_GPU_HISTORY="$work/hist2" || { echo "FAIL: release run $n failed"; fails=1; }
+    (( n == 2 )) || diff -q "$work/hi_1.out" "$work/hr_$n.out" > /dev/null || { echo "FAIL: release run $n changes the output (the card's, as in run 1 of step 59)"; fails=1; }
+  done
+  grep -q '^cuInit$' "$work/hr_2.log" && grep -q '^cuLaunchKernel$' "$work/hr_2.log" && [[ "$(hline hr_2)" == before=candidate\ after=long\ held=1\ released=1* ]] || { echo "FAIL: the hold was not given up at its budget: $(calls hr_2); $(hline hr_2)"; fails=1; }
+  grep -q '^cuInit$' "$work/hr_3.log" && [[ "$(hline hr_3)" == before=long* ]] || { echo "FAIL: a long program did not start the driver again: $(calls hr_3); $(hline hr_3)"; fails=1; }
+  # 61. a kernel that failed on the card (STUB_LAUNCH_FAIL=700, an illegal address) is kept in the simulator from its first launch in the next run, and with nothing known to run on the card the
+  # driver does not start with the device; the output is the mode-off output in each.
+  rm -rf "$work/hist3"
+  PROG=fit run hf_1 tiny "${hh[@]}" STUB_LAUNCH_FAIL=700 VGPU_HOST_GPU_HISTORY="$work/hist3" || { echo "FAIL: the faulting run failed"; fails=1; }
+  grep -q 'failed on the card (error 700)' "$work/hf_1.err" || { echo "FAIL: the stand-in card's fault was not seen: $(grep -m3 host_gpu "$work/hf_1.err")"; fails=1; }
+  diff -q "$work/off_f_tiny.out" "$work/hf_1.out" > /dev/null || { echo "FAIL: the fault changes the output"; fails=1; }
+  PROG=fit run hf_2 tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist3" || { echo "FAIL: the run after a fault failed"; fails=1; }
+  [[ ! -s "$work/hf_2.log" ]] && grep -q 'history: this kernel failed on the card in an earlier run' "$work/hf_2.err" || { echo "FAIL: a kernel known to fault reached the card or the driver started: $(calls hf_2)"; fails=1; }
+  diff -q "$work/off_f_tiny.out" "$work/hf_2.out" > /dev/null || { echo "FAIL: the run after a fault changes the output"; fails=1; }
+  # 62. a history in any state is no history: junk in the file, a truncated file, a file of another key moved into place, a directory where the file is. The run is the one without a history
+  # (the driver starts, the launches reach the card), the output is the mode-off output, and the file is a good record afterwards (unless a directory is in the way).
+  key="$(sed -n 's/^host_gpu_history: key=\([0-9a-f]*\) .*/\1/p' "$work/hi_3.err" | head -1)"
+  [[ -n "$key" ]] || { echo "FAIL: no key in the history line"; fails=1; }
+  for bad in junk trunc other; do
+    case $bad in
+      junk) head -c 3000 /dev/urandom > "$work/hist/$key.hist" ;;
+      trunc) head -c 40 "$work/hist/$key.hist" > "$work/hist/$key.t" && mv "$work/hist/$key.t" "$work/hist/$key.hist" ;;
+      other) cp "$work/hist2/"*.hist "$work/hist/$key.hist" ;;
+    esac
+    PROG=fit run hc_$bad tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist" || { echo "FAIL: the run with a $bad history failed"; fails=1; }
+    grep -q '^cuInit$' "$work/hc_$bad.log" && [[ "$(hline hc_$bad)" == before=none* ]] || { echo "FAIL: a $bad history was not read as no history: $(calls hc_$bad); $(hline hc_$bad)"; fails=1; }
+    diff -q "$work/hi_1.out" "$work/hc_$bad.out" > /dev/null || { echo "FAIL: a $bad history changes the output"; fails=1; }
+  done
+  rm -rf "$work/hist/$key.hist"; mkdir "$work/hist/$key.hist"
+  PROG=fit run hc_dir tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist" || { echo "FAIL: the run with a directory in place of the history failed"; fails=1; }
+  diff -q "$work/hi_1.out" "$work/hc_dir.out" > /dev/null && grep -q '^cuInit$' "$work/hc_dir.log" || { echo "FAIL: a directory in place of the history was not no history"; fails=1; }
+  # ... and a history never reaches exact mode or FIT=0
+  rm -rf "$work/hist4"
+  for sw in "VGPU_HOST_GPU=exact" "VGPU_HOST_GPU_FIT=0"; do
+    PROG=fit run hx tiny "${hh[@]}" $sw VGPU_HOST_GPU_HISTORY="$work/hist4" || { echo "FAIL: the run with $sw and a history failed"; fails=1; }
+    [[ ! -e "$work/hist4" ]] && ! grep -q '^host_gpu_history:' "$work/hx.err" || { echo "FAIL: $sw read or wrote a history"; fails=1; }
+  done
+  # 63. what the driver is told (section 17.2, 17.3): turbo mode asks for one work queue (CUDA_DEVICE_MAX_CONNECTIONS=1: half the driver's start, measured) unless the user has set the variable;
+  # exact mode does not touch it. With a history directory the driver's compile cache is kept beside it (CUDA_CACHE_PATH=<dir>/cuda-cache), unless the user has set CUDA_CACHE_PATH or CUDA_CACHE_DISABLE.
+  denv() { sed -n 's/^connections=\(.*\) cache=\(.*\)$/\1 \2/p' "$work/$1.log.env" | head -1; }
+  PROG=fit run de_turbo tiny VGPU_HOST_GPU=turbo || { echo "FAIL: the turbo run failed"; fails=1; }
+  [[ "$(denv de_turbo)" == "1 (unset)" ]] || { echo "FAIL: turbo mode did not ask for one work queue, or touched the compile cache: '$(denv de_turbo)'"; fails=1; }
+  PROG=fit run de_user tiny VGPU_HOST_GPU=turbo CUDA_DEVICE_MAX_CONNECTIONS=4 || { echo "FAIL: the run with a queue count of the user's failed"; fails=1; }
+  [[ "$(denv de_user)" == "4 (unset)" ]] || { echo "FAIL: turbo mode overrode the user's CUDA_DEVICE_MAX_CONNECTIONS: '$(denv de_user)'"; fails=1; }
+  PROG=prog run de_exact big VGPU_HOST_GPU=exact "${reachx[@]}" || { echo "FAIL: the exact run failed"; fails=1; }
+  [[ -s "$work/de_exact.log.env" && "$(denv de_exact)" == "(unset) (unset)" ]] || { echo "FAIL: exact mode did not start the driver, or set CUDA_DEVICE_MAX_CONNECTIONS: '$(denv de_exact)'"; fails=1; }
+  rm -rf "$work/hist5"
+  PROG=fit run de_hist tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist5" || { echo "FAIL: the history run for the cache failed"; fails=1; }
+  [[ "$(denv de_hist)" == "1 $work/hist5/cuda-cache" && -d "$work/hist5/cuda-cache" ]] || { echo "FAIL: the compile cache did not go beside the history: '$(denv de_hist)'"; fails=1; }
+  PROG=fit run de_hist_user tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist6" CUDA_CACHE_PATH="$work/mycache" || { echo "FAIL: the run with a cache path of the user's failed"; fails=1; }
+  [[ "$(denv de_hist_user)" == "1 $work/mycache" ]] || { echo "FAIL: the user's CUDA_CACHE_PATH was overridden: '$(denv de_hist_user)'"; fails=1; }
+  PROG=fit run de_hist_off tiny "${hh[@]}" VGPU_HOST_GPU_HISTORY="$work/hist7" CUDA_CACHE_DISABLE=1 || { echo "FAIL: the run with the cache disabled failed"; fails=1; }
+  [[ "$(denv de_hist_off)" == "1 (unset)" ]] || { echo "FAIL: CUDA_CACHE_DISABLE=1 was not respected: '$(denv de_hist_off)'"; fails=1; }
+  PROG=fit run de_nohist tiny "${hh[@]}" || { echo "FAIL: the run without a history failed"; fails=1; }
+  [[ "$(denv de_nohist)" == "1 (unset)" ]] || { echo "FAIL: the compile cache moved without a history directory: '$(denv de_nohist)'"; fails=1; }
 else
   echo "NOTE: turbo fit steps 45 to 52 need the rtx3060 profile (sm_86); skipped for $profile"
+fi
+# 59. (section 20) a kernel that can assert or trap, and a PTX module whose variables no instruction names. The stand-in card computes nothing, so the failure is the stand-in's
+# (STUB_LAUNCH_FAIL=710 for an assert, 719 for a trap): the program has to print what the plain simulator, which fires the assert or the trap itself, makes it print.
+if [[ "$cc" == 86 ]]; then
+  for m in assertok assertfire trapok trapfire plain; do
+    env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/trap" "$m" > "$work/off_trap_$m.out" 2> "$work/off_trap_$m.err" || { echo "FAIL: the $m run of host_gpu_trap with the mode off failed"; exit 1; }
+  done
+  grep -q 'sync=710 copy=710 later_call=710' "$work/off_trap_assertfire.out" && grep -q 'sync=719 copy=719 later_call=719' "$work/off_trap_trapfire.out" && grep -q 'sync=0 copy=0 later_call=0' "$work/off_trap_assertok.out" \
+    || { echo "FAIL: the plain simulator does not print the codes this step is written against: $(cat "$work"/off_trap_*.out | tr '\n' ' ')"; fails=1; }
+  # (a) a kernel that asserts is sent in turbo mode (it was refused before), not in exact mode, not with VGPU_HOST_GPU_TURBO_OFF=assert
+  PROG=trap run tr_ok assertok VGPU_HOST_GPU=turbo STUB_CARD_OK=1 || { echo "FAIL: the turbo run of assertok failed"; tail -5 "$work/tr_ok.err"; fails=1; }
+  grep -q '^cuLaunchKernel$' "$work/tr_ok.log" || { echo "FAIL: a kernel that asserts did not reach the card in turbo mode: $(calls tr_ok); $(grep -m3 host_gpu "$work/tr_ok.err")"; fails=1; }
+  diff -q "$work/off_trap_assertok.out" "$work/tr_ok.out" > /dev/null || { echo "FAIL: turbo mode changes the output of assertok"; fails=1; }
+  PROG=trap run tr_exact assertok VGPU_HOST_GPU=exact STUB_CARD_OK=1 || { echo "FAIL: the exact run of assertok failed"; fails=1; }
+  ! grep -q '^cuLaunchKernel$' "$work/tr_exact.log" || { echo "FAIL: exact mode sent a kernel that asserts to the card: $(calls tr_exact)"; fails=1; }
+  PROG=trap run tr_off assertok VGPU_HOST_GPU=turbo VGPU_HOST_GPU_TURBO_OFF=assert VGPU_HOST_GPU_LOG=1 STUB_CARD_OK=1 || { echo "FAIL: the turbo run of assertok with assert off failed"; fails=1; }
+  ! grep -q '^cuLaunchKernel$' "$work/tr_off.log" && grep -q 'the kernel calls __assertfail (VGPU_HOST_GPU_TURBO_OFF=assert)' "$work/tr_off.err" || { echo "FAIL: VGPU_HOST_GPU_TURBO_OFF=assert did not keep the kernel in the simulator, with the reason: $(calls tr_off); $(grep -m3 host_gpu "$work/tr_off.err")"; fails=1; }
+  diff -q "$work/off_trap_assertok.out" "$work/tr_off.out" > /dev/null || { echo "FAIL: TURBO_OFF=assert changes the output of assertok"; fails=1; }
+  # (b) a card that fails the launch with the assert's or the trap's error: the program sees what the simulator makes it see, whether or not the card held data
+  for pair in assertfire:710:device-assert trapfire:719:trap; do
+    m=${pair%%:*}; rest=${pair#*:}; code=${rest%%:*}; kind=${rest#*:}
+    PROG=trap run "tr_$m" "$m" VGPU_HOST_GPU=turbo STUB_CARD_OK=1 STUB_LAUNCH_FAIL=$code || { echo "FAIL: the turbo run of $m failed (exit $?): $(tail -3 "$work/tr_$m.err")"; fails=1; }
+    grep -q '^cuLaunchKernel$' "$work/tr_$m.log" || { echo "FAIL: $m did not reach the card: $(calls "tr_$m")"; fails=1; }
+    diff -q "$work/off_trap_$m.out" "$work/tr_$m.out" > /dev/null || { echo "FAIL: a card that fails $m with $code changes the program's lines: $(cat "$work/off_trap_$m.out") against $(cat "$work/tr_$m.out")"; fails=1; }
+    grep -q "VirtualGPU error \[$kind\]" "$work/tr_$m.err" || { echo "FAIL: $m: the launch did not fail with the simulator's error [$kind]: $(grep -m3 'VirtualGPU error\|host_gpu' "$work/tr_$m.err")"; fails=1; }
+    grep -q "on the card (error $code); the launch fails as it does in the simulator" "$work/tr_$m.err" || { echo "FAIL: $m: the failure on the card was not said: $(grep -m3 host_gpu "$work/tr_$m.err")"; fails=1; }
+    # ... the other error codes of a card launch that fails are not taken for the program's own failure
+    PROG=trap run "tr_${m}_other" "$m" VGPU_HOST_GPU=turbo STUB_CARD_OK=1 STUB_LAUNCH_FAIL=701 || { echo "FAIL: the turbo run of $m against a card that fails with 701 failed"; fails=1; }
+    grep -q "failed on the card (error 701); mode off, the simulator runs it" "$work/tr_${m}_other.err" || { echo "FAIL: $m: an error 701 was not handled as any card failure: $(grep -m2 host_gpu "$work/tr_${m}_other.err")"; fails=1; }
+    diff -q "$work/off_trap_$m.out" "$work/tr_${m}_other.out" > /dev/null || { echo "FAIL: error 701 on a kernel that can fire changes the program's lines"; fails=1; }
+  done
+  # (c) PTX only: a module that declares a variable no instruction names (only the host writes it) is given to the card; one whose kernel reads it is not
+  PROG=trapp run tp_un plain VGPU_HOST_GPU=turbo STUB_CARD_OK=1 VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the PTX run with an unreferenced variable failed"; tail -5 "$work/tp_un.err"; fails=1; }
+  grep -q '^cuModuleLoadData$' "$work/tp_un.log" && grep -q '^image ptx$' "$work/tp_un.log" || { echo "FAIL: PTX whose only variable no instruction names was not given to the card: $(calls tp_un); $(grep -m3 'host_gpu' "$work/tp_un.err")"; fails=1; }
+  diff -q "$work/off_trap_plain.out" "$work/tp_un.out" > /dev/null || { echo "FAIL: an unreferenced variable changes the output"; fails=1; }
+  PROG=trapp run tp_all plain VGPU_HOST_GPU=turbo STUB_CARD_OK=1 VGPU_HOST_GPU_LOG=1 VGPU_HOST_GPU_PTX_VARIABLES=all || { echo "FAIL: the PTX run with VGPU_HOST_GPU_PTX_VARIABLES=all failed"; fails=1; }
+  ! grep -q '^cuModuleLoadData$' "$work/tp_all.log" && grep -q 'the PTX declares a module variable' "$work/tp_all.err" || { echo "FAIL: VGPU_HOST_GPU_PTX_VARIABLES=all did not bring back the rule that any variable refuses: $(calls tp_all); $(grep -m3 host_gpu "$work/tp_all.err")"; fails=1; }
+  PROG=trappr run tp_ref plain VGPU_HOST_GPU=turbo STUB_CARD_OK=1 VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the PTX run with a referenced variable failed"; fails=1; }
+  ! grep -q '^cuModuleLoadData$' "$work/tp_ref.log" && grep -q 'the PTX declares a module variable (.global) that the module can reach' "$work/tp_ref.err" || { echo "FAIL: PTX whose kernel reads a variable was given to the card: $(calls tp_ref); $(grep -m3 host_gpu "$work/tp_ref.err")"; fails=1; }
+  diff -q "$work/off_trap_plain.out" "$work/tp_ref.out" > /dev/null || { echo "FAIL: a referenced variable changes the output"; fails=1; }
+  # ... a PTX module with a trap is given to the card (turbo only), and its failure is told as the simulator tells it
+  PROG=trapp run tp_trap trapfire VGPU_HOST_GPU=turbo STUB_CARD_OK=1 STUB_LAUNCH_FAIL=719 VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the PTX trapfire run failed"; tail -3 "$work/tp_trap.err"; fails=1; }
+  grep -q '^cuLaunchKernel$' "$work/tp_trap.log" && grep -q "VirtualGPU error \[trap\]" "$work/tp_trap.err" || { echo "FAIL: a PTX trap was not sent, or its failure was not the simulator's: $(calls tp_trap); $(grep -m3 'host_gpu\|VirtualGPU' "$work/tp_trap.err")"; fails=1; }
+  diff -q "$work/off_trap_trapfire.out" "$work/tp_trap.out" > /dev/null || { echo "FAIL: a trap in PTX on a failing card changes the program's lines"; fails=1; }
+  PROG=trapp run tp_trap_off trapok VGPU_HOST_GPU=turbo VGPU_HOST_GPU_TURBO_OFF=assert STUB_CARD_OK=1 VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the PTX trapok run with assert off failed"; fails=1; }
+  ! grep -q '^cuLaunchKernel$' "$work/tp_trap_off.log" || { echo "FAIL: TURBO_OFF=assert did not keep a PTX trap in the simulator: $(calls tp_trap_off)"; fails=1; }
+  # ... and the PTX of a kernel that asserts keeps its message strings, which the kernel reaches: not given to the card
+  PROG=trapall run tp_as assertok VGPU_HOST_GPU=turbo STUB_CARD_OK=1 VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the PTX run of assertok failed"; fails=1; }
+  ! grep -q '^cuModuleLoadData$' "$work/tp_as.log" || { echo "FAIL: PTX of a kernel that asserts (its message strings are variables the kernel reads) was given to the card: $(calls tp_as)"; fails=1; }
+  diff -q "$work/off_trap_assertok.out" "$work/tp_as.out" > /dev/null || { echo "FAIL: the PTX assert changes the output"; fails=1; }
 fi
 # 58. (#660, #662) what a kernel kept in the simulator costs the mode: 50 kernels of one launch each and a looping kernel stay in the simulator and say so. These pin the size rules, which
 # turbo mode asks with VGPU_HOST_GPU_FIT=0 (the default FIT=1 would send every one of them to the card).

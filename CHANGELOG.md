@@ -37,6 +37,36 @@ release says what runs and what it produces, never how fast a real GPU would run
   size rule now takes the card's time for a kernel it has not run as a twentieth of the simulator's estimate (at most 100 us, as before), lets a
   launch of 40 us or more be sent (was 200 us), and lets a kernel launched thousands of times repay the driver start at 50 us saved a launch.
   The simulator's results do not change, only which path a launch takes. `VGPU_HOST_GPU_SHORT=0` restores the old rule.
+
+- **Turbo host-GPU mode admits a kernel that can assert or trap, and a PTX module whose variables no instruction names** (`12-host-gpu-turbo.md` section 20, [data](docs/perf-design/data/turbo-admit/README.md)). On an A10G a failed `assert` ends the context with error 710 and `__trap()` / `__brkpt()` with 719,
+  every later call returns the same code and the memory the card held is gone, exactly as the plain simulator does it; turbo now sends such kernels (`__assertfail`, `BPT.TRAP`, and nvcc 13's call through a register that the scan can bound to a slot of constant bank 4 naming
+  an external function it admits), and when the card reports 710 or 719 the launch fails with the simulator's own error, whether or not the card held data the simulator lacks (the card's assertion text is on stderr; the process no longer ends with an internal error). `VGPU_HOST_GPU_TURBO_OFF=assert` keeps them
+  in the simulator; exact mode and the plain simulator are unchanged. A PTX module is refused only for a variable some statement of it can name (`.extern`, `.visible`, `.weak`, `.managed`, unreadable declarations and any
+  name that occurs outside its declaration count as named); the libcu++ marker objects nvcc declares in every module that includes `<cuda/std/...>` no longer keep it off the card (`VGPU_HOST_GPU_PTX_VARIABLES=all` restores the old rule). Tests: unit tests of the scan and the register-call bound, stub step 59, `tools/turbo-census` follows both rules.
+
+- **Turbo refusal census** (`tools/turbo-census`, `test_turbo_census`, [docs/perf-design/data/turbo-census/](docs/perf-design/data/turbo-census/README.md), `12-host-gpu-turbo.md` section 18): a CPU-only tool that says, for every kernel of built binaries and libraries, which image
+  turbo would give each host card (sm_75, sm_86, sm_89, sm_90) under the a10g and h100 profiles and why a kernel stays in the simulator, using the runtime's own image choice, PTX scan and instruction classes. Turbo itself is unchanged.
+
+- **Turbo host-GPU mode on a machine with several cards: simulated device N runs on host card N.** Until now the card path served simulated device 0 on the real driver's device 0 only. With
+  `VGPU_HOST_GPU=turbo` each simulated device now has its own card, context, window (the simulator's own per-device address, reserved on that card), module cache and residency; devices beyond the
+  host's card count stay in the simulator (said once per device), and a device with a peer link, or a launch with a pointer into another device's memory, stays in the simulator too. With more than one simulated device the
+  launches on cards are queued and not waited for, so the cards run at the same time. `CUDA_VISIBLE_DEVICES` now picks the card of the slot it shows (the simulated device in window 1 used the card path's window
+  0 before), and `VGPU_HOST_GPU_DEVICES=a,b,..` chooses the real devices by hand. Exact mode and single-device programs are unchanged. Measured on four Tesla T4 (AWS g4dn.12xlarge), 4 simulated T4s, a
+  fused-multiply-add kernel on each: 31 s in the simulator, 20 s with turbo as before (one card), 0.93 s with four cards, same output; the time stays flat from 1 to 4 devices. Details, the measurements on the
+  card (what a process can do with several cards) and the known limit (a read-back that waits for one card holds the shim's API lock): `docs/perf-design/12-host-gpu-turbo.md` section 19.
+
+
+- **Turbo host-GPU mode: a program history, a cheaper driver start, the driver's compile cache beside the history** (follows PR #693; [section 21](docs/perf-design/12-host-gpu-turbo.md)).
+  `VGPU_HOST_GPU_HISTORY=<directory>` (off by default) keeps a small checksummed record per program, card model and switch set: a program whose last run in the simulator took under half the driver's start stays in the simulator and never starts the driver
+  (Rodinia bfs 0.24 s to 0.014 s, HeCBench backprop 0.24 s to 0.013 s, attention 0.25 s to 0.036 s on an A10G), and a kernel that faulted on the card (error 700, 715 to 719) is kept in the simulator from its first launch (Rodinia srad_v2 0.37 s to 0.064 s). A first run leaves a candidate, the second runs in the simulator
+  as a bounded trial and leaves tiny or long, the third gains; a hold ends when the simulator has spent the start cost, or at a launch much larger than the record's. A missing, corrupt, foreign, stale or concurrently written file is no history; the record never changes a result; exact mode and `VGPU_HOST_GPU_FIT=0` never read it. Turbo mode also asks the driver for one work queue
+  (`CUDA_DEVICE_MAX_CONNECTIONS=1`, unless set: the driver's start and end cost about 0.24 s of every process, 0.155 s with it; turbo launches on one stream) and, with a history directory, keeps the driver's compile cache in `<directory>/cuda-cache` (PTX-only HeCBench s3d: 3.0 s of JIT on every run, 0.025 s with the cache). Unit test `test_host_gpu_history`
+  (corrupt, version, concurrent writers), stub steps 58 to 63, ten mutations each caught.
+
+- **Turbo texture and surface offload: design and measurements, nothing built** (docs/perf-design/12-host-gpu-turbo.md section 22). Texture and surface instructions stay refused in turbo as before. On an A10G the card's
+  texture handles are small counters (1, 2, 3), a handle it does not know reads as zeros with no error, substituting handle words in kernel parameters and mirroring arrays with `cuMemcpy2D/3D` both work, and a handle held
+  in device memory cannot be found from a launch's arguments; with 0.36 s of simulator time in the whole corpus, below one driver start, the path was not built. Experiment source and output are under `docs/perf-design/data/turbo-tex/`.
+
 - **Turbo host-GPU mode, next round: PTX retargeting, a driver start that overlaps the program's set-up, and the simulated profile's launch limits** (follows the turbo-fit round, PR #693).
   A module whose only PTX is plain `.target sm_90` (a build with `-arch=sm_90` or `compute_90` alone) now runs on an sm_80, sm_86 or sm_87 card: its target line is rewritten to
   the card's and the driver compiles it, provided the PTX uses no form that card lacks (a text scan of the forms ptxas 13.0 rejects there: `mbarrier.try_wait`, `expect_tx`, count-form

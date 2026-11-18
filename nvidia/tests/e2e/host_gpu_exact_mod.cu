@@ -1,5 +1,5 @@
 // The second translation unit of host_gpu_exact.cu: its module has a __device__ variable, and its kernel calls assert, which keeps it in the
-// simulator in both modes (a failed assert on the card loses the context). Until Round sp66 the variable alone refused every kernel of the module;
+// simulator in exact mode (turbo mode sends it since section 20: a failed assert on the card ends the context as it ends the simulator's; it does not fail here). Until Round sp66 the variable alone refused every kernel of the module;
 // now the card is given the simulator's address of the variable (vgpu/host_gpu_image.hpp) and only what a kernel itself calls decides.
 #include <cassert>
 

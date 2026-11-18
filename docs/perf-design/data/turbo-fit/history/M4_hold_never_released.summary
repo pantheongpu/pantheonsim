@@ -1,0 +1,2 @@
+unit rc=0 0 FAIL lines; first: 
+stub rc=1 1 FAIL lines; first: FAIL: the hold was not given up at its budget: ; before=candidate after=long held=1 released=0 kept_launches=3 sim_s=0.000382 card_s=0.000000 launches=3 threads=96 loopfree_work=0 faulted_kernels=0

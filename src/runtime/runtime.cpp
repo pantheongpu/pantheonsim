@@ -1191,7 +1191,7 @@ Device::Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemet
   if (const char* fh = std::getenv("VGPU_MEMO_FINAL_HASH"); fh && *fh) memo::final_hash_register(&mem_);
   // VGPU_MEMO=1: launch-level result caching (vgpu/runtime/memo.hpp). Not with a real GPU in the loop.
   if (const memo::Config mc = memo::Config::from_env(); mc.enabled && !std::getenv("VGPU_HOST_GPU") && !std::getenv("VGPU_HOSTGPU_CAPTURE")) enable_memo(mc);
-  if (profile_.vendor == "nvidia" && std::getenv("VGPU_HOST_GPU")) hostgpu::Runtime::prestart(profile_, ordinal_);   // (turbo with FIT=1: the card's driver starts while the program sets up)
+  if (profile_.vendor == "nvidia" && std::getenv("VGPU_HOST_GPU")) hostgpu::Runtime::prestart(profile_, ordinal_, physical_);   // (turbo with FIT=1: the card's driver starts while the program sets up)
 }
 
 Device::~Device() {
@@ -1278,7 +1278,7 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
     }
     const auto cap_t0 = std::chrono::steady_clock::now();
     // VGPU_HOST_GPU=exact: the launch may run on the machine's real GPU (vgpu/host_gpu_rt.hpp); null when the mode is off.
-    hostgpu::Runtime* const hg = hostgpu::Runtime::for_device(profile_, ordinal_);
+    hostgpu::Runtime* const hg = hostgpu::Runtime::for_device(profile_, ordinal_, physical_);
     // Turbo mode's fit check knows the CARD's limits, not the simulated profile's: a launch the simulated profile refuses (more shared memory, threads, registers or grid than
     // it allows, a cluster it lacks) is refused as the plain simulator refuses it, with the same error, before the card is asked. (Exact mode's card is the profile.)
     // (a grid or block with a zero dimension is the mode's own to refuse, with its own log line, and the simulator then gives its error)

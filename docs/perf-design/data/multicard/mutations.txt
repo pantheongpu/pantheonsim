@@ -1,0 +1,48 @@
+== M0 unmutated
+M0: unit failures=0 e2e FAIL lines=0
+== M1 every device slot uses window 0 (the window of slot 0)
+M1: unit failures=0 e2e FAIL lines=25
+FAIL: dp4: the driver was never told 'launch on 1':  1 ctx_retain 0; 1 ctx_retain 1; 1 ctx_retain 2; 1 ctx_retain 3; 4 cuDeviceGet; 4 cuDeviceGetCount; 4 cuDevicePrimaryCtxRetain; 3 cuFuncGetAttribute; 4 cuInit; 3 cuLaun
+FAIL: dp4: the driver was never told 'reserve 0x210000000000 on 1':  1 ctx_retain 0; 1 ctx_retain 1; 1 ctx_retain 2; 1 ctx_retain 3; 4 cuDeviceGet; 4 cuDeviceGetCount; 4 cuDevicePrimaryCtxRetain; 3 cuFuncGetAttribute; 4 
+FAIL: dp4: the driver was never told 'mem_create on 1 for 1':  1 ctx_retain 0; 1 ctx_retain 1; 1 ctx_retain 2; 1 ctx_retain 3; 4 cuDeviceGet; 4 cuDeviceGetCount; 4 cuDevicePrimaryCtxRetain; 3 cuFuncGetAttribute; 4 cuInit
+== M2 every device uses the driver's device 0
+M2: unit failures=0 e2e FAIL lines=32
+FAIL: dp4: the driver was never told 'ctx_retain 1':  4 ctx_retain 0; 4 cuDeviceGet; 4 cuDeviceGetCount; 4 cuDevicePrimaryCtxRetain; 12 cuFuncGetAttribute; 4 cuInit; 12 cuLaunchKernel; 4 cuMemAddressReserve; 4 cuMemcpyHt
+FAIL: dp4: the driver was never told 'launch on 1':  4 ctx_retain 0; 4 cuDeviceGet; 4 cuDeviceGetCount; 4 cuDevicePrimaryCtxRetain; 12 cuFuncGetAttribute; 4 cuInit; 12 cuLaunchKernel; 4 cuMemAddressReserve; 4 cuMemcpyHto
+FAIL: dp4: the driver was never told 'reserve 0x210000000000 on 1':  4 ctx_retain 0; 4 cuDeviceGet; 4 cuDeviceGetCount; 4 cuDevicePrimaryCtxRetain; 12 cuFuncGetAttribute; 4 cuInit; 12 cuLaunchKernel; 4 cuMemAddressReserv
+== M3 a peer pointer argument is not looked at
+M3: unit failures=0 e2e FAIL lines=3
+FAIL: peerptr: the output is not the mode-off output:
+FAIL: peerptr: the driver was told 'launch on' (a launch whose argument is another device's pointer)
+FAIL: the multi-card stand-in tests
+== M4 one runtime for every simulated device (device 0's)
+M4: unit failures=0 e2e FAIL lines=33
+FAIL: dp4: the driver was never told 'ctx_retain 1':  1 ctx_retain 0; 1 cuDeviceGet; 1 cuDeviceGetCount; 1 cuDevicePrimaryCtxRetain; 3 cuFuncGetAttribute; 1 cuInit; 3 cuLaunchKernel; 1 cuMemAddressReserve; 1 cuMemcpyHtoD
+FAIL: dp4: the driver was never told 'launch on 1':  1 ctx_retain 0; 1 cuDeviceGet; 1 cuDeviceGetCount; 1 cuDevicePrimaryCtxRetain; 3 cuFuncGetAttribute; 1 cuInit; 3 cuLaunchKernel; 1 cuMemAddressReserve; 1 cuMemcpyHtoD;
+FAIL: dp4: the driver was never told 'reserve 0x210000000000 on 1':  1 ctx_retain 0; 1 cuDeviceGet; 1 cuDeviceGetCount; 1 cuDevicePrimaryCtxRetain; 3 cuFuncGetAttribute; 1 cuInit; 3 cuLaunchKernel; 1 cuMemAddressReserve;
+== M5 CUDA_VISIBLE_DEVICES is not read (the slot is taken for the driver's number)
+M5: unit failures=1 e2e FAIL lines=7
+FAIL: cvd: the driver was never told 'ctx_retain 2':  2 cuDeviceGetCount; 2 cuInit;
+FAIL: cvd: the driver was never told 'ctx_retain 3':  2 cuDeviceGetCount; 2 cuInit;
+FAIL: cvd: the driver was never told 'reserve 0x220000000000 on 2':  2 cuDeviceGetCount; 2 cuInit;
+[ FAIL ] visible_devices_renumber_the_real_driver_not_the_slot
+== M6 exact mode serves every device like turbo
+M6: unit failures=1 e2e FAIL lines=0
+[ FAIL ] exact_mode_serves_device_zero_only_and_turbo_every_window
+== M7 a device without a card is served by the first card instead of staying simulated
+M7: unit failures=2 e2e FAIL lines=4
+FAIL: dp2: no message for device 2, which has no card: host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host GPU, in the card's own arithmetic and order of operations: results may differ from the simulator's 
+FAIL: dp2: no message for device 3, which has no card: host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host GPU, in the card's own arithmetic and order of operations: results may differ from the simulator's 
+FAIL: dp2: the no-card message is not said once per device
+[ FAIL ] slots_beyond_the_machines_cards_stay_simulated
+[ FAIL ] visible_devices_renumber_the_real_driver_not_the_slot
+== M8 every launch is waited for (the queue is off)
+M8: unit failures=0 e2e FAIL lines=2
+FAIL: dp4: a launch was waited for although four devices queue theirs (first sync at line 40, last launch at line 99)
+FAIL: the multi-card stand-in tests
+== M9 launches are queued with one device too
+M9: unit failures=0 e2e FAIL lines=2
+FAIL: a single device's launches were not each waited for: launch on 0,launch on 0,launch on 0,sync on 0,
+FAIL: the multi-card stand-in tests
+== done
+RESTORED: unit failures=0 e2e FAIL lines=0
