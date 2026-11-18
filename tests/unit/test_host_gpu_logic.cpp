@@ -3537,7 +3537,8 @@ VTEST(a_call_through_a_register_is_followed_only_when_its_target_slot_is_known) 
   VCHECK(register_call_slot(bad, 7) == -1);   // (a branch or call between the load and the call)
   bad = v; bad[2].entry = true;
   VCHECK(register_call_slot(bad, 7) == -1);   // (a join point between the index and the load: not through MOV ... LDC straight-line)
-  VCHECK(register_call_slot(v, 3) == -1 && register_call_slot(v, 99) == -1);   // (not a call)
+  volatile size_t far_index = 99;   // (read through a volatile: with the constant, GCC 13 inlines the guarded access and warns array-bounds, which -Werror makes an error)
+  VCHECK(register_call_slot(v, 3) == -1 && register_call_slot(v, far_index) == -1);   // (not a call, and past the end)
   bad = v; bad[7].reg = kRcRZ;
   VCHECK(register_call_slot(bad, 7) == -1);
   bad = v; bad[0] = mov(2, -8);
