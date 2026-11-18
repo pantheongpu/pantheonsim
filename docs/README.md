@@ -36,6 +36,8 @@ One line per document. Start with the repository [README](../README.md); the des
 * [ci-runners.md](ci-runners.md): which runner a job uses.
 * [ci-merge-conflicts.md](ci-merge-conflicts.md): CI and merge conflicts.
 * [ci-card-check.md](ci-card-check.md): the e2e programs on a real GPU (design, not enabled).
+* [design-async-launch.md](design-async-launch.md): plan for kernels that run beside the host thread (not implemented).
+* [found-bugs.md](found-bugs.md): bugs in other people's programs the simulator found, with evidence and unsent report drafts.
 * [../TODO.md](../TODO.md): open work by area.
 * [gap-register.md](gap-register.md): what is refused, stubbed or not modelled, with evidence.
 * [history/TODO-done.md](history/TODO-done.md): finished work and the rev 5 audit notes.

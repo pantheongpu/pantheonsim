@@ -274,7 +274,7 @@ replaces the datasheet values in that section too. L40 is not rentable: g6e is t
 Cards rented for the narrow-precision work ([lowprec.md](lowprec.md)) read more
 than the library probes needed. Nothing here flips a `verified` flag: a profile is
 `verified: true` only when the whole characterization (`nvidia/tools/characterize.cu`)
-was read from the card, and these runs read only what is listed.
+was read from the card, and these runs read only what is listed. "512 values" below is 256 from `ptx_semantics` plus 256 from `control_flow`; the definition and the list of verified profiles are in [docs/status.md](../../docs/status.md#gpu-profiles).
 
 | Profile | Card | What was read | Result |
 | --- | --- | --- | --- |

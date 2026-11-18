@@ -1,0 +1,339 @@
+mmasim_xcheck run: 220000 vectors per form, seed 1
+
+### Volta | mma m8n8k4.f32.f16.f16.f32 (K=4, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Volta numbers (chunk 4, G 24): not a shipped model vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 0, R3 27102, R4 0
+
+### Volta | mma m8n8k4.f16.f16.f16.f16 (K=4, f16 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Volta numbers (chunk 4, G 24): not a shipped model vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 31485, R3 29016, R4 1257
+
+### Turing | mma m8n8k4.f32.f16.f16.f32 (K=4, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Volta numbers (chunk 4, G 24): not a shipped model vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 0, R3 27166, R4 0
+
+### Turing | mma m8n8k4.f16.f16.f16.f16 (K=4, f16 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Volta numbers (chunk 4, G 24): not a shipped model vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 31592, R3 28918, R4 1292
+
+### Turing | mma m16n8k8.f32.f16.f16.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 0, R3 27204, R4 0
+
+### Turing | mma m16n8k8.f16.f16.f16.f16 (K=8, f16 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 24855, R3 29075, R4 943
+
+### Ampere | mma m16n8k8.f32.f16.f16.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 0, R3 27101, R4 0
+
+### Ampere | mma m16n8k8.f16.f16.f16.f16 (K=8, f16 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 24947, R3 28944, R4 918
+
+### Ampere | mma m16n8k16.f32.f16.f16.f32 (K=16, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 0, R3 27144, R4 0
+
+### Ampere | mma m16n8k16.f16.f16.f16.f16 (K=16, f16 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 22324, R3 29088, R4 800
+
+### Ampere | mma m16n8k16.f32.bf16.bf16.f32 (K=16, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 27853, R2 22357, R3 27108, R4 3474
+
+### Ampere | mma m16n8k8.f32.bf16.bf16.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35572, R2 25340, R3 27210, R4 3543
+
+### Ampere | mma m16n8k8.f32.tf32.tf32.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35475, R2 25157, R3 27080, R4 3530
+
+### Ampere | mma m16n8k4.f32.tf32.tf32.f32 (K=4, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 45239, R2 31162, R3 27148, R4 3631
+
+### Ada Lovelace | mma m16n8k8.f32.f16.f16.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 0, R3 27200, R4 0
+
+### Ada Lovelace | mma m16n8k8.f16.f16.f16.f16 (K=8, f16 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 24885, R3 29060, R4 903
+
+### Ada Lovelace | mma m16n8k16.f32.f16.f16.f32 (K=16, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 0, R3 27270, R4 0
+
+### Ada Lovelace | mma m16n8k16.f16.f16.f16.f16 (K=16, f16 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 22439, R3 28957, R4 780
+
+### Ada Lovelace | mma m16n8k16.f32.bf16.bf16.f32 (K=16, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 27641, R2 22238, R3 27244, R4 3471
+
+### Ada Lovelace | mma m16n8k8.f32.bf16.bf16.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35678, R2 25289, R3 27124, R4 3458
+
+### Ada Lovelace | mma m16n8k8.f32.tf32.tf32.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35529, R2 25234, R3 27132, R4 3463
+
+### Ada Lovelace | mma m16n8k4.f32.tf32.tf32.f32 (K=4, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 44867, R2 31113, R3 27162, R4 3755
+
+### Hopper | mma m16n8k8.f32.f16.f16.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 0, R3 27151, R4 0
+
+### Hopper | mma m16n8k8.f16.f16.f16.f16 (K=8, f16 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 17766, R3 29158, R4 905
+
+### Hopper | mma m16n8k16.f32.f16.f16.f32 (K=16, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 0, R3 27157, R4 0
+
+### Hopper | mma m16n8k16.f16.f16.f16.f16 (K=16, f16 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 14073, R3 29000, R4 783
+
+### Hopper | mma m16n8k16.f32.bf16.bf16.f32 (K=16, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 27846, R2 20815, R3 27135, R4 3487
+
+### Hopper | mma m16n8k8.f32.bf16.bf16.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35305, R2 23228, R3 27148, R4 3521
+
+### Hopper | mma m16n8k8.f32.tf32.tf32.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35545, R2 23330, R3 27147, R4 3636
+
+### Hopper | mma m16n8k4.f32.tf32.tf32.f32 (K=4, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 45109, R2 28864, R3 27257, R4 3658
+
+### Hopper | wgmma m64n8k16.f32.f16.f16 (K=16, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 0, R3 27120, R4 0
+
+### Hopper | wgmma m64n8k16.f16.f16.f16 (K=16, f16 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 14011, R3 29059, R4 802
+
+### Hopper | wgmma m64n8k16.f32.bf16.bf16 (K=16, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 27843, R2 20953, R3 27119, R4 3525
+
+### Hopper | wgmma m64n8k8.f32.tf32.tf32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35514, R2 23158, R3 26939, R4 3599
+
+### Blackwell | mma m16n8k8.f32.f16.f16.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 0, R3 27008, R4 0
+
+### Blackwell | mma m16n8k8.f16.f16.f16.f16 (K=8, f16 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 17756, R3 28953, R4 912
+
+### Blackwell | mma m16n8k16.f32.f16.f16.f32 (K=16, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 0, R3 27223, R4 0
+
+### Blackwell | mma m16n8k16.f16.f16.f16.f16 (K=16, f16 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 13887, R3 28957, R4 874
+
+### Blackwell | mma m16n8k16.f32.bf16.bf16.f32 (K=16, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 27710, R2 20792, R3 27200, R4 3513
+
+### Blackwell | mma m16n8k8.f32.bf16.bf16.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35480, R2 23138, R3 27131, R4 3460
+
+### Blackwell | mma m16n8k8.f32.tf32.tf32.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35502, R2 23326, R3 27137, R4 3610
+
+### Blackwell | mma m16n8k4.f32.tf32.tf32.f32 (K=4, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 45027, R2 28989, R3 27238, R4 3700
+
+### Blackwell | tcgen05 m64n8k16.kind::f16.f32.f16.f16 (K=16, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 0, R3 27076, R4 0
+
+### Blackwell | tcgen05 m64n8k16.kind::f16.f16.f16.f16 (K=16, f16 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 14056, R3 28989, R4 794
+
+### Blackwell | tcgen05 m64n8k16.kind::f16.f32.bf16.bf16 (K=16, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 27605, R2 20749, R3 27014, R4 3476
+
+### Blackwell | tcgen05 m64n8k8.kind::tf32.f32.tf32.tf32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35491, R2 23189, R3 27106, R4 3466
+
+### RTX Blackwell | mma m16n8k8.f32.f16.f16.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 0, R3 27093, R4 0
+
+### RTX Blackwell | mma m16n8k8.f16.f16.f16.f16 (K=8, f16 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 17619, R3 29022, R4 851
+
+### RTX Blackwell | mma m16n8k16.f32.f16.f16.f32 (K=16, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 0, R3 27077, R4 0
+
+### RTX Blackwell | mma m16n8k16.f16.f16.f16.f16 (K=16, f16 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 13999, R3 28953, R4 818
+
+### RTX Blackwell | mma m16n8k16.f32.bf16.bf16.f32 (K=16, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 27768, R2 20807, R3 27138, R4 3478
+
+### RTX Blackwell | mma m16n8k8.f32.bf16.bf16.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35414, R2 23121, R3 27153, R4 3595
+
+### RTX Blackwell | mma m16n8k8.f32.tf32.tf32.f32 (K=8, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35554, R2 23042, R3 27085, R4 3490
+
+### RTX Blackwell | mma m16n8k4.f32.tf32.tf32.f32 (K=4, f32 accumulator) [MMA-Sim T_FDPA transcription]
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 45127, R2 29143, R3 27071, R4 3681
+
+### CDNA1 | mfma f32_16x16x16f16 (K=16, f32 accumulator) [MMA-Sim E_FDPA transcription]
+  ours: double sum, rounded once (default)             vectors 165041, mismatches 45731 (R1 0, R2 0, R3 0, R4 0, none of the four 45731), skipped outside the exact window: 54959
+    first: a=[32f5 c800 b1c6 cbfc 4468 b9d8 c1ba 3f19 b09c 46ef ac00 4e1f 4957 3c00 358b b59b] b=[ba53 bc55 3141 4a9c c800 2e84 ae02 c800 bc00 bb87 c9aa 4350 2c00 384e af09 49c5] c=00000000  ours=c32ae6b9 mmasim=c32ae6ba  corners: none
+    first: a=[4458 ceb6 3400 43f0 c6d7 3800 c400 40cf 4458 ceb6 3400 43f0 c6d7 3800 c400 2e67] b=[4000 38da 4c00 cc00 b800 ccf9 c94d 36ec c000 b8da cc00 4c00 3800 4cf9 494d b6ec] c=00000000  ours=3f7f3263 mmasim=3f7f3243  corners: none
+    first: a=[20be 1400 a800 26f1 2bb3 9641 12e5 0000 9fd3 a70c 81b5 0000 96ff a70d 1c00 0c00] b=[1df3 05bc 037b ab47 849b 8c00 8505 9000 8800 0b53 1b58 a39b a63e 850a 9c00 a9d0] c=80000000  ours=bac223d7 mmasim=bac223d8  corners: none
+    non-corner: a=[32f5 c800 b1c6 cbfc 4468 b9d8 c1ba 3f19 b09c 46ef ac00 4e1f 4957 3c00 358b b59b] b=[ba53 bc55 3141 4a9c c800 2e84 ae02 c800 bc00 bb87 c9aa 4350 2c00 384e af09 49c5] c=00000000  ours=c32ae6b9 mmasim=c32ae6ba  corners: none
+    non-corner: a=[4458 ceb6 3400 43f0 c6d7 3800 c400 40cf 4458 ceb6 3400 43f0 c6d7 3800 c400 2e67] b=[4000 38da 4c00 cc00 b800 ccf9 c94d 36ec c000 b8da cc00 4c00 3800 4cf9 494d b6ec] c=00000000  ours=3f7f3263 mmasim=3f7f3243  corners: none
+    non-corner: a=[20be 1400 a800 26f1 2bb3 9641 12e5 0000 9fd3 a70c 81b5 0000 96ff a70d 1c00 0c00] b=[1df3 05bc 037b ab47 849b 8c00 8505 9000 8800 0b53 1b58 a39b a63e 850a 9c00 a9d0] c=80000000  ours=bac223d7 mmasim=bac223d8  corners: none
+
+### CDNA1 | mfma f32_16x16x8bf16 (K=8, f32 accumulator) [MMA-Sim E_FDPA transcription]
+  ours: double sum, rounded once (default)             vectors 80792, mismatches 12098 (R1 0, R2 0, R3 0, R4 0, none of the four 12098), skipped outside the exact window: 139208
+    first: a=[40af 3e23 3ff9 4166 40af 3e23 3ff9 c05d] b=[4128 bee5 c000 bddf c128 3ee5 4000 3ddf] c=00000000  ours=bff87ac0 mmasim=bff87ad0  corners: none
+    first: a=[3ff4 bee2 c000 4000 3e80 c000 be72 bdd9] b=[bf09 3e28 4005 be57 3fae 41f6 be3d 406a] c=3dfad5ce  ours=c28619b3 mmasim=c28619b4  corners: none
+    first: a=[4135 bee2 c180 c0bb 4135 c180 c180 c0bb] b=[c0e7 3d91 40fa 3e7a 40e7 bd91 c0fa be7a] c=00000000  ours=3f8cfff0 mmasim=3f8d0000  corners: none
+    non-corner: a=[40af 3e23 3ff9 4166 40af 3e23 3ff9 c05d] b=[4128 bee5 c000 bddf c128 3ee5 4000 3ddf] c=00000000  ours=bff87ac0 mmasim=bff87ad0  corners: none
+    non-corner: a=[3ff4 bee2 c000 4000 3e80 c000 be72 bdd9] b=[bf09 3e28 4005 be57 3fae 41f6 be3d 406a] c=3dfad5ce  ours=c28619b3 mmasim=c28619b4  corners: none
+    non-corner: a=[4135 bee2 c180 c0bb 4135 c180 c180 c0bb] b=[c0e7 3d91 40fa 3e7a 40e7 bd91 c0fa be7a] c=00000000  ours=3f8cfff0 mmasim=3f8d0000  corners: none
+
+### CDNA1 | mfma f32_16x16x4f32 (K=4, f32 accumulator) [MMA-Sim FMA chain transcription]
+  ours: double sum, rounded once (default)             vectors 220000, mismatches 43350 (R1 0, R2 0, R3 0, R4 0, none of the four 43350)
+    first: a=[bfc40cfa 3f79d535 3e000000 40000000] b=[c1e20be5 417eaa6f 414d6332 3e8f5682] c=bf000000  ours=4271e6fc mmasim=4271e6fd  corners: none
+    first: a=[3e384f6d 3f8f71ca 3e384f6d 3f8f71ca] b=[c1e1897b 41efbca2 41e1897b c1efbca2] c=00000000  ours=00000000 mmasim=349d3160  corners: none
+    first: a=[2130a9fb 1d000000 1840b59f 1fbe8a5d] b=[9a800000 9dd3e135 9d679d9a 999f08bc] c=80000000  ours=8000768a mmasim=80007689  corners: none
+    non-corner: a=[bfc40cfa 3f79d535 3e000000 40000000] b=[c1e20be5 417eaa6f 414d6332 3e8f5682] c=bf000000  ours=4271e6fc mmasim=4271e6fd  corners: none
+    non-corner: a=[3e384f6d 3f8f71ca 3e384f6d 3f8f71ca] b=[c1e1897b 41efbca2 41e1897b c1efbca2] c=00000000  ours=00000000 mmasim=349d3160  corners: none
+    non-corner: a=[2130a9fb 1d000000 1840b59f 1fbe8a5d] b=[9a800000 9dd3e135 9d679d9a 999f08bc] c=80000000  ours=8000768a mmasim=80007689  corners: none
+
+### CDNA2 | mfma f32_16x16x16f16 (K=16, f32 accumulator) [MMA-Sim FTZ_MUL_ADD transcription]
+  ours: double sum, rounded once (default)             vectors 220000, mismatches 111497 (R1 0, R2 0, R3 0, R4 0, none of the four 111497)
+    first: a=[0c79 87d3 9c8a 0a3f 9043 0c00 2b22 a8db 1ef0 a000 a400 2912 26f4 9e1a 2400 20e5] b=[1c00 80ad 0fe5 1000 8838 a7ec a000 a6e6 a800 9fb1 a35d 278a a942 25b6 24d2 14da] c=80000000  ours=3a64fde1 mmasim=3a64fdcc  corners: none
+    first: a=[c7a7 4000 c557 cde3 b30a 4000 ccb0 2c00 c7a7 4000 c557 cde3 b30a 4000 2f77 2c00] b=[3800 b370 378f b53e ad97 bfab 2c1e b1b2 b800 3370 b78f 353e 2d97 3fab ac1e 31b2] c=c1800000  ours=c189b5ae mmasim=c189b5af  corners: none
+    first: a=[0d2a 03f2 06d6 15d2 12c2 09ba 1202 013a 1120 1473 0c00 065c 00bf 0800 0000 0373] b=[8302 9400 8a95 8e00 83ef 92a8 8063 8954 9497 8289 8c2d 9400 833a 9000 9694 92b2] c=00000000  ours=b5f3d50a mmasim=b5d6e071  corners: none
+    non-corner: a=[0c79 87d3 9c8a 0a3f 9043 0c00 2b22 a8db 1ef0 a000 a400 2912 26f4 9e1a 2400 20e5] b=[1c00 80ad 0fe5 1000 8838 a7ec a000 a6e6 a800 9fb1 a35d 278a a942 25b6 24d2 14da] c=80000000  ours=3a64fde1 mmasim=3a64fdcc  corners: none
+    non-corner: a=[c7a7 4000 c557 cde3 b30a 4000 ccb0 2c00 c7a7 4000 c557 cde3 b30a 4000 2f77 2c00] b=[3800 b370 378f b53e ad97 bfab 2c1e b1b2 b800 3370 b78f 353e 2d97 3fab ac1e 31b2] c=c1800000  ours=c189b5ae mmasim=c189b5af  corners: none
+    non-corner: a=[0d2a 03f2 06d6 15d2 12c2 09ba 1202 013a 1120 1473 0c00 065c 00bf 0800 0000 0373] b=[8302 9400 8a95 8e00 83ef 92a8 8063 8954 9497 8289 8c2d 9400 833a 9000 9694 92b2] c=00000000  ours=b5f3d50a mmasim=b5d6e071  corners: none
+  ours: gfx90a opt-in (VGPU_MFMA_CDNA2=fttn)           vectors 220000, mismatches 67268 (R1 0, R2 0, R3 0, R4 0, none of the four 67268)
+    first: a=[c7a7 4000 c557 cde3 b30a 4000 ccb0 2c00 c7a7 4000 c557 cde3 b30a 4000 2f77 2c00] b=[3800 b370 378f b53e ad97 bfab 2c1e b1b2 b800 3370 b78f 353e 2d97 3fab ac1e 31b2] c=c1800000  ours=c189b5ad mmasim=c189b5af  corners: none
+    first: a=[2800 b400 d43f 88bd 6400 077e 4a44 d193 38e3 e000 ce3a 3134 790d e4fb b400 b89d] b=[a8e7 5c00 362c d2e3 5000 c0c0 e800 f87b 9dc3 dd9b 10d6 185a 2800 2c00 7800 d400] c=1b3d17fb  ours=49de3b47 mmasim=49de3b48  corners: none
+    first: a=[0400 229d 0c00 86a6 1cea 05a9 123b 296a a3cc 21fd 9800 0400 abb0 2800 1c00 95f2] b=[a871 029a 93b9 9a31 a400 275d 8522 a6bd a328 1a32 a043 a6bc 089f 97f1 2800 0cd6] c=80000000  ours=ba64b600 mmasim=ba64b603  corners: none
+    non-corner: a=[c7a7 4000 c557 cde3 b30a 4000 ccb0 2c00 c7a7 4000 c557 cde3 b30a 4000 2f77 2c00] b=[3800 b370 378f b53e ad97 bfab 2c1e b1b2 b800 3370 b78f 353e 2d97 3fab ac1e 31b2] c=c1800000  ours=c189b5ad mmasim=c189b5af  corners: none
+    non-corner: a=[2800 b400 d43f 88bd 6400 077e 4a44 d193 38e3 e000 ce3a 3134 790d e4fb b400 b89d] b=[a8e7 5c00 362c d2e3 5000 c0c0 e800 f87b 9dc3 dd9b 10d6 185a 2800 2c00 7800 d400] c=1b3d17fb  ours=49de3b47 mmasim=49de3b48  corners: none
+    non-corner: a=[0400 229d 0c00 86a6 1cea 05a9 123b 296a a3cc 21fd 9800 0400 abb0 2800 1c00 95f2] b=[a871 029a 93b9 9a31 a400 275d 8522 a6bd a328 1a32 a043 a6bc 089f 97f1 2800 0cd6] c=80000000  ours=ba64b600 mmasim=ba64b603  corners: none
+
+### CDNA2 | mfma f32_16x16x16bf16_1k (K=16, f32 accumulator) [MMA-Sim FTZ_MUL_ADD transcription]
+  ours: double sum, rounded once (default)             vectors 220000, mismatches 105433 (R1 0, R2 0, R3 0, R4 0, none of the four 105433)
+    first: a=[6390 4780 f962 5a02 e980 7e09 33d7 6c2a c9ac 6880 ebee ff00 5e30 8ba2 7f40 f94f] b=[d680 3804 0de9 db91 f21c 7180 6b00 78a2 f500 72e8 cf64 6380 6000 2fe7 f15f e71b] c=54000000  ours=ff800000 mmasim=ffc00000  corners: none
+    first: a=[4cb4 2a80 943f 8438 ad6a 45d6 fa2e 3ca8 6e37 4280 1858 2935 f805 cd65 6800 d900] b=[9575 079f 699f 2040 ed70 2a62 df80 5700 e06f 0547 ac4c d34f ac00 ba93 be91 4845] c=83800000  ours=7f800000 mmasim=ffc00000  corners: none
+    first: a=[c1a6 41d1 c0b0 40e1 3f8c c180 bdc8 be43 c1a6 41d1 c0b0 40e1 3f8c c180 bdc8 be43] b=[c100 bec3 bf00 c0d5 bf52 4080 bf79 4100 4100 3ec3 3f00 40d5 3f52 c080 3f79 c100] c=401d69d5  ours=401d69d5 mmasim=401d69e0  corners: none
+    non-corner: a=[6390 4780 f962 5a02 e980 7e09 33d7 6c2a c9ac 6880 ebee ff00 5e30 8ba2 7f40 f94f] b=[d680 3804 0de9 db91 f21c 7180 6b00 78a2 f500 72e8 cf64 6380 6000 2fe7 f15f e71b] c=54000000  ours=ff800000 mmasim=ffc00000  corners: none
+    non-corner: a=[4cb4 2a80 943f 8438 ad6a 45d6 fa2e 3ca8 6e37 4280 1858 2935 f805 cd65 6800 d900] b=[9575 079f 699f 2040 ed70 2a62 df80 5700 e06f 0547 ac4c d34f ac00 ba93 be91 4845] c=83800000  ours=7f800000 mmasim=ffc00000  corners: none
+    non-corner: a=[c1a6 41d1 c0b0 40e1 3f8c c180 bdc8 be43 c1a6 41d1 c0b0 40e1 3f8c c180 bdc8 be43] b=[c100 bec3 bf00 c0d5 bf52 4080 bf79 4100 4100 3ec3 3f00 40d5 3f52 c080 3f79 c100] c=401d69d5  ours=401d69d5 mmasim=401d69e0  corners: none
+  ours: gfx90a opt-in (VGPU_MFMA_CDNA2=fttn)           vectors 220000, mismatches 78402 (R1 0, R2 0, R3 0, R4 0, none of the four 78402)
+    first: a=[6390 4780 f962 5a02 e980 7e09 33d7 6c2a c9ac 6880 ebee ff00 5e30 8ba2 7f40 f94f] b=[d680 3804 0de9 db91 f21c 7180 6b00 78a2 f500 72e8 cf64 6380 6000 2fe7 f15f e71b] c=54000000  ours=7f800000 mmasim=ffc00000  corners: none
+    first: a=[4cb4 2a80 943f 8438 ad6a 45d6 fa2e 3ca8 6e37 4280 1858 2935 f805 cd65 6800 d900] b=[9575 079f 699f 2040 ed70 2a62 df80 5700 e06f 0547 ac4c d34f ac00 ba93 be91 4845] c=83800000  ours=7f800000 mmasim=ffc00000  corners: none
+    first: a=[c1a6 41d1 c0b0 40e1 3f8c c180 bdc8 be43 c1a6 41d1 c0b0 40e1 3f8c c180 bdc8 be43] b=[c100 bec3 bf00 c0d5 bf52 4080 bf79 4100 4100 3ec3 3f00 40d5 3f52 c080 3f79 c100] c=401d69d5  ours=401d69c0 mmasim=401d69e0  corners: none
+    non-corner: a=[6390 4780 f962 5a02 e980 7e09 33d7 6c2a c9ac 6880 ebee ff00 5e30 8ba2 7f40 f94f] b=[d680 3804 0de9 db91 f21c 7180 6b00 78a2 f500 72e8 cf64 6380 6000 2fe7 f15f e71b] c=54000000  ours=7f800000 mmasim=ffc00000  corners: none
+    non-corner: a=[4cb4 2a80 943f 8438 ad6a 45d6 fa2e 3ca8 6e37 4280 1858 2935 f805 cd65 6800 d900] b=[9575 079f 699f 2040 ed70 2a62 df80 5700 e06f 0547 ac4c d34f ac00 ba93 be91 4845] c=83800000  ours=7f800000 mmasim=ffc00000  corners: none
+    non-corner: a=[c1a6 41d1 c0b0 40e1 3f8c c180 bdc8 be43 c1a6 41d1 c0b0 40e1 3f8c c180 bdc8 be43] b=[c100 bec3 bf00 c0d5 bf52 4080 bf79 4100 4100 3ec3 3f00 40d5 3f52 c080 3f79 c100] c=401d69d5  ours=401d69c0 mmasim=401d69e0  corners: none
+
+### CDNA2 | mfma f32_16x16x8bf16 (K=8, f32 accumulator) [MMA-Sim FTZ_MUL_ADD transcription]
+  ours: double sum, rounded once (default)             vectors 220000, mismatches 90263 (R1 0, R2 0, R3 0, R4 0, none of the four 90263)
+    first: a=[a4b1 9ac6 9c5c 1f1a a57d 2400 2059 23a7] b=[1ba6 216a 9b05 a080 2264 a28f 22ec 9b00] c=80000000  ours=88825945 mmasim=888258e3  corners: none
+    first: a=[1f80 197d 1a73 2049 1d3d 1fc8 1d3b 1800] b=[9b4b 9cb9 9d88 a12c 9e0a a080 9acb 9e77] c=00106698  ours=821e08dd mmasim=82200c00  corners: none
+    first: a=[1fa7 223b 9d9a 1db2 9d7c a213 9ee8 a43c] b=[2100 9d15 1e5f 1cd6 23e6 1bd9 2448 1c08] c=800f9cd0  ours=83c28696 mmasim=83c14d80  corners: none
+    non-corner: a=[a4b1 9ac6 9c5c 1f1a a57d 2400 2059 23a7] b=[1ba6 216a 9b05 a080 2264 a28f 22ec 9b00] c=80000000  ours=88825945 mmasim=888258e3  corners: none
+    non-corner: a=[1f80 197d 1a73 2049 1d3d 1fc8 1d3b 1800] b=[9b4b 9cb9 9d88 a12c 9e0a a080 9acb 9e77] c=00106698  ours=821e08dd mmasim=82200c00  corners: none
+    non-corner: a=[1fa7 223b 9d9a 1db2 9d7c a213 9ee8 a43c] b=[2100 9d15 1e5f 1cd6 23e6 1bd9 2448 1c08] c=800f9cd0  ours=83c28696 mmasim=83c14d80  corners: none
+  ours: gfx90a opt-in (VGPU_MFMA_CDNA2=fttn)           vectors 220000, mismatches 60523 (R1 0, R2 0, R3 0, R4 0, none of the four 60523)
+    first: a=[a4b1 9ac6 9c5c 1f1a a57d 2400 2059 23a7] b=[1ba6 216a 9b05 a080 2264 a28f 22ec 9b00] c=80000000  ours=88825946 mmasim=888258e3  corners: none
+    first: a=[1f80 197d 1a73 2049 1d3d 1fc8 1d3b 1800] b=[9b4b 9cb9 9d88 a12c 9e0a a080 9acb 9e77] c=00106698  ours=82201273 mmasim=82200c00  corners: none
+    first: a=[1fa7 223b 9d9a 1db2 9d7c a213 9ee8 a43c] b=[2100 9d15 1e5f 1cd6 23e6 1bd9 2448 1c08] c=800f9cd0  ours=83c24823 mmasim=83c14d80  corners: none
+    non-corner: a=[a4b1 9ac6 9c5c 1f1a a57d 2400 2059 23a7] b=[1ba6 216a 9b05 a080 2264 a28f 22ec 9b00] c=80000000  ours=88825946 mmasim=888258e3  corners: none
+    non-corner: a=[1f80 197d 1a73 2049 1d3d 1fc8 1d3b 1800] b=[9b4b 9cb9 9d88 a12c 9e0a a080 9acb 9e77] c=00106698  ours=82201273 mmasim=82200c00  corners: none
+    non-corner: a=[1fa7 223b 9d9a 1db2 9d7c a213 9ee8 a43c] b=[2100 9d15 1e5f 1cd6 23e6 1bd9 2448 1c08] c=800f9cd0  ours=83c24823 mmasim=83c14d80  corners: none
+
+### CDNA2 | mfma f32_16x16x4f32 (K=4, f32 accumulator) [MMA-Sim FMA chain transcription]
+  ours: double sum, rounded once (default)             vectors 220000, mismatches 43349 (R1 0, R2 0, R3 0, R4 0, none of the four 43349)
+    first: a=[9ed0c409 1dbe48fe a035369b 1e800000] b=[2366b8eb 225ae043 a13505de 9c800000] c=00646b2b  ours=82574a96 mmasim=82574a95  corners: none
+    first: a=[dc000000 cda94182 f51aa264 ba2ad922] b=[5ec3aef5 f9ba6159 77000000 d9000000] c=dbcf8923  ours=ff800000 mmasim=7f800000  corners: none
+    first: a=[c1b91886 be29bd80 c1b91886 be800000] b=[3d9a6e6c bf6be4a9 bd9a6e6c 3f6be4a9] c=00000000  ours=bd9ef82f mmasim=bd9ef82a  corners: none
+    non-corner: a=[9ed0c409 1dbe48fe a035369b 1e800000] b=[2366b8eb 225ae043 a13505de 9c800000] c=00646b2b  ours=82574a96 mmasim=82574a95  corners: none
+    non-corner: a=[dc000000 cda94182 f51aa264 ba2ad922] b=[5ec3aef5 f9ba6159 77000000 d9000000] c=dbcf8923  ours=ff800000 mmasim=7f800000  corners: none
+    non-corner: a=[c1b91886 be29bd80 c1b91886 be800000] b=[3d9a6e6c bf6be4a9 bd9a6e6c 3f6be4a9] c=00000000  ours=bd9ef82f mmasim=bd9ef82a  corners: none
+
+### CDNA3 | mfma f32_16x16x16_f16 (K=16, f32 accumulator) [MMA-Sim TR_FDPA transcription]
+  ours: double sum, rounded once (default)             vectors 220000, mismatches 64990 (R1 0, R2 0, R3 0, R4 0, none of the four 64990)
+    first: a=[1a75 0473 933d 21de 13bc a000 9ff5 1848 88da 8400 0800 8f5a 8ab7 1000 1400 2458] b=[025e 923d 1f0f 8879 24e3 291e a36a 1f66 8800 a514 9cd3 20e6 8c72 0273 2221 1ff5] c=80000000  ours=b80fdce3 mmasim=b80fdce0  corners: none
+    first: a=[ca09 b800 4000 ad86 bdd3 3a0d 4fd9 cc1d ca09 b800 4000 ad86 bdd3 3a0d 4fd9 cc1d] b=[4800 b800 4a04 b9c3 c0aa 3ab1 34d2 c369 c800 3800 ca04 39c3 40aa bab1 b4d2 4369] c=c0c5c7cf  ours=c0c5c7cf mmasim=c0c5c7d0  corners: none
+    first: a=[0161 1800 0800 9c00 8fdb c2f9 9fe9 9d5e a6f2 1758 c463 951c 3000 af44 c42c d871] b=[4800 8400 0a90 48b3 200f 169c 1402 4418 c37a 3b6e 125c 34ce 6400 e400 01c9 8305] c=c184b45e  ours=4363b43b mmasim=4363b43c  corners: none
+    non-corner: a=[1a75 0473 933d 21de 13bc a000 9ff5 1848 88da 8400 0800 8f5a 8ab7 1000 1400 2458] b=[025e 923d 1f0f 8879 24e3 291e a36a 1f66 8800 a514 9cd3 20e6 8c72 0273 2221 1ff5] c=80000000  ours=b80fdce3 mmasim=b80fdce0  corners: none
+    non-corner: a=[ca09 b800 4000 ad86 bdd3 3a0d 4fd9 cc1d ca09 b800 4000 ad86 bdd3 3a0d 4fd9 cc1d] b=[4800 b800 4a04 b9c3 c0aa 3ab1 34d2 c369 c800 3800 ca04 39c3 40aa bab1 b4d2 4369] c=c0c5c7cf  ours=c0c5c7cf mmasim=c0c5c7d0  corners: none
+    non-corner: a=[0161 1800 0800 9c00 8fdb c2f9 9fe9 9d5e a6f2 1758 c463 951c 3000 af44 c42c d871] b=[4800 8400 0a90 48b3 200f 169c 1402 4418 c37a 3b6e 125c 34ce 6400 e400 01c9 8305] c=c184b45e  ours=4363b43b mmasim=4363b43c  corners: none
+
+### CDNA3 | mfma f32_16x16x16_bf16 (K=16, f32 accumulator) [MMA-Sim TR_FDPA transcription]
+  ours: double sum, rounded once (default)             vectors 220000, mismatches 55467 (R1 0, R2 0, R3 0, R4 0, none of the four 55467)
+    first: a=[1a00 1bf3 9d80 1fe1 9a80 1c80 a400 1c55 1e00 1f78 1e81 9a00 1a17 a46c 1c17 a353] b=[1f14 2137 a344 193e 9ee0 1f23 239e 2080 9b61 9a38 9ea9 9f15 1adf 9aad a34f a07f] c=001841d2  ours=881d2ab9 mmasim=881d2aba  corners: none
+    first: a=[7773 7300 e3e9 11e2 7b63 4680 bbc8 a198 0900 2900 7cbb c561 15e2 d113 c98d 3e64] b=[b100 3280 7134 3f7a 9580 086e d780 4ba9 15ab 1700 4929 0caf e083 475e 0300 0e80] c=83800000  ours=ff800000 mmasim=7fffffff  corners: none
+    first: a=[238a a2c8 1980 a46c a226 1a2e 1d67 2180 152c 9f48 22a0 1c12 961c 9527 9d3f 1a4e] b=[2500 1615 1680 23c7 1e01 9cf6 9e00 a211 14ad 2480 a399 2100 9c66 9872 a300 1600] c=00000000  ours=081fd734 mmasim=081fd735  corners: none
+    non-corner: a=[1a00 1bf3 9d80 1fe1 9a80 1c80 a400 1c55 1e00 1f78 1e81 9a00 1a17 a46c 1c17 a353] b=[1f14 2137 a344 193e 9ee0 1f23 239e 2080 9b61 9a38 9ea9 9f15 1adf 9aad a34f a07f] c=001841d2  ours=881d2ab9 mmasim=881d2aba  corners: none
+    non-corner: a=[7773 7300 e3e9 11e2 7b63 4680 bbc8 a198 0900 2900 7cbb c561 15e2 d113 c98d 3e64] b=[b100 3280 7134 3f7a 9580 086e d780 4ba9 15ab 1700 4929 0caf e083 475e 0300 0e80] c=83800000  ours=ff800000 mmasim=7fffffff  corners: none
+    non-corner: a=[238a a2c8 1980 a46c a226 1a2e 1d67 2180 152c 9f48 22a0 1c12 961c 9527 9d3f 1a4e] b=[2500 1615 1680 23c7 1e01 9cf6 9e00 a211 14ad 2480 a399 2100 9c66 9872 a300 1600] c=00000000  ours=081fd734 mmasim=081fd735  corners: none
+
+### CDNA3 | mfma f32_16x16x8_xf32 (K=8, f32 accumulator) [MMA-Sim TR_FDPA transcription]
+  ours: double sum, rounded once (default)             vectors 220000, mismatches 45413 (R1 0, R2 0, R3 0, R4 0, none of the four 45413)
+    first: a=[5897a000 e2874000 efffe000 4d48e000 91800000 9b154000 c8800000 d9b0a000] b=[b1800000 dbcfa000 caeca000 6bf28000 b46d4000 5c37e000 a5800000 57bd4000] c=21719c41  ours=7edd6b27 mmasim=7edd6b26  corners: none
+    first: a=[9c07a000 a0000000 1a000000 244c4000 a10dc000 23220000 a2106000 1e9e0000] b=[223ea000 1be20000 99800000 9f658000 1d800000 a0fa8000 99f9a000 1dd5c000] c=00651ce2  ours=84f9cac7 mmasim=84f9cac8  corners: none
+    first: a=[1a72c000 00000000 00000000 00000000 00000000 00000000 00000000 00000000] b=[991b8000 00000000 00000000 00000000 00000000 00000000 00000000 00000000] c=00000000  ours=80000000 mmasim=00000000  corners: none
+    non-corner: a=[5897a000 e2874000 efffe000 4d48e000 91800000 9b154000 c8800000 d9b0a000] b=[b1800000 dbcfa000 caeca000 6bf28000 b46d4000 5c37e000 a5800000 57bd4000] c=21719c41  ours=7edd6b27 mmasim=7edd6b26  corners: none
+    non-corner: a=[9c07a000 a0000000 1a000000 244c4000 a10dc000 23220000 a2106000 1e9e0000] b=[223ea000 1be20000 99800000 9f658000 1d800000 a0fa8000 99f9a000 1dd5c000] c=00651ce2  ours=84f9cac7 mmasim=84f9cac8  corners: none
+    non-corner: a=[1a72c000 00000000 00000000 00000000 00000000 00000000 00000000 00000000] b=[991b8000 00000000 00000000 00000000 00000000 00000000 00000000 00000000] c=00000000  ours=80000000 mmasim=00000000  corners: none
+
+### CDNA3 | mfma f32_16x16x4_f32 (K=4, f32 accumulator) [MMA-Sim FMA chain transcription]
+  ours: double sum, rounded once (default)             vectors 220000, mismatches 43638 (R1 0, R2 0, R3 0, R4 0, none of the four 43638)
+    first: a=[41beb6a7 bd800000 41beb6a7 bd800000] b=[41800000 bff21147 c1800000 3ff21147] c=418df1fb  ours=418df1fb mmasim=418df1ff  corners: none
+    first: a=[3f2fb836 c1ecb319 bdfb0e52 bf000000] b=[3fe2a44b bf000000 bdb0630a 3d800000] c=bf07c241  ours=41775460 mmasim=41775461  corners: none
+    first: a=[9d5f48c8 97519098 96080f22 20c52102] b=[20b33249 25c0a7d1 97245e6b 1a0c8d89] c=00000000  ours=800c2085 mmasim=800c2084  corners: none
+    non-corner: a=[41beb6a7 bd800000 41beb6a7 bd800000] b=[41800000 bff21147 c1800000 3ff21147] c=418df1fb  ours=418df1fb mmasim=418df1ff  corners: none
+    non-corner: a=[3f2fb836 c1ecb319 bdfb0e52 bf000000] b=[3fe2a44b bf000000 bdb0630a 3d800000] c=bf07c241  ours=41775460 mmasim=41775461  corners: none
+    non-corner: a=[9d5f48c8 97519098 96080f22 20c52102] b=[20b33249 25c0a7d1 97245e6b 1a0c8d89] c=00000000  ours=800c2085 mmasim=800c2084  corners: none
+
+TOTAL NVIDIA: 0 mismatches of 11880000 comparisons; AMD (every column): 867422 of 2885833

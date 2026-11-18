@@ -609,9 +609,8 @@ an instance left running bills by the hour).
 tree, so corrections are visible rather than silently applied.
 
 Verified against real hardware: seventeen profiles (fourteen NVIDIA, three AMD). The
-table has the first twelve; the A100 80GB (`nvidia/a100`) was read from a physical
-device on an 8x instance, as the note after the table says, and the later NVIDIA
-and AMD ones are in the "Profile inventory" and nvidia/docs/profiles.md:
+table has sixteen of them; the A100 80GB (`nvidia/a100`) was read from a physical
+device on an 8x instance, as the note after the table says, and is not a row. The current list is in [docs/status.md](../status.md#gpu-profiles):
 
 | profile | device | how |
 | --- | --- | --- |
@@ -631,8 +630,8 @@ and AMD ones are in the "Profile inventory" and nvidia/docs/profiles.md:
 | `nvidia/rtx-pro-4500` | RTX PRO 4500 Blackwell (sm_120) | EC2 `g7.2xlarge` (2026-10-18) |
 | `amd/rx6800`, `amd/rx6700xt` | RX 6800, RX 6700 XT (RDNA2) | physical cards (`amd/registers/measurements/`) |
 
-The first eleven NVIDIA parts in the table match the physical device on **512
-conformance values each** -- the same binary run on hardware and on VirtualGPU,
+The first eleven NVIDIA parts in the table (through the L40S) were recorded as matching the physical device on **512
+conformance values each** (256 from `ptx_semantics` and 256 from `control_flow`; see [docs/status.md](../status.md#gpu-profiles)), and the two RTX PRO rows were checked the same way later (their results are in nvidia/docs/profiles.md) -- the same binary run on hardware and on VirtualGPU,
 diffed (`nvidia/tests/conformance/run_conformance.sh`,
 `nvidia/tools/verify-profile.sh`).
 

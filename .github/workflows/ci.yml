@@ -287,6 +287,7 @@ jobs:
       - name: Check the memory
         env:
           CI_MEM_WAIT_SECS: '7200'
+          GH_TOKEN: ${{ github.token }}
         run: ci/jobs.sh --check sass
 
       - name: Install CUDA 13
@@ -401,6 +402,7 @@ jobs:
       - name: Check the memory
         env:
           CI_MEM_WAIT_SECS: '7200'
+          GH_TOKEN: ${{ github.token }}
         run: ci/jobs.sh --check ollama
 
       - name: Install CUDA 13
@@ -559,6 +561,7 @@ jobs:
       - name: Check the memory
         env:
           CI_MEM_WAIT_SECS: '7200'
+          GH_TOKEN: ${{ github.token }}
         run: ci/jobs.sh --check ollama-amd
 
       - name: Install ollama and its ROCm backend
@@ -909,6 +912,7 @@ jobs:
       - name: Check the memory
         env:
           CI_MEM_WAIT_SECS: '7200'
+          GH_TOKEN: ${{ github.token }}
         run: ci/jobs.sh --check asan
 
       # The checkout belongs to the runner's user and the job runs as root in
@@ -1021,6 +1025,7 @@ jobs:
       - name: Check the memory
         env:
           CI_MEM_WAIT_SECS: '7200'
+          GH_TOKEN: ${{ github.token }}
         run: ci/jobs.sh --check tsan
 
       # The checkout belongs to the runner's user and the job runs as root in
