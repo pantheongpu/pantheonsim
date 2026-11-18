@@ -33,6 +33,13 @@
 // *** 2026-11-17: the flipped and random digests were re-recorded for #694 (a RET word with a condition predicate in bits 87-90 now keeps it
 // as a source). The corpora digest is unchanged. ***
 //
+// *** 2026-11-18 (round 12, ci124): the flipped and random digests were RE-RECORDED on purpose for the register-mask form of ELECT that ptxas 12.4 writes
+// (dec_elect: bit 72 set makes the third operand a uniform register, with bit 91 as its bitwise not; before, the word was read as a predicate source and
+// `elect.sync` found no leader). Verified by dumping both passes (VGPU_DECODE_DUMP) from a build with the `if (w.bit(72))` branch and one with it switched off
+// (which gave the previous digests again) and diffing them: 5 dump lines differ in "flipped" and 28 in "random" (7 distinct words, each on 4 architectures),
+// every one an ELECT word with bit 72 set, and the differences are only that source operand (a UR with its not, where a predicate was), f[0] = 1 and the text;
+// the corpora digest is UNCHANGED (no word of the real-code corpora has bit 72 set in an ELECT). The digests are the same on a CUDA 12.4 and a 13.0 build. ***
+//
 // VGPU_DECODE_PRINT=1 prints the digests (to regenerate the table after a decoder change that is meant to change
 // them); VGPU_DECODE_DUMP=<dir> writes the full dump of every pass, so two builds can be diffed to see which
 // instruction differs; VGPU_DECODE_BENCH=1 times decode and to_text over the corpora.
@@ -185,7 +192,7 @@ VTEST(words_with_flipped_bits_decode_to_the_same_bits) {
     words.push_back({w, 16 * (rng.next() % 4096)});
   }
   const std::vector<int> archs = {75, 86, 90, 100, 120};
-  check("flipped", run_pass("flipped", words, archs), "5d947662020b86895d1439b2f225e319");
+  check("flipped", run_pass("flipped", words, archs), "da351bb3d321143d42d9acfe91eed066");
 }
 
 VTEST(random_opcodes_decode_to_the_same_bits) {
@@ -198,7 +205,7 @@ VTEST(random_opcodes_decode_to_the_same_bits) {
     words.push_back({w, 16 * (rng.next() % 4096)});
   }
   const std::vector<int> archs = {80, 89, 103, 120};
-  check("random", run_pass("random", words, archs), "3046eb52f152ff413ef240b963eb1503");
+  check("random", run_pass("random", words, archs), "64b70dc8e5f3263b13a15b2a0527ff5e");
 }
 
 VTEST(bench_decode) {

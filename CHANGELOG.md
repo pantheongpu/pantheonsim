@@ -7,6 +7,7 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **The SASS decoder reads the register-mask form of `ELECT` that ptxas 12.4 writes** (`ELECT P0, URZ, ~URZ`; 12.8 and 13.0 write `ELECT P0, URZ, PT`). The decoder always read bits 87 to 90 as the predicate, so on CUDA 12.4 `elect.sync` named the always-false predicate and elected no thread: a kernel that counted its leader printed `sum=0`. The form is decoded and the lowest thread of the mask is elected (measured: the SASS words come from cuobjdump of nvcc 12.4.131; the meaning of the mask is inferred, because ptxas 12.4.131 wrote the same operand for the masks 0xffffffff, 0xffff0000 and a register). `test_sass_elect_forms` runs the SASS words of both forms on a simulated H100 without nvcc, so it runs on every toolchain; the flipped-bit and random-opcode digests of `test_decode_same_bits` are re-recorded (5 and 28 dump lines, all `ELECT` words with bit 72 set; the corpora digest is unchanged). Not run on a Hopper card.
 - **The compute capability 12.0 Blackwell profiles sum by the Hopper rule, measured on an RTX PRO 6000 Blackwell Server Edition** (issue #664). `rtx-pro-6000-server`
   (`measured`) and `rtx5090`, `rtx-pro-4500`, `rtx-pro-6000`, `rtx-pro-6000-max-q` (`inferred` from it) took the sequential f32 sum before: wmma, `mma.sync` and SASS
   `HMMA` in f16, bf16 and tf32 now give the card's bits (both probes print the H100's lines, 60 of 60 and 169 of 169; FTTN's motivating example 191.875 instead of 0;
