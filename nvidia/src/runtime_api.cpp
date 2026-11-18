@@ -55,7 +55,6 @@
 #include <vector>
 
 #include "platform.hpp"
-#include "vgpu/host_gpu_rt.hpp"
 #include "enum_value.hpp"
 #include "func_attrs.hpp"
 #include "kept_args.hpp"
@@ -171,8 +170,6 @@ struct RegisteredModule {
   std::string ptx;                // the PTX, while it is being loaded
   std::string cubin;              // the SASS this device runs, when the fatbin has it
   std::string unusable;           // when it has nothing this device runs: what it holds instead
-  std::shared_ptr<const vgpu::hostgpu::CardSource> card;   // turbo mode: every image of the fatbin the host GPU could run (null otherwise)
-  bool card_looked = false;
   std::unordered_map<int, uint64_t> module_per_device;  // device -> runtime module id
   std::unordered_map<int, uint32_t> prof_id;            // device -> the id a profiler knows it by
 };
@@ -972,13 +969,8 @@ uint64_t module_on_current(State& s, RegisteredModule& m) {
   auto it = m.module_per_device.find(dev);
   if (it != m.module_per_device.end()) return it->second;
   if (!registered_ptx(s, m)) throw vgpu::Error::make(vgpu::Err::UnsupportedPtx, "no SASS or PTX in this fatbin");
-  if (!m.card_looked) {
-    m.card_looked = true;
-    m.card = vgpu::cuda::card_source_from_fatbin(m.fatbin);
-  }
   if (!m.cubin.empty()) {
     const uint64_t mid = s.rt->device(dev).load_cubin(reinterpret_cast<const uint8_t*>(m.cubin.data()), m.cubin.size());
-    if (m.card) s.rt->device(dev).set_card_source(mid, m.card);
     m.module_per_device[dev] = mid;
     bind_managed_vars(s, m, dev, mid);
     announce_module_loaded(s, m, dev, mid);
@@ -986,7 +978,6 @@ uint64_t module_on_current(State& s, RegisteredModule& m) {
   }
   if (m.ptx.empty()) m.ptx = extract_registered_ptx(s, m.fatbin);
   uint64_t mid = s.rt->device(dev).load_module(m.ptx);
-  if (m.card) s.rt->device(dev).set_card_source(mid, m.card);
   m.module_per_device[dev] = mid;
   std::string().swap(m.ptx);
   bind_managed_vars(s, m, dev, mid);
@@ -1344,8 +1335,6 @@ VGPU_EXPORT void** __cudaRegisterFatBinary(void* fatCubin) {
   State& s = st();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
   try {
-    // (before ensure_init: the simulated device, and with it the driver's start, may be created there; the program's identity for the history is the fatbins registered by then)
-    vgpu::hostgpu::note_program_image(fatCubin);
     ensure_init(s);
     auto rm = std::make_unique<RegisteredModule>();
     rm->fatbin = fatCubin;

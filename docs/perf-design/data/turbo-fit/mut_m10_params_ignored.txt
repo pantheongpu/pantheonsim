@@ -1,4 +1,0 @@
-== unit m10_params_ignored
-[ FAIL ] the_card_image_must_take_the_simulator_s_arguments
-/home/saqib/.cache/pantheonsim-turbo-fit/tests/unit/test_host_gpu_logic.cpp:3206: VCHECK(!parameter_sizes_agree(k, {8, 8})) failed
-130/131 tests passed

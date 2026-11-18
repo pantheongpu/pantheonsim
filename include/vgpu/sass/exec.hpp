@@ -75,9 +75,6 @@ struct Code {
 
 struct Module {
   Cubin cubin;
-  // The cubin as it was loaded, kept only when host-GPU mode is on (VGPU_HOST_GPU, vgpu/host_gpu_rt.hpp): the real driver loads
-  // it for a launch on the card. `cubin` is patched with this device's addresses as it loads.
-  std::vector<uint8_t> image;
   int sm = 0;
   std::vector<Code> code;                     // one per .text section
   std::map<std::string, size_t> code_index;   // section name -> code
@@ -140,10 +137,6 @@ struct Module {
 // executor cannot run.
 std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& mem, const DeviceProfile& profile);
 void unload(Module& m, MemoryManager& mem);
-// A module for analysis only: the cubin parsed and its code placed and relocated as load() does, but for no device (nothing is checked against a
-// profile, no device memory is taken, no bytes of a bank or variable are written, and the addresses of the variables are made up). What the host-GPU
-// mode reads the code of an image it will give the card from (src/runtime/host_gpu.cpp). Throws vgpu::Error on a malformed image.
-std::shared_ptr<Module> analyze(const uint8_t* image, size_t size);
 // Moves variable `name` to `va` (a __managed__ one onto managed memory): every
 // relocation against it, in a constant bank, a variable's initialiser or the
 // code, is applied again with the new address. Done before the module's first

@@ -1,6 +1,6 @@
 # Card check: the e2e programs on a real GPU (design, not enabled)
 
-Status: a proposal. **`card-check.yml` does not exist in `.github/workflows/`**, no runner is registered and nothing runs it. (The one real-card workflow in the tree is `card-host-gpu.yml`, which rents an AWS A10G for host-GPU mode and is not scheduled either; it is a different design, see the checklist's last item.) Turning it
+Status: a proposal. **`card-check.yml` does not exist in `.github/workflows/`**, no runner is registered and nothing runs it. (There is no other real-card workflow in the tree.) Turning it
 on is the steps under [Enabling it](#enabling-it), all of which are the
 maintainer's to take.
 
@@ -158,7 +158,7 @@ Nothing below has been done. In order; each line is a gate, not a suggestion.
 
 1. **Decision first.** The maintainer decides whether server1 may host it at all. Memory of 2026-10-09 banned runs on server1 (it was crashing);
    2026-10-27 relaxed that to "when idle, benchmarks only, nice". A nightly CI job is neither: it needs an explicit yes, and an alternative is
-   the rented-card route of `card-host-gpu.yml` (about $0.70 a run, nothing on server1).
+   a rented card (an ephemeral cloud instance with a registered runner, a few dollars a run, nothing on server1).
 2. **The workflow file does not exist.** Write `card-check.yml` with `on: schedule` + `workflow_dispatch` only (never `pull_request`, `push`,
    `workflow_run`), `permissions: contents: read`, `concurrency: card-check` with `cancel-in-progress: false`, `timeout-minutes: 90`,
    `actions/checkout` of the default ref only, no secrets. `tests/lint/check_workflow_yaml.py` and `check_pr_guard_coverage.py` must pass on it.
@@ -180,7 +180,3 @@ Nothing below has been done. In order; each line is a gate, not a suggestion.
 8. **Disk.** The job deletes its workspace and build tree at the end whatever happened (`if: always()`); no Docker.
 9. **`card-portable.txt` and the `card` mode** of `ci/external/suites.sh` must exist before the workflow; they do not yet.
 10. **First run by hand** (`workflow_dispatch`) with someone watching server1's load and the search site's latency, as the design says.
-11. **Do not conflate with `card-host-gpu.yml`.** That workflow is also disabled (no `schedule`), needs three secrets and an IAM user, and its
-    `launch` step sets the instance output only after the runner is online: if the step is cancelled after `run-instances`, `stop` is skipped
-    and only the userdata TTL ends the instance. Fix that (print the id and set the output right after `run-instances`) before anyone
-    schedules it; it is not changed here.

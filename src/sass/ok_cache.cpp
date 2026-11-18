@@ -228,7 +228,6 @@ bool known(const Key& k) {
 }
 
 void remember(const Key& k) {
-  if (exec::g_sample_copy.load(std::memory_order_relaxed)) return;   // (a sample's copy of the process writes no cache)
   const std::string path = cache_path();
   if (path.empty()) return;
   State& s = state();

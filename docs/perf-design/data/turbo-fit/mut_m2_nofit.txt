@@ -1,8 +1,0 @@
-FAIL: fl_threads: a launch that does not fit the card was sent to it:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 3 cuFuncGetAttribute; 1 cuInit; 1 cuLaunchKernel; 1 cuMemAddressReserve; 1 cuMemcpyHto
-FAIL: fl_threads: refused_fit is not counted: host_gpu_fit: policy=fit card_sm=86 card_sms=28 refused_image=0 refused_fit=0
-FAIL: fl_threads: the log does not say that the launch does not fit: host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host GPU, in the card's own arithmetic and order of operations: result
-host_gpu: _Z4widePii: card image sm_86 cubin; classes: exact; admitted (exact set)
-FAIL: fl_threads changes the output of fit wide
-FAIL: fl_blockx: a launch that does not fit the card was sent to it:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 3 cuFuncGetAttribute; 1 cuInit; 1 cuLaunchKernel; 1 cuMemAddressReserve; 1 cuMemcpyHtoD
-FAIL: fl_blockx: refused_fit is not counted: host_gpu_fit: policy=fit card_sm=86 card_sms=28 refused_image=0 refused_fit=0
-FAIL: fl_blockx: the log does not say that the launch does not fit: host_gpu: VGPU_HOST_GPU=turbo runs the kernels it can on the host GPU, in the card's own arithmetic and order of operations: results
