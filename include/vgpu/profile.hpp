@@ -202,6 +202,26 @@ inline constexpr const char* tensor_sum_name(TensorSum m) {
   return m == TensorSum::Ampere ? "ampere" : m == TensorSum::Hopper ? "hopper" : "sequential";
 }
 
+// The sum of the 8-bit float forms (e4m3 and e5m2 operands, mma.sync). A tensor core adds them as the f16 rule does -- chunks of products and
+// the accumulator, each term cut toward zero at 2^(top - grid) -- but with other numbers, and an f32 result is cut to out_bits fraction bits
+// before it is stored (an Ada core keeps 13). vgpu/exec/tc_fp8.hpp has the arithmetic, docs/matrix-numerics.md the evidence.
+//
+//   Sequential  products and sums in f32, k in order: what every device whose FP8 sum is not known gets.
+//   Ada         chunks of 16, cut at 2^(top - 14), an f32 result cut to 13 fraction bits.
+//   ViaF16      the f16 rule of numerics.tensor_sum: ptxas turns an FP8 mma.sync on these devices into a conversion to f16 and HMMA, so the
+//               tensor core sums the products as it does f16 ones (chunks of 16 for Hopper). The SASS engine runs that code as it stands;
+//               the PTX engine does the same sum.
+enum class Fp8Sum : uint8_t { Sequential, Ada, ViaF16 };
+struct Fp8SumRule {
+  const char* name;
+  unsigned chunk;      // products to a chunk
+  int grid;            // a chunk's terms are cut at 2^(top - grid)
+  int out_bits;        // fraction bits an f32 result keeps (23: all of them)
+};
+inline constexpr Fp8SumRule kAdaFp8Rule{"ada: chunks of 16, cut at 2^(top-14), f32 results cut to 13 fraction bits", 16, 14, 13};
+inline constexpr const Fp8SumRule* fp8_sum_rule(Fp8Sum m) { return m == Fp8Sum::Ada ? &kAdaFp8Rule : nullptr; }   // ViaF16 has no numbers of its own
+inline constexpr const char* fp8_sum_name(Fp8Sum m) { return m == Fp8Sum::Ada ? "ada" : m == Fp8Sum::ViaF16 ? "via_f16" : "sequential"; }
+
 // A profile's `numerics:` section. Absent (present == false): the sequential sum and no published model, which is what an AMD or
 // Intel profile has -- their engines do not read this.
 struct Numerics {
@@ -216,6 +236,12 @@ struct Numerics {
   // numerics.tensor_sum_published: the model the literature gives a device whose own sum is not measured (so only beside
   // tensor_sum: sequential). Never in force by default: VGPU_TC_EXACT=published turns it on. Sequential: none is published.
   TensorSum tensor_sum_published = TensorSum::Sequential;
+  // numerics.tensor_sum_fp8 and its numbers (_chunk, _grid, _out_bits): the sum of the e4m3 and e5m2 forms. Optional: absent is the
+  // sequential sum, with the numbers zero. Present, the numbers are always those of fp8_sum_rule(tensor_sum_fp8).
+  Fp8Sum tensor_sum_fp8 = Fp8Sum::Sequential;
+  uint32_t tensor_sum_fp8_chunk = 0;
+  int32_t tensor_sum_fp8_grid = 0;
+  int32_t tensor_sum_fp8_out_bits = 0;
 };
 
 // What a value in a profile rests on. Exactly four classes; a key carries at most one.

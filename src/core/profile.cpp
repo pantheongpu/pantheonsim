@@ -103,7 +103,8 @@ void parse_numerics(const Value& doc, DeviceProfile& p, const std::string& origi
   for (const auto& [key, value] : n.map) {
     (void)value;
     if (key != "tensor_sum" && key != "tensor_sum_chunk" && key != "tensor_sum_chunk_tf32" && key != "tensor_sum_grid" &&
-        key != "tensor_sum_published")
+        key != "tensor_sum_published" && key != "tensor_sum_fp8" && key != "tensor_sum_fp8_chunk" && key != "tensor_sum_fp8_grid" &&
+        key != "tensor_sum_fp8_out_bits")
       fail(origin, "numerics: unknown key '" + key + "'");
   }
   // The tensor-core sum is read by the NVIDIA engines only. On another vendor's profile it would be a property nothing consults.
@@ -135,6 +136,36 @@ void parse_numerics(const Value& doc, DeviceProfile& p, const std::string& origi
     if (!parse_tensor_sum(pub, p.numerics.tensor_sum_published) || p.numerics.tensor_sum_published == TensorSum::Sequential)
       fail(origin, "numerics.tensor_sum_published must be ampere or hopper, got: " + pub);
     if (rule) fail(origin, "numerics.tensor_sum_published is for a device whose own sum is not known: it needs tensor_sum: sequential");
+  }
+  // The FP8 sum: optional, and when named, written out with its numbers as the f16 sum is (via_f16 has none: it is the f16 rule's).
+  const bool fp8_numbers = n.map.count("tensor_sum_fp8_chunk") || n.map.count("tensor_sum_fp8_grid") || n.map.count("tensor_sum_fp8_out_bits");
+  if (n.map.count("tensor_sum_fp8")) {
+    const std::string name = get_str(n, "tensor_sum_fp8", origin);
+    bool known = false;
+    for (Fp8Sum m : {Fp8Sum::Sequential, Fp8Sum::Ada, Fp8Sum::ViaF16})
+      if (name == fp8_sum_name(m)) {
+        p.numerics.tensor_sum_fp8 = m;
+        known = true;
+      }
+    if (!known) fail(origin, "numerics.tensor_sum_fp8 must be sequential, ada or via_f16, got: " + name);
+    const Fp8SumRule* r8 = fp8_sum_rule(p.numerics.tensor_sum_fp8);
+    if (!r8) {
+      if (fp8_numbers) fail(origin, "numerics.tensor_sum_fp8_* have no meaning with tensor_sum_fp8: " + name);
+      if (p.numerics.tensor_sum_fp8 == Fp8Sum::ViaF16 && !tensor_sum_rule(p.numerics.tensor_sum))
+        fail(origin, "numerics.tensor_sum_fp8: via_f16 sums as the f16 rule does, so it needs a tensor_sum that is not sequential");
+    } else {
+      const int64_t chunk = get_int(n, "tensor_sum_fp8_chunk", origin), grid = get_int(n, "tensor_sum_fp8_grid", origin),
+                    out_bits = get_int(n, "tensor_sum_fp8_out_bits", origin);
+      if (chunk != r8->chunk || grid != r8->grid || out_bits != r8->out_bits)
+        fail(origin, "numerics: tensor_sum_fp8 " + name + " is chunks of " + std::to_string(r8->chunk) + ", grid " + std::to_string(r8->grid) +
+                         ", " + std::to_string(r8->out_bits) + " result bits; the profile says " + std::to_string(chunk) + ", " +
+                         std::to_string(grid) + ", " + std::to_string(out_bits) + ", and the engines have no such sum");
+      p.numerics.tensor_sum_fp8_chunk = static_cast<uint32_t>(chunk);
+      p.numerics.tensor_sum_fp8_grid = static_cast<int32_t>(grid);
+      p.numerics.tensor_sum_fp8_out_bits = static_cast<int32_t>(out_bits);
+    }
+  } else if (fp8_numbers) {
+    fail(origin, "numerics.tensor_sum_fp8_* need numerics.tensor_sum_fp8");
   }
 }
 

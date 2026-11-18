@@ -1,3 +1,4 @@
+fp8/*.txt (the e4m3 and e5m2 samples: 24 vectors each of an RTX 1000 Ada, a B200 and, f16 accumulator, an H100: the first 24 of each file, same source commit, same conversion) and
 khattak_sample files (A100.*.txt, H100.*.txt, B200.*.txt): 24 test vectors each, copied from the model_validation/ directory of
 https://github.com/north-numerical-computing/MATLAB-tensor-core (commit 79143bd29a4a71dc7c2ed47741b63572498b17f6), converted by
 tools/tcpapers/khattak_convert.py to one line a vector. They are the recorded results of A100, H100 and B200 cards; the full sets

@@ -60,6 +60,7 @@ asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.skip 2816\n.popsection")
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/sass_atomics.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
+#include "vgpu/exec/tc_fp8.hpp"
 #include "vgpu/exec/tile_mma.hpp"
 #include "vgpu/exec/wgmma.hpp"
 #include "vgpu/exec/tensormap.hpp"
@@ -10224,6 +10225,9 @@ class Interpreter {
           K % (op.ab_type == MmaElem::TF32 ? 4 : 8) == 0)
         return false;   // the chunked sum of an RTX 3060
       if (profile_.cc_major == 12 && narrow(op.ab_type) && narrow(op.b_type) && !op.acc_f16) return false;   // sm_120's narrow-float sum
+      if (narrow(op.ab_type) && narrow(op.b_type) && !op.sparse && profile_.cc_major != 12 &&
+          (vgpu::exec::tc86::fp8_rule(profile_) || vgpu::exec::tc86::fp8_via_f16(profile_)))
+        return false;   // the device's own FP8 sum (tc_fp8.hpp)
     }
     const uint32_t bits = b1 ? 1 : f64 ? 64 : frag_bits(ta), per_reg = f64 ? 1 : 32 / bits;
     const uint32_t a_regs = (M * K / (op.sparse ? 2 : 1)) / (W_ * per_reg), b_regs = (K * kN) / (W_ * per_reg);
@@ -10577,19 +10581,41 @@ class Interpreter {
     // An RTX 3060's tensor core (sm_86) sums f16, bf16 and tf32 products in chunks (include/vgpu/exec/tc_ampere.hpp), not one at a time
     // in f32: D for the whole tile first, then taken instead of the sequential sum below. Not the sparse, block-scaled or narrow forms.
     const vgpu::exec::tc86::SumRule* const tc_rule = vgpu::exec::tc86::sum_rule(profile_);
-    const bool tc86_sum = tc_rule && !op.sparse && !op.block_scale &&
-                          (op.ab_type == MmaElem::F16 || op.ab_type == MmaElem::BF16 || op.ab_type == MmaElem::TF32) &&
-                          op.b_type == op.ab_type && !op.acc_int && !op.acc_f64 && K % (op.ab_type == MmaElem::TF32 ? 4 : 8) == 0;
+    // The e4m3 and e5m2 forms (vgpu/exec/tc_fp8.hpp): an Ada core's own sum, or, where ptxas lowers them to f16 and HMMA (Hopper, datacenter
+    // Blackwell), the f16 sum of the device. sm_120's narrow-float core is the branch below.
+    const auto fp8_elem = [](MmaElem t) { return t == MmaElem::E4M3 || t == MmaElem::E5M2; };
+    const bool fp8_forms = fp8_elem(op.ab_type) && fp8_elem(op.b_type) && !op.sparse && !op.block_scale && !op.acc_int && !op.acc_f64;
+    const vgpu::Fp8SumRule* const fp8_rule = fp8_forms && profile_.cc_major != 12 ? vgpu::exec::tc86::fp8_rule(profile_) : nullptr;
+    const bool fp8_f16 = fp8_forms && tc_rule && K % 8 == 0 && vgpu::exec::tc86::fp8_via_f16(profile_);
+    const bool tc86_sum = (tc_rule && !op.sparse && !op.block_scale &&
+                           (op.ab_type == MmaElem::F16 || op.ab_type == MmaElem::BF16 || op.ab_type == MmaElem::TF32) &&
+                           op.b_type == op.ab_type && !op.acc_int && !op.acc_f64 && K % (op.ab_type == MmaElem::TF32 ? 4 : 8) == 0) ||
+                          fp8_f16;
     std::array<float, 16 * kN> Dtc{};
     if (tc86_sum) {
-      std::array<float, 16 * 16> Af{};
-      std::array<float, 16 * kN> Bf{}, Cf{};
-      for (uint32_t x = 0; x < M * K; ++x) Af[x] = static_cast<float>(A[x]);
-      for (uint32_t x = 0; x < K * kN; ++x) Bf[x] = static_cast<float>(B[x]);
+      std::array<float, 16 * 32> Af{};
+      std::array<float, 32 * kN> Bf{};
+      std::array<float, 16 * kN> Cf{};
+      // An FP8 form is, on these devices, two HMMA.16816 on f16 operands for K = 32 (the second starting from the first's result) that
+      // start from zero, and then the accumulator added on its own by an FADD (HADD2 for an f16 accumulator): not inside the sum. And ptxas
+      // splits K by bit 1 of the index, not in halves: the first takes k = 0 1 4 5 8 9 ..., the second k = 2 3 6 7 10 11 ... (the SASS of
+      // sm_90 and sm_100 says so, and the SASS engine runs it; the recorded B200 and H100 vectors agree).
+      uint32_t kmap[32];
+      for (uint32_t n = 0; n < K; ++n) kmap[n] = fp8_f16 && K == 32 ? (n < 16 ? (n / 2) * 4 + n % 2 : ((n - 16) / 2) * 4 + 2 + n % 2) : n;
+      for (uint32_t i = 0; i < M; ++i)
+        for (uint32_t n = 0; n < K; ++n) Af[i * K + n] = static_cast<float>(A[i * K + kmap[n]]);
+      for (uint32_t n = 0; n < K; ++n)
+        for (uint32_t j = 0; j < kN; ++j) Bf[n * kN + j] = static_cast<float>(B[kmap[n] * kN + j]);
       for (uint32_t x = 0; x < M * kN; ++x) Cf[x] = static_cast<float>(C[x]);
-      vgpu::exec::tc86::mma(*tc_rule, op.ab_type == MmaElem::TF32, M, kN, K,
-                            op.ab_type == MmaElem::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide, op.acc_f16, Af.data(), K,
-                            Bf.data(), kN, Cf.data(), kN, Dtc.data(), kN);
+      const int emin = op.ab_type == MmaElem::F16 || fp8_f16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide;
+      const uint32_t step = fp8_f16 ? 16 : K;
+      const std::array<float, 16 * kN> zero{};
+      for (uint32_t k0 = 0; k0 < K; k0 += step)
+        vgpu::exec::tc86::mma(*tc_rule, op.ab_type == MmaElem::TF32, M, kN, step, emin, op.acc_f16, Af.data() + k0, K, Bf.data() + k0 * kN, kN,
+                              k0 ? Dtc.data() : fp8_f16 ? zero.data() : Cf.data(), kN, Dtc.data(), kN);
+      if (fp8_f16)
+        for (uint32_t x = 0; x < M * kN; ++x)
+          Dtc[x] = op.acc_f16 ? static_cast<float>(f16_to_double(double_to_f16(static_cast<double>(Cf[x]) + static_cast<double>(Dtc[x])))) : Cf[x] + Dtc[x];
     }
     const int prev_round = std::fegetround();
     if (op.acc_f64) {
@@ -10628,6 +10654,10 @@ class Interpreter {
           double acc = C[i * kN + j];
           for (uint32_t k = 0; k < K; ++k) acc = std::fma(A[i * K + k], B[k * kN + j], acc);
           D[i * kN + j] = acc;
+        } else if (fp8_rule) {
+          D[i * kN + j] = vgpu::exec::tc86::fp8_dot(*fp8_rule, op.acc_f16, op.ab_type == MmaElem::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3,
+                                                    op.b_type == MmaElem::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3,
+                                                    &A[i * K], 1, &B[j], kN, K, C[i * kN + j]);
         } else if (narrow_tensor_core) {
           // sm_120's narrow-float tensor core: the exact sum, rounded once toward zero (mma_narrow_sum).
           double terms[256];
