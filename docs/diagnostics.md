@@ -53,6 +53,14 @@ the same value to the same word. The write is still recorded, so a later store
 of a *different* value is caught against it; only the report is suppressed.
 `VGPU_RACE=2` reports these too.
 
+Atomics (`atom`, `red`) from different warps on one word between two barriers
+are not a race: the hardware orders them. An atomic beside another warp's plain
+load or store of that word is still reported.
+
+The check stops the launch at the first race. `VGPU_RACE_CONTINUE=1` prints each
+one (once per instruction and kind, up to 50) and lets the launch finish, so a
+false positive early on does not hide the later kernels.
+
 It is off by default because it costs a shadow word per shared word, and on
 because you are looking for something. It found the flash-attention race in
 llama.cpp in one run, naming the kernel, the PTX line and both warps; that same

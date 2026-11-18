@@ -284,6 +284,9 @@ struct WordShadow {
   uint32_t read_epoch = 0xFFFFFFFF;
   uint32_t write_epoch = 0xFFFFFFFF;
   uint16_t writer = 0xFFFF;         // warp that wrote it, 0xFFFF for none
+  // Atomics are ordered against each other, so they are kept apart from plain accesses: up to two different warps that did one this epoch.
+  uint32_t atomic_epoch = 0xFFFFFFFF;
+  uint16_t atomic_a = 0xFFFF, atomic_b = 0xFFFF;
 };
 
 struct SharedShadow {
@@ -725,6 +728,8 @@ std::atomic<bool> g_race{false};
 // default -- see the comment on `unobservable_write` for why those are not
 // races -- but the strict definition has its uses, so it stays reachable.
 std::atomic<bool> g_race_strict{false};
+// VGPU_RACE_CONTINUE=1: print each race and go on, instead of stopping the launch at the first.
+std::atomic<bool> g_race_continue{false};
 
 // Sampled together, once per launch. Caching either in a function-local static
 // makes it depend on which kernel in a process ran first -- which is how the
@@ -737,6 +742,7 @@ void refresh_modes(const LaunchEnv& env) {
   const char* race = env.race;
   g_race.store(race && (race[0] == '1' || race[0] == '2'), std::memory_order_relaxed);
   g_race_strict.store(race && race[0] == '2', std::memory_order_relaxed);
+  g_race_continue.store(env.race_continue && env.race_continue[0] == '1', std::memory_order_relaxed);
   const char* fast = env.fastpath;
   g_fast_path.store(!(fast && fast[0] == '0'), std::memory_order_relaxed);
   vgpu::exec::tc86::refresh_exact(env.tc_exact);   // VGPU_TC_EXACT=0: the earlier sequential tensor sums (include/vgpu/exec/tc_ampere.hpp)
@@ -5532,15 +5538,25 @@ class Interpreter {
   static bool detect_races() { return g_race.load(std::memory_order_relaxed); }
   static bool races_strict() { return g_race_strict.load(std::memory_order_relaxed); }
 
-  [[noreturn]] void report_race(const Instr& ins, const char* what, uint64_t word,
-                                uint32_t other_warp) {
-    ctx_fail(ins, -1, Err::DataRace,
-             std::string(what) + " on shared memory at byte offset " +
-                 std::to_string(word * 4) + ": warp " + std::to_string(cur_warp_) +
-                 " and warp " + std::to_string(other_warp) +
-                 " both reach it with no bar.sync between them, so which one wins is not "
-                 "something the program decided. Hardware usually hides this because warps "
-                 "advance together; it is a real race either way");
+  // Stops the launch with the race, or with VGPU_RACE_CONTINUE=1 prints it once per place and goes on.
+  void report_race(const Instr& ins, const char* what, uint64_t word, uint32_t other_warp) {
+    const std::string msg = std::string(what) + " on shared memory at byte offset " + std::to_string(word * 4) + ": warp " +
+                            std::to_string(cur_warp_) + " and warp " + std::to_string(other_warp) +
+                            " both reach it with no bar.sync between them, so which one wins is not "
+                            "something the program decided. Hardware usually hides this because warps "
+                            "advance together; it is a real race either way";
+    if (!g_race_continue.load(std::memory_order_relaxed)) ctx_fail(ins, -1, Err::DataRace, msg);
+    static std::mutex m;
+    static std::set<std::string> seen;
+    std::lock_guard<std::mutex> lock(m);
+    if (seen.size() >= 50) return;
+    if (!seen.insert(cur_->name + ":" + std::to_string(ins.line) + ":" + what).second) return;
+    try {
+      ctx_fail(ins, -1, Err::DataRace, msg);
+    } catch (const Error& e) {
+      std::fprintf(stderr, "%s\n", e.what());   // VGPU_RACE_CONTINUE: the launch goes on
+    }
+    if (seen.size() == 50) std::fprintf(stderr, "VirtualGPU: 50 races reported, the rest are not printed\n");
   }
 
   // True when the store leaves shared memory exactly as it found it.
@@ -5573,11 +5589,17 @@ class Interpreter {
                           bool is_write, uint64_t value = 0) {
     if (!ctx.shadow) return;
     SharedShadow& sh = *ctx.shadow;
-    const bool silent = is_write && unobservable_write(ctx, addr, bytes, value);
+    const bool atomic = in_atomic_;
+    const bool silent = !atomic && is_write && unobservable_write(ctx, addr, bytes, value);
     const uint64_t first = (addr - kSharedVaBase) / 4;
     const uint64_t last = (addr - kSharedVaBase + (bytes ? bytes - 1 : 0)) / 4;
     for (uint64_t w = first; w <= last && w < sh.words.size(); ++w) {
       WordShadow& s = sh.words[w];
+      // Another warp's atomic on the word this epoch: a plain access is not ordered against it.
+      if (!atomic && !silent && s.atomic_epoch == sh.epoch) {
+        const uint16_t other = s.atomic_a != cur_warp_ ? s.atomic_a : s.atomic_b;
+        if (other != 0xFFFF) report_race(ins, is_write ? "write-write race" : "write-read race", w, other);
+      }
       if (is_write) {
         if (!silent && s.write_epoch == sh.epoch && s.writer != 0xFFFF && s.writer != cur_warp_)
           report_race(ins, "write-write race", w, s.writer);
@@ -5590,16 +5612,29 @@ class Interpreter {
               break;
             }
         }
-        s.writer = static_cast<uint16_t>(cur_warp_);
-        s.write_epoch = sh.epoch;
+        if (!atomic) {
+          s.writer = static_cast<uint16_t>(cur_warp_);
+          s.write_epoch = sh.epoch;
+        }
       } else {
         if (s.write_epoch == sh.epoch && s.writer != 0xFFFF && s.writer != cur_warp_)
           report_race(ins, "write-read race", w, s.writer);
-        if (s.read_epoch != sh.epoch) {
-          s.readers = WarpSet{};
-          s.read_epoch = sh.epoch;
+        if (!atomic) {
+          if (s.read_epoch != sh.epoch) {
+            s.readers = WarpSet{};
+            s.read_epoch = sh.epoch;
+          }
+          s.readers.add(cur_warp_);
         }
-        s.readers.add(cur_warp_);
+      }
+      if (atomic) {
+        if (s.atomic_epoch != sh.epoch) {
+          s.atomic_epoch = sh.epoch;
+          s.atomic_a = static_cast<uint16_t>(cur_warp_);
+          s.atomic_b = 0xFFFF;
+        } else if (s.atomic_a != cur_warp_ && s.atomic_b == 0xFFFF) {
+          s.atomic_b = static_cast<uint16_t>(cur_warp_);
+        }
       }
     }
   }
@@ -14361,6 +14396,7 @@ class Interpreter {
   // (exch), or by c if they equal b (cas), under the same striped lock the
   // other atomics take -- 16-byte atomicity is promised against other atomics.
   void exec_atom128(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    AtomicScope atomic_scope(in_atomic_);
     Lanes _s_base, s1, s2, s3, s4;
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     const Lanes& blo = read_operand(w, ctx, ins, op.b, s1);
@@ -14591,6 +14627,7 @@ class Interpreter {
   // packed .f16x2/.bf16x2 element is a word, and two .f16/.bf16 elements share
   // one: register 2i is its low half and 2i+1 its high.
   void exec_atom_vec(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    AtomicScope atomic_scope(in_atomic_);
     const bool wide = op.ty.bits == 32 || op.packed_half;   // one register per word
     const uint32_t nwords = wide ? op.vec : op.vec / 2u;
     const uint32_t bytes = nwords * 4u;
@@ -14658,6 +14695,7 @@ class Interpreter {
   }
 
   void exec_atom(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    AtomicScope atomic_scope(in_atomic_);
     if (op.vec > 1) {
       exec_atom_vec(w, ctx, ins, op, m);
       return;
@@ -16017,6 +16055,13 @@ class Interpreter {
   mutable const EntryFn* func_class_fn_ = nullptr;
   mutable const uint8_t* func_class_ = nullptr;
   uint32_t cur_warp_ = 0;     // which warp of the block is running, for race reports
+  bool in_atomic_ = false;    // inside atom/red: its shared-memory accesses are atomic ones for the race detector
+  struct AtomicScope {
+    bool& flag;
+    const bool was;
+    explicit AtomicScope(bool& f) : flag(f), was(f) { flag = true; }
+    ~AtomicScope() { flag = was; }
+  };
   bool fast_enabled_ = true;   // VGPU_FASTPATH, sampled at launch
   // The word that is non-zero while an arithmetic fault is armed (MemoryManager::alu_fault_armed's, taken once: the
   // hook is set when the device is made). Read at every instruction that could be hit, so not through mem_ each time.
