@@ -31,6 +31,14 @@ release says what runs and what it produces, never how fast a real GPU would run
 - **FTTN on the simulator, every NVIDIA profile with a tensor core, both engines, redone against the current profiles** (issue #664): the earlier rows for b200 and
   the sm_120 profiles predated their Hopper rule. docs/numerics/fttn-simulators.md (`tools/fttn/sim_table.py`), and a page per profile that says what is measured on
   a card, published, inferred or unknown: docs/numerics/per-profile.md.
+- **Removed: host-GPU offload (`VGPU_HOST_GPU=exact` and `turbo`).** The public simulator no longer sends any launch to a real GPU: it is the plain simulator
+  only, and every run gives the same bits on any machine. Gone with it: the setting `host_gpu` and `host_gpu_log` (`vgpu config` and the settings file),
+  `VGPU_HOST_GPU` and the whole `VGPU_HOST_GPU_*` family (`_LOG`, `_VERIFY`, `_TIMEOUT`, `_WIDER`, `_DIV`, `_SQRT`, `_START_*`, `_SAMPLE*`, `_FIRST_BIG`, `_SHORT`,
+  `_STREAK`, `_STATIC`, `_WRITE_THROUGH`, `_MAX_MIB`, `_TRACE`, `_LIBCUDA`, `_NO_FIRST_LAUNCH`, and the ones only turbo read: `_FIT`, `_PRESTART`, `_TURBO_OFF`,
+  `_ATOMICS`, `_ATOL`, `_RTOL`, `_TOL_TYPE`, `_HISTORY`, `_COOP`, `_HOSTMAP`, `_DEVICES`, `_PTX_VARIABLES`), `VGPU_HOSTGPU_CAPTURE*`, the card gate in the memory manager,
+  the exit-summary lines of the mode, the `tools/turbo-census` tool, the benchmark harness, probes and card-CI scripts for it, their tests, and the design notes and
+  measurement data for it under `docs/perf-design`. A program that sets `VGPU_HOST_GPU` now runs in the simulator as if it had not. Released versions keep the code under
+  their Apache-2.0 licence; nothing else in the simulator's results changed.
 - **CI: a memory share left by a killed runner no longer blocks the host.** A runner that is restarted or killed mid-job never runs its "Give back the memory reservation" step, and the share held the slot for up to 4 hours while every other heavy job on the host waited for it and failed (the `ollama on amd/mi300x` failure on #701). A waiting `ci/jobs.sh --check` now asks GitHub whether the run behind each share has ended and drops the shares of runs that have; any doubt keeps the share. The check steps pass `GH_TOKEN`.
 - **The compute capability 12.0 Blackwell profiles sum by the Hopper rule, measured on an RTX PRO 6000 Blackwell Server Edition** (issue #664). `rtx-pro-6000-server`
   (`measured`) and `rtx5090`, `rtx-pro-4500`, `rtx-pro-6000`, `rtx-pro-6000-max-q` (`inferred` from it) took the sequential f32 sum before: wmma, `mma.sync` and SASS
@@ -42,74 +50,11 @@ release says what runs and what it produces, never how fast a real GPU would run
 - **OpenCL on the MI455X is documented as an upstream ROCm limit, and `amd_opencl` expects it** (issue #651). ROCm's `libamdocl64`, 7.1.0 and 7.2.4 alike, logs `Unsupported HSA device gfx1250` and drops the device although the simulator offers both agents; the other nine GPUs list both devices and pass. `amd/mi455x` is back in the test's cases and passes only when the runtime says exactly that (a missing device with any other reason still fails); if a ROCm release lists the device its checks run. The CI job unpacks ROCm 7.2.4's OpenCL runtime now (`fetch-rocm-opencl.sh DIR [VERSION]`).
 - **AMD counters: cache lines of global and flat accesses** (issue #650, the second half). `VGPU_DISPATCH_STATS` also prints `vmem_lines_rd` and `vmem_lines_wr`, the distinct vector L1 lines the active lanes touch (64 bytes on CDNA, 128 on RDNA and gfx1250; the table is in `docs/cli.md`).
   It is modelled, not verified against a card, and no rocprofiler counter is mapped to it. The test is `test_amd_gcn_cache_lines`.
-- **Turbo mode sends cooperative launches and launches with an argument into mapped host memory to the card** (issue #661). A cooperative launch (grid-wide barrier) goes
-  through `cuLaunchCooperativeKernel` when the card holds the grid at once; mapped host buffers are registered with the driver at their own addresses. Results are the
-  card's, as in turbo; `VGPU_HOST_GPU_COOP=0` and `VGPU_HOST_GPU_HOSTMAP=0` keep them in the simulator. Textures stay refused (design note, `docs/perf-design/14-turbo-textures-design.md`).
-- **Host-GPU size rules: the first big launch of a young process is sampled** (issues #656, #659). A launch of 65,536 threads or more whose kernel has a loop is asked neither
-  the static floor nor the process's age for its sample while the process has spent nothing on samples (one sample, 3 to 14 ms). On an A10G, CUDA Samples mergeSort goes from
-  2.30 s to 0.58 s, MC_EstimatePiInlineP from 4.09 s to 0.29 s and MC_SingleAsianOptionP from 4.09 s to 0.77 s, outputs identical, 15 other programs within 6 %.
-  `VGPU_HOST_GPU_FIRST_BIG=<threads>` sets the size, 0 is the rule before (`turbof0` in `tools/bench/hostgpu/run.py`); exact mode and `VGPU_HOST_GPU_FIT=0` only, the default turbo sends every fitting launch already.
 - **CI: the playground host can take burst jobs when two of its three slots are free** (`tools/burst-runners/host-burst.sh`, docs/ci.md).
 - **A SASS `RET` with a condition predicate returns only the lanes where both predicates hold** (issue #691). On sm_90 ptxas ends a `__noinline__`
   function that returns early when two cells are equal with a `RET` whose second predicate sits in the same bits as `BRA` and `EXIT` have it; the decoder
   dropped it, so lanes that were not equal returned without running the rest, and about a third of an atomic counter's increments were lost. The test
   is `e2e_ret_condition_predicate`.
-- **Turbo and exact host-GPU modes cost a program whose launches stay in the simulator much less** (issues #662, #660). A program of 50 distinct
-  kernels launched once each ran 1.29x slower with `VGPU_HOST_GPU=turbo` than without; it is now 1.02x, and 5,000 short launches of one kernel went from
-  1.18x to 1.07x (the same decisions, outputs and counters). The scan of each kernel's code skips the loop analysis when no loop can run, looks
-  mnemonics up as integers, and the module's call graph walk no longer builds a string per section; `VGPU_HOST_GPU_LOG` is read once.
-- **Turbo mode sends very short launches to the card when it clearly wins** (issue #660). On an A10G an empty launch plus its sync costs 8 us, so the
-  size rule now takes the card's time for a kernel it has not run as a twentieth of the simulator's estimate (at most 100 us, as before), lets a
-  launch of 40 us or more be sent (was 200 us), and lets a kernel launched thousands of times repay the driver start at 50 us saved a launch.
-  The simulator's results do not change, only which path a launch takes. `VGPU_HOST_GPU_SHORT=0` restores the old rule.
-
-- **Turbo host-GPU mode admits a kernel that can assert or trap, and a PTX module whose variables no instruction names** (`12-host-gpu-turbo.md` section 20, [data](docs/perf-design/data/turbo-admit/README.md)). On an A10G a failed `assert` ends the context with error 710 and `__trap()` / `__brkpt()` with 719,
-  every later call returns the same code and the memory the card held is gone, exactly as the plain simulator does it; turbo now sends such kernels (`__assertfail`, `BPT.TRAP`, and nvcc 13's call through a register that the scan can bound to a slot of constant bank 4 naming
-  an external function it admits), and when the card reports 710 or 719 the launch fails with the simulator's own error, whether or not the card held data the simulator lacks (the card's assertion text is on stderr; the process no longer ends with an internal error). `VGPU_HOST_GPU_TURBO_OFF=assert` keeps them
-  in the simulator; exact mode and the plain simulator are unchanged. A PTX module is refused only for a variable some statement of it can name (`.extern`, `.visible`, `.weak`, `.managed`, unreadable declarations and any
-  name that occurs outside its declaration count as named); the libcu++ marker objects nvcc declares in every module that includes `<cuda/std/...>` no longer keep it off the card (`VGPU_HOST_GPU_PTX_VARIABLES=all` restores the old rule). Tests: unit tests of the scan and the register-call bound, stub step 59, `tools/turbo-census` follows both rules.
-
-- **Turbo refusal census** (`tools/turbo-census`, `test_turbo_census`, [docs/perf-design/data/turbo-census/](docs/perf-design/data/turbo-census/README.md), `12-host-gpu-turbo.md` section 18): a CPU-only tool that says, for every kernel of built binaries and libraries, which image
-  turbo would give each host card (sm_75, sm_86, sm_89, sm_90) under the a10g and h100 profiles and why a kernel stays in the simulator, using the runtime's own image choice, PTX scan and instruction classes. Turbo itself is unchanged.
-
-- **Turbo host-GPU mode on a machine with several cards: simulated device N runs on host card N.** Until now the card path served simulated device 0 on the real driver's device 0 only. With
-  `VGPU_HOST_GPU=turbo` each simulated device now has its own card, context, window (the simulator's own per-device address, reserved on that card), module cache and residency; devices beyond the
-  host's card count stay in the simulator (said once per device), and a device with a peer link, or a launch with a pointer into another device's memory, stays in the simulator too. With more than one simulated device the
-  launches on cards are queued and not waited for, so the cards run at the same time. `CUDA_VISIBLE_DEVICES` now picks the card of the slot it shows (the simulated device in window 1 used the card path's window
-  0 before), and `VGPU_HOST_GPU_DEVICES=a,b,..` chooses the real devices by hand. Exact mode and single-device programs are unchanged. Measured on four Tesla T4 (AWS g4dn.12xlarge), 4 simulated T4s, a
-  fused-multiply-add kernel on each: 31 s in the simulator, 20 s with turbo as before (one card), 0.93 s with four cards, same output; the time stays flat from 1 to 4 devices. Details, the measurements on the
-  card (what a process can do with several cards) and the known limit (a read-back that waits for one card holds the shim's API lock): `docs/perf-design/12-host-gpu-turbo.md` section 19.
-
-
-- **Turbo host-GPU mode: a program history, a cheaper driver start, the driver's compile cache beside the history** (follows PR #693; [section 21](docs/perf-design/12-host-gpu-turbo.md)).
-  `VGPU_HOST_GPU_HISTORY=<directory>` (off by default) keeps a small checksummed record per program, card model and switch set: a program whose last run in the simulator took under half the driver's start stays in the simulator and never starts the driver
-  (Rodinia bfs 0.24 s to 0.014 s, HeCBench backprop 0.24 s to 0.013 s, attention 0.25 s to 0.036 s on an A10G), and a kernel that faulted on the card (error 700, 715 to 719) is kept in the simulator from its first launch (Rodinia srad_v2 0.37 s to 0.064 s). A first run leaves a candidate, the second runs in the simulator
-  as a bounded trial and leaves tiny or long, the third gains; a hold ends when the simulator has spent the start cost, or at a launch much larger than the record's. A missing, corrupt, foreign, stale or concurrently written file is no history; the record never changes a result; exact mode and `VGPU_HOST_GPU_FIT=0` never read it. Turbo mode also asks the driver for one work queue
-  (`CUDA_DEVICE_MAX_CONNECTIONS=1`, unless set: the driver's start and end cost about 0.24 s of every process, 0.155 s with it; turbo launches on one stream) and, with a history directory, keeps the driver's compile cache in `<directory>/cuda-cache` (PTX-only HeCBench s3d: 3.0 s of JIT on every run, 0.025 s with the cache). Unit test `test_host_gpu_history`
-  (corrupt, version, concurrent writers), stub steps 58 to 63, ten mutations each caught.
-
-- **Turbo texture and surface offload: design and measurements, nothing built** (docs/perf-design/12-host-gpu-turbo.md section 22). Texture and surface instructions stay refused in turbo as before. On an A10G the card's
-  texture handles are small counters (1, 2, 3), a handle it does not know reads as zeros with no error, substituting handle words in kernel parameters and mirroring arrays with `cuMemcpy2D/3D` both work, and a handle held
-  in device memory cannot be found from a launch's arguments; with 0.36 s of simulator time in the whole corpus, below one driver start, the path was not built. Experiment source and output are under `docs/perf-design/data/turbo-tex/`.
-
-- **Turbo host-GPU mode, next round: PTX retargeting, a driver start that overlaps the program's set-up, and the simulated profile's launch limits** (follows the turbo-fit round, PR #693).
-  A module whose only PTX is plain `.target sm_90` (a build with `-arch=sm_90` or `compute_90` alone) now runs on an sm_80, sm_86 or sm_87 card: its target line is rewritten to
-  the card's and the driver compiles it, provided the PTX uses no form that card lacks (a text scan of the forms ptxas 13.0 rejects there: `mbarrier.try_wait`, `expect_tx`, count-form
-  `mbarrier.arrive`, vector and 128-bit atomics, `fence.proxy.async`, packed 16-bit integer arithmetic, fp8 converts, cluster directives, plus the sm_90 forms already refused) and declares
-  no module variable. A module the driver then refuses stays in the simulator without ending turbo; `retargeted=` and `retarget_refused=` count them on the `host_gpu_fit:` line. Measured on an
-  A10G: PolyBench FDTD-2D built for sm_90 went from 119 s in the simulator (no card path before) to 4.2 s. With `VGPU_HOST_GPU_FIT=1` the card's driver now starts on its helper thread when the
-  simulated device is created (`VGPU_HOST_GPU_PRESTART=0` restores the lazy start), which took 0.1 to 0.14 s off programs with set-up to overlap. Turbo now makes the simulated profile's launch checks
-  (launch bounds, registers, grid, shared memory) before it asks the card, so a launch the plain simulator refuses is refused the same way. Details and measurements: `docs/perf-design/12-host-gpu-turbo.md` section 16.
-
-- **Turbo host-GPU mode sends every kernel the card can run, from the card's own image, and is documented as not bit-accurate** (owner decision 2026-11-17).
-  `VGPU_HOST_GPU=turbo` now chooses, per module, the image the host GPU runs (a cubin for its own architecture, else an older cubin of its major, else PTX the
-  driver compiles) instead of the one the simulated profile runs, so a simulated H100 on an RTX 3060 uses the card; the start-up gates on architecture and SM count are gone in turbo
-  (exact keeps them, and is unchanged in every other way). Instructions no class names (class `unlisted`; `VGPU_HOST_GPU_TURBO_OFF=unlisted` keeps them out) no longer keep a kernel
-  in the simulator; texture and surface instructions and `BPT` still do. A launch is checked against the card's limits (threads, registers, shared memory, grid, memory)
-  and stays simulated when it does not fit. **`VGPU_HOST_GPU_FIT=1` (the default in turbo) skips the size rule, the sample, the first-launch rule, the start cost and the bans, so every
-  fitting kernel goes to the card; `VGPU_HOST_GPU_FIT=0` keeps the earlier rules.** Turbo prints a notice that its results may differ from the simulator's; the summary gains
-  `bits_different=` and a `host_gpu_fit:` line. Details, measurements and mutation evidence: `docs/perf-design/12-host-gpu-turbo.md` section 15, `docs/perf-design/data/turbo-fit/`.
-
 - **PTX with an `.extern` variable is judged as NVIDIA's driver judges it** (issue #681, follow-up to the entry below). The same RTX 3080 Ti was
   asked about the cases the first change did not cover, and answered differently from the simulator in four of them. Now, as on the card:
   an `.extern` variable with an initialiser (`.extern .global .u32 e = 5;`) fails the load with `CUDA_ERROR_INVALID_PTX`
@@ -173,7 +118,6 @@ release says what runs and what it produces, never how fast a real GPU would run
   encoding is from nvcc output, the execution was not run on a Blackwell card). Tests: `test_mufu_model`, `test_decode_same_bits`
   (its flipped and random digests moved for the MUFU words with bit 72 set on sm_90 and later, see its header); details in
   [docs/numerics/math-functions.md](docs/numerics/math-functions.md).
-- **`VGPU_HOST_GPU=turbo` now sends kernels that use BMMA (1-bit tensor MMA) to the card** (issue #661). They were refused (`class=never insn=BMMA.88128.XOR.POPC`). BMMA is integer popcount arithmetic: on an A10G, `bmma_gemm` (36 launches, XOR and AND) ran on the card under `VGPU_HOST_GPU_VERIFY=all` with 0 different words of 775,680, byte-identical to the simulator. Measured on the A10G only; other cards with BMMA are inferred. `VGPU_HOST_GPU=exact` is unchanged (BMMA is not in its set), and `VGPU_HOST_GPU_TURBO_OFF=tensor` refuses these kernels again. Test: `test_host_gpu_logic`.
 - **Behaviour change: the b200 and gb200 profiles sum tensor-core products by the Hopper rule by default, not sequentially.** On
   `nvidia/b200` and `nvidia/gb200` (compute capability 10.0), `wmma`, `mma.sync` and SASS `HMMA` in f16, bf16 and tf32 now add the
   products in chunks of 16 (tf32: 8) with the terms cut at 2^(top - 26), the rule of an H100, instead of one at a time in f32.
@@ -259,45 +203,6 @@ release says what runs and what it produces, never how fast a real GPU would run
     on the rx6800 profile 441 of 900 results of the Varity programs did not run and 10 were wrong. Optimized code and
     wave64 kernels are unchanged.
 
-- Host-GPU modes (`VGPU_HOST_GPU=exact|turbo`, experimental): a kernel's first launch is sampled when the driver is up, as it is before the
-  start ([round sp76](docs/perf-design/rounds/11-rounds-sp36-sp41.md#round-sp76-host-gpu-a-kernels-first-launch-once-the-driver-is-up),
-  [design](docs/perf-design/12-host-gpu-turbo.md), section 13; pantheonsim #657, #659). Until now no launch was sampled once the driver's
-  start had begun (a sample forks the process, and a process that held the real driver was not forked), so a kernel first launched after
-  the start was simulated however long its launch was: the second kernel of HeCBench aidw, 149 s of the program's 193 s on an A10G. Before
-  the fork the process now pulls what only the card holds, the forked copy takes every chunk as its own and cannot call the driver, and the
-  launch is held against a card path with no start in it; a kernel whose earlier whole launch was under the sampling floor is not sampled
-  again, and one whose earlier whole launch was over it is sampled at its next launch whatever its static count. Against the stand-in driver all four launches of aidw are sent (three before), and over the corpus twelve more first launches go (CUDA Samples alignedTypes ten,
-  histogram and mergeSort one each) for seventeen samples; with the switch off against on no program that starts the driver is more than
-  2 % apart in wall time. **Not run on a card**: that a process holding
-  the real driver can be forked is what the card test's new step 13 and `docs/perf-design/data/sp76/card-run.sh` ask first.
-  `VGPU_HOST_GPU_SAMPLE_STARTED=0` is the rule before (the benchmark's forms `exactd0` and `turbod0`). The plain simulator and the bits of
-  exact mode are unchanged.
-- Host-GPU modes, measured and not changed (round sp76): Rodinia particlefilter_float, which the card run of round sp75 left unsettled, is
-  not slower by that round's rule: with one host thread and its clock seed fixed the two forms agree to 1 %, and with several host threads
-  the program itself computes one of several answers per run (a race between the blocks of its `normalize_weights_kernel`), which is what
-  splits its run times in two groups. And no rule was found that keeps the driver start from HeCBench silu (bought at the 31st of 50
-  launches, pantheonsim #662) without taking it from programs that repay it: replayed over the launches of the corpus, each candidate costs
-  the keep list more than silu loses.
-- Host-GPU modes (`VGPU_HOST_GPU=exact|turbo`, experimental): a launch whose blocks each take longer than the wait for its sample is no longer
-  kept in the simulator for want of an answer ([round sp75](docs/perf-design/rounds/11-rounds-sp36-sp41.md#round-sp75-host-gpu-a-block-that-outlasts-the-wait),
-  [design](docs/perf-design/12-host-gpu-turbo.md), section 12; pantheonsim #656, #657). The forked copy that times a launch's first blocks now stops
-  a block at a limit and answers with the time it ran, which is under what the block takes; the estimate and the rule that decides are
-  unchanged. A grid of 2 to 255 blocks whose kernel has no loop the sample inside the blocks follows is sampled the same way when its static
-  estimate reaches 30 ms. Against the stand-in driver the first launch of HeCBench aidw (78 s in the simulator on the build machine) and the
-  single launches of the CUDA Samples cudaTensorCoreGemm, tf32TensorCoreGemm and bf16TensorCoreGemm (5 to 83 s) are sent to the card;
-  on one A10G (`docs/perf-design/data/sp75/card.md`, the run of `card-run.sh`) turbo mode takes tf32TensorCoreGemm from 209 s to 3.0 s,
-  bf16TensorCoreGemm from 157 s to 3.8 s, cudaTensorCoreGemm from 16.1 s to 1.3 s and immaTensorCoreGemm from 3.5 s to 1.2 s, the card's
-  results bit for bit the simulator's in verify runs, and aidw from 360 s to 193 s with 3 of its 4 launches on the card; no program of the
-  corpus was found slower by the rule (Rodinia particlefilter_float, whose time depends on its clock seed, is not settled). aidw's second kernel is still simulated once (no
-  sample is taken while the driver is up), and launches under the sampling floor in a young process (MC_SingleAsianOptionP,
-  MC_EstimatePiInlineP, warpAggregatedAtomicsCG, Rodinia lavaMD) are not reached. `VGPU_HOST_GPU_SAMPLE_BLOCK=0` is the rule before. The
-  plain simulator and the bits of exact mode are unchanged.
-- Host-GPU modes: `VGPU_HOST_GPU_LOG=1` says why each launch stayed in the simulator. The `host_gpu_kept:` reasons, which read `size rule`
-  for every launch the size rule, the first-launch rule or a sample kept, now name the cause (`size rule: no estimate, not sampled: <why>`,
-  `size rule: the sampled estimate does not repay the card path and the driver start`, `size rule: the estimate does not beat the card path`,
-  `size rule: the estimate does not repay the driver start`, `size rule: the kernel is banned ...`), a `host_gpu_nosample:` line gives the
-  numbers behind an unsampled launch (the kernel's first two), and a sampled launch's decision is printed when it is made. A script that
-  matches the reason `size rule` exactly must match its prefix instead.
 - Device profiles say what their numerics are and what each value rests on (issue #664, first step of architecture-aware
   simulation; [nvidia/docs/profiles.md](nvidia/docs/profiles.md), "Numerics and provenance"). **No result changes.**
   - New optional profile sections: `numerics:` (the tensor-core sum: `tensor_sum`, its chunk sizes and grid, and
@@ -488,7 +393,7 @@ GitHub Action. The list below is every entry that was under Unreleased.
   back, and the next card launch pushed it all again. Measured on one A10G (Round sp65): PolyBench LU 11.6 s to 1.5 s in turbo mode and with
   `VGPU_HOST_GPU_DIV=1`, Rodinia gaussian 0.99 s to 0.53 s, GRAMSCHM's traffic from 98 GB to 40 GB each way; outputs identical.
   `VGPU_HOST_GPU_STREAK=0` keeps the old rule; the summary's `host_gpu_streak:` line counts the launches sent this way
-  ([design](docs/perf-design/12-host-gpu-turbo.md), section 9). A launch with a grid or block dimension of 0 now stays in the simulator, which
+  (design notes, since removed, section 9). A launch with a grid or block dimension of 0 now stays in the simulator, which
   reports its own configuration error, instead of failing on the card (it ended the mode with an internal error when the card held memory).
 - Host-GPU mode (experimental, opt-in), exact mode: `VGPU_HOST_GPU_SQRT=1` also admits kernels whose only instructions outside the exact set are
   the IEEE square root sequence nvcc builds for `sqrtf` and `__fsqrt_rn` (`MUFU.RSQ`, a range check, a refinement, a slow-path subroutine), alone or
@@ -505,7 +410,7 @@ GitHub Action. The list below is every entry that was under Unreleased.
   before every launch. The simulator still runs each launch with no card copy valid, and the program's output is the simulator's as before.
   On a stand-in card (server3, Round sp67) PolyBench 3DCONV under verify goes from 39.3 s to 6.2 s (0.37 s plain), the other seven programs
   measured from 1.0x to 1.4x faster; on an A10G 3DCONV 46.5 s to 8.5 s and the others 1.04x to 1.29x faster, every launch identical; the exit summary's "MiB went to the card" is smaller accordingly
-  ([docs/perf-design/10-host-gpu-hooks.md](docs/perf-design/10-host-gpu-hooks.md) section 8, pantheonsim #569).
+  (design notes, since removed, section 8, pantheonsim #569).
 
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: what a kernel's module holds besides code no longer keeps the kernel in the
   simulator by itself. A kernel that uses the module's `__device__` or `__constant__` variables can run on the card: the card is given a copy of
@@ -519,7 +424,7 @@ GitHub Action. The list below is every entry that was under Unreleased.
   `vprintf` through a register, which is not followed yet, so on that toolkit such kernels still stay) and, by default, float
   atomics with a returned value, compare-and-swap and exchange (`VGPU_HOST_GPU_ATOMICS=0` keeps them out; an opt-in before).
   `VGPU_HOST_GPU_WIDER=0` restores the earlier rules for A/B runs, and with `VGPU_HOST_GPU_LOG` the exit summary lists per kernel the launches kept
-  in the simulator and why, with their simulator seconds (`host_gpu_kept:`) ([design](docs/perf-design/12-host-gpu-turbo.md), section 10;
+  in the simulator and why, with their simulator seconds (`host_gpu_kept:`) (design notes, since removed, section 10;
   Round sp66; pantheonsim #587). Measured on one A10G: the 45 programs whose decisions change go from 1.08x to 1.12x
   (exact) and from 1.20x to 1.60x (turbo) against the simulator, outputs identical; four short programs lose 0.13 to 0.24 s to the driver start.
 - Under `vgpu run --preload`, where the driver is loaded privately (#597), CUPTI and NVSHMEM now find it: they looked driver
@@ -808,7 +713,7 @@ GitHub Action. The list below is every entry that was under Unreleased.
   loop, reads how far each lane's induction register is from the bound its compare reads, and times one turn of the loop on one warp; the
   launch's simulator time is the turns left at that cost. Measured on one A10G (Round sp61): PolyBench COVAR 64.7 s to 41.8 s and CORR 64.8 s to
   42.0 s in both modes (their long kernel, 24.5 s in the simulator, takes 1.67 s on the card path), outputs identical. Grids of 256 blocks or more
-  are sampled as before; `VGPU_HOST_GPU_SAMPLE=whole` keeps the rule of Round sp60b ([design](docs/perf-design/12-host-gpu-turbo.md), section 8).
+  are sampled as before; `VGPU_HOST_GPU_SAMPLE=whole` keeps the rule of Round sp60b (design notes, since removed, section 8).
 - Host-GPU mode (experimental, opt-in), both `exact` and `turbo`: a launch of a kernel with a loop that the mode knows nothing of yet is now *sampled*
   before the simulator is left to run it. The process is forked, the copy runs a few of the launch's blocks (up to 32, a few milliseconds), reports
   their times and ends; if they say that the launch repays the card path and the start of the real driver, the card runs the launch, otherwise
@@ -817,7 +722,7 @@ GitHub Action. The list below is every entry that was under Unreleased.
   the sampling off; `=log` reports what it would do with no card. Measured on one A10G (Round sp60b): PolyBench SYRK 5.16 s to 1.30 s, SYR2K
   9.81 s to 2.37 s, 2MM 172 s to 122 s in both modes, HeCBench black-scholes 25.1 s to 6.1 s in turbo; geometric mean over 61 programs from 1.12x
   to 1.18x (`exact`) and from 1.14x to 1.27x (`turbo`) against the simulator, outputs identical. Kernels launched on a few large blocks (PolyBench
-  COVAR, CORR) are not reached ([design](docs/perf-design/12-host-gpu-turbo.md), section 8; pantheonsim #587).
+  COVAR, CORR) are not reached (design notes, since removed, section 8; pantheonsim #587).
 - Host-GPU mode (experimental, opt-in): `VGPU_HOST_GPU=turbo` also runs on the machine's real GPU the kernels whose result is the
   card's own and not the simulator's bits: the approximate functions (`MUFU`), packed half arithmetic, float reductions, calls inside the
   kernel, tensor-core instructions and integer atomics that return a value; float atomics with a returned value, compare-and-swap and
@@ -830,7 +735,7 @@ GitHub Action. The list below is every entry that was under Unreleased.
   sm_89 as it was meant to be (the check did not recognise the decoder's spelling of the type). Measured on one A10G (Round sp59): geometric mean 1.23x over 59 programs
   of PolyBench/GPU, Rodinia and HeCBench against 1.12x for `exact`, outputs identical. `VGPU_HOST_GPU_VERIFY` now gives the card copy up before the
   simulator runs the launch, in both modes: the simulator's atomics could lose updates under verify, and the card ran on its own earlier results.
-  [Design and limits](docs/perf-design/12-host-gpu-turbo.md); the benchmark harness is
+  Design and limits (notes since removed); the benchmark harness is
   `tools/bench/hostgpu/run.py`, the card probes `tools/probes/hostgpu_turbo_card_probes.sh`. `docs/cli.md` now lists every
   `VGPU_HOST_GPU_*` variable (pantheonsim #587).
 - Tier 2 (`VGPU_JIT=1`, still off by default), the cold run ([round sp63](docs/perf-design/rounds/11-rounds-sp36-sp41.md)): a section the

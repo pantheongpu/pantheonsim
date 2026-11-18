@@ -19,6 +19,5 @@ default is slower than form `x`.
 | `identity-t1.md` | `VGPU_THREADS=1`, one run each of a, a again, b, c, m with `VGPU_MEMO_FINAL_HASH`, `VGPU_COUNTERS_FILE` (pid removed) and `VGPU_KERNEL_DIGEST`: are the output and the three files of every form those of the default? (With `VGPU_COUNTERS_FILE` set, host-GPU mode turns itself off, so form `c` is here the variable alone.) |
 | `4cpu.md` | six programs on four logical CPUs of two cores (`taskset -c 0-3`, the shape of the A10G rig of round sp59), default threads, a and c, 7 runs each |
 | `warm-t1.md` | `VGPU_THREADS=1`: off against `VGPU_MEMO=1` with a `VGPU_MEMO_DIR`: one cold run, then the median of two warm runs; the hits are the last warm run's |
-| `sp59-baseline.md` | from round sp59's `bench.json` (branch `hostgpu-relaxed`): the forms that sent nothing to the card against the plain simulator, the plain simulator of one pass against another, the headline numbers with CORR and SYRK set to 1.00 |
 
 The per-run records (`runs-*.jsonl`, 1.1 MB) are not kept: every table here is `tables.py`, `identity.py` or the inline summaries over them.

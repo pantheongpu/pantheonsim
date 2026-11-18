@@ -537,7 +537,7 @@ Hash128 DeviceMemo::env_hash() {
   if (n == env_n_ && sig == env_sig_ && env_valid_) return env_hash_;
   static const char* const ignore[] = {"VGPU_MEMO",      "VGPU_COUNTERS", "VGPU_KERNEL_DIGEST", "VGPU_QUIET",    "VGPU_THREADS",
                                        "VGPU_TELEMETRY", "VGPU_SESSION",  "VGPU_STATE_DIR",     "VGPU_SASS_LOG", "VGPU_SASS_CACHE",
-                                       "VGPU_JIT_STATS", "VGPU_TIER_STATS", "VGPU_HOST_GPU_LOG", "VGPU_REGISTERS_DIR"};
+                                       "VGPU_JIT_STATS", "VGPU_TIER_STATS", "VGPU_REGISTERS_DIR"};
   std::vector<std::string> vars;
   for (char** e = environ; e && *e; ++e) {
     if (std::strncmp(*e, "VGPU_", 5) != 0) continue;

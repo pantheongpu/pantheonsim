@@ -168,13 +168,11 @@ bool is_bank(const std::string& name, unsigned* bank) {
 // Writes `value` into the instruction a code relocation names (vgpu/sass/reloc_patch.hpp).
 static void patch_code(CubinSection& s, const CubinReloc& r, uint64_t value) { patch_code_word(&s.bytes[r.offset], r.type, value); }
 
-// `mem` null: an analysis-only load (analyze()): the code is placed, decoded when asked for and its relocations that name code or a function the
-// simulator provides are applied, but nothing is checked against a device and no device memory is taken (the variables and banks get addresses
-// that exist nowhere, and their bytes are not written).
+// The loader behind load(). A null `mem` places and relocates the code without a device (no device memory is taken, nothing is checked against a
+// profile); nothing calls it that way now.
 static std::shared_ptr<Module> load_impl(const uint8_t* image, size_t size, MemoryManager* mem, const DeviceProfile* profile) {
   auto m = std::make_shared<Module>();
   m->cubin = parse_cubin(image, size);
-  if (const char* hg = std::getenv("VGPU_HOST_GPU"); mem && hg && *hg) m->image.assign(image, image + size);
   const Cubin& c = m->cubin;
   m->sm = c.sm;
   if (profile) {
@@ -361,7 +359,6 @@ static std::shared_ptr<Module> load_impl(const uint8_t* image, size_t size, Memo
 
 std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& mem, const DeviceProfile& profile) { return load_impl(image, size, &mem, &profile); }
 
-std::shared_ptr<Module> analyze(const uint8_t* image, size_t size) { return load_impl(image, size, nullptr, nullptr); }
 
 void rebind(Module& m, MemoryManager& mem, const std::string& name, uint64_t va) {
   const auto it = m.symbol_va.find(name);

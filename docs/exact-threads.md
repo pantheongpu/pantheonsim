@@ -152,7 +152,7 @@ The other ways a block could see the order of blocks are closed one by one:
 | textures and surfaces | not tried |
 | pinned, managed or registered host memory | reads are allowed and not noted (the shadow covers the device's range only; `host_load_batch` and `load_host_run` make no note at all): no block can write it, because every writing method stops the trial before a store to a host-mapped address, wherever the mapping is; the host itself writing it during a launch is as visible in order |
 | virtual-memory reservations, mappings and handles, memory shared with another process, file-backed allocations | not tried: the same bytes may be mapped at two addresses, which a shadow by address cannot see |
-| an armed fault (`vgpu fault arm`), the host-GPU card gate, the result cache, a memory trace | not tried |
+| an armed fault (`vgpu fault arm`), the result cache, a memory trace | not tried |
 | `VGPU_SASS_TRACE`, `VGPU_TRACE`, `VGPU_RACE`, `VGPU_TIER_STATS` | not tried: their output is in the order things ran |
 | an allocation, a free or a device-to-device copy during the launch | stops the trial |
 | the warp clocks (`SR_CLOCK*`) | a count of the warp's own instructions: the same in any order |

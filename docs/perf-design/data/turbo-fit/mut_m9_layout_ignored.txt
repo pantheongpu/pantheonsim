@@ -1,4 +1,0 @@
-== unit m9_layout_ignored
-[ FAIL ] the_card_image_must_lay_variables_out_as_the_simulator_s_does
-/home/saqib/.cache/pantheonsim-turbo-fit/tests/unit/test_host_gpu_logic.cpp:3180: VCHECK(!variable_layout_mismatch(cubin_with({{"a", ".nv.global", 0, 16}, {"b", ".nv.global", 24, 8}, {"c", ".nv.constant3", 0, 4}}), sim).empty()) f
-130/131 tests passed

@@ -419,7 +419,7 @@ uint64_t sass_max_steps(uint64_t configured) {
 // ---- kernels whose blocks wait on one another (vgpu/exec/lockstep.hpp) ----------------------------
 //
 // A kernel polls global memory when it has a loop with an atomic that returns its old value, or a
-// strong load (a volatile or turbo one, CTA scope aside), whose address and operands are the same
+// strong load (a volatile or relaxed one, CTA scope aside), whose address and operands are the same
 // on every turn of the loop, and no store to global memory anywhere in the loop: `while (atomicCAS(lock,
 // 0, 1)) {}`, `while (*(volatile int*)flag != n) {}`. A compare-and-swap retry loop is not one: the value
 // it swaps in comes from the old value, which changes. The test is cheap and errs towards "no": a
@@ -820,15 +820,6 @@ class Runner {
   void init_block(Block& blk, uint64_t linear);
   bool step_warp(Block& blk, Warp& w);
   void restore_uniforms(Warp& w, Mask group);
-  // Progress inside a block (exec::LaunchPart::probe, Round sp61): the block run until its warps stand in a followed loop, read there, and in the first
-  // block (`measure`) one warp run alone to time a turn of its loop. The block is left where it stands: the run is a copy's, thrown away.
-  void probe_block(Block& blk, exec::LaunchPart& part, bool measure);
-  // A block of a sample with bounded blocks (exec::LaunchPart::block_limit_s, Round sp75): true when the block was stopped at the limit (the
-  // sample ends there).
-  bool bounded_part_block(Block& blk, uint64_t unit, unsigned t, exec::LaunchPart& part, std::chrono::steady_clock::time_point part_t0);
-  double part_block_limit_s_ = 0;
-  int probe_loop_at(const exec::BlockProbe& p, uint64_t pc) const;
-  bool probe_value(const Warp& w, const exec::ProbeOperand& o, unsigned lane, uint32_t* v) const;
   // A warp's turn: up to `limit` calls of step_warp, ending early when it cannot run or yields. With the tier, a call may do the work
   // of several (the chain, tier_ops.inc): `budget` tells it how many calls the turn has left, `extra` how many it took over.
   template <bool Tier>
@@ -1559,17 +1550,6 @@ exec::LaunchStats Runner::run() {
   const uint64_t units = clustered_ ? blocks / csize_ : blocks;
   units_ = cfg_.cooperative ? 0 : units;   // a cooperative launch has every block running already
   std::atomic<uint64_t>& next = next_unit_;
-  // The first blocks only (exec::LaunchPart, host-GPU mode's sample): the one-thread loop below stops at the part's limit or budget.
-  exec::LaunchPart* const part = cfg_.part;
-  const auto part_t0 = std::chrono::steady_clock::now();
-  if (part) {
-    part->total = units;
-    part->next = 0;
-    if (cfg_.cooperative || clustered_) {   // not run in parts: no block is run
-      stats_.blocks = blocks;
-      return stats_;
-    }
-  }
   std::exception_ptr failure;
   std::mutex fail_mu;
   // A launch on one host thread has no one to wait for: nothing else sets `failure`, adds to the launch's counts or takes
@@ -1579,13 +1559,7 @@ exec::LaunchStats Runner::run() {
     PooledBlock held;
     Block& blk = *held.block;
     for (;;) {
-      if (part) {
-        const uint64_t taken = next.load(std::memory_order_relaxed);
-        if (taken >= part->limit) return;
-        if (part->budget_s > 0 && taken >= 1 && (part->timed_s >= part->budget_s || part->run_s >= 5 * part->budget_s)) return;
-      }
       uint64_t i = next.fetch_add(1);
-      if (part) i *= std::max<uint64_t>(part->stride, 1);
       if (i >= units) return;
       if (!solo) {
         std::lock_guard<std::mutex> g(fail_mu);
@@ -1596,33 +1570,11 @@ exec::LaunchStats Runner::run() {
           run_cluster(i, t);
           continue;
         }
-        if (part && part->probe) {   // progress inside the block, not the whole block (solo: a part runs on one thread)
-          init_block(blk, i);
-          blk.worker = t;
-          probe_block(blk, *part, part->next == 0);
-          continue;
-        }
-        if (part && part_block_limit_s_ > 0) {   // bounded blocks (exec::LaunchPart::block_limit_s, Round sp75): only in a sample's copy
-          if (bounded_part_block(blk, i, t, *part, part_t0)) return;
-          continue;
-        }
         init_block(blk, i);
         blk.worker = t;
         run_block(blk);
         if (solo) {
           stats_.add(blk.st);
-          if (part) {
-            // The block again, timed: its first run paid what the launch pays once.
-            const auto again = std::chrono::steady_clock::now();
-            if (part->first_block_s < 0) part->first_block_s = std::chrono::duration<double>(again - part_t0).count();
-            init_block(blk, i);
-            blk.worker = t;
-            run_block(blk);
-            const auto end = std::chrono::steady_clock::now();
-            part->timed_s += std::chrono::duration<double>(end - again).count();
-            part->run_s = std::chrono::duration<double>(end - part_t0).count();
-            ++part->next;
-          }
         } else {
           std::lock_guard<std::mutex> g(stats_mu_);
           stats_.add(blk.st);
@@ -1665,13 +1617,6 @@ exec::LaunchStats Runner::run() {
       exact = static_cast<unsigned>(std::min<uint64_t>(exact, units));
       if (const uint32_t sms = profile_.limits.multiprocessors) exact = std::min<unsigned>(exact, sms);
     }
-  }
-  if (part) {   // a part runs on the calling thread alone
-    part->threads = threads;
-    part_block_limit_s_ = exec::part_block_limit(*part, units, threads);
-    part->block_limit_used_s = part_block_limit_s_;
-    if (part->block_limit_s > 0 && part->need_s > 0 && !(part_block_limit_s_ > 0)) part->limit = 0;   // (no stopped block could show the launch is long: none is run)
-    threads = 1;
   }
   // Blocks that may wait on one another (vgpu/exec/lockstep.hpp): a kernel with a loop that polls
   // global memory runs the blocks the device holds at once together, taking turns.
@@ -1719,8 +1664,6 @@ exec::LaunchStats Runner::run() {
       }
     }
     for (Block& blk : all) stats_.add(blk.st);
-  } else if (lockstep && part) {
-    // Blocks that take turns are not run in parts: no block is run.
   } else if (lockstep) {
     const exec::LockstepShape shape = exec::lockstep_shape(units, capacity, threads, /*ranges=*/false, /*small_grid_spreads=*/loads_only);
     exec::lockstep_note(k_.name.c_str(), units, shape);
@@ -2420,187 +2363,6 @@ bool Runner::step_warp(Block& blk, Warp& w) {
     execute(blk, w, *ins, group);
     return true;
   }
-}
-
-// ---- progress inside a block (vgpu/exec/block_progress.hpp; host-GPU mode's sample, Round sp61) ------------------------------------------
-
-int Runner::probe_loop_at(const exec::BlockProbe& p, uint64_t pc) const {
-  for (unsigned i = 0; i < p.count && i < exec::kProbeLoops; ++i)
-    if (pc >= p.loops[i].lo && pc <= p.loops[i].hi) return static_cast<int>(i);
-  return -1;
-}
-
-// What a compare's operand holds for a lane at a pause; false for a register past the warp's file.
-bool Runner::probe_value(const Warp& w, const exec::ProbeOperand& o, unsigned lane, uint32_t* v) const {
-  switch (o.kind) {
-    case exec::ProbeOperand::Reg:
-      if (o.reg == kRZ) {
-        *v = 0;
-        return true;
-      }
-      if (o.reg >= w.nregs) return false;
-      *v = w.r[o.reg * 32 + lane];
-      return true;
-    case exec::ProbeOperand::UReg:
-      if (o.reg >= (m_.sm >= 100 ? 255u : 63u)) {
-        *v = 0;
-        return true;
-      }
-      *v = w.ur[o.reg];
-      return true;
-    case exec::ProbeOperand::Imm:
-      *v = static_cast<uint32_t>(o.imm);
-      return true;
-    case exec::ProbeOperand::CBank:
-      *v = cbank32(o.reg, static_cast<uint64_t>(o.imm));
-      return true;
-    default:
-      return false;
-  }
-}
-
-// A whole block as the part loop of run() runs it (twice, the second run timed), but its first run is stopped once it has lasted the limit.
-// The clock is read between rounds of short turns (kBoundedSlice steps a warp: a round of 4096, run_block's, can last longer than the limit
-// itself in a block of many warps). A block that ended in its first run is then run again whole and timed, exactly as an unbounded sample
-// times it. One that was stopped is run again from its start for as many rounds, and that run is the timed one: what the block did before it
-// was stopped, without what a launch pays once (decode, set-up, the copy's page faults), which is less than the block takes.
-bool Runner::bounded_part_block(Block& blk, uint64_t unit, unsigned t, exec::LaunchPart& part, std::chrono::steady_clock::time_point part_t0) {
-  constexpr int kBoundedSlice = 64;
-  const auto since = [](std::chrono::steady_clock::time_point a) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count(); };
-  init_block(blk, unit);
-  blk.worker = t;
-  uint64_t rounds = 0;
-  bool ended = true;
-  const auto first = std::chrono::steady_clock::now();
-  while (block_round(blk, kBoundedSlice)) {
-    ++rounds;
-    if (since(first) >= part_block_limit_s_) {
-      ended = false;
-      break;
-    }
-  }
-  stats_.add(blk.st);
-  const auto again = std::chrono::steady_clock::now();
-  if (part.first_block_s < 0) part.first_block_s = std::chrono::duration<double>(again - part_t0).count();
-  init_block(blk, unit);
-  blk.worker = t;
-  if (ended) {
-    run_block(blk);
-  } else {
-    for (uint64_t made = 0; made < rounds && block_round(blk, kBoundedSlice); ++made) {
-    }
-  }
-  const auto end = std::chrono::steady_clock::now();
-  part.timed_s += std::chrono::duration<double>(end - again).count();
-  part.run_s = std::chrono::duration<double>(end - part_t0).count();
-  ++part.next;
-  part.unfinished = !ended;
-  return !ended;
-}
-
-void Runner::probe_block(Block& blk, exec::LaunchPart& part, bool measure) {
-  const exec::BlockProbe& p = *part.probe;
-  const auto t0 = std::chrono::steady_clock::now();
-  const auto since = [&](std::chrono::steady_clock::time_point a) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count(); };
-  const auto live = [](const Warp& w) { return (w.alive & ~w.exited) != 0; };
-  const auto in_loop = [&](const Warp& w) {
-    for (Mask m = w.alive & ~w.exited; m; m &= m - 1)
-      if (probe_loop_at(p, w.pc[std::countr_zero(m)]) >= 0) return true;
-    return false;
-  };
-  // The turns a warp has left: the most of any lane standing in a followed loop.
-  const auto turns_left = [&](const Warp& w) {
-    double most = 0;
-    for (Mask m = w.alive & ~w.exited; m; m &= m - 1) {
-      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-      const int li = probe_loop_at(p, w.pc[l]);
-      if (li < 0) continue;
-      const exec::ProbeLoop& lp = p.loops[li];
-      uint32_t x = 0, b = 0;
-      if (!probe_value(w, lp.iv, l, &x) || !probe_value(w, lp.bound, l, &b)) continue;
-      most = std::max(most, exec::lane_turns_left(x, b, lp));
-    }
-    return most;
-  };
-  // 1. Every warp to the loop: rounds of short turns, so that they go together.
-  for (;;) {
-    if (!block_round(blk, 256)) break;   // (the block ended)
-    bool all = true;
-    for (const Warp& w : blk.warps)
-      if (live(w) && !in_loop(w)) {
-        all = false;
-        break;
-      }
-    if (all || since(t0) >= p.enter_s) break;
-  }
-  // 2. Read.
-  exec::BlockReading r;
-  Warp* most = nullptr;
-  double most_turns = -1;
-  for (Warp& w : blk.warps) {
-    r.steps += static_cast<double>(w.steps);
-    if (!live(w)) continue;
-    if (!in_loop(w)) {
-      ++part.warps_unfollowed;
-      continue;
-    }
-    ++part.warps_followed;
-    const double t = turns_left(w);
-    r.turns += t;
-    if (t > most_turns) {
-      most_turns = t;
-      most = &w;
-    }
-  }
-  // 3. The first block: its warp with the most turns left runs alone, and the turns its induction register moves time one turn.
-  if (measure && most) {
-    Warp& w = *most;
-    uint32_t before[32] = {};
-    int loop_of[32];
-    for (unsigned l = 0; l < 32; ++l) {
-      loop_of[l] = -1;
-      if (!(((w.alive & ~w.exited) >> l) & 1)) continue;
-      const int li = probe_loop_at(p, w.pc[l]);
-      if (li >= 0 && probe_value(w, p.loops[li].iv, l, &before[l])) loop_of[l] = li;
-    }
-    const uint64_t steps0 = w.steps;
-    const auto t1 = std::chrono::steady_clock::now();
-    bool left = false;
-    while (since(t1) < p.measure_s) {
-      bool progress = false;
-      if (tier_) turn<true>(blk, w, 4096, progress);
-      else turn<false>(blk, w, 4096, progress);
-      w.yield = false;
-      if (!live(w) || !in_loop(w)) {
-        left = true;
-        break;
-      }
-      if (!progress) break;   // (it waits for warps that are not running: what it ran is the measure)
-    }
-    exec::TurnMeasure& m = part.measure;
-    m.seconds = since(t1);
-    m.steps = w.steps - steps0;
-    m.left = left;
-    if (left) {
-      m.turns = most_turns;
-    } else {
-      double turns = 0;
-      for (unsigned l = 0; l < 32; ++l) {
-        uint32_t after = 0;
-        if (loop_of[l] < 0 || !(((w.alive & ~w.exited) >> l) & 1) || probe_loop_at(p, w.pc[l]) != loop_of[l] ||
-            !probe_value(w, p.loops[loop_of[l]].iv, l, &after))
-          continue;
-        turns = std::max(turns, exec::turns_between(before[l], after, p.loops[loop_of[l]]));
-      }
-      m.turns = turns;
-    }
-  }
-  if (part.next < exec::LaunchPart::kReadings) part.readings[part.next] = r;
-  const double took = since(t0);
-  if (part.first_block_s < 0) part.first_block_s = took;
-  part.timed_s += took;
-  part.run_s = part.timed_s;
-  ++part.next;
 }
 
 // Whether an instruction leaves every lane's pc to its caller (see step_warp).

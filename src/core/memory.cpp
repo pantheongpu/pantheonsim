@@ -202,9 +202,6 @@ void MemoryManager::remember_freed(uint64_t ptr, uint64_t size) {
 void MemoryManager::free(uint64_t ptr) {
   if (spec_) [[unlikely]] spec_refuse("a free during the launch");
   if (memo_sink_) memo_sink_->on_free(ptr);
-  // The gate is told of every free, not only while some allocation holds a card copy: it tracks allocations that have none (a launch the size rule
-  // refused still registers them), and an entry that outlives its allocation points into a freed record and reads freed memory.
-  if (CardGate* gate = card_gate_.load(std::memory_order_acquire)) gate->before_free(ptr);
   // Quiet: a free says which allocation it takes (note_free) and leaves every other answer a thread
   // remembered as it was.
   ExclusiveGuard table_guard(table_lock_.get(), /*quiet=*/true);
@@ -367,10 +364,6 @@ uint64_t MemoryManager::mapped_run(uint64_t addr, uint64_t len) const {
 
 const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t len, const char* op,
                                                         uint64_t* base_out, bool writing, bool page_slack) const {
-  if (card_resident_.load(std::memory_order_relaxed) > 0)
-    if (CardGate* gate = card_gate_.load(std::memory_order_acquire))
-      // A kernel-style scalar store asks for "device memory write" without the writing flag (which would also change the read-only checks).
-      gate->before_access(addr, len, writing || (op && std::strcmp(op, "device memory write") == 0));
   SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);
   if (up != live_.begin()) {
@@ -449,8 +442,6 @@ struct LookupMemory {
     const void* allocation = nullptr;
   };
   Entry way[kWays];
-  Entry card;            // the allocation with a valid card copy this thread's scalar accesses found last (resolve_scalar, while a card gate is in play):
-                         // kept apart from the ways, whose hits never look at the card copy
   unsigned last = 0;     // the way that answered last: the next lookup tries it first
   unsigned prev = 0;     // the way that answered before it: the miss path tries it second (a kernel that reads one allocation and
                          // writes another alternates between two)
@@ -527,7 +518,7 @@ bool MemoryManager::lookup_cache_default() {
 }
 
 // The table lookup behind a miss in the memory of recent lookups.
-[[gnu::noinline]] MemoryManager::Found MemoryManager::find_ordinary_miss(uint64_t addr, uint64_t len, void* memory, bool card_ok) const {
+[[gnu::noinline]] MemoryManager::Found MemoryManager::find_ordinary_miss(uint64_t addr, uint64_t len, void* memory) const {
   BigReaderLock* lock = table_lock_.get();
   LookupMemory& mem = *static_cast<LookupMemory*>(memory);
   const uint64_t epoch = lock->epoch();
@@ -556,10 +547,6 @@ bool MemoryManager::lookup_cache_default() {
   const Allocation& a = prev->second;
   const uint64_t off = addr - prev->first;
   if (!(off < a.size && len <= a.size - off)) return {nullptr, 0};
-  if (a.card_valid.load(std::memory_order_relaxed) != 0) {   // a card copy: every access asks the gate
-    if (card_ok) return {&a, prev->first};   // (the scalar path asks it itself, and never remembers this answer)
-    return {nullptr, 0};   // everything else takes resolve(), which asks it
-  }
   if (&mem == &g_ended_lookups) return {&a, prev->first};
   // The epoch read under the shared lock cannot move while it is held.
   uint32_t v = mem.victim;
@@ -576,7 +563,7 @@ bool MemoryManager::lookup_cache_default() {
 }
 
 [[gnu::always_inline]] inline const MemoryManager::Allocation* MemoryManager::find_ordinary(
-    uint64_t addr, uint64_t len, uint64_t* base_out, uint8_t* hint, bool card_ok) const {
+    uint64_t addr, uint64_t len, uint64_t* base_out, uint8_t* hint) const {
   BigReaderLock* lock = table_lock_.get();
   if (!lock || !lookup_cache_) return nullptr;
   LookupMemory& mem = lookups();
@@ -591,7 +578,7 @@ bool MemoryManager::lookup_cache_default() {
     if (base_out) *base_out = e.base;
     return static_cast<const Allocation*>(e.allocation);
   }
-  const Found f = find_ordinary_miss(addr, len, &mem, card_ok);
+  const Found f = find_ordinary_miss(addr, len, &mem);
   if (f.a) {
     if (base_out) *base_out = f.base;
     if (hint) __atomic_store_n(hint, static_cast<uint8_t>(mem.last), __ATOMIC_RELAXED);
@@ -619,43 +606,6 @@ bool MemoryManager::lookup_cache_default() {
 const MemoryManager::Allocation& MemoryManager::resolve_scalar(uint64_t addr, uint64_t len, const char* op,
                                                                uint64_t* base_out, bool writing,
                                                                bool page_slack) const {
-  if (card_resident_.load(std::memory_order_relaxed) > 0) {
-    // A card gate is in play (host-GPU mode). resolve() asks the gate and then looks the allocation up, and the lookup above has already found a card-valid
-    // allocation's record under the table lock for nothing (it is never remembered, so every access repeated it): ask the gate here, for the allocation
-    // that lookup found, and return it as resolve() would (an access wholly inside it; anything else is resolve()'s, diagnostics and all).
-    // The thread remembers the card-valid allocation it found last (the way the lookup memory does for the others, under the table lock's epoch), so an access to
-    // it takes neither the table lock nor the map; the gate is asked on every access, as before.
-    BigReaderLock* lock = table_lock_.get();
-    LookupMemory* mem = lock && lookup_cache_ ? &lookups() : nullptr;
-    const uint64_t epoch = mem ? lock->epoch() : 0;   // (read before the lookup: a table that changes after it voids the entry made below)
-    if (mem && epoch != 0 && mem->card.epoch == epoch) {
-      const uint64_t off = addr - mem->card.base;
-      if (off < mem->card.size && len <= mem->card.size - off) {
-        const Allocation* a = static_cast<const Allocation*>(mem->card.allocation);
-        if (a->card_valid.load(std::memory_order_relaxed) != 0)
-          if (CardGate* gate = card_gate_.load(std::memory_order_acquire))
-            gate->before_access(addr, len, writing || (op && std::strcmp(op, "device memory write") == 0));
-        if (base_out) *base_out = mem->card.base;
-        return *a;
-      }
-    }
-    uint64_t base = 0;
-    if (const Allocation* a = find_ordinary(addr, len, &base, nullptr, /*card_ok=*/true)) {
-      if (a->card_valid.load(std::memory_order_relaxed) != 0) {
-        if (CardGate* gate = card_gate_.load(std::memory_order_acquire))
-          gate->before_access(addr, len, writing || (op && std::strcmp(op, "device memory write") == 0));
-        if (mem && mem != &g_ended_lookups) {
-          mem->card.epoch = epoch;
-          mem->card.base = base;
-          mem->card.size = a->size;
-          mem->card.allocation = a;
-        }
-      }
-      if (base_out) *base_out = base;
-      return *a;
-    }
-    return resolve(addr, len, op, base_out, writing, page_slack);
-  }
   if (const Allocation* a = find_ordinary(addr, len, base_out)) return *a;
   return resolve(addr, len, op, base_out, writing, page_slack);
 }
@@ -664,11 +614,10 @@ const MemoryManager::Allocation& MemoryManager::resolve_scalar(uint64_t addr, ui
 // one) comes here once per lane, so it asks the thread's memory of recent lookups first, as a scalar access does (resolve_scalar), and
 // takes the shared table lock only on a miss: the answer is the allocation resolve() finds (a hit is an allocation of live_ that holds
 // the whole access, with nothing a table lookup adds: page slack is not asked here), and an access that is not one is resolve()'s, errors
-// and all. Not while a card gate is in play (card_resident_): resolve() asks the gate before it looks.
+// and all.
 const MemoryManager::Allocation& MemoryManager::resolve_bulk(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
                                                              bool writing) const {
-  if (card_resident_.load(std::memory_order_relaxed) <= 0)
-    if (const Allocation* a = find_ordinary(addr, len, base_out)) return *a;
+  if (const Allocation* a = find_ordinary(addr, len, base_out)) return *a;
   return resolve(addr, len, op, base_out, writing);
 }
 
@@ -1266,7 +1215,6 @@ void MemoryManager::unmap_host(uint64_t addr) {
       if (retired.size() >= kRetiredHostMaps) retired.erase(retired.begin());
       retired.push_back(HostMap{v[i].base, v[i].len, nullptr});
       v.erase(v.begin() + static_cast<long>(i));
-      host_maps_->unmaps.fetch_add(1, std::memory_order_relaxed);
       host_maps_->gen.store(fresh_generation(), std::memory_order_release);
       break;
     }
@@ -1274,7 +1222,6 @@ void MemoryManager::unmap_host(uint64_t addr) {
 
 void MemoryManager::free_all() {
   if (memo_sink_) memo_sink_->on_poison("free_all");
-  if (CardGate* gate = card_gate_.load(std::memory_order_acquire)) gate->before_free(UINT64_MAX);
   // The heap's blocks go in the sweep below with every other allocation; its
   // record of them, and the budget they held, go here.
   std::lock_guard<std::mutex> heap_guard(heap_->mu);
@@ -1648,12 +1595,6 @@ bool MemoryManager::access_at(uint64_t va, bool* readable, bool* writable) const
 
 uint64_t MemoryManager::share(uint64_t ptr, const std::string& path) {
   if (memo_sink_) memo_sink_->on_poison("share");
-  // The exported file is the allocation from here on: whatever only the card holds comes back first.
-  // (the allocation leaves live_ below, for a file: the gate drops what it tracks of it as well)
-  if (CardGate* gate = card_gate_.load(std::memory_order_acquire)) {
-    if (card_resident_.load(std::memory_order_relaxed) > 0) gate->before_access(ptr, UINT64_MAX / 2, false);
-    gate->before_free(ptr);
-  }
   ExclusiveGuard table_guard(table_lock_.get());
   if (const auto it = shared_.find(ptr); it != shared_.end()) return it->second.size;
   const auto live = live_.find(ptr);
@@ -1758,15 +1699,6 @@ uint8_t* MemoryManager::host_address(uint64_t addr, uint64_t len) const {
   if (h.read_only) throw_read_only_host_write(addr, len);
   return h.host + (addr - h.base);
 }
-
-std::vector<MemoryManager::HostSpan> MemoryManager::host_spans() const {
-  std::vector<HostSpan> out;
-  std::lock_guard<std::mutex> lock(host_maps_->mu);
-  for (const HostMap& m : host_maps_->maps) out.push_back(HostSpan{m.base, m.len, m.host, m.read_only});
-  return out;
-}
-
-uint64_t MemoryManager::host_unmaps() const { return host_maps_->unmaps.load(std::memory_order_relaxed); }
 
 bool MemoryManager::is_host_mapped(uint64_t addr) const {
   // Nothing mapped near it: no lock, as before any buffer was mapped at all.
@@ -1876,7 +1808,6 @@ const MemoryManager::Allocation* MemoryManager::run_allocation(uint64_t addr, ui
   auto prev = std::prev(up);
   *base = prev->first;
   if (addr - *base >= prev->second.size || len > prev->second.size - (addr - *base)) return nullptr;
-  if (prev->second.card_valid.load(std::memory_order_relaxed) != 0) return nullptr;
   return &prev->second;
 }
 
@@ -2021,34 +1952,12 @@ void MemoryManager::read_chunks(const Allocation& a, uint64_t off, uint8_t* d, u
   }
 }
 
-std::atomic<uint32_t>* MemoryManager::card_slot(uint64_t base) const {
-  SharedGuard table_guard(table_lock_.get());
-  const auto it = live_.find(base);
-  return it == live_.end() ? nullptr : const_cast<std::atomic<uint32_t>*>(&it->second.card_valid);
-}
-
-void MemoryManager::card_void_lookups(const std::vector<uint64_t>& bases) {
-  ExclusiveGuard table_guard(table_lock_.get(), /*quiet=*/true);
-  for (uint64_t b : bases) table_lock_->note_free(b);
-}
-
 std::vector<std::pair<uint64_t, uint64_t>> MemoryManager::live_ranges() const {
   SharedGuard table_guard(table_lock_.get());
   std::vector<std::pair<uint64_t, uint64_t>> out;
   out.reserve(live_.size());
   for (const auto& [base, a] : live_) out.emplace_back(base, a.size);
   return out;
-}
-
-const char* MemoryManager::card_blocker() const {
-  {
-    SharedGuard table_guard(table_lock_.get());
-    if (!maps_.empty()) return "virtual memory mappings (cuMemMap) hold device memory the card copy would lack";
-    if (!shared_.empty()) return "memory shared with another process (IPC) is outside the card copy";
-  }
-  if (heap_used() != 0) return "the device heap (kernel malloc) holds device memory the card copy would lack";
-  if (peer_linked()) return "peer access links this device's memory with another device's, which the card copy would lack";
-  return nullptr;
 }
 
 void MemoryManager::set_peer(MemoryManager& peer, bool enabled) {
