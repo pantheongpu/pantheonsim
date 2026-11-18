@@ -43,7 +43,9 @@ void put(std::string& s, T v) {
 // A cubin for sm_90 with one kernel taking one 8-byte pointer (the layout of test_sass_store_gate, with the architecture 90).
 std::string make_cubin(const std::vector<Insn>& code) {
   const std::string names("\0.shstrtab\0.text.k\0.nv.info.k\0", 31);
-  std::string info;   // KPARAM_INFO: index, ordinal | offset << 16, size << 18
+  std::string info;   // PARAM_CBANK (sm_90 keeps the parameters at 0x210; the default is 0x160), then KPARAM_INFO: index, ordinal | offset << 16, size << 18
+  put<uint8_t>(info, 4), put<uint8_t>(info, 0x0a), put<uint16_t>(info, 8);
+  put<uint32_t>(info, 0), put<uint32_t>(info, (8u << 16) | 0x210);
   put<uint8_t>(info, 4), put<uint8_t>(info, 0x17), put<uint16_t>(info, 12);
   put<uint32_t>(info, 0), put<uint32_t>(info, 0), put<uint32_t>(info, 8u << 18);
   std::string out(64, '\0');
