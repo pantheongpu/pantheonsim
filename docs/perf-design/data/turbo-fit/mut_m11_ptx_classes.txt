@@ -1,7 +1,0 @@
-== unit m11_ptx_classes
-131/131 tests passed
-FAIL: VGPU_HOST_GPU_ATOMICS=0 did not keep a PTX module with a float atomic out of the card:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 1 cuInit; 1 cuMemAddressReserve; 1 cuModuleLoadData; 1 image ptx;
-FAIL: VGPU_HOST_GPU_ATOMICS=0: no class line for the PTX module: 
-FAIL: VGPU_HOST_GPU_TURBO_OFF=atomics did not keep a PTX module with a float atomic out of the card:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 1 cuInit; 1 cuMemAddressReserve; 1 cuModuleLoadData; 1 image ptx;
-FAIL: VGPU_HOST_GPU_TURBO_OFF=atomics: no class line for the PTX module: 
-STUB_DONE

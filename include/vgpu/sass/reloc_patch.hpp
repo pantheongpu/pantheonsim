@@ -1,5 +1,4 @@
-// Writing a resolved address into the instruction a code relocation names (shared by the module loader, src/sass/module.cpp, and the
-// host-GPU mode's card image, vgpu/host_gpu_image.hpp).
+// Writing a resolved address into the instruction a code relocation names (used by the module loader, src/sass/module.cpp).
 #pragma once
 
 #include <cstdint>

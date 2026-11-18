@@ -92,7 +92,7 @@ current sources.)
 
 What is measured, what the knobs do, and what was tried without gain: [docs/performance.md](docs/performance.md). Open or opt-in:
 
-- Tier 2 (`VGPU_JIT=1`), launch-level result caching (`VGPU_MEMO=1`) and host-GPU mode (`VGPU_HOST_GPU`) are opt-in; making any a default
+- Tier 2 (`VGPU_JIT=1`) and launch-level result caching (`VGPU_MEMO=1`) are opt-in; making any a default
   needs its own measurement ([docs/perf-design/](docs/perf-design/README.md)).
 - Release-wide PGO was measured to give no speed-up on held-out programs and stays an opt-in tool ([docs/pgo.md](docs/pgo.md)).
 - Leads measured below the bar and not built (store-forward stalls, register-file clear, memory counting in the PTX and AMD engines, ...):

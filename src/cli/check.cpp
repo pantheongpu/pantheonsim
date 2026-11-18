@@ -2,7 +2,7 @@
 //
 // The simulator's claim is that it computes what the card computes. This is the command that tests the claim on one program: the same
 // binary, once with NVIDIA's own libraries (the card) and once with the simulator's libraries in front, with the simulated profile
-// equal to the card. It changes nothing in the simulator; it only runs it. See docs/perf-design/08-host-gpu-opt-in-scope.md (Phase 0).
+// equal to the card. It changes nothing in the simulator; it only runs it.
 //
 // A comparison is only worth reading if the card agrees with itself, so the program is run on the card twice and lines that differ
 // between those two runs are set aside before the simulator is compared against either. What a comparison drops (timing lines) and

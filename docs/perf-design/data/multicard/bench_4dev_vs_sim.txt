@@ -1,9 +1,0 @@
-  31.38 s  out=613a2ec6  devices=4  4 0 1048576 65536 2
-  19.93 s  out=613a2ec6  devices=4 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_DEVICES=0  4 0 1048576 65536 2
-   0.93 s  out=613a2ec6  devices=4 VGPU_HOST_GPU=turbo  4 0 1048576 65536 2
-  32.17 s  out=613a2ec6  devices=4  4 1 1048576 65536 2
-  26.71 s  out=613a2ec6  devices=4 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_DEVICES=0  4 1 1048576 65536 2
-   0.92 s  out=613a2ec6  devices=4 VGPU_HOST_GPU=turbo  4 1 1048576 65536 2
-  32.88 s  out=613a2ec6  devices=4  4 2 1048576 65536 2
-  28.01 s  out=613a2ec6  devices=4 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_DEVICES=0  4 2 1048576 65536 2
-   1.15 s  out=613a2ec6  devices=4 VGPU_HOST_GPU=turbo  4 2 1048576 65536 2

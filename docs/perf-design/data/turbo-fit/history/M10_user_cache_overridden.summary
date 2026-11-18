@@ -1,2 +1,0 @@
-unit rc=0 0 FAIL lines; first: 
-stub rc=1 2 FAIL lines; first: FAIL: the user's CUDA_CACHE_PATH was overridden: '1 /tmp/vgpu-host-gpu-stub.HEVZJA/hist6/cuda-cache'
