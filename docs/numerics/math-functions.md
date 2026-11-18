@@ -274,7 +274,7 @@ rational arithmetic), and the paper's point, that the three orders give three an
 
 With `-use_fast_math` nvcc compiles `sinf`, `cosf`, `tanhf`, `sqrtf`, `logf` and `1/x` to the `MUFU` instruction with
 little or nothing around it. This is where the card and the simulator are known to differ most, from our own earlier
-measurement on an A10G ([Round sp59](../perf-design/rounds/11-rounds-sp36-sp41.md#round-sp59-turbo-host-gpu-mode-on-an-a10g)):
+measurement on an A10G (rounds sp44 and sp59, which are not kept in this repository):
 `MUFU.RCP` is 1 ulp off on about 13 % of mantissas, the card's `MUFU.SIN/COS` are fixed-point with about 3.6e-7 absolute
 error, and `tanh` differs on 5.6 % of float patterns. `mathfn_fast` puts every function of the set on that footing in one
 run.
@@ -738,9 +738,9 @@ Every one was re-recorded from a card run, not from the simulator, and says so i
 | `tests/unit/test_exec3.cpp` | 1 expected value: `div.full.f32` of 0x3cae08fc by 0x41e66e7d is 0x3a415888 (`a * MUFU.RCP(b)`), was the exact quotient 0x3a415887 | the same instruction on an RTX 3060 |
 
 Run and unchanged (they pass as they are, with the model on): every other unit test of the PTX interpreter, the SASS executor,
-the tier, the JIT, the SIMD kernels, the memo and the host-GPU logic (129 test programs), and the e2e tests whose programs
+the tier, the JIT, the SIMD kernels and the memo (129 test programs), and the e2e tests whose programs
 use these instructions: `e2e_simd_lane_forms`, `e2e_float_half_forms`, `e2e_round9_probe` (their card lines), `e2e_ptx_sweep`,
-`e2e_div_approx`, `e2e_sass_tier`, `e2e_sass_fastpath`, `e2e_host_gpu_stub`, and `e2e_sass_archs` (every e2e program built for
+`e2e_div_approx`, `e2e_sass_tier`, `e2e_sass_fastpath` and `e2e_sass_archs` (every e2e program built for
 ten architectures, each run from its SASS and from its PTX, which must print the same: 300 program and architecture pairs
 agree; its one failure on the build machine, `runtime_conformance` for sm_75, is two driver-entry checks of a partial build
 without the driver shim and fails the same way with `VGPU_MUFU_EXACT=0`). `numerics_cases.txt` did not change (the cards

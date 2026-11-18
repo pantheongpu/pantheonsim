@@ -72,21 +72,8 @@ All settings:
 | `counters` | `true` or `false` | `false` | Print exact per-launch performance counters |
 | `quiet` | `true` or `false` | `false` | Silence every simulator message on stderr |
 | `trace` | `true` or `false` | `false` | Log every runtime and driver entry point |
-| `host_gpu` | `off` or `exact` | `off` | Experimental: run kernels whose result is defined bit for bit on this machine's real NVIDIA GPU (the simulated model); the rest stays simulated |
-| `host_gpu_log` | `true` or `false` | `false` | Print each host_gpu decision with its numbers |
 
 Each setting is described in [docs/config.md](docs/config.md). It also runs [in a browser](https://pantheonsim.com/play/), [in CI](docs/github-action.md) and [in Docker](docs/docker.md).
-
-## Host-GPU exact mode
-
-PantheonSim runs everything on the CPU by default, and every run gives the same bits. On a machine that has the real NVIDIA GPU being simulated, one experimental mode hands kernel launches to that card to save time:
-
-| Mode | Setting | What runs on the card | What the program gets |
-|---|---|---|---|
-| Simulator (default) | `host_gpu: off` | Nothing | The simulator's result, the same bits every run |
-| Exact | `host_gpu: exact` or `VGPU_HOST_GPU=exact` | Only kernels the card computes bit for bit as the simulator does (integer and IEEE arithmetic) | The simulator's bits |
-
-Exact mode gives the simulator's bits: a launch whose kernel is outside that set, or that is too short to repay the card path, stays in the simulator. `VGPU_HOST_GPU_VERIFY=1` runs each launch both ways and compares the bytes. Counters, fault injection and the simulator's checks do not apply to launches that run on the card. Details: [how launches are chosen](docs/perf-design/12-host-gpu-size-rules.md), [all variables](docs/cli.md).
 
 ## How PantheonSim is developed
 

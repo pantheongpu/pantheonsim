@@ -25,7 +25,6 @@ Library calls (cuBLAS, rocBLAS GEMMs) are the only place a transfer to an NPU co
 - **Zero dependencies.** Each vendor has its own stack (XDNA: XRT and the amdxdna driver; Intel: OpenVINO; Qualcomm: QNN). Any use would be an opt-in plug-in loaded at run time, never a build dependency.
 - **Availability.** Most CI runners and our test machines have no NPU; the experiment needs one machine that does (server3, a Ryzen 7 PRO 8840U, is the candidate; **whether its driver stack is usable is not known**).
 - **Latency.** Host-to-NPU transfer and graph launch cost likely exceed the compute of small tiles.
-- **Competition.** Host-GPU mode (studies 7 to 12) already sends matrix work to a real card with far better software support.
 
 ## 4. The experiment that would settle it
 
@@ -41,4 +40,4 @@ BF16/FP16 approximate offload (a mode that is not bit-exact; decide only after s
 
 ## Status log
 
-- 2026-11-17: stub written; priority low until the host-GPU modes are further along.
+- 2026-11-17: stub written; priority low.

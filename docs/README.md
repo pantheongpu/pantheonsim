@@ -40,7 +40,7 @@ One line per document. Start with the repository [README](../README.md); the des
 ## Performance
 
 * [performance.md](performance.md): how fast it is, which switches matter, what did not pay off.
-* [perf-design/README.md](perf-design/README.md): design studies (tiering, JIT, memoisation, host GPU) and round notes.
+* [perf-design/README.md](perf-design/README.md): design studies (tiering, JIT, memoisation) and round notes.
 * [perf-design/rounds/README.md](perf-design/rounds/README.md): the full round-by-round measurement log, indexed.
 * [pgo.md](pgo.md): profile-guided release builds (opt-in).
 

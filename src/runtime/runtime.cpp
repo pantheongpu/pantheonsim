@@ -26,7 +26,6 @@
 
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/sass/exec.hpp"
-#include "vgpu/host_gpu_rt.hpp"
 #include "vgpu/exec/launch_env.hpp"
 #include "vgpu/host_stats.hpp"
 #include "vgpu/memory_backing.hpp"
@@ -238,44 +237,6 @@ void digest_launch(const MemoryManager& mem, const std::string& name, const std:
   }
 }
 
-
-// VGPU_HOSTGPU_CAPTURE=<dir> (host-gpu spike, M2): for the first VGPU_HOSTGPU_CAPTURE_MAX launches of each kernel (default 2),
-// write what a replay on a real card needs into <dir>/<seq>.*: the launch (kernel name, grid, block, shared bytes, argument
-// bytes) in .meta, the whole device memory before the launch in .pre (records of base, size, bytes) and after it in .post. The
-// card replay tool (docs/perf-design/data/round13/m2_replay.cu) loads the program's own cubin, pushes .pre to the same
-// virtual addresses, runs the kernel and compares the result with .post. Throwaway instrumentation, never on by default.
-struct HostGpuCapture {
-  const char* dir = std::getenv("VGPU_HOSTGPU_CAPTURE");
-  uint64_t per_kernel = [] { const char* e = std::getenv("VGPU_HOSTGPU_CAPTURE_MAX"); return e ? std::strtoull(e, nullptr, 10) : 2ull; }();
-  uint64_t max_bytes = [] { const char* e = std::getenv("VGPU_HOSTGPU_CAPTURE_MAXBYTES"); return e ? std::strtoull(e, nullptr, 10) : (768ull << 20); }();
-  std::mutex mu;
-  std::map<std::string, uint64_t> seen;
-  uint64_t seq = 0;
-};
-HostGpuCapture& hostgpu_capture() { static HostGpuCapture c; return c; }
-
-bool dump_memory(const MemoryManager& mem, const char* path, uint64_t max_bytes) {
-  const auto ranges = mem.live_ranges();
-  uint64_t total = 0;
-  for (const auto& r : ranges) total += r.second;
-  if (total > max_bytes) return false;
-  FILE* f = std::fopen(path, "wb");
-  if (!f) return false;
-  std::vector<uint8_t> buf;
-  for (const auto& [base, size] : ranges) {
-    const uint64_t hdr[2] = {base, size};
-    std::fwrite(hdr, 8, 2, f);
-    for (uint64_t at = 0; at < size;) {
-      const uint64_t n = std::min<uint64_t>(size - at, uint64_t{1} << 24);
-      buf.resize(n);
-      mem.read(base + at, buf.data(), n);
-      std::fwrite(buf.data(), 1, n, f);
-      at += n;
-    }
-  }
-  std::fclose(f);
-  return true;
-}
 
 }  // namespace
 
@@ -1175,7 +1136,7 @@ Device::Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemet
   install_fault_hook();
   if (const char* fh = std::getenv("VGPU_MEMO_FINAL_HASH"); fh && *fh) memo::final_hash_register(&mem_);
   // VGPU_MEMO=1: launch-level result caching (vgpu/runtime/memo.hpp). Not with a real GPU in the loop.
-  if (const memo::Config mc = memo::Config::from_env(); mc.enabled && !std::getenv("VGPU_HOST_GPU") && !std::getenv("VGPU_HOSTGPU_CAPTURE")) enable_memo(mc);
+  if (const memo::Config mc = memo::Config::from_env(); mc.enabled) enable_memo(mc);
 }
 
 Device::~Device() {
@@ -1236,58 +1197,10 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
     fault_->maybe_hang(fn.name, telemetry_, static_cast<uint32_t>(physical_));
   }
   try {
-    HostGpuCapture& cap = hostgpu_capture();
-    uint64_t cap_seq = ~0ull;
-    if (cap.dir && *cap.dir) {
-      std::lock_guard<std::mutex> g(cap.mu);
-      if (cap.seen[fn.name]++ < cap.per_kernel) {
-        cap_seq = cap.seq++;
-        char p[600];
-        std::snprintf(p, sizeof p, "%s/%06llu.pre", cap.dir, static_cast<unsigned long long>(cap_seq));
-        if (!dump_memory(mem_, p, cap.max_bytes)) cap_seq = ~0ull;
-        else {
-          std::snprintf(p, sizeof p, "%s/%06llu.meta", cap.dir, static_cast<unsigned long long>(cap_seq));
-          if (FILE* m = std::fopen(p, "w")) {
-            std::fprintf(m, "kernel %s\ngrid %u %u %u\nblock %u %u %u\nshared %u\nnargs %zu\n", fn.name.c_str(), cfg.grid[0], cfg.grid[1],
-                         cfg.grid[2], cfg.block[0], cfg.block[1], cfg.block[2], cfg.shared_bytes, args.size());
-            for (const auto& a : args) {
-              std::fprintf(m, "arg %zu ", a.size());
-              for (uint8_t b : a) std::fprintf(m, "%02x", b);
-              std::fprintf(m, "\n");
-            }
-            std::fclose(m);
-          }
-        }
-      }
-    }
-    const auto cap_t0 = std::chrono::steady_clock::now();
-    // VGPU_HOST_GPU=exact: the launch may run on the machine's real GPU (vgpu/host_gpu_rt.hpp); null when the mode is off.
-    hostgpu::Runtime* const hg = hostgpu::Runtime::for_device(profile_, ordinal_);
-    if (hg && hg->try_launch(fn, cfg, args, mem_)) {
-      if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(physical_), 0.0);
-      return;
-    }
-    // Host-GPU mode: the first blocks of a launch nothing is known of are timed in a forked copy of the process, and what they say may send the
-    // launch to the card (vgpu/host_gpu.hpp "The first blocks of a launch, timed"). Nothing of the sample exists in this process afterwards.
-    if (hostgpu::Runtime::SamplePlan plan; hg && hg->sample_plan(fn, &plan)) {
-      hostgpu::Runtime::SampleRun run;
-      run.driver_started_at_fork = hg->driver_start_begun();
-      run.part.block_limit_s = plan.block_limit_s;   // (bounded blocks, Round sp75: the copy's LaunchPart takes these three from here)
-      run.part.block_cap_s = plan.block_cap_s;
-      run.part.need_s = plan.need_s;
-      run.answered = sample_in_copy(fn, cfg, args, syms, plan.limit, plan.stride, plan.budget_s, plan.timeout_s, plan.probe, &run.part, &run.wall_s, &run.fork_s,
-                                    run.driver_started_at_fork ? hg : nullptr);
-      if (hg->sample_decide(fn, cfg, args, mem_, run)) {
-        if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(physical_), 0.0);
-        digest_launch(mem_, fn.name, args);
-        return;
-      }
-    }
-    if (hg) hg->before_simulated(mem_);
     // Launch-level result caching (vgpu/runtime/memo.hpp): a stored result is applied instead of running the kernel.
     memo::Ticket mt;
     exec::LaunchStats mstats;
-    if (memo_ && !hg && !(cap.dir && *cap.dir)) {
+    if (memo_) {
       memo::KernelRef kr;
       const exec::LaunchEnv* env = cfg.env;
       exec::LaunchEnv own_env;
@@ -1327,7 +1240,7 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
         return;
       }
     }
-    const auto sim_t0 = std::chrono::steady_clock::now();   // after the card path: a verify run does both, and the simulator's time is this alone
+    const auto sim_t0 = std::chrono::steady_clock::now();
     if (mt.active) {
       exec::LaunchStats rstats;
       try {
@@ -1342,18 +1255,6 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
     } else {
       run_kernel(fn, cfg, args, syms);
     }
-    if (hg) hg->note_simulated(fn, cfg, std::chrono::duration<double>(std::chrono::steady_clock::now() - sim_t0).count(), &mem_, &args);
-    if (cap_seq != ~0ull) {
-      char p[600];
-      const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - cap_t0).count();
-      std::snprintf(p, sizeof p, "%s/%06llu.time", cap.dir, static_cast<unsigned long long>(cap_seq));
-      if (FILE* t = std::fopen(p, "w")) { std::fprintf(t, "%.9f\n", secs); std::fclose(t); }
-      std::snprintf(p, sizeof p, "%s/%06llu.post", cap.dir, static_cast<unsigned long long>(cap_seq));
-      dump_memory(mem_, p, cap.max_bytes);
-      // VGPU_HOSTGPU_CAPTURE_STOP=<n>: the capture is the point; end the program once n launches are on disk.
-      static const uint64_t stop = [] { const char* e = std::getenv("VGPU_HOSTGPU_CAPTURE_STOP"); return e ? std::strtoull(e, nullptr, 10) : 0ull; }();
-      if (stop && cap_seq + 1 >= stop) std::_Exit(0);
-    }
     digest_launch(mem_, fn.name, args);
   } catch (const Error& e) {
     if (fault_) {
@@ -1367,241 +1268,6 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   }
 }
 
-// Runs the launch's first blocks in a forked copy of the process and returns what the copy measured. The copy has this thread alone (fork), runs the
-// blocks on it, writes the part's times to a pipe and ends with _exit: no handler, destructor or buffered output of the program runs in it, and what
-// it wrote to memory was its own (copy-on-write). A copy that does not answer within `timeout_s` (a lock another thread held when the process was
-// forked, a first block that is longer than that) is ended, and the caller has no estimate.
-namespace {
-std::mutex g_copies_mu;
-std::vector<pid_t> g_copies;   // sampled copies that answered and had not ended when last asked
-
-// Reaps the sampled copies that have ended; with `wait`, waits for the others too (they have answered and are on their way out). Returns how
-// many were still running when it was called.
-size_t reap_sample_copies(bool wait) {
-  std::lock_guard<std::mutex> g(g_copies_mu);
-  size_t running = 0;
-  for (size_t i = 0; i < g_copies.size();) {
-    pid_t r = waitpid(g_copies[i], nullptr, WNOHANG);
-    if (r == 0) {
-      ++running;
-      if (wait) {
-        while ((r = waitpid(g_copies[i], nullptr, 0)) < 0 && errno == EINTR) {}
-      }
-    }
-    if (r != 0) g_copies.erase(g_copies.begin() + static_cast<std::ptrdiff_t>(i));
-    else ++i;
-  }
-  return running;
-}
-}  // namespace
-
-bool Device::sample_in_copy(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, const std::vector<std::vector<uint8_t>>& args,
-                            const exec::SymbolTable* syms, uint64_t limit, uint64_t stride, double budget_s, double timeout_s, const exec::BlockProbe* probe,
-                            exec::LaunchPart* out, double* wall_s, double* fork_s, hostgpu::Runtime* driver_up) {
-  *wall_s = *fork_s = 0;
-  // Copies that answered are not waited for (a process takes a millisecond to be torn down): they are reaped at the next sample, and the mode's
-  // exit handler waits for the ones still there (reap_sample_copies), so the process leaves no child behind.
-  reap_sample_copies(false);
-  struct Message {
-    uint64_t next, total;
-    uint32_t threads;
-    double first_block_s, run_s, timed_s;
-    // progress inside the blocks (Round sp61): what LaunchPart::probe's run read
-    exec::BlockReading readings[exec::LaunchPart::kReadings];
-    exec::TurnMeasure measure;
-    uint64_t warps_followed, warps_unfollowed;
-    // bounded blocks (Round sp75): the last block counted was stopped at the limit, and the limit used
-    uint32_t unfinished;
-    double block_limit_used_s;
-  } msg{};
-  const auto t0 = std::chrono::steady_clock::now();
-  const auto since = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
-  int fds[2];
-  if (pipe2(fds, O_CLOEXEC) != 0) return false;
-  std::fflush(nullptr);   // (nothing buffered is in the copy to be written twice, whatever it does)
-  const pid_t pid = fork();
-  if (pid < 0) {
-    close(fds[0]);
-    close(fds[1]);
-    return false;
-  }
-  if (pid == 0) {
-    exec::g_sample_copy.store(true, std::memory_order_relaxed);
-    // The driver is up in the process this is a copy of (Round sp76): the copy takes every chunk as its own before it runs a block, and ends
-    // here, with no answer, if it cannot (vgpu/host_gpu_rt.hpp sample_copy_begin). It never calls the driver.
-    if (driver_up && !driver_up->sample_copy_begin()) _exit(5);
-    int status = 3;
-    try {
-      exec::LaunchPart part;
-      part.limit = limit;
-      part.stride = stride;
-      part.budget_s = budget_s;
-      part.probe = probe;
-      part.block_limit_s = out->block_limit_s;   // In fields the caller set on `out` (bounded blocks, Round sp75)
-      part.block_cap_s = out->block_cap_s;
-      part.need_s = out->need_s;
-      exec::LaunchConfig part_cfg = cfg;
-      part_cfg.part = &part;
-      run_kernel(fn, part_cfg, args, syms);
-      msg.next = part.next;
-      msg.total = part.total;
-      msg.threads = part.threads;
-      msg.first_block_s = part.first_block_s;
-      msg.run_s = part.run_s;
-      msg.timed_s = part.timed_s;
-      std::copy(std::begin(part.readings), std::end(part.readings), std::begin(msg.readings));
-      msg.measure = part.measure;
-      msg.warps_followed = part.warps_followed;
-      msg.warps_unfollowed = part.warps_unfollowed;
-      msg.unfinished = part.unfinished ? 1 : 0;
-      msg.block_limit_used_s = part.block_limit_used_s;
-      status = write(fds[1], &msg, sizeof msg) == static_cast<ssize_t>(sizeof msg) ? 0 : 4;
-    } catch (const std::exception& e) {
-      // (a launch that faults says so when the simulator runs it for the program; here only under VGPU_HOST_GPU_LOG=2)
-      if (const char* v = std::getenv("VGPU_HOST_GPU_LOG"); v && v[0] == '2') {
-        const std::string text = std::string("host_gpu: the sampled blocks of ") + fn.name + " threw: " + e.what() + "\n";
-        if (write(2, text.data(), text.size()) < 0) status = 3;
-      }
-    } catch (...) {
-    }
-    _exit(status);
-  }
-  *fork_s = since();
-  close(fds[1]);
-  size_t got = 0;
-  for (;;) {
-    const double left = timeout_s - since();
-    if (left <= 0) break;
-    pollfd p{fds[0], POLLIN, 0};
-    const int r = poll(&p, 1, std::max(1, static_cast<int>(left * 1000)));
-    if (r < 0 && errno == EINTR) continue;
-    if (r <= 0) break;
-    const ssize_t n = read(fds[0], reinterpret_cast<char*>(&msg) + got, sizeof msg - got);
-    if (n < 0 && errno == EINTR) continue;
-    if (n <= 0) break;   // (the copy ended without a whole answer)
-    got += static_cast<size_t>(n);
-    if (got == sizeof msg) break;
-  }
-  close(fds[0]);
-  if (got != sizeof msg) {
-    kill(pid, SIGKILL);
-    int st = 0;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-    // (what became of it, for the log: 3 is a launch that threw in the copy, 9 a copy that was ended for not answering, 5 a copy of a process
-    // with the driver up that found a chunk only the card held)
-    out->next = WIFEXITED(st) ? static_cast<uint64_t>(WEXITSTATUS(st)) : WIFSIGNALED(st) ? static_cast<uint64_t>(WTERMSIG(st)) : 0;
-  } else if (waitpid(pid, nullptr, WNOHANG) == 0) {
-    std::lock_guard<std::mutex> g(g_copies_mu);
-    g_copies.push_back(pid);
-  }
-  if (got == sizeof msg) {
-    out->next = msg.next;
-    out->total = msg.total;
-    out->threads = msg.threads;
-    out->first_block_s = msg.first_block_s;
-    out->run_s = msg.run_s;
-    out->timed_s = msg.timed_s;
-    std::copy(std::begin(msg.readings), std::end(msg.readings), std::begin(out->readings));
-    out->measure = msg.measure;
-    out->warps_followed = msg.warps_followed;
-    out->warps_unfollowed = msg.warps_unfollowed;
-    out->unfinished = msg.unfinished != 0;
-    out->block_limit_used_s = msg.block_limit_used_s;
-  }
-  *wall_s = since();
-  return got == sizeof msg;
-}
-
-void Device::check_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg) const {
-  // Both engines apply the kernel's __cluster_dims__ when the launch names no cluster, then validate.
-  exec::LaunchConfig c = in_cfg;
-  if (c.cluster == std::array<uint32_t, 3>{0, 0, 0}) c.cluster = fn.req_cluster;
-  exec::validate_launch(fn, c, profile_);
-}
-
-void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
-                        const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms, exec::LaunchStats* stats_out) {
-  // How many of this kernel's blocks the device holds at once: what a kernel whose blocks wait on one
-  // another needs to know (vgpu/exec/lockstep.hpp). The same figure cudaOccupancyMaxActiveBlocksPerMultiprocessor
-  // gives, times the SMs.
-  exec::LaunchConfig cfg = in_cfg;
-  // The environment is read in one pass for the whole launch: the caller's (the runtime's), or one made here.
-  exec::LaunchEnv own_env;
-  if (!cfg.env) {
-    own_env = exec::read_launch_env();
-    cfg.env = &own_env;
-  }
-  if (!cfg.resident_blocks && exec::lockstep_mode(cfg.env->lockstep) != exec::LockstepMode::Off) {
-    const uint64_t threads = uint64_t{cfg.block[0]} * cfg.block[1] * cfg.block[2];
-    if (threads && threads <= profile_.limits.max_threads_per_block) {
-      try {
-        const exec::KernelResources res = exec::kernel_resources(fn, profile_, static_cast<uint32_t>(threads), cfg.shared_bytes, true);
-        cfg.resident_blocks = uint64_t{res.occupancy.blocks_per_sm} * profile_.limits.multiprocessors;
-      } catch (const Error&) {
-        // The launch's own checks report what is wrong with the kernel; the blocks just run as before.
-      }
-    }
-  }
-  if (fn.sass) {
-    // SASS: the executor for machine code (nvidia/docs/sass.md), after the
-    // launch checks both engines make. __cluster_dims__ applies whether or
-    // not the launch names a cluster, as in the PTX engine.
-    exec::LaunchConfig c = cfg;
-    if (c.cluster == std::array<uint32_t, 3>{0, 0, 0}) c.cluster = fn.req_cluster;
-    exec::validate_launch(fn, c, profile_);
-    exec::LaunchStats st = sass::launch(*fn.sass, fn.name, c, args, mem_, profile_);
-    if (stats_out) *stats_out = st;
-    report_counters(ordinal_, fn.name, c, st);
-    if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(physical_), 0.0);   // the machine's slot, not the program's index
-    return;
-  }
-  if (!telemetry_) {
-    exec::LaunchStats st = exec::launch(fn, cfg, args, mem_, profile_, syms);
-    if (stats_out) *stats_out = st;
-    report_counters(ordinal_, fn.name, cfg, st);
-    return;
-  }
-  // Utilization is the real fraction of wall time spent executing kernels. The
-  // progress hook publishes it *during* the launch so a long kernel still shows
-  // live telemetry rather than freezing until it returns.
-  uint32_t ord = static_cast<uint32_t>(physical_);
-  telemetry::Publisher* pub = telemetry_;
-  const exec::LaunchStats st = exec::launch(fn, cfg, args, mem_, profile_, syms,
-               [pub, ord](double dt) { pub->note_kernel(ord, dt); });
-  if (stats_out) *stats_out = st;
-  report_counters(ordinal_, fn.name, cfg, st);
-  pub->note_kernel(ord, 0.0);
-}
-
-void Runtime::publish_identity(const DeviceProfile& p, int ordinal) {
-  telemetry::DeviceSample* d = telemetry_.device(static_cast<uint32_t>(ordinal));
-  if (!d) return;
-  telemetry::describe_device(p, ordinal, d);
-  telemetry_.refresh(static_cast<uint32_t>(ordinal));
-}
-
-
-Runtime::Runtime(const DeviceProfile& profile, int device_count, std::vector<int> physical, int machine) {
-  if (device_count < 1) throw Error::make(Err::InvalidValue, "device_count must be >= 1");
-  // Every device needs an address window of its own (memory.hpp).
-  static_assert(telemetry::kMaxDevices <= vgpu::kDeviceVaWindows);
-  if (physical.empty())
-    for (int i = 0; i < device_count; ++i) physical.push_back(i);
-  if (static_cast<int>(physical.size()) != device_count)
-    throw Error::make(Err::InvalidValue, "a physical device for each of the ", device_count, " devices");
-  for (int p : physical) machine = std::max(machine, p + 1);
-  if (machine > telemetry::kMaxDevices)
-    throw Error::make(Err::InvalidValue, "device_count must be <= ", telemetry::kMaxDevices);
-  // Telemetry describes the whole machine, each device in its own slot;
-  // the devices shown here are what this process makes busy.
-  telemetry_.set_device_count(static_cast<uint32_t>(machine));
-  for (int i = 0; i < machine; ++i) publish_identity(profile, i);
-  for (int i = 0; i < device_count; ++i)
-    devices_.push_back(std::make_unique<Device>(profile, i, telemetry_.active() ? &telemetry_ : nullptr,
-                                                physical[static_cast<size_t>(i)]));
-  for (auto& d : devices_) d->set_device_count(device_count);
-}
-
 Device& Runtime::device(int ordinal) {
   if (ordinal < 0 || ordinal >= device_count())
     throw Error::make(Err::InvalidValue, "invalid device ordinal ", ordinal, " (have ", device_count(),
@@ -1611,4 +1277,3 @@ Device& Runtime::device(int ordinal) {
 
 }  // namespace vgpu::runtime
 
-size_t vgpu::hostgpu::sample_copies_reap(bool wait) { return vgpu::runtime::reap_sample_copies(wait); }

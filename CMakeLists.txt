@@ -284,7 +284,6 @@ add_library(vgpu STATIC
   src/runtime/runtime.cpp
   src/runtime/memo.cpp
   src/runtime/host_stats.cpp
-  src/runtime/host_gpu.cpp
   src/runtime/shared_runtime.cpp
   src/runtime/visible_devices.cpp
   nvidia/src/device_attributes.cpp
@@ -1443,12 +1442,6 @@ endfunction()
 
 vgpu_unit_test(test_yamlish)
 vgpu_unit_test(test_check_compare)
-vgpu_unit_test(test_host_gpu_logic)
-vgpu_unit_test(test_host_gpu_ref)
-# The square root idiom of host-GPU exact mode (include/vgpu/host_gpu_idiom.hpp), on real nvcc SASS (tests/unit/host_gpu_idiom_sass.inc): no card.
-vgpu_unit_test(test_host_gpu_idiom)
-vgpu_unit_test(test_card_gate)
-vgpu_unit_test(test_host_gpu_track)
 target_include_directories(test_check_compare PRIVATE src/cli)
 vgpu_unit_test(test_profile)
 # What every shim call does around its body: ApiCall's reports, depth and argument hand-over, the inline flags.
@@ -4325,34 +4318,6 @@ vgpu_shard_tests(e2e_sass_tier ENV_VAR VGPU_SASS_TIER_SHARD LIST_ENV VGPU_SASS_T
 # (The sanitizer jobs narrow the shards' runs with VGPU_TIER_ARCHS and VGPU_TIER_PROGRAMS, which leaves three runs for eight shards: the partition is checked on
 # the script's whole list.)
 set_property(TEST e2e_sass_tier_shards_partition APPEND PROPERTY ENVIRONMENT "VGPU_TIER_ARCHS=" "VGPU_TIER_PROGRAMS=")
-
-# Host-GPU mode (include/vgpu/host_gpu.hpp, docs/perf-design/09-host-gpu-spike.md): VGPU_HOST_GPU=exact runs eligible launches on the machine's
-# real GPU. Skips (as on every hosted runner) when the machine has no card of a model the simulator knows.
-add_test(NAME e2e_host_gpu
-         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_gpu.sh)
-set_tests_properties(e2e_host_gpu PROPERTIES
-  DEPENDS vgpucudart
-  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-  SKIP_REGULAR_EXPRESSION "^SKIP:"
-  TIMEOUT 900)
-
-# The same mode's start-up on any machine, with a stand-in driver (nvidia/tests/e2e/host_gpu_stub_driver.c): lazy, off the launch path, failing cleanly.
-add_test(NAME e2e_host_gpu_stub
-         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_gpu_stub.sh)
-set_tests_properties(e2e_host_gpu_stub PROPERTIES
-  DEPENDS vgpucudart
-  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-  SKIP_REGULAR_EXPRESSION "^SKIP:"
-  TIMEOUT 600)
-
-# The host-GPU benchmark harness (tools/bench/hostgpu/run.py, docs/perf-design/12-host-gpu-size-rules.md): its self-test parses canned summary lines, classes
-# canned outputs, builds the table and kills a child that hangs. No card, no simulator, no nvcc.
-find_package(Python3 COMPONENTS Interpreter QUIET)
-if(Python3_Interpreter_FOUND)
-  add_test(NAME hostgpu_bench_selftest
-           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/bench/hostgpu/run.py --dry-run)
-  set_tests_properties(hostgpu_bench_selftest PROPERTIES TIMEOUT 120)
-endif()
 
 # Tier 2 (src/sass/jit.hpp, VGPU_JIT=1) against the tier, on the same programs: results and every counter, with the JIT forced on at once, one
 # and four host threads, a warm cache, the faults of sass_tier_steps, and every way the JIT can fail (the output must not change).

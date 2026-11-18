@@ -1944,7 +1944,6 @@ struct Manager {
   }
 
   void submit(Job job, std::shared_ptr<Unit> u) {
-    if (exec::g_sample_copy.load(std::memory_order_relaxed)) return;   // (a sample's copy of the process compiles nothing and writes no cache)
     const double at = stats_on() ? ms_since(g_loaded) : 0.0;
     if (sync) {
       run(job, u, at);
