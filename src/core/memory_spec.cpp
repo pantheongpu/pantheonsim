@@ -382,7 +382,6 @@ thread_local MemoryManager::Spec::Worker* t_spec_worker = nullptr;
 
 bool MemoryManager::spec_possible() const {
   if (memo_sink_ || memo_untrackable() || memo_faults_armed() || memo_trace_active()) return false;
-  if (card_gate_.load(std::memory_order_relaxed) || card_resident_.load(std::memory_order_relaxed) > 0) return false;
   SharedGuard table_guard(table_lock_.get());
   for (const auto& [base, a] : live_)
     if (a.external) return false;   // bytes that live in a file another process may map

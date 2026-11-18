@@ -125,7 +125,7 @@ No new test may rely on timing sleeps; use flags and events.
 4. Error paths: eager and sticky errors, `cudaDeviceReset` and `cudaFree` with a kernel pending, process exit with a kernel pending,
    capture and graph launches (`tests/lint/check_capture_coverage.py` stays green).
 5. Card comparison: the real-GPU check (`docs/ci-card-check.md`) is the way to confirm that a program that spins on the host behaves
-   as on hardware; until it exists, only the AWS card host (`card-host-gpu.yml`) can.
+   as on hardware; until it exists, only a run on a rented card can.
 6. Profiling: committed CUPTI and trace expected files unchanged.
 
 ## 6. Stages and effort

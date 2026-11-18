@@ -1,3 +1,0 @@
-[ FAIL ] wsl_is_read_from_the_kernel_version
-tests/unit/test_host_gpu_logic.cpp:3095: VCHECK(host_is_wsl("Linux version 5.15.0-Microsoft", false)) failed
-126/127 tests passed
