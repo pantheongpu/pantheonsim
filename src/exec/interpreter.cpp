@@ -5547,7 +5547,7 @@ class Interpreter {
     try {
       ctx_fail(ins, -1, Err::DataRace, msg);
     } catch (const Error& e) {
-      std::fprintf(stderr, "VirtualGPU error [data-race] (continuing): %s\n", e.what());
+      std::fprintf(stderr, "%s\n", e.what());   // VGPU_RACE_CONTINUE: the launch goes on
     }
     if (seen.size() == 50) std::fprintf(stderr, "VirtualGPU: 50 races reported, the rest are not printed\n");
   }
