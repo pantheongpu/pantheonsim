@@ -18,6 +18,7 @@ There are 48 (`vgpu list-gpus`): 38 NVIDIA and 10 AMD. Fourteen NVIDIA profiles 
 
 - Verified NVIDIA: T4, A10, A10G, A100 (`a100` and `a100-sxm4-40gb`), H100, H100 PCIe, L4, L40S, RTX 3060, RTX 3080 Ti, GH200, RTX PRO 6000 Server Edition, RTX PRO 4500.
 - Verified AMD: MI325X, RX 6800, RX 6700 XT.
+- **"512 conformance values"** means 256 values printed by `nvidia/tests/conformance/ptx_semantics.cu` plus 256 by `control_flow.cu`, run on a card and on the simulator and diffed (`nvidia/tools/verify-profile.sh`). It is a per-card check of NVIDIA profiles only. The card references committed to the tree are `nvidia/tests/data/card/l40s/` and `nvidia/tests/data/card/rtx-pro-6000-server/`; for the earlier cards the result is recorded in [nvidia/docs/profiles.md](../nvidia/docs/profiles.md) and [docs/history/TODO-done.md](history/TODO-done.md) and the reference files were not kept. The other docs link here instead of restating the list. `tests/lint/check_profile_counts.py` checks the counts on this page against the profile files.
 - Not verified: the rest, including H200, B200, B300, GB200, RTX 4090, RTX 5090, MI250X, MI300X, MI350X, MI455X, RX 6900 XT, RX 7900 XTX and RX 9070 XT.
 
 Details: [nvidia/docs/profiles.md](../nvidia/docs/profiles.md), [amd/README.md](../amd/README.md).

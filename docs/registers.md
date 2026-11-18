@@ -299,8 +299,8 @@ their live behaviour; every byte the database does not declare is the captured
 card's: its thirteen capabilities, from Virtual Channel and L1 substates to
 Resizable BAR and lane margining. `lspci -vvv` of the simulated RTX 3060 matches
 the real card's but for the IDs and the BAR addresses, and the
-`nvidia/rtx3080ti` profile -- characterized from the same card, verified on
-512 conformance values -- matches it byte for byte but for the BAR addresses its
+`nvidia/rtx3080ti` profile -- characterized from the same card, verified (see
+[docs/status.md](status.md#gpu-profiles) for what that covers) -- matches it byte for byte but for the BAR addresses its
 host's firmware chose. Other cards use the generic layout.
 
 An NVIDIA GPU whose id NVIDIA has not published (`nvidia/vr200`, `nvidia/thor`)

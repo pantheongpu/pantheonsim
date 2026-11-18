@@ -1,0 +1,40 @@
+== mut-theirs 1 / Ampere mma m16n8k16.f32.bf16
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 50 (R1 48, R2 40, R3 0, R4 0, none of the four 2)
+    corner coverage (vectors in each corner's neighbourhood): R1 27853, R2 22357, R3 27108, R4 0
+== mut-theirs 1 / Ampere mma m16n8k16.f16.f16
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 22324, R3 29088, R4 0
+== mut-theirs 1 / Hopper mma m16n8k8.f32.tf32
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 13 (R1 13, R2 13, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35545, R2 23330, R3 27147, R4 0
+== mut-theirs 2 / Ampere mma m16n8k16.f32.bf16
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 13874 (R1 12720, R2 6973, R3 1301, R4 0, none of the four 910)
+    corner coverage (vectors in each corner's neighbourhood): R1 27949, R2 22357, R3 27108, R4 0
+== mut-theirs 2 / Ampere mma m16n8k16.f16.f16
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 0 (R1 0, R2 0, R3 0, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 22324, R3 29088, R4 0
+== mut-theirs 2 / Hopper mma m16n8k8.f32.tf32
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 16366 (R1 16366, R2 7948, R3 1961, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35656, R2 23330, R3 27147, R4 0
+== mut-theirs 3 / Ampere mma m16n8k16.f32.bf16
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 91 (R1 0, R2 91, R3 0, R4 91, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 27853, R2 22357, R3 27108, R4 91
+== mut-theirs 3 / Ampere mma m16n8k16.f16.f16
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 600 (R1 0, R2 593, R3 4, R4 600, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 22324, R3 29088, R4 600
+== mut-theirs 3 / Hopper mma m16n8k8.f32.tf32
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 191 (R1 0, R2 191, R3 0, R4 191, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35545, R2 23330, R3 27147, R4 191
+== mut-theirs 4 / Ampere mma m16n8k16.f32.bf16
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 7715 (R1 6808, R2 2032, R3 2575, R4 0, none of the four 234)
+    corner coverage (vectors in each corner's neighbourhood): R1 27853, R2 22357, R3 27108, R4 0
+== mut-theirs 4 / Ampere mma m16n8k16.f16.f16
+  ours: Ampere (chunk 8 / tf32 4, G 25)                vectors 220000, mismatches 4 (R1 0, R2 1, R3 2, R4 0, none of the four 1)
+    corner coverage (vectors in each corner's neighbourhood): R1 0, R2 22324, R3 29088, R4 0
+== mut-theirs 4 / Hopper mma m16n8k8.f32.tf32
+  ours: Hopper (chunk 16 / tf32 8, G 26)               vectors 220000, mismatches 1832 (R1 1633, R2 0, R3 1832, R4 0, none of the four 0)
+    corner coverage (vectors in each corner's neighbourhood): R1 35545, R2 23330, R3 27147, R4 0
+# (each block: the transcription of MMA-Sim made deliberately wrong in one corner, `--mut-theirs N`, 220,000 vectors per form, run before the
+#  R4 coverage column was added; N: 1 no floor under a zero accumulator, 2 a subnormal f32 result rounded instead of cut, 3 a negative zero
+#  kept, 4 a subnormal accumulator positioned by its own leading bit. A block with 0 mismatches for an f16 accumulator under N 1 and 2 is
+#  expected: those corners do not exist for an f16 result of f16 inputs.)

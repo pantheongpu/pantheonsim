@@ -4544,6 +4544,9 @@ if(Python3_Interpreter_FOUND)
   # Relative links, anchors and docs/*.md references in the Markdown files resolve (seconds, no build).
   add_test(NAME lint_doc_links
            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lint/check_doc_links.py ${CMAKE_SOURCE_DIR})
+  # The profile counts in docs/status.md (and the digits restated in README, CONTRIBUTING, ARCHITECTURE) match the profile files.
+  add_test(NAME lint_profile_counts
+           COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lint/check_profile_counts.py ${CMAKE_SOURCE_DIR})
   # tools/bench/real/short.py puts every perf sample of a short program in a start-up phase by its call chain; the
   # rules are checked against chains of the shapes perf gives (seconds, no build, no perf).
   add_test(NAME lint_short_split_selftest

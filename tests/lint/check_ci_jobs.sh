@@ -184,6 +184,24 @@ out="$(CI_NOW=$((1000000 + 14401)) rj live --check asan 2>&1)"; rc=$?
 expect "an expired share is dropped: exit" 0 "$rc"
 expect "only the live job is in the ledger" "live" "$(rj a --reservations | awk '{ print $1 }')"
 rj live --release >/dev/null
+# A share whose run has ended (the runner was killed before --release) is dropped by a waiting --check
+# that asks the API (a file tree stands in for it); a run still going, or no answer, keeps its share.
+runs="$d/api/repos/o/r/actions/runs"; mkdir -p "$runs/111/attempts" "$runs/222/attempts"
+printf '{\n  "id": 111,\n  "status": "completed",\n  "conclusion": "failure"\n}\n' > "$runs/111/attempts/1"
+printf '{\n  "id": 222,\n  "status": "in_progress",\n  "jobs": [\n    {\n      "status": "completed"\n    }\n  ]\n}\n' > "$runs/222/attempts/1"
+api() { GH_TOKEN=t GITHUB_REPOSITORY=o/r GITHUB_API_URL="file://$d/api" rj "$@"; }
+rj 111-1-s-sass --check sass >/dev/null 2>&1 || fail "the share of the finished run was not taken"
+out="$(api 999-1-s-asan --check asan 2>&1)"; rc=$?
+expect "a job gets in once the share of a finished run is dropped: exit" 0 "$rc"
+[[ $out == *"dropped the share of 111-1-s-sass"* ]] || fail "the drop is not said: $out"
+expect "only the new job holds a share" "999-1-s-asan" "$(rj a --reservations | awk '{ print $1 }')"
+rj 999-1-s-asan --release >/dev/null
+rj 222-1-s-sass --check sass >/dev/null 2>&1 || fail "the share of the running run was not taken"
+api 999-1-s-asan --check asan >/dev/null 2>&1 && fail "a share of a run still going was dropped"
+rj 222-1-s-sass --release >/dev/null
+rj 333-1-s-sass --check sass >/dev/null 2>&1 || fail "the share of the unknown run was not taken"
+api 999-1-s-asan --check asan >/dev/null 2>&1 && fail "a share whose run could not be asked about was dropped"
+rj 333-1-s-sass --release >/dev/null
 # A capacity of two jobs lets two in and refuses the third.
 export CI_RESERVE_CAPACITY_GIB=10
 rj a --check sass >/dev/null 2>&1 || fail "capacity 10: the first was refused"
