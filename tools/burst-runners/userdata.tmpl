@@ -1,14 +1,15 @@
 #!/bin/bash
-# pantheonsim CI burst runner: two GitHub Actions runner processes on this
-# instance, for the SASS / ASan / TSan jobs (BURST_RUNS_ON). Each has the one label
-# pantheonsim-burst and none of the defaults (self-hosted, Linux, X64), so a job
-# that asks for any other label -- the ML job's pantheonsim-ci -- cannot be given to it. A watchdog shuts
+# CI burst runner: two GitHub Actions runner processes on this instance, registered with the
+# ORGANISATION (Default group) with GitHub's default labels plus pantheongpu, like the LAN runners,
+# so any job that asks for [self-hosted, pantheongpu] can run here. The ML job asks for the label
+# ml, which only the playground host's runner has. A watchdog shuts
 # the instance down (it terminates on shutdown) when no pull request is open, or
 # after TTL_HOURS whatever the state.
 set -uxo pipefail
 exec > >(tee /var/log/burst-setup.log | logger -t burst-setup -s 2>/dev/console) 2>&1
 export DEBIAN_FRONTEND=noninteractive
-REPO=pantheongpu/pantheonsim
+REPO=pantheongpu/pantheonsim   # the watchdog counts this repo's open pull requests
+ORG=pantheongpu
 TOKEN='__TOKEN__'
 RUNNER_VERSION=2.337.0
 NRUNNERS=2
@@ -16,6 +17,10 @@ TTL_HOURS=24
 
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends docker.io curl jq ca-certificates tar git sudo
+# pantheonsim-web's unit tests start a real sshd, which refuses to run without /run/sshd (the LAN runners have
+# it because their sshd service is up). Create it now and at every boot.
+apt-get install -y -qq --no-install-recommends openssh-server
+mkdir -p /run/sshd && echo 'd /run/sshd 0755 root root -' > /etc/tmpfiles.d/sshd.conf
 systemctl enable --now docker
 
 useradd -m -s /bin/bash runner
@@ -34,8 +39,8 @@ for i in $(seq 1 $NRUNNERS); do
   # (docker exec children outlive the runner's wait), which a non-root runner then cannot
   # delete at its next checkout. Root can, and these instances are disposable.
   (cd "$d" && echo RUNNER_ALLOW_RUNASROOT=1 >> .env \
-   && RUNNER_ALLOW_RUNASROOT=1 ./config.sh --unattended --url "https://github.com/$REPO" --token "$TOKEN" \
-      --name "burst-$IID-$i" --no-default-labels --labels pantheonsim-burst --replace --work _work \
+   && RUNNER_ALLOW_RUNASROOT=1 ./config.sh --unattended --url "https://github.com/$ORG" --token "$TOKEN" \
+      --name "burst-$IID-$i" --labels pantheongpu --replace --work _work \
    && ./svc.sh install root && ./svc.sh start)
 done
 

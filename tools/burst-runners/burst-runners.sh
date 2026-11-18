@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# A pool of AWS instances running GitHub Actions runners for the long CI jobs
-# (SASS, ASan, TSan: BURST_RUNS_ON in .github/workflows/ci.yml), for when the
-# pull request backlog is long.
+# A pool of AWS instances running GitHub Actions runners for the shared pool, for when the
+# queue is long. The runners belong to the ORGANISATION (Default group) and carry GitHub's
+# default labels plus `pantheongpu`, so any job that asks for [self-hosted, pantheongpu] --
+# this repo's BURST_RUNS_ON and the private repos' CI -- runs on whichever runner is free.
 #
 #   tools/burst-runners/burst-runners.sh start [instances]    (default 2)
 #   tools/burst-runners/burst-runners.sh status
@@ -9,23 +10,22 @@
 #   tools/burst-runners/burst-runners.sh stop-old <instance-id>...    (after BURST_REPLACE=1 start)
 #
 # start   launches the instances (two runner processes each, m7i.2xlarge,
-#         on-demand, no inbound access), waits for their runners to come online,
-#         then sets the repository variable BURST_RUNS_ON.
-# stop    unsets the variable, terminates the instances and removes their
-#         runners. The instances also shut themselves down (they terminate on
+#         on-demand, no inbound access) and waits for their runners to come online.
+#         BURST_RUNS_ON is not touched: it already names the shared pool.
+# stop    terminates the instances and removes their runners. The instances also shut themselves down (they terminate on
 #         shutdown) when no pull request has been open for 15 minutes, or after
 #         24 hours: userdata.tmpl.
 #
 # Needs the aws CLI (credentials for an account with room for the vCPUs) and an
-# authenticated gh with admin on the repository. Set AWS_PROFILE and AWS_REGION
+# authenticated gh with admin on the organisation (runner registration). Set AWS_PROFILE and AWS_REGION
 # as usual. The registration token is passed to the instances in their user
 # data and expires after an hour.
 set -euo pipefail
 cd "$(dirname "$0")"
-REPO="${BURST_REPO:-pantheongpu/pantheonsim}"
+REPO="${BURST_REPO:-pantheongpu/pantheonsim}"   # only for the open-PR count in `status`
+ORG="${BURST_ORG:-pantheongpu}"
 REGION="${AWS_REGION:-us-east-1}"
 TYPE="${BURST_INSTANCE_TYPE:-m7i.2xlarge}"
-LABEL=pantheonsim-burst
 TAG=pantheonsim-ci-burst
 export AWS_DEFAULT_REGION="$REGION"
 
@@ -33,7 +33,7 @@ instances() {
   aws ec2 describe-instances --filters "Name=tag:Project,Values=$TAG" \
     "Name=instance-state-name,Values=${1:-pending,running}" --query 'Reservations[].Instances[].InstanceId' --output text
 }
-runners() { gh api "repos/$REPO/actions/runners" --paginate --jq ".runners[] | select(.name | startswith(\"burst-\")) | \"\(.id) \(.name) \(.status)\""; }
+runners() { gh api "orgs/$ORG/actions/runners" --paginate --jq ".runners[] | select(.name | startswith(\"burst-\")) | \"\(.id) \(.name) \(.status)\""; }
 
 case "${1:-}" in
   start)
@@ -53,7 +53,7 @@ case "${1:-}" in
       sg=$(aws ec2 create-security-group --group-name pantheonsim-burst-runners --description "pantheonsim CI burst runners: outbound only" --vpc-id "$vpc" --query GroupId --output text)
     fi
     ud=$(mktemp); trap 'rm -f "$ud"' EXIT; chmod 600 "$ud"
-    tok=$(gh api -X POST "repos/$REPO/actions/runners/registration-token" --jq .token)
+    tok=$(gh api -X POST "orgs/$ORG/actions/runners/registration-token" --jq .token)
     sed "s/__TOKEN__/$tok/" userdata.tmpl > "$ud"; unset tok
     ids=$(aws ec2 run-instances --image-id "$ami" --instance-type "$TYPE" --count "$n" --subnet-id "$subnet" \
       --security-group-ids "$sg" --metadata-options HttpTokens=required,HttpEndpoint=enabled \
@@ -72,31 +72,29 @@ case "${1:-}" in
       sleep 20
     done
     runners | grep -E "burst-($pat)-"
-    [[ "$have" -ge "$want" ]] || { echo "only $have of $want runners online: not setting BURST_RUNS_ON; see 'aws ec2 get-console-output'"; exit 1; }
-    gh variable set BURST_RUNS_ON --repo "$REPO" --body "[\"$LABEL\"]"
-    echo "BURST_RUNS_ON set: the SASS, ASan and TSan jobs go to the pool"
+    [[ "$have" -ge "$want" ]] || { echo "only $have of $want runners online; see 'aws ec2 get-console-output'"; exit 1; }
+    echo "$have burst runners online in the shared pool ([self-hosted, pantheongpu])"
     ;;
   status)
     echo "instances: $(instances pending,running,stopping)"
-    echo "BURST_RUNS_ON: $(gh variable get BURST_RUNS_ON --repo "$REPO" 2>/dev/null || echo unset)"
+    echo "BURST_RUNS_ON: $(gh variable get BURST_RUNS_ON --repo "$REPO" 2>/dev/null || echo unset) (names the shared pool; left alone)"
     runners
     echo "open pull requests: $(gh pr list --repo "$REPO" --state open --json number --jq length)"
     ;;
   stop)
-    gh variable delete BURST_RUNS_ON --repo "$REPO" 2>/dev/null && echo "BURST_RUNS_ON unset" || true
     ids=$(instances pending,running,stopping)
     [[ -z "$ids" ]] || aws ec2 terminate-instances --instance-ids $ids --query 'TerminatingInstances[].[InstanceId,CurrentState.Name]' --output text
     # Their runners stay listed as offline until removed.
-    runners | while read -r id name _; do gh api -X DELETE "repos/$REPO/actions/runners/$id" && echo "removed runner $name"; done
+    runners | while read -r id name _; do gh api -X DELETE "orgs/$ORG/actions/runners/$id" && echo "removed runner $name"; done
     ;;
-  stop-old)   # retire named instances once their runners are idle, leaving the rest and the variable alone
+  stop-old)   # retire named instances once their runners are idle, leaving the rest alone
     shift
     for id in "$@"; do
       for _ in $(seq 1 180); do   # up to 3 hours for a running job to finish
         left=0
         while read -r rid name _; do
           [[ "$name" == burst-$id-* ]] || continue
-          gh api -X DELETE "repos/$REPO/actions/runners/$rid" >/dev/null 2>&1 && echo "removed runner $name" || left=1   # a busy runner refuses
+          gh api -X DELETE "orgs/$ORG/actions/runners/$rid" >/dev/null 2>&1 && echo "removed runner $name" || left=1   # a busy runner refuses
         done < <(runners)
         [[ $left == 0 ]] && break
         sleep 60

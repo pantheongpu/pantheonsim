@@ -12,7 +12,7 @@ and documentation were written with AI coding assistants (Anthropic's Claude),
 directed and reviewed by the maintainers. That is why the project grew to its
 present size in a few months and why pull requests here carry no second
 reviewer. We do not ask you to trust the code because of who or what wrote it.
-Here is the evidence that exists: about 900 ctest tests are registered, and CI
+Here is the evidence that exists: several hundred ctest tests are registered (`ctest -N` gives the exact number for your build; it varies with the toolchains found, and the sanitizer jobs run 534 of them), and CI
 runs them on every pull request (the ROCm, PyTorch and rocBLAS ones on a runner
 that has ROCm installed), under AddressSanitizer, UBSan and ThreadSanitizer too;
 on that runner, a test that skips without a stated reason fails its job. CUDA

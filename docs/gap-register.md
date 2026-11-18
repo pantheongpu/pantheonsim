@@ -116,7 +116,7 @@ the sense that something specific is still missing, and each entry says what.
   by `sensors`) are published live in the session's sysfs. An RTX 3080 Ti's
   whole configuration space, read as root, is replayed for Ampere GeForce
   profiles, its registers found through its capability chain; an
-  nvidia/rtx3080ti profile of that card is verified on 512 values, and its
+  nvidia/rtx3080ti profile of that card is a verified profile (docs/status.md), and its
   measured BAR0 (identification 0xb72000a1, unmapped 0xbadf5040) is its MMIO
   space. Next: map more of BAR0 as headers publish it, and capture data-center and AMD Instinct cards (the RX 6800 and RX 6700 XT are captured in amd/registers/measurements). The
   session's /sys/bus/pci devices carry config, resource, IDs and link files
@@ -631,7 +631,7 @@ which has not been looked into.
 - A memory-aware adversarial scheduler (feeding the race detector's shadow state back into scheduling): not
   started ("Next milestones" 2).
 - LLVM JIT (ARCHITECTURE.md D1): not started.
-- Real-GPU card check (docs/ci-card-check.md): designed on a 3080 Ti, not enabled.
+- Real-GPU card check (docs/ci-card-check.md): designed on a 3080 Ti; the workflow file `card-check.yml` was never written, see the checklist there.
 - AMD rows in `workloads.yml` and its `coverage` check: absent.
 - The hip-tests disabled-case lists and the SASS-vs-PTX digest differences (see "CI inventory"): unreconciled.
 - Pantheon workloads: 44 of 46 pass with `scripts/run-pantheon-workloads.sh`, which skips `media_enc_virus` and
