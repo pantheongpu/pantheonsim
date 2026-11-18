@@ -1615,6 +1615,29 @@ VTEST(sampling_needs_a_long_static_estimate_or_a_process_that_can_afford_it) {
   VCHECK(!worth_sampling(w, c, 0.26));
 }
 
+VTEST(a_big_launch_is_sampled_in_a_young_process) {
+  const Costs c;
+  SampleCandidate w = old_enough(4096);
+  w.age_s = 0.02;                                  // mergeSort's first launch: 4096 blocks of 512 threads, 20 ms into the process
+  w.threads = 4096ull * 512;
+  w.static_s = 0.003;                              // (histogram256Kernel's count; under the floor of 30 ms)
+  VCHECK(!worth_sampling(w, c, 0.26));             // the rule off: too young
+  w.big_threads = kFirstBigThreads;
+  VCHECK(worth_sampling(w, c, 0.26));
+  w.threads = kFirstBigThreads - 1;
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.threads = kFirstBigThreads;
+  VCHECK(worth_sampling(w, c, 0.26));
+  w.spent_s = 0.004;                               // only the process's first sample is excused
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.spent_s = 0;
+  w.loop = false;                                  // it does not lift the other conditions
+  VCHECK(!worth_sampling(w, c, 0.26));
+  w.loop = true;
+  w.whole_s = 0.003;
+  VCHECK(!worth_sampling(w, c, 0.26));
+}
+
 VTEST(sim_time_table_peeks_at_one_sample_and_takes_an_extrapolation_as_history) {
   SimTimeTable t;
   VCHECK(!t.peek("k", 100).has_value());
@@ -3046,7 +3069,15 @@ VTEST(a_launch_fits_the_card_by_its_limits) {
   f.known = true;
   c.shared_optin = 0;
   VCHECK(!c.known() && fits({1, 1, 1}, {64, 1, 1}, 0) == FitRefusal::Unknown);
-  for (unsigned r = 0; r <= static_cast<unsigned>(FitRefusal::SharedAttribute); ++r) VCHECK(r ? std::string(fit_refusal_text(static_cast<FitRefusal>(r))).size() > 10u : std::string(fit_refusal_text(FitRefusal::None)).empty());
+  for (unsigned r = 0; r <= static_cast<unsigned>(FitRefusal::HostMemory); ++r) VCHECK(r ? std::string(fit_refusal_text(static_cast<FitRefusal>(r))).size() > 10u : std::string(fit_refusal_text(FitRefusal::None)).empty());
+}
+
+VTEST(a_cooperative_grid_goes_to_the_card_when_it_is_resident_at_once) {
+  VCHECK(coop_fits(80, 1, 80));      // one block an SM on 80 SMs: every block resident
+  VCHECK(!coop_fits(81, 1, 80));     // one block more and the grid barrier would never be passed
+  VCHECK(coop_fits(320, 4, 80) && !coop_fits(321, 4, 80));
+  VCHECK(!coop_fits(1, 0, 80));      // the kernel cannot be resident at all (occupancy 0)
+  VCHECK(!coop_fits(1, 4, 0));       // an SM count the driver did not give
 }
 
 VTEST(the_window_needs_the_free_memory_and_a_reserve) {

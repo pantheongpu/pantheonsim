@@ -398,6 +398,7 @@ struct CardLimits {
   uint32_t shared_optin = 0;             // ..._MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: static + dynamic shared memory of one block
   uint32_t regs_per_block = 0;           // ..._MAX_REGISTERS_PER_BLOCK
   uint64_t memory_total = 0;             // cuMemGetInfo's total
+  bool cooperative = false;              // ..._COOPERATIVE_LAUNCH
   bool known() const { return max_threads_per_block != 0 && shared_optin != 0 && regs_per_block != 0 && max_grid[0] != 0 && max_block[0] != 0; }
 };
 struct FuncAttrs {
@@ -406,12 +407,13 @@ struct FuncAttrs {
   uint32_t static_shared = 0;    // ..._SHARED_SIZE_BYTES
   uint32_t regs = 0;             // ..._NUM_REGS
 };
-enum class FitRefusal : uint8_t { None, Unknown, BlockDim, Threads, KernelThreads, Registers, Shared, GridDim, Memory, SharedAttribute };
+enum class FitRefusal : uint8_t { None, Unknown, BlockDim, Threads, KernelThreads, Registers, Shared, GridDim, Memory, SharedAttribute, Cooperative, HostMemory };
 inline const char* fit_refusal_text(FitRefusal r) {
   static const char* const n[] = {"", "the card's limits or the function's attributes are not known", "a block dimension over the card's limit",
                                   "more threads in a block than the card allows", "more threads in a block than the kernel can run (its registers or __launch_bounds__)",
                                   "more registers for the block than the card has", "more shared memory than the card allows a block", "a grid dimension over the card's limit",
-                                  "the simulator's memory is larger than the card's", "the card refused the dynamic shared memory size"};
+                                  "the simulator's memory is larger than the card's", "the card refused the dynamic shared memory size",
+                                  "a cooperative grid that the card cannot hold at once", "the card could not be given the mapped host memory at its own address"};
   return n[static_cast<unsigned>(r)];
 }
 // Whether a launch of a function with these attributes, this shape and `dynamic_shared` bytes of dynamic shared memory runs on a card with these
@@ -431,6 +433,9 @@ inline FitRefusal fits_card(const CardLimits& card, const FuncAttrs& f, const ui
   if (card.memory_total && window_bytes > card.memory_total) return FitRefusal::Memory;
   return FitRefusal::None;
 }
+
+// A cooperative launch needs every block resident together: `per_sm` is the driver's occupancy of the kernel at this block size and shared memory.
+inline bool coop_fits(uint64_t blocks, uint32_t per_sm, uint32_t sms) { return per_sm != 0 && blocks <= uint64_t{per_sm} * sms; }
 
 // The room the mode leaves on the card when it backs the simulator's window (src/runtime/host_gpu.cpp ensure_mapped): the window must fit in the free
 // memory with this much to spare for the driver's own allocations (the context, the module images, the printf buffer).

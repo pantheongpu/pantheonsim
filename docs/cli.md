@@ -373,11 +373,22 @@ variable is unset by default.
 | `VGPU_TRACE` | `1` logs every runtime and driver entry point. | off |
 | `VGPU_LOAD_PLAIN` | AMD: `1` reads code objects as before [#565](https://github.com/pantheongpu/pantheonsim/issues/565): a compressed bundle inflated through a buffer and copied out (by default a kept entry is inflated straight into its place), a linked object's image zeroed before its sections are copied in, and no request for 2 MB pages for the buffers a code object is read into. The bytes read are the same either way (`test_amd_codeobject_same_bits_plain`, `test_amd_bundle`); for ruling the loader out when a result looks wrong. | off |
 | `VGPU_TRACE_API`, `VGPU_TRACE_LAUNCHES` | AMD: `1` names each HIP call, or what each launch runs, one line to stderr each. | off |
-| `VGPU_DISPATCH_STATS=<file>` | AMD: appends one `VGPU_DISPATCH` line to the file for each kernel launch that finished (`1`: to stderr), as `key=value` pairs: waves, instructions, the per-unit counts (`valu`, `mfma`, `salu`, `smem`, `vmem`, `flat`, `lds`, `branch`, ...), then `vmem_bytes_rd`, `vmem_bytes_wr`, `lds_bytes_rd`, `lds_bytes_wr` (the bytes the active lanes ask for; an atomic counts as written; image, tensor, formatted-buffer and copy-to-LDS accesses and scalar memory are not counted), `lds_bank_conflicts` (the passes through LDS's banks beyond the first, which is the card's `SQC_LDS_BANK_CONFLICT`: the rule was measured on an RX 6800 and an RX 6700 XT and is applied unchecked to other targets; counted only when this variable is set, since it reads every lane's address), `mix=` (the vector instructions by operation and type, e.g. `add_f32:12,fma_f32:30`, `-` for none), `mops=` (matrix work in 512-operation units by input type, e.g. `f16:8`) and `kernel=` (last). A reader should skip a key it does not know. | off |
+| `VGPU_DISPATCH_STATS=<file>` | AMD: appends one `VGPU_DISPATCH` line to the file for each kernel launch that finished (`1`: to stderr), as `key=value` pairs: waves, instructions, the per-unit counts (`valu`, `mfma`, `salu`, `smem`, `vmem`, `flat`, `lds`, `branch`, ...), then `vmem_bytes_rd`, `vmem_bytes_wr`, `lds_bytes_rd`, `lds_bytes_wr` (the bytes the active lanes ask for; an atomic counts as written; image, tensor, formatted-buffer and copy-to-LDS accesses and scalar memory are not counted), `vmem_lines_rd`, `vmem_lines_wr` (the vector L1 cache lines global and flat accesses touch, an atomic as a write: **MODELLED**, not verified against hardware; line sizes below), `lds_bank_conflicts` (the passes through LDS's banks beyond the first, which is the card's `SQC_LDS_BANK_CONFLICT`: the rule was measured on an RX 6800 and an RX 6700 XT and is applied unchecked to other targets; counted only when this variable is set, since it reads every lane's address), `mix=` (the vector instructions by operation and type, e.g. `add_f32:12,fma_f32:30`, `-` for none), `mops=` (matrix work in 512-operation units by input type, e.g. `f16:8`) and `kernel=` (last). A reader should skip a key it does not know. | off |
 | `VGPU_SASS_TRACE=<warp>` | Print every SASS instruction one warp runs, with the lane group and the first lane's results; after a `BSSY`, `BSYNC`, `BREAK` or `BMOV` it adds the barrier masks. | off |
 | `VGPU_SASS_TRACE_KERNEL=<text>` | Restrict the trace to kernels whose name contains the text. | all |
 | `VGPU_SASS_TRACE_BLOCK=<x>` | Trace block `(x,0,0)` instead of block `(0,0,0)`. | `0` |
 | `VGPU_SASS_TRACE_RAW=1` | Add each traced instruction's 128 bits (high word first) to the trace, for finding where a field is encoded. | off |
+
+`vmem_lines_rd` and `vmem_lines_wr` (AMD, **MODELLED**, not verified against hardware: RDNA2's rocprof has no request counters) count, for each global or flat access, the distinct vector L1 cache lines its active lanes touch (a part-used line counts whole; the same meaning as rocprofiler-compute's "Cache Accesses"). Image, buffer, scratch and LDS-aperture accesses are not counted. The line size per target:
+
+| Target | Line | Source |
+| --- | --- | --- |
+| gfx90a (CDNA2) | 64 B | documented (rocprofiler-compute, vL1D: "current AMD Instinct MI CDNA accelerators and GCN GPUs") |
+| gfx942, gfx950 (CDNA3, CDNA4) | 64 B | inferred from that sentence; no AMD document found names these cards' line |
+| gfx1100 (RDNA3) | 128 B | documented for RDNA3.5 only (rocprofiler-compute, RDNA system speed-of-light) |
+| gfx1030 (RDNA2), gfx1200 (RDNA4) | 128 B | unknown, RDNA3.5's value assumed |
+| gfx1250 | 128 B | unknown, RDNA's value assumed |
+
 
 The code reads further `VGPU_*` variables that plumb the simulator's own parts
 together (NVSHMEM and NCCL rendezvous, the NVRTC and nvJitLink libraries, state
