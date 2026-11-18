@@ -1,6 +1,6 @@
 # Card check: the e2e programs on a real GPU (design, not enabled)
 
-Status: a proposal. No runner is registered and no workflow runs it. Turning it
+Status: a proposal. **`card-check.yml` does not exist in `.github/workflows/`**, no runner is registered and nothing runs it. (The one real-card workflow in the tree is `card-host-gpu.yml`, which rents an AWS A10G for host-GPU mode and is not scheduled either; it is a different design, see the checklist's last item.) Turning it
 on is the steps under [Enabling it](#enabling-it), all of which are the
 maintainer's to take.
 
@@ -151,3 +151,36 @@ there must never run code from a fork:
    without the shim), then `card-check.yml` as described.
 3. Run it once by hand (`workflow_dispatch`) while watching server1's load and
    the search site's latency; then let the schedule take over.
+
+## Checklist to enable it (audit of 2026-11-18)
+
+Nothing below has been done. In order; each line is a gate, not a suggestion.
+
+1. **Decision first.** The maintainer decides whether server1 may host it at all. Memory of 2026-10-09 banned runs on server1 (it was crashing);
+   2026-10-27 relaxed that to "when idle, benchmarks only, nice". A nightly CI job is neither: it needs an explicit yes, and an alternative is
+   the rented-card route of `card-host-gpu.yml` (about $0.70 a run, nothing on server1).
+2. **The workflow file does not exist.** Write `card-check.yml` with `on: schedule` + `workflow_dispatch` only (never `pull_request`, `push`,
+   `workflow_run`), `permissions: contents: read`, `concurrency: card-check` with `cancel-in-progress: false`, `timeout-minutes: 90`,
+   `actions/checkout` of the default ref only, no secrets. `tests/lint/check_workflow_yaml.py` and `check_pr_guard_coverage.py` must pass on it.
+3. **Runner label.** The design says `[self-hosted, server1, rtx3080ti]`. No existing workflow uses a `server1` label (the repository's
+   self-hosted labels are `pantheonsim-ci` and `pantheonsim-card`), so a new, unique label is needed, and it must not be one the other jobs
+   (`runs-on: ${{ vars.* }}` in `ci.yml`) can resolve to. Do not reuse `pantheonsim-ci`: a PR job would then land on server1.
+4. **Runner group.** Registered in a group restricted to this repository and to `card-check.yml` ("selected workflows"); fork-PR approval set to
+   "all outside collaborators"; `--ephemeral`. Verify on github.com before the first run; the lint cannot see it.
+5. **Systemd limits on the runner unit** (`CPUQuota=600%`, `MemoryMax=8G`, `IOWeight=10`) in place and checked with `systemctl show`. The
+   job's own `taskset -c 0-5`, `nice -n 19`, `ionice -c3`, `-j6` and `RelWithDebInfo` (no LTO) are the second line, not the first.
+6. **Idle gating, in the job's first step, failing closed.** Skip (exit 0 with a notice) if the 5-minute load average exceeds 10, if Postgres has
+   more than N active connections (N is unset in the design: choose it from server1's normal count), if `nvidia-smi` shows another process on
+   the card, or if the gate commands themselves fail (no `pg_stat_activity` access means skip, not run). Re-check the load before every
+   program, not only at the start, and abort the rest of the run when it rises: a 90-minute job can outlive the quiet hour.
+7. **No GPU hazards.** The card-portable list must exclude programs that fault or reset the GPU on purpose, bulk BAR0 reads (a read-only BAR0
+   sweep gave the 3080 Ti Xid 62 and a reset on 2026-09), `vgpu`-only features, and anything under `nvidia/tools/regprobe`. Each program under
+   `timeout 300`, one at a time, `CUDA_VISIBLE_DEVICES=0`. After each failure, check `dmesg` for Xid lines (needs a read grant) and stop the
+   run on one.
+8. **Disk.** The job deletes its workspace and build tree at the end whatever happened (`if: always()`); no Docker.
+9. **`card-portable.txt` and the `card` mode** of `ci/external/suites.sh` must exist before the workflow; they do not yet.
+10. **First run by hand** (`workflow_dispatch`) with someone watching server1's load and the search site's latency, as the design says.
+11. **Do not conflate with `card-host-gpu.yml`.** That workflow is also disabled (no `schedule`), needs three secrets and an IAM user, and its
+    `launch` step sets the instance output only after the runner is online: if the step is cancelled after `run-instances`, `stop` is skipped
+    and only the userdata TTL ends the instance. Fix that (print the id and set the output right after `run-instances`) before anyone
+    schedules it; it is not changed here.

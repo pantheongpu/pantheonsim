@@ -43,7 +43,7 @@ Slowest tests in the build job (ctest `Passed N sec`): `e2e_cutlass_hopper`
 else is over 40 s. The two CUTLASS tests are 2167 of the 3204 s of ctest time
 (68%). In the sanitizer jobs no test is over 173 s (`e2e_sass_archs`,
 `e2e_lowprec_lt` 156 s, `amd_memtest_patterns` 130 s, `e2e_ipc` 128 s,
-`test_memfast` 126 s): 534 tests, 1840 s (ASan) and 1436 s (TSan) one at a time
+`test_memfast` 126 s): 534 tests in those jobs (the number registered depends on the toolchains found; `ctest -N` gives it for a build), 1840 s (ASan) and 1436 s (TSan) one at a time
 on a 24-core machine.
 
 What was done about it, each a separate commit:
