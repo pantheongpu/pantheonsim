@@ -34,4 +34,5 @@ while read -r id branch sha; do
   if [[ $dry == true ]]; then echo "would cancel run $id ($branch ${sha:0:8})"; continue; fi
   if gh run cancel "$id" --repo "$repo" >/dev/null 2>&1; then echo "cancelled run $id ($branch ${sha:0:8})"; else echo "could not cancel run $id"; fi
 done <<< "$runs"
-echo "$cancelled stale pull_request run(s) $([[ $dry == true ]] && echo would be) cancelled, $kept kept"
+verb=cancelled; [[ $dry == true ]] && verb="would be cancelled"
+echo "$cancelled stale pull_request run(s) $verb, $kept kept"
