@@ -7,6 +7,7 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **CI: a memory share left by a killed runner no longer blocks the host.** A runner that is restarted or killed mid-job never runs its "Give back the memory reservation" step, and the share held the slot for up to 4 hours while every other heavy job on the host waited for it and failed (the `ollama on amd/mi300x` failure on #701). A waiting `ci/jobs.sh --check` now asks GitHub whether the run behind each share has ended and drops the shares of runs that have; any doubt keeps the share. The check steps pass `GH_TOKEN`.
 - **The compute capability 12.0 Blackwell profiles sum by the Hopper rule, measured on an RTX PRO 6000 Blackwell Server Edition** (issue #664). `rtx-pro-6000-server`
   (`measured`) and `rtx5090`, `rtx-pro-4500`, `rtx-pro-6000`, `rtx-pro-6000-max-q` (`inferred` from it) took the sequential f32 sum before: wmma, `mma.sync` and SASS
   `HMMA` in f16, bf16 and tf32 now give the card's bits (both probes print the H100's lines, 60 of 60 and 169 of 169; FTTN's motivating example 191.875 instead of 0;
