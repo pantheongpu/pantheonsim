@@ -39,7 +39,9 @@
 # minimum, and the capacity is CI_RESERVE_CAPACITY_GIB (default 5: one heavy job at a time, a
 # host with room for two sets 10;
 # the default is 10 on the AWS burst runners, RUNNER_NAME burst-*). --release gives the share back; a share a killed runner never
-# released expires after CI_RESERVE_TTL_SECS (default 4 hours). No usable ledger (no directory
+# released expires after CI_RESERVE_TTL_SECS (default 4 hours), or sooner: a waiting --check asks
+# GitHub (GH_TOKEN, GITHUB_REPOSITORY) whether the run behind each share has ended and drops the
+# shares of runs that have. No usable ledger (no directory
 # or no flock) is a warning, never a failure: the check then works as it always did.
 #
 # Environment
@@ -225,6 +227,23 @@ ledger_edit() {
   ) 9>>"$ledger"
 }
 
+# prune_finished: drops the shares of runs that have ended. A runner that is killed or restarted
+# mid-job never runs its --release step, and its share would hold the slot until it expires, while
+# every other heavy job on the host waits for it. Any doubt (no token, no network, an answer that is
+# not "completed") keeps the share.
+prune_finished() {
+  local tok=${GH_TOKEN:-${GITHUB_TOKEN:-}} repo=${GITHUB_REPOSITORY:-} api=${GITHUB_API_URL:-https://api.github.com} id st
+  [[ -n $tok && -n $repo ]] && command -v curl >/dev/null 2>&1 || return 0
+  while read -r id; do
+    [[ $id =~ ^([0-9]+)-([0-9]+)- ]] || continue
+    st=$(curl -fsS -m 15 -H "Authorization: Bearer $tok" "$api/repos/$repo/actions/runs/${BASH_REMATCH[1]}/attempts/${BASH_REMATCH[2]}" 2>/dev/null |
+         sed -n 's/^  "status": "\([a-z_]*\)",\{0,1\}$/\1/p' | head -1)
+    [[ $st == completed ]] || continue
+    ledger_edit "$id" 0 0 0 >/dev/null
+    echo "memory: dropped the share of $id (its run has ended)"
+  done < <(awk '{ print $1 }' "$ledger" 2>/dev/null)
+}
+
 mode="jobs"; per=""; profile=""; max=${CI_JOBS_MAX:-}
 while (( $# )); do
   case "$1" in
@@ -307,6 +326,11 @@ if [[ $mode == check ]]; then
       while :; do
         verdict=$(ledger_edit "$id" "$mib" "$cap_mib" "$ttl")
         [[ $verdict == ok ]] && break
+        if (( waited % (poll_secs * 10) == 0 )); then   # now, then every ten polls
+          prune_finished
+          verdict=$(ledger_edit "$id" "$mib" "$cap_mib" "$ttl")
+          [[ $verdict == ok ]] && break
+        fi
         if (( waited >= wait_secs )); then
           msg="the memory the other heavy jobs on this machine have reserved leaves no room for the $profile job's $pmin GiB ($verdict, capacity ${cap_mib} MiB; ci/jobs.sh --reservations). Re-run it when they are done."
           if [[ ${GITHUB_ACTIONS:-} == true ]]; then echo "::error::$msg"; else echo "error: $msg"; fi
