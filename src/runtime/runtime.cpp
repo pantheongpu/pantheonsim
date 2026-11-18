@@ -599,20 +599,6 @@ uint64_t Device::module_const_bytes(uint64_t module_id, const std::string& kerne
   return 0;
 }
 
-void Device::set_card_source(uint64_t module_id, std::shared_ptr<const hostgpu::CardSource> source) {
-  LoadedModule* found = find_module(module_id);
-  if (!found) return;
-  LoadedModule& lm = *found;
-  lm.card = source;
-  if (lm.mod)
-    for (ptx::EntryFn& e : lm.mod->entries) e.card = source;
-  if (lm.lazy) {   // (the kernels parsed so far; the others take it when they are parsed, in lazy_function)
-    std::lock_guard<std::recursive_mutex> lock(lm.lazy->mu);
-    for (auto& [name, part] : lm.lazy->parsed)
-      for (ptx::EntryFn& e : part->entries) e.card = source;
-  }
-}
-
 const ptx::EntryFn* Device::get_function(uint64_t module_id, const std::string& name) const {
   if (LoadedModule* found = find_module(module_id)) {
     LoadedModule& lm = *found;
@@ -681,7 +667,6 @@ const ptx::EntryFn* Device::lazy_function(LoadedModule& lm, const std::string& n
   for (size_t i = 0; i < lz.func_order.size(); ++i)
     if (auto it = by_name.find(lz.func_order[i]); it != by_name.end()) fn.module_funcs[i] = it->second;
   fn.module_entry_names = lz.entry_order;
-  fn.card = lm.card;
   for (auto& [va, k] : lm.kernels)
     if (!k && va == lm.symbols.at(name)) k = &fn;
   forget_kernel_table();
@@ -1191,7 +1176,6 @@ Device::Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemet
   if (const char* fh = std::getenv("VGPU_MEMO_FINAL_HASH"); fh && *fh) memo::final_hash_register(&mem_);
   // VGPU_MEMO=1: launch-level result caching (vgpu/runtime/memo.hpp). Not with a real GPU in the loop.
   if (const memo::Config mc = memo::Config::from_env(); mc.enabled && !std::getenv("VGPU_HOST_GPU") && !std::getenv("VGPU_HOSTGPU_CAPTURE")) enable_memo(mc);
-  if (profile_.vendor == "nvidia" && std::getenv("VGPU_HOST_GPU")) hostgpu::Runtime::prestart(profile_, ordinal_, physical_);   // (turbo with FIT=1: the card's driver starts while the program sets up)
 }
 
 Device::~Device() {
@@ -1278,11 +1262,7 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
     }
     const auto cap_t0 = std::chrono::steady_clock::now();
     // VGPU_HOST_GPU=exact: the launch may run on the machine's real GPU (vgpu/host_gpu_rt.hpp); null when the mode is off.
-    hostgpu::Runtime* const hg = hostgpu::Runtime::for_device(profile_, ordinal_, physical_);
-    // Turbo mode's fit check knows the CARD's limits, not the simulated profile's: a launch the simulated profile refuses (more shared memory, threads, registers or grid than
-    // it allows, a cluster it lacks) is refused as the plain simulator refuses it, with the same error, before the card is asked. (Exact mode's card is the profile.)
-    // (a grid or block with a zero dimension is the mode's own to refuse, with its own log line, and the simulator then gives its error)
-    if (hg && hg->turbo() && !hostgpu::launch_shape_empty(cfg.grid.data(), cfg.block.data())) check_launch(fn, cfg);
+    hostgpu::Runtime* const hg = hostgpu::Runtime::for_device(profile_, ordinal_);
     if (hg && hg->try_launch(fn, cfg, args, mem_)) {
       if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(physical_), 0.0);
       return;

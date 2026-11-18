@@ -20,7 +20,7 @@ kernel once. A kernel is never sent when it takes the simulator under 200 us, so
 The decision for these is a pure function of constants, so a log on server3 against the stand-in driver would print "the estimate does not
 beat the card path" and teach nothing: it was not run. Nothing in the simulator is wrong. The lever is the two priors, and only a card says what
 they should be: the card's real cost of one tiny launch with a sync (unknown; the 7 us is an estimate of the launch call alone), whether the
-arrays stay on the card between launches (the streak rule of sp65 is meant for that; documented, `12-host-gpu-turbo.md` section 9), and
+arrays stay on the card between launches (the streak rule of sp65 is meant for that; documented, `12-host-gpu-size-rules.md` section 9), and
 the kernel time of a stencil of 32 x 128 threads (inferred: single-digit microseconds; unknown). `card-short-launch.sh` measures all of it and
 says in its header what each outcome means. If the sync latency is over about 50 us the issue closes as "no gain" (the issue allows it).
 
@@ -28,7 +28,7 @@ says in its header what each outcome means. If the sync latency is over about 50
 
 | item | what is needed | tag |
 |---|---|---|
-| `BMMA` (1-bit tensor MMA) | it was in the turbo `never` class; it is in the `tensor` class since 2026-11-16 (`12-host-gpu-turbo.md` section 2). The samples have no BMMA program, so `nvidia/tests/e2e/bmma_gemm.cu` is our own (wmma `precision::b1`, 8x8x128, XOR+popc and AND+popc, 3 kernels, 6 shapes, 36 cases, host popcount self-check). Measured 2026-11-16: an RTX 3060 (CUDA 13.0, sm_86 SASS has `BMMA.88128.XOR.POPC` and `.AND.POPC`) matches the host reference in 36 of 36 cases, and the simulator prints the same bytes as the card (checksum `0xae570291798d39ce`) from sm_86 SASS, the PTX engine and a compute_80 build; pinned as `e2e_bmma_gemm`. Decided by the card: on an A10G (g5.xlarge, driver 595.112.07, CUDA 13.2 nvcc, 2026-11-16) turbo `VGPU_HOST_GPU_VERIFY=all` `ATOL=0 RTOL=0` gave other_identical=36, other_different=0; host_gpu_turbo launches_card=36, words_compared=775680, words_different=0, words_outside=0; the output is byte-identical to the simulator's; exact mode verify=all also other_identical=36 (a probe: BMMA is not in the exact set). Files in `card-2026-11-16-bmma/`. Admitted to the tensor class, with a unit test; the exact set is unchanged. Admitted | simulator equals card: measured on an RTX 3060 and an A10G; other cards with BMMA: inferred (integer arithmetic) |
+| `BMMA` (1-bit tensor MMA) | it was in the turbo `never` class; it is in the `tensor` class since 2026-11-16 (`12-host-gpu-size-rules.md` section 2). The samples have no BMMA program, so `nvidia/tests/e2e/bmma_gemm.cu` is our own (wmma `precision::b1`, 8x8x128, XOR+popc and AND+popc, 3 kernels, 6 shapes, 36 cases, host popcount self-check). Measured 2026-11-16: an RTX 3060 (CUDA 13.0, sm_86 SASS has `BMMA.88128.XOR.POPC` and `.AND.POPC`) matches the host reference in 36 of 36 cases, and the simulator prints the same bytes as the card (checksum `0xae570291798d39ce`) from sm_86 SASS, the PTX engine and a compute_80 build; pinned as `e2e_bmma_gemm`. Decided by the card: on an A10G (g5.xlarge, driver 595.112.07, CUDA 13.2 nvcc, 2026-11-16) turbo `VGPU_HOST_GPU_VERIFY=all` `ATOL=0 RTOL=0` gave other_identical=36, other_different=0; host_gpu_turbo launches_card=36, words_compared=775680, words_different=0, words_outside=0; the output is byte-identical to the simulator's; exact mode verify=all also other_identical=36 (a probe: BMMA is not in the exact set). Files in `card-2026-11-16-bmma/`. Admitted to the tensor class, with a unit test; the exact set is unchanged. Admitted | simulator equals card: measured on an RTX 3060 and an A10G; other cards with BMMA: inferred (integer arithmetic) |
 | `QMMA`, sm_90/sm_100 tensor instructions | not on the A10G (sm_86): no card here can run them. H100/B200 needed | unknown |
 | texture and surface instructions (dct8x8, simpleCubemapTexture, simpleLayeredTexture, simpleSurfaceWrite) | the card would hold texture objects the simulator keeps in its own tables: mirroring them is a design, not a fix. About 1 s of the issue's 4 s | not started |
 | argument into mapped host memory (zerocopy, simpleIPC, simpleZeroCopy: 3.4 s) | the card must see the host's mapping at the same address, the simulator's pointer being its own | not started |
@@ -38,7 +38,7 @@ None of these is a pure simulator-side bug, so nothing was changed.
 
 ## #656 the rest: a loop-weighted static count for `initRNG` (design; not built)
 
-The design in the issue and in `12-host-gpu-turbo.md` sections 13 and 14 is not clear enough to build without a census, so only the numbers
+The design in the issue and in `12-host-gpu-size-rules.md` sections 13 and 14 is not clear enough to build without a census, so only the numbers
 are set down (measured on server3 against the stand-in driver, `data/sp76/launches.md` and `data/sp76/start-model.md`):
 
 | program | kernel | counted | taken | floor | age | a sample says | needs | verdict |

@@ -1,42 +1,39 @@
 #!/usr/bin/env python3
 """Host-GPU benchmark: run prebuilt CUDA programs (PolyBench/GPU, Rodinia, the
-reduced HeCBench list) on the simulator in three forms -- sim (the mode off),
-exact (VGPU_HOST_GPU=exact) and turbo (VGPU_HOST_GPU=turbo) -- and
-optionally once more as turbo with VGPU_HOST_GPU_VERIFY=all, and report per
-program: wall time, speed-up over sim, launches on the card, seconds on the
-card and in the simulator, why launches stayed in the simulator, what verify
-found, and how the program's output compares with the sim run's.
+reduced HeCBench list) on the simulator in two forms -- sim (the mode off) and
+exact (VGPU_HOST_GPU=exact) -- and optionally once more as exact with
+VGPU_HOST_GPU_VERIFY=all, and report per program: wall time, speed-up over sim,
+launches on the card, seconds on the card and in the simulator, why launches
+stayed in the simulator, what verify found, and how the program's output
+compares with the sim run's.
 
 Needs a machine with the NVIDIA card the simulator is told to be (--gpu) and
 the corpora of tools/bench/real (pack_corpora.sh; the same layout, arguments
-and timeouts' meaning).  See docs/perf-design/12-host-gpu-turbo.md.
+and timeouts' meaning).  See docs/perf-design/09-host-gpu-spike.md.
 
   run.py --build /path/to/build --corp /path/to/corp --gpu nvidia/a10g \\
-         --runs 3 --forms sim,exact,turbo,verify --timeout 600 \\
+         --runs 3 --forms sim,exact,verify --timeout 600 \\
          --json out.json --md out.md
   run.py --dry-run          # self-test, no card, no simulator (wired into ctest)
 
 Forms.  sim, exact, exactdiv (exact with VGPU_HOST_GPU_DIV=1), exacti (exact with VGPU_HOST_GPU_DIV=1 and
-VGPU_HOST_GPU_SQRT=1: both opt-in idioms), turbo, exact0 and turbo0
-(exact and turbo with VGPU_HOST_GPU_SAMPLE=0: no launch is sampled), and exactw and turbow (with
-VGPU_HOST_GPU_SAMPLE=whole: whole blocks only, the rule of Round sp60b), and exactn and turbon (with
-VGPU_HOST_GPU_STREAK=0: no launch is sent because the card holds the memory, the rule of Round sp61), and exactw0 and
-turbow0 (with VGPU_HOST_GPU_WIDER=0: the safety rules before Round sp66), and exactl0 and turbol0 (with
-VGPU_HOST_GPU_START_LAUNCHES=0: the start-cost account alone, the rule before the integration of sp64-sp68), and
-exactr0 and turbor0 (with VGPU_HOST_GPU_START_REPEATS=0: the start share of 50 launches whatever the kernel's
-history, the rule before Round sp69), and exactb0 and turbob0 (with VGPU_HOST_GPU_SAMPLE_BLOCK=0: a sample's copy runs
-whole blocks however long, the rule before Round sp75), and exactd0 and turbod0 (with VGPU_HOST_GPU_SAMPLE_STARTED=0: no
-launch is sampled once the driver's start has begun, the rule before Round sp76), and turboc0 and turbom0 (turbo with the default rules and
-VGPU_HOST_GPU_COOP=0, or VGPU_HOST_GPU_HOSTMAP=0: a cooperative launch, or one with an argument into mapped host memory, stays in the simulator, the
-rule before #661) , and turbof0 (with VGPU_HOST_GPU_FIRST_BIG=0: a big
-launch is not sampled in a young process, the rule before #659) are timed
+VGPU_HOST_GPU_SQRT=1: both opt-in idioms), exact0 (exact with VGPU_HOST_GPU_SAMPLE=0: no launch is sampled), exactw
+(with VGPU_HOST_GPU_SAMPLE=whole: whole blocks only, the rule of Round sp60b), exactn (with VGPU_HOST_GPU_STREAK=0: no
+launch is sent because the card holds the memory, the rule of Round sp61), exactw0 (with VGPU_HOST_GPU_WIDER=0: the
+safety rules before Round sp66), exactl0 (with VGPU_HOST_GPU_START_LAUNCHES=0: the start-cost account alone, the rule
+before the integration of sp64-sp68), exactr0 (with VGPU_HOST_GPU_START_REPEATS=0: the start share of 50 launches
+whatever the kernel's history, the rule before Round sp69), exactb0 (with VGPU_HOST_GPU_SAMPLE_BLOCK=0: a sample's copy
+runs whole blocks however long, the rule before Round sp75), exactd0 (with VGPU_HOST_GPU_SAMPLE_STARTED=0: no
+launch is sampled once the driver's start has begun, the rule before Round sp76) and exactf0 (with
+VGPU_HOST_GPU_FIRST_BIG=0: a big launch is not sampled in a young process, the rule before #659) are timed
 --runs times each, interleaved; a program whose first sim run takes longer
 than --long-secs gets --long-runs runs of each.
 exact prints its machine-readable lines only with VGPU_HOST_GPU_LOG, which
 also prints a line per launch, so the timed exact runs go without it and ONE
 extra, untimed exact run with the log collects card_s, sim_s and the refusal
-classes (--no-exact-stats skips it; a program cut to --long-runs does not
-get it either).  verify is one untimed run.
+counts (--no-exact-stats skips it; a program cut to --long-runs does not
+get it either).  verify is one untimed run (exact, VGPU_HOST_GPU_VERIFY=all: the
+card's memory against the simulator's, byte for byte).
 
 Output comparison, against the first sim run: stdout and stderr with the
 lines that carry timings and the simulator's own lines dropped, and for
@@ -65,8 +62,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "real"))
 import real  # noqa: E402  (tools/bench/real/real.py: the corpus manifest and the timing-line filter)
 
-FORMS = ("sim", "exact", "exact0", "exactw", "exactn", "exactw0", "exactl0", "exactr0", "exactb0", "exactd0", "exactdiv", "exacti", "turbo", "turborules", "turbo0", "turbow", "turbon", "turbow0", "turbol0", "turbor0", "turbob0", "turbod0", "turbof0", "turbos0", "turboc0", "turbom0", "verify")
-CARD_FORMS = ("exact", "exact0", "exactw", "exactn", "exactw0", "exactl0", "exactr0", "exactb0", "exactd0", "exactdiv", "exacti", "turbo", "turborules", "turbo0", "turbow", "turbon", "turbow0", "turbol0", "turbor0", "turbob0", "turbod0", "turbof0", "turbos0", "turboc0", "turbom0")   # the timed forms that use the card, in the table's order
+FORMS = ("sim", "exact", "exact0", "exactw", "exactn", "exactw0", "exactl0", "exactr0", "exactb0", "exactd0", "exactf0", "exactdiv", "exacti", "verify")
+CARD_FORMS = ("exact", "exact0", "exactw", "exactn", "exactw0", "exactl0", "exactr0", "exactb0", "exactd0", "exactf0", "exactdiv", "exacti")   # the timed forms that use the card, in the table's order
 # lines the simulator or the mode prints: never part of the program's output
 OURS = re.compile(r"^(host_gpu[a-z_]*:|\[vgpu\]|vgpu:)")
 # A word of the output is a number when all of it is one and it has a fraction or an exponent: an integer (a count, an index, a checksum printed in
@@ -98,12 +95,11 @@ def _fields(rest):
 
 def parse_stderr(text):
     """What the host-GPU mode said at the end of a run -> dict."""
-    r = {"mode_off": None, "summary": None, "turbo": None, "refusals": None, "verify": None,
-         "refused_kernels": [], "outside_kernels": [], "moved_mib": None, "timeout_line": None}
+    r = {"mode_off": None, "summary": None, "stats": None, "refusals": None, "verify": None,
+         "moved_mib": None, "timeout_line": None}
     for line in text.splitlines():
-        m = re.match(r"host_gpu: (\d+) launches ran on the card, (\d+) in the simulator \((\d+) kernels not "
-                     r"(?:in the exact set|admitted by turbo mode), (\d+) too small, (\d+) unsupported launch shapes, "
-                     r"(\d+) failed on the card\)", line)
+        m = re.match(r"host_gpu: (\d+) launches ran on the card, (\d+) in the simulator \((\d+) kernels not in the exact set, "
+                     r"(\d+) too small, (\d+) unsupported launch shapes, (\d+) failed on the card\)", line)
         if m:
             g = [int(x) for x in m.groups()]
             r["summary"] = {"offloaded": g[0], "simulated": g[1], "refused_code": g[2], "too_small": g[3],
@@ -113,24 +109,16 @@ def parse_stderr(text):
         if m:
             r["moved_mib"] = [float(m.group(1)), float(m.group(2))]
             continue
-        if line.startswith("host_gpu_turbo: "):
-            r["turbo"] = _fields(line.split(": ", 1)[1])
+        if line.startswith("host_gpu_summary: "):   # with VGPU_HOST_GPU_LOG: launches on the card and in the simulator, seconds of each
+            r["stats"] = _fields(line.split(": ", 1)[1])
         elif line.startswith("host_gpu_refusals: "):
             r["refusals"] = _fields(line.split(": ", 1)[1])
-        elif line.startswith("host_gpu_fit: "):   # turbo fit: policy, the card's sm and SM count, launches refused for no image / not fitting
-            r["fit"] = _fields(line.split(": ", 1)[1])
         elif line.startswith("host_gpu_sampled: "):   # launches sampled in a forked copy, how many were sent, what the samples cost
             r["sampled"] = _fields(line.split(": ", 1)[1])
         elif line.startswith("host_gpu_streak: "):   # launches sent because the card held the memory (Round sp65)
             r["streak"] = _fields(line.split(": ", 1)[1])
         elif line.startswith("host_gpu_verify: "):
             r["verify"] = _fields(line.split(": ", 1)[1])
-        elif line.startswith("host_gpu_refused: "):
-            m = re.match(r"host_gpu_refused: kernel=(\S+) class=(\S+) insn=(.*)", line)
-            if m:
-                r["refused_kernels"].append({"kernel": m.group(1), "class": m.group(2), "insn": m.group(3)})
-        elif line.startswith("host_gpu_outside: "):
-            r["outside_kernels"].append(_fields(line.split(": ", 1)[1]))
         elif line.startswith("host_gpu: ") and "mode off" in line and r["mode_off"] is None:
             r["mode_off"] = line[len("host_gpu: "):]
         elif line.startswith("host_gpu: ") and "VGPU_HOST_GPU_TIMEOUT" in line:
@@ -157,7 +145,7 @@ def program_text(stdout, stderr):
 
 
 def close(card, sim, atol, rtol):
-    """-> (inside tolerance, abs difference, relative difference); the rule of include/vgpu/host_gpu_tol.hpp."""
+    """-> (inside tolerance, abs difference, relative difference): |card - sim| <= atol + rtol * |sim|."""
     if math.isnan(card) or math.isnan(sim):
         return math.isnan(card) and math.isnan(sim), 0.0, 0.0
     if math.isinf(card) or math.isinf(sim):
@@ -227,46 +215,32 @@ def compare_outputs(sim, other, atol, rtol):
 
 def form_env(form, a):
     env = {}
-    if form in ("exact", "exact0", "exactw", "exactn", "exactw0", "exactl0", "exactr0", "exactb0", "exactd0", "exactdiv", "exacti"):
+    if form != "sim":
         env["VGPU_HOST_GPU"] = "exact"
-        if form in ("exactdiv", "exacti"):
-            env["VGPU_HOST_GPU_DIV"] = "1"   # the IEEE division sequence joins the exact set (docs/cli.md)
-        if form == "exacti":
-            env["VGPU_HOST_GPU_SQRT"] = "1"   # and the IEEE square root sequence (Round sp68): exact with both opt-in idioms
-    elif form in ("turbo", "turborules", "turbo0", "turbow", "turbon", "turbow0", "turbol0", "turbor0", "turbob0", "turbod0", "turbof0", "turbos0", "turboc0", "turbom0", "verify"):
-        env["VGPU_HOST_GPU"] = "turbo"
-        env["VGPU_HOST_GPU_ATOL"] = repr(a.atol)
-        env["VGPU_HOST_GPU_RTOL"] = repr(a.rtol)
+    if form in ("exactdiv", "exacti"):
+        env["VGPU_HOST_GPU_DIV"] = "1"   # the IEEE division sequence joins the exact set (docs/cli.md)
+    if form == "exacti":
+        env["VGPU_HOST_GPU_SQRT"] = "1"   # and the IEEE square root sequence (Round sp68): exact with both opt-in idioms
     if form == "verify":
         env["VGPU_HOST_GPU_VERIFY"] = "all"
-    # Turbo's default is VGPU_HOST_GPU_FIT=1 since 2026-11-17 (every fitting kernel goes to the card: none of the performance rules below is asked). `turbo` and `verify`
-    # measure that; `turborules` and every turbo form that is an A/B of one of the rules run with VGPU_HOST_GPU_FIT=0, the rules turbo had before.
-    if form == "turborules" or form in ("turbo0", "turbow", "turbon", "turbow0", "turbol0", "turbor0", "turbob0", "turbod0", "turbof0", "turbos0"):
-        env["VGPU_HOST_GPU_FIT"] = "0"
-    if form in ("exact0", "turbo0"):
+    if form == "exact0":
         env["VGPU_HOST_GPU_SAMPLE"] = "0"   # no launch is sampled: the size rule as it was before Round sp60b, for A/B runs
-    if form in ("exactw", "turbow"):
+    if form == "exactw":
         env["VGPU_HOST_GPU_SAMPLE"] = "whole"   # whole blocks only, never inside them: the rule of Round sp60b, for A/B runs of Round sp61
-    if form in ("exactn", "turbon"):
+    if form == "exactn":
         env["VGPU_HOST_GPU_STREAK"] = "0"   # no launch is sent because the card holds the memory: the rule of Round sp61, for A/B runs of Round sp65
-    if form in ("exactl0", "turbol0"):
+    if form == "exactl0":
         env["VGPU_HOST_GPU_START_LAUNCHES"] = "0"   # the start-cost account alone, for A/B runs of the start-share rule (integration of sp64-sp68)
-    if form in ("exactr0", "turbor0"):
+    if form == "exactr0":
         env["VGPU_HOST_GPU_START_REPEATS"] = "0"   # the share of 50 launches however often the kernel has run, for A/B runs of Round sp69
-    if form in ("exactb0", "turbob0"):
+    if form == "exactb0":
         env["VGPU_HOST_GPU_SAMPLE_BLOCK"] = "0"   # a sample's copy runs whole blocks, however long: the rule before Round sp75, for its A/B runs
-    if form in ("exactd0", "turbod0"):
+    if form == "exactd0":
         env["VGPU_HOST_GPU_SAMPLE_STARTED"] = "0"   # no launch is sampled once the driver's start has begun: the rule before Round sp76, for its A/B runs
-    if form == "turboc0":
-        env["VGPU_HOST_GPU_COOP"] = "0"   # a cooperative launch stays in the simulator: the rule before #661, for its A/B runs
-    if form == "turbom0":
-        env["VGPU_HOST_GPU_HOSTMAP"] = "0"   # a launch with an argument into mapped host memory stays in the simulator: the rule before #661
-    if form == "turbof0":
+    if form == "exactf0":
         env["VGPU_HOST_GPU_FIRST_BIG"] = "0"   # a big launch is not sampled in a young process: the rule before #659, for its A/B runs
-    if form == "turbos0":
-        env["VGPU_HOST_GPU_SHORT"] = "0"   # the size rule before #660 (fixed 100 us card prior, 200 us floor), for its A/B runs
-    if form in ("exactw0", "turbow0"):
-        env["VGPU_HOST_GPU_WIDER"] = "0"   # the safety rules before Round sp66 (module-wide refusals, the texture refusal, the atomics opt-in), for A/B runs
+    if form == "exactw0":
+        env["VGPU_HOST_GPU_WIDER"] = "0"   # the safety rules before Round sp66 (module-wide refusals, the texture refusal), for A/B runs
     if form != "sim":
         for kv in a.env:
             k, v = kv.split("=", 1)
@@ -317,11 +291,11 @@ def summarise(form, runs, ref, a):
     info = parse_stderr(last["stderr"])
     rec = {"wall": [round(r["wall"], 4) for r in runs], "rc": [r["rc"] for r in runs],
            "timeout": any(r["timeout"] for r in runs), "median_s": round(statistics.median(r["wall"] for r in runs), 4),
-           "mode_off": info["mode_off"], "refused_kernels": info["refused_kernels"], "moved_mib": info["moved_mib"]}
-    s, rel = info["summary"], info["turbo"]
-    if rel:
-        rec.update(launches_card=rel.get("launches_card"), launches_sim=rel.get("launches_sim"), card_s=rel.get("card_s"),
-                   sim_s=rel.get("sim_s"))
+           "mode_off": info["mode_off"], "moved_mib": info["moved_mib"]}
+    s, st = info["summary"], info["stats"]
+    if st:
+        rec.update(launches_card=st.get("launches_card"), launches_sim=st.get("launches_sim"), card_s=st.get("card_s"),
+                   sim_s=st.get("sim_s"))
     elif s:
         rec.update(launches_card=s["offloaded"], launches_sim=s["simulated"], card_s=None, sim_s=None)
     if s:
@@ -331,16 +305,13 @@ def summarise(form, runs, ref, a):
         rec["sampled"] = info["sampled"]
     if info.get("streak"):
         rec["streak"] = info["streak"]
-    if info["refusals"]:
-        rec["refusals"] = info["refusals"]
-    elif s:
+    if s:
         rec["refusals"] = {"refused_code": s["refused_code"], "refused_safety": s["refused_safety"], "too_small": s["too_small"],
                            "failed": s["failed"]}
+    if info["refusals"]:   # (the log's own line has no count of kernels outside the exact set: that one is the prose line's)
+        rec["refusals"] = dict(rec.get("refusals", {}), **info["refusals"])
     if form == "verify":
-        rec["verify"] = {"launches": info["verify"], "outside_kernels": info["outside_kernels"]}
-        if rel:
-            for k in ("words_compared", "words_different", "words_outside", "words_subnormal", "kernels_outside", "max_abs", "max_rel"):
-                rec["verify"][k] = rel.get(k)
+        rec["verify"] = {"launches": info["verify"]}
     if info["timeout_line"]:
         rec["card_timeout"] = info["timeout_line"]
     if ref is not None and not rec["timeout"]:
@@ -472,9 +443,7 @@ def _refusals(d):
     if d is None or not d.get("refusals"):
         return "-"
     r = d["refusals"]
-    if "refused_never" in r:
-        return "%d/%d/%d/%d/%d/%d" % (r["refused_never"], r["refused_atomics"], r["refused_off"], r["refused_exact"], r["refused_safety"], r["too_small"])
-    return "code %d, safety %d, small %d" % (r["refused_code"], r["refused_safety"], r["too_small"])
+    return "code %s, safety %d, small %d" % (r.get("refused_code", "?"), r["refused_safety"], r["too_small"])
 
 
 def _output(d):
@@ -496,10 +465,10 @@ def _verify(d):
         return "-"
     if d["timeout"]:
         return "TIMEOUT"
-    v = d.get("verify") or {}
-    if v.get("words_compared") is None:
+    v = (d.get("verify") or {}).get("launches")
+    if not v:
         return "off" if d.get("mode_off") else "-"
-    return "%d / %d (abs %s, rel %s)" % (v["words_different"], v["words_outside"], _g(v.get("max_abs")), _g(v.get("max_rel")))
+    return "%d / %d" % (v.get("in_set_different", 0) + v.get("other_different", 0), sum(v.get(k, 0) for k in ("in_set_identical", "in_set_different", "other_identical", "other_different")))
 
 
 def markdown(res):
@@ -511,10 +480,10 @@ def markdown(res):
     for f in CARD_FORMS:
         if f in forms:
             cols += ["%s s" % f, "x sim", "%s card / all launches" % f, "%s card s / sim s" % f, "%s output" % f]
-    if "turbo" in forms:
-        cols.append("turbo kept in sim: never/atomics/off/exact/safety/small")
+    if "exact" in forms:
+        cols.append("exact kept in sim: code, safety, small")
     if "verify" in forms:
-        cols += ["verify words different / outside (largest)", "verify kernels outside", "verify output"]
+        cols += ["verify launches different / compared", "verify output"]
     out.append("| " + " | ".join(cols) + " |")
     out.append("|" + "|".join("---" if i == 0 else "---:" for i in range(len(cols))) + "|")
     speed = {f: [] for f in CARD_FORMS}
@@ -533,12 +502,11 @@ def markdown(res):
                 notes.append("%s %s: %s" % (key, f, d["mode_off"]))
             if d and d.get("card_timeout"):
                 notes.append("%s %s: %s" % (key, f, d["card_timeout"]))
-        if "turbo" in forms:
-            row.append(_refusals(rec.get("turbo")))
+        if "exact" in forms:
+            row.append(_refusals(rec.get("exact")))
         if "verify" in forms:
             d = rec.get("verify")
-            v = (d or {}).get("verify") or {}
-            row += [_verify(d), "-" if v.get("kernels_outside") is None else str(v["kernels_outside"]), _output(d)]
+            row += [_verify(d), _output(d)]
         if rec.get("sim", {}).get("repeats") is False:
             notes.append("%s: the sim runs do not print the same output twice: its comparisons mean little" % key)
         out.append("| " + " | ".join(row) + " |")
@@ -546,14 +514,6 @@ def markdown(res):
     for f in CARD_FORMS:
         if speed[f]:
             out.append("%s: geometric mean speed-up over sim %.2fx (%d programs)." % (f, real.geomean(speed[f]), len(speed[f])))
-    missing = {}
-    for key, rec in res["programs"].items():
-        for k in (rec.get("turbo") or {}).get("refused_kernels", []):
-            missing.setdefault((k["class"], k["insn"].split(" ")[0]), []).append(key)
-    if missing:
-        out += ["", "Kernels turbo mode kept in the simulator, by class and first refused instruction:", ""]
-        for (cls, mn), keys in sorted(missing.items()):
-            out.append("* %s `%s`: %d kernels (%s)" % (cls, mn, len(keys), ", ".join(sorted(set(keys))[:8])))
     if notes:
         out += ["", "Notes:", ""] + ["* " + n for n in notes]
     return "\n".join(out) + "\n"
@@ -561,18 +521,14 @@ def markdown(res):
 
 # ---- self-test (--dry-run): no card, no simulator -----------------------------------
 
-CANNED_TURBO = """[vgpu] device nvidia/a10g
-host_gpu_refused: kernel=_Z9tex_fetchPfi class=never insn=TEX.SCR.LL R4, R5, R2, R2, 0x0, 0x58, 2D, 0x1
-host_gpu_refused: kernel=_Z4lockPi class=atomics insn=ATOMG.E.CAS.STRONG.GPU P0, R6, [R2.64], R4, R5
-host_gpu: verify _Z8use_expfPKfPfi (admitted): 1048576 words compared, 4711 different, 0 outside tolerance, 0 zero or denormal on both sides; largest difference 2.38418579e-07, relative 1.19209275e-07
-host_gpu: 37 launches ran on the card, 12 in the simulator (5 kernels not admitted by turbo mode, 3 too small, 1 unsupported launch shapes, 0 failed on the card)
+CANNED_EXACT_LOG = """[vgpu] device nvidia/a10g
+host_gpu: 37 launches ran on the card, 12 in the simulator (5 kernels not in the exact set, 3 too small, 1 unsupported launch shapes, 0 failed on the card)
 host_gpu: 96.0 MiB went to the card, 12.5 MiB came back
 host_gpu_verify: in_set_identical=3 in_set_different=34 other_identical=0 other_different=5
-host_gpu_turbo: mode=turbo launches_card=37 launches_sim=12 card_s=0.412345 sim_s=3.250000 words_compared=9437184 words_different=4711 words_outside=2 words_subnormal=0 kernels_outside=1 max_abs=2.38418579e-07 max_rel=0.5
-host_gpu_refusals: refused_never=3 refused_atomics=2 refused_off=0 refused_exact=0 refused_safety=1 too_small=3 failed=0
+host_gpu_summary: mode=exact launches_card=37 launches_sim=12 card_s=0.412345 sim_s=3.250000
+host_gpu_refusals: refused_safety=1 too_small=3 failed=0
 host_gpu_sampled: sampled=2 sent=1 timeouts=0 cost_s=0.006100 after_driver=0 copies_running_at_exit=0 copies_left=0
 host_gpu_streak: sent=7 card_only_mib=48.5 rule=1
-host_gpu_outside: kernel=_Z4histPiS_i words_compared=262144 words_different=2 words_outside=2 max_abs=1 max_rel=0.5 first=0x7f4a00001040:card=0x00000003:sim=0x00000002
 """
 CANNED_EXACT = """host_gpu: 8 launches ran on the card, 41 in the simulator (30 kernels not in the exact set, 2 too small, 4 unsupported launch shapes, 0 failed on the card)
 host_gpu: 16.0 MiB went to the card, 4.0 MiB came back
@@ -588,31 +544,25 @@ def selftest():
             fails.append(what)
 
     # the mode's lines
-    r = parse_stderr(CANNED_TURBO)
-    check(r["summary"] == {"offloaded": 37, "simulated": 12, "refused_code": 5, "too_small": 3, "refused_safety": 1, "failed": 0}, "turbo prose summary")
-    check(r["turbo"]["mode"] == "turbo" and r["turbo"]["launches_card"] == 37 and r["turbo"]["launches_sim"] == 12, "host_gpu_turbo launches")
-    check(r["turbo"]["card_s"] == 0.412345 and r["turbo"]["sim_s"] == 3.25, "host_gpu_turbo seconds")
-    check(r["turbo"]["words_compared"] == 9437184 and r["turbo"]["words_different"] == 4711 and r["turbo"]["words_outside"] == 2, "host_gpu_turbo words")
-    check(r["turbo"]["kernels_outside"] == 1 and abs(r["turbo"]["max_abs"] - 2.38418579e-07) < 1e-15 and r["turbo"]["max_rel"] == 0.5, "host_gpu_turbo maxima")
+    r = parse_stderr(CANNED_EXACT_LOG)
+    check(r["summary"] == {"offloaded": 37, "simulated": 12, "refused_code": 5, "too_small": 3, "refused_safety": 1, "failed": 0}, "exact prose summary")
+    check(r["stats"]["mode"] == "exact" and r["stats"]["launches_card"] == 37 and r["stats"]["launches_sim"] == 12, "host_gpu_summary launches")
+    check(r["stats"]["card_s"] == 0.412345 and r["stats"]["sim_s"] == 3.25, "host_gpu_summary seconds")
     check(r["sampled"]["sampled"] == 2 and r["sampled"]["sent"] == 1 and r["sampled"]["after_driver"] == 0 and r["sampled"]["copies_left"] == 0, "host_gpu_sampled")
     check(r["streak"] == {"sent": 7, "card_only_mib": 48.5, "rule": 1}, "host_gpu_streak")
-    check(r["refusals"] == {"refused_never": 3, "refused_atomics": 2, "refused_off": 0, "refused_exact": 0, "refused_safety": 1, "too_small": 3, "failed": 0}, "host_gpu_refusals")
+    check(r["refusals"] == {"refused_safety": 1, "too_small": 3, "failed": 0}, "host_gpu_refusals")
     check(r["verify"] == {"in_set_identical": 3, "in_set_different": 34, "other_identical": 0, "other_different": 5}, "host_gpu_verify")
-    check(len(r["refused_kernels"]) == 2 and r["refused_kernels"][0] == {"kernel": "_Z9tex_fetchPfi", "class": "never", "insn": "TEX.SCR.LL R4, R5, R2, R2, 0x0, 0x58, 2D, 0x1"}, "host_gpu_refused")
-    check(r["refused_kernels"][1]["class"] == "atomics" and r["refused_kernels"][1]["insn"].startswith("ATOMG.E.CAS"), "host_gpu_refused atomics")
-    check(len(r["outside_kernels"]) == 1 and r["outside_kernels"][0]["kernel"] == "_Z4histPiS_i" and r["outside_kernels"][0]["words_outside"] == 2, "host_gpu_outside")
-    check(r["outside_kernels"][0]["first"] == "0x7f4a00001040:card=0x00000003:sim=0x00000002", "host_gpu_outside first")
     check(r["moved_mib"] == [96.0, 12.5] and r["mode_off"] is None, "MiB line")
     e = parse_stderr(CANNED_EXACT)
-    check(e["summary"]["offloaded"] == 8 and e["summary"]["refused_code"] == 30 and e["turbo"] is None and e["refusals"] is None, "exact prose summary")
+    check(e["summary"]["offloaded"] == 8 and e["summary"]["refused_code"] == 30 and e["stats"] is None and e["refusals"] is None, "exact prose summary without the log")
     o = parse_stderr(CANNED_OFF)
     check(o["mode_off"] and o["mode_off"].startswith("cannot load the real driver") and o["summary"] is None, "mode off line")
-    check(parse_stderr("")["summary"] is None and parse_stderr("host_gpu_turbo: garbage\n")["turbo"] == {}, "empty and malformed lines")
+    check(parse_stderr("")["summary"] is None and parse_stderr("host_gpu_summary: garbage\n")["stats"] == {}, "empty and malformed lines")
     t = parse_stderr("host_gpu: k has been on the card for more than 600 s (VGPU_HOST_GPU_TIMEOUT): a kernel ...\n")
     check(t["timeout_line"] is not None and t["mode_off"] is None, "card timeout line")
 
     # the program's own text
-    txt = program_text("result 1.5\nTime: 3.2 s\nhost_gpu: x\n", "host_gpu_turbo: mode=turbo\n[vgpu] hello\nwarning: y\n")
+    txt = program_text("result 1.5\nTime: 3.2 s\nhost_gpu: x\n", "host_gpu_summary: mode=exact\n[vgpu] hello\nwarning: y\n")
     check(txt == "result 1.5\nwarning: y", "program_text drops timings and our lines: %r" % txt)
 
     # numbers
@@ -680,82 +630,56 @@ def selftest():
     ref = (program_text("sum 1.000000\n", ""), {})
     sim = summarise("sim", [fake(10.0, "sum 1.000000\n", ""), fake(12.0, "sum 1.000000\n", "")], None, A)
     exact = summarise("exact", [fake(5.0, "sum 1.000000\n", CANNED_EXACT)], ref, A)
-    turbo = summarise("turbo", [fake(1.0, "sum 1.000002\n", CANNED_TURBO), fake(1.2, "sum 1.000002\n", CANNED_TURBO)], ref, A)
-    verify = summarise("verify", [fake(30.0, "sum 1.000000\n", CANNED_TURBO)], ref, A)
-    hung = summarise("turbo", [fake(600.0, "", "", timeout=True, rc=-9)], ref, A)
-    off = summarise("turbo", [fake(10.5, "sum 1.000000\n", CANNED_OFF)], ref, A)
+    logged = summarise("exact", [fake(1.0, "sum 1.000002\n", CANNED_EXACT_LOG), fake(1.2, "sum 1.000002\n", CANNED_EXACT_LOG)], ref, A)
+    verify = summarise("verify", [fake(30.0, "sum 1.000000\n", CANNED_EXACT_LOG)], ref, A)
+    hung = summarise("exact", [fake(600.0, "", "", timeout=True, rc=-9)], ref, A)
+    off = summarise("exact", [fake(10.5, "sum 1.000000\n", CANNED_OFF)], ref, A)
     check(sim["median_s"] == 11.0 and "output" not in sim, "sim record")
     check(exact["launches_card"] == 8 and exact["launches_total"] == 49 and exact["card_s"] is None and exact["output"]["class"] == "identical", "exact record: %r" % exact)
     check(exact["refusals"] == {"refused_code": 30, "refused_safety": 4, "too_small": 2, "failed": 0}, "exact refusals from the prose line")
-    check(turbo["launches_card"] == 37 and turbo["launches_total"] == 49 and turbo["card_s"] == 0.412345 and turbo["sim_s"] == 3.25, "turbo record")
-    check(turbo["output"]["class"] == "numeric" and abs(turbo["output"]["max_abs"] - 2e-6) < 1e-10 and turbo["median_s"] == 1.1, "turbo output class: %r" % turbo["output"])
-    check(turbo["refusals"]["refused_never"] == 3 and len(turbo["refused_kernels"]) == 2, "turbo refusals")
-    check(verify["verify"]["words_outside"] == 2 and verify["verify"]["kernels_outside"] == 1 and verify["verify"]["launches"]["in_set_different"] == 34, "verify record")
+    check(logged["launches_card"] == 37 and logged["launches_total"] == 49 and logged["card_s"] == 0.412345 and logged["sim_s"] == 3.25, "logged exact record")
+    check(logged["output"]["class"] == "numeric" and abs(logged["output"]["max_abs"] - 2e-6) < 1e-10 and logged["median_s"] == 1.1, "output class: %r" % logged["output"])
+    check(logged["refusals"] == {"refused_code": 5, "refused_safety": 1, "too_small": 3, "failed": 0}, "refusals: the log's line and the prose line together: %r" % logged["refusals"])
+    check(verify["verify"]["launches"]["in_set_different"] == 34 and verify["verify"]["launches"]["other_different"] == 5, "verify record")
     check(verify["output"]["class"] == "identical", "verify output")
     check(hung["timeout"] and "output" not in hung, "a timed-out form has no output class")
     check(off["mode_off"].startswith("cannot load") and off.get("launches_card") is None, "mode off record")
-    exact["speedup"], turbo["speedup"] = 2.2, 10.0
+    exact["speedup"], logged["speedup"] = 2.2, 10.0
     res = {"meta": {"gpu": "nvidia/a10g", "runs": 2, "forms": list(FORMS), "timeout": 600, "atol": 1e-8, "rtol": 1e-5, "threads": "default", "env": []},
-           "programs": {"polybench/GEMM": {"sim": sim, "exact": exact, "turbo": turbo, "verify": verify},
-                        "hecbench/hang": {"sim": sim, "exact": exact, "turbo": hung},
-                        "rodinia/nocard": {"sim": sim, "turbo": off}}}
+           "programs": {"polybench/GEMM": {"sim": sim, "exact": logged, "exactdiv": exact, "verify": verify},
+                        "hecbench/hang": {"sim": sim, "exact": hung},
+                        "rodinia/nocard": {"sim": sim, "exact": off}}}
     md = markdown(res)
     rows = [l for l in md.splitlines() if l.startswith("| ")]
     check(len(rows) == 4 and len(set(l.count("|") for l in rows)) == 1, "every table row has the header's columns:\n" + md)
     gemm = [l for l in rows if l.startswith("| polybench/GEMM")][0]
-    for want in ("| 11.00 |", "| 5.00 | 2.20x | 8 / 49 |", "| 1.10 | 10.00x | 37 / 49 | 0.41 / 3.25 | numeric (abs 2e-06, rel 2e-06) |", "| 3/2/0/0/1/3 |",
-                 "| 4711 / 2 (abs 2.38e-07, rel 0.5) | 1 | identical |"):
+    for want in ("| 11.00 |", "| 1.10 | 10.00x | 37 / 49 | 0.41 / 3.25 | numeric (abs 2e-06, rel 2e-06) |", "| 5.00 | 2.20x | 8 / 49 |",
+                 "| code 5, safety 1, small 3 |", "| 39 / 42 | identical |"):
         check(want in gemm, "GEMM row lacks %r:\n%s" % (want, gemm))
     check("| TIMEOUT | - | - | - | - |" in [l for l in rows if l.startswith("| hecbench/hang")][0], "the hung program's row")
     check("| off |" in [l for l in rows if l.startswith("| rodinia/nocard")][0], "the no-card row")
-    check("turbo: geometric mean speed-up over sim 10.00x (1 programs)." in md and "exact: geometric mean speed-up over sim 2.20x (2 programs)." in md, "geometric means")
-    check("* never `TEX.SCR.LL`: 1 kernels (polybench/GEMM)" in md and "* atomics `ATOMG.E.CAS.STRONG.GPU`: 1 kernels" in md, "the list of refused kernels")
-    check("rodinia/nocard turbo: cannot load the real driver" in md, "the mode-off note")
+    check("exact: geometric mean speed-up over sim 10.00x (1 programs)." in md and "exactdiv: geometric mean speed-up over sim 2.20x (1 programs)." in md, "geometric means")
+    check("rodinia/nocard exact: cannot load the real driver" in md, "the mode-off note")
     json.dumps(res)   # everything that goes to the JSON file can be written
 
     # the forms' environments
     class B:
-        atol, rtol, env = 1e-8, 1e-5, ["VGPU_HOST_GPU_ATOMICS=1"]
+        atol, rtol, env = 1e-8, 1e-5, ["VGPU_HOST_GPU_LOG=1"]
     check(form_env("sim", B) == {}, "sim sets nothing")
-    check(form_env("exact", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_ATOMICS": "1"}, "exact env")
-    check(form_env("exactdiv", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_DIV": "1", "VGPU_HOST_GPU_ATOMICS": "1"}, "exactdiv env")
-    check(form_env("exacti", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_DIV": "1", "VGPU_HOST_GPU_SQRT": "1", "VGPU_HOST_GPU_ATOMICS": "1"}, "exacti env")
-    v = form_env("verify", B)
-    check(v["VGPU_HOST_GPU"] == "turbo" and v["VGPU_HOST_GPU_VERIFY"] == "all" and float(v["VGPU_HOST_GPU_RTOL"]) == 1e-5 and v["VGPU_HOST_GPU_ATOMICS"] == "1", "verify env")
-    check("VGPU_HOST_GPU_VERIFY" not in form_env("turbo", B), "turbo env")
-    check(form_env("exact0", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_SAMPLE": "0", "VGPU_HOST_GPU_ATOMICS": "1"}, "exact0 env")
-    check(form_env("turbo0", B)["VGPU_HOST_GPU"] == "turbo" and form_env("turbo0", B)["VGPU_HOST_GPU_SAMPLE"] == "0" and
-          "VGPU_HOST_GPU_SAMPLE" not in form_env("turbo", B) and "VGPU_HOST_GPU_SAMPLE" not in form_env("exact", B), "turbo0 env")
-    check(form_env("exactw", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_SAMPLE": "whole", "VGPU_HOST_GPU_ATOMICS": "1"}, "exactw env")
-    check(form_env("turbow", B)["VGPU_HOST_GPU"] == "turbo" and form_env("turbow", B)["VGPU_HOST_GPU_SAMPLE"] == "whole", "turbow env")
-    check(form_env("exactn", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_STREAK": "0", "VGPU_HOST_GPU_ATOMICS": "1"}, "exactn env")
-    check(form_env("turbon", B)["VGPU_HOST_GPU"] == "turbo" and form_env("turbon", B)["VGPU_HOST_GPU_STREAK"] == "0" and
-          "VGPU_HOST_GPU_STREAK" not in form_env("turbo", B) and "VGPU_HOST_GPU_STREAK" not in form_env("exact", B), "turbon env")
-    check(form_env("exactw0", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_WIDER": "0", "VGPU_HOST_GPU_ATOMICS": "1"}, "exactw0 env")
-    check(form_env("turbow0", B)["VGPU_HOST_GPU"] == "turbo" and form_env("turbow0", B)["VGPU_HOST_GPU_WIDER"] == "0" and
-          "VGPU_HOST_GPU_WIDER" not in form_env("turbo", B) and "VGPU_HOST_GPU_WIDER" not in form_env("exact", B) and
-          "VGPU_HOST_GPU_WIDER" not in form_env("exactn", B) and "VGPU_HOST_GPU_STREAK" not in form_env("turbow0", B), "turbow0 env")
-    check(form_env("exactl0", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_START_LAUNCHES": "0", "VGPU_HOST_GPU_ATOMICS": "1"}, "exactl0 env")
-    check(form_env("turbol0", B)["VGPU_HOST_GPU"] == "turbo" and form_env("turbol0", B)["VGPU_HOST_GPU_START_LAUNCHES"] == "0" and
-          "VGPU_HOST_GPU_START_LAUNCHES" not in form_env("turbo", B) and "VGPU_HOST_GPU_START_LAUNCHES" not in form_env("exactw0", B), "turbol0 env")
-    check(form_env("exactr0", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_START_REPEATS": "0", "VGPU_HOST_GPU_ATOMICS": "1"}, "exactr0 env")
-    check(form_env("exactb0", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_SAMPLE_BLOCK": "0", "VGPU_HOST_GPU_ATOMICS": "1"}, "exactb0 env")
-    check(form_env("turbob0", B)["VGPU_HOST_GPU"] == "turbo" and form_env("turbob0", B)["VGPU_HOST_GPU_SAMPLE_BLOCK"] == "0" and
-          "VGPU_HOST_GPU_SAMPLE_BLOCK" not in form_env("turbo", B), "turbob0 env")
-    check(form_env("exactd0", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_SAMPLE_STARTED": "0", "VGPU_HOST_GPU_ATOMICS": "1"}, "exactd0 env")
-    check(form_env("turbod0", B)["VGPU_HOST_GPU"] == "turbo" and form_env("turbod0", B)["VGPU_HOST_GPU_SAMPLE_STARTED"] == "0" and
-          "VGPU_HOST_GPU_SAMPLE_STARTED" not in form_env("turbo", B) and "VGPU_HOST_GPU_SAMPLE_STARTED" not in form_env("turbob0", B) and
-          "VGPU_HOST_GPU_SAMPLE_BLOCK" not in form_env("turbod0", B), "turbod0 env")
-    check(form_env("turbof0", B)["VGPU_HOST_GPU_FIRST_BIG"] == "0" and form_env("turbof0", B)["VGPU_HOST_GPU_FIT"] == "0" and
-          "VGPU_HOST_GPU_FIRST_BIG" not in form_env("turborules", B), "turbof0 env")
-    check(form_env("turbos0", B)["VGPU_HOST_GPU_SHORT"] == "0" and "VGPU_HOST_GPU_SHORT" not in form_env("turbo", B), "turbos0 env")
-    check(form_env("turboc0", B)["VGPU_HOST_GPU"] == "turbo" and form_env("turboc0", B)["VGPU_HOST_GPU_COOP"] == "0" and "VGPU_HOST_GPU_FIT" not in form_env("turboc0", B) and
-          "VGPU_HOST_GPU_COOP" not in form_env("turbo", B) and "VGPU_HOST_GPU_HOSTMAP" not in form_env("turboc0", B), "turboc0 env")
-    check(form_env("turbom0", B)["VGPU_HOST_GPU"] == "turbo" and form_env("turbom0", B)["VGPU_HOST_GPU_HOSTMAP"] == "0" and "VGPU_HOST_GPU_FIT" not in form_env("turbom0", B) and
-          "VGPU_HOST_GPU_HOSTMAP" not in form_env("turbo", B) and "VGPU_HOST_GPU_COOP" not in form_env("turbom0", B), "turbom0 env")
-    check(form_env("turbor0", B)["VGPU_HOST_GPU"] == "turbo" and form_env("turbor0", B)["VGPU_HOST_GPU_START_REPEATS"] == "0" and
-          "VGPU_HOST_GPU_START_REPEATS" not in form_env("turbo", B) and "VGPU_HOST_GPU_START_REPEATS" not in form_env("turbol0", B) and
-          "VGPU_HOST_GPU_START_LAUNCHES" not in form_env("turbor0", B), "turbor0 env")
+    check(form_env("exact", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_LOG": "1"}, "exact env")
+    check(form_env("exactdiv", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_DIV": "1", "VGPU_HOST_GPU_LOG": "1"}, "exactdiv env")
+    check(form_env("exacti", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_DIV": "1", "VGPU_HOST_GPU_SQRT": "1", "VGPU_HOST_GPU_LOG": "1"}, "exacti env")
+    check(form_env("verify", B) == {"VGPU_HOST_GPU": "exact", "VGPU_HOST_GPU_VERIFY": "all", "VGPU_HOST_GPU_LOG": "1"}, "verify env")
+    check("VGPU_HOST_GPU_VERIFY" not in form_env("exact", B), "exact env has no verify")
+    one = {"exact0": ("VGPU_HOST_GPU_SAMPLE", "0"), "exactw": ("VGPU_HOST_GPU_SAMPLE", "whole"), "exactn": ("VGPU_HOST_GPU_STREAK", "0"),
+           "exactw0": ("VGPU_HOST_GPU_WIDER", "0"), "exactl0": ("VGPU_HOST_GPU_START_LAUNCHES", "0"), "exactr0": ("VGPU_HOST_GPU_START_REPEATS", "0"),
+           "exactb0": ("VGPU_HOST_GPU_SAMPLE_BLOCK", "0"), "exactd0": ("VGPU_HOST_GPU_SAMPLE_STARTED", "0"), "exactf0": ("VGPU_HOST_GPU_FIRST_BIG", "0")}
+    for f, (k, v) in one.items():
+        e = form_env(f, B)
+        check(e == {"VGPU_HOST_GPU": "exact", k: v, "VGPU_HOST_GPU_LOG": "1"}, "%s env: %r" % (f, e))
+        for g, (k2, _) in one.items():   # each form changes its own switch and no other (exact0 and exactw share one)
+            if k2 != k:
+                check(k2 not in e, "%s env must not set %s" % (f, k2))
 
     for f in fails:
         print("FAIL: " + f)
@@ -772,16 +696,16 @@ def main():
     ap.add_argument("--corpora", default="polybench,rodinia,hecbench")
     ap.add_argument("--programs", default="", help="comma list of corpus/name or name; default all")
     ap.add_argument("--skip", default="", help="comma list of corpus/name or name to leave out")
-    ap.add_argument("--forms", default="sim,exact,turbo", help="of sim,exact,turborules,exact0,exactw,exactn,exactw0,exactl0,exactr0,exactb0,exactd0,exactdiv,exacti,turbo,turbo0,turbow,turbon,turbow0,turbol0,turbor0,turbob0,turbod0,turbos0,turboc0,turbom0,verify (turboc0, turbom0: with VGPU_HOST_GPU_COOP=0 or VGPU_HOST_GPU_HOSTMAP=0, the rules before #661; turbos0: with VGPU_HOST_GPU_SHORT=0, the size rule before #660; exactd0, turbod0: with VGPU_HOST_GPU_SAMPLE_STARTED=0; exactb0, turbob0: with VGPU_HOST_GPU_SAMPLE_BLOCK=0; exactr0, turbor0: with VGPU_HOST_GPU_START_REPEATS=0; exactdiv: exact with VGPU_HOST_GPU_DIV=1; exacti: exact with VGPU_HOST_GPU_DIV=1 and VGPU_HOST_GPU_SQRT=1; exact0, turbo0: with VGPU_HOST_GPU_SAMPLE=0; exactw, turbow: with VGPU_HOST_GPU_SAMPLE=whole; exactn, turbon: with VGPU_HOST_GPU_STREAK=0; exactw0, turbow0: with VGPU_HOST_GPU_WIDER=0, the safety rules before Round sp66; exactl0, turbol0: with VGPU_HOST_GPU_START_LAUNCHES=0; verify: one untimed turbo run with VGPU_HOST_GPU_VERIFY=all)")
+    ap.add_argument("--forms", default="sim,exact", help="of sim,exact,exact0,exactw,exactn,exactw0,exactl0,exactr0,exactb0,exactd0,exactf0,exactdiv,exacti,verify (exactdiv: exact with VGPU_HOST_GPU_DIV=1; exacti: exact with VGPU_HOST_GPU_DIV=1 and VGPU_HOST_GPU_SQRT=1; exact0: with VGPU_HOST_GPU_SAMPLE=0; exactw: with VGPU_HOST_GPU_SAMPLE=whole; exactn: with VGPU_HOST_GPU_STREAK=0; exactw0: with VGPU_HOST_GPU_WIDER=0, the safety rules before Round sp66; exactl0: with VGPU_HOST_GPU_START_LAUNCHES=0; exactr0: with VGPU_HOST_GPU_START_REPEATS=0; exactb0: with VGPU_HOST_GPU_SAMPLE_BLOCK=0; exactd0: with VGPU_HOST_GPU_SAMPLE_STARTED=0; exactf0: with VGPU_HOST_GPU_FIRST_BIG=0; verify: one untimed exact run with VGPU_HOST_GPU_VERIFY=all)")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--long-secs", type=float, default=120, help="a program whose first sim run takes longer gets --long-runs runs")
     ap.add_argument("--long-runs", type=int, default=1)
     ap.add_argument("--timeout", type=float, default=600, help="seconds per run; a run past it is killed and recorded")
     ap.add_argument("--verify-timeout", type=float, default=0, help="seconds for the verify run (default: --timeout)")
     ap.add_argument("--threads", default="default", help="VGPU_THREADS, or 'default' to leave it unset")
-    ap.add_argument("--atol", type=float, default=1e-8)
+    ap.add_argument("--atol", type=float, default=1e-8, help="output comparison: a number within atol + rtol * |sim| of the sim run's counts as the same number")
     ap.add_argument("--rtol", type=float, default=1e-5)
-    ap.add_argument("--env", action="append", default=[], metavar="K=V", help="added to every form but sim (e.g. VGPU_HOST_GPU_ATOMICS=1); repeatable")
+    ap.add_argument("--env", action="append", default=[], metavar="K=V", help="added to every form but sim (e.g. VGPU_HOST_GPU_MAX_MIB=1024); repeatable")
     ap.add_argument("--no-exact-stats", action="store_true", help="skip the extra exact run with VGPU_HOST_GPU_LOG=1")
     ap.add_argument("--max-load", type=float, default=0, help="wait while the 1-minute load average is above this (0: do not wait)")
     ap.add_argument("--json", default="")

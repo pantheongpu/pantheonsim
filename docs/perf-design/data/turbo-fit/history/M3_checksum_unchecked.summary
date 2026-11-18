@@ -1,2 +1,0 @@
-unit rc=1 1 FAIL lines; first: [ FAIL ] a_corrupt_file_is_a_miss_in_every_way_it_can_be_corrupt
-stub rc=0 0 FAIL lines; first: 

@@ -1266,7 +1266,6 @@ void MemoryManager::unmap_host(uint64_t addr) {
       if (retired.size() >= kRetiredHostMaps) retired.erase(retired.begin());
       retired.push_back(HostMap{v[i].base, v[i].len, nullptr});
       v.erase(v.begin() + static_cast<long>(i));
-      host_maps_->unmaps.fetch_add(1, std::memory_order_relaxed);
       host_maps_->gen.store(fresh_generation(), std::memory_order_release);
       break;
     }
@@ -1758,15 +1757,6 @@ uint8_t* MemoryManager::host_address(uint64_t addr, uint64_t len) const {
   if (h.read_only) throw_read_only_host_write(addr, len);
   return h.host + (addr - h.base);
 }
-
-std::vector<MemoryManager::HostSpan> MemoryManager::host_spans() const {
-  std::vector<HostSpan> out;
-  std::lock_guard<std::mutex> lock(host_maps_->mu);
-  for (const HostMap& m : host_maps_->maps) out.push_back(HostSpan{m.base, m.len, m.host, m.read_only});
-  return out;
-}
-
-uint64_t MemoryManager::host_unmaps() const { return host_maps_->unmaps.load(std::memory_order_relaxed); }
 
 bool MemoryManager::is_host_mapped(uint64_t addr) const {
   // Nothing mapped near it: no lock, as before any buffer was mapped at all.

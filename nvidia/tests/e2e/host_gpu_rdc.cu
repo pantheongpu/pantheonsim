@@ -1,6 +1,6 @@
-// Round sp66 (docs/perf-design/12-host-gpu-turbo.md section 2, the call class): built with -rdc=true, together with host_gpu_rdc_fn.cu, so that
+// Round sp66: built with -rdc=true, together with host_gpu_rdc_fn.cu, so that
 // `mix` is a device function of its own section and the kernel calls it with an absolute call (CALL.ABS.NOINC, a relocation the driver links).
-// Turbo mode classes the callee's code with the kernel's and sends the kernel to the card; exact mode does not (CALL is outside its set).
+// Exact mode keeps the kernel in the simulator (CALL is outside its set).
 // Integer arithmetic only: the same bits on the card and in the simulator. Prints one hash per launch.
 #include <cstdint>
 #include <cstdio>

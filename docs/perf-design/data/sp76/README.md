@@ -1,6 +1,6 @@
 # Round sp76: a kernel's first launch once the driver is up (data)
 
-The design is section 13 of [../../12-host-gpu-turbo.md](../../12-host-gpu-turbo.md); the round's text is *Round sp76* in
+The design is section 13 of [../../12-host-gpu-size-rules.md](../../12-host-gpu-size-rules.md); the round's text is *Round sp76* in
 [../../rounds/11-rounds-sp36-sp41.md](../../rounds/11-rounds-sp36-sp41.md). Tracking: pantheonsim #657, #659 (and Rodinia
 particlefilter_float, #662 and the rest of #656, measured and not changed).
 

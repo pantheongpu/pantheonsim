@@ -65,7 +65,7 @@ has that address unmapped or backed with zeros inside the span `ensure_mapped` f
 * `MemoryManager::card_blocker()` (include/vgpu/memory.hpp, src/core/memory.cpp), used by `Runtime::kernel_eligible` (not cached: a mapping can appear between two
   launches). Nothing on an access path changed.
 * `kIncompatibleVars`, `diagnostic_switched_on`, `mode_text_is_known` (include/vgpu/host_gpu.hpp): the start-up refusal is pure logic now and unit tested.
-  The message is printed even under `VGPU_QUIET`; `VGPU_HOST_GPU=<not off, exact or turbo>` prints "not a mode; mode off".
+  The message is printed even under `VGPU_QUIET`; `VGPU_HOST_GPU=<not off or exact>` prints "not a mode; mode off".
 * Config keys `host_gpu` (`off`, `exact`) and `host_gpu_log` (src/cli/config.cpp, docs/config.md, README.md, pantheonsim.example.yaml).
 * Tests: the table test over every `MemoryManager` entry, `card_blocker_*`, `mode_text_known_and_diagnostic_switches`, step 6 of `run_host_gpu_stub.sh`.
 
@@ -148,8 +148,7 @@ Why the gate's promises hold:
   compare to the next launch, never during one, so the atomics of the simulator's host threads never meet the gate's slow path (the bug of sp59).
 * **The next launch on the card starts from the simulator's memory.** A chunk is kept only when its bytes on the card, copied back right after the card's
   launch, equal the simulator's after the simulator's launch; no launch runs on the card between the copy and the compare. Every other chunk stays Host and is
-  pushed. In turbo mode the bytewise test comes first, so a chunk that differs within tolerance is pushed too: differences still do not carry from one
-  launch to the next.
+  pushed.
 * **What the host does between launches is seen.** A kept chunk is an ordinary card copy for the inventory of section 2: a host write (`write`, `fill`,
   a device-to-device copy, which declines a card-valid allocation and falls back to `read` + `write`) asks the gate and makes the chunk Host, so it is pushed
   again; a host read changes nothing (Both) and pulls nothing (the simulator's memory is the truth in verify mode); a free drops the entry; an IPC export drops it
@@ -157,8 +156,8 @@ Why the gate's promises hold:
   a launch on the card), so no remembered lookup reaches it without the gate.
 * **Exclusive.** The change of chunk states is made in `note_simulated`, which holds the gate's lock exclusively: a thread's `GateMemory` of settled chunks
   is voided by the generation, as for every other change.
-* **Nothing else moves.** Only verify runs reach the code (the pending launch exists only then); plain runs never construct the mode, and `exact` and `turbo`
-  without verify take the paths they took. The program's output is the simulator's, as before. A verify run now keeps one buffer per live range for the card's
+* **Nothing else moves.** Only verify runs reach the code (the pending launch exists only then); plain runs never construct the mode, and `exact`
+  without verify takes the paths it took. The program's output is the simulator's, as before. A verify run now keeps one buffer per live range for the card's
   bytes between launches (the size of live memory), where it allocated and freed one per launch.
 
 Tests: `test_host_gpu_track` (`compare_with_card_...`, `keep_verified_chunks_...`, `chunks_kept_after_a_verify_are_guarded_by_the_gate_...`), 10 of 10 mutants

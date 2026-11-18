@@ -1,4 +1,4 @@
-// What turbo mode costs a program whose launches stay in the simulator (pantheonsim #662, #660): `kernels` launches 50 distinct large
+// What host-GPU mode costs a program whose launches stay in the simulator (pantheonsim #662, #660): `kernels` launches 50 distinct large
 // kernels once each on one warp, `repeat` one kernel 5000 times. Neither has a launch worth a card.
 #include <cstdio>
 #include <cstring>

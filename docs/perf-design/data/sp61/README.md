@@ -1,6 +1,6 @@
 # Round sp61: progress inside a block (data)
 
-The design is section 8 of [../../12-host-gpu-turbo.md](../../12-host-gpu-turbo.md) ("What it did not reach, and progress inside a block").
+The design is section 8 of [../../12-host-gpu-size-rules.md](../../12-host-gpu-size-rules.md) ("What it did not reach, and progress inside a block").
 The round's text is appended to [../../rounds/11-rounds-sp36-sp41.md](../../rounds/11-rounds-sp36-sp41.md) after the card part.
 
 ## Before the card (server3: GCC 13.3, `Release`, `-Werror`, no LTO, `VGPU_THREADS=4`, profile `nvidia/a10g`, no driver)

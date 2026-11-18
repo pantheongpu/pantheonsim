@@ -1,6 +1,6 @@
 # Round sp65: a launch while the card holds the memory (data)
 
-The design is section 9 of [../../12-host-gpu-turbo.md](../../12-host-gpu-turbo.md) ("A launch while the card holds the memory").
+The design is section 9 of [../../12-host-gpu-size-rules.md](../../12-host-gpu-size-rules.md) ("A launch while the card holds the memory").
 The round's text is appended to [../../rounds/11-rounds-sp36-sp41.md](../../rounds/11-rounds-sp36-sp41.md) after the card part.
 
 ## Before the card (server3: GCC 13.3, `Release`, `-Werror`, no LTO, `VGPU_THREADS=4`, profile `nvidia/a10g`, no driver)

@@ -3,6 +3,8 @@ This directory holds the complete, unedited measurement log that used to be `doc
 [../../performance.md](../../performance.md) first: it is the overview (how fast, which knobs, what did not pay off). Come here for the evidence
 behind a number: the machine, the commands, the A/B tables, the mutation checks and the dead ends.
 
+Note on host-GPU rounds: rounds sp59 and later (sp60b, sp61, sp65, sp66, sp75, sp76 and their data) were run when this repository still had a second, relaxed host-GPU mode that did not return the simulator's bits. That mode was removed on 2026-11-18; released versions keep it. The log is kept as it was written, and where a figure was measured in that mode it is not a result of `exact` mode. What stays in the code is described in [../12-host-gpu-size-rules.md](../12-host-gpu-size-rules.md).
+
 The text of the eleven files, concatenated in order, is the old page (plus the sections *Round sp40* and *Round sp41*, which were written on
 branch `sp41-ptx-amd-counting` and appended at the end, and the rounds from *Round sp46* to *Round sp76*, each appended after them on its own branch). Nothing was edited when it was split, so a sentence such as "the section above" or
 "see 'Noise'" refers to the order of these files. Section names in source comments, `docs/cli.md` and the other docs now point at the file

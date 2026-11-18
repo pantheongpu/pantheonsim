@@ -1,6 +1,6 @@
 # Round sp66: what keeps turbo mode's launches in the simulator, and what was lifted (data)
 
-The design is section 10 of [../../12-host-gpu-turbo.md](../../12-host-gpu-turbo.md) ("What a module holds besides code"), and section 2 for the
+The design is section 10 of [../../12-host-gpu-size-rules.md](../../12-host-gpu-size-rules.md) ("What a module holds besides code"), and section 2 for the
 atomics default. The round's text is in [../../rounds/11-rounds-sp36-sp41.md](../../rounds/11-rounds-sp36-sp41.md).
 
 ## Before the card (server3: GCC 13.3, `Release`, `-Werror`, no LTO, `VGPU_THREADS=3`, profile `nvidia/a10g`, the stand-in driver)

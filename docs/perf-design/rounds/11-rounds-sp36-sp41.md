@@ -2522,7 +2522,7 @@ What would put the line over the bar, from what was measured: a page whose lines
 
 ## Round sp59 (turbo host-GPU mode on an A10G)
 
-Branch `hostgpu-turbo`. `VGPU_HOST_GPU=turbo` ([design](../12-host-gpu-turbo.md), pantheonsim #587) on one real A10G: the card CI, the probes, and
+Branch `hostgpu-turbo`. `VGPU_HOST_GPU=turbo` ([design](../12-host-gpu-size-rules.md), pantheonsim #587) on one real A10G: the card CI, the probes, and
 PolyBench/GPU, Rodinia and the reduced HeCBench list as plain simulator, `exact`, `exact` with `VGPU_HOST_GPU_DIV=1` and `turbo`. Data, commands and the
 rig: [`data/sp59/`](../data/sp59/README.md). One rig, single runs for the long programs, one toolkit (13.0): read the caveats.
 
@@ -2834,7 +2834,7 @@ Branch `sp60b-first-launch`, on `hostgpu-relaxed` (pantheonsim #587). Round sp59
 host-GPU mode is the size rule, and in it the first launch of a kernel: it goes to the card only on a static estimate that is far too low for a
 kernel with a loop, and programs that launch each kernel once have no second launch. This round replaces the guess with a measurement: a launch
 with no estimate is **sampled** in a forked copy of the process, and goes to the card when the measured time repays the card path and the
-driver start. Design and soundness: [12, section 8](../12-host-gpu-turbo.md). Data, scripts and commands: [`data/sp60b/`](../data/sp60b/README.md).
+driver start. Design and soundness: [12, section 8](../12-host-gpu-size-rules.md). Data, scripts and commands: [`data/sp60b/`](../data/sp60b/README.md).
 Before the card everything ran on server3 (no driver); the card part is one A10G (g5.xlarge, 4 vCPU, driver 595.112.07, nvcc 13.0), about 4 hours.
 
 ### Headline (one A10G; `exact0` and `turbo0` are the same build with `VGPU_HOST_GPU_SAMPLE=0`, the rule of sp59; medians of 3 interleaved runs, 1 for a program over 30 s)
@@ -3015,7 +3015,7 @@ Branch `sp61-inblock-progress`, on `hostgpu-relaxed` (pantheonsim #587). Round s
 runs on 8 blocks of 256 threads, so no block ends within a sample and a grid under 256 blocks was not sampled at all. This round samples such a
 launch *inside* its blocks: the forked copy runs each block until its warps stand in the kernel's top-level counted loop, reads per lane how far the
 loop's induction register is from the bound its compare reads, and times one turn of the loop on one warp. Design and soundness:
-[12, section 8](../12-host-gpu-turbo.md). Data, scripts and commands: [`data/sp61/`](../data/sp61/README.md). Before the card everything ran on server3
+[12, section 8](../12-host-gpu-size-rules.md). Data, scripts and commands: [`data/sp61/`](../data/sp61/README.md). Before the card everything ran on server3
 (no driver); the card part is one A10G (g5.xlarge, 4 vCPU, driver 595.112.07, nvcc 13.0), about 2.5 hours.
 
 ### Headline (one A10G; `exactw` and `turbow` are the same build with `VGPU_HOST_GPU_SAMPLE=whole`, the rule of sp60b; medians of 3 runs)
@@ -3423,7 +3423,7 @@ Sides as round sp63's (`sp64.py`): **Ba**, **Na** the base and the changed build
 Branch `sp65-resident-streaks`, on `hostgpu-relaxed` f55c8e65 (pantheonsim #587). With residency a launch on the card leaves every live 64 KiB chunk
 the card's alone, and a launch the simulator runs first pulls all of them back; the size rule weighed a short launch's simulator time alone against the
 card path, so a short kernel between two card launches was kept in the simulator, pulled the whole live memory back and made the next card launch
-push it all again. This round prices such a launch with what each side moves. Design and soundness: [12, section 9](../12-host-gpu-turbo.md).
+push it all again. This round prices such a launch with what each side moves. Design and soundness: [12, section 9](../12-host-gpu-size-rules.md).
 Data, scripts and commands: [`data/sp65/`](../data/sp65/README.md). Before the card everything ran on server3 (no driver; the machine's lock was shared
 with three other rounds, so the trace passes were cut to what can change); the card part is one A10G (g5.xlarge, 4 vCPU, driver 595.112.07, nvcc 13.0),
 about 2 hours.
@@ -3543,7 +3543,7 @@ change: 17 launches kept, 48 MiB moved, 225.0 s. LU, gaussian and lud were run a
 Branch `sp66-turbo-wider`, on `hostgpu-relaxed` f55c8e65 (pantheonsim #587). Turbo mode's instruction classes were no longer what kept work in the
 simulator (sp59: no launch refused as `never`); the safety refusals and the atomics opt-in were. This round measured, per launch and weighted by
 simulator seconds, everything that keeps a launch off the card, and lifted each block that could be lifted soundly. Design and soundness:
-[12, section 10](../12-host-gpu-turbo.md) (and sections 2 and 3). Data, scripts and commands: [`data/sp66/`](../data/sp66/README.md). Before the card
+[12, section 10](../12-host-gpu-size-rules.md) (and sections 2 and 3). Data, scripts and commands: [`data/sp66/`](../data/sp66/README.md). Before the card
 everything ran on server3 against the stand-in driver; the card part is one A10G (g5.xlarge, 4 vCPU, driver 595.112.07, nvcc 13.0), about 2.5 hours
 (a second pass of 25 minutes after the fixes).
 
@@ -3933,11 +3933,11 @@ by hand, with `git rerere` off (a scratch merge of sp68 with sp65 had left resol
 * **Step numbers of `nvidia/tests/e2e/run_host_gpu_stub.sh`.** The rounds each numbered their new steps from 24: now sp65 24 to 27, sp67 28, sp68
   29, sp66 30 to 36. The card test `run_host_gpu.sh`: sp66 7 to 11, sp68 12 (one PASS line for both). The round texts above keep the numbers they
   had when they ran (sp66's "24 to 30", sp67's and sp68's "28", sp68's card "7"); `host_gpu_lazy.cu`, `10-host-gpu-hooks.md` and the test table of
-  `12-host-gpu-turbo.md` follow the new ones.
+  `12-host-gpu-size-rules.md` follow the new ones.
 * **Harness forms.** sp65 and sp66 both added `exactn` and `turbon` to `tools/bench/hostgpu/run.py`, for `VGPU_HOST_GPU_STREAK=0` and for
   `VGPU_HOST_GPU_WIDER=0`: merged, one form set both switches. sp65's keep the names; sp66's are now `exactw0` and `turbow0`
   (`data/sp66/card-run.sh` uses them; the `exactn` and `turbon` columns of `data/sp66/changed.md` and `repeat.md` are `WIDER=0`, as their README says).
-* **`12-host-gpu-turbo.md`.** Two sections 10: sp65's section 9, sp66's section 10, "What is next" 11; the duplicated intro lines and test-table rows
+* **`12-host-gpu-size-rules.md`.** Two sections 10: sp65's section 9, sp66's section 10, "What is next" 11; the duplicated intro lines and test-table rows
   are one each.
 * `data/sp64/pieces-not-kept.patch` (11.7 KB) left the tree to keep the directory under 100 KB; it is on branch `sp64-jit-threads` (commit 21787e28).
 
@@ -5200,7 +5200,7 @@ loop (6,100 and 5,984) and the rest are what they were.
 
 Branch `sp75-turbo-first-launch`, on `sp69-hotspot-start` (6cf503d3, the head of PR #645). Tracking: pantheonsim #656 (a single long launch is
 not sent on its first run), #657 (HeCBench aidw: two of four launches kept, 365 s), and the diagnoses of #659 and #662. Design:
-[12-host-gpu-turbo.md](../12-host-gpu-turbo.md), section 12. Data and commands: [`data/sp75/`](../data/sp75/README.md). **Everything
+[12-host-gpu-size-rules.md](../12-host-gpu-size-rules.md), section 12. Data and commands: [`data/sp75/`](../data/sp75/README.md). **Everything
 below but *The card run* is server3 with the stand-in driver; the card run (2026-11-15, one A10G) is
 [`data/sp75/card.md`](../data/sp75/card.md), made with `data/sp75/card-run.sh`.**
 
@@ -5404,7 +5404,7 @@ at 8.2 GB free. Round sp69's directory was read (how it built) and not changed.
 Branch `sp76-turbo-driver-up`, on the head of PR #669 (Round sp75 and its card run). Tracking: pantheonsim #657 (HeCBench aidw: one launch of
 four still simulated, 149 s of 193 s) and #659 (the first launches of kernels a program launches after its driver start), with Rodinia
 particlefilter_float (unsettled in Round sp75's card run), #662 (HeCBench silu: the start bought late) and the rest of #656 (the launches
-under the sampling floor in a young process) measured and not changed. Design: [12-host-gpu-turbo.md](../12-host-gpu-turbo.md), section 13.
+under the sampling floor in a young process) measured and not changed. Design: [12-host-gpu-size-rules.md](../12-host-gpu-size-rules.md), section 13.
 Data and commands: [`data/sp76/`](../data/sp76/README.md). **Everything below but the next paragraph is server3 with the stand-in driver; the round had no card when it was written. Card run afterwards, A10G, 2026-11-15** ([`data/sp76/card.md`](../data/sp76/card.md)): the fork of a process that holds the real driver is safe (20 of 20 runs in each mode, no `NVRM` or `Xid` line, 5 ms a fork); aidw 181.57 s to 44.41 s with 4 of 4 launches on the card, mergeSort 3.18 to 2.12 s, histogram 3.27 to 2.30 s, segmentationTreeThrust 6.52 to 5.25 s, outputs identical; no program that takes such a sample slower, but samples/interval (1.09) and samples/reduction (1.07) read slower in one run and were not rerun.
 
 **The question.** Round sp75's card run sent aidw's first kernel on a block stopped at its limit and left the first launch of its second

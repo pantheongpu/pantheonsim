@@ -1,4 +1,4 @@
-// Host-GPU mode: the cubin the card loads for a module that has variables (Round sp66, docs/perf-design/12-host-gpu-turbo.md section 3).
+// Host-GPU mode: the cubin the card loads for a module that has variables (Round sp66, docs/perf-design/12-host-gpu-size-rules.md section 3).
 //
 // The card runs the module's own code, but where that code finds a `__device__` or `__constant__` variable is decided by whoever loads the
 // cubin: the simulator put each variable in its own device memory, at an address of the window the card mirrors; the real driver would put
@@ -24,39 +24,6 @@
 #include "vgpu/sass/reloc_patch.hpp"
 
 namespace vgpu::hostgpu {
-
-// Turbo mode gives the card another build of the module than the simulator's (src/runtime/host_gpu.cpp), so the card's references to the module's variables are made
-// the simulator's addresses by the same patch. That is only right when the two builds lay the variables out alike. Empty when they do; else why not. A variable is a
-// non-function symbol of a variable section (.nv.global*, .nv.constant*): the same name, section, offset and size in both, the sections equally large, and no variable of
-// one build missing from the other. (Static shared memory and other sections the loader gives no address are not compared.)
-inline std::string variable_layout_mismatch(const sass::Cubin& card, const sass::Cubin& sim) {
-  const auto is_var = [](const sass::CubinSymbol& y) {
-    return !y.function && !y.name.empty() && y.name[0] != '.' && (y.section.rfind(".nv.global", 0) == 0 || y.section.rfind(".nv.constant", 0) == 0);
-  };
-  const auto find = [&](const sass::Cubin& c, const sass::CubinSymbol& y) -> const sass::CubinSymbol* {
-    for (const sass::CubinSymbol& o : c.symbols)
-      if (is_var(o) && o.name == y.name) return &o;
-    return nullptr;
-  };
-  for (const sass::CubinSymbol& y : card.symbols) {
-    if (!is_var(y)) continue;
-    const sass::CubinSymbol* o = find(sim, y);
-    const sass::CubinSection* a = card.section(y.section);
-    const sass::CubinSection* b = sim.section(y.section);
-    if (!o || o->section != y.section || o->value != y.value || o->size != y.size || !a || !b || a->size != b->size) return y.name + " is laid out differently in the card's image than in the simulator's";
-  }
-  for (const sass::CubinSymbol& o : sim.symbols)
-    if (is_var(o) && !find(card, o)) return o.name + " is not in the card's image";
-  return {};
-}
-
-// A launch marshals the simulator's arguments for the card's image: every parameter of the kernel must be where, and as large as, the simulator's arguments are.
-inline bool parameter_sizes_agree(const sass::CubinKernel& k, const std::vector<size_t>& arg_sizes) {
-  if (k.params.size() != arg_sizes.size()) return false;
-  for (size_t i = 0; i < arg_sizes.size(); ++i)
-    if (k.params[i].size != arg_sizes[i]) return false;
-  return true;
-}
 
 struct CardImage {
   bool ok = false;

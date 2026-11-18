@@ -1,6 +1,6 @@
 # Round sp75: a block that outlasts the wait (data)
 
-The design is section 12 of [../../12-host-gpu-turbo.md](../../12-host-gpu-turbo.md); the round's text is *Round sp75* in
+The design is section 12 of [../../12-host-gpu-size-rules.md](../../12-host-gpu-size-rules.md); the round's text is *Round sp75* in
 [../../rounds/11-rounds-sp36-sp41.md](../../rounds/11-rounds-sp36-sp41.md). Tracking: pantheonsim #656, #657 (and the diagnoses of #659, #662).
 
 Everything here was built and run on server3 (Ryzen 7 PRO 8840U, GCC 13.3, `Release`, `-Werror`, no LTO, `VGPU_THREADS=3`, profile

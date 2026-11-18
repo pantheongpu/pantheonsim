@@ -1,7 +1,5 @@
 // Host-GPU mode, `exact` (docs/perf-design/09-host-gpu-spike.md): a launch whose kernel passes the eligibility scan and whose
 // size rule says the card path wins runs on the machine's real GPU, on the simulator's own device memory.
-// `turbo` (docs/perf-design/12-host-gpu-turbo.md) is the same machinery with a wider eligibility scan (kernels whose result is the card's, not the
-// simulator's bits) and a verify that compares by tolerance; every safety check, the size rule and the residency protocol are shared.
 //
 // How, in this first form (write-through, no state between launches): the simulator's device memory stays the truth. For a launch
 // every live allocation is copied to the card at the same virtual address (the driver's virtual-memory calls reserve the
@@ -27,17 +25,10 @@
 #include <set>
 #include <thread>
 
-#include <atomic>
-extern char** environ;
-
 #include "vgpu/error.hpp"
 #include "vgpu/exec/devrt.hpp"
-#include "vgpu/host_gpu_history.hpp"
 #include "vgpu/host_gpu_idiom.hpp"
-#include "vgpu/host_gpu_cards.hpp"
 #include "vgpu/host_gpu_image.hpp"
-#include "vgpu/host_gpu_regcall.hpp"
-#include "vgpu/host_gpu_source.hpp"
 #include "vgpu/host_gpu_track.hpp"
 #include "vgpu/sass/exec.hpp"
 
@@ -64,19 +55,13 @@ struct CUmemAllocationProp {
 struct CUmemAccessDesc { CUmemLocation location; int flags; };
 
 constexpr uint64_t kGranule = 2ull << 20;
-constexpr int kCudaErrorAssert = 710, kCudaErrorLaunchFailure = 719;   // CUDA_ERROR_ASSERT, CUDA_ERROR_LAUNCH_FAILED (cuda.h)
 constexpr int kAttrMultiprocessors = 16, kAttrCcMajor = 75, kAttrCcMinor = 76;
-constexpr int kFuncAttrMaxDynamicShared = 8;
-// (cuda.h CUdevice_attribute and CUfunction_attribute)
-constexpr int kAttrMaxThreads = 1, kAttrMaxBlockX = 2, kAttrMaxGridX = 5, kAttrMaxRegisters = 12, kAttrSharedOptin = 97, kAttrCooperative = 95;
-constexpr unsigned kHostRegisterDeviceMap = 2;   // CU_MEMHOSTREGISTER_DEVICEMAP
-constexpr int kFuncAttrMaxThreads = 0, kFuncAttrSharedSize = 1, kFuncAttrNumRegs = 4;
+constexpr int kFuncAttrMaxDynamicShared = 8;   // (cuda.h CUdevice_attribute and CUfunction_attribute)
 
 struct Api {
   void* lib = nullptr;
   CUresult (*cuInit)(unsigned) = nullptr;
   CUresult (*cuDeviceGet)(CUdevice*, int) = nullptr;
-  CUresult (*cuDeviceGetCount)(int*) = nullptr;   // (turbo mode with several cards; not required: without it the card count is unknown and only slot 0 is served)
   CUresult (*cuDeviceGetAttribute)(int*, int, CUdevice) = nullptr;
   CUresult (*cuDevicePrimaryCtxRetain)(CUcontext*, CUdevice) = nullptr;
   CUresult (*cuCtxSetCurrent)(CUcontext) = nullptr;
@@ -95,13 +80,6 @@ struct Api {
   CUresult (*cuLaunchKernel)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void*, void**, void**) = nullptr;
   CUresult (*cuModuleGetGlobal)(CUdeviceptr*, size_t*, CUmodule, const char*) = nullptr;   // (a module's __constant__ banks, Round sp66)
   CUresult (*cuMemcpyDtoD)(CUdeviceptr, CUdeviceptr, size_t) = nullptr;
-  CUresult (*cuFuncGetAttribute)(int*, int, CUfunction) = nullptr;   // (turbo mode's fit check; not required: without it nothing is sent in turbo mode)
-  // (turbo mode's cooperative launches and mapped host memory; not required: without one of them those launches stay in the simulator)
-  CUresult (*cuLaunchCooperativeKernel)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void*, void**) = nullptr;
-  CUresult (*cuOccupancyMaxActiveBlocksPerMultiprocessor)(int*, CUfunction, int, size_t) = nullptr;
-  CUresult (*cuMemHostRegister)(void*, size_t, unsigned) = nullptr;
-  CUresult (*cuMemHostUnregister)(void*) = nullptr;
-  CUresult (*cuMemHostGetDevicePointer)(CUdeviceptr*, void*, unsigned) = nullptr;
 
   bool load(const char* path) {
     lib = dlopen(path, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
@@ -119,13 +97,6 @@ struct Api {
     VGPU_HG_SYM(cuLaunchKernel) VGPU_HG_SYM_V2(cuModuleGetGlobal) VGPU_HG_SYM_V2(cuMemcpyDtoD)
 #undef VGPU_HG_SYM
 #undef VGPU_HG_SYM_V2
-    cuFuncGetAttribute = reinterpret_cast<decltype(cuFuncGetAttribute)>(dlsym(lib, "cuFuncGetAttribute"));
-    cuDeviceGetCount = reinterpret_cast<decltype(cuDeviceGetCount)>(dlsym(lib, "cuDeviceGetCount"));
-    cuLaunchCooperativeKernel = reinterpret_cast<decltype(cuLaunchCooperativeKernel)>(dlsym(lib, "cuLaunchCooperativeKernel"));
-    cuOccupancyMaxActiveBlocksPerMultiprocessor = reinterpret_cast<decltype(cuOccupancyMaxActiveBlocksPerMultiprocessor)>(dlsym(lib, "cuOccupancyMaxActiveBlocksPerMultiprocessor"));
-    cuMemHostRegister = reinterpret_cast<decltype(cuMemHostRegister)>(dlsym(lib, "cuMemHostRegister_v2"));
-    cuMemHostUnregister = reinterpret_cast<decltype(cuMemHostUnregister)>(dlsym(lib, "cuMemHostUnregister"));
-    cuMemHostGetDevicePointer = reinterpret_cast<decltype(cuMemHostGetDevicePointer)>(dlsym(lib, "cuMemHostGetDevicePointer_v2"));
     return true;
   }
 };
@@ -223,93 +194,10 @@ bool logging_code() {
   return q && std::string(q) == "2";
 }
 
-// ---- program history (docs/perf-design/12-host-gpu-turbo.md section 17; vgpu/host_gpu_history.hpp) ----
-// The fatbins the program registered, hashed in registration order by note_program_image (the shim's __cudaRegisterFatBinary, before main): the program's identity, known
-// before any module is loaded, which is when the driver would start. A program that loads its modules through the driver API after its device exists has no identity here
-// and no history (it behaves as without one).
-std::mutex g_prog_mu;
-history::Hasher g_prog_hash;
-size_t g_prog_images = 0, g_prog_bytes = 0;
-bool g_prog_unkeyed = false;
-std::string history_dir() {
-  static const std::string dir = history::directory_from(std::getenv("VGPU_HOST_GPU_HISTORY"), std::getenv("XDG_CACHE_HOME"), std::getenv("HOME"));
-  return dir;
-}
-// The card's model without the driver (that is the point): the PCI vendor and device ids of the NVIDIA display devices (sysfs), and the kernel module's version line
-// when /proc has it. [documented: sysfs ABI; measured only on the A10G rig] VGPU_HOST_GPU_HISTORY_CARD=<text> stands in for both (tests). Empty: the model cannot be
-// read, and there is no history.
-std::string card_model_text() {
-  if (const char* v = std::getenv("VGPU_HOST_GPU_HISTORY_CARD"); v && *v) return v;
-  std::vector<std::string> ids;
-  if (DIR* d = ::opendir("/sys/bus/pci/devices")) {
-    const auto word = [](const std::string& path) {
-      std::string t;
-      if (FILE* f = std::fopen(path.c_str(), "r")) {
-        char b[32];
-        if (std::fgets(b, sizeof b, f)) t = b;
-        std::fclose(f);
-      }
-      while (!t.empty() && (t.back() == '\n' || t.back() == ' ')) t.pop_back();
-      return t;
-    };
-    while (const dirent* e = ::readdir(d)) {
-      if (e->d_name[0] == '.') continue;
-      const std::string base = std::string("/sys/bus/pci/devices/") + e->d_name + "/";
-      if (word(base + "vendor") != "0x10de") continue;
-      const std::string cls = word(base + "class");
-      if (cls.compare(0, 4, "0x03") != 0) continue;
-      ids.push_back("10de:" + word(base + "device"));
-    }
-    ::closedir(d);
-  }
-  if (ids.empty()) return "";
-  std::sort(ids.begin(), ids.end());
-  std::string t;
-  for (const std::string& i : ids) t += i + ";";
-  if (FILE* f = std::fopen("/proc/driver/nvidia/version", "r")) {
-    char b[256];
-    if (std::fgets(b, sizeof b, f)) t += b;
-    std::fclose(f);
-  }
-  return t;
-}
-// What of the environment changes where a launch runs: every VGPU_HOST_GPU_* variable but the ones that only say where to write or what to print.
-uint64_t decision_env_hash() {
-  std::vector<std::string> v;
-  for (char** e = environ; e && *e; ++e) {
-    if (std::strncmp(*e, "VGPU_HOST_GPU_", 14) != 0) continue;
-    if (!std::strncmp(*e, "VGPU_HOST_GPU_HISTORY", 21) || !std::strncmp(*e, "VGPU_HOST_GPU_LOG=", 18) || !std::strncmp(*e, "VGPU_HOST_GPU_PRESTART=", 23) ||
-        !std::strncmp(*e, "VGPU_HOST_GPU_LIBCUDA=", 22) || !std::strncmp(*e, "VGPU_HOST_GPU_PROC_VERSION=", 27))
-      continue;
-    v.push_back(*e);
-  }
-  std::sort(v.begin(), v.end());
-  history::Hasher h;
-  for (const std::string& s : v) h.text(s + "\n");
-  return h.h;
-}
-// Turbo mode runs every card launch on the null stream, one at a time, so the driver's work queues (CUDA_DEVICE_MAX_CONNECTIONS) are not used for concurrency, and creating and tearing them
-// down is most of the driver's fixed cost: on an A10G (driver 595) a bfs process took 0.24 s with the variable unset, 0.155 s with 1 (0.175 with 2, 0.21 with 4, 0.28 with 8, 0.76 with 32), of
-// which cuDevicePrimaryCtxRetain 95 ms against 47 ms [measured, docs section 17.3]. Set to 1 when turbo is selected, unless the user has set it (the driver reads it at its first call, which is
-// why this runs when the library loads, before main: setenv from a later thread could race the program's own getenv calls). Children of the process inherit it. [inferred: no effect on
-// results, the launches are serialised by the mode's gate; every output of the benchmark programs equalled the simulator's with it set, section 17.3]
-__attribute__((constructor)) void tune_driver_environment() {
-  const char* m = std::getenv("VGPU_HOST_GPU");
-  if (!m || std::string(m) != "turbo" || std::getenv("CUDA_DEVICE_MAX_CONNECTIONS")) return;
-  setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1", 0);
-}
-bool kernel_fault_code(int r) { return r == 700 || r == 715 || r == 716 || r == 717 || r == 718 || r == 719; }   // [documented] illegal address, instruction, misaligned, address space, pc, launch failure
-
 }  // namespace
 
 // The index of the instruction at pc (decoded with pc = 16 * index), or -1.
 static int64_t code_index(int64_t pc, size_t count) { return pc >= 0 && pc % 16 == 0 && static_cast<uint64_t>(pc) / 16 < count ? pc / 16 : -1; }
-
-namespace {
-// How many simulated devices have a runtime (turbo mode with several cards). With more than one, a launch on a card is not waited for (Impl::settle): the cards of the
-// different devices then run at the same time. With one device a launch is waited for, as it always was.
-std::atomic<int> g_runtimes{0};
-}  // namespace
 
 struct Runtime::Impl : CardGate {
   Api api;
@@ -333,8 +221,7 @@ struct Runtime::Impl : CardGate {
   std::map<const void*, CUmodule> modules;   // by module_key
   // Why a launch stays in the simulator before the size rule is asked: a safety check (the launch's shape, the module, memory the card does not hold),
   // or the kernel's code.
-  // `Image` (turbo mode): no image of the module runs on the card, or the one that does cannot be given what the simulator holds of the module.
-  enum class Refused : uint8_t { No, Safety, Code, Image };
+  enum class Refused : uint8_t { No, Safety, Code };
   struct Verdict {
     bool ok = false;
     uint64_t instrs = 0;
@@ -343,12 +230,8 @@ struct Runtime::Impl : CardGate {
     bool loop = false;       // ... a real one: a cycle in its flow (code_has_loop)
     exec::BlockProbe probe;  // its top-level counted loops, for a sample inside its blocks (find_probe_loops); count 0: none
     Refused kind = Refused::No;
-    TurboRefusal rr = TurboRefusal::None;   // Code: which class of instruction (in exact mode: what turbo mode would say with its defaults)
     const char* why = "";                       // the reason given on a later launch of the same kernel
     std::string why_text;                       // ... when it is made for this kernel (`why` then points here)
-    bool printf = false;                        // it reaches vprintf (turbo mode): stdout is flushed before its launch on the card
-    bool trap = false;                          // it can assert or trap (turbo mode, section 20): a card failure with 710 or 719 is the program's own failure
-    bool trap_only = false;                     // class never only by BPT, and admitted otherwise: a cooperative launch runs it (grid.sync() traps only outside one)
   };
   // VGPU_HOST_GPU_LOG: what kept each kernel's launches in the simulator, with the simulator's seconds (one host_gpu_kept line per kernel and
   // reason at exit), for a census of what the mode still cannot send.
@@ -381,19 +264,11 @@ struct Runtime::Impl : CardGate {
     return "module holds " + join(held) + "; kernel reaches " + join(reached);
   }
   Mode mode = Mode::Exact;
-  TurboSwitches sw;      // turbo mode's switches; the defaults in exact mode (where they only class the refusals for the summary)
-  Tolerance tol;           // turbo mode's verify (VGPU_HOST_GPU_ATOL, VGPU_HOST_GPU_RTOL)
-  struct KernelTol {
-    TolReport rep;
-    unsigned said = 0;     // launches outside tolerance already reported without VGPU_HOST_GPU_LOG
-  };
-  std::map<std::string, KernelTol> tol_by_kernel;
 
-  // VGPU_HOST_GPU_TIMEOUT (seconds; turbo mode: 600 unless set, exact mode: none unless set). cuCtxSynchronize has no deadline, a kernel on the card
+  // VGPU_HOST_GPU_TIMEOUT (seconds; none unless set). cuCtxSynchronize has no deadline, a kernel on the card
   // cannot be cancelled, and with a kernel still running the card's memory cannot be read back, so there is nothing to fall back to: when a launch has
-  // been on the card for longer than the limit the process says so and ends, instead of hanging without a word. Exact mode had no such launch to fear
-  // beyond the program's own (the card computes the simulator's bits, so it loops exactly when the simulator would); in turbo mode a loop that waits
-  // on a value the card computes differently, or on a lock another thread never gives back, is the card's to run.
+  // been on the card for longer than the limit the process says so and ends, instead of hanging without a word. Exact mode has no such launch to fear
+  // beyond the program's own (the card computes the simulator's bits, so it loops exactly when the simulator would).
   struct Watchdog {
     std::mutex mu;
     std::condition_variable cv;
@@ -431,8 +306,7 @@ struct Runtime::Impl : CardGate {
         if (armed && deadline == until && std::chrono::steady_clock::now() >= until) {
           std::fprintf(stderr,
                        "host_gpu: %s has been on the card for more than %g s (VGPU_HOST_GPU_TIMEOUT): a kernel on the card cannot be cancelled and its memory cannot be read back; the process ends. "
-                       "A kernel that waits for blocks the card cannot hold at once (a persistent or spin-barrier kernel sized for a larger simulated profile) or for another stream "
-                       "hangs this way; VGPU_HOST_GPU_FIT=0 keeps such kernels in the simulator (docs/perf-design/12-host-gpu-turbo.md section 15)\n",
+                       "A kernel that waits for another stream hangs this way\n",
                        kernel.c_str(), limit_s);
           std::fflush(nullptr);
           _exit(124);
@@ -483,7 +357,7 @@ struct Runtime::Impl : CardGate {
   size_t copies_running_at_exit = 0;   // sampled copies that had answered and not yet ended when the process came to its end (they were waited for)
   bool sample_block = true;       // bounded blocks (Round sp75); VGPU_HOST_GPU_SAMPLE_BLOCK=0: the copy runs whole blocks, however long (the rule before)
   uint64_t big_threads = kFirstBigThreads;   // VGPU_HOST_GPU_FIRST_BIG=<threads>; 0: the rule before #659 (a big launch is not sampled in a young process)
-  bool sample_started = true;   // a launch is sampled with the driver up too (Round sp76; sample_allowed); VGPU_HOST_GPU_SAMPLE_STARTED=0: never once the start has begun (the rule before)
+  bool sample_started = true;     // a launch is sampled with the driver up too (Round sp76; sample_allowed); VGPU_HOST_GPU_SAMPLE_STARTED=0: never once the start has begun (the rule before)
   double sample_spent_s = 0;      // what the samples of this process have cost
   double sample_dearest_s = 0;    // the dearest of them
   struct Decision;
@@ -530,29 +404,9 @@ struct Runtime::Impl : CardGate {
     if (old > 0 && v == 0) gate_mem->card_resident_count().fetch_sub(1, std::memory_order_relaxed);
   }
 
-  // A launch on this card that nobody waited for (turbo mode with several simulated devices, `async_ok`): the launch was queued on the card's default stream and the
-  // call returned, so that the cards of other devices run at the same time. Everything that reads or writes the card's memory afterwards (copies on the same stream)
-  // is ordered after it by the driver (documented: the legacy default stream), so the data needs nothing; what is left is the error of a kernel that failed, the
-  // watchdog, and the process's end. settle() waits for it. mu held by the caller, or no other thread using this card (exit).
-  bool inflight = false;
-  std::string inflight_kernel;
-  void settle() {
-    if (!inflight) return;
-    inflight = false;
-    api.cuCtxSetCurrent(ctx);
-    const CUresult r = api.cuCtxSynchronize();
-    watchdog.disarm();
-    if (r) {
-      dead = true;
-      throw Error(Err::Internal, "host_gpu: " + inflight_kernel + " failed on the card (error " + std::to_string(r) + ") after its launch had returned, and the card holds data the simulator does not, so the process ends "
-                  "(several simulated devices queue their launches on the cards; VGPU_HOST_GPU_DEVICES=<one device> or VGPU_DEVICE_COUNT=1 waits for each launch)");
-    }
-  }
-
   // Copies chunks the card alone holds into the simulator's memory (not in a verify run, where the simulator's memory is the truth already).
   void pull_chunks(Res& a, const std::vector<uint64_t>& idx) {
     if (idx.empty() || verify) return;
-    settle();
     // A sample's copy of the process never calls the driver (Round sp76: its process pulled these chunks before the fork, and the copy made
     // them its own; one that comes here all the same ends without an answer).
     if (exec::g_sample_copy.load(std::memory_order_relaxed)) throw Error(Err::Internal, "host_gpu: a sample's copy of the process does not call the driver");
@@ -604,16 +458,6 @@ struct Runtime::Impl : CardGate {
     }
   }
 
-  // The card's context is dead and what only it held is gone (a kernel asserted or trapped there, section 20): every chunk is the simulator's again, as stale as
-  // it was, and nothing is pulled (the driver would refuse). A real GPU loses the same memory when its context dies; the program's next calls fail with the sticky error.
-  void discard_card_data() {
-    for (auto& [b, a] : res) {
-      if (a.slot->load(std::memory_order_relaxed) == 0) continue;
-      (void)a.r.sim_launch();
-      update_slot(a);
-    }
-  }
-
   // A sample is about to fork the process while the driver is up (Round sp76; mu held by the caller): every chunk the card alone holds comes
   // back and is then shared (Where::Both), so that the copy's blocks read the launch's real input and never ask the card for it. It is the
   // pull the simulator makes before it runs the launch itself (reset_for_simulator), made earlier; the card's copy stays valid, so a launch
@@ -639,127 +483,6 @@ struct Runtime::Impl : CardGate {
     sync_tracked(res, mem, ranges);
   }
 
-  // ---- program history (section 17) ----
-  // VGPU_HOST_GPU_HISTORY: what earlier runs of this program (hist_key: its fatbins, the simulated profile, the card model, the mode's switches) learned: that the
-  // whole program is shorter in the simulator than the driver's start (the process then stays in the simulator, `hist_hold`, and gives up after hist_lim.budget_s of
-  // simulator time, `hist_released`), and which kernels fail on the card (they are kept in the simulator from their first launch). Turbo mode with FIT=1 only; a missing,
-  // stale or unreadable history is no history. It decides where a launch runs, never what it computes.
-  bool hist_init_done = false, hist_on = false, hist_have = false, hist_hold = false, hist_released = false;
-  std::string hist_dir, hist_key, hist_profile, hist_before;   // hist_before: what the record said at the start (the summary line)
-  history::Record hist_rec;
-  history::Limits hist_lim;
-  std::map<std::string, history::Kernel> hist_kernels;   // this process's, by kernel
-  uint64_t hist_kept = 0, hist_threads = 0;
-  double hist_loopfree_work = 0;   // threads x static instructions of the launches of kernels without a loop (the verdict was asked of them)   // launches kept in the simulator by the history (a hold, or a kernel known to fail)
-
-  // Reads the history once (idempotent); true when the process is to hold the driver back. Called with the gate held.
-  bool hist_init() {
-    if (hist_init_done) return hist_hold;
-    hist_init_done = true;
-    if (mode != Mode::Turbo || !fit || verify) return false;
-    hist_dir = history_dir();
-    if (hist_dir.empty()) return false;
-    // The driver's compile cache beside the history (section 17.2): the PTX a retargeted module is compiled from costs 3 s on a large module (HeCBench s3d, A10G) and 0.025 s when the cache
-    // has it; the default cache is under $HOME, which an ephemeral runner loses, while the history directory is the one a runner is told to keep. Never over a setting of the user's.
-    if (!std::getenv("CUDA_CACHE_PATH") && !std::getenv("CUDA_CACHE_DISABLE")) {
-      const std::string cache = hist_dir + "/cuda-cache";
-      if (history::make_dirs(cache)) setenv("CUDA_CACHE_PATH", cache.c_str(), 0);
-    }
-    if (!(costs.start_cost_s > 0)) return false;
-    std::string prog;
-    {
-      std::lock_guard<std::mutex> g(g_prog_mu);
-      if (g_prog_unkeyed || g_prog_images == 0) return false;
-      history::Hasher h = g_prog_hash;
-      h.word(g_prog_images);
-      prog = history::hex16(h.h);
-    }
-    const std::string card = card_model_text();
-    if (card.empty()) return false;
-    history::Hasher k;
-    k.text(prog);
-    k.text(hist_profile);
-    k.text(card);
-    k.text("turbo-fit");
-    k.word(decision_env_hash());
-    k.word(history::kVersion);
-    hist_key = history::hex16(k.h);
-    hist_lim = history::limits_for_start_cost(costs.start_cost_s);
-    hist_on = true;
-    hist_have = history::load(hist_dir, hist_key, &hist_rec);
-    const history::Decision d = history::decide_start(hist_have ? &hist_rec : nullptr);
-    hist_hold = d.hold;
-    hist_before = !hist_have ? "none" : hist_rec.verdict == history::Verdict::Tiny ? "tiny" : hist_rec.verdict == history::Verdict::Candidate ? "candidate" :
-                  hist_rec.verdict == history::Verdict::Long ? "long" : "unknown";
-    if (logging())
-      std::fprintf(stderr, "host_gpu_history: key=%s record=%s runs=%llu: %s%s\n", hist_key.c_str(), hist_before.c_str(), static_cast<unsigned long long>(hist_have ? hist_rec.runs : 0),
-                   d.why, d.start_driver ? "" : " (the driver does not start with the device)");
-    return !d.start_driver;
-  }
-  // Why this launch stays in the simulator on the history's word, or null. Called before the launch is decided; the budget counts the simulator's launches so far.
-  const char* hist_keeps(const std::string& kernel, uint64_t threads) {
-    hist_init();
-    if (!hist_on) return nullptr;
-    history::Kernel& hk = hist_kernels[kernel];
-    ++hk.launches;
-    hk.max_threads = std::max(hk.max_threads, threads);
-    hist_threads += threads;
-    if (history::known_faulted(hist_have ? &hist_rec : nullptr, kernel)) return "this kernel failed on the card in an earlier run";
-    if (hist_hold && !hist_released) {
-      const double left = hist_lim.budget_s - stats.sim_seconds;
-      if (left > 0 && !history::kernel_outlasts(hist_have ? &hist_rec : nullptr, kernel, left, threads)) return "the program is known to be shorter in the simulator than the driver's start";
-      hist_released = true;
-      if (logging()) std::fprintf(stderr, "host_gpu_history: %s: the simulator has spent %.3f s of %.3f s%s; the driver starts\n", kernel.c_str(), stats.sim_seconds, hist_lim.budget_s,
-                                  left > 0 ? " and this kernel is known to take longer than what is left, or this launch is much larger than the record's" : "");
-    }
-    return nullptr;
-  }
-  void hist_note_sim(const std::string& kernel, double s) {
-    if (!hist_on) return;
-    hist_kernels[kernel].sim_s += s;
-  }
-  void hist_note_card(const std::string& kernel, double kernel_s) {
-    if (!hist_on) return;
-    history::Kernel& k = hist_kernels[kernel];
-    k.card_s += kernel_s;
-    k.card_ok = true;
-  }
-  // A kernel that failed on the card: written at once (the process may not get to its exit), without counting the run.
-  void hist_note_fault(const std::string& kernel, int code) {
-    if (!hist_on || !kernel_fault_code(code)) return;
-    hist_kernels[kernel].faulted = true;
-    history::Record rec;
-    if (!history::load(hist_dir, hist_key, &rec)) rec = hist_rec;
-    history::note_fault(&rec, kernel);
-    history::store(hist_dir, hist_key, rec);
-  }
-  // At exit: this run folded into the record as it is now on disk (another process may have written since this one read it).
-  void hist_commit() {
-    if (!hist_on || verify) return;
-    history::Observed o;
-    o.held = hist_hold;
-    o.released = hist_released;
-    o.sim_s = stats.sim_seconds;
-    o.card_s = stats.card_seconds;
-    o.threads = hist_threads;
-    o.loopfree_work = hist_loopfree_work;
-    for (const auto& [name, k] : hist_kernels) {
-      history::Kernel c = k;
-      c.name = name;
-      o.launches += k.launches;
-      o.kernels.push_back(c);
-    }
-    history::Record rec;
-    if (!history::load(hist_dir, hist_key, &rec)) rec = history::Record{};
-    history::update(&rec, o, hist_lim);
-    history::store(hist_dir, hist_key, rec);
-    if (logging())
-      std::fprintf(stderr, "host_gpu_history: key=%s before=%s after=%s held=%d released=%d kept_launches=%llu sim_s=%.6f card_s=%.6f launches=%u threads=%llu loopfree_work=%.4g faulted_kernels=%zu\n", hist_key.c_str(),
-                     hist_before.c_str(), rec.verdict == history::Verdict::Tiny ? "tiny" : rec.verdict == history::Verdict::Long ? "long" : rec.verdict == history::Verdict::Candidate ? "candidate" : "unknown",
-                     hist_hold ? 1 : 0, hist_released ? 1 : 0, static_cast<unsigned long long>(hist_kept), o.sim_s, o.card_s, o.launches, static_cast<unsigned long long>(o.threads), o.loopfree_work,
-                     static_cast<size_t>(std::count_if(rec.kernels.begin(), rec.kernels.end(), [](const history::Kernel& k) { return k.faulted; })));
-  }
-
   // ---- start-up of the real driver: lazy ----
   // Loading the driver, cuInit, the primary context and the 1 TiB reservation cost 0.15 to 0.35 s (09 doc, section 5; 0.23 s on an A10G, Round sp42). Nothing happens
   // until try_launch has decided that a launch goes to the card (should_offload_with_start charges this cost in that decision): `await_start` is the only caller of
@@ -780,33 +503,11 @@ struct Runtime::Impl : CardGate {
   uint32_t want_mp = 0;
   uint64_t va_base = 0;
   std::string lib_path;
-  // Several cards (turbo mode; docs/perf-design/12-host-gpu-turbo.md section 17): one Impl per simulated device slot, each with its own context, window,
-  // residency, module cache and launch lock. `slot` is the device's window (va_base = kDeviceVaBase + slot * kDeviceVaStride); `card_dev` the real driver's device
-  // it runs on, chosen by the start thread (pick_card); `multi` is false in exact mode, which serves slot 0 on the driver's device 0 as it always did.
-  int slot = 0;
-  bool multi = false;
-  bool has_list = false;
-  std::vector<int> card_list;      // VGPU_HOST_GPU_DEVICES
-  std::string cvd;                 // CUDA_VISIBLE_DEVICES as the process had it (cvd_set: whether it was set)
-  bool cvd_set = false;
-  int card_dev = 0;
-  bool no_card = false;            // the machine has no card for this slot (a device beyond the host's cards): it stays in the simulator, said once
-  // Turbo mode's card (filled by the start thread before `done`): its architecture, SM count and launch limits. Until the driver is up the images are
-  // chosen for the simulated profile's architecture (`want_sm`), which is the card's whenever the two agree; await_start redoes the verdicts when not.
-  bool fit = true;            // VGPU_HOST_GPU_FIT (turbo mode): see vgpu/host_gpu_source.hpp parse_fit
-  bool host_known = false;
-  int host_sm = 0;
-  uint32_t host_mp = 0;
-  CardLimits limits;
-  std::map<CUfunction, FuncAttrs> func_attrs;
-  int image_sm() const { return host_known ? host_sm : want_sm; }
 
-  void configure_start(const DeviceProfile& profile, uint64_t base, int slot_in = 0) {
-    slot = slot_in;
+  void configure_start(const DeviceProfile& profile, uint64_t base) {
     const char* path = std::getenv("VGPU_HOST_GPU_LIBCUDA");
     lib_path = path && *path ? path : "/usr/lib/x86_64-linux-gnu/libcuda.so.1";
     want_sm = profile.cc_major * 10 + profile.cc_minor;
-    hist_profile = profile.id + "/" + std::to_string(want_sm) + "/" + std::to_string(profile.limits.multiprocessors);
     want_mp = profile.limits.multiprocessors;
     multiprocessors = want_mp;
     va_base = base;
@@ -823,61 +524,24 @@ struct Runtime::Impl : CardGate {
     const int sm = want_sm;
     const uint32_t mp_want = want_mp;
     const uint64_t base = va_base;
-    const bool exact_gate = mode != Mode::Turbo;   // (turbo mode takes the card as it is: each module is given the image the card runs, vgpu/host_gpu_source.hpp)
-    std::thread([sh, self, lib, sm, mp_want, base, exact_gate] {
+    std::thread([sh, self, lib, sm, mp_want, base] {
       bool ok = false;
       std::string why;
       do {
         if (!self->api.load(lib.c_str())) { why = "cannot load the real driver " + lib; break; }
         if (self->api.cuInit(0)) { why = "cuInit failed"; break; }
         CUdevice d;
-        int dev = 0;
-        if (self->multi) {   // (turbo mode: the slot's own card; exact mode asks for the driver's device 0 as before)
-          int count = 0;
-          if (self->api.cuDeviceGetCount) self->api.cuDeviceGetCount(&count);
-          else count = self->slot == 0 ? 1 : 0;
-          const CardPick pick = pick_card(self->slot, self->has_list ? &self->card_list : nullptr, self->cvd_set ? self->cvd.c_str() : nullptr, count);
-          if (pick.index < 0) {
-            self->no_card = true;
-            why = "simulated device " + std::to_string(self->slot) + " has no host card (" + card_why_text(pick.why) + "; the driver shows " + std::to_string(count) +
-                  "), so it stays in the simulator";
-            break;
-          }
-          dev = pick.index;
-        }
-        self->card_dev = dev;
-        if (self->api.cuDeviceGet(&d, dev)) { why = "no device " + std::to_string(dev); break; }
+        if (self->api.cuDeviceGet(&d, 0)) { why = "no device 0"; break; }
         int mp = 0, cmaj = 0, cmin = 0;
         self->api.cuDeviceGetAttribute(&mp, kAttrMultiprocessors, d);
         self->api.cuDeviceGetAttribute(&cmaj, kAttrCcMajor, d);
         self->api.cuDeviceGetAttribute(&cmin, kAttrCcMinor, d);
-        if (exact_gate && (cmaj * 10 + cmin != sm || static_cast<uint32_t>(mp) != mp_want)) {
+        if (cmaj * 10 + cmin != sm || static_cast<uint32_t>(mp) != mp_want) {
           why = "the card (sm_" + std::to_string(cmaj * 10 + cmin) + ", " + std::to_string(mp) + " SMs) is not the simulated device (sm_" +
                 std::to_string(sm) + ", " + std::to_string(mp_want) + " SMs)";
           break;
         }
-        self->host_sm = cmaj * 10 + cmin;
-        self->host_mp = static_cast<uint32_t>(mp);
-        if (!exact_gate) {   // (the launch limits of the card, for the fit check; a limit the driver does not give stays 0 and the check refuses)
-          CardLimits& L = self->limits;
-          const auto get = [&](int attr) {
-            int v = 0;
-            return self->api.cuDeviceGetAttribute(&v, attr, d) == 0 && v > 0 ? static_cast<uint32_t>(v) : 0u;
-          };
-          L.max_threads_per_block = get(kAttrMaxThreads);
-          for (int i = 0; i < 3; ++i) {
-            L.max_block[i] = get(kAttrMaxBlockX + i);
-            L.max_grid[i] = get(kAttrMaxGridX + i);
-          }
-          L.shared_optin = get(kAttrSharedOptin);
-          L.regs_per_block = get(kAttrMaxRegisters);
-          L.cooperative = get(kAttrCooperative) != 0;
-        }
         if (self->api.cuDevicePrimaryCtxRetain(&self->ctx, d) || self->api.cuCtxSetCurrent(self->ctx)) { why = "no context"; break; }
-        if (!exact_gate) {
-          size_t freeb = 0, total = 0;
-          if (self->api.cuMemGetInfo(&freeb, &total) == 0) self->limits.memory_total = total;
-        }
         CUdeviceptr p = 0;
         const CUresult r = self->api.cuMemAddressReserve(&p, kDeviceVaStride, 0, base, 0);
         if (r || p != base) { why = "the card did not give the simulator's address window"; break; }
@@ -904,22 +568,13 @@ struct Runtime::Impl : CardGate {
       return false;
     }
     if (!sh->ok) {
-      if (!quiet()) std::fprintf(stderr, "host_gpu: %s%s\n", sh->why.c_str(), no_card ? "" : "; mode off");
+      if (!quiet()) std::fprintf(stderr, "host_gpu: %s; mode off\n", sh->why.c_str());
       start_failed = dead = true;
       return false;
     }
     window_base = va_base;
     mapped_end = va_base;
     start_ready = true;
-    if (mode == Mode::Turbo) {
-      host_known = true;
-      multiprocessors = host_mp;   // (the first-launch rule's SM count is the card's)
-      // The verdicts made before the driver was up chose images for the simulated profile's architecture: made again for the card's, when it is another.
-      if (host_sm != want_sm) {
-        eligible.clear();
-        module_cards.clear();
-      }
-    }
     return true;
   }
 
@@ -941,7 +596,7 @@ struct Runtime::Impl : CardGate {
     CUmemAllocationProp prop = {};
     prop.type = 1;   // CU_MEM_ALLOCATION_TYPE_PINNED
     prop.location.type = 1;   // CU_MEM_LOCATION_TYPE_DEVICE
-    prop.location.id = card_dev;
+    prop.location.id = 0;
     CUhandle h;
     CUresult r = api.cuMemCreate(&h, size, &prop, 0);
     if (!r) r = api.cuMemMap(lo, size, 0, h, 0);
@@ -967,53 +622,15 @@ struct Runtime::Impl : CardGate {
   // inputs in 2^31 fail, test_host_gpu_ref), so a card of another architecture has to pass the probe before it can be trusted with it.
   bool sqrt_idiom = false;
   // VGPU_HOST_GPU_WIDER=0: the safety rules before Round sp66, for A/B runs: any variable, external function or device-side launch in a module refuses all its
-  // kernels, a live texture object and a graph's launch refuse every launch, and turbo mode's float atomics with a value, CAS and EXCH are an opt-in (VGPU_HOST_GPU_ATOMICS=1).
+  // kernels, a live texture object and a graph's launch refuse every launch.
   bool wider = true;
-  // Turbo mode (docs/perf-design/12-host-gpu-turbo.md section 23): a cooperative launch goes to the card as one (VGPU_HOST_GPU_COOP=0 keeps it in the
-  // simulator), and so does a launch with an argument into mapped host memory, which the card is given at the same address (VGPU_HOST_GPU_HOSTMAP=0).
-  bool coop = true;
-  bool hostmap = true;
-  std::map<uint64_t, uint64_t> pinned;   // host buffers registered with the driver, by address, with their length
-  uint64_t pinned_unmaps = 0;            // MemoryManager::host_unmaps() when they were registered
-
-  // Registers every host buffer the simulator has mapped with the driver, so that a pointer into one, in an argument or in memory, means the same
-  // there. Registered with DEVICEMAP, a buffer's device pointer is its host pointer (measured, A10G, driver 595: checked here, for every buffer).
-  // False: a buffer could not be given, and the launch stays in the simulator.
-  bool pin_host_maps(MemoryManager& mem) {
-    if (!api.cuMemHostRegister || !api.cuMemHostUnregister || !api.cuMemHostGetDevicePointer) return false;
-    if (const uint64_t n = mem.host_unmaps(); n != pinned_unmaps) {   // (a buffer freed and mapped again at its address is other memory)
-      for (const auto& [base, len] : pinned) api.cuMemHostUnregister(reinterpret_cast<void*>(base));
-      pinned.clear();
-      pinned_unmaps = n;
-    }
-    for (const MemoryManager::HostSpan& sp : mem.host_spans()) {
-      if (sp.base != reinterpret_cast<uint64_t>(sp.host) || sp.len == 0) return false;
-      if (const auto it = pinned.find(sp.base); it != pinned.end()) {
-        if (it->second == sp.len) continue;
-        api.cuMemHostUnregister(sp.host);
-        pinned.erase(it);
-      }
-      CUdeviceptr dev = 0;
-      if (api.cuMemHostRegister(sp.host, sp.len, kHostRegisterDeviceMap)) return false;
-      if (api.cuMemHostGetDevicePointer(&dev, sp.host, 0) || dev != sp.base) {
-        api.cuMemHostUnregister(sp.host);
-        return false;
-      }
-      pinned[sp.base] = sp.len;
-    }
-    return true;
-  }
 
   struct Decision {
     bool ok = false;
     const char* why = "";
     Refused kind = Refused::No;
-    TurboRefusal rr = TurboRefusal::None;
     uint64_t instrs = 0;
     bool runnable = false, back_edge = false, loop = false;
-    bool printf = false;   // (Verdict::printf)
-    bool trap = false;     // (Verdict::trap)
-    bool host_args = false;   // an argument points into mapped host memory (turbo mode: the card is given it before the launch)
     const exec::BlockProbe* probe = nullptr;   // the kernel's followed loops (Verdict::probe; the table of verdicts keeps it), or null
   };
 
@@ -1029,63 +646,33 @@ struct Runtime::Impl : CardGate {
   };
   struct ModuleCard {
     std::string refuse;                 // set: no kernel of the module can go to the card, and why
-    bool refuse_is_image = false;       // ... because of the image (turbo mode: none runs on the card, or it cannot be read), not the module's variables
     bool patched = false;               // the card loads `image`, not the module's own cubin
     CardImage image;
     std::vector<std::pair<std::string, uint64_t>> banks;   // constant banks with variables: section name, simulator address
     std::vector<BankCopy> copies;       // ... resolved on the card when the module is loaded there
-    // Turbo mode: the image the card is given, chosen for the card's own architecture (vgpu/host_gpu_source.hpp pick_card_image).
-    const sass::Module* view = nullptr;     // the module whose code the scan reads: the simulator's (exact mode, and a card image that is its own) or `analysis`
-    std::shared_ptr<sass::Module> analysis; // the analysis-only module of a card cubin that is not the simulator's image
-    bool is_ptx = false;                    // the card is given PTX, which the driver compiles
-    std::string own;                        // the bytes the card loads when they are neither the simulator's image nor patched: the chosen candidate's
-    bool use_own = false;
-    std::string what;                       // "sm_86 cubin", "compute_75 PTX": for the log
-    PtxScan ptx;                            // is_ptx: what the text scan found
-    bool same_as_sim = true;
-    bool retargeted = false;                // turbo: plain sm_90 PTX given to an older card with its target line rewritten (pick_retarget_image)
-    bool counted_retarget = false;
-    bool load_failed = false;               // the driver did not load the image (said once; its kernels stay in the simulator)
+    const sass::Module* view = nullptr;     // the module whose code the scan reads: the simulator's (null: the module has no image to read)
   };
   std::map<const void*, ModuleCard> module_cards;
 
-  // The module a kernel is in, as the tables here know it: the images the card may be given (turbo mode, one per module), else the simulator's cubin.
-  const void* module_key(const ptx::EntryFn& fn) const {
-    if (mode == Mode::Turbo && fn.card) return fn.card.get();
-    return fn.sass.get();
-  }
+  // The module a kernel is in, as the tables here know it: the simulator's cubin.
+  const void* module_key(const ptx::EntryFn& fn) const { return fn.sass.get(); }
 
   // The variables of a module on the card (Round sp66; vgpu/host_gpu_image.hpp). `sim`: the module the simulator runs, whose variables the card must
-  // address where the simulator put them; `view`: the module whose cubin the card loads (the same, or the analysis of the card's own image, whose
-  // variables must then be laid out as the simulator's are). `bytes`: the card's cubin.
-  void module_variables(ModuleCard& mc, const sass::Module* sim, const sass::Module& view, const uint8_t* bytes, size_t n) {
-    if (!view.managed.empty() || (sim && !sim->managed.empty())) {   // (host memory: the window does not hold it)
+  // address where the simulator put them; the card loads its cubin (`bytes`).
+  void module_variables(ModuleCard& mc, const sass::Module& sim, const uint8_t* bytes, size_t n) {
+    if (!sim.managed.empty()) {   // (host memory: the window does not hold it)
       mc.refuse = "the module has __managed__ variables";
       return;
     }
     std::set<std::string> sections;   // the sections that hold variables, by the table of them
-    bool any_variable = false;
-    for (const sass::CubinSymbol& sym : view.cubin.symbols) {
+    for (const sass::CubinSymbol& sym : sim.cubin.symbols) {
       if (sym.function || sym.name.empty() || sym.name[0] == '.') continue;
-      any_variable = true;
-      if (sim && sim->symbol_va.count(sym.name) && sim->section_va.count(sym.section)) sections.insert(sym.section);
-    }
-    if (&view != sim) {   // the card's image is not the simulator's: its variables are the simulator's only if the two modules lay them out alike
-      if (any_variable && !sim) {
-        mc.refuse = "module variables: the card image has variables and the simulator runs the module from PTX";
-        return;
-      }
-      if (sim) {
-        if (const std::string why = variable_layout_mismatch(view.cubin, sim->cubin); !why.empty()) {
-          mc.refuse = "module variables: " + why;
-          return;
-        }
-      }
+      if (sim.symbol_va.count(sym.name) && sim.section_va.count(sym.section)) sections.insert(sym.section);
     }
     if (sections.empty()) return;
     mc.image = card_image_at_sim_addresses(bytes, n, [&](const std::string& sec) -> std::optional<uint64_t> {
       if (!sections.count(sec)) return std::nullopt;
-      return sim->section_va.at(sec);
+      return sim.section_va.at(sec);
     });
     if (!mc.image.ok) {
       mc.refuse = "module variables: " + mc.image.why;
@@ -1093,7 +680,7 @@ struct Runtime::Impl : CardGate {
     }
     mc.patched = true;
     for (const std::string& sec : sections)
-      if (sec.rfind(".nv.constant", 0) == 0) mc.banks.emplace_back(sec, sim->section_va.at(sec));
+      if (sec.rfind(".nv.constant", 0) == 0) mc.banks.emplace_back(sec, sim.section_va.at(sec));
   }
 
   ModuleCard& module_card(const ptx::EntryFn& fn) {
@@ -1101,77 +688,12 @@ struct Runtime::Impl : CardGate {
     if (const auto it = module_cards.find(key); it != module_cards.end()) return it->second;
     ModuleCard& mc = module_cards[key];
     const sass::Module* sim = fn.sass.get();
-    if (mode != Mode::Turbo) {   // exact mode: the simulator's own image, as always
-      mc.view = sim;
-      if (!sim) {
-        mc.refuse = "not a SASS module";
-        return mc;
-      }
-      module_variables(mc, sim, *sim, sim->image.data(), sim->image.size());
+    mc.view = sim;
+    if (!sim) {
+      mc.refuse = "not a SASS module";
       return mc;
     }
-    // Turbo mode: the best image the card can run. A module with no image list (loaded before the mode was on, or from no fatbin) has the simulator's
-    // own cubin as its only candidate.
-    std::vector<CardCandidate> own_list;
-    const std::vector<CardCandidate>* cands = fn.card ? &fn.card->candidates : nullptr;
-    if (!cands && sim && !sim->image.empty()) {
-      CardCandidate c;
-      c.kind = CardCandidate::Cubin;
-      c.arch = sim->sm;
-      c.suffix = sim->cubin.arch_specific ? 'a' : 0;
-      c.bytes.assign(reinterpret_cast<const char*>(sim->image.data()), sim->image.size());
-      own_list.push_back(std::move(c));
-      cands = &own_list;
-    }
-    const auto refuse_image = [&](std::string why) -> ModuleCard& {
-      mc.refuse = std::move(why);
-      mc.refuse_is_image = true;
-      return mc;
-    };
-    if (!cands) return refuse_image("the module has no image the card can load");
-    const int sm = image_sm();
-    int pick = pick_card_image(*cands, sm);
-    bool retarget = false;
-    if (pick < 0 && (pick = pick_retarget_image(*cands, sm)) >= 0) retarget = true;   // (plain sm_90 PTX for an sm_80/86/87 card: the target line is rewritten, below)
-    if (pick < 0) return refuse_image("no image of the module runs on the card (sm_" + std::to_string(sm) + "): it holds " + describe_candidates(*cands));
-    const CardCandidate& c = (*cands)[static_cast<size_t>(pick)];
-    if (c.kind == CardCandidate::Ptx) {
-      mc.is_ptx = true;
-      mc.what = "compute_" + std::to_string(c.arch) + (c.suffix ? std::string(1, c.suffix) : std::string()) + " PTX";
-      mc.ptx = scan_ptx_for_card(c.bytes, sw.printf_off, retarget, sw.ptx_vars_unreferenced, sw.assert_off);
-      mc.own = c.bytes;
-      if (retarget) {
-        mc.retargeted = true;
-        mc.what += " retargeted to sm_" + std::to_string(sm);
-        mc.own = retarget_ptx_text(c.bytes, sm);
-        if (mc.own.empty()) return refuse_image("the PTX has no plain `.target sm_90` line to retarget");
-        if (!mc.ptx.refuse.empty()) {
-          ++stats.retarget_refused;
-          return refuse_image(std::string("compute_90 PTX could be retargeted to sm_") + std::to_string(sm) + " but " + mc.ptx.refuse);
-        }
-      }
-      mc.use_own = true;
-      mc.same_as_sim = false;
-      return mc;
-    }
-    mc.what = "sm_" + std::to_string(c.arch) + (c.suffix ? std::string(1, c.suffix) : std::string()) + " cubin";
-    const bool same = sim && sim->image.size() == c.bytes.size() && std::memcmp(sim->image.data(), c.bytes.data(), c.bytes.size()) == 0;
-    mc.same_as_sim = same;
-    if (same) {
-      mc.view = sim;
-      module_variables(mc, sim, *sim, sim->image.data(), sim->image.size());
-      return mc;
-    }
-    // Another image than the one the simulator runs: read its code without loading it (sass::analyze: no device memory), and give the card its own bytes.
-    try {
-      mc.analysis = sass::analyze(reinterpret_cast<const uint8_t*>(c.bytes.data()), c.bytes.size());
-    } catch (const Error& e) {
-      return refuse_image("the card's image (" + mc.what + ") cannot be read: " + e.message());
-    }
-    mc.view = mc.analysis.get();
-    mc.own = c.bytes;
-    mc.use_own = true;
-    module_variables(mc, sim, *mc.analysis, reinterpret_cast<const uint8_t*>(mc.own.data()), mc.own.size());
+    module_variables(mc, *sim, sim->image.data(), sim->image.size());
     return mc;
   }
 
@@ -1182,10 +704,9 @@ struct Runtime::Impl : CardGate {
       d.kind = Refused::Safety;
       return d;
     };
-    const bool turbo = mode == Mode::Turbo;
-    if (!turbo && (!fn.sass || fn.sass->image.empty())) return unsafe("not a SASS module");
-    if ((cfg.cooperative && !(turbo && coop)) || cfg.cluster != std::array<uint32_t, 3>{0, 0, 0} || fn.req_cluster != std::array<uint32_t, 3>{0, 0, 0}) return unsafe("cooperative or cluster launch");
-    // (Texture objects: a kernel reads one only through a texture or surface instruction, which neither the exact set nor any turbo class admits,
+    if (!fn.sass || fn.sass->image.empty()) return unsafe("not a SASS module");
+    if (cfg.cooperative || cfg.cluster != std::array<uint32_t, 3>{0, 0, 0} || fn.req_cluster != std::array<uint32_t, 3>{0, 0, 0}) return unsafe("cooperative or cluster launch");
+    // (Texture objects: a kernel reads one only through a texture or surface instruction, which the exact set does not admit,
     // so a launch is no longer refused because the device has one; until Round sp66 one live texture object kept every launch off the card.)
     if (!wider && cfg.textures) return unsafe("texture objects");
     // (A graph's launch: every kernel of a graph is given the graph's conditional handles, but a kernel reaches them only by calling
@@ -1199,40 +720,27 @@ struct Runtime::Impl : CardGate {
       for (size_t i = 0; i + 8 <= a.size(); i += 8) {
         uint64_t v;
         std::memcpy(&v, &a[i], 8);
-        if (v && mem.host_map_possible(v) && mem.is_host_mapped(v)) {
-          if (!(turbo && hostmap)) return unsafe("argument points into mapped host memory");
-          d.host_args = true;
-        }
-        // Several cards: a card holds its own device's window and nothing of another simulated device's, so a pointer into another window (a peer pointer: documented
-        // CUDA, it needs peer access, which card_blocker below already keeps off the card) would fault there, and a fault kills every context of the process (measured,
-        // tools/multicard/va_probe.cu step 9). The simulator answers such a launch as it always did. Not in exact mode, which has the one device.
-        if (multi && addr_in_other_window(v, slot, kDeviceVaBase, kDeviceVaStride, kDeviceVaWindows)) return unsafe("argument points into another simulated device's memory");
+        if (v && mem.host_map_possible(v) && mem.is_host_mapped(v)) return unsafe("argument points into mapped host memory");
       }
     // Device memory that is not in the allocation table (VMM mappings, IPC, the kernel heap) is not on the card: a pointer to it, from an argument or from
     // memory, would read what the card never got. Not cached: a mapping can appear between two launches of one kernel.
     if (const char* blocker = mem.card_blocker()) return unsafe(blocker);
-    // Turbo mode with its performance rules off (VGPU_HOST_GPU_FIT=1) decides on the card itself: the image the card runs is chosen for its own
-    // architecture, so the card is started before the first verdict (with the rules, the driver starts only when a launch has been decided to go there).
-    if (turbo && fit && !host_known && !await_start()) return unsafe("the host GPU could not be started");
     const auto key = std::make_pair(module_key(fn), fn.name);
     const auto decision_of = [&](const Verdict& v) {
-      d.ok = v.ok || (v.trap_only && cfg.cooperative && coop);   // (the trap of grid.sync() is for a launch that is not cooperative)
+      d.ok = v.ok;
       d.why = v.why;
       d.kind = v.kind;
-      d.rr = v.rr;
       d.instrs = v.instrs;
       d.runnable = v.runnable;
       d.back_edge = v.back_edge;
       d.loop = v.loop;
-      d.printf = v.printf;
-      d.trap = v.trap;
       d.probe = v.probe.count ? &v.probe : nullptr;
       return d;
     };
     if (const auto it = eligible.find(key); it != eligible.end()) return decision_of(it->second);
     ModuleCard& mcard = module_card(fn);
     const sass::Module* const mv = mcard.view;   // (null: the module has no image to read)
-    const bool say = logging() && !turbo;   // exact mode's log lines, as they always were; turbo mode says its own below
+    const bool say = logging();
     Verdict v;
     bool ok = true;
     const char* why = "";
@@ -1240,10 +748,7 @@ struct Runtime::Impl : CardGate {
     // What the kernel needs of its module besides code (Round sp66): the module's variables at the simulator's addresses (module_card), and no
     // external function the card cannot run for it (vgpu/host_gpu.hpp extern_kind). Until Round sp66 any variable, external function or device-side
     // launch anywhere in the module kept all its kernels in the simulator.
-    PtxScan no_scan;
-    const PtxScan& pscan = mcard.is_ptx ? mcard.ptx : no_scan;
-    bool image_refusal = mcard.refuse_is_image;   // (the reason is the image, not the module's variables or externs)
-    if (mv && !mcard.is_ptx && !wider && (!mv->symbol_va.empty() || !mv->cubin.externs.empty() || mv->device_launches)) {   // (the rule before Round sp66, VGPU_HOST_GPU_WIDER=0)
+    if (mv && !wider && (!mv->symbol_va.empty() || !mv->cubin.externs.empty() || mv->device_launches)) {   // (the rule before Round sp66, VGPU_HOST_GPU_WIDER=0)
       ok = false;
       v.why_text = "module variables, device calls or device-side launches: " + module_detail(*mv, fn.name);
       why = v.why_text.c_str();
@@ -1251,19 +756,6 @@ struct Runtime::Impl : CardGate {
       ok = false;
       v.why_text = mcard.refuse;
       why = v.why_text.c_str();
-    } else if (mcard.is_ptx) {   // (turbo mode: the card compiles the PTX itself; what its text holds was scanned when the image was chosen)
-      if (!pscan.refuse.empty() && !pscan.never) {
-        ok = false;
-        v.why_text = pscan.refuse;
-        why = v.why_text.c_str();
-      }
-      v.printf = pscan.printf && !verify;
-      v.trap = pscan.trap;
-      if (pscan.printf && verify) {
-        ok = false;
-        v.why_text = "the kernel calls vprintf (not under VGPU_HOST_GPU_VERIFY: it would print twice)";
-        why = v.why_text.c_str();
-      }
     } else {
       const sass::Module& m = *mv;
       for (const std::string& f : sass::reachable(m, fn.name)) {
@@ -1272,120 +764,45 @@ struct Runtime::Impl : CardGate {
         for (const auto& [addr, name] : m.builtins) builtin = builtin || name == f;
         if (!devrt && !builtin && std::find(m.cubin.externs.begin(), m.cubin.externs.end(), f) == m.cubin.externs.end()) continue;   // (a device function of the module)
         const ExternKind k = extern_kind(f, devrt);
-        // (a verify run runs a launch on the card and then in the simulator: a kernel that prints would print twice, so it is not sent there)
-        if (extern_admitted(k, mode, sw.printf_off, sw.assert_off) && !(verify && k == ExternKind::Printf)) {
-          if (k == ExternKind::Printf) v.printf = true;
-          if (k == ExternKind::Assert) v.trap = true;
-          continue;
-        }
         ok = false;
-        v.why_text = std::string("the kernel calls ") + (k == ExternKind::Other ? f : extern_kind_name(k)) +
-                     (k == ExternKind::Printf ? (!turbo ? " (turbo mode only)" : verify ? " (not under VGPU_HOST_GPU_VERIFY: it would print twice)" : " (VGPU_HOST_GPU_TURBO_OFF=printf)")
-                      : k == ExternKind::Assert ? (!turbo ? " (turbo mode only)" : " (VGPU_HOST_GPU_TURBO_OFF=assert)") : "");
+        v.why_text = std::string("the kernel calls ") + (k == ExternKind::Other ? f : extern_kind_name(k));
         why = v.why_text.c_str();
         break;
       }
     }
     std::map<std::string, size_t>::const_iterator ci;
-    if (mv && !mcard.is_ptx && mcard.refuse.empty()) {
+    if (mv && mcard.refuse.empty()) {
       ci = mv->code_index.find(".text." + fn.name);
       if (ok && ci == mv->code_index.end()) { ok = false; why = "no code section"; }
-      // The card's image is another build of the module than the simulator's: a launch marshals the simulator's arguments for it, so every parameter must
-      // be where the simulator's cubin has it.
-      if (ok && !mcard.same_as_sim) {
-        const auto kit = mv->kernel_index.find(fn.name);
-        std::vector<size_t> sizes;
-        for (const auto& a : args) sizes.push_back(a.size());
-        const bool same = kit != mv->kernel_index.end() && kit->second < mv->cubin.kernels.size() && parameter_sizes_agree(mv->cubin.kernels[kit->second], sizes);
-        if (!same) {
-          ok = false;
-          image_refusal = true;
-          v.why_text = "the kernel's parameters in the card's image (" + mcard.what + ") are not the simulator's";
-          why = v.why_text.c_str();
-        }
-      }
     }
     const bool runnable_here = ok;
     if (!ok) {
-      v.kind = turbo && image_refusal ? Refused::Image : Refused::Safety;
+      v.kind = Refused::Safety;
       v.why = why;   // (before the reason was kept, a later launch of such a kernel was said, and counted, as "not in the exact set")
     }
-    ClassMask classes = 0, classes_but_trap = 0;
     bool indirect = false;   // a jump through a register, a call or a return, or a branch to nowhere in the code (the flow's `indirect`)
-    std::string first_never, first_gated;   // the text of the first instruction of no class, and of the first one a switch refuses
-    if (ok && mcard.is_ptx) {
-      classes |= pscan.classes;   // (the PTX's own classes: TURBO_OFF and VGPU_HOST_GPU_ATOMICS=0 apply to it as to SASS)
-      if (pscan.never) {
-        classes |= class_bit(InsnClass::Never);
-        first_never = pscan.refuse;
-      }
-      if (const ClassMask gated = sw.off | (sw.atomics ? 0 : class_bit(InsnClass::AtomFloat) | class_bit(InsnClass::AtomSwap)); (pscan.classes & gated) && first_gated.empty())
-        first_gated = "PTX (class " + std::string((pscan.classes & gated & class_bit(InsnClass::AtomSwap)) ? "atomic-swap" : (pscan.classes & gated & class_bit(InsnClass::AtomFloat)) ? "atomic-float" : "switched off") + ")";
-      ok = false;   // (PTX has no exact set: the verdict below is turbo mode's)
-    }
     if (ok) {
       const sass::Module& m = *mv;
       const sass::Code& code = m.code[ci->second];
       v.instrs = code.count;
-      // The classes of the code (vgpu/host_gpu.hpp turbo_class) and its branches. Nothing is printed here and exact mode decides nothing by it.
-      // The code is the kernel's section and, since Round sp66, the sections of the device functions it calls (call_to_entry): each is classed the
-      // same way, once.
-      std::vector<const sass::Code*> todo{&code};
-      std::set<const sass::Code*> seen{&code};
-      while (!todo.empty()) {
-        const sass::Code& sec = *todo.back();
-        todo.pop_back();
-        const bool own = &sec == &code;
-        const uint64_t code_lo = sec.count ? sec.instr(0).pc : 0, code_hi = sec.count ? sec.instr(sec.count - 1).pc : 0;
-        for (size_t i = 0; i < sec.count; ++i) {
-          const sass::Instr& ins = sec.instr(i);
-          if (own && ins.op == sass::Op::BRA) {
-            int64_t label = -1;
-            for (const auto& o : ins.src)
-              if (o.kind == sass::Kind::Label) {
-                branches.emplace_back(ins.pc, static_cast<uint64_t>(o.imm));
-                label = o.imm;
-              }
-            indirect = indirect || code_index(label, code.count) < 0;
-          }
-          indirect = indirect || (own && (ins.op == sass::Op::BRX || ins.op == sass::Op::CALL || ins.op == sass::Op::RET));
-          const bool trap_ok = turbo && !sw.assert_off;   // (BPT.TRAP and the bounded call through a register: section 20)
-          InsnClass c = turbo_class(ins.mnemonic, ins.mods, trap_ok);
-          if (trap_ok && bpt_is_trap(ins.mnemonic, ins.mods)) v.trap = true;
-          if (call_needs_scan(ins.op == sass::Op::CALL, c)) {   // (an unlisted CALL, one with a modifier the decoder cannot name, is followed like any other)
-            // A call that leaves the section runs code this scan has to see. Three kinds are followed: a relative call inside the section; the absolute
-            // call to vprintf, which the driver links when it loads the module (admitted above); and an absolute call to the first instruction of
-            // another code section of the module, a device function kept out of line (a -rdc build), whose code is then classed too. A call through a
-            // register, or to anywhere else, runs code nobody classed: never.
-            const bool label = !ins.src.empty() && ins.src[0].kind == sass::Kind::Label;
-            const bool rel = mods_have(ins.mods, "REL");
-            const int64_t target = label ? ins.src[0].imm : -1;
-            const auto b = label ? m.builtins.find(static_cast<uint64_t>(target)) : m.builtins.end();
-            const bool to_printf = v.printf && !rel && b != m.builtins.end() && b->second == "vprintf";
-            if (!to_printf && !call_stays_inside(rel, label, target, code_lo, code_hi)) {
-              const sass::Code* callee = label && !rel && target >= 0 ? m.code_at(static_cast<uint64_t>(target)) : nullptr;
-              if (callee && call_to_entry(rel, label, target, callee->base, callee->count)) {
-                if (seen.insert(callee).second) todo.push_back(callee);
-              } else if (trap_ok && !label && !rel && register_call_to_admitted_extern(m, sec, i, sw, &v.trap)) {
-                // (a call through a register whose target is a slot of bank 4 that names __assertfail, or vprintf with printf admitted: section 20)
-              } else {
-                c = InsnClass::Never;
-              }
+      // The branches of the code, and whether it jumps or calls through a register (what the loop test below reads).
+      for (size_t i = 0; i < code.count; ++i) {
+        const sass::Instr& ins = code.instr(i);
+        if (ins.op == sass::Op::BRA) {
+          int64_t label = -1;
+          for (const auto& o : ins.src)
+            if (o.kind == sass::Kind::Label) {
+              branches.emplace_back(ins.pc, static_cast<uint64_t>(o.imm));
+              label = o.imm;
             }
-          }
-          classes |= class_bit(c);
-          if (!(c == InsnClass::Never && ins.mnemonic == "BPT")) classes_but_trap |= class_bit(c);
-          if (c == InsnClass::Never && first_never.empty()) first_never = sass::to_text(ins);
-          const ClassMask gated = sw.off | (sw.atomics ? 0 : class_bit(InsnClass::AtomFloat) | class_bit(InsnClass::AtomSwap));
-          if ((class_bit(c) & gated) && first_gated.empty()) first_gated = sass::to_text(ins);
+          indirect = indirect || code_index(label, code.count) < 0;
         }
+        indirect = indirect || ins.op == sass::Op::BRX || ins.op == sass::Op::CALL || ins.op == sass::Op::RET;
       }
       // The exact set's scan; the idioms (VGPU_HOST_GPU_DIV, VGPU_HOST_GPU_SQRT) are checked once, at the first instruction outside the set that one of them
       // could explain.
       bool idiom_checked = false, idiom_ok = false;
-      // (turbo mode admits a kernel its classes admit, in the exact set or not: the scan could only change what exact mode says)
-      const bool exact_needed = !turbo || turbo_refusal(classes, sw) != TurboRefusal::None;
-      for (size_t i = 0; i < code.count && ok && exact_needed; ++i) {
+      for (size_t i = 0; i < code.count && ok; ++i) {
         const sass::Instr& ins = code.instr(i);
         if (!exact_opcode_allowed(ins.mnemonic, ins.mods)) {
           if ((div_idiom || sqrt_idiom) && (ins.op == sass::Op::MUFU || ins.op == sass::Op::CALL || ins.op == sass::Op::RET)) {
@@ -1435,46 +852,16 @@ struct Runtime::Impl : CardGate {
       if (logging_code() && !sfu.empty())
         for (size_t i = 0; i < code.count; ++i) std::fprintf(stderr, "host_gpu:   %s: %s\n", fn.name.c_str(), sass::to_text(code.instr(i)).c_str());
     }
-    if (runnable_here) {
-      const bool exact_ok = ok;
-      v.rr = exact_ok ? TurboRefusal::None : turbo_refusal(classes, sw);
-      v.trap_only = turbo && v.rr == TurboRefusal::Never && !mcard.is_ptx && turbo_refusal(classes_but_trap, sw) == TurboRefusal::None;
-      if (turbo) ok = v.rr == TurboRefusal::None;   // (a kernel of the exact set, the division idiom included, is admitted whatever is switched off)
-      if (!ok) {
-        v.kind = Refused::Code;
-        static const char* const kTurboWhy[] = {"", "an instruction the card cannot run for the simulator (class never)", "a class switched off with VGPU_HOST_GPU_TURBO_OFF",
-                                                  "an atomic, kept out with VGPU_HOST_GPU_ATOMICS=0"};
-        why = turbo ? kTurboWhy[static_cast<unsigned>(v.rr)] : why;
-        v.why = turbo ? why : "kernel code not in the exact set (cached)";
-      }
-      if (turbo) {
-        // One line per kernel, for the benchmark to list what turbo mode still cannot send: said like the summary (not under VGPU_QUIET alone).
-        static const char* const kRefusalName[] = {"", "never", "off", "atomics"};
-        if (!ok && (!quiet() || logging()))
-          std::fprintf(stderr, "host_gpu_refused: kernel=%s class=%s insn=%s\n", fn.name.c_str(), kRefusalName[static_cast<unsigned>(v.rr)],
-                       (v.rr == TurboRefusal::Never ? first_never : first_gated).c_str());
-        if (logging()) {
-          std::string held;
-          for (unsigned c = 0; c < kInsnClasses; ++c)
-            if (classes & (ClassMask{1} << c)) held += std::string(held.empty() ? "" : " ") + insn_class_name(static_cast<InsnClass>(c));
-          std::fprintf(stderr, "host_gpu: %s: card image %s%s; classes: %s; %s\n", fn.name.c_str(), mcard.what.c_str(), mcard.same_as_sim ? "" : " (not the simulator's image)",
-                       held.c_str(), ok ? (exact_ok ? "admitted (exact set)" : "admitted") : v.trap_only ? "never by a trap only: admitted in a cooperative launch" : why);
-        }
-      }
-    }
-    if (turbo && mcard.load_failed && ok) {   // (the driver refused the module's image: what it admitted stays in the simulator, as the kernels already scanned do)
-      ok = false;
-      v.kind = Refused::Image;
-      v.why_text = "the driver did not load the card's image";
-      v.why = v.why_text.c_str();
-      why = v.why_text.c_str();
+    if (runnable_here && !ok) {
+      v.kind = Refused::Code;
+      v.why = "kernel code not in the exact set (cached)";
     }
     v.ok = ok;
     v.runnable = runnable_here;
     v.back_edge = has_back_edge(branches);
-    if (runnable_here && !mcard.is_ptx) {
+    if (runnable_here) {
       const sass::Code& code = mv->code[ci->second];
-      std::vector<FlowInsn> flow(v.back_edge ? code.count : 0);   // (no back edge: a loop is only an indirect jump, which the class scan saw)
+      std::vector<FlowInsn> flow(v.back_edge ? code.count : 0);   // (no back edge: a loop is only an indirect jump, which the scan above saw)
       for (size_t i = 0; i < flow.size(); ++i) {
         const sass::Instr& ins = code.instr(i);
         const bool always = ins.guard == sass::kPT;
@@ -1609,22 +996,6 @@ struct Runtime::Impl : CardGate {
     return d;
   }
 
-  // What the driver says of a function on the card (cached): registers, static shared memory, the most threads the kernel can run.
-  FuncAttrs attrs_of(CUfunction f) {
-    if (const auto it = func_attrs.find(f); it != func_attrs.end()) return it->second;
-    FuncAttrs a;
-    int mt = 0, sh = 0, rg = 0;
-    if (api.cuFuncGetAttribute && api.cuFuncGetAttribute(&mt, kFuncAttrMaxThreads, f) == 0 && api.cuFuncGetAttribute(&sh, kFuncAttrSharedSize, f) == 0 &&
-        api.cuFuncGetAttribute(&rg, kFuncAttrNumRegs, f) == 0 && mt >= 0 && sh >= 0 && rg >= 0) {
-      a.known = true;
-      a.max_threads = static_cast<uint32_t>(mt);
-      a.static_shared = static_cast<uint32_t>(sh);
-      a.regs = static_cast<uint32_t>(rg);
-    }
-    func_attrs[f] = a;
-    return a;
-  }
-
   CUfunction function_for(const ptx::EntryFn& fn) {
     const sass::Module* m = fn.sass.get();
     const void* const key = module_key(fn);
@@ -1632,22 +1003,9 @@ struct Runtime::Impl : CardGate {
     if (const auto it = modules.find(key); it != modules.end()) mod = it->second;
     else {
       ModuleCard& mc = module_card(fn);
-      if (mc.load_failed) return nullptr;   // (turbo mode: said once; the driver is not asked again for a module it has refused)
-      const void* const bytes = mc.patched ? static_cast<const void*>(mc.image.bytes.data()) : mc.use_own ? static_cast<const void*>(mc.own.c_str()) : static_cast<const void*>(m->image.data());
+      const void* const bytes = mc.patched ? static_cast<const void*>(mc.image.bytes.data()) : static_cast<const void*>(m->image.data());
       if (const CUresult r = api.cuModuleLoadData(&mod, bytes)) {
-        if (logging() || (mode == Mode::Turbo && !quiet()))
-          std::fprintf(stderr, "host_gpu: cuModuleLoadData failed (%d)%s%s\n", r, mc.patched ? " (the image with the simulator's addresses)" : "",
-                       mc.what.empty() ? "" : (" for the card's " + mc.what).c_str());
-        if (mode == Mode::Turbo) {   // the module's kernels stay in the simulator from now on, counted as image refusals
-          mc.load_failed = true;
-          for (auto& [ekey, verdict] : eligible)
-            if (ekey.first == key && verdict.ok) {   // (the kernels of the module the scan admitted; a later verdict says it at its end, kernel_eligible)
-              verdict.ok = false;
-              verdict.kind = Refused::Image;
-              verdict.why_text = "the driver did not load the card's image";
-              verdict.why = verdict.why_text.c_str();
-            }
-        }
+        if (logging()) std::fprintf(stderr, "host_gpu: cuModuleLoadData failed (%d)%s\n", r, mc.patched ? " (the image with the simulator's addresses)" : "");
         return nullptr;
       }
       // Where the card put each constant bank that holds variables: from any variable of it the driver names, less the variable's offset in the
@@ -1682,11 +1040,6 @@ struct Runtime::Impl : CardGate {
         }
         mc.copies.push_back({va, cs->size, base});
       }
-      if (mc.retargeted && !mc.counted_retarget) {
-        mc.counted_retarget = true;
-        ++stats.retargeted;
-        if (logging()) std::fprintf(stderr, "host_gpu: the driver compiled the card's %s\n", mc.what.c_str());
-      }
       modules[key] = mod;
     }
     CUfunction f = nullptr;
@@ -1704,37 +1057,23 @@ void print_summary(Runtime::Impl* im) {
   // VGPU_QUIET silences the prose, not a report that was asked for: VGPU_HOST_GPU_VERIFY and VGPU_HOST_GPU_LOG each exist to be read at the end of the run.
   if (quiet() && !im->verify && !logging()) return;
   const Stats& s = im->stats;
-  const bool turbo = im->mode == Mode::Turbo;
   const auto ull = [](uint64_t v) { return static_cast<unsigned long long>(v); };
-  if (turbo)
-    std::fprintf(stderr,
-                 "host_gpu: %llu launches ran on the card, %llu in the simulator (%llu kernels not admitted by turbo mode, %llu too small, %llu unsupported launch shapes, %llu failed on the card)\n",
-                 ull(s.offloaded), ull(s.simulated), ull(s.refused_kernel), ull(s.refused_size), ull(s.refused_launch), ull(s.failed));
-  else
-    std::fprintf(stderr,
-                 "host_gpu: %llu launches ran on the card, %llu in the simulator (%llu kernels not in the exact set, %llu too small, %llu unsupported launch shapes, %llu failed on the card)\n",
-                 ull(s.offloaded), ull(s.simulated), ull(s.refused_kernel), ull(s.refused_size), ull(s.refused_launch), ull(s.failed));
+  std::fprintf(stderr,
+               "host_gpu: %llu launches ran on the card, %llu in the simulator (%llu kernels not in the exact set, %llu too small, %llu unsupported launch shapes, %llu failed on the card)\n",
+               ull(s.offloaded), ull(s.simulated), ull(s.refused_kernel), ull(s.refused_size), ull(s.refused_launch), ull(s.failed));
   std::fprintf(stderr, "host_gpu: %.1f MiB went to the card, %.1f MiB came back\n", s.pushed_bytes / 1048576.0, s.pulled_bytes / 1048576.0);
   if (im->verify)   // (the second line is for scripts: the card CI parses it, not the prose above)
     std::fprintf(stderr, "host_gpu_verify: in_set_identical=%llu in_set_different=%llu other_identical=%llu other_different=%llu\n", ull(s.same_exact_set),
                  ull(s.differ_exact_set), ull(s.same_other), ull(s.differ_other));
-  if (im->verify && !turbo)
+  if (im->verify)
     std::fprintf(stderr, "host_gpu: verify: kernels in the exact set: %llu identical, %llu different; other kernels: %llu identical, %llu different\n",
                  ull(s.same_exact_set), ull(s.differ_exact_set), ull(s.same_other), ull(s.differ_other));
-  // The two lines for scripts (tools/bench/hostgpu/run.py): always in turbo mode; in exact mode only with VGPU_HOST_GPU_LOG, so that exact mode's
-  // summary is what it was. launches_card counts every launch that ran on the card, the ones a verify run repeats in the simulator included.
-  if (turbo || logging()) {
-    uint64_t kernels_outside = 0;
-    for (const auto& [k, kt] : im->tol_by_kernel) kernels_outside += kt.rep.outside > 0;
-    std::fprintf(stderr,
-                 "host_gpu_turbo: mode=%s launches_card=%llu launches_sim=%llu card_s=%.6f sim_s=%.6f words_compared=%llu words_different=%llu words_outside=%llu words_subnormal=%llu kernels_outside=%llu max_abs=%.9g max_rel=%.9g bits_different=%llu\n",
-                 turbo ? "turbo" : "exact", ull(s.card_runs), ull(s.simulated), s.card_seconds, s.sim_seconds, ull(s.tol.words), ull(s.tol.different), ull(s.tol.outside),
-                 ull(s.tol.subnormal), ull(kernels_outside), s.tol.max_abs, s.tol.max_rel, ull(s.tol.bits));
-    if (turbo)   // (a line of its own: the two above keep their fields for the scripts that read them)
-      std::fprintf(stderr, "host_gpu_fit: policy=%s card_sm=%d card_sms=%u refused_image=%llu refused_fit=%llu retargeted=%llu retarget_refused=%llu\n", im->fit ? "fit" : "rules", im->host_known ? im->host_sm : 0,
-                   im->host_known ? im->host_mp : 0u, ull(s.refused_image), ull(s.refused_fit), ull(s.retargeted), ull(s.retarget_refused));
-    std::fprintf(stderr, "host_gpu_refusals: refused_never=%llu refused_atomics=%llu refused_off=%llu refused_exact=%llu refused_safety=%llu too_small=%llu failed=%llu\n",
-                 ull(s.refused_never), ull(s.refused_atomics), ull(s.refused_off), ull(s.refused_exact), ull(s.refused_launch), ull(s.refused_size), ull(s.failed));
+  // The lines for scripts (tools/bench/hostgpu/run.py), only with VGPU_HOST_GPU_LOG, so that exact mode's summary is what it was. launches_card counts
+  // every launch that ran on the card, the ones a verify run repeats in the simulator included.
+  if (logging()) {
+    std::fprintf(stderr, "host_gpu_summary: mode=exact launches_card=%llu launches_sim=%llu card_s=%.6f sim_s=%.6f\n", ull(s.card_runs), ull(s.simulated), s.card_seconds,
+                 s.sim_seconds);
+    std::fprintf(stderr, "host_gpu_refusals: refused_safety=%llu too_small=%llu failed=%llu\n", ull(s.refused_launch), ull(s.refused_size), ull(s.failed));
     std::fprintf(stderr, "host_gpu_sampled: sampled=%llu sent=%llu timeouts=%llu cost_s=%.6f after_driver=%llu copies_running_at_exit=%zu copies_left=%zu\n", ull(s.sampled),
                  ull(s.sample_sent), ull(s.sample_timeouts), s.sample_seconds, ull(s.sample_after_driver), im->copies_running_at_exit, sample_copies_reap(false));
     std::fprintf(stderr, "host_gpu_streak: sent=%llu card_only_mib=%.1f rule=%d\n", ull(s.streak_sent), s.streak_card_only_bytes / 1048576.0, im->streak_rule ? 1 : 0);
@@ -1744,54 +1083,17 @@ void print_summary(Runtime::Impl* im) {
     if (logging())
       for (const auto& [kr, k] : im->kept)
         std::fprintf(stderr, "host_gpu_kept: kernel=%s launches=%llu sim_s=%.6f reason=%s\n", kr.first.c_str(), ull(k.launches), k.sim_s, kr.second.c_str());
-    if (turbo && im->verify)
-      for (const auto& [k, kt] : im->tol_by_kernel)
-        if (kt.rep.outside)
-          std::fprintf(stderr, "host_gpu_outside: kernel=%s words_compared=%llu words_different=%llu words_outside=%llu max_abs=%.9g max_rel=%.9g first=0x%llx:card=0x%08x:sim=0x%08x\n",
-                       k.c_str(), ull(kt.rep.words), ull(kt.rep.different), ull(kt.rep.outside), kt.rep.max_abs, kt.rep.max_rel, ull(kt.rep.first_addr), kt.rep.first_card,
-                       kt.rep.first_sim);
   }
 }
 Runtime::Impl* g_summary_impl = nullptr;
-std::vector<Runtime::Impl*> g_other_impls, g_all_impls;   // the runtimes of the other simulated devices (turbo mode with several cards), in the order they were made
-// One line for a simulated device beyond the first one the mode served: which card it ran on and what it did (the lines above are the first device's; a script
-// that wants the process's totals adds these). Nothing when its driver could not be used or it never launched.
-void print_card_line(Runtime::Impl* im) {
-  if (!im || im->start_failed || !im->start_ready) return;
-  if (quiet() && !im->verify && !logging()) return;
-  const Stats& s = im->stats;
-  std::fprintf(stderr, "host_gpu_card: device_slot=%d card=%d launches_card=%llu launches_sim=%llu card_s=%.6f sim_s=%.6f mib_to_card=%.1f mib_back=%.1f\n", im->slot, im->card_dev,
-               static_cast<unsigned long long>(s.card_runs), static_cast<unsigned long long>(s.simulated), s.card_seconds, s.sim_seconds, s.pushed_bytes / 1048576.0,
-               s.pulled_bytes / 1048576.0);
-}
 }  // namespace
 
-namespace {
-// What the environment says, read once for the process: every device's runtime is made from it.
-struct SharedConfig {
-  Mode mode = Mode::Off;   // Off: the mode is not on, or could not be started (said once)
-  TurboSwitches sw;
-  Tolerance tol;
-  bool fit = true;
-  double timeout_s = 0;
-  bool wider = true;
-  bool coop = true;
-  bool hostmap = true;
-  bool has_list = false;   // VGPU_HOST_GPU_DEVICES (turbo mode)
-  std::vector<int> list;
-  bool cvd_set = false;
-  std::string cvd;
-};
-SharedConfig g_cfg;
-}  // namespace
-
-Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal, int physical) {
+Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
   static std::once_flag once;
-  static std::mutex made_mu;
-  static std::map<int, Runtime*> made;   // by device slot (the window): the simulated devices the mode has been asked for
+  static Runtime* rt = nullptr;
   std::call_once(once, [&] {
     const char* mode_text = std::getenv("VGPU_HOST_GPU");
-    if (!mode_text_is_known(mode_text)) std::fprintf(stderr, "host_gpu: VGPU_HOST_GPU=%s is not a mode (off, exact or turbo); mode off\n", mode_text);
+    if (!mode_text_is_known(mode_text)) std::fprintf(stderr, "host_gpu: VGPU_HOST_GPU=%s is not a mode (off or exact); mode off\n", mode_text);
     const Mode mode = mode_from_text(mode_text);
     if (mode == Mode::Off) return;
     // Said even under VGPU_QUIET: someone who asked for the mode and got none must be told why.
@@ -1804,106 +1106,20 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal, int phys
       if (!quiet()) std::fprintf(stderr, "host_gpu: only NVIDIA devices; mode off\n");
       return;
     }
-    // Turbo mode's own switches. A value that cannot be read turns the mode off with a message (said even under VGPU_QUIET): someone who asked for a
-    // tolerance or for a class to be off must not get a run under another.
-    TurboSwitches sw;
-    Tolerance tol;
-    bool fit = true;
-    double timeout_s = mode == Mode::Turbo ? 600 : 0;
+    // A value that cannot be read turns the mode off with a message (said even under VGPU_QUIET): someone who asked for a time limit must not get a run without one.
+    double timeout_s = 0;
     const char* wider_text = std::getenv("VGPU_HOST_GPU_WIDER");
     const bool wider = !(wider_text && std::string(wider_text) == "0");
-    if (!wider) sw.atomics = false;
-    if (mode == Mode::Turbo) {
-      // (float atomics with a value, CAS and EXCH: admitted unless VGPU_HOST_GPU_ATOMICS=0, from Round sp66; the opt-in before)
-      if (const char* v = std::getenv("VGPU_HOST_GPU_ATOMICS"); v && *v) sw.atomics = *v != '0';
-      // (a PTX module that declares variables no instruction names: admitted from section 20; VGPU_HOST_GPU_PTX_VARIABLES=all refuses any variable again)
-      if (const char* v = std::getenv("VGPU_HOST_GPU_PTX_VARIABLES"); v && std::string(v) == "all") sw.ptx_vars_unreferenced = false;
-      if (!parse_fit(std::getenv("VGPU_HOST_GPU_FIT"), &fit)) {
-        std::fprintf(stderr, "host_gpu: VGPU_HOST_GPU_FIT=%s is not 0 or 1; mode off\n", std::getenv("VGPU_HOST_GPU_FIT"));
-        return;
-      }
-      std::string bad;
-      if (!parse_turbo_off(std::getenv("VGPU_HOST_GPU_TURBO_OFF"), &sw.off, &bad, &sw.printf_off, &sw.assert_off)) {
-        std::fprintf(stderr, "host_gpu: VGPU_HOST_GPU_TURBO_OFF: %s is not a class (mufu, tensor, half, call, atomics, red, extra, unlisted, printf, assert); mode off\n", bad.c_str());
-        return;
-      }
-      const std::pair<const char*, double*> tolerances[] = {{"VGPU_HOST_GPU_ATOL", &tol.atol}, {"VGPU_HOST_GPU_RTOL", &tol.rtol}};
-      for (const auto& [name, to] : tolerances)
-        if (const char* v = std::getenv(name); v && *v && !parse_tolerance(v, to)) {
-          std::fprintf(stderr, "host_gpu: %s=%s is not a number that is zero or more; mode off\n", name, v);
-          return;
-        }
-      if (const char* v = std::getenv("VGPU_HOST_GPU_TOL_TYPE"); v && *v && !parse_reading(v, &tol.reading)) {
-        std::fprintf(stderr, "host_gpu: VGPU_HOST_GPU_TOL_TYPE=%s is not auto, f32, f64 or f16; mode off\n", v);
-        return;
-      }
-    }
-    if (const char* v = std::getenv("VGPU_HOST_GPU_TIMEOUT"); v && *v && !parse_tolerance(v, &timeout_s)) {   // (the same form: seconds, zero or more; 0 is no limit)
+    if (const char* v = std::getenv("VGPU_HOST_GPU_TIMEOUT"); v && *v && !parse_seconds(v, &timeout_s)) {   // (seconds, zero or more; 0 is no limit)
       std::fprintf(stderr, "host_gpu: VGPU_HOST_GPU_TIMEOUT=%s is not a number of seconds that is zero or more; mode off\n", v);
       return;
     }
-    if (mode == Mode::Turbo && fit) {   // (FIT=0 starts the driver lazily, as before; exact is untouched)
-      std::string ver;
-      const char* vp = std::getenv("VGPU_HOST_GPU_PROC_VERSION");   // (tests: a file standing in for /proc/version; /dev/dxg is then not looked at)
-      if (FILE* f = std::fopen(vp && *vp ? vp : "/proc/version", "r")) {
-        char b[512];
-        size_t n = std::fread(b, 1, sizeof b - 1, f);
-        ver.assign(b, n);
-        std::fclose(f);
-      }
-      if (host_is_wsl(ver, !(vp && *vp) && access("/dev/dxg", F_OK) == 0)) {
-        std::fprintf(stderr, "host_gpu: this host is WSL2, where the driver start does not return (a 10 s wait in every process); turbo mode with VGPU_HOST_GPU_FIT=1 is off here (VGPU_HOST_GPU_FIT=0 starts it lazily); mode off\n");
-        return;
-      }
-    }
-    // Several cards (turbo mode only; exact mode serves device 0 as it always did): which real devices the simulated ones use (vgpu/host_gpu_cards.hpp).
-    if (mode == Mode::Turbo) {
-      if (!parse_card_list(std::getenv("VGPU_HOST_GPU_DEVICES"), &g_cfg.list, &g_cfg.has_list)) {
-        std::fprintf(stderr, "host_gpu: VGPU_HOST_GPU_DEVICES=%s is not a list of different device numbers (for example 0,1); mode off\n", std::getenv("VGPU_HOST_GPU_DEVICES"));
-        return;
-      }
-      if (const char* c = std::getenv("CUDA_VISIBLE_DEVICES")) {
-        g_cfg.cvd_set = true;
-        g_cfg.cvd = c;
-      }
-    }
-    g_cfg.mode = mode;
-    g_cfg.sw = sw;
-    g_cfg.tol = tol;
-    g_cfg.fit = fit;
-    g_cfg.timeout_s = timeout_s;
-    g_cfg.wider = wider;
-    g_cfg.coop = !(std::getenv("VGPU_HOST_GPU_COOP") && std::string(std::getenv("VGPU_HOST_GPU_COOP")) == "0");
-    g_cfg.hostmap = !(std::getenv("VGPU_HOST_GPU_HOSTMAP") && std::string(std::getenv("VGPU_HOST_GPU_HOSTMAP")) == "0");
-    // Turbo mode does not return the simulator's bits: said once, when the mode comes on (not under VGPU_QUIET, which silences the prose).
-    if (mode == Mode::Turbo && !quiet()) std::fprintf(stderr, "%s\n", turbo_notice());
-  });
-  if (g_cfg.mode == Mode::Off) return nullptr;
-  // The device's slot is its window's (a simulated device the program reaches as ordinal 0 may sit in window 1 under CUDA_VISIBLE_DEVICES). Exact mode serves the
-  // device in ordinal 0 on the driver's device 0 and window 0 as before.
-  const int slot = served_slot(g_cfg.mode == Mode::Turbo, ordinal, physical, kDeviceVaWindows);
-  if (slot < 0) return nullptr;
-  std::lock_guard<std::mutex> made_lock(made_mu);
-  if (auto it = made.find(slot); it != made.end()) return it->second;
-  {
-    const Mode mode = g_cfg.mode;
-    const SharedConfig& cfg = g_cfg;
     auto* r = new Runtime;
     r->impl_->mode = mode;
-    r->impl_->sw = cfg.sw;
-    r->impl_->tol = cfg.tol;
-    r->impl_->watchdog.limit_s = cfg.timeout_s;
-    r->impl_->wider = cfg.wider;
-    r->impl_->coop = cfg.coop;
-    r->impl_->hostmap = cfg.hostmap;
-    r->impl_->fit = cfg.fit;
-    r->impl_->multi = mode == Mode::Turbo;
-    r->impl_->has_list = cfg.has_list;
-    r->impl_->card_list = cfg.list;
-    r->impl_->cvd_set = cfg.cvd_set;
-    r->impl_->cvd = cfg.cvd;
+    r->impl_->watchdog.limit_s = timeout_s;
+    r->impl_->wider = wider;
     // The driver is not started here: see Impl::begin_start. The switches are read now so that they do not depend on whether it came up.
-    r->impl_->configure_start(profile, mode == Mode::Turbo ? kDeviceVaBase + static_cast<uint64_t>(slot) * kDeviceVaStride : kDeviceVaBase, mode == Mode::Turbo ? slot : 0);
+    r->impl_->configure_start(profile, kDeviceVaBase);
     if (const char* v = std::getenv("VGPU_HOST_GPU_VERIFY"); v && *v && *v != '0') r->impl_->verify = std::string(v) == "all" ? 2 : 1;
     if (const char* v = std::getenv("VGPU_HOST_GPU_WRITE_THROUGH"); v && *v && *v != '0') r->impl_->resident = false;
     if (const char* v = std::getenv("VGPU_HOST_GPU_STREAK"); v && std::string(v) == "0") r->impl_->streak_rule = false;
@@ -1914,8 +1130,8 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal, int phys
       r->impl_->sample_mode = std::string(v) == "0" ? Impl::SampleMode::Off : std::string(v) == "log" ? Impl::SampleMode::Log :
                               std::string(v) == "always" ? Impl::SampleMode::Always : std::string(v) == "whole" ? Impl::SampleMode::Whole : Impl::SampleMode::On;
     if (const char* v = std::getenv("VGPU_HOST_GPU_SAMPLE_BLOCK"); v && std::string(v) == "0") r->impl_->sample_block = false;   // the copy runs whole blocks (the rule before Round sp75)
-    if (const char* v = std::getenv("VGPU_HOST_GPU_SAMPLE_STARTED"); v && std::string(v) == "0") r->impl_->sample_started = false;   // no sample once the driver's start has begun (the rule before Round sp76)
     if (const char* v = std::getenv("VGPU_HOST_GPU_FIRST_BIG"); v && *v) r->impl_->big_threads = std::strtoull(v, nullptr, 10);
+    if (const char* v = std::getenv("VGPU_HOST_GPU_SAMPLE_STARTED"); v && std::string(v) == "0") r->impl_->sample_started = false;   // no sample once the driver's start has begun (the rule before Round sp76)
     if (const char* v = std::getenv("VGPU_HOST_GPU_SHORT"); v && std::string(v) == "0") r->impl_->costs = Costs{};   // the size rule before #660: a fixed 100 us card prior, 200 us floor
     if (const char* v = std::getenv("VGPU_HOST_GPU_STATIC"); v && *v && *v != '0') r->impl_->static_estimate = true;
     if (const char* v = std::getenv("VGPU_HOST_GPU_START_COST"); v && *v) {   // seconds; 0: do not charge the driver start (the rule before sp43)
@@ -1934,66 +1150,15 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal, int phys
       if (end != v && n >= 0) r->impl_->costs.start_repeats = n;
     }
     if (const char* mb = std::getenv("VGPU_HOST_GPU_MAX_MIB")) r->impl_->max_bytes = std::strtoull(mb, nullptr, 10) << 20;
-    if (!g_summary_impl) {   // (the first device's runtime prints the summary lines scripts read; the others add one line each: print_card_line)
-      g_summary_impl = r->impl_;
-      std::atexit([] {
-        g_summary_impl->copies_running_at_exit = sample_copies_reap(true);   // (no child is left behind, whatever the summary prints)
-        for (Runtime::Impl* im : g_all_impls) try { im->settle(); } catch (...) {}   // (a launch no one waited for: its kernel ends before the process does)
-        for (Runtime::Impl* im : g_other_impls) im->settle_start();
-        g_summary_impl->settle_start();
-        print_summary(g_summary_impl);
-        if (!g_other_impls.empty()) print_card_line(g_summary_impl);   // (with several devices the first has a line of its own too, so that the lines add up to the process)
-        for (Runtime::Impl* im : g_other_impls) print_card_line(im);
-        g_summary_impl->hist_commit();
-      });
-    } else {
-      g_other_impls.push_back(r->impl_);
-    }
-    g_all_impls.push_back(r->impl_);
-    made[slot] = r;
-    g_runtimes.fetch_add(1, std::memory_order_relaxed);
-    return r;
-  }
-}
-
-void note_program_image(const void* wrapper) {
-  if (history_dir().empty() || !wrapper) return;
-  std::lock_guard<std::mutex> g(g_prog_mu);
-  if (g_prog_unkeyed) return;
-  // __fatBinC_Wrapper_t { int magic = 0x466243B1; int version; const void* data; ... } and the container it points at (nvidia/src/fatbin.cpp): 0xBA55ED50, version,
-  // header_size (u16), size (u64) of the body that follows the header.
-  uint32_t magic = 0;
-  std::memcpy(&magic, wrapper, 4);
-  const unsigned char* inner = nullptr;
-  if (magic == 0x466243B1) std::memcpy(&inner, static_cast<const unsigned char*>(wrapper) + 8, sizeof inner);
-  uint16_t hs = 0;
-  uint64_t body = 0;
-  if (inner) {
-    std::memcpy(&magic, inner, 4);
-    std::memcpy(&hs, inner + 6, 2);
-    std::memcpy(&body, inner + 8, 8);
-  }
-  const uint64_t total = uint64_t{hs} + body;
-  if (!inner || magic != 0xBA55ED50 || hs < 16 || total > history::kMaxImageBytes || g_prog_bytes + total > (history::kMaxImageBytes * 2ull)) {
-    g_prog_unkeyed = true;   // no identity: the program behaves as without a history
-    return;
-  }
-  g_prog_hash.bytes(inner, static_cast<size_t>(total));
-  g_prog_bytes += static_cast<size_t>(total);
-  ++g_prog_images;
-}
-
-bool Runtime::turbo() const { return impl_->mode == Mode::Turbo; }
-
-void Runtime::prestart(const DeviceProfile& profile, int ordinal, int physical) {
-  if (!turbo_selected()) return;   // (turbo mode starts every simulated device's card; slot 0 alone in exact mode, which never prestarts)
-  const char* off = std::getenv("VGPU_HOST_GPU_PRESTART");
-  if (off && std::string(off) == "0") return;
-  Runtime* rt = for_device(profile, ordinal, physical);
-  if (!rt || rt->impl_->mode != Mode::Turbo || !rt->impl_->fit) return;
-  std::lock_guard<GateLock> g(rt->impl_->mu);
-  if (rt->impl_->hist_init()) return;   // section 17: the history says the driver is not needed yet (a launch that needs it starts it then)
-  rt->impl_->begin_start();   // (idempotent; the thread only touches `api` and `ctx`, which nobody reads before await_start)
+    g_summary_impl = r->impl_;
+    std::atexit([] {
+      g_summary_impl->copies_running_at_exit = sample_copies_reap(true);   // (no child is left behind, whatever the summary prints)
+      g_summary_impl->settle_start();
+      print_summary(g_summary_impl);
+    });
+    rt = r;
+  });
+  return ordinal == 0 ? rt : nullptr;
 }
 
 void Runtime::before_simulated(MemoryManager& mem) {
@@ -2006,7 +1171,7 @@ void Runtime::before_simulated(MemoryManager& mem) {
     // Verifying: this launch already ran on the card and the simulator runs it now, on its own memory, which is the truth. The card's copy is given up
     // (nothing is pulled). Until Round sp59 it was kept valid, which was wrong twice over: the simulator then ran its launch through the gate's slow
     // path, where an atomic of one host thread could lose the update of another (HeCBench atomicAggregate printed FAIL under VERIFY with 4 host threads
-    // and PASS with 1), and the next launch on the card started from the card's own earlier results instead of the simulator's, so in turbo mode the
+    // and PASS with 1), and the next launch on the card started from the card's own earlier results instead of the simulator's, so the
     // differences of one launch carried into the next. The price was that a verify run pushed all live memory before every launch; since sp67 the
     // compare in note_simulated gives the card back the chunks whose bytes agree (keep_verified_chunks), and only the others are pushed again.
     impl_->verify_card_ran = false;
@@ -2024,7 +1189,6 @@ void Runtime::note_simulated(const ptx::EntryFn& fn, const exec::LaunchConfig& c
                              const std::vector<std::vector<uint8_t>>* args) {
   std::lock_guard<GateLock> g(impl_->mu);
   impl_->stats.sim_seconds += sim_seconds;
-  impl_->hist_note_sim(fn.name, sim_seconds);
   if (impl_->start_failed) return;   // the driver could not be used: nothing to learn for
   InternalScope internal;
   struct NoteClock {   // (VGPU_HOST_GPU_LOG: the host_gpu_overhead line)
@@ -2054,19 +1218,13 @@ void Runtime::note_simulated(const ptx::EntryFn& fn, const exec::LaunchConfig& c
   }
   Impl::Pending& p = impl_->pending;
   if (p.active && mem && p.kernel == fn.name) {
-    const bool turbo = impl_->mode == Mode::Turbo;
     bool same = true;
     uint64_t bad_chunks = 0;
-    TolReport rep;   // turbo mode: the differing chunks word by word (vgpu/host_gpu_tol.hpp); equal chunks only add to the count of words
     compare_with_card(
-        *mem, p.ranges, p.card, impl_->verify_chunk, impl_->verify_equal,
-        [&](size_t, uint64_t addr, uint64_t n) {
-          if (turbo) rep.words += tol_word_count(addr, n);
-        },
-        [&](size_t, uint64_t addr, const uint8_t* card, const uint8_t* sim, uint64_t n) {
+        *mem, p.ranges, p.card, impl_->verify_chunk, impl_->verify_equal, [&](size_t, uint64_t, uint64_t) {},
+        [&](size_t, uint64_t, const uint8_t*, const uint8_t*, uint64_t) {
           same = false;
           ++bad_chunks;
-          if (turbo) compare_words(card, sim, addr, n, impl_->tol, rep);
         });
     // The chunks that agree are a valid card copy again: the next launch on the card pushes only the others (vgpu/host_gpu_track.hpp keep_verified_chunks,
     // docs/perf-design/10-host-gpu-hooks.md section 8). This is an exclusive section of the gate's lock (held since the top of this function).
@@ -2074,24 +1232,7 @@ void Runtime::note_simulated(const ptx::EntryFn& fn, const exec::LaunchConfig& c
       keep_verified_chunks(impl_->res, *impl_->gate_mem, p.ranges, impl_->verify_equal, [&](Tracked& a) { impl_->update_slot(a); });
     Stats& st = impl_->stats;
     ++(p.in_exact_set ? (same ? st.same_exact_set : st.differ_exact_set) : (same ? st.same_other : st.differ_other));
-    if (turbo) {
-      st.tol.add(rep);
-      Impl::KernelTol& kt = impl_->tol_by_kernel[fn.name];
-      kt.rep.add(rep);
-      // Every launch with VGPU_HOST_GPU_LOG; without it, the first three launches of a kernel that have a word outside tolerance.
-      constexpr unsigned kSaidWithoutLog = 3;
-      const bool say_outside = rep.outside && kt.said < kSaidWithoutLog;
-      if (say_outside) ++kt.said;
-      if (logging() || say_outside) {
-        char first[96] = "";
-        if (rep.has_first)
-          std::snprintf(first, sizeof first, ", first outside at 0x%llx: card 0x%08x sim 0x%08x", static_cast<unsigned long long>(rep.first_addr), rep.first_card, rep.first_sim);
-        std::fprintf(stderr, "host_gpu: verify %s (%s): %llu words compared, %llu different, %llu outside tolerance, %llu zero or denormal on both sides; largest difference %.9g, relative %.9g%s%s\n",
-                     fn.name.c_str(), p.in_exact_set ? "admitted" : "not admitted", static_cast<unsigned long long>(rep.words), static_cast<unsigned long long>(rep.different),
-                     static_cast<unsigned long long>(rep.outside), static_cast<unsigned long long>(rep.subnormal), rep.max_abs, rep.max_rel, first,
-                     say_outside && !logging() && kt.said == kSaidWithoutLog ? " (later launches of this kernel are not listed; VGPU_HOST_GPU_LOG=1 lists all)" : "");
-      }
-    } else if (logging() || (!same && p.in_exact_set)) {
+    if (logging() || (!same && p.in_exact_set)) {
       std::fprintf(stderr, "host_gpu: verify %s (%s): %s%s\n", fn.name.c_str(), p.in_exact_set ? "in the exact set" : "outside the exact set",
                    same ? "identical" : "DIFFERENT, 64 KiB chunks: ", same ? "" : std::to_string(bad_chunks).c_str());
     }
@@ -2165,31 +1306,13 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     }
     return false;
   }
-  // Program history (section 17): a kernel that failed on the card in an earlier run, or a program known to be shorter in the simulator than the driver's start. Asked before the kernel's
-  // verdict, which in turbo mode with FIT=1 starts the driver itself (the image the card runs is chosen on the card's architecture).
-  if (!forced && !im.verify) {
-    if (const char* h = im.hist_keeps(fn.name, uint64_t{cfg.grid[0]} * cfg.grid[1] * cfg.grid[2] * cfg.block[0] * cfg.block[1] * cfg.block[2])) {
-      ++im.hist_kept;
-      ++im.stats.simulated;
-      if (logging()) {
-        im.last.kept = std::string("history: ") + h;
-        std::fprintf(stderr, "host_gpu: %s stays in the simulator: history: %s\n", fn.name.c_str(), h);
-      }
-      return false;
-    }
-  }
   const auto scan_t0 = std::chrono::steady_clock::now();
   Impl::Decision dec = im.kernel_eligible(fn, cfg, args, mem);
   if (logging()) im.log_scan_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - scan_t0).count();
   const char* const why = dec.why;
   const uint64_t static_instrs = dec.instrs;
   const bool runnable = dec.runnable, back_edge = dec.back_edge;
-  const bool in_exact_set = dec.ok;   // (in turbo mode: admitted by its classes)
-  if (im.hist_on) {
-    const bool loop = dec.loop;   // (a real cycle in the flow: back_edge is true of every SASS kernel, which ends in a branch to itself)
-    if (!loop) im.hist_loopfree_work += static_cast<double>(cfg.grid[0]) * cfg.grid[1] * cfg.grid[2] * cfg.block[0] * cfg.block[1] * cfg.block[2] * static_cast<double>(dec.instrs);
-    im.hist_kernels[fn.name].loop = loop;
-  }
+  const bool in_exact_set = dec.ok;
   im.last.in_set = in_exact_set;
   im.last.threads_per_block = cfg.block[0] * cfg.block[1] * cfg.block[2];
   im.last.instrs = static_instrs;
@@ -2197,30 +1320,17 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   const uint64_t blocks = uint64_t{cfg.grid[0]} * cfg.grid[1] * cfg.grid[2];
   // (The driver is not started here, whatever the kernel: only a launch that has been decided to go to the card starts it, below, at await_start.)
   if (!in_exact_set && !(im.verify == 2 && runnable)) {
-    if (dec.kind == Impl::Refused::Code) {
-      ++im.stats.refused_kernel;
-      ++(dec.rr == TurboRefusal::Never ? im.stats.refused_never : dec.rr == TurboRefusal::Off ? im.stats.refused_off : dec.rr == TurboRefusal::Atomics ? im.stats.refused_atomics : im.stats.refused_exact);
-    } else if (dec.kind == Impl::Refused::Image) {
-      ++im.stats.refused_image;
-    } else {
-      ++im.stats.refused_launch;
-    }
+    if (dec.kind == Impl::Refused::Code) ++im.stats.refused_kernel;
+    else ++im.stats.refused_launch;
     ++im.stats.simulated;
     if (logging()) {
-      static const char* const kClassName[] = {"exact", "never", "off", "atomics"};
-      im.last.kept = dec.kind == Impl::Refused::Code ? std::string("class ") + kClassName[static_cast<unsigned>(dec.rr)] :
-                     dec.kind == Impl::Refused::Image ? std::string("image: ") + why : std::string("safety: ") + why;
+      im.last.kept = dec.kind == Impl::Refused::Code ? std::string("code: not in the exact set") : std::string("safety: ") + why;
       std::fprintf(stderr, "host_gpu: %s stays in the simulator: %s\n", fn.name.c_str(), why);
     }
     return false;
   }
-  // Turbo mode with VGPU_HOST_GPU_FIT=1 (the default): no performance rule is asked. The kernel passed the checks above and goes to the card when it fits
-  // it (below); what the simulator would have taken is not looked for, nor the size of the launch, the start cost, the sample of its first blocks or
-  // the bans of kernels the card path did not repay.
-  const bool turbo = im.mode == Mode::Turbo;
-  const bool fit_send = turbo && im.fit && !forced;
   // What the simulator took before for this kernel, else a lower bound from the code and the grid.
-  std::optional<double> sim_s = forced ? std::optional<double>(*forced_sim_s) : fit_send ? std::optional<double>(0.0) : im.sim_times.predict(fn.name, blocks);
+  std::optional<double> sim_s = forced ? std::optional<double>(*forced_sim_s) : im.sim_times.predict(fn.name, blocks);
   if (!sim_s && im.static_estimate) sim_s = static_sim_seconds(blocks, cfg.block[0] * cfg.block[1] * cfg.block[2], static_instrs, im.costs);
   if (!sim_s && im.verify) sim_s = 0;   // verifying: every launch runs on both, whatever the rule would say
   bool first_launch_rule = false;
@@ -2260,14 +1370,14 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   e.push_bytes = push_bytes;
   e.pull_bytes = im.resident ? 0 : total;   // write-through: an upper bound, only what changed is written back, but the card's copy is read in full
   if (const auto it = im.card_kernel_s.find(fn.name); it != im.card_kernel_s.end()) e.card_kernel_s = it->second;
-  if (!forced && !im.verify && !fit_send && im.banned.count(fn.name)) {
+  if (!forced && !im.verify && im.banned.count(fn.name)) {
     ++im.stats.refused_size;
     ++im.stats.simulated;
     if (logging()) im.last.kept = "size rule: the kernel is banned (a card launch of it did not pay)";
     return false;
   }
   const uint64_t kept_before = im.sim_times.samples(fn.name);   // this kernel's launches the simulator has run so far (start_share_launches, host_gpu.hpp)
-  const bool by_size = forced || im.verify || fit_send || should_offload_with_start(e, im.costs, im.start_sh != nullptr, im.eligible_sim_spent_s, kept_before);
+  const bool by_size = forced || im.verify || should_offload_with_start(e, im.costs, im.start_sh != nullptr, im.eligible_sim_spent_s, kept_before);
   // Round sp65: while the card holds chunks the simulator does not, keeping this launch would pull them back first, and sending it moves only what
   // the simulator holds alone (streak_offload). `ref_s` is what the simulator side was expected to cost: the bans below weigh the card path against it.
   bool streak = false;
@@ -2278,7 +1388,7 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   // Whichever rule sends it, a launch while the card holds chunks the simulator does not is weighed by the bans against the pull it saves too
   // (ban_reference_seconds, vgpu/host_gpu.hpp).
   const double ref_s = ban_reference_seconds(StreakLaunch{e.sim_s, card_only_bytes, push_bytes, e.card_kernel_s}, im.costs, im.resident && im.streak_rule);
-  if ((!fit_send && total > im.max_bytes) || (!by_size && !streak)) {
+  if (total > im.max_bytes || (!by_size && !streak)) {
     ++im.stats.refused_size;
     ++im.stats.simulated;
     if (logging())
@@ -2297,40 +1407,14 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
                  card_path_seconds(cold, im.costs) * 1e3, im.eligible_sim_spent_s, static_cast<unsigned long long>(kept_before));
   }
   // The card path. Anything that goes wrong before the kernel has run leaves the simulator's memory as it was.
-  const bool was_started = im.start_ready;
   if (!im.await_start()) {   // the driver is unusable (said once on stderr): this launch and all later ones are the simulator's
     ++im.stats.simulated;
     return false;
   }
-  if (turbo && !was_started && im.host_sm != im.want_sm) {
-    // Turbo mode with its performance rules on decided on the images for the simulated profile's architecture; the card is another one, so the verdicts
-    // were made again when it came up (await_start), and this launch is decided afresh by them.
-    dec = im.kernel_eligible(fn, cfg, args, mem);
-    if (!dec.ok) {
-      ++(dec.kind == Impl::Refused::Image ? im.stats.refused_image : dec.kind == Impl::Refused::Code ? im.stats.refused_kernel : im.stats.refused_launch);
-      ++im.stats.simulated;
-      if (logging()) {
-        im.last.kept = dec.kind == Impl::Refused::Image ? std::string("image: ") + dec.why : std::string("card verdict: ") + dec.why;
-        std::fprintf(stderr, "host_gpu: %s stays in the simulator: %s\n", fn.name.c_str(), dec.why);
-      }
-      return false;
-    }
-  }
   const auto t0 = std::chrono::steady_clock::now();
   im.api.cuCtxSetCurrent(im.ctx);
   const uint64_t base = mem.va_base();
-  // The launch does not fit the card: it stays in the simulator, and the mode goes on (a launch the card refuses ends it).
-  const auto fit_refuse = [&](FitRefusal why_not) {
-    ++im.stats.refused_fit;
-    ++im.stats.simulated;
-    if (logging()) {
-      im.last.kept = std::string("fit: ") + fit_refusal_text(why_not);
-      std::fprintf(stderr, "host_gpu: %s stays in the simulator: does not fit the card: %s\n", fn.name.c_str(), fit_refusal_text(why_not));
-    }
-    return false;
-  };
-  if (turbo && hi > base && im.limits.memory_total && hi - base > im.limits.memory_total) return fit_refuse(FitRefusal::Memory);
-  if (hi && (hi < base || !im.ensure_mapped(hi))) {   // (no device allocation, as in a zero-copy program: nothing to back)
+  if (hi < base || !im.ensure_mapped(hi)) {
     if (logging()) std::fprintf(stderr, "host_gpu: %s: could not back the simulator's window up to 0x%llx on the card\n", fn.name.c_str(), static_cast<unsigned long long>(hi));
     ++im.stats.failed;
     ++im.stats.simulated;
@@ -2342,19 +1426,6 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     ++im.stats.failed;
     ++im.stats.simulated;
     return false;
-  }
-  if (turbo) {   // the card's own limits, against this launch's shape and this kernel's registers and shared memory
-    const FitRefusal fr = fits_card(im.limits, im.attrs_of(f), cfg.grid.data(), cfg.block.data(), cfg.shared_bytes, hi > base ? hi - base : 0);
-    if (fr != FitRefusal::None) return fit_refuse(fr);
-    if (cfg.shared_bytes > 48 * 1024 && im.api.cuFuncSetAttribute(f, kFuncAttrMaxDynamicShared, static_cast<int>(cfg.shared_bytes))) return fit_refuse(FitRefusal::SharedAttribute);
-    if (cfg.cooperative) {
-      int per_sm = 0;
-      if (!im.limits.cooperative || !im.api.cuLaunchCooperativeKernel || !im.api.cuOccupancyMaxActiveBlocksPerMultiprocessor ||
-          im.api.cuOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, f, static_cast<int>(cfg.block[0] * cfg.block[1] * cfg.block[2]), cfg.shared_bytes) ||
-          !coop_fits(blocks, static_cast<uint32_t>(std::max(per_sm, 0)), im.host_mp))
-        return fit_refuse(FitRefusal::Cooperative);
-    }
-    if (dec.host_args && !im.pin_host_maps(mem)) return fit_refuse(FitRefusal::HostMemory);
   }
   std::vector<uint8_t>& buf = im.push_buf;
   bool card_only_data = false;   // chunks only the card holds, from earlier launches: lost if the card fails now
@@ -2402,52 +1473,26 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
         if (im.resident) im.reset_for_simulator();
         return false;
       }
-  // A kernel that prints: what the program printed before the launch is out before the card's lines, which the driver prints at the synchronisation below.
-  if (dec.printf) std::fflush(stdout);
   if (cfg.shared_bytes > 48 * 1024) im.api.cuFuncSetAttribute(f, kFuncAttrMaxDynamicShared, static_cast<int>(cfg.shared_bytes));
   std::vector<void*> params;
   std::vector<std::vector<uint8_t>> keep = args;
   for (auto& a : keep) params.push_back(a.data());
-  std::vector<std::vector<uint8_t>> host_before;   // a verify run: the mapped host memory as the simulator will run on it, which the card changes in place
-  if (im.verify && dec.host_args)
-    for (const auto& [base, len] : im.pinned) host_before.emplace_back(reinterpret_cast<uint8_t*>(base), reinterpret_cast<uint8_t*>(base) + len);
   const auto k0 = std::chrono::steady_clock::now();
-  // Several simulated devices (g_runtimes > 1; the usual one-device program never takes this path): the launch is queued and not waited for, so that the cards of
-  // different devices run at the same time. Not with a kernel that prints (the driver prints at the synchronisation), not in a verify run or with the write-through
-  // path (they read the card's memory straight after), and not with the performance rules (VGPU_HOST_GPU_FIT=0), which time the card path.
-  const bool queue = turbo && fit_send && im.resident && !im.verify && !dec.printf && g_runtimes.load(std::memory_order_relaxed) > 1;
   im.watchdog.arm(fn.name);
-  CUresult r = cfg.cooperative ? im.api.cuLaunchCooperativeKernel(f, cfg.grid[0], cfg.grid[1], cfg.grid[2], cfg.block[0], cfg.block[1], cfg.block[2], cfg.shared_bytes, nullptr, params.data())
-                               : im.api.cuLaunchKernel(f, cfg.grid[0], cfg.grid[1], cfg.grid[2], cfg.block[0], cfg.block[1], cfg.block[2], cfg.shared_bytes, nullptr, params.data(), nullptr);
-  if (!r && !queue) r = im.api.cuCtxSynchronize();
-  if (!queue || r) im.watchdog.disarm();
-  if (queue && !r) {   // (the watchdog stays armed until settle: a queued kernel that never ends is still caught)
-    im.inflight = true;
-    im.inflight_kernel = fn.name;
-  }
+  CUresult r = im.api.cuLaunchKernel(f, cfg.grid[0], cfg.grid[1], cfg.grid[2], cfg.block[0], cfg.block[1], cfg.block[2], cfg.shared_bytes, nullptr,
+                                     params.data(), nullptr);
+  if (!r) r = im.api.cuCtxSynchronize();
+  im.watchdog.disarm();
   const double kernel_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - k0).count();
   if (r) {   // a failed kernel poisons the context (an illegal address): the mode ends, the simulator takes this launch
     im.dead = true;
     ++im.stats.failed;
     ++im.stats.simulated;
-    // A kernel that can assert or trap (section 20), and the card says it did (710 CUDA_ERROR_ASSERT after the driver printed the assertion text to stderr, 719
-    // CUDA_ERROR_LAUNCH_FAILED for a trap) [measured, A10G]: the program's own failure, which the card has already had and the simulator may not reproduce on the
-    // data it holds. The launch fails with the error the simulator gives for the same event (Err::DeviceAssert, Err::Trap: 710 and 719 to the program, the context
-    // dead after it), whether or not the card holds data the simulator lacks: a real GPU loses it the same way.
-    if (dec.trap && (r == kCudaErrorAssert || r == kCudaErrorLaunchFailure)) {
-      if (im.resident) im.discard_card_data();
-      if (!quiet()) std::fprintf(stderr, "host_gpu: %s %s on the card (error %d); the launch fails as it does in the simulator\n", fn.name.c_str(), r == kCudaErrorAssert ? "asserted" : "trapped", r);
-      if (r == kCudaErrorAssert) throw Error(Err::DeviceAssert, "device-side assertion failed in " + fn.name + " on the card (VGPU_HOST_GPU=turbo; the card printed the assertion text above)");
-      throw Error(Err::Trap, "kernel " + fn.name + " trapped on the card (VGPU_HOST_GPU=turbo)");
-    }
     if (im.resident) {
-      if (card_only_data) throw Error(Err::Internal, "host_gpu: " + fn.name + " failed on the card, which holds data from earlier launches that the simulator does not, so the simulator cannot take the launch over and the process ends. "
-                         "In turbo mode this is the price of sending every launch: VGPU_HOST_GPU_FIT=0 (the size rules) or VGPU_HOST_GPU_TURBO_OFF=<class> keeps such a kernel in the simulator "
-                         "(docs/perf-design/12-host-gpu-turbo.md section 15, known limits)");
+      if (card_only_data) throw Error(Err::Internal, "host_gpu: " + fn.name + " failed on the card, which holds data from earlier launches that the simulator does not, so the simulator cannot take the launch over and the process ends");
       im.reset_for_simulator();
     }
     if (!quiet()) std::fprintf(stderr, "host_gpu: %s failed on the card (error %d); mode off, the simulator runs it\n", fn.name.c_str(), r);
-    im.hist_note_fault(fn.name, r);
     return false;
   }
   im.last.card_s = kernel_s;
@@ -2483,14 +1528,6 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
       for (uint64_t at = 0; at < rs; at += (32ull << 20))
         if (im.api.cuMemcpyDtoH(to.data() + at, rb + at, std::min<uint64_t>(rs - at, 32ull << 20))) { im.pending.reset(); return false; }
     }
-    size_t held = 0;
-    for (const auto& [base, len] : im.pinned) {   // (the card's bytes of the host memory are compared too; the simulator then gets its own)
-      if (held == host_before.size()) break;
-      uint8_t* const h = reinterpret_cast<uint8_t*>(base);
-      im.pending.ranges.emplace_back(base, len);
-      im.pending.card.emplace_back(h, h + len);
-      std::memcpy(h, host_before[held++].data(), len);
-    }
     im.verify_card_ran = true;
     ++im.stats.simulated;
     return false;
@@ -2498,15 +1535,14 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
   if (im.resident) {   // nothing comes back now: the simulator's memory is stale where the card wrote, and the gate pulls it when it is read
     const double total_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     const bool first_card_launch = im.card_kernel_s.count(fn.name) == 0;
-    if (!fit_send && !first_card_launch && offload_ends(im.slow_launches[fn.name], offload_paid_off(total_s, ref_s), im.costs)) {
+    if (!first_card_launch && offload_ends(im.slow_launches[fn.name], offload_paid_off(total_s, ref_s), im.costs)) {
       im.banned.insert(fn.name);
       if (logging()) std::fprintf(stderr, "host_gpu: %s took %.3f ms on the card path against an estimate of %.3f ms in the simulator: offloading it ends\n", fn.name.c_str(), total_s * 1e3, ref_s * 1e3);
     }
-    if (!fit_send && im.traffic.record(fn.name, push_bytes, total, total_s, ref_s, !first_card_launch) && im.banned.insert(fn.name).second && logging())
+    if (im.traffic.record(fn.name, push_bytes, total, total_s, ref_s, !first_card_launch) && im.banned.insert(fn.name).second && logging())
       std::fprintf(stderr, "host_gpu: %s pushed %.1f MiB of %.1f MiB live on each of its last %u launches: offloading it ends (traffic)\n", fn.name.c_str(),
                    push_bytes / 1048576.0, total / 1048576.0, kTrafficLaunches);
     im.card_kernel_s[fn.name] = im.keep_card_time(fn.name, kernel_s, first_card_launch, e.sim_s);
-    im.hist_note_card(fn.name, kernel_s);
     ++im.stats.offloaded;
     im.sim_times.note_offload(fn.name);
     if (first_launch_rule && logging()) std::fprintf(stderr, "host_gpu: %s: first launch decided by the static rule (loop, %llu blocks)\n", fn.name.c_str(), static_cast<unsigned long long>(blocks));
@@ -2545,12 +1581,11 @@ bool Runtime::Impl::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg
     }
   const double total_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   // The first launch of a kernel on the card also pays the module's load: not held against the estimate.
-  if (!fit_send && im.card_kernel_s.count(fn.name) && offload_ends(im.slow_launches[fn.name], offload_paid_off(total_s, e.sim_s), im.costs)) {
+  if (im.card_kernel_s.count(fn.name) && offload_ends(im.slow_launches[fn.name], offload_paid_off(total_s, e.sim_s), im.costs)) {
     im.banned.insert(fn.name);
     if (logging()) std::fprintf(stderr, "host_gpu: %s took %.3f ms on the card path against an estimate of %.3f ms in the simulator: offloading it ends\n", fn.name.c_str(), total_s * 1e3, e.sim_s * 1e3);
   }
   im.card_kernel_s[fn.name] = im.keep_card_time(fn.name, kernel_s, !im.card_kernel_s.count(fn.name), e.sim_s);
-  im.hist_note_card(fn.name, kernel_s);
   ++im.stats.offloaded;
   im.sim_times.note_offload(fn.name);
   if (logging())
@@ -2789,34 +1824,4 @@ bool Runtime::sample_decide(const ptx::EntryFn& fn, const exec::LaunchConfig& cf
   return true;
 }
 
-}  // namespace vgpu::hostgpu
-
-namespace vgpu::hostgpu {
-// Whether turbo mode will actually run: the shim keeps every image of a fatbin only then, so that a mode that ends up off (a diagnostic that needs the simulator, a bad value,
-// a WSL host with FIT=1) copies nothing. The same checks as Runtime::for_device, without its messages.
-bool turbo_selected() {
-  static const bool on = [] {
-    if (mode_from_text(std::getenv("VGPU_HOST_GPU")) != Mode::Turbo) return false;
-    for (const char* v : kIncompatibleVars)
-      if (diagnostic_switched_on(v, std::getenv(v))) return false;
-    bool fit = true;
-    if (!parse_fit(std::getenv("VGPU_HOST_GPU_FIT"), &fit)) return false;
-    ClassMask off = 0;
-    bool printf_off = false, assert_off = false;
-    if (!parse_turbo_off(std::getenv("VGPU_HOST_GPU_TURBO_OFF"), &off, nullptr, &printf_off, &assert_off)) return false;
-    if (fit) {
-      std::string ver;
-      const char* vp = std::getenv("VGPU_HOST_GPU_PROC_VERSION");
-      if (FILE* f = std::fopen(vp && *vp ? vp : "/proc/version", "r")) {
-        char b[512];
-        const size_t n = std::fread(b, 1, sizeof b - 1, f);
-        ver.assign(b, n);
-        std::fclose(f);
-      }
-      if (host_is_wsl(ver, !(vp && *vp) && access("/dev/dxg", F_OK) == 0)) return false;
-    }
-    return true;
-  }();
-  return on;
-}
 }  // namespace vgpu::hostgpu

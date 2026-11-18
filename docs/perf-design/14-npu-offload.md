@@ -15,7 +15,7 @@ The tensor-core class (`mma`, `imma`, `wgmma`, `tile_mma`, `imma_frag`, MFMA/WMM
 | operand / accumulate | NPU can do it | bit-exact against the simulator |
 | --- | --- | --- |
 | INT8 x INT8 into INT32 | yes (all NPUs) | **yes in principle**: integer accumulation has no rounding |
-| BF16 / FP16 into FP32 | yes | **no**: accumulation order and rounding differ; same class of difference as turbo mode |
+| BF16 / FP16 into FP32 | yes | **no**: accumulation order and rounding differ; not bit-exact against the simulator |
 | FP32 / FP64 | no | not applicable |
 
 Library calls (cuBLAS, rocBLAS GEMMs) are the only place a transfer to an NPU could pay for itself: a per-warp tile is far smaller than the cost of moving it. Study 4 already records that library kernels are native; an NPU would be one more engine behind that recognition, not a change to the ISA-level interpreter.
@@ -37,7 +37,7 @@ Library calls (cuBLAS, rocBLAS GEMMs) are the only place a transfer to an NPU co
 
 ## 5. Not in scope
 
-BF16/FP16 approximate offload (a turbo-style mode; decide only after step 2), any use for non-matrix work, and a build-time dependency on any vendor SDK.
+BF16/FP16 approximate offload (a mode that is not bit-exact; decide only after step 2), any use for non-matrix work, and a build-time dependency on any vendor SDK.
 
 ## Status log
 

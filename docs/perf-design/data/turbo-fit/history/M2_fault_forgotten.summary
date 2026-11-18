@@ -1,2 +1,0 @@
-unit rc=1 2 FAIL lines; first: [ FAIL ] a_kernel_that_failed_on_the_card_is_kept_out_of_it_for_good
-stub rc=1 2 FAIL lines; first: FAIL: a kernel known to fault reached the card or the driver started:  1 cuDeviceGet; 1 cuDevicePrimaryCtxRetain; 3 cuFuncGetAttribute; 1 cuInit; 3 cuLaunchKernel; 1 cuMemAddressReserve; 1 cuMemcpyHto

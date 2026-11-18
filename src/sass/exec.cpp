@@ -418,7 +418,7 @@ uint64_t sass_max_steps(uint64_t configured) {
 // ---- kernels whose blocks wait on one another (vgpu/exec/lockstep.hpp) ----------------------------
 //
 // A kernel polls global memory when it has a loop with an atomic that returns its old value, or a
-// strong load (a volatile or turbo one, CTA scope aside), whose address and operands are the same
+// strong load (a volatile or relaxed one, CTA scope aside), whose address and operands are the same
 // on every turn of the loop, and no store to global memory anywhere in the loop: `while (atomicCAS(lock,
 // 0, 1)) {}`, `while (*(volatile int*)flag != n) {}`. A compare-and-swap retry loop is not one: the value
 // it swaps in comes from the old value, which changes. The test is cheap and errs towards "no": a

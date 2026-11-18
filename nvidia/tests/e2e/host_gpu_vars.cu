@@ -1,4 +1,4 @@
-// Round sp66 (docs/perf-design/12-host-gpu-turbo.md section 3): what a kernel's module holds besides code no longer keeps the kernel in the simulator
+// Round sp66 (docs/perf-design/12-host-gpu-size-rules.md): what a kernel's module holds besides code no longer keeps the kernel in the simulator
 // by itself. One module (this translation unit) with __device__ and __constant__ variables, string literals, vprintf, malloc/free and assert, and a
 // texture object on the device. run_host_gpu_stub.sh runs it against the stand-in driver, run_host_gpu.sh on a card; its stdout must not depend on the
 // host-GPU mode (with `printf`, the card's lines are the same text: what is printed is integers).

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <map>
@@ -25,21 +26,31 @@
 
 namespace vgpu::hostgpu {
 
-enum class Mode { Off, Exact, Turbo };
+enum class Mode { Off, Exact };
 
-// "exact" and "turbo" turn the mode on; anything else, empty or null is off. (`approx` is not a mode: a typo must not turn one on.)
-// Turbo (docs/perf-design/12-host-gpu-turbo.md) also sends kernels to the card whose results are the card's own and not the simulator's bits.
+// "exact" turns the mode on; anything else, empty or null is off. (`approx` is not a mode: a typo must not turn one on.)
 inline Mode mode_from_text(const char* text) {
   if (!text) return Mode::Off;
   const std::string t(text);
-  return t == "exact" ? Mode::Exact : t == "turbo" ? Mode::Turbo : Mode::Off;
+  return t == "exact" ? Mode::Exact : Mode::Off;
 }
 
-// A mode value that is none of off, exact and turbo (a typo, or `approx`, which is not a mode) must be said, never read as off in silence.
+// A mode value that is none of off and exact (a typo, or `approx`, which is not a mode) must be said, never read as off in silence.
 inline bool mode_text_is_known(const char* text) {
   if (!text || !*text) return true;
   const std::string t(text);
-  return t == "off" || t == "exact" || t == "turbo" || t == "0";
+  return t == "off" || t == "exact" || t == "0";
+}
+
+// A number of seconds (VGPU_HOST_GPU_TIMEOUT): finite, zero or more, and nothing after it. False for anything else (the caller says so and does not guess).
+inline bool parse_seconds(const char* text, double* out) {
+  if (!text || !*text) return false;
+  char* end = nullptr;
+  const double v = std::strtod(text, &end);
+  if (end == text || *end != '\0') return false;
+  if (!(v >= 0) || std::isinf(v)) return false;   // (a NaN fails v >= 0)
+  *out = v;
+  return true;
 }
 
 // The switches of diagnostics that only the simulator can give: with any of them on the mode refuses to start (08 section 3), never quietly drops them.
@@ -103,8 +114,8 @@ inline bool exact_mnemonic_allowed(const std::string& m) {
 // Modifiers that turn an allowed mnemonic into an order- or implementation-dependent one: a floating-point reduction adds in
 // whatever order the blocks arrive, and a reduction on a float is not the integer one.
 // The decoder prints a float type and its rounding as ONE modifier ("F32.FTZ.RN", "F16x2.RN", "F32x2.FTZ.RN"), so the dot-separated parts are
-// looked at, and a type by how it starts. (Until turbo mode was added this compared whole modifiers with "F32", "F64" and "F16", which the decoder
-// never prints alone: a float reduction passed as an integer one on sm_75 to sm_89. On sm_90 and later the mnemonic is REDG, which is not in the set.)
+// looked at, and a type by how it starts. (Whole modifiers compared with "F32", "F64" and "F16" would never match, since the decoder
+// never prints them alone: a float reduction passed as an integer one on sm_75 to sm_89. On sm_90 and later the mnemonic is REDG, which is not in the set.)
 inline bool exact_mods_allowed(const std::string& mnemonic, const std::vector<std::string>& mods) {
   if (mnemonic == "RED") {
     for (const std::string& m : mods)
@@ -227,34 +238,7 @@ inline CodeInsn::Kind classify_for_idiom(const std::string& mnemonic, const std:
   return exact_mnemonic_allowed(mnemonic) ? K::Other : K::Memory;
 }
 
-// ---- turbo mode: what a kernel's code is made of (docs/perf-design/12-host-gpu-turbo.md) ------------------------------------------------
-// VGPU_HOST_GPU=turbo also sends kernels to the card whose result is the card's and not the simulator's bits. Every instruction of a kernel is put in
-// one class, once, and the mode admits a kernel by the classes it holds. A mnemonic that is not named below is Unlisted: the card runs the cubin's own
-// words, whatever the simulator's decoder calls them, so turbo admits it (VGPU_HOST_GPU_TURBO_OFF=unlisted keeps such kernels in the simulator);
-// exact mode, whose whitelist is untouched, refuses it. Never is what the card cannot run for the simulator: it needs a table only the simulator holds
-// (textures and surfaces) or ends the card's context (BPT).
-enum class InsnClass : uint8_t {
-  Exact,       // today's exact set
-  Mufu,        // every MUFU form (the card's approximation is 1 to 2 ulp from the simulator's, sp44)
-  Half,        // packed half arithmetic: HADD2, HMUL2, HFMA2, HSETP2, HSET2, HMNMX2
-  FloatRed,    // a float reduction with no returned value: the sum depends on the order the threads arrive in
-  Call,        // CALL and RET (the runtime also checks that every call stays inside the kernel's own code section)
-  Extra,       // plain compute and memory instructions the exact set never measured: they read and write registers, shared memory and the same global
-               // addresses as LDG and STG, so the card needs nothing that only the simulator holds
-  Tensor,      // HMMA, IMMA, DMMA, BMMA (BMMA is integer popcount arithmetic: A10G measured, 12-host-gpu-turbo.md section 2)
-  AtomInt,     // integer atomics that return the old value (ADD, MIN, MAX, AND, OR, XOR, INC, DEC): memory ends the same, the returned values depend on the order
-  AtomFloat,   // float atomics that return a value: admitted unless VGPU_HOST_GPU_ATOMICS=0 (an opt-in until Round sp66)
-  AtomSwap,    // CAS, CAST.SPIN, EXCH: as AtomFloat; the card does not agree with itself from run to run on programs built on these (09 doc, M2)
-  Never,       // textures and surfaces (handles are indices into the simulator's tables), BPT (a trap ends the card's context), the sm_90+ forms of
-               // unmeasured_private_mnemonic (TMA, warpgroup, cluster, ...), a call the scan cannot follow
-  Unlisted,    // an instruction no class names (an unnamed mnemonic, a field the decoder could not name, ATOMS.ARRIVE, QMMA, the
-               // tensor-memory forms ...): admitted by turbo, never by exact
-};
-inline constexpr unsigned kInsnClasses = 12;
-inline const char* insn_class_name(InsnClass c) {
-  static const char* const n[kInsnClasses] = {"exact", "mufu", "half", "float-red", "call", "extra", "tensor", "atomic-int", "atomic-float", "atomic-swap", "never", "unlisted"};
-  return n[static_cast<unsigned>(c)];
-}
+// ---- the modifiers of an instruction, read by their dot-separated parts --------------------------------------------------------------------
 
 // The decoder keeps some modifiers joined as nvdisasm prints them ("F32.FTZ.RN", "F16x2.RN"): these look at the dot-separated parts.
 template <class Pred>
@@ -270,150 +254,11 @@ inline bool any_mod_part(const std::vector<std::string>& mods, Pred pred) {
 inline bool mods_have(const std::vector<std::string>& mods, const char* part) {
   return any_mod_part(mods, [&](const std::string& p) { return p == part; });
 }
-// A float operand type: F16x2, F32, F32x4, F64, BF16x2 ...
-inline bool mods_float_typed(const std::vector<std::string>& mods) {
-  return any_mod_part(mods, [](const std::string& p) { return p.rfind("F16", 0) == 0 || p.rfind("F32", 0) == 0 || p.rfind("F64", 0) == 0 || p.rfind("BF16", 0) == 0; });
-}
-// A field the decoder could not name prints as "(9)": an instruction that carries one is not known.
-inline bool mods_undecoded(const std::vector<std::string>& mods) {
-  for (const std::string& m : mods)
-    if (m[0] == '(' || m.find(".(") != std::string::npos) return true;
-  return false;
-}
-
-// The texture and surface instructions: they read the simulator's own tables (the handle in the instruction or a register is an index into
-// them), so a kernel that holds one cannot run on the card: class Never, in both modes. A kernel without one does
-// not read a texture object, whatever objects exist (until Round sp66 one live texture object kept every launch of the device off the card).
-inline bool texture_mnemonic(const std::string& m) {
-  static const char* const kTex[] = {"TEX", "TEXS", "TLD", "TLDS", "TLD4", "TLD4S", "TXD", "TXQ", "TMML", "SULD", "SUST", "SUATOM", "SURED", "SUQUERY"};
-  for (const char* t : kTex)
-    if (m == t) return true;
-  return false;
-}
-
-// sm_90 and later instructions turbo does not admit as `unlisted`: they touch state the simulator keeps in its own format or has no card evidence for.
-// The tensor-memory-access forms read a 128-byte tensor map, and the shim's CUtensorMap is the simulator's own layout ("GPUTMAP1", vgpu/exec/tensormap.hpp),
-// not the hardware descriptor; the warpgroup, cluster, distributed-shared-memory, register-reconfiguration, tensor-memory and work-stealing forms (and JMP, which
-// can leave the section the scan read) have not been run on a card by this mode. They are class Never until a card run shows one safe.
-inline bool unmeasured_private_mnemonic(const std::string& m) {
-  static const char* const k[] = {"UTMALDG", "UTMASTG", "UTMAREDG", "UTMAPF", "UTMACMDFLUSH", "UBLKRED", "UBLKCP", "UCGABAR", "HGMMA", "IGMMA", "BGMMA", "QGMMA", "WARPGROUP",
-                                  "SYNCS", "ELECT", "USETMAXREG", "LDGMC", "ENDCOLLECTIVE", "STSM", "STAS", "REDAS", "ARRIVES", "UGETNEXTWORKID", "RPCMOV", "LDTM", "STTM",
-                                  "UTCSHIFT", "UTCMMA", "UTCBAR", "UTCCP", "UTCATOMSWS", "JMP"};
-  for (const char* t : k)
-    if (m == t) return true;
-  return false;
-}
-
-// Whether the scan must follow a CALL instruction's target: whatever class its mnemonic and modifiers made of it, an instruction that is a CALL runs code (an
-// undecodable modifier makes it Unlisted, which must not skip the scan).
-inline bool call_needs_scan(bool is_call_op, InsnClass c) { return is_call_op && (c == InsnClass::Call || c == InsnClass::Unlisted); }
-
-// BPT.TRAP, the instruction `__trap()`, the failure branch of `assert` and a cooperative-groups failure compile to. [measured, A10G, 2026-11-17,
-// docs/perf-design/12-host-gpu-turbo.md section 20: on the card it ends the kernel with error 719 (assert: 710 from the __assertfail before it), and the
-// context is dead after it, as the simulator's Err::Trap and Err::DeviceAssert are.] Only the TRAP form: the debugger forms (DRAIN, CAL, PAUSE, INT) and any
-// BPT the decoder could not name stay class Never.
-inline bool bpt_is_trap(const std::string& mnemonic, const std::vector<std::string>& mods) { return mnemonic == "BPT" && mods.size() == 1 && mods[0] == "TRAP"; }
-
-inline InsnClass turbo_class(const std::string& mnemonic, const std::vector<std::string>& mods, bool trap_ok = false) {
-  using C = InsnClass;
-  const auto is_one_of = [&](std::initializer_list<const char*> names) {
-    for (const char* n : names)
-      if (mnemonic == n) return true;
-    return false;
-  };
-  if (trap_ok && bpt_is_trap(mnemonic, mods)) return C::Unlisted;   // (admitted by turbo mode as the unlisted class: the card ends the kernel as the simulator would)
-  if (texture_mnemonic(mnemonic) || mnemonic == "BPT" || unmeasured_private_mnemonic(mnemonic)) return C::Never;
-  if (mnemonic.empty() || mods_undecoded(mods)) return C::Unlisted;
-  // Reductions and atomics first, by what they do.
-  if (is_one_of({"RED", "REDG"})) {
-    if (mods_have(mods, "CAS") || mods_have(mods, "CAST") || mods_have(mods, "SPIN") || mods_have(mods, "EXCH")) return C::AtomSwap;
-    if (mods_float_typed(mods)) return C::FloatRed;
-    if (mods_have(mods, "INC") || mods_have(mods, "DEC") || mods_have(mods, "POPC")) return C::AtomInt;
-    return mnemonic == "RED" ? C::Exact : C::Extra;   // (REDG is sm_90's spelling: the exact set never named it)
-  }
-  if (is_one_of({"ATOM", "ATOMG", "ATOMS"})) {
-    if (mods_have(mods, "ARRIVE")) return C::Unlisted;   // sm_80's mbarrier.arrive
-    if (mods_have(mods, "CAS") || mods_have(mods, "CAST") || mods_have(mods, "SPIN") || mods_have(mods, "EXCH")) return C::AtomSwap;
-    return mods_float_typed(mods) ? C::AtomFloat : C::AtomInt;
-  }
-  if (exact_opcode_allowed(mnemonic, mods)) return C::Exact;
-  if (mnemonic == "MUFU") return C::Mufu;
-  if (is_one_of({"HADD2", "HMUL2", "HFMA2", "HSETP2", "HSET2", "HMNMX2"})) return C::Half;
-  // (LEPC: the return address of an absolute call, CUDA 13's vprintf call; the card's own program counter, used by the call and its RET alone. Round sp66.)
-  if (is_one_of({"CALL", "RET", "LEPC"})) return C::Call;
-  if (is_one_of({"HMMA", "IMMA", "DMMA", "BMMA"})) return C::Tensor;
-  // (Round sp66: B2R reads the result of a block's BAR.RED, the same function on both sides; NANOSLEEP is a hint that a spin-wait backs off, as cub's
-  // decoupled look-back does: neither touches anything the card lacks)
-  if (is_one_of({"IDP", "VABSDIFF", "VABSDIFF4", "VIADDMNMX", "VIMNMX3", "FMNMX3", "F2IP", "FSWZADD", "REDUX", "LDGSTS", "LDGDEPBAR", "LDSM", "MOVM", "FFMA2",
-                 "FMUL2", "FADD2", "B2R", "NANOSLEEP"}))
-    return C::Extra;
-  return C::Unlisted;
-}
-
-// A call stays inside the kernel when it is relative, to a label, and the label is an address of the kernel's own code section [lo, hi]. A call through a
-// register or to an absolute address (another section, a function pointer) leaves the code this scan has seen.
-inline bool call_stays_inside(bool relative, bool to_label, int64_t target, uint64_t lo, uint64_t hi) {
-  return relative && to_label && target >= 0 && static_cast<uint64_t>(target) >= lo && static_cast<uint64_t>(target) <= hi;
-}
-
-// ---- a call through a register whose target the scan can bound (section 20) ----------------------------------------------------------------
-// nvcc 13 calls `__assertfail` (and vprintf in some builds) as `MOV Rx, 0x0 ; LDC.64 Rt, c[0x4][Rx+off] ; ... ; CALL.ABS.NOINC Rt`: bank 4 is a table of 8-byte
-// slots the module's relocations fill (`.rel.nv.constant4`: slot 0 `__assertfail`, the others the assert's string variables) [measured: cuobjdump and readelf of
-// HeCBench assert-cuda, sm_86, 2026-11-17]. A call through a register is otherwise a function pointer from memory, which the scan cannot follow. It is followed here
-// only when the target register is, in straight-line code, the 64-bit load from bank 4 of a slot whose index is a MOV immediate (or RZ), and nothing between the load and
-// the call writes it, jumps, or is a place another path can enter: then the target is the symbol the relocation names at that slot, which the caller checks against the
-// externals turbo admits. Anything else (a load whose index comes from elsewhere, a guarded load, a join point) is not bounded. `RcInsn` is the part of a decoded
-// instruction this needs, so that the function is pure.
-struct RcInsn {
-  enum Kind : uint8_t { Other, MovImm, LdcBank, CallReg, Control };   // Control: a branch, call, return, exit or convergence instruction
-  Kind kind = Other;
-  uint32_t dst_reg = 0, dst_n = 0;   // the registers it writes: dst_reg .. dst_reg + dst_n - 1 (dst_n 0: none)
-  uint32_t reg = 0;                  // MovImm: the register written; LdcBank: the index register (255, RZ, for none); CallReg: the target register
-  int64_t imm = 0;                   // MovImm: the value; LdcBank: the offset added to the index
-  uint32_t bank = 0;                 // LdcBank
-  bool guarded = false;              // it runs only under a predicate
-  bool wide = false;                 // LdcBank: a 64-bit load
-  bool entry = false;                // another path can arrive at this instruction (a branch or convergence target)
-};
-inline constexpr uint32_t kRcRZ = 255;
-inline bool rc_writes(const RcInsn& x, uint32_t r) { return x.dst_n && r >= x.dst_reg && r < x.dst_reg + x.dst_n; }
-// The slot (byte offset in bank 4) the call at v[call] takes its target from, or -1.
-inline int64_t register_call_slot(const std::vector<RcInsn>& v, size_t call) {
-  if (call >= v.size() || v[call].kind != RcInsn::CallReg || v[call].reg == kRcRZ || v[call].entry) return -1;
-  const uint32_t t = v[call].reg;
-  size_t ldc = call;
-  for (size_t j = call; j-- > 0;) {   // the last write of the target's two registers
-    const RcInsn& x = v[j];
-    if (x.kind == RcInsn::Control) return -1;
-    if (rc_writes(x, t) || rc_writes(x, t + 1)) {
-      if (x.kind != RcInsn::LdcBank || x.guarded || !x.wide || x.bank != 4 || x.dst_reg != t || x.dst_n != 2) return -1;
-      ldc = j;
-      break;
-    }
-    if (x.entry) return -1;   // a join point between the load and the call
-  }
-  if (ldc == call) return -1;
-  const RcInsn& l = v[ldc];
-  if (l.reg == kRcRZ) return l.imm >= 0 ? l.imm : -1;
-  for (size_t j = ldc; j-- > 0;) {   // the last write of the index register
-    const RcInsn& x = v[j];
-    if (x.kind == RcInsn::Control) return -1;
-    if (v[j + 1].entry && j + 1 <= ldc) return -1;   // (a place to enter between the index and the load)
-    if (rc_writes(x, l.reg)) {
-      if (x.kind != RcInsn::MovImm || x.guarded || x.reg != l.reg || x.dst_n != 1) return -1;
-      const int64_t slot = x.imm + l.imm;
-      return slot >= 0 ? slot : -1;
-    }
-  }
-  return -1;
-}
 
 // ---- what a kernel reaches besides its code (Round sp66) ----------------------------------------------------------------------------
 // A function the module calls but does not define (Cubin::externs): the driver links it when it loads the module on the card, the simulator runs a
-// builtin in its place. What each kind needs on the card, and so whether a kernel that reaches one can go there:
-//   * vprintf: the card writes the arguments to its printf buffer and the driver prints them when the host synchronises with the kernel, which the
-//     card path does at once (cuCtxSynchronize), after flushing the process's stdout; the text is the card's formatting of the card's values. Turbo
-//     mode admits it (VGPU_HOST_GPU_TURBO_OFF=printf keeps it out); exact mode does not (its promise is about memory, not about a second printer);
+// builtin in its place. A kernel that reaches one of these stays in the simulator; the kind is for the reason given:
+//   * vprintf: the card would write to its own printf buffer and the driver print it, a second printer that is not the simulator's;
 //   * __assertfail: a failed assert on the card ends the kernel with a sticky error, the context is lost, and data only the card holds with it;
 //   * malloc and free: the card's heap is the card's own, outside the simulator's window: a pointer from it, kept in memory, means nothing to the
 //     simulator, and the simulator's heap is not on the card;
@@ -431,78 +276,11 @@ inline const char* extern_kind_name(ExternKind k) {
   static const char* const n[] = {"vprintf", "__assertfail", "malloc/free", "device-side launch", "an unknown external function"};
   return n[static_cast<unsigned>(k)];
 }
-// __assertfail (section 20): admitted in turbo mode, because a failed assert ends the kernel on the card as it does in the simulator (error 710, the card's own
-// assertion text on stderr, a context that is dead after it). VGPU_HOST_GPU_TURBO_OFF=assert keeps such kernels in the simulator.
-inline bool extern_admitted(ExternKind k, Mode mode, bool printf_off, bool assert_off = true) {
-  return mode == Mode::Turbo && ((k == ExternKind::Printf && !printf_off) || (k == ExternKind::Assert && !assert_off));
-}
 
-// An absolute call to the first instruction of a code section of the module (Round sp66): a device function the compiler kept out of line, in a
-// section of its own (a -rdc build). The driver links the call to its own copy of the same code, so the call is followed: the callee's section is
-// classed with the kernel's. `base`, `count`: the section the target lies in (its first address, its instructions; 0 is no code).
-inline bool call_to_entry(bool relative, bool to_label, int64_t target, uint64_t base, uint64_t count) {
-  return !relative && to_label && target >= 0 && count > 0 && static_cast<uint64_t>(target) == base;
-}
-
-// The classes a kernel holds, as bits, and what the mode's switches make of them.
-using ClassMask = uint32_t;
-inline constexpr ClassMask class_bit(InsnClass c) { return ClassMask{1} << static_cast<unsigned>(c); }
-
-struct TurboSwitches {
-  // Float atomics with a returned value, CAS, CAST.SPIN and EXCH: admitted unless VGPU_HOST_GPU_ATOMICS=0 (Round sp66; an opt-in before, see
-  // docs/perf-design/12-host-gpu-turbo.md section 2 for why the default changed).
-  bool atomics = true;
-  ClassMask off = 0;        // VGPU_HOST_GPU_TURBO_OFF: classes switched off for an experiment
-  bool printf_off = false;  // VGPU_HOST_GPU_TURBO_OFF=printf: a kernel that calls vprintf stays in the simulator (Round sp66)
-  bool ptx_vars_unreferenced = true;   // a PTX module's variables that no instruction names are admitted (VGPU_HOST_GPU_PTX_VARIABLES=all: refuse any variable; section 20)
-  bool assert_off = false;  // VGPU_HOST_GPU_TURBO_OFF=assert: a kernel that can assert or trap stays in the simulator (section 20)
-};
-
-// VGPU_HOST_GPU_TURBO_OFF=mufu,tensor,half,call,atomics,red,extra,unlisted,printf (a comma list). False, with the bad name in *bad, for anything else.
-// `printf` is not a class of instructions (a kernel's call to vprintf is, once admitted, of the call class): it sets *printf_off, and is a bad
-// name when printf_off is null.
-inline bool parse_turbo_off(const char* text, ClassMask* off, std::string* bad = nullptr, bool* printf_off = nullptr, bool* assert_off = nullptr) {
-  *off = 0;
-  if (printf_off) *printf_off = false;
-  if (assert_off) *assert_off = false;
-  if (!text) return true;
-  const std::string t(text);
-  for (size_t at = 0; at <= t.size();) {
-    const size_t comma = std::min(t.find(',', at), t.size());
-    const std::string name = t.substr(at, comma - at);
-    at = comma + 1;
-    if (name.empty()) continue;
-    if (name == "mufu") *off |= class_bit(InsnClass::Mufu);
-    else if (name == "tensor") *off |= class_bit(InsnClass::Tensor);
-    else if (name == "half") *off |= class_bit(InsnClass::Half);
-    else if (name == "call") *off |= class_bit(InsnClass::Call);
-    else if (name == "atomics") *off |= class_bit(InsnClass::AtomInt) | class_bit(InsnClass::AtomFloat) | class_bit(InsnClass::AtomSwap);
-    else if (name == "red") *off |= class_bit(InsnClass::FloatRed);
-    else if (name == "extra") *off |= class_bit(InsnClass::Extra);
-    else if (name == "unlisted") *off |= class_bit(InsnClass::Unlisted);
-    else if (name == "printf" && printf_off) *printf_off = true;
-    else if (name == "assert" && assert_off) *assert_off = true;   // (`assert` also keeps out BPT.TRAP and the bounded call through a register: section 20)
-    else {
-      if (bad) *bad = name;
-      return false;
-    }
-  }
-  return true;
-}
-
-// Why turbo mode keeps a kernel in the simulator, by the classes of its code. The first that applies, in this order.
-enum class TurboRefusal : uint8_t {
-  None,      // admitted
-  Never,     // an instruction the card cannot run for the simulator (class Never: textures, surfaces, BPT, a call the scan cannot follow)
-  Off,       // a class switched off with VGPU_HOST_GPU_TURBO_OFF
-  Atomics,   // a float atomic with a returned value, a CAS or an EXCH, with VGPU_HOST_GPU_ATOMICS=0
-};
-inline TurboRefusal turbo_refusal(ClassMask classes, const TurboSwitches& sw) {
-  if (classes & class_bit(InsnClass::Never)) return TurboRefusal::Never;
-  if (classes & sw.off) return TurboRefusal::Off;
-  if (!sw.atomics && (classes & (class_bit(InsnClass::AtomFloat) | class_bit(InsnClass::AtomSwap)))) return TurboRefusal::Atomics;
-  return TurboRefusal::None;
-}
+// The room the mode leaves on the card when it backs the simulator's window (src/runtime/host_gpu.cpp ensure_mapped): the window must fit in the free
+// memory with this much to spare for the driver's own allocations (the context, the module images).
+inline constexpr uint64_t kWindowReserve = 256ull << 20;
+inline bool window_fits(uint64_t bytes, uint64_t free_bytes) { return bytes + kWindowReserve <= free_bytes; }
 
 // ---- residency (the design for a card copy that outlives a launch) ---------------------------------------------------------
 
@@ -736,17 +514,17 @@ inline bool should_offload(const Estimate& e, const Costs& c) {
 // sends must also save a share of the start by itself (start_share_saved, Costs::start_launches): 5 ms with the defaults, the start repaid within
 // 50 launches like it. The launches that bought the start in the programs where it paid were longer: logged on server3 (integration of sp64-sp68),
 // whose simulator ran these programs about 4 times as fast as the A10G rig's, 18 to 28 ms in PolyBench FDTD-2D, LU and GRAMSCHM, 19 ms (static) in
-// 3MM, 5.4 ms in Rodinia gaussian (about 20 ms on the rig) and 1.9 ms in HeCBench asyncAllocation's turbo run (about 8 ms on the rig: 800 launches
-// in 6.6 s; 6.6x faster in turbo mode, Round sp66). The constant is fitted to that corpus on the rig: the closest are dct8x8 below it (1.3x) and
+// 3MM, 5.4 ms in Rodinia gaussian (about 20 ms on the rig) and 1.9 ms in HeCBench asyncAllocation's run in the relaxed mode that has since been removed (about 8 ms on the rig: 800 launches
+// in 6.6 s; 6.6x faster there, Round sp66). The constant is fitted to that corpus on the rig: the closest are dct8x8 below it (1.3x) and
 // asyncAllocation above it (1.6x), and a host whose simulator is much faster than the rig's sees shorter launches and buys fewer starts.
 // A first launch sent by its static estimate (first_launch_offload) must save start_cost_s / start_launches_static, 12.5 ms: the estimate does not
-// depend on the host, and on server3 it was 8.5 ms for the dct8x8 kernel whose first launch would otherwise buy the start in turbo mode, against 15.5 ms
-// in HeCBench atomicPerf (1.43x in turbo mode on the rig, Round sp66) and 19 ms in 3MM (1.25x).
+// depend on the host, and on server3 it was 8.5 ms for the dct8x8 kernel whose first launch would otherwise buy the start, against 15.5 ms
+// in HeCBench atomicPerf (1.43x in that mode on the rig, Round sp66) and 19 ms in 3MM (1.25x).
 // Launches that repay the start alone (the sampled ones of SYRK, SYR2K, 2MM, COVAR, CORR and black-scholes among them) are not affected, and
 // neither is any launch once the driver is up.
 //
 // The share alone kept the start from a program of many short launches that would repay it many times over (Round sp69): Rodinia hotspot, 1,000
-// launches of one kernel of about 1 ms each on the A10G rig, each saving 0.9 ms, was 2.27x faster in turbo mode under the account alone (Round sp66)
+// launches of one kernel of about 1 ms each on the A10G rig, each saving 0.9 ms, was 2.27x faster in that mode under the account alone (Round sp66)
 // and 1.00x under the share (998 launches "too small", the driver never started). What tells it from the four is how often its kernel has already
 // been launched: threadFenceReduction launches its kernel 101 times and dct8x8 has 118 launches in all, and they end before the start is repaid. So
 // the number of launches the start must be repaid within (start_share_launches) is start_launches, or, for a kernel the simulator has already run
@@ -982,7 +760,7 @@ inline bool first_launch_offload(const FirstLaunch& f, const Costs& c, bool driv
   return should_offload_with_start(e, fc, driver_started, eligible_sim_spent_s);
 }
 
-// ---- the first blocks of a launch, timed (docs/perf-design/12-host-gpu-turbo.md "The first blocks of a launch, timed"; Round sp60b) ----------
+// ---- the first blocks of a launch, timed (docs/perf-design/12-host-gpu-size-rules.md "The first blocks of a launch, timed"; Round sp60b) ----------
 // The static estimate of first_launch_offload counts every instruction of the code once a warp, so it is low by the trip count of the kernel's loops,
 // and the history rule needs launches that some programs never make again (one launch a kernel). Nothing static says how long a thread runs; the
 // launch itself does. So a launch the rules above leave to the simulator for want of an estimate is SAMPLED before the simulator runs it: the process
@@ -1093,7 +871,7 @@ inline bool sample_offload(const Sample& s, uint64_t push_bytes, uint64_t live_b
   return sampled_offload(sampled_launch_seconds(s).value_or(0), push_bytes, live_bytes, c, driver_started, card_kernel_s);
 }
 
-// ---- bounded blocks (docs/perf-design/12-host-gpu-turbo.md section 12; Round sp75) ----------------------------------------------------
+// ---- bounded blocks (docs/perf-design/12-host-gpu-size-rules.md section 12; Round sp75) ----------------------------------------------------
 // The copy ran each sampled block to its end, and the process waited sample_timeout_seconds for it: a launch whose blocks each take longer
 // than the wait gave no answer and stayed in the simulator, which is the launch that most needs the card (HeCBench aidw: 400 blocks of 0.6 s
 // each on server3, two launches of 78 s kept, 365 s of the program's time on the A10G rig). A block that has not ended after t seconds takes
@@ -1136,7 +914,7 @@ inline double sample_need_seconds(uint64_t push_bytes, uint64_t live_bytes, cons
   return std::max(c.margin * fixed / (1 - share), c.min_sim_s);
 }
 
-// ---- progress inside a block (docs/perf-design/12-host-gpu-turbo.md section 8, "Progress inside a block"; Round sp61) ---------------------
+// ---- progress inside a block (docs/perf-design/12-host-gpu-size-rules.md section 8, "Progress inside a block"; Round sp61) ---------------------
 // A grid of fewer than kSampleMinBlocks blocks gives no sample above: its blocks are few and each may run for seconds (PolyBench COVAR's
 // covar_kernel: 8 blocks of 256 threads, every thread looping over the matrix). Such a launch is sampled INSIDE its blocks: the copy runs each
 // block it takes until its warps stand in the kernel's top-level loop and reads, per lane, how far the loop's induction register is from the
@@ -1457,7 +1235,7 @@ inline const char* no_sample_text(NoSample r) {
 }
 inline bool worth_sampling(const SampleCandidate& w, const Costs& c, double card_path_s) { return sample_refusal(w, c, card_path_s) == NoSample::None; }
 
-// ---- a sample once the driver is up (docs/perf-design/12-host-gpu-turbo.md section 13; Round sp76) ------------------------------------
+// ---- a sample once the driver is up (docs/perf-design/12-host-gpu-size-rules.md section 13; Round sp76) ------------------------------------
 // From Round sp60b to Round sp75 no launch was sampled once the driver's start had begun: the sample is taken in a forked copy of the process,
 // and a copy that held the real driver's context was a thing nobody had tried. So a kernel first launched after the start had the static
 // first-launch rule and its history, and no measure: HeCBench aidw's second kernel (400 blocks of over a second each) was simulated once,

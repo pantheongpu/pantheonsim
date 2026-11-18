@@ -274,7 +274,7 @@ rational arithmetic), and the paper's point, that the three orders give three an
 
 With `-use_fast_math` nvcc compiles `sinf`, `cosf`, `tanhf`, `sqrtf`, `logf` and `1/x` to the `MUFU` instruction with
 little or nothing around it. This is where the card and the simulator are known to differ most, from our own earlier
-measurement on an A10G ([docs/perf-design/12-host-gpu-turbo.md](../perf-design/12-host-gpu-turbo.md), section 5):
+measurement on an A10G ([Round sp59](../perf-design/rounds/11-rounds-sp36-sp41.md#round-sp59-turbo-host-gpu-mode-on-an-a10g)):
 `MUFU.RCP` is 1 ulp off on about 13 % of mantissas, the card's `MUFU.SIN/COS` are fixed-point with about 3.6e-7 absolute
 error, and `tanh` differs on 5.6 % of float patterns. `mathfn_fast` puts every function of the set on that footing in one
 run.

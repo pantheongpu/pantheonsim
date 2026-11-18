@@ -2,9 +2,7 @@
 // worth a card, `small` the same kernel on a few warps, `mufu` a kernel outside the set (expf); `div`, `rcp`, `divexp` an IEEE division, a bare rcp.approx and a division with an expf (the division idiom: in the set
 // only with VGPU_HOST_GPU_DIV=1, and only when it is the sole thing outside it). It prints the results on stdout, which must not depend on the
 // host-GPU mode, and on stderr how long the first launch took in milliseconds ("first_launch_ms=").
-// For turbo mode (VGPU_HOST_GPU=turbo, docs/perf-design/12-host-gpu-turbo.md): `iatom` an integer atomicAdd whose old value is used (admitted),
-// `fatom` a float atomicAdd whose old value is used and `cas` a compare-and-swap (both only with VGPU_HOST_GPU_ATOMICS=1). Each thread's result
-// does not depend on the order the threads run in, so these print the same lines wherever they run. `hist` is an integer reduction onto 64 words (the
+// `hist` is an integer reduction onto 64 words (the
 // exact set), for the verify run of step 16: its sums are the same in any order, unless an update is lost. `none` is `acct` with no launch at all: what a
 // card that computes nothing leaves (step 18: a sampled launch sent to such a card must print exactly this).
 // `few` is `big` on 8 blocks with a long loop in every thread (Round sp61: a grid too small to sample by whole blocks, sampled inside its blocks),
@@ -116,28 +114,6 @@ __global__ void rsqrtk(float* d, int n) {   // a bare rsqrtf: MUFU.RSQ with noth
 __global__ void sqrtdivk(float* d, int n) {   // the square root idiom and the division idiom in one kernel
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) d[i] = sqrtf(fabsf(d[i]) + float(i)) / (float(i % 977) + 1.25f);
-}
-
-__global__ void iatomk(unsigned* d, int n) {   // an integer atomic with a returned value: ATOMG.ADD
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-  unsigned acc = 0;
-  for (unsigned r = 0; r < 16; ++r) acc += atomicAdd(&d[i], r + 1);   // its own element: the old values are the same in any order
-  d[i] += acc;
-}
-__global__ void fatomk(float* d, int n) {   // a float atomic with a returned value (ATOMG.ADD.F32 or a compare-and-swap loop, by toolkit and architecture)
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-  float acc = 0;
-  for (int r = 0; r < 16; ++r) acc += atomicAdd(&d[i], 1.0f);   // small integers: exact in any order
-  d[i] += acc;
-}
-__global__ void cask(unsigned* d, int n) {   // compare-and-swap: ATOMG.CAS
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-  unsigned acc = 0;
-  for (unsigned r = 0; r < 16; ++r) acc += atomicCAS(&d[i], d[i], d[i] + r);
-  d[i] ^= acc;
 }
 
 __global__ void histk(unsigned* d, int n) {   // an integer reduction onto 64 words that every block hits: the simulator's host threads contend for them
@@ -280,7 +256,6 @@ int main(int argc, char** argv) {
   const bool div = !std::strcmp(mode, "div"), rcp = !std::strcmp(mode, "rcp"), divexp_mode = !std::strcmp(mode, "divexp");
   const bool hist = !std::strcmp(mode, "hist");
   const bool sqrt_mode = !std::strcmp(mode, "sqrt"), rsqrt_mode = !std::strcmp(mode, "rsqrt"), sqrtdiv_mode = !std::strcmp(mode, "sqrtdiv");
-  const bool iatom = !std::strcmp(mode, "iatom"), fatom = !std::strcmp(mode, "fatom"), cas = !std::strcmp(mode, "cas");
   const bool fewnone = !std::strcmp(mode, "fewnone");
   const bool none = !std::strcmp(mode, "none") || fewnone;
   const bool few = !std::strcmp(mode, "few") || !std::strcmp(mode, "fewshort") || fewnone;
@@ -311,9 +286,6 @@ int main(int argc, char** argv) {
     else if (rsqrt_mode) rsqrtk<<<(n + 255) / 256, 256>>>(static_cast<float*>(d), n);
     else if (sqrtdiv_mode) sqrtdivk<<<(n + 255) / 256, 256>>>(static_cast<float*>(d), n);
     else if (hist) histk<<<(n + 255) / 256, 256>>>(static_cast<unsigned*>(d), n);
-    else if (iatom) iatomk<<<(n + 255) / 256, 256>>>(static_cast<unsigned*>(d), n);
-    else if (fatom) fatomk<<<(n + 255) / 256, 256>>>(static_cast<float*>(d), n);
-    else if (cas) cask<<<(n + 255) / 256, 256>>>(static_cast<unsigned*>(d), n);
     else if (few) scramble1<<<(n + 255) / 256, 256>>>(static_cast<uint32_t*>(d), n, rounds);
     else scramble<<<(n + 255) / 256, 256>>>(static_cast<uint32_t*>(d), n, rounds);
     cudaDeviceSynchronize();

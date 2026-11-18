@@ -1,5 +1,5 @@
 // Progress inside a block: how much of a block's work is left, read from the induction register of the loop its warps are in (Round sp61;
-// docs/perf-design/12-host-gpu-turbo.md section 8, "Progress inside a block").
+// docs/perf-design/12-host-gpu-size-rules.md section 8, "Progress inside a block").
 //
 // The host-GPU mode's sample (vgpu/host_gpu.hpp, "The first blocks of a launch, timed") times whole blocks in a forked copy of the process.
 // A grid of a few blocks whose threads loop for seconds (PolyBench COVAR and CORR: 8 blocks of 256 threads, each thread looping over the whole

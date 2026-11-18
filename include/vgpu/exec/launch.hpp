@@ -61,7 +61,7 @@ struct DeviceGraphLauncher {
 
 struct LaunchEnv;   // vgpu/exec/launch_env.hpp
 
-// A few blocks of a launch, run alone and timed (docs/perf-design/12-host-gpu-turbo.md, "The first blocks of a launch, timed"). The run is not
+// A few blocks of a launch, run alone and timed (docs/perf-design/12-host-gpu-size-rules.md, "The first blocks of a launch, timed"). The run is not
 // a launch: the other blocks are never run. It is made in a copy of the process that is thrown away (the host-GPU mode's sample), and only
 // the SASS engine's plain block loop makes it: a cooperative or clustered launch, and one whose blocks take turns (lockstep), runs no block at all.
 // True in the forked copy of the process that runs a LaunchPart, and only there (set after the fork, before anything runs). A copy is thrown
@@ -74,7 +74,7 @@ struct LaunchPart {
   uint64_t limit = 0;               // how many blocks are run at most
   uint64_t stride = 1;              // the blocks run are 0, stride, 2 x stride, ...: spread over the grid, whose blocks need not be alike
   double budget_s = 0;              // above 0: no further block is taken once the timed runs have lasted this long, or the whole run five times it
-  // Bounded blocks (Round sp75; docs/perf-design/12-host-gpu-turbo.md section 12): above 0, a run of a block is stopped once it has lasted
+  // Bounded blocks (Round sp75; docs/perf-design/12-host-gpu-size-rules.md section 12): above 0, a run of a block is stopped once it has lasted
   // part_block_limit() seconds, and the sample ends there. A block stopped in its first run is run again from its start for as many rounds as
   // the first run made, and that second run is the timed one, as for a whole block: `timed_s` then holds the time of a part of the block,
   // which is less than the block takes, `next` counts the block, and `unfinished` is set. With `need_s` above 0 the limit is what one block

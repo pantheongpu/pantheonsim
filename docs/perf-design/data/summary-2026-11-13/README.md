@@ -1,7 +1,7 @@
 # Host-GPU modes against the plain simulator: one summary run (2026-11-13)
 
 One pass of the whole benchmark corpus in four forms on a real A10G, for a single table of what the host-GPU modes
-([../../12-host-gpu-turbo.md](../../12-host-gpu-turbo.md)) gain over the plain simulator. The tables are in [summary.md](summary.md); the
+([../../12-host-gpu-size-rules.md](../../12-host-gpu-size-rules.md)) gain over the plain simulator. The tables are in [summary.md](summary.md); the
 harness records, compacted, in `bench.json`; `summary.py` makes both from the harness JSON of the passes.
 
 ## Code
