@@ -4661,6 +4661,10 @@ set_tests_properties(lint_thp_always PROPERTIES TIMEOUT 60)
 add_test(NAME lint_pr_guard COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_pr_guard.sh)
 set_tests_properties(lint_pr_guard PROPERTIES TIMEOUT 120)
 
+# ci/cancel-stale-runs.sh (the runs of merged, closed and superseded pull requests) against a fake gh.
+add_test(NAME lint_cancel_stale_runs COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_cancel_stale_runs.sh)
+set_tests_properties(lint_cancel_stale_runs PROPERTIES TIMEOUT 60)
+
 # ci/external/hip-tests.sh's per-case limits against a fake Catch2 suite: a case of a slow suite
 # (HT_SLOW_SUITES) that does not finish is SLOW, not a failure; other suites still fail on a timeout.
 add_test(NAME lint_hip_tests_runner COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_hip_tests_runner.sh)
