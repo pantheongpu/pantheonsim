@@ -1,0 +1,166 @@
+ok   fprev sm_86 rtx3060 sass
+ok   fprev sm_80 a100 sass (the RTX 3060's lines)
+ok   fprev sm_90 h100 sass
+ok   fprev sm_100 b200 (default: the Hopper rule, inferred from a B200's recorded vectors) sass (the h100's lines)
+ok   fprev sm_120 rtx-pro-6000-server (default: the Hopper rule, measured on the card) sass (the h100's lines)
+ok   fprev sm_86 rtx3060 ptx
+ok   fprev sm_80 a100 ptx (the RTX 3060's lines)
+ok   fprev sm_90 h100 ptx
+ok   fprev sm_100 b200 (default: the Hopper rule, inferred from a B200's recorded vectors) ptx (the h100's lines)
+ok   fprev sm_120 rtx-pro-6000-server (default: the Hopper rule, measured on the card) ptx (the h100's lines)
+ok   tc_features sm_86 rtx3060 sass
+ok   tc_features sm_80 a100 sass (the RTX 3060's lines)
+ok   tc_features sm_90 h100 sass
+ok   tc_features sm_100 b200 (default: the Hopper rule, inferred from a B200's recorded vectors) sass (the h100's lines)
+ok   tc_features sm_120 rtx-pro-6000-server (default: the Hopper rule, measured on the card) sass (the h100's lines)
+ok   tc_features sm_86 rtx3060 ptx
+ok   tc_features sm_80 a100 ptx (the RTX 3060's lines)
+ok   tc_features sm_90 h100 ptx
+ok   tc_features sm_100 b200 (default: the Hopper rule, inferred from a B200's recorded vectors) ptx (the h100's lines)
+ok   tc_features sm_120 rtx-pro-6000-server (default: the Hopper rule, measured on the card) ptx (the h100's lines)
+ok   fprev VGPU_TC_EXACT=0 differs from the card's lines
+ok   fprev b200 with VGPU_TC_EXACT=0 is not the Hopper rule
+ok   tc_features VGPU_TC_EXACT=0 differs from the card's lines
+ok   tc_features b200 with VGPU_TC_EXACT=0 is not the Hopper rule
+ok   fprev non-wmma kernels with VGPU_TC_EXACT=0
+ok   A100.bf16.fp32 on rtx3060 sass: 0 mismatches
+ok   A100.bf16.fp32 on a100 sass: 0 mismatches
+ok   A100.fp16.fp16 on rtx3060 sass: 0 mismatches
+ok   A100.fp16.fp16 on a100 sass: 0 mismatches
+ok   A100.fp16.fp32 on rtx3060 sass: 0 mismatches
+ok   A100.fp16.fp32 on a100 sass: 0 mismatches
+ok   A100.tf32.fp32 on rtx3060 sass: 0 mismatches
+ok   A100.tf32.fp32 on a100 sass: 0 mismatches
+ok   H100.bf16.fp32 on h100 sass: 0 mismatches
+ok   H100.bf16.fp32 on rtx3060 sass: 16 mismatches (the Ampere rule is not Hopper's)
+ok   H100.fp16.fp16 on h100 sass: 0 mismatches
+ok   H100.fp16.fp16 on rtx3060 sass: 16 mismatches (the Ampere rule is not Hopper's)
+ok   H100.fp16.fp32 on h100 sass: 0 mismatches
+ok   H100.fp16.fp32 on rtx3060 sass: 16 mismatches (the Ampere rule is not Hopper's)
+ok   H100.tf32.fp32 on h100 sass: 0 mismatches
+ok   H100.tf32.fp32 on rtx3060 sass: 16 mismatches (the Ampere rule is not Hopper's)
+ok   A100.fp16.fp32 on h100 sass: 3 mismatches (the Hopper rule is not Ampere's)
+ok   A100.bf16.fp32 on h100 sass: 4 mismatches (the Hopper rule is not Ampere's)
+ok   B200.bf16.fp32 on b200 (default, the Hopper rule) sass: 0 mismatches
+ok   B200.bf16.fp32 on b200 (VGPU_TC_EXACT=0) sass: 20 mismatches (sequential sum, not the B200's)
+ok   B200.fp16.fp16 on b200 (default, the Hopper rule) sass: 0 mismatches
+ok   B200.fp16.fp32 on b200 (default, the Hopper rule) sass: 0 mismatches
+ok   B200.fp16.fp32 on b200 (VGPU_TC_EXACT=0) sass: 16 mismatches (sequential sum, not the B200's)
+ok   B200.tf32.fp32 on b200 (default, the Hopper rule) sass: 0 mismatches
+ok   B200.tf32.fp32 on b200 (VGPU_TC_EXACT=0) sass: 17 mismatches (sequential sum, not the B200's)
+ok   A100.bf16.fp32 on rtx3060 ptx: 0 mismatches
+ok   A100.bf16.fp32 on a100 ptx: 0 mismatches
+ok   A100.fp16.fp16 on rtx3060 ptx: 0 mismatches
+ok   A100.fp16.fp16 on a100 ptx: 0 mismatches
+ok   A100.fp16.fp32 on rtx3060 ptx: 0 mismatches
+ok   A100.fp16.fp32 on a100 ptx: 0 mismatches
+ok   A100.tf32.fp32 on rtx3060 ptx: 0 mismatches
+ok   A100.tf32.fp32 on a100 ptx: 0 mismatches
+ok   H100.bf16.fp32 on h100 ptx: 0 mismatches
+ok   H100.bf16.fp32 on rtx3060 ptx: 16 mismatches (the Ampere rule is not Hopper's)
+ok   H100.fp16.fp16 on h100 ptx: 0 mismatches
+ok   H100.fp16.fp16 on rtx3060 ptx: 16 mismatches (the Ampere rule is not Hopper's)
+ok   H100.fp16.fp32 on h100 ptx: 0 mismatches
+ok   H100.fp16.fp32 on rtx3060 ptx: 16 mismatches (the Ampere rule is not Hopper's)
+ok   H100.tf32.fp32 on h100 ptx: 0 mismatches
+ok   H100.tf32.fp32 on rtx3060 ptx: 16 mismatches (the Ampere rule is not Hopper's)
+ok   A100.fp16.fp32 on h100 ptx: 3 mismatches (the Hopper rule is not Ampere's)
+ok   A100.bf16.fp32 on h100 ptx: 4 mismatches (the Hopper rule is not Ampere's)
+ok   B200.bf16.fp32 on b200 (default, the Hopper rule) ptx: 0 mismatches
+ok   B200.bf16.fp32 on b200 (VGPU_TC_EXACT=0) ptx: 20 mismatches (sequential sum, not the B200's)
+ok   B200.fp16.fp16 on b200 (default, the Hopper rule) ptx: 0 mismatches
+ok   B200.fp16.fp32 on b200 (default, the Hopper rule) ptx: 0 mismatches
+ok   B200.fp16.fp32 on b200 (VGPU_TC_EXACT=0) ptx: 16 mismatches (sequential sum, not the B200's)
+ok   B200.tf32.fp32 on b200 (default, the Hopper rule) ptx: 0 mismatches
+ok   B200.tf32.fp32 on b200 (VGPU_TC_EXACT=0) ptx: 17 mismatches (sequential sum, not the B200's)
+ok   fp8 Ada.e4m3.fp16 on l40s sass: 0 mismatches (Ada's own sum: chunks of 16, cut 13 bits down, result cut to 13 bits)
+ok   fp8 Ada.e4m3.fp16 on l40s sass (VGPU_TC_EXACT=0): 5 mismatches (the sequential sum is not the card's)
+ok   fp8 Ada.e4m3.fp32 on l40s sass: 0 mismatches (Ada's own sum: chunks of 16, cut 13 bits down, result cut to 13 bits)
+ok   fp8 Ada.e4m3.fp32 on l40s sass (VGPU_TC_EXACT=0): 24 mismatches (the sequential sum is not the card's)
+ok   fp8 Ada.e5m2.fp16 on l40s sass: 0 mismatches (Ada's own sum: chunks of 16, cut 13 bits down, result cut to 13 bits)
+ok   fp8 Ada.e5m2.fp16 on l40s sass (VGPU_TC_EXACT=0): 9 mismatches (the sequential sum is not the card's)
+ok   fp8 Ada.e5m2.fp32 on l40s sass: 0 mismatches (Ada's own sum: chunks of 16, cut 13 bits down, result cut to 13 bits)
+ok   fp8 Ada.e5m2.fp32 on l40s sass (VGPU_TC_EXACT=0): 24 mismatches (the sequential sum is not the card's)
+ok   fp8 Ada.e4m3.fp16 on l40s ptx: 0 mismatches (Ada's own sum: chunks of 16, cut 13 bits down, result cut to 13 bits)
+ok   fp8 Ada.e4m3.fp16 on l40s ptx (VGPU_TC_EXACT=0): 5 mismatches (the sequential sum is not the card's)
+ok   fp8 Ada.e4m3.fp32 on l40s ptx: 0 mismatches (Ada's own sum: chunks of 16, cut 13 bits down, result cut to 13 bits)
+ok   fp8 Ada.e4m3.fp32 on l40s ptx (VGPU_TC_EXACT=0): 24 mismatches (the sequential sum is not the card's)
+ok   fp8 Ada.e5m2.fp16 on l40s ptx: 0 mismatches (Ada's own sum: chunks of 16, cut 13 bits down, result cut to 13 bits)
+ok   fp8 Ada.e5m2.fp16 on l40s ptx (VGPU_TC_EXACT=0): 9 mismatches (the sequential sum is not the card's)
+ok   fp8 Ada.e5m2.fp32 on l40s ptx: 0 mismatches (Ada's own sum: chunks of 16, cut 13 bits down, result cut to 13 bits)
+ok   fp8 Ada.e5m2.fp32 on l40s ptx (VGPU_TC_EXACT=0): 24 mismatches (the sequential sum is not the card's)
+ok   fp8 H100.e4m3.fp16 on h100 sass: 0 mismatches (ptxas lowers it to f16 and HMMA: the device's f16 rule)
+ok   fp8 H100.e5m2.fp16 on h100 sass: 0 mismatches (ptxas lowers it to f16 and HMMA: the device's f16 rule)
+ok   fp8 H100.e4m3.fp16 on h100 ptx: 0 mismatches (ptxas lowers it to f16 and HMMA: the device's f16 rule)
+ok   fp8 H100.e4m3.fp16 on h100 ptx (VGPU_TC_EXACT=0): 8 mismatches (the sequential sum is not the card's)
+ok   fp8 H100.e5m2.fp16 on h100 ptx: 0 mismatches (ptxas lowers it to f16 and HMMA: the device's f16 rule)
+ok   fp8 H100.e5m2.fp16 on h100 ptx (VGPU_TC_EXACT=0): 5 mismatches (the sequential sum is not the card's)
+ok   fp8 B200.e4m3.fp16 on b200 sass: 0 mismatches (ptxas lowers it to f16 and HMMA: the device's f16 rule)
+ok   fp8 B200.e4m3.fp32 on b200 sass: 0 mismatches (ptxas lowers it to f16 and HMMA: the device's f16 rule)
+ok   fp8 B200.e5m2.fp16 on b200 sass: 0 mismatches (ptxas lowers it to f16 and HMMA: the device's f16 rule)
+ok   fp8 B200.e5m2.fp32 on b200 sass: 0 mismatches (ptxas lowers it to f16 and HMMA: the device's f16 rule)
+ok   fp8 B200.e4m3.fp16 on b200 ptx: 0 mismatches (ptxas lowers it to f16 and HMMA: the device's f16 rule)
+ok   fp8 B200.e4m3.fp16 on b200 ptx (VGPU_TC_EXACT=0): 7 mismatches (the sequential sum is not the card's)
+ok   fp8 B200.e4m3.fp32 on b200 ptx: 0 mismatches (ptxas lowers it to f16 and HMMA: the device's f16 rule)
+ok   fp8 B200.e4m3.fp32 on b200 ptx (VGPU_TC_EXACT=0): 10 mismatches (the sequential sum is not the card's)
+ok   fp8 B200.e5m2.fp16 on b200 ptx: 0 mismatches (ptxas lowers it to f16 and HMMA: the device's f16 rule)
+ok   fp8 B200.e5m2.fp16 on b200 ptx (VGPU_TC_EXACT=0): 7 mismatches (the sequential sum is not the card's)
+ok   fp8 B200.e5m2.fp32 on b200 ptx: 0 mismatches (ptxas lowers it to f16 and HMMA: the device's f16 rule)
+ok   fp8 B200.e5m2.fp32 on b200 ptx (VGPU_TC_EXACT=0): 9 mismatches (the sequential sum is not the card's)
+ok   full Ada.e4m3.fp16 on rtx6000-ada sass: 0 mismatches
+ok   full Ada.e4m3.fp16 on rtx6000-ada ptx: 0 mismatches
+ok   full Ada.e4m3.fp32 on rtx6000-ada sass: 0 mismatches
+ok   full Ada.e4m3.fp32 on rtx6000-ada ptx: 0 mismatches
+ok   full Ada.e5m2.fp16 on rtx6000-ada sass: 0 mismatches
+ok   full Ada.e5m2.fp16 on rtx6000-ada ptx: 0 mismatches
+ok   full Ada.e5m2.fp32 on rtx6000-ada sass: 0 mismatches
+ok   full Ada.e5m2.fp32 on rtx6000-ada ptx: 0 mismatches
+ok   full B200.e4m3.fp16 on b200 sass: 0 mismatches
+ok   full B200.e4m3.fp16 on b200 ptx: 0 mismatches
+ok   full B200.e4m3.fp32 on b200 sass: 0 mismatches
+ok   full B200.e4m3.fp32 on b200 ptx: 0 mismatches
+ok   full B200.e5m2.fp16 on b200 sass: 0 mismatches
+ok   full B200.e5m2.fp16 on b200 ptx: 0 mismatches
+ok   full B200.e5m2.fp32 on b200 sass: 0 mismatches
+ok   full B200.e5m2.fp32 on b200 ptx: 0 mismatches
+ok   full H100.e4m3.fp16 on h100 sass: 0 mismatches
+ok   full H100.e4m3.fp16 on h100 ptx: 0 mismatches
+ok   full H100.e5m2.fp16 on h100 sass: 0 mismatches
+ok   full H100.e5m2.fp16 on h100 ptx: 0 mismatches
+ok   full H200.e4m3.fp16 on h200 sass: 0 mismatches
+ok   full H200.e4m3.fp16 on h200 ptx: 0 mismatches
+ok   full H200.e5m2.fp16 on h200 sass: 0 mismatches
+ok   full H200.e5m2.fp16 on h200 ptx: 0 mismatches
+ok   full L40S.e4m3.fp32 on l40s sass: 0 mismatches
+ok   full L40S.e4m3.fp32 on l40s ptx: 0 mismatches
+ok   full L40S.e5m2.fp32 on l40s sass: 0 mismatches
+ok   full L40S.e5m2.fp32 on l40s ptx: 0 mismatches
+ok   full A100.fp16.fp16 on a100: 0 mismatches
+ok   full A100.fp16.fp32 on a100: 0 mismatches
+ok   full A2.fp16.fp16 on rtx3060: 0 mismatches
+ok   full A2.fp16.fp32 on rtx3060: 0 mismatches
+ok   full Ada.fp16.fp16 on rtx6000-ada: 0 mismatches
+ok   full Ada.fp16.fp32 on rtx6000-ada: 0 mismatches
+ok   full B200.fp16.fp16 on b200: 0 mismatches
+ok   full B200.fp16.fp32 on b200: 0 mismatches
+ok   full H100.fp16.fp16 on h100: 0 mismatches
+ok   full H100.fp16.fp32 on h100: 0 mismatches
+ok   full H200.fp16.fp16 on h200: 0 mismatches
+ok   full H200.fp16.fp32 on h200: 0 mismatches
+ok   full L40S.fp16.fp16 on l40s: 0 mismatches
+ok   full L40S.fp16.fp32 on l40s: 0 mismatches
+ok   full A100.bf16.fp32 on a100: 0 mismatches
+ok   full A2.bf16.fp32 on rtx3060: 0 mismatches
+ok   full Ada.bf16.fp32 on rtx6000-ada: 0 mismatches
+ok   full B200.bf16.fp32 on b200: 0 mismatches
+ok   full H100.bf16.fp32 on h100: 0 mismatches
+ok   full H200.bf16.fp32 on h200: 0 mismatches
+ok   full L40S.bf16.fp32 on l40s: 0 mismatches
+ok   full A100.tf32.fp32 on a100: 0 mismatches
+ok   full A2.tf32.fp32 on rtx3060: 0 mismatches
+ok   full Ada.tf32.fp32 on rtx6000-ada: 0 mismatches
+ok   full B200.tf32.fp32 on b200: 0 mismatches
+ok   full H100.tf32.fp32 on h100: 0 mismatches
+ok   full H200.tf32.fp32 on h200: 0 mismatches
+ok   full L40S.tf32.fp32 on l40s: 0 mismatches
+PASS

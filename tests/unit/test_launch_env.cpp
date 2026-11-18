@@ -39,6 +39,7 @@ struct Names {
   const char* trace = std::getenv("VGPU_TRACE");
   const char* strict = std::getenv("VGPU_STRICT");
   const char* race = std::getenv("VGPU_RACE");
+  const char* race_continue = std::getenv("VGPU_RACE_CONTINUE");
   const char* max_steps = std::getenv("VGPU_MAX_STEPS");
   const char* scheduler = std::getenv("VGPU_SCHEDULER");
   const char* scheduler_seed = std::getenv("VGPU_SCHEDULER_SEED");
@@ -62,6 +63,7 @@ void same_as_getenv(const char* what) {
   if (e.trace != n.trace) throw vtest::Failure(std::string(what) + ": VGPU_TRACE differs");
   if (e.strict != n.strict) throw vtest::Failure(std::string(what) + ": VGPU_STRICT differs");
   if (e.race != n.race) throw vtest::Failure(std::string(what) + ": VGPU_RACE differs");
+  if (e.race_continue != n.race_continue) throw vtest::Failure(std::string(what) + ": VGPU_RACE_CONTINUE differs");
   if (e.max_steps != n.max_steps) throw vtest::Failure(std::string(what) + ": VGPU_MAX_STEPS differs");
   if (e.scheduler != n.scheduler) throw vtest::Failure(std::string(what) + ": VGPU_SCHEDULER differs");
   if (e.scheduler_seed != n.scheduler_seed) throw vtest::Failure(std::string(what) + ": VGPU_SCHEDULER_SEED differs");
@@ -88,13 +90,14 @@ VTEST(every_variable_the_launch_reads_is_found_with_its_value) {
 }
 
 VTEST(the_runtime_and_interpreter_variables_are_found_with_their_values) {
-  Replaced env({"VGPU_TRACE=1", "VGPU_STRICT=1", "VGPU_RACE=2", "VGPU_MAX_STEPS=99", "VGPU_SCHEDULER=random", "VGPU_SCHEDULER_SEED=7",
+  Replaced env({"VGPU_TRACE=1", "VGPU_STRICT=1", "VGPU_RACE=2", "VGPU_RACE_CONTINUE=1", "VGPU_MAX_STEPS=99", "VGPU_SCHEDULER=random", "VGPU_SCHEDULER_SEED=7",
                 "VGPU_FAIL_ALLOC=all", "VGPU_FAIL_LAUNCH=2,3", "VGPU_FAIL_MEMCPY=1", "VGPU_FASTCOUNT=0", "VGPU_FAIL_OTHER=1", "VGPU_SIMD=avx2",
                 "VGPU_TRACEX=1", "VGPU_RACE_X=1", "VGPU_STRICTLY=1", "VGPU_MAX_STEPS2=1", "VGPU_SCHEDULER_SEEDS=1"});
   const LaunchEnv e = vgpu::exec::read_launch_env();
   VCHECK(e.trace && std::string(e.trace) == "1");
   VCHECK(e.strict && std::string(e.strict) == "1");
   VCHECK(e.race && std::string(e.race) == "2");
+  VCHECK(e.race_continue && std::string(e.race_continue) == "1");
   VCHECK(e.max_steps && std::string(e.max_steps) == "99");
   VCHECK(e.scheduler && std::string(e.scheduler) == "random");
   VCHECK(e.scheduler_seed && std::string(e.scheduler_seed) == "7");

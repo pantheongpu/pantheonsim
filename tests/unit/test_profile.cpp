@@ -614,3 +614,34 @@ VTEST(every_builtin_profile_tags_its_numerics) {
   for (const char* id : {"amd/mi250x", "amd/mi300x", "amd/mi325x", "amd/mi350x", "amd/mi455x", "amd/rx7900xtx", "amd/rx9070xt", "amd/rx6900xt"})
     VCHECK(vgpu::load_gpu(id).provenance.empty());
 }
+
+// The FP8 sum (numerics.tensor_sum_fp8, include/vgpu/exec/tc_fp8.hpp): optional, named, written out with its numbers, and only the sums the engines implement.
+VTEST(the_fp8_sum_is_named_with_its_numbers_and_only_the_implemented_ones_are_accepted) {
+  const std::string fp8_keys = "numerics.tensor_sum_fp8, numerics.tensor_sum_fp8_chunk, numerics.tensor_sum_fp8_grid, numerics.tensor_sum_fp8_out_bits";
+  const auto tail = [&](bool numbers) {
+    return std::string("provenance:\n  inferred: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid, ") +
+           (numbers ? fp8_keys : "numerics.tensor_sum_fp8") + "]\nevidence:\n  numerics: \"data recorded by others\"\n";
+  };
+  const std::string ada = "  tensor_sum_fp8: ada\n  tensor_sum_fp8_chunk: 16\n  tensor_sum_fp8_grid: 14\n  tensor_sum_fp8_out_bits: 13\n";
+  const DeviceProfile p = with_sections(std::string(kAmpereNumerics) + ada + tail(true));
+  VCHECK(p.numerics.tensor_sum_fp8 == vgpu::Fp8Sum::Ada);
+  VCHECK_EQ(p.numerics.tensor_sum_fp8_chunk, 16u);
+  VCHECK_EQ(p.numerics.tensor_sum_fp8_grid, 14);
+  VCHECK_EQ(p.numerics.tensor_sum_fp8_out_bits, 13);
+  VCHECK(p.provenance_of("numerics.tensor_sum_fp8_grid") == Provenance::Inferred);
+  // absent: the sequential sum, numbers zero
+  const DeviceProfile q = with_sections(std::string(kAmpereNumerics) + "provenance:\n  measured: " + kAllFour + "\nevidence:\n  numerics: \"a card\"\n");
+  VCHECK(q.numerics.tensor_sum_fp8 == vgpu::Fp8Sum::Sequential && q.numerics.tensor_sum_fp8_chunk == 0 && q.numerics.tensor_sum_fp8_grid == 0);
+  // via_f16 has no numbers of its own, and rides on the f16 rule
+  const DeviceProfile v = with_sections(std::string(kAmpereNumerics) + "  tensor_sum_fp8: via_f16\n" + tail(false));
+  VCHECK(v.numerics.tensor_sum_fp8 == vgpu::Fp8Sum::ViaF16);
+  refused(std::string(kAmpereNumerics) + "  tensor_sum_fp8: via_f16\n  tensor_sum_fp8_grid: 14\n" + tail(true), "have no meaning with tensor_sum_fp8: via_f16");
+  refused("numerics:\n  tensor_sum: sequential\n  tensor_sum_fp8: via_f16\nprovenance:\n  unknown: [numerics.tensor_sum, numerics.tensor_sum_fp8]\n", "needs a tensor_sum that is not sequential");
+  // numbers that are not the named sum's, a missing number, an unknown name, numbers without a name, an untagged key
+  refused(std::string(kAmpereNumerics) + "  tensor_sum_fp8: ada\n  tensor_sum_fp8_chunk: 16\n  tensor_sum_fp8_grid: 15\n  tensor_sum_fp8_out_bits: 13\n" + tail(true), "the engines have no such sum");
+  refused(std::string(kAmpereNumerics) + "  tensor_sum_fp8: ada\n  tensor_sum_fp8_chunk: 8\n  tensor_sum_fp8_grid: 14\n  tensor_sum_fp8_out_bits: 13\n" + tail(true), "the engines have no such sum");
+  refused(std::string(kAmpereNumerics) + "  tensor_sum_fp8: ada\n  tensor_sum_fp8_chunk: 16\n  tensor_sum_fp8_grid: 14\n" + tail(true), "missing required key: tensor_sum_fp8_out_bits");
+  refused(std::string(kAmpereNumerics) + "  tensor_sum_fp8: hopper\n" + tail(false), "must be sequential, ada or via_f16");
+  refused(std::string(kAmpereNumerics) + "  tensor_sum_fp8_chunk: 16\n" + tail(true), "need numerics.tensor_sum_fp8");
+  refused(std::string(kAmpereNumerics) + ada + tail(false), "numerics.tensor_sum_fp8_chunk has no provenance class");
+}

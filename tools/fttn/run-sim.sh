@@ -35,5 +35,7 @@ amd() {   # <profile> <gfx>
   done
 }
 nv t4 75; nv rtx2080ti 75; nv rtx3060 86; nv rtx3060 80; nv rtx3060 75; nv a10g 86; nv a100 80; nv l4 89; nv l40s 89
-nv h100 90; nv b200 100; nv rtx-pro-6000 120; nv rtx5090 120
+nv h100 90; nv h100-pcie 90; nv h200 90; nv gh200-480gb 90
+nv b200 100; nv gb200 100; nv b300 100; nv vr200 100; nv thor 110
+nv rtx-pro-6000 120; nv rtx-pro-6000-server 120; nv rtx5090 120; nv gb10 120
 amd mi250x gfx90a; amd mi300x gfx942; amd mi325x gfx942; amd rx7900xtx gfx1100

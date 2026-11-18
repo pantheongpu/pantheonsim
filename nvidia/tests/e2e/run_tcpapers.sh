@@ -13,6 +13,9 @@
 #   nvidia/tests/data/tcpapers/<card>.<fmt>.<out>.txt   24 recorded test vectors each of an A100, an H100 and a B200 (Khattak and Mikaitis's
 #                                                       model_validation, BSD-2, see NOTICE): the simulator must reproduce them bit for bit with the
 #                                                       profile of the card (b200 by default since 2026-11-16; before, with VGPU_TC_EXACT=published), and the wrong rule must not.
+#   nvidia/tests/data/tcpapers/fp8/<card>.<fmt>.<out>.txt   24 recorded e4m3 / e5m2 mma.sync m16n8k32 vectors each (f32 and f16 accumulators) of an RTX 1000 Ada, a B200 and (f16
+#                                                       accumulator) an H100, same source and notice. The simulator must reproduce them with the profile of the card on both engines
+#                                                       (l40s for Ada, b200, h100), and the sequential sum (VGPU_TC_EXACT=0) must not. FP8 sums: include/vgpu/exec/tc_fp8.hpp.
 #   VGPU_KHATTAK_VECTORS=<dir>   the full sets (tools/tcpapers/khattak-fetch.sh <x> then <x>/vectors): 5,000 vectors a file, 28 files.
 #   VGPU_TCPAPERS_BIN=<dir>      programs already built: <dir>/sm<NN>/{fprev_probe,tc_features,khattak_vectors} (skips nvcc).
 # The sum is the device's, not the cubin's architecture, so each profile runs the program built for its own architecture.
@@ -43,6 +46,16 @@ if [[ -z "${VGPU_TCPAPERS_BIN:-}" ]]; then
       if [[ $a == 86 ]]; then echo "FAIL: the programs do not build for sm_86"; cat "$out/b.txt"; exit 1; fi
       echo "SKIP sm_$a: this toolkit does not build it ($(head -1 "$out/b.txt"))"; rm -rf "$bin/sm$a"
     fi
+  done
+fi
+# The FP8 program (mma.sync e4m3 / e5m2 needs sm_89 or newer).
+if [[ -z "${VGPU_TCPAPERS_BIN:-}" ]]; then
+  for a in 89 90 100; do
+    mkdir -p "$bin/sm$a"
+    nvcc -std=c++17 -O1 -arch=sm_$a -cudart shared -w $(shim_sanitizer_nvcc_flags "$shim") "$tool/khattak_fp8_vectors.cu" -o "$bin/sm$a/khattak_fp8_vectors" 2> "$out/b8.txt" \
+      || { echo "SKIP fp8 sm_$a: this toolkit does not build it ($(head -1 "$out/b8.txt"))"; rm -f "$bin/sm$a/khattak_fp8_vectors"; }
+    # (the wmma vectors of the Ada and L40S sets of the full run are built for sm_89 too)
+    [[ $a == 89 && ! -x "$bin/sm89/khattak_vectors" ]] && nvcc -std=c++17 -O1 -arch=sm_89 -cudart shared -w $(shim_sanitizer_nvcc_flags "$shim") "$tool/khattak_vectors.cu" -o "$bin/sm89/khattak_vectors" 2> "$out/b8.txt"
   done
 fi
 if ! require_shim_libs "$shim" "$bin/sm86/tc_features"; then exit 0; fi
@@ -118,9 +131,39 @@ for eng in sass ptx; do
     done
   fi
 done
+# 3b. The FP8 vectors (mma.sync m16n8k32, the vector in row 0 of A and column 0 of B).
+fp8mism() {   # <sm> <profile> <engine> <file> [ENV=value]   the mismatch count of one FP8 vector file
+  local a="$1" gpu="$2" eng="$3" f="$4"; shift 4
+  local base; base="$(basename "$f" .txt)"; local card fmt o; IFS=. read -r card fmt o <<< "$base"
+  run khattak_fp8_vectors "$a" "$gpu" "$eng" "$out/kv8.txt" "$@" "$fmt" "$o" "$f" --show 0
+  mism "$out/kv8.txt"
+}
+fp8check() {   # <sm> <profile> <file glob> <what> <engines the sequential sum must fail on>
+  local a="$1" gpu="$2" glob="$3" what="$4" negeng="$5"
+  [[ -x "$bin/sm$a/khattak_fp8_vectors" ]] || { echo "skip fp8 $gpu: no sm_$a build"; return; }
+  for eng in sass ptx; do
+    for f in $glob; do
+      m="$(fp8mism "$a" "$gpu" $eng "$f")"; if [[ "$m" == 0 ]]; then echo "ok   fp8 $(basename "$f" .txt) on $gpu $eng: 0 mismatches ($what)"; else echo "FAIL fp8 $(basename "$f" .txt) on $gpu $eng: mismatches=${m:-?} ($what)"; fails=1; fi
+      [[ " $negeng " == *" $eng "* ]] || continue   # (on sm_90 and sm_100 the SASS engine runs the cubin's HMMA chain and FADD, whose sequential sum is close to the card's: the PTX engine tells the sums apart)
+      m="$(fp8mism "$a" "$gpu" $eng "$f" VGPU_TC_EXACT=0)"; if [[ "$m" =~ ^[0-9]+$ ]] && (( m >= 1 )); then echo "ok   fp8 $(basename "$f" .txt) on $gpu $eng (VGPU_TC_EXACT=0): $m mismatches (the sequential sum is not the card's)"; else echo "FAIL fp8 $(basename "$f" .txt) on $gpu $eng (VGPU_TC_EXACT=0): expected mismatches, got ${m:-?}"; fails=1; fi
+    done
+  done
+}
+fp8check 89 l40s "$data/fp8/Ada.*.txt" "Ada's own sum: chunks of 16, cut 13 bits down, result cut to 13 bits" "sass ptx"
+fp8check 90 h100 "$data/fp8/H100.*.txt" "ptxas lowers it to f16 and HMMA: the device's f16 rule" "ptx"
+fp8check 100 b200 "$data/fp8/B200.*.txt" "ptxas lowers it to f16 and HMMA: the device's f16 rule" "ptx"
 # 4. Optionally the full sets.
 if [[ -n "${VGPU_KHATTAK_VECTORS:-}" ]]; then
-  for f in "$VGPU_KHATTAK_VECTORS"/*.txt; do
+  for f in "$VGPU_KHATTAK_VECTORS"/*.e[45]m*.txt; do
+    base="$(basename "$f" .txt)"; card="${base%%.*}"
+    case $card in Ada) a=89; gpu=rtx6000-ada;; L40S) a=89; gpu=l40s;; H100) a=90; gpu=h100;; H200) a=90; gpu=h200;; B200) a=100; gpu=b200;; *) continue;; esac
+    [[ "$card" == H* && "$base" == *.fp32 ]] && continue   # (recorded through wgmma with a zero accumulator: not mma.sync)
+    [[ -x "$bin/sm$a/khattak_fp8_vectors" ]] || { echo "skip $base: no sm_$a build"; continue; }
+    for eng in sass ptx; do
+      m="$(fp8mism "$a" "$gpu" $eng "$f")"; if [[ "$m" == 0 ]]; then echo "ok   full $base on $gpu $eng: 0 mismatches"; else echo "FAIL full $base on $gpu $eng: mismatches=${m:-?}"; fails=1; fi
+    done
+  done
+  for f in "$VGPU_KHATTAK_VECTORS"/*.fp16.f*.txt "$VGPU_KHATTAK_VECTORS"/*.bf16.*.txt "$VGPU_KHATTAK_VECTORS"/*.tf32.*.txt; do
     base="$(basename "$f" .txt)"; card="${base%%.*}"
     case $card in A100) a=80; gpu=a100;; A2) a=86; gpu=rtx3060;; Ada) a=89; gpu=rtx6000-ada;; L40S) a=89; gpu=l40s;; H100) a=90; gpu=h100;; H200) a=90; gpu=h200;; B200) a=100; gpu=b200;; *) continue;; esac
     [[ -x "$bin/sm$a/khattak_vectors" ]] || { echo "skip $base: no sm_$a build"; continue; }

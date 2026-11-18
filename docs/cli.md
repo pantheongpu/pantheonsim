@@ -334,6 +334,7 @@ variable is unset by default.
 | --- | --- | --- |
 | `VGPU_STRICT` | `1` turns on the checks that catch bugs hardware hides: integer division by zero, and storing a register nothing has written. | off |
 | `VGPU_RACE` | `1` reports unordered shared-memory access between warps; `2` also reports stores that change nothing. | off |
+| `VGPU_RACE_CONTINUE` | `1` makes `VGPU_RACE` print each race (once per instruction and kind, 50 at most) to stderr and carry on, instead of stopping the launch at the first. | off |
 | `VGPU_COUNTERS` | `1` prints exact per-launch performance counters. | off |
 | `VGPU_COUNTERS_FILE` | Append one line of JSON per kernel launch to this file, for a tool that reads counters. `vgpu ncu` sets it and reports from the file. | off |
 

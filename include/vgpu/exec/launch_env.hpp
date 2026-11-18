@@ -22,6 +22,7 @@ struct LaunchEnv {
   const char* trace = nullptr;        // VGPU_TRACE
   const char* strict = nullptr;       // VGPU_STRICT
   const char* race = nullptr;         // VGPU_RACE
+  const char* race_continue = nullptr;   // VGPU_RACE_CONTINUE
   const char* max_steps = nullptr;    // VGPU_MAX_STEPS
   const char* scheduler = nullptr;    // VGPU_SCHEDULER
   const char* scheduler_seed = nullptr;   // VGPU_SCHEDULER_SEED

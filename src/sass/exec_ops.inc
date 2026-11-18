@@ -5174,6 +5174,7 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
           K % (at == MmaT::TF32 ? 4 : 8) == 0)
         ok = false;   // the chunked sum of an RTX 3060
       if (m_.sm / 10 == 12 && narrow(at) && narrow(bt) && acc == AccF32) ok = false;   // sm_120's narrow-float sum
+      if (ins.op == Op::QMMA && narrow(at) && narrow(bt) && m_.sm / 10 != 12 && vgpu::exec::tc86::fp8_rule(profile_)) ok = false;   // Ada's FP8 sum (tc_fp8.hpp)
     }
     const unsigned a_n = is_sparse ? a_regs / 2 : a_regs, c_n = acc == AccF16 ? c_elems / 2 : c_elems;
     const auto in_file = [&](unsigned base, unsigned n) { return base == kRZ || base + n * rw <= w.nregs; };
@@ -5351,6 +5352,11 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
     vgpu::exec::tc86::mma(*tc_rule, at == MmaT::TF32, M, kN, K, at == MmaT::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide,
                           acc == AccF16, Af, K, Bf, kN, Cf, kN, Dtc, kN);
   }
+  // The e4m3 and e5m2 forms on a device with its own FP8 sum (vgpu/exec/tc_fp8.hpp). Hopper and datacenter Blackwell cubins hold HMMA for
+  // these, which the f16 rule above already sums; sm_120's narrow-float core is the branch below.
+  const auto fp8_op = [](MmaT t) { return t == MmaT::E4M3 || t == MmaT::E5M2; };
+  const vgpu::Fp8SumRule* const fp8_rule = ins.op == Op::QMMA && !block_scaled && !sparse && fp8_op(at) && fp8_op(bt) && acc != AccS32 &&
+                                           acc != AccF64 && m_.sm / 10 != 12 ? vgpu::exec::tc86::fp8_rule(profile_) : nullptr;
   const auto narrow_elem = [](MmaT t) {
     return t == MmaT::E4M3 || t == MmaT::E5M2 || t == MmaT::E3M2 || t == MmaT::E2M3 || t == MmaT::E2M1 || t == MmaT::E2M1P;
   };
@@ -5379,6 +5385,10 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
           for (unsigned k = 0; k < K; ++k) a = std::fma(A[i * K + k], B[k * kN + j], a);
           return a;
         });
+      } else if (fp8_rule) {
+        D[i * kN + j] = vgpu::exec::tc86::fp8_dot(*fp8_rule, acc == AccF16, at == MmaT::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3,
+                                                  bt == MmaT::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3, &A[i * K], 1, &B[j], kN,
+                                                  K, C[i * kN + j]);
       } else if (narrow_tensor_core) {
         // sm_120's narrow-float tensor core: the exact sum, rounded once toward zero (exec::mma_narrow_sum).
         double terms[256];

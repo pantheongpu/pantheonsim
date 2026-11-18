@@ -1,6 +1,7 @@
 #include "vgpu/ptx/ast.hpp"
 
 #include <cstdint>
+#include <vector>
 #include <mutex>
 #include <unordered_map>
 
@@ -72,6 +73,58 @@ static bool micro_source(const Operand& o, uint32_t& value, bool& imm) {
     return true;
   }
   return false;
+}
+
+void build_order(EntryFn& fn) {
+  const size_t n = fn.body.size();
+  fn.order.clear();
+  if (n == 0) return;
+  // The successors of an instruction: a branch's target, and the next instruction unless it is an unguarded branch or ends the thread.
+  const auto succs = [&](size_t pc, size_t* out) {
+    const Instr& ins = fn.body[pc];
+    size_t k = 0;
+    bool next = true;
+    if (const auto* b = std::get_if<OpBra>(&ins.op)) {
+      out[k++] = b->target;
+      next = ins.has_pred;
+    } else if (std::holds_alternative<OpRet>(ins.op) || std::holds_alternative<OpTrap>(ins.op)) {
+      next = ins.has_pred;
+    }
+    if (next && pc + 1 < n) out[k++] = pc + 1;
+    return k;
+  };
+  // Depth-first from the entry, the target before the fall-through so that the fall-through finishes last and comes first. An edge to an
+  // instruction still on the stack is a back edge. Any other edge to a lower pc means the body is out of order.
+  struct Item { size_t pc; size_t succ[2]; size_t count, next; };
+  std::vector<uint8_t> state(n, 0);   // 1 on the stack, 2 done
+  std::vector<uint32_t> post;
+  std::vector<Item> stack;
+  bool ordered = true;
+  const auto push = [&](size_t pc) {
+    Item it{pc, {0, 0}, 0, 0};
+    it.count = succs(pc, it.succ);
+    state[pc] = 1;
+    stack.push_back(it);
+  };
+  push(0);
+  while (!stack.empty()) {
+    Item& it = stack.back();
+    if (it.next == it.count) {
+      state[it.pc] = 2;
+      post.push_back(static_cast<uint32_t>(it.pc));
+      stack.pop_back();
+      continue;
+    }
+    const size_t to = it.succ[it.next++];
+    if (to >= n || state[to] == 1) continue;
+    if (to < it.pc) ordered = false;
+    if (state[to] == 0) push(to);
+  }
+  if (ordered) return;
+  fn.order.assign(n, 0);
+  for (size_t i = 0; i < post.size(); ++i) fn.order[post[i]] = static_cast<uint32_t>(post.size() - 1 - i);
+  for (size_t pc = 0; pc < n; ++pc)
+    if (state[pc] == 0) fn.order[pc] = static_cast<uint32_t>(post.size() + pc);   // never reached from the entry
 }
 
 void build_micro(EntryFn& fn) {

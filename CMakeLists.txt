@@ -1661,6 +1661,8 @@ vgpu_unit_test(test_simd)
 vgpu_unit_test(test_tc_ampere)
 # The vector kernels of that sum against its scalar form, bit for bit, over random and adversarial operands (on the tiles the dispatcher gives them).
 vgpu_unit_test(test_tc_ampere_fast)
+# The e4m3 / e5m2 tensor-core sums (include/vgpu/exec/tc_fp8.hpp): recorded Ada vectors, an independent form, special values, what each profile names.
+vgpu_unit_test(test_tc_fp8)
 # IMMA.16816 / 16832 (8-bit operands) straight from the registers (include/vgpu/exec/imma_frag.hpp) against the definition, every sign combination.
 vgpu_unit_test(test_imma_frag)
 # LDSM's data movement (include/vgpu/exec/ldsm.hpp) against the element-at-a-time form it replaced, rows anywhere in the array and at a page's end.
@@ -3414,6 +3416,14 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_solver_jacobi_paths
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh solver_jacobi_paths cusolver)
   set_tests_properties(e2e_solver_jacobi_paths PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
+  # mma.sync after a lane-divergent branch (issue #699), from the PTX PoCL's CUDA driver wrote: six passes, the second on with a split warp before them.
+  add_test(NAME e2e_driver_mma_divergence
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh driver_mma_divergence cuda)
+  set_tests_properties(e2e_driver_mma_divergence PROPERTIES
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
