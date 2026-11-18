@@ -7,6 +7,10 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **`VGPU_RACE` no longer reports shared-memory atomics from different warps as a race** (issue #700). `atom.shared.*` and `red.shared.*` on one word between two `bar.sync`
+  stopped a launch with a write-read race; they are ordered by the hardware, so only an atomic against another warp's plain load or store of the word is reported now
+  (a plain `st.shared` from two warps still is). `VGPU_RACE_CONTINUE=1` is new: it prints each race to stderr, once per instruction and kind, and lets the launch go on.
+  The SASS executor has no race detector. Tests: `test_exec3`, `test_launch_env`.
 - **The compute capability 12.0 Blackwell profiles sum by the Hopper rule, measured on an RTX PRO 6000 Blackwell Server Edition** (issue #664). `rtx-pro-6000-server`
   (`measured`) and `rtx5090`, `rtx-pro-4500`, `rtx-pro-6000`, `rtx-pro-6000-max-q` (`inferred` from it) took the sequential f32 sum before: wmma, `mma.sync` and SASS
   `HMMA` in f16, bf16 and tf32 now give the card's bits (both probes print the H100's lines, 60 of 60 and 169 of 169; FTTN's motivating example 191.875 instead of 0;

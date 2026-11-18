@@ -54,7 +54,10 @@ LaunchEnv read_launch_env() {
           take(e.scheduler_seed, is(s, "SCHEDULER_SEED"));
         }
         break;
-      case 'R': take(e.race, is(s, "RACE")); break;
+      case 'R':
+        take(e.race, is(s, "RACE"));
+        take(e.race_continue, is(s, "RACE_CONTINUE"));
+        break;
       case 'E':
         take(e.exact_threads, is(s, "EXACT_THREADS"));
         take(e.exact_log, is(s, "EXACT_LOG"));
@@ -85,6 +88,7 @@ LaunchEnv read_launch_env() {
   e.trace = std::getenv("VGPU_TRACE");
   e.strict = std::getenv("VGPU_STRICT");
   e.race = std::getenv("VGPU_RACE");
+  e.race_continue = std::getenv("VGPU_RACE_CONTINUE");
   e.max_steps = std::getenv("VGPU_MAX_STEPS");
   e.scheduler = std::getenv("VGPU_SCHEDULER");
   e.scheduler_seed = std::getenv("VGPU_SCHEDULER_SEED");

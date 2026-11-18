@@ -7385,6 +7385,101 @@ DONE:
   VCHECK(err.code() == Err::DataRace);
 }
 
+// Atomics from different warps on one word between two barriers are ordered by the hardware: not a race. An atomic against a plain
+// access of that word is one (issue #700). `body` runs between the barriers, in every thread; %r1 is the thread id, %r2 the word.
+static std::string atomics_kernel(const std::string& body) {
+  return std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<3>;
+    .shared .align 4 .b8 tile[256];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, tile;
+    setp.ne.u32 %p1, %r1, 0;
+    @%p1 bra SKIP0;
+    mov.u32 %r3, 0;
+    st.shared.u32 [%r2], %r3;
+SKIP0:
+    bar.sync 0;
+)" + body + R"(
+    bar.sync 0;
+    @%p1 bra DONE;
+    ld.shared.u32 %r4, [%r2];
+    st.global.u32 [%rd2], %r4;
+DONE:
+    ret;
+}
+)";
+}
+
+static uint64_t run_atomics_kernel(const std::string& body, const char* mode = "1") {
+  Env e;
+  auto m = ptx::parse(atomics_kernel(body));
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};   // two warps
+  setenv("VGPU_RACE", mode, 1);
+  try {
+    exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  } catch (...) {
+    unsetenv("VGPU_RACE");
+    throw;
+  }
+  unsetenv("VGPU_RACE");
+  return e.mem.load_scalar(out, 4);
+}
+
+VTEST(shared_atomics_from_two_warps_are_not_a_race) {
+  VCHECK_EQ(run_atomics_kernel("    atom.shared.max.s32 %r5, [%r2], %r1;\n"), uint64_t{63});
+  VCHECK_EQ(run_atomics_kernel("    red.shared.max.s32 [%r2], %r1;\n"), uint64_t{63});
+  VCHECK_EQ(run_atomics_kernel("    atom.shared.add.u32 %r5, [%r2], 1;\n", "2"), uint64_t{64});
+}
+
+VTEST(a_plain_store_or_load_beside_another_warps_atomic_is_still_a_race) {
+  // Warp 0 does the atomic, warp 1 the plain access, in the same phase.
+  const std::string guard0 = "    setp.gt.u32 %p2, %r1, 31;\n";
+  for (const char* plain : {"st.shared.u32 [%r2], %r1;", "ld.shared.u32 %r6, [%r2];"}) {
+    for (bool atomic_first : {true, false}) {
+      const std::string a = "    @!%p2 red.shared.add.u32 [%r2], 1;\n";
+      const std::string b = std::string("    @%p2 ") + plain + "\n";
+      auto err = VCAPTURE(Error, run_atomics_kernel(guard0 + (atomic_first ? a + b : b + a)));
+      VCHECK(err.code() == Err::DataRace);
+    }
+  }
+}
+
+VTEST(plain_stores_to_one_word_stay_a_race_when_atomics_are_exempt) {
+  auto err = VCAPTURE(Error, run_atomics_kernel("    st.shared.u32 [%r2], %r1;\n"));
+  VCHECK(err.code() == Err::DataRace);
+  VCHECK_CONTAINS(err.what(), "write-write race");
+}
+
+VTEST(atomics_after_the_barrier_that_ordered_a_plain_store_are_not_a_race) {
+  // The plain store before the first barrier is ordered by it, as before.
+  VCHECK_EQ(run_atomics_kernel("    red.shared.add.u32 [%r2], 1;\n"), uint64_t{64});
+}
+
+VTEST(race_continue_prints_the_race_and_lets_the_launch_finish) {
+  const std::string racy = "    st.shared.u32 [%r2], %r1;\n";
+  setenv("VGPU_RACE_CONTINUE", "1", 1);
+  uint64_t got = 0;
+  try {
+    got = run_atomics_kernel(racy);
+  } catch (...) {
+    unsetenv("VGPU_RACE_CONTINUE");
+    throw;
+  }
+  unsetenv("VGPU_RACE_CONTINUE");
+  VCHECK(got <= 63);   // one of the stores won
+  // And without it the same kernel stops, as before.
+  auto err = VCAPTURE(Error, run_atomics_kernel(racy));
+  VCHECK(err.code() == Err::DataRace);
+}
+
 VTEST(one_warp_reusing_its_own_shared_words_is_not_a_race) {
   // A warp racing with itself is impossible: its own accesses are ordered by
   // the program. A detector that keyed on the word alone would say otherwise.
