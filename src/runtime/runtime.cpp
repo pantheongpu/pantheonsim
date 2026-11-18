@@ -1268,6 +1268,96 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   }
 }
 
+void Device::check_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg) const {
+  // Both engines apply the kernel's __cluster_dims__ when the launch names no cluster, then validate.
+  exec::LaunchConfig c = in_cfg;
+  if (c.cluster == std::array<uint32_t, 3>{0, 0, 0}) c.cluster = fn.req_cluster;
+  exec::validate_launch(fn, c, profile_);
+}
+
+void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
+                        const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms, exec::LaunchStats* stats_out) {
+  // How many of this kernel's blocks the device holds at once: what a kernel whose blocks wait on one
+  // another needs to know (vgpu/exec/lockstep.hpp). The same figure cudaOccupancyMaxActiveBlocksPerMultiprocessor
+  // gives, times the SMs.
+  exec::LaunchConfig cfg = in_cfg;
+  // The environment is read in one pass for the whole launch: the caller's (the runtime's), or one made here.
+  exec::LaunchEnv own_env;
+  if (!cfg.env) {
+    own_env = exec::read_launch_env();
+    cfg.env = &own_env;
+  }
+  if (!cfg.resident_blocks && exec::lockstep_mode(cfg.env->lockstep) != exec::LockstepMode::Off) {
+    const uint64_t threads = uint64_t{cfg.block[0]} * cfg.block[1] * cfg.block[2];
+    if (threads && threads <= profile_.limits.max_threads_per_block) {
+      try {
+        const exec::KernelResources res = exec::kernel_resources(fn, profile_, static_cast<uint32_t>(threads), cfg.shared_bytes, true);
+        cfg.resident_blocks = uint64_t{res.occupancy.blocks_per_sm} * profile_.limits.multiprocessors;
+      } catch (const Error&) {
+        // The launch's own checks report what is wrong with the kernel; the blocks just run as before.
+      }
+    }
+  }
+  if (fn.sass) {
+    // SASS: the executor for machine code (nvidia/docs/sass.md), after the
+    // launch checks both engines make. __cluster_dims__ applies whether or
+    // not the launch names a cluster, as in the PTX engine.
+    exec::LaunchConfig c = cfg;
+    if (c.cluster == std::array<uint32_t, 3>{0, 0, 0}) c.cluster = fn.req_cluster;
+    exec::validate_launch(fn, c, profile_);
+    exec::LaunchStats st = sass::launch(*fn.sass, fn.name, c, args, mem_, profile_);
+    if (stats_out) *stats_out = st;
+    report_counters(ordinal_, fn.name, c, st);
+    if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(physical_), 0.0);   // the machine's slot, not the program's index
+    return;
+  }
+  if (!telemetry_) {
+    exec::LaunchStats st = exec::launch(fn, cfg, args, mem_, profile_, syms);
+    if (stats_out) *stats_out = st;
+    report_counters(ordinal_, fn.name, cfg, st);
+    return;
+  }
+  // Utilization is the real fraction of wall time spent executing kernels. The
+  // progress hook publishes it *during* the launch so a long kernel still shows
+  // live telemetry rather than freezing until it returns.
+  uint32_t ord = static_cast<uint32_t>(physical_);
+  telemetry::Publisher* pub = telemetry_;
+  const exec::LaunchStats st = exec::launch(fn, cfg, args, mem_, profile_, syms,
+               [pub, ord](double dt) { pub->note_kernel(ord, dt); });
+  if (stats_out) *stats_out = st;
+  report_counters(ordinal_, fn.name, cfg, st);
+  pub->note_kernel(ord, 0.0);
+}
+
+void Runtime::publish_identity(const DeviceProfile& p, int ordinal) {
+  telemetry::DeviceSample* d = telemetry_.device(static_cast<uint32_t>(ordinal));
+  if (!d) return;
+  telemetry::describe_device(p, ordinal, d);
+  telemetry_.refresh(static_cast<uint32_t>(ordinal));
+}
+
+
+Runtime::Runtime(const DeviceProfile& profile, int device_count, std::vector<int> physical, int machine) {
+  if (device_count < 1) throw Error::make(Err::InvalidValue, "device_count must be >= 1");
+  // Every device needs an address window of its own (memory.hpp).
+  static_assert(telemetry::kMaxDevices <= vgpu::kDeviceVaWindows);
+  if (physical.empty())
+    for (int i = 0; i < device_count; ++i) physical.push_back(i);
+  if (static_cast<int>(physical.size()) != device_count)
+    throw Error::make(Err::InvalidValue, "a physical device for each of the ", device_count, " devices");
+  for (int p : physical) machine = std::max(machine, p + 1);
+  if (machine > telemetry::kMaxDevices)
+    throw Error::make(Err::InvalidValue, "device_count must be <= ", telemetry::kMaxDevices);
+  // Telemetry describes the whole machine, each device in its own slot;
+  // the devices shown here are what this process makes busy.
+  telemetry_.set_device_count(static_cast<uint32_t>(machine));
+  for (int i = 0; i < machine; ++i) publish_identity(profile, i);
+  for (int i = 0; i < device_count; ++i)
+    devices_.push_back(std::make_unique<Device>(profile, i, telemetry_.active() ? &telemetry_ : nullptr,
+                                                physical[static_cast<size_t>(i)]));
+  for (auto& d : devices_) d->set_device_count(device_count);
+}
+
 Device& Runtime::device(int ordinal) {
   if (ordinal < 0 || ordinal >= device_count())
     throw Error::make(Err::InvalidValue, "invalid device ordinal ", ordinal, " (have ", device_count(),
