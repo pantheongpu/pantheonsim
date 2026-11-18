@@ -111,6 +111,7 @@ shopt -u nullglob
 (( ${#carts[@]} )) || { echo "SKIP: libvgpucudart not built"; exit 0; }
 nvcc_bin="$(pick_nvcc_for_shim "$shim")"
 [[ -n "$nvcc_bin" ]] || { echo "SKIP: no nvcc matching this shim's toolkit"; exit 0; }
+nvv="$("$nvcc_bin" --version | sed -n 's/.*release \([0-9]*\)\.\([0-9]*\).*/\1\2/p')"
 cc_bin="$(command -v cc || command -v gcc)"
 [[ -n "$cc_bin" ]] || { echo "SKIP: no C compiler"; exit 0; }
 # The simulator loads the card driver with RTLD_DEEPBIND, which the sanitizer runtimes refuse to dlopen.
@@ -746,25 +747,28 @@ if [[ "$cc" == 86 ]]; then
   hostmap_case hm_shift kept STUB_HOSTPTR_SHIFT=4096
   grep -q '^cuMemHostUnregister$' "$work/hm_shift.log" || { echo "FAIL: hm_shift: a registration whose device pointer is not the host pointer was kept: $(calls hm_shift)"; fails=1; }
   # 47.
-  # (QMMA, FP8 tensor cores, sm_89: no class names it, and a card that has it runs it)
-  PROG=fit89 fitoff qmma nvidia/rtx4090
-  for m in turbo exact; do
-    PROG=fit89 run "fe_$m" qmma VGPU_GPU=nvidia/rtx4090 STUB_SM=89 STUB_MP=128 VGPU_HOST_GPU=$m VGPU_HOST_GPU_LOG=1 "${reachx[@]}" || { echo "FAIL: the $m qmma run failed"; tail -5 "$work/fe_$m.err"; fails=1; }
-    diff -q "$work/off_f_qmma.out" "$work/fe_$m.out" > /dev/null || { echo "FAIL: $m changes the output of fit89 qmma"; fails=1; }
-  done
-  grep -q '^cuModuleLoadData$' "$work/fe_turbo.log" && grep -q '^image elf sm_89$' "$work/fe_turbo.log" || { echo "FAIL: a kernel with an instruction no class names did not reach the card in turbo mode: $(calls fe_turbo); $(grep -m3 host_gpu "$work/fe_turbo.err")"; fails=1; }
-  grep -q '^host_gpu_refused:' "$work/fe_turbo.err" && { echo "FAIL: turbo refused a kernel with an unlisted instruction: $(grep -m1 '^host_gpu_refused' "$work/fe_turbo.err")"; fails=1; }
-  grep -q 'classes: .*unlisted' "$work/fe_turbo.err" || { echo "FAIL: the kernel's classes do not include unlisted: $(grep -m2 'classes:' "$work/fe_turbo.err")"; fails=1; }
-  ! grep -q '^cuModuleLoadData$' "$work/fe_exact.log" || { echo "FAIL: exact mode sent a kernel with an unlisted instruction to the card: $(calls fe_exact)"; fails=1; }
-  PROG=fit89 run fe_off qmma VGPU_GPU=nvidia/rtx4090 STUB_SM=89 STUB_MP=128 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_TURBO_OFF=unlisted "${reachx[@]}" || { echo "FAIL: the qmma run with unlisted off failed"; fails=1; }
-  ! grep -q '^cuModuleLoadData$' "$work/fe_off.log" || { echo "FAIL: VGPU_HOST_GPU_TURBO_OFF=unlisted did not keep the kernel in the simulator: $(calls fe_off)"; fails=1; }
-  grep -q '^host_gpu_refused: kernel=[^ ]* class=off insn=QMMA' "$work/fe_off.err" || { echo "FAIL: no class=off line for QMMA: $(grep -m2 '^host_gpu_refused' "$work/fe_off.err")"; fails=1; }
-  # (ELECT, sm_90: a form no card run has shown safe: class never in turbo, exact refuses it too)
-  PROG=fit90 fitoff elect nvidia/h100
-  grep -q '^mode=elect sum=1$' "$work/off_f_elect.out" || { echo "FAIL: the sm_90 build of fit elect printed: $(cat "$work/off_f_elect.out")"; fails=1; }
-  PROG=fit90 run fe_elect elect VGPU_GPU=nvidia/h100 STUB_SM=90 STUB_MP=132 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 "${reachx[@]}" || { echo "FAIL: the turbo elect run failed"; fails=1; }
-  ! grep -q '^cuModuleLoadData$' "$work/fe_elect.log" && grep -q '^host_gpu_refused: kernel=[^ ]* class=never insn=ELECT' "$work/fe_elect.err" || { echo "FAIL: ELECT (an sm_90 form no card run has shown safe) was not refused as class never: $(calls fe_elect); $(grep -m2 '^host_gpu_refused' "$work/fe_elect.err")"; fails=1; }
-  diff -q "$work/off_f_elect.out" "$work/fe_elect.out" > /dev/null || { echo "FAIL: the elect refusal changes the output"; fails=1; }
+  # (QMMA, ELECT and the PTX atomic below need nvcc 12.8 or later: 12.0 has no FP8 mma, and the sm_90 elect and the PTX module differ on 12.4)
+  if (( nvv >= 128 )); then
+    # (QMMA, FP8 tensor cores, sm_89: no class names it, and a card that has it runs it)
+    PROG=fit89 fitoff qmma nvidia/rtx4090
+    for m in turbo exact; do
+      PROG=fit89 run "fe_$m" qmma VGPU_GPU=nvidia/rtx4090 STUB_SM=89 STUB_MP=128 VGPU_HOST_GPU=$m VGPU_HOST_GPU_LOG=1 "${reachx[@]}" || { echo "FAIL: the $m qmma run failed"; tail -5 "$work/fe_$m.err"; fails=1; }
+      diff -q "$work/off_f_qmma.out" "$work/fe_$m.out" > /dev/null || { echo "FAIL: $m changes the output of fit89 qmma"; fails=1; }
+    done
+    grep -q '^cuModuleLoadData$' "$work/fe_turbo.log" && grep -q '^image elf sm_89$' "$work/fe_turbo.log" || { echo "FAIL: a kernel with an instruction no class names did not reach the card in turbo mode: $(calls fe_turbo); $(grep -m3 host_gpu "$work/fe_turbo.err")"; fails=1; }
+    grep -q '^host_gpu_refused:' "$work/fe_turbo.err" && { echo "FAIL: turbo refused a kernel with an unlisted instruction: $(grep -m1 '^host_gpu_refused' "$work/fe_turbo.err")"; fails=1; }
+    grep -q 'classes: .*unlisted' "$work/fe_turbo.err" || { echo "FAIL: the kernel's classes do not include unlisted: $(grep -m2 'classes:' "$work/fe_turbo.err")"; fails=1; }
+    ! grep -q '^cuModuleLoadData$' "$work/fe_exact.log" || { echo "FAIL: exact mode sent a kernel with an unlisted instruction to the card: $(calls fe_exact)"; fails=1; }
+    PROG=fit89 run fe_off qmma VGPU_GPU=nvidia/rtx4090 STUB_SM=89 STUB_MP=128 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_TURBO_OFF=unlisted "${reachx[@]}" || { echo "FAIL: the qmma run with unlisted off failed"; fails=1; }
+    ! grep -q '^cuModuleLoadData$' "$work/fe_off.log" || { echo "FAIL: VGPU_HOST_GPU_TURBO_OFF=unlisted did not keep the kernel in the simulator: $(calls fe_off)"; fails=1; }
+    grep -q '^host_gpu_refused: kernel=[^ ]* class=off insn=QMMA' "$work/fe_off.err" || { echo "FAIL: no class=off line for QMMA: $(grep -m2 '^host_gpu_refused' "$work/fe_off.err")"; fails=1; }
+    # (ELECT, sm_90: a form no card run has shown safe: class never in turbo, exact refuses it too)
+    PROG=fit90 fitoff elect nvidia/h100
+    grep -q '^mode=elect sum=1$' "$work/off_f_elect.out" || { echo "FAIL: the sm_90 build of fit elect printed: $(cat "$work/off_f_elect.out")"; fails=1; }
+    PROG=fit90 run fe_elect elect VGPU_GPU=nvidia/h100 STUB_SM=90 STUB_MP=132 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 "${reachx[@]}" || { echo "FAIL: the turbo elect run failed"; fails=1; }
+    ! grep -q '^cuModuleLoadData$' "$work/fe_elect.log" && grep -q '^host_gpu_refused: kernel=[^ ]* class=never insn=ELECT' "$work/fe_elect.err" || { echo "FAIL: ELECT (an sm_90 form no card run has shown safe) was not refused as class never: $(calls fe_elect); $(grep -m2 '^host_gpu_refused' "$work/fe_elect.err")"; fails=1; }
+    diff -q "$work/off_f_elect.out" "$work/fe_elect.out" > /dev/null || { echo "FAIL: the elect refusal changes the output"; fails=1; }
+  fi
   # 48. a simulated H100 (sm_90) on an sm_86 card: turbo mode runs the card's own sm_86 cubin; exact mode is off.
   fitoff tiny nvidia/h100
   PROG=fit run h_turbo tiny VGPU_GPU=nvidia/h100 STUB_SM=86 STUB_MP=28 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the turbo run of an H100 profile on an sm_86 card failed"; tail -5 "$work/h_turbo.err"; fails=1; }
@@ -840,15 +844,17 @@ if [[ "$cc" == 86 ]]; then
   PROG=fit run lf_run wide VGPU_HOST_GPU=turbo STUB_CARD_OK=1 STUB_LAUNCH_FAIL=701 || { echo "FAIL: the run against a card that refuses the launch failed (exit $?): $(tail -3 "$work/lf_run.err")"; fails=1; }
   grep -q 'wide.* failed on the card (error 701); mode off, the simulator runs it' "$work/lf_run.err" || { echo "FAIL: a launch the card refused was not said: $(grep -m2 host_gpu "$work/lf_run.err")"; fails=1; }
   diff -q "$work/off_f_wide.out" "$work/lf_run.out" > /dev/null || { echo "FAIL: a launch the card refused changes the output of fit wide"; fails=1; }
-  # 54. a module the card compiles from PTX obeys the turbo switches as a cubin does: a float atomic in it is kept out by VGPU_HOST_GPU_ATOMICS=0 and TURBO_OFF=atomics
-  # (the class of a PTX module is that of all its kernels: its first kernel's launch is refused for the atomic of another)
-  FIT_ATOM=1 PROG=fit75p run pa_on tiny VGPU_HOST_GPU=turbo || { echo "FAIL: the PTX atomic run failed"; fails=1; }
-  grep -q '^cuModuleLoadData$' "$work/pa_on.log" && grep -q '^image ptx$' "$work/pa_on.log" || { echo "FAIL: PTX with a float atomic did not reach the card by default: $(calls pa_on)"; fails=1; }
-  for sw in VGPU_HOST_GPU_ATOMICS=0 VGPU_HOST_GPU_TURBO_OFF=atomics; do
-    FIT_ATOM=1 PROG=fit75p run pa_off tiny VGPU_HOST_GPU=turbo "$sw" || { echo "FAIL: the PTX atomic run with $sw failed"; fails=1; }
-    ! grep -q '^cuModuleLoadData$' "$work/pa_off.log" || { echo "FAIL: $sw did not keep a PTX module with a float atomic out of the card: $(calls pa_off)"; fails=1; }
-    grep -q '^host_gpu_refused: kernel=[^ ]* class=\(atomics\|off\) insn=PTX' "$work/pa_off.err" || { echo "FAIL: $sw: no class line for the PTX module: $(grep -m2 '^host_gpu_refused' "$work/pa_off.err")"; fails=1; }
-  done
+  if (( nvv >= 128 )); then
+    # 54. a module the card compiles from PTX obeys the turbo switches as a cubin does: a float atomic in it is kept out by VGPU_HOST_GPU_ATOMICS=0 and TURBO_OFF=atomics
+    # (the class of a PTX module is that of all its kernels: its first kernel's launch is refused for the atomic of another)
+    FIT_ATOM=1 PROG=fit75p run pa_on tiny VGPU_HOST_GPU=turbo || { echo "FAIL: the PTX atomic run failed"; fails=1; }
+    grep -q '^cuModuleLoadData$' "$work/pa_on.log" && grep -q '^image ptx$' "$work/pa_on.log" || { echo "FAIL: PTX with a float atomic did not reach the card by default: $(calls pa_on)"; fails=1; }
+    for sw in VGPU_HOST_GPU_ATOMICS=0 VGPU_HOST_GPU_TURBO_OFF=atomics; do
+      FIT_ATOM=1 PROG=fit75p run pa_off tiny VGPU_HOST_GPU=turbo "$sw" || { echo "FAIL: the PTX atomic run with $sw failed"; fails=1; }
+      ! grep -q '^cuModuleLoadData$' "$work/pa_off.log" || { echo "FAIL: $sw did not keep a PTX module with a float atomic out of the card: $(calls pa_off)"; fails=1; }
+      grep -q '^host_gpu_refused: kernel=[^ ]* class=\(atomics\|off\) insn=PTX' "$work/pa_off.err" || { echo "FAIL: $sw: no class line for the PTX module: $(grep -m2 '^host_gpu_refused' "$work/pa_off.err")"; fails=1; }
+    done
+  fi
   # 55. variables in a card image that is not the simulator's: host_gpu_vars built for sm_80 and sm_86, an sm_80 card, the simulator on sm_86 (it runs the sm_86 image): the card's own
   # sm_80 cubin has the same layout, is given the simulator's addresses (no relocation left against a variable) and the kernels reach the card.
   PROG=vars80 run va_80 vars STUB_SM=80 STUB_MP=108 VGPU_HOST_GPU=turbo VGPU_HOST_GPU_LOG=1 || { echo "FAIL: the sm_80 card vars run failed"; tail -3 "$work/va_80.err"; fails=1; }
