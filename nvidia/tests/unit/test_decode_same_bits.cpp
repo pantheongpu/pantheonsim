@@ -30,6 +30,9 @@
 // older architecture, none that is not a MUFU), and the differences are only the F16 / BF16 mod, f[1] (.F16) and f[2] (.BF16) and the
 // text they print; the corpora digest is UNCHANGED (no word of the real-code corpora differs). ***
 //
+// *** 2026-11-17: the flipped and random digests were re-recorded for #694 (a RET word with a condition predicate in bits 87-90 now keeps it
+// as a source). The corpora digest is unchanged. ***
+//
 // VGPU_DECODE_PRINT=1 prints the digests (to regenerate the table after a decoder change that is meant to change
 // them); VGPU_DECODE_DUMP=<dir> writes the full dump of every pass, so two builds can be diffed to see which
 // instruction differs; VGPU_DECODE_BENCH=1 times decode and to_text over the corpora.
@@ -182,7 +185,7 @@ VTEST(words_with_flipped_bits_decode_to_the_same_bits) {
     words.push_back({w, 16 * (rng.next() % 4096)});
   }
   const std::vector<int> archs = {75, 86, 90, 100, 120};
-  check("flipped", run_pass("flipped", words, archs), "b62dc7622b513d146b88f6c6f9bc2c55");
+  check("flipped", run_pass("flipped", words, archs), "5d947662020b86895d1439b2f225e319");
 }
 
 VTEST(random_opcodes_decode_to_the_same_bits) {
@@ -195,7 +198,7 @@ VTEST(random_opcodes_decode_to_the_same_bits) {
     words.push_back({w, 16 * (rng.next() % 4096)});
   }
   const std::vector<int> archs = {80, 89, 103, 120};
-  check("random", run_pass("random", words, archs), "396dd752c0a00ae7820e00eba0e86239");
+  check("random", run_pass("random", words, archs), "3046eb52f152ff413ef240b963eb1503");
 }
 
 VTEST(bench_decode) {

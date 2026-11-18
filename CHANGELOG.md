@@ -15,6 +15,15 @@ release says what runs and what it produces, never how fast a real GPU would run
   every line of its sm_75 build is the RTX 3060's, so the SASS executor's answer for `half_form_30` (HMUL2.F32 on sm_75) is the one that is wrong; it is still left
   out of the sm_75 SASS comparison. docs/matrix-numerics.md.
 - **OpenCL on the MI455X is documented as an upstream ROCm limit, and `amd_opencl` expects it** (issue #651). ROCm's `libamdocl64`, 7.1.0 and 7.2.4 alike, logs `Unsupported HSA device gfx1250` and drops the device although the simulator offers both agents; the other nine GPUs list both devices and pass. `amd/mi455x` is back in the test's cases and passes only when the runtime says exactly that (a missing device with any other reason still fails); if a ROCm release lists the device its checks run. The CI job unpacks ROCm 7.2.4's OpenCL runtime now (`fetch-rocm-opencl.sh DIR [VERSION]`).
+- **AMD counters: cache lines of global and flat accesses** (issue #650, the second half). `VGPU_DISPATCH_STATS` also prints `vmem_lines_rd` and `vmem_lines_wr`, the distinct vector L1 lines the active lanes touch (64 bytes on CDNA, 128 on RDNA and gfx1250; the table is in `docs/cli.md`).
+  It is modelled, not verified against a card, and no rocprofiler counter is mapped to it. The test is `test_amd_gcn_cache_lines`.
+- **Turbo mode sends cooperative launches and launches with an argument into mapped host memory to the card** (issue #661). A cooperative launch (grid-wide barrier) goes
+  through `cuLaunchCooperativeKernel` when the card holds the grid at once; mapped host buffers are registered with the driver at their own addresses. Results are the
+  card's, as in turbo; `VGPU_HOST_GPU_COOP=0` and `VGPU_HOST_GPU_HOSTMAP=0` keep them in the simulator. Textures stay refused (design note, `docs/perf-design/14-turbo-textures-design.md`).
+- **Host-GPU size rules: the first big launch of a young process is sampled** (issues #656, #659). A launch of 65,536 threads or more whose kernel has a loop is asked neither
+  the static floor nor the process's age for its sample while the process has spent nothing on samples (one sample, 3 to 14 ms). On an A10G, CUDA Samples mergeSort goes from
+  2.30 s to 0.58 s, MC_EstimatePiInlineP from 4.09 s to 0.29 s and MC_SingleAsianOptionP from 4.09 s to 0.77 s, outputs identical, 15 other programs within 6 %.
+  `VGPU_HOST_GPU_FIRST_BIG=<threads>` sets the size, 0 is the rule before (`turbof0` in `tools/bench/hostgpu/run.py`); exact mode and `VGPU_HOST_GPU_FIT=0` only, the default turbo sends every fitting launch already.
 - **CI: the playground host can take burst jobs when two of its three slots are free** (`tools/burst-runners/host-burst.sh`, docs/ci.md).
 - **A SASS `RET` with a condition predicate returns only the lanes where both predicates hold** (issue #691). On sm_90 ptxas ends a `__noinline__`
   function that returns early when two cells are equal with a `RET` whose second predicate sits in the same bits as `BRA` and `EXIT` have it; the decoder

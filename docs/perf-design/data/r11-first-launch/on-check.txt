@@ -1,0 +1,27 @@
+hecbench-radixsort2-cuda off 0 on 1
+   new: _ZN3cub17CUB_300001_SM_8606detail1 960 x 128 est 0.007148 send 0 cost 0.003110 launch_s 0.012039
+hecbench-silu-cuda off 1 on 1
+   new: _Z19silu_forward_kernelPKfPfm 4096 x 64 est 0.008103 send 0 cost 0.002153 launch_s 0.014807
+   gone: _Z20silu_backward_kernelPKfS0_Pfm 2048
+polybench-3MM off 0 on 1
+   new: _Z11mm3_kernel1iiiiiPfS_S_ 1024 x 256 est 0.243139 send 0 cost 0.006901 launch_s 0.399823
+polybench-GEMM off 0 on 1
+   new: _Z11gemm_kerneliiiffPfS_S_ 1024 x 256 est 0.266893 send 0 cost 0.005161 launch_s 0.435910
+rodinia-particlefilter_float off 4 on 1
+   gone: _Z10sum_kernelPdi 20
+   gone: _Z17likelihood_kernelPdS_S_S_S_PiS 20
+rodinia-pathfinder off 0 on 1
+   new: _Z14dynproc_kerneliPiS_S_iiii 463 x 256 est 0.022325 send 0 cost 0.006986 launch_s 0.039138
+samples-MC_EstimatePiInlineP off 1 on 1
+   new: _Z7initRNGP17curandStateXORWOWj 782 x 128 est 0.948846 send 1 cost 0.011612 launch_s -1
+   gone: _Z12computeValueIfEvPjP17curandSta 782
+samples-MC_SingleAsianOptionP off 2 on 1
+   new: _Z7initRNGP17curandStateXORWOWj 782 x 128 est 0.947335 send 1 cost 0.011579 launch_s -1
+   gone: _Z13generatePathsIfEvPT_P17curandS 782
+   gone: _Z12computeValueIfEvPT_PKS0_PK11As 782
+samples-dct8x8 off 2 on 1
+samples-histogram off 2 on 3
+samples-mergeSort off 1 on 2
+   new: _Z21mergeSortSharedKernelILj1EEvPj 4096 x 512 est 0.796879 send 1 cost 0.007254 launch_s -1
+samples-segmentationTreeThrust off 4 on 3
+59 programs compared; 12 differ

@@ -17,8 +17,11 @@
 // memory (swizzle, permute, bpermute, the global wave sync and the counters of ds_append and ds_consume).
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <string_view>
+
+#include "vgpu/amd_gcn.hpp"
 
 namespace vgpu::amd::gcn {
 
@@ -175,6 +178,40 @@ inline uint32_t lds_bank_conflicts(const uint32_t* addr, uint64_t exec, const Ld
     }
   }
   return total;
+}
+
+// ---- cache lines of global and flat accesses -------------------------------------------------------------------------
+//
+// MODELLED, not checked against a card: RDNA2's rocprof lists no TCP or L2 request counters, and no other target was measured.
+// A wave's access counts the distinct vector L1 cache lines its active lanes touch (a lane's bytes may cross a line), the
+// definition the rocprofiler-compute docs give for "Cache Accesses" (the vL1D's cache line lookups, after coalescing; a line used
+// in part counts whole). Line size per target, and where it comes from:
+//   gfx90a (CDNA2)            64 B  documented: rocprofiler-compute "Vector L1 cache (vL1D)": the vL1D line is 64B on "current
+//                                   AMD Instinct MI CDNA accelerators and GCN GPUs" (and "may vary"). (GCN, gfx9 before gfx90a: same, not a target here.)
+//   gfx942, gfx950 (CDNA3/4)  64 B  inferred from that sentence; no AMD document found names the MI300 or MI350 vL1D line (a
+//                                   third-party article says 128 B for CDNA3: unconfirmed). Their L2 line is not stated either.
+//   gfx1100 (RDNA3), gfx1200 (RDNA4), gfx1030 (RDNA2)
+//                             128 B documented for RDNA3.5 (rocprofiler-compute "System Speed-of-Light", RDNA: GL0, GL1 and GL2 move
+//                                   one 128-byte line or request); unknown for RDNA2, RDNA3 and RDNA4 (and RDNA1), where 128 B is assumed.
+//   gfx1250 (CDNA5)           128 B unknown, assumed as for RDNA (no document found).
+// No rocprofiler counter is mapped: the docs found name the metric ("Cache Accesses"), not a TCP counter, so none is claimed.
+inline uint32_t vl1d_line_bytes(Target t) {
+  switch (t) {
+    case Target::Gfx90a: case Target::Gfx942: case Target::Gfx950: return 64;
+    default: return 128;
+  }
+}
+
+// The distinct lines of `line` bytes that the lanes of `exec` touch, each moving `bytes` from its address `addr[lane]`.
+inline uint32_t cache_lines(const uint64_t* addr, uint64_t exec, uint32_t bytes, uint32_t line) {
+  uint64_t ids[128];   // (a lane moves at most 16 bytes: two lines at the most)
+  uint32_t n = 0;
+  for (; exec; exec &= exec - 1) {
+    const uint64_t a = addr[__builtin_ctzll(exec)];
+    for (uint64_t l = a / line; l <= (a + bytes - 1) / line; ++l) ids[n++] = l;
+  }
+  std::sort(ids, ids + n);
+  return static_cast<uint32_t>(std::unique(ids, ids + n) - ids);
 }
 
 }  // namespace vgpu::amd::gcn
