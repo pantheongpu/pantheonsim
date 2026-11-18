@@ -7,6 +7,11 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **`mma.sync` after a lane-divergent branch gives the right result when the compiler laid the blocks out of order** (issue #699). The PTX interpreter runs the path with the
+  lowest pc first, which reconverges a warp only if every forward branch goes to a higher pc. PoCL's CUDA driver (LLVM NVPTX) wrote the loop's latch block before the loop,
+  so after the sign branch the lanes that took it ran on into the next pass and issued its `mma.sync` alone, reading the other lanes' fragments before they had written
+  them (608 of 768 results wrong from the second pass on). A body that has such a branch now runs its paths in a reverse post-order of the control-flow graph
+  (`EntryFn::order`); a body already in order runs as before. The test is `e2e_driver_mma_divergence`.
 - **The compute capability 12.0 Blackwell profiles sum by the Hopper rule, measured on an RTX PRO 6000 Blackwell Server Edition** (issue #664). `rtx-pro-6000-server`
   (`measured`) and `rtx5090`, `rtx-pro-4500`, `rtx-pro-6000`, `rtx-pro-6000-max-q` (`inferred` from it) took the sequential f32 sum before: wmma, `mma.sync` and SASS
   `HMMA` in f16, bf16 and tf32 now give the card's bits (both probes print the H100's lines, 60 of 60 and 169 of 169; FTTN's motivating example 191.875 instead of 0;

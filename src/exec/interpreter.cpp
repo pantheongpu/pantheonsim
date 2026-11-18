@@ -3526,8 +3526,15 @@ class Interpreter {
   // How long a path may wait to issue before select_path gives it the turn.
   static constexpr uint64_t kStarvedSteps = 1024;
 
-  // Merges paths sitting at the same pc and returns the index of the one with
-  // the lowest pc, which is the path that runs next.
+  // Where a path at pc stands in the order paths run in: the pc itself, or the pc's place in EntryFn::order for a body that is not laid out
+  // with every forward branch going up.
+  size_t path_rank(size_t pc) const {
+    const auto& order = cur_->order;
+    return order.empty() ? pc : pc < order.size() ? order[pc] : order.size() + pc;
+  }
+
+  // Merges paths sitting at the same pc and returns the index of the one that
+  // runs next: the lowest pc, or the lowest place in the body's order.
   size_t select_path(Warp& w) {
     if (w.paths.size() == 1) {
       w.paths[0].parked = Path::kRunnable;   // alone: nothing left to wait for
@@ -3548,7 +3555,7 @@ class Interpreter {
     // Lowest pc first, among the paths not waiting at a barrier.
     size_t best = w.paths.size();
     for (size_t i = 0; i < w.paths.size(); ++i)
-      if (!w.paths[i].parked && (best == w.paths.size() || w.paths[i].pc < w.paths[best].pc))
+      if (!w.paths[i].parked && (best == w.paths.size() || path_rank(w.paths[i].pc) < path_rank(w.paths[best].pc)))
         best = i;
     if (best == w.paths.size()) best = 0;   // cannot happen: bar.sync keeps one runnable
     // Lowest pc first is what reconverges a warp promptly, but on its own it
@@ -3756,7 +3763,7 @@ class Interpreter {
         // this pc (it merges the two), or is lower, or has waited past kStarvedSteps. Otherwise it stamps this one.
         bool other = false;
         for (size_t i = 0; i < nothers; ++i) other |= others[i] == pc;
-        for (size_t i = 0; i < nlive; ++i) other |= live_pc[i] < pc || steps - live_issued[i] > kStarvedSteps;
+        for (size_t i = 0; i < nlive; ++i) other |= path_rank(live_pc[i]) < path_rank(pc) || steps - live_issued[i] > kStarvedSteps;
         if (other) break;
         path.issued_at = steps;
       }

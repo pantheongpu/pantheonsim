@@ -3438,6 +3438,14 @@ if(TARGET vgpucublas)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
 
+  # mma.sync after a lane-divergent branch (issue #699), from the PTX PoCL's CUDA driver wrote: six passes, the second on with a split warp before them.
+  add_test(NAME e2e_driver_mma_divergence
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh driver_mma_divergence cuda)
+  set_tests_properties(e2e_driver_mma_divergence PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
   # Two PEs on two devices that have no peer path (the rtx3060 profile, as the card's pair): NVSHMEM refuses the
   # job, as NVIDIA's does ("Peer GPU 1 is not accessible").
   if(TARGET vgpunvshmem)

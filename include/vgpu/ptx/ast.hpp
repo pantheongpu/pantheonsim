@@ -1480,6 +1480,8 @@ const std::vector<std::string>& opcode_names();
 // Decodes fn.body into fn.micro. Pure function of the body.
 struct EntryFn;
 void build_micro(EntryFn& fn);
+// Fills EntryFn::order (see there).
+void build_order(EntryFn& fn);
 
 // Numbers every call slot name of the module (the slots the instructions use and the callees' parameter and return
 // names) and stores the numbers in the instructions and functions. Run once after parsing.
@@ -1545,6 +1547,11 @@ struct EntryFn {
   std::vector<MicroOp> micro;
   // The 64-bit constants the MicroOps of f64 arithmetic and mov name by position.
   std::vector<uint64_t> micro_consts;
+  // The order paths of a diverged warp run in, when the body's own order is not one that works: lowest pc first only reconverges a warp if
+  // every forward branch goes to a higher pc, and a compiler may put a block that the loop's latch jumps to before the loop (LLVM's NVPTX
+  // does). Then order[pc] is pc's place in a reverse post-order of the control-flow graph, without the back edges. Empty when the body is
+  // already in such an order, which is the usual case.
+  std::vector<uint32_t> order;
   std::map<std::string, Type> reg_decls;      // declared virtual registers
   // Dense register numbering used by the interpreter's flat register file.
   std::map<std::string, uint32_t> reg_ids;
