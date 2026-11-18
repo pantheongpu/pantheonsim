@@ -7,6 +7,21 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- **The e4m3 and e5m2 `mma.sync` forms sum as the recorded cards' vectors do: Ada's own sum on sm_89, the f16 sum behind ptxas's conversion on sm_90 and sm_100** (issue #664). The
+  forms took the sequential f32 sum on every device but sm_120 (and, on sm_90 and sm_100, the SASS engine already ran the card's f16 `HMMA` while the PTX engine
+  did not: the engines disagreed on 164 to 219 of every 500 of the recorded vectors below). The 5,000 e4m3 and 5,000 e5m2 vectors each, f32 and f16 accumulators, that Khattak and
+  Mikaitis recorded (arXiv 2512.07004) are now reproduced bit for bit by both engines: RTX 1000 Ada and L40S by the new `ada` sum (chunks of 16 products, terms cut 13
+  bits below the largest, an f32 result cut to 13 fraction bits; before: 500 of 500 mismatches on every f32 file and 118 to 138 of 500 on the f16 ones), H100, H200
+  and B200 by `via_f16` (a conversion to f16 and two `HMMA.16816`, K split by bit 1 of the index, the accumulator added afterwards by `FADD` or `HADD2`: the SASS of
+  both architectures says so; before, PTX engine only: 164 to 219 of 500 mismatches). New profile keys `numerics.tensor_sum_fp8` (`sequential | ada | via_f16`)
+  and its numbers, `inferred` everywhere: no card of ours ran an FP8 form. l4, l40, l40s, rtx4080, rtx4090 and rtx6000-ada get `ada`; the h100, h200 and gh200
+  profiles and b200 and gb200 get `via_f16`; sm_120 (its own narrow-float sum, measured), b300, vr200, thor and gb10 are unchanged. `VGPU_TC_EXACT=0` gives the
+  earlier sequential results back. `wgmma`, `tcgen05.mma` and the sparse forms are unchanged: the H100 and H200 FP8 sets were recorded through `wgmma` with a zero
+  accumulator and a rule fits them (chunks of 32, cut 13 bits down, result cut to 13 bits: 100 of 100), not yet implemented. Tests: `test_tc_fp8`,
+  `test_profile`, and `e2e_tcpapers` (24 recorded vectors a file, both engines, and the sequential sum must fail them). docs/numerics/fp8-vectors.md.
+- **FTTN on the simulator, every NVIDIA profile with a tensor core, both engines, redone against the current profiles** (issue #664): the earlier rows for b200 and
+  the sm_120 profiles predated their Hopper rule. docs/numerics/fttn-simulators.md (`tools/fttn/sim_table.py`), and a page per profile that says what is measured on
+  a card, published, inferred or unknown: docs/numerics/per-profile.md.
 - **The compute capability 12.0 Blackwell profiles sum by the Hopper rule, measured on an RTX PRO 6000 Blackwell Server Edition** (issue #664). `rtx-pro-6000-server`
   (`measured`) and `rtx5090`, `rtx-pro-4500`, `rtx-pro-6000`, `rtx-pro-6000-max-q` (`inferred` from it) took the sequential f32 sum before: wmma, `mma.sync` and SASS
   `HMMA` in f16, bf16 and tf32 now give the card's bits (both probes print the H100's lines, 60 of 60 and 169 of 169; FTTN's motivating example 191.875 instead of 0;

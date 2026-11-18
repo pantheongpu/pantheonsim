@@ -1681,6 +1681,8 @@ vgpu_unit_test(test_simd)
 vgpu_unit_test(test_tc_ampere)
 # The vector kernels of that sum against its scalar form, bit for bit, over random and adversarial operands (on the tiles the dispatcher gives them).
 vgpu_unit_test(test_tc_ampere_fast)
+# The e4m3 / e5m2 tensor-core sums (include/vgpu/exec/tc_fp8.hpp): recorded Ada vectors, an independent form, special values, what each profile names.
+vgpu_unit_test(test_tc_fp8)
 # IMMA.16816 / 16832 (8-bit operands) straight from the registers (include/vgpu/exec/imma_frag.hpp) against the definition, every sign combination.
 vgpu_unit_test(test_imma_frag)
 # LDSM's data movement (include/vgpu/exec/ldsm.hpp) against the element-at-a-time form it replaced, rows anywhere in the array and at a page's end.

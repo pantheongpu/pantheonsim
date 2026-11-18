@@ -112,7 +112,13 @@ from the loaded profile**; no engine compares a compute capability for it (`tc86
 | `tensor_sum_grid` | integer | A chunk's terms are cut at `2^(top - grid)`: 25, 26. |
 | `tensor_sum_published` | `ampere` or `hopper` (optional, only beside `tensor_sum: sequential`) | The model the literature gives the device, which no card of ours has checked and no recorded data covers. Never in force by default: `VGPU_TC_EXACT=published` turns it on (no profile uses it now: `b200` and `gb200` have the rule in force). |
 
+| `tensor_sum_fp8` | `sequential`, `ada` or `via_f16` (optional) | The sum of the e4m3 and e5m2 `mma.sync` forms (`vgpu::Fp8Sum`, `include/vgpu/exec/tc_fp8.hpp`). Absent is `sequential`. `ada`: chunks of 16, terms cut at `2^(top - 14)`, an f32 result cut to 13 fraction bits. `via_f16`: ptxas turns the form into f16 `HMMA`s, so the `tensor_sum` rule sums them and C is added afterwards (needs a `tensor_sum` that is not `sequential`). |
+| `tensor_sum_fp8_chunk`, `_grid`, `_out_bits` | integers (with `ada` only) | 16, 14, 13: written out as the f16 numbers are. Absent with `sequential` and `via_f16`. |
+
 Rules the loader enforces (a profile that breaks one does not load, and the message names the file and the key):
+
+- `tensor_sum_fp8: ada` needs its three numbers and they must be 16, 14 and 13; `sequential` and `via_f16` must have none; `via_f16` needs a
+  `tensor_sum` other than `sequential`; the numbers without the name are refused (`test_profile`).
 
 - The three numbers are required with `ampere` and `hopper` and must be that model's (8 / 4 / 25, 16 / 8 / 26); with `sequential`
   they must be absent. The engines implement these two rules (scalar code for both, vector kernels for the first), not a sum of any

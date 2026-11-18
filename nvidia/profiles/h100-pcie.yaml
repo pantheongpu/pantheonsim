@@ -62,7 +62,10 @@ numerics:
   tensor_sum_chunk: 16             # products to a chunk, f16 and bf16
   tensor_sum_chunk_tf32: 8         # ... tf32
   tensor_sum_grid: 26              # a chunk's terms are cut at 2^(top - 26)
+  tensor_sum_fp8: via_f16          # sequential | ada | via_f16: the e4m3 and e5m2 forms (mma.sync), summed as f16 ones are
 provenance:
+  inferred: [numerics.tensor_sum_fp8]
   measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]
 evidence:
   numerics: "card: NVIDIA H100 PCIe (this model), Lambda; driver: 570.148.08; toolkit: nvcc 12.8.93; date: 2026-11-15. Both probes print the card lines (nvidia/tests/data/simd_lane_forms.h100.txt, float_half_forms.h100.txt), the same from sm_80, sm_86 and sm_89 builds; FTTN; a dump of 8,388,608 wmma results, every one the hopper rule (tools/fttn/tc_dump_check.cpp). docs/matrix-numerics.md"
+  numerics.tensor_sum_fp8: "inferred, NOT run by us on a card. ptxas turns an FP8 mma.sync for sm_90 into a conversion to f16 and HMMA (the SASS shows F2FP.F16.E4M3.UNPACK_B), so the device's f16 rule sums the products. The 5,000 e4m3 and 5,000 e5m2 vectors with an f16 accumulator that Khattak and Mikaitis (arXiv 2512.07004) recorded on an H100 and on an H200 are reproduced by it; their f32-accumulator sets were recorded through wgmma with a zero accumulator and say nothing about mma.sync. docs/numerics/fp8-vectors.md, docs/matrix-numerics.md"
