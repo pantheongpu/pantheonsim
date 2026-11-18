@@ -52,7 +52,7 @@ __global__ void elect(int* p) {
 
 // An FP8 tensor-core multiply (QMMA on sm_89): an instruction no turbo class names, which runs on an sm_89 card.
 __global__ void qmma(int* p) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890   // sm_90 ptxas refuses the FP8 mma
   unsigned a0 = threadIdx.x, a1 = 1, a2 = 2, a3 = 3, b0 = 4, b1 = 5;
   float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
   asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"

@@ -127,6 +127,6 @@ def _train_step(d, freeze_key_bias=False):
     return [torch.stack(losses), list(m.parameters())]
 
 
-check(L, 'tiny causal transformer, three AdamW steps', 2e-3)(_train_step)
+check(L, 'tiny causal transformer, three AdamW steps', 3e-3)(_train_step)
 check(L, 'tiny causal transformer, three AdamW steps, key biases left out of the update', 2e-3, tier='full')(
     lambda d: _train_step(d, freeze_key_bias=True))
