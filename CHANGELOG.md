@@ -8,6 +8,30 @@ release says what runs and what it produces, never how fast a real GPU would run
 ## Unreleased
 
 - **CI: the runs of merged, closed and superseded pull requests are cancelled.** After a PR merged, its sanitizer jobs kept shared runners for hours while the open PRs queued behind them. `ci/cancel-stale-runs.sh`, a second step of the cancel-conflicting-prs workflow (after every push to main and every 20 minutes), cancels every queued or running pull_request run whose head commit is not the head of an open PR. Push, schedule and dispatch runs are not touched.
+- **`mma.sync` after a lane-divergent branch gives the right result when the compiler laid the blocks out of order** (issue #699). The PTX interpreter runs the path with the
+  lowest pc first, which reconverges a warp only if every forward branch goes to a higher pc. PoCL's CUDA driver (LLVM NVPTX) wrote the loop's latch block before the loop,
+  so after the sign branch the lanes that took it ran on into the next pass and issued its `mma.sync` alone, reading the other lanes' fragments before they had written
+  them (608 of 768 results wrong from the second pass on). A body that has such a branch now runs its paths in a reverse post-order of the control-flow graph
+  (`EntryFn::order`); a body already in order runs as before. The test is `e2e_driver_mma_divergence`.
+- **`VGPU_RACE` no longer reports shared-memory atomics from different warps as a race** (issue #700). `atom.shared.*` and `red.shared.*` on one word between two `bar.sync`
+  stopped a launch with a write-read race; they are ordered by the hardware, so only an atomic against another warp's plain load or store of the word is reported now
+  (a plain `st.shared` from two warps still is). `VGPU_RACE_CONTINUE=1` is new: it prints each race to stderr, once per instruction and kind, and lets the launch go on.
+  The SASS executor has no race detector. Tests: `test_exec3`, `test_launch_env`.
+- **The e4m3 and e5m2 `mma.sync` forms sum as the recorded cards' vectors do: Ada's own sum on sm_89, the f16 sum behind ptxas's conversion on sm_90 and sm_100** (issue #664). The
+  forms took the sequential f32 sum on every device but sm_120 (and, on sm_90 and sm_100, the SASS engine already ran the card's f16 `HMMA` while the PTX engine
+  did not: the engines disagreed on 164 to 219 of every 500 of the recorded vectors below). The 5,000 e4m3 and 5,000 e5m2 vectors each, f32 and f16 accumulators, that Khattak and
+  Mikaitis recorded (arXiv 2512.07004) are now reproduced bit for bit by both engines: RTX 1000 Ada and L40S by the new `ada` sum (chunks of 16 products, terms cut 13
+  bits below the largest, an f32 result cut to 13 fraction bits; before: 500 of 500 mismatches on every f32 file and 118 to 138 of 500 on the f16 ones), H100, H200
+  and B200 by `via_f16` (a conversion to f16 and two `HMMA.16816`, K split by bit 1 of the index, the accumulator added afterwards by `FADD` or `HADD2`: the SASS of
+  both architectures says so; before, PTX engine only: 164 to 219 of 500 mismatches). New profile keys `numerics.tensor_sum_fp8` (`sequential | ada | via_f16`)
+  and its numbers, `inferred` everywhere: no card of ours ran an FP8 form. l4, l40, l40s, rtx4080, rtx4090 and rtx6000-ada get `ada`; the h100, h200 and gh200
+  profiles and b200 and gb200 get `via_f16`; sm_120 (its own narrow-float sum, measured), b300, vr200, thor and gb10 are unchanged. `VGPU_TC_EXACT=0` gives the
+  earlier sequential results back. `wgmma`, `tcgen05.mma` and the sparse forms are unchanged: the H100 and H200 FP8 sets were recorded through `wgmma` with a zero
+  accumulator and a rule fits them (chunks of 32, cut 13 bits down, result cut to 13 bits: 100 of 100), not yet implemented. Tests: `test_tc_fp8`,
+  `test_profile`, and `e2e_tcpapers` (24 recorded vectors a file, both engines, and the sequential sum must fail them). docs/numerics/fp8-vectors.md.
+- **FTTN on the simulator, every NVIDIA profile with a tensor core, both engines, redone against the current profiles** (issue #664): the earlier rows for b200 and
+  the sm_120 profiles predated their Hopper rule. docs/numerics/fttn-simulators.md (`tools/fttn/sim_table.py`), and a page per profile that says what is measured on
+  a card, published, inferred or unknown: docs/numerics/per-profile.md.
 - **Removed: host-GPU offload (`VGPU_HOST_GPU=exact` and `turbo`).** The public simulator no longer sends any launch to a real GPU: it is the plain simulator
   only, and every run gives the same bits on any machine. Gone with it: the setting `host_gpu` and `host_gpu_log` (`vgpu config` and the settings file),
   `VGPU_HOST_GPU` and the whole `VGPU_HOST_GPU_*` family (`_LOG`, `_VERIFY`, `_TIMEOUT`, `_WIDER`, `_DIV`, `_SQRT`, `_START_*`, `_SAMPLE*`, `_FIRST_BIG`, `_SHORT`,

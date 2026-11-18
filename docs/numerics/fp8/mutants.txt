@@ -1,0 +1,21 @@
+# Mutation evidence, pantheonsim.com host (capped container, 2026-11-18): one thing changed at a time in a copy of the tree; each mutant must fail.
+# Unit mutants (tests/unit/test_tc_fp8.cpp, built standalone against the unmutated library):
+F = grid (one bit more)                                   killed: card_vectors agrees_with_an_independent_form
+F = grid - 2                                              killed: card_vectors agrees_with_an_independent_form the_corners
+terms rounded to nearest, not cut                         killed: card_vectors agrees_with_an_independent_form the_corners
+result keeps all 23 bits                                  killed: card_vectors agrees_with_an_independent_form
+f16 result cut, not rounded                               killed: card_vectors agrees_with_an_independent_form
+f16 grid 11 bits                                          killed: card_vectors agrees_with_an_independent_form
+subnormal operand exponent unclamped                      killed: agrees_with_an_independent_form
+infinity returns at once (no carry to the next chunk)     killed: special_values
+no NaN for 0 x inf                                        killed: special_values
+f16 overflow not an infinity                              killed: agrees_with_an_independent_form special_values
+a zero sum is -0                                          killed: special_values
+ada chunk 8 (include/vgpu/profile.hpp kAdaFp8Rule)        killed: card_vectors profiles_name_their_fp8_sum
+ada grid 15                                               killed: card_vectors profiles_name_their_fp8_sum
+ada out bits 14                                           killed: card_vectors profiles_name_their_fp8_sum
+# Engine mutants (src/exec/interpreter.cpp rebuilt; the 24-vector samples of nvidia/tests/data/tcpapers/fp8 on the PTX engine, mismatches of 24):
+PTX K split in halves, not by bit 1 of the index          killed: B200 e5m2 f16 accumulator 8, H100 e4m3 f16 accumulator 9 (B200 e4m3 f32: 0)
+PTX accumulator inside the chain, not added afterwards    killed: 24, 24, 24 (B200 e4m3 f32, B200 e5m2 f16, H100 e4m3 f16)
+# Not distinguishable by any data: the exponent a zero term counts at (MMA-Sim: -132, f16 -20). With e4m3 and e5m2 operands every other term is
+# above it, so it was left out of the rule rather than kept as a number nothing checks.

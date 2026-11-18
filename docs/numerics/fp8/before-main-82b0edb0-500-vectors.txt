@@ -1,0 +1,60 @@
+l40s sm_89 L40S.e4m3.fp32  sass | e4m3 out=fp32 vectors=500 mismatches=500
+l40s sm_89 L40S.e4m3.fp32  ptx | e4m3 out=fp32 vectors=500 mismatches=500
+l40s sm_89 L40S.e5m2.fp32  sass | e5m2 out=fp32 vectors=500 mismatches=500
+l40s sm_89 L40S.e5m2.fp32  ptx | e5m2 out=fp32 vectors=500 mismatches=500
+l40s sm_89 Ada.e4m3.fp16  sass | e4m3 out=fp16 vectors=500 mismatches=118
+l40s sm_89 Ada.e4m3.fp16  ptx | e4m3 out=fp16 vectors=500 mismatches=118
+l40s sm_89 Ada.e4m3.fp32  sass | e4m3 out=fp32 vectors=500 mismatches=500
+l40s sm_89 Ada.e4m3.fp32  ptx | e4m3 out=fp32 vectors=500 mismatches=500
+l40s sm_89 Ada.e5m2.fp16  sass | e5m2 out=fp16 vectors=500 mismatches=138
+l40s sm_89 Ada.e5m2.fp16  ptx | e5m2 out=fp16 vectors=500 mismatches=138
+l40s sm_89 Ada.e5m2.fp32  sass | e5m2 out=fp32 vectors=500 mismatches=500
+l40s sm_89 Ada.e5m2.fp32  ptx | e5m2 out=fp32 vectors=500 mismatches=500
+h100 sm_90 H100.e4m3.fp16  sass | e4m3 out=fp16 vectors=500 mismatches=0
+h100 sm_90 H100.e4m3.fp16  ptx | e4m3 out=fp16 vectors=500 mismatches=179
+h100 sm_90 H100.e4m3.fp16 --zero-c sass | e4m3 out=fp16 vectors=500 mismatches=500
+h100 sm_90 H100.e4m3.fp16 --zero-c ptx | e4m3 out=fp16 vectors=500 mismatches=500
+h100 sm_90 H100.e4m3.fp32  sass | e4m3 out=fp32 vectors=500 mismatches=500
+h100 sm_90 H100.e4m3.fp32  ptx | e4m3 out=fp32 vectors=500 mismatches=500
+h100 sm_90 H100.e4m3.fp32 --zero-c sass | e4m3 out=fp32 vectors=500 mismatches=307
+h100 sm_90 H100.e4m3.fp32 --zero-c ptx | e4m3 out=fp32 vectors=500 mismatches=307
+h100 sm_90 H100.e5m2.fp16  sass | e5m2 out=fp16 vectors=500 mismatches=0
+h100 sm_90 H100.e5m2.fp16  ptx | e5m2 out=fp16 vectors=500 mismatches=149
+h100 sm_90 H100.e5m2.fp16 --zero-c sass | e5m2 out=fp16 vectors=500 mismatches=499
+h100 sm_90 H100.e5m2.fp16 --zero-c ptx | e5m2 out=fp16 vectors=500 mismatches=499
+h100 sm_90 H100.e5m2.fp32  sass | e5m2 out=fp32 vectors=500 mismatches=500
+h100 sm_90 H100.e5m2.fp32  ptx | e5m2 out=fp32 vectors=500 mismatches=500
+h100 sm_90 H100.e5m2.fp32 --zero-c sass | e5m2 out=fp32 vectors=500 mismatches=186
+h100 sm_90 H100.e5m2.fp32 --zero-c ptx | e5m2 out=fp32 vectors=500 mismatches=186
+h100 sm_90 H200.e4m3.fp16  sass | e4m3 out=fp16 vectors=500 mismatches=0
+h100 sm_90 H200.e4m3.fp16  ptx | e4m3 out=fp16 vectors=500 mismatches=185
+h100 sm_90 H200.e4m3.fp16 --zero-c sass | e4m3 out=fp16 vectors=500 mismatches=500
+h100 sm_90 H200.e4m3.fp16 --zero-c ptx | e4m3 out=fp16 vectors=500 mismatches=499
+h100 sm_90 H200.e4m3.fp32  sass | e4m3 out=fp32 vectors=500 mismatches=500
+h100 sm_90 H200.e4m3.fp32  ptx | e4m3 out=fp32 vectors=500 mismatches=500
+h100 sm_90 H200.e4m3.fp32 --zero-c sass | e4m3 out=fp32 vectors=500 mismatches=307
+h100 sm_90 H200.e4m3.fp32 --zero-c ptx | e4m3 out=fp32 vectors=500 mismatches=307
+h100 sm_90 H200.e5m2.fp16  sass | e5m2 out=fp16 vectors=500 mismatches=0
+h100 sm_90 H200.e5m2.fp16  ptx | e5m2 out=fp16 vectors=500 mismatches=176
+h100 sm_90 H200.e5m2.fp16 --zero-c sass | e5m2 out=fp16 vectors=500 mismatches=500
+h100 sm_90 H200.e5m2.fp16 --zero-c ptx | e5m2 out=fp16 vectors=500 mismatches=500
+h100 sm_90 H200.e5m2.fp32  sass | e5m2 out=fp32 vectors=500 mismatches=500
+h100 sm_90 H200.e5m2.fp32  ptx | e5m2 out=fp32 vectors=500 mismatches=500
+h100 sm_90 H200.e5m2.fp32 --zero-c sass | e5m2 out=fp32 vectors=500 mismatches=186
+h100 sm_90 H200.e5m2.fp32 --zero-c ptx | e5m2 out=fp32 vectors=500 mismatches=186
+b200 sm_100 B200.e4m3.fp16  sass | e4m3 out=fp16 vectors=500 mismatches=0
+b200 sm_100 B200.e4m3.fp16  ptx | e4m3 out=fp16 vectors=500 mismatches=183
+rtx-pro-6000-server sm_120 B200.e4m3.fp16  sass | e4m3 out=fp16 vectors=500 mismatches=183
+rtx-pro-6000-server sm_120 B200.e4m3.fp16  ptx | e4m3 out=fp16 vectors=500 mismatches=183
+b200 sm_100 B200.e4m3.fp32  sass | e4m3 out=fp32 vectors=500 mismatches=0
+b200 sm_100 B200.e4m3.fp32  ptx | e4m3 out=fp32 vectors=500 mismatches=181
+rtx-pro-6000-server sm_120 B200.e4m3.fp32  sass | e4m3 out=fp32 vectors=500 mismatches=170
+rtx-pro-6000-server sm_120 B200.e4m3.fp32  ptx | e4m3 out=fp32 vectors=500 mismatches=170
+b200 sm_100 B200.e5m2.fp16  sass | e5m2 out=fp16 vectors=500 mismatches=0
+b200 sm_100 B200.e5m2.fp16  ptx | e5m2 out=fp16 vectors=500 mismatches=164
+rtx-pro-6000-server sm_120 B200.e5m2.fp16  sass | e5m2 out=fp16 vectors=500 mismatches=164
+rtx-pro-6000-server sm_120 B200.e5m2.fp16  ptx | e5m2 out=fp16 vectors=500 mismatches=164
+b200 sm_100 B200.e5m2.fp32  sass | e5m2 out=fp32 vectors=500 mismatches=0
+b200 sm_100 B200.e5m2.fp32  ptx | e5m2 out=fp32 vectors=500 mismatches=184
+rtx-pro-6000-server sm_120 B200.e5m2.fp32  sass | e5m2 out=fp32 vectors=500 mismatches=183
+rtx-pro-6000-server sm_120 B200.e5m2.fp32  ptx | e5m2 out=fp32 vectors=500 mismatches=183

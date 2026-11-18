@@ -1,0 +1,202 @@
+nvidia/t4 sm_75 fp16in sass | Tesla T4 Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/t4 sm_75 fp16in ptx | Tesla T4 Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/t4 sm_75 motivating sass | D=0.000000 bits=0x00000000 rc=0
+nvidia/t4 sm_75 motivating ptx | D=0.000000 bits=0x00000000 rc=0
+nvidia/rtx2080ti sm_75 fp16in sass | NVIDIA GeForce RTX 2080 Ti Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/rtx2080ti sm_75 fp16in ptx | NVIDIA GeForce RTX 2080 Ti Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/rtx2080ti sm_75 motivating sass | D=0.000000 bits=0x00000000 rc=0
+nvidia/rtx2080ti sm_75 motivating ptx | D=0.000000 bits=0x00000000 rc=0
+nvidia/rtx3060 sm_86 fp16in sass | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/rtx3060 sm_86 fp16in ptx | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/rtx3060 sm_86 bf16in sass | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 8 N.A.  rc=0
+nvidia/rtx3060 sm_86 bf16in ptx | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 8 N.A.  rc=0
+nvidia/rtx3060 sm_86 tf-fp32in sass | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/rtx3060 sm_86 tf-fp32in ptx | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/rtx3060 sm_86 fp64in sass | NVIDIA GeForce RTX 3060 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/rtx3060 sm_86 fp64in ptx | NVIDIA GeForce RTX 3060 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/rtx3060 sm_86 motivating sass | D=0.000000 bits=0x00000000 rc=0
+nvidia/rtx3060 sm_86 motivating ptx | D=0.000000 bits=0x00000000 rc=0
+nvidia/rtx3060 sm_80 fp16in sass | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/rtx3060 sm_80 fp16in ptx | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/rtx3060 sm_80 bf16in sass | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 8 N.A.  rc=0
+nvidia/rtx3060 sm_80 bf16in ptx | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 8 N.A.  rc=0
+nvidia/rtx3060 sm_80 tf-fp32in sass | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/rtx3060 sm_80 tf-fp32in ptx | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/rtx3060 sm_80 fp64in sass | NVIDIA GeForce RTX 3060 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/rtx3060 sm_80 fp64in ptx | NVIDIA GeForce RTX 3060 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/rtx3060 sm_80 motivating sass | D=0.000000 bits=0x00000000 rc=0
+nvidia/rtx3060 sm_80 motivating ptx | D=0.000000 bits=0x00000000 rc=0
+nvidia/rtx3060 sm_75 fp16in sass | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/rtx3060 sm_75 fp16in ptx | NVIDIA GeForce RTX 3060 Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/rtx3060 sm_75 motivating sass | D=0.000000 bits=0x00000000 rc=0
+nvidia/rtx3060 sm_75 motivating ptx | D=0.000000 bits=0x00000000 rc=0
+nvidia/a10g sm_86 fp16in sass | NVIDIA A10G Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/a10g sm_86 fp16in ptx | NVIDIA A10G Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/a10g sm_86 bf16in sass | NVIDIA A10G Yes 1 Trucate N.A. N.A. 8 N.A.  rc=0
+nvidia/a10g sm_86 bf16in ptx | NVIDIA A10G Yes 1 Trucate N.A. N.A. 8 N.A.  rc=0
+nvidia/a10g sm_86 tf-fp32in sass | NVIDIA A10G Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/a10g sm_86 tf-fp32in ptx | NVIDIA A10G Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/a10g sm_86 fp64in sass | NVIDIA A10G Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/a10g sm_86 fp64in ptx | NVIDIA A10G Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/a10g sm_86 motivating sass | D=0.000000 bits=0x00000000 rc=0
+nvidia/a10g sm_86 motivating ptx | D=0.000000 bits=0x00000000 rc=0
+nvidia/a100 sm_80 fp16in sass | NVIDIA A100-SXM4-80GB Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/a100 sm_80 fp16in ptx | NVIDIA A100-SXM4-80GB Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/a100 sm_80 bf16in sass | NVIDIA A100-SXM4-80GB Yes 1 Trucate N.A. N.A. 8 N.A.  rc=0
+nvidia/a100 sm_80 bf16in ptx | NVIDIA A100-SXM4-80GB Yes 1 Trucate N.A. N.A. 8 N.A.  rc=0
+nvidia/a100 sm_80 tf-fp32in sass | NVIDIA A100-SXM4-80GB Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/a100 sm_80 tf-fp32in ptx | NVIDIA A100-SXM4-80GB Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/a100 sm_80 fp64in sass | NVIDIA A100-SXM4-80GB Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/a100 sm_80 fp64in ptx | NVIDIA A100-SXM4-80GB Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/a100 sm_80 motivating sass | D=0.000000 bits=0x00000000 rc=0
+nvidia/a100 sm_80 motivating ptx | D=0.000000 bits=0x00000000 rc=0
+nvidia/l4 sm_89 fp16in sass | NVIDIA L4 Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/l4 sm_89 fp16in ptx | NVIDIA L4 Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/l4 sm_89 bf16in sass | NVIDIA L4 Yes 1 Trucate N.A. N.A. 8 N.A.  rc=0
+nvidia/l4 sm_89 bf16in ptx | NVIDIA L4 Yes 1 Trucate N.A. N.A. 8 N.A.  rc=0
+nvidia/l4 sm_89 tf-fp32in sass | NVIDIA L4 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/l4 sm_89 tf-fp32in ptx | NVIDIA L4 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/l4 sm_89 fp64in sass | NVIDIA L4 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/l4 sm_89 fp64in ptx | NVIDIA L4 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/l4 sm_89 motivating sass | D=0.000000 bits=0x00000000 rc=0
+nvidia/l4 sm_89 motivating ptx | D=0.000000 bits=0x00000000 rc=0
+nvidia/l40s sm_89 fp16in sass | NVIDIA L40S Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/l40s sm_89 fp16in ptx | NVIDIA L40S Yes 1 Trucate N.A. N.A. 8 RTN  rc=0
+nvidia/l40s sm_89 bf16in sass | NVIDIA L40S Yes 1 Trucate N.A. N.A. 8 N.A.  rc=0
+nvidia/l40s sm_89 bf16in ptx | NVIDIA L40S Yes 1 Trucate N.A. N.A. 8 N.A.  rc=0
+nvidia/l40s sm_89 tf-fp32in sass | NVIDIA L40S Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/l40s sm_89 tf-fp32in ptx | NVIDIA L40S Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/l40s sm_89 fp64in sass | NVIDIA L40S Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/l40s sm_89 fp64in ptx | NVIDIA L40S Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/l40s sm_89 motivating sass | D=0.000000 bits=0x00000000 rc=0
+nvidia/l40s sm_89 motivating ptx | D=0.000000 bits=0x00000000 rc=0
+nvidia/h100 sm_90 fp16in sass | NVIDIA H100 80GB HBM3 Yes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/h100 sm_90 fp16in ptx | NVIDIA H100 80GB HBM3 Yes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/h100 sm_90 bf16in sass | NVIDIA H100 80GB HBM3 Yes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/h100 sm_90 bf16in ptx | NVIDIA H100 80GB HBM3 Yes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/h100 sm_90 tf-fp32in sass | NVIDIA H100 80GB HBM3 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/h100 sm_90 tf-fp32in ptx | NVIDIA H100 80GB HBM3 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/h100 sm_90 fp64in sass | NVIDIA H100 80GB HBM3 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/h100 sm_90 fp64in ptx | NVIDIA H100 80GB HBM3 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/h100 sm_90 motivating sass | D=191.875000 bits=0x433fe000 rc=0
+nvidia/h100 sm_90 motivating ptx | D=191.875000 bits=0x433fe000 rc=0
+nvidia/h100-pcie sm_90 fp16in sass | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/h100-pcie sm_90 fp16in ptx | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/h100-pcie sm_90 bf16in sass | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/h100-pcie sm_90 bf16in ptx | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/h100-pcie sm_90 tf-fp32in sass | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/h100-pcie sm_90 tf-fp32in ptx | NVIDIA H100 PCIe Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/h100-pcie sm_90 fp64in sass | NVIDIA H100 PCIe Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/h100-pcie sm_90 fp64in ptx | NVIDIA H100 PCIe Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/h100-pcie sm_90 motivating sass | D=191.875000 bits=0x433fe000 rc=0
+nvidia/h100-pcie sm_90 motivating ptx | D=191.875000 bits=0x433fe000 rc=0
+nvidia/h200 sm_90 fp16in sass | NVIDIA H200 Yes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/h200 sm_90 fp16in ptx | NVIDIA H200 Yes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/h200 sm_90 bf16in sass | NVIDIA H200 Yes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/h200 sm_90 bf16in ptx | NVIDIA H200 Yes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/h200 sm_90 tf-fp32in sass | NVIDIA H200 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/h200 sm_90 tf-fp32in ptx | NVIDIA H200 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/h200 sm_90 fp64in sass | NVIDIA H200 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/h200 sm_90 fp64in ptx | NVIDIA H200 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/h200 sm_90 motivating sass | D=191.875000 bits=0x433fe000 rc=0
+nvidia/h200 sm_90 motivating ptx | D=191.875000 bits=0x433fe000 rc=0
+nvidia/gh200-480gb sm_90 fp16in sass | NVIDIA GH200 480GB Yes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/gh200-480gb sm_90 fp16in ptx | NVIDIA GH200 480GB Yes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/gh200-480gb sm_90 bf16in sass | NVIDIA GH200 480GB Yes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/gh200-480gb sm_90 bf16in ptx | NVIDIA GH200 480GB Yes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/gh200-480gb sm_90 tf-fp32in sass | NVIDIA GH200 480GB Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/gh200-480gb sm_90 tf-fp32in ptx | NVIDIA GH200 480GB Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/gh200-480gb sm_90 fp64in sass | NVIDIA GH200 480GB Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/gh200-480gb sm_90 fp64in ptx | NVIDIA GH200 480GB Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/gh200-480gb sm_90 motivating sass | D=191.875000 bits=0x433fe000 rc=0
+nvidia/gh200-480gb sm_90 motivating ptx | D=191.875000 bits=0x433fe000 rc=0
+nvidia/b200 sm_100 fp16in sass | NVIDIA B200 Yes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/b200 sm_100 fp16in ptx | NVIDIA B200 Yes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/b200 sm_100 bf16in sass | NVIDIA B200 Yes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/b200 sm_100 bf16in ptx | NVIDIA B200 Yes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/b200 sm_100 tf-fp32in sass | NVIDIA B200 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/b200 sm_100 tf-fp32in ptx | NVIDIA B200 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/b200 sm_100 fp64in sass | NVIDIA B200 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/b200 sm_100 fp64in ptx | NVIDIA B200 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/b200 sm_100 motivating sass | D=191.875000 bits=0x433fe000 rc=0
+nvidia/b200 sm_100 motivating ptx | D=191.875000 bits=0x433fe000 rc=0
+nvidia/gb200 sm_100 fp16in sass | NVIDIA GB200 Yes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/gb200 sm_100 fp16in ptx | NVIDIA GB200 Yes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/gb200 sm_100 bf16in sass | NVIDIA GB200 Yes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/gb200 sm_100 bf16in ptx | NVIDIA GB200 Yes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/gb200 sm_100 tf-fp32in sass | NVIDIA GB200 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/gb200 sm_100 tf-fp32in ptx | NVIDIA GB200 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/gb200 sm_100 fp64in sass | NVIDIA GB200 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/gb200 sm_100 fp64in ptx | NVIDIA GB200 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/gb200 sm_100 motivating sass | D=191.875000 bits=0x433fe000 rc=0
+nvidia/gb200 sm_100 motivating ptx | D=191.875000 bits=0x433fe000 rc=0
+nvidia/b300 sm_100 fp16in sass | NVIDIA B300 SXM6 AC Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/b300 sm_100 fp16in ptx | NVIDIA B300 SXM6 AC Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/b300 sm_100 bf16in sass | NVIDIA B300 SXM6 AC Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/b300 sm_100 bf16in ptx | NVIDIA B300 SXM6 AC Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/b300 sm_100 tf-fp32in sass | NVIDIA B300 SXM6 AC Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/b300 sm_100 tf-fp32in ptx | NVIDIA B300 SXM6 AC Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/b300 sm_100 fp64in sass | NVIDIA B300 SXM6 AC Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/b300 sm_100 fp64in ptx | NVIDIA B300 SXM6 AC Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/b300 sm_100 motivating sass | D=0.000000 bits=0x00000000 rc=0
+nvidia/b300 sm_100 motivating ptx | D=0.000000 bits=0x00000000 rc=0
+nvidia/vr200 sm_100 fp16in sass | NVIDIA Rubin Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/vr200 sm_100 fp16in ptx | NVIDIA Rubin Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/vr200 sm_100 bf16in sass | NVIDIA Rubin Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/vr200 sm_100 bf16in ptx | NVIDIA Rubin Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/vr200 sm_100 tf-fp32in sass | NVIDIA Rubin Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/vr200 sm_100 tf-fp32in ptx | NVIDIA Rubin Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/vr200 sm_100 fp64in sass | NVIDIA Rubin Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/vr200 sm_100 fp64in ptx | NVIDIA Rubin Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/vr200 sm_100 motivating sass | D=0.000000 bits=0x00000000 rc=0
+nvidia/vr200 sm_100 motivating ptx | D=0.000000 bits=0x00000000 rc=0
+nvidia/thor sm_110 fp16in sass | NVIDIA Jetson AGX Thor Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/thor sm_110 fp16in ptx | NVIDIA Jetson AGX Thor Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/thor sm_110 bf16in sass | NVIDIA Jetson AGX Thor Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/thor sm_110 bf16in ptx | NVIDIA Jetson AGX Thor Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/thor sm_110 tf-fp32in sass | NVIDIA Jetson AGX Thor Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/thor sm_110 tf-fp32in ptx | NVIDIA Jetson AGX Thor Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/thor sm_110 fp64in sass | NVIDIA Jetson AGX Thor Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/thor sm_110 fp64in ptx | NVIDIA Jetson AGX Thor Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/thor sm_110 motivating sass | D=0.000000 bits=0x00000000 rc=0
+nvidia/thor sm_110 motivating ptx | D=0.000000 bits=0x00000000 rc=0
+nvidia/rtx-pro-6000 sm_120 fp16in sass | NVIDIA RTX PRO 6000 Blackwell Workstation EditionYes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/rtx-pro-6000 sm_120 fp16in ptx | NVIDIA RTX PRO 6000 Blackwell Workstation EditionYes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/rtx-pro-6000 sm_120 bf16in sass | NVIDIA RTX PRO 6000 Blackwell Workstation EditionYes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/rtx-pro-6000 sm_120 bf16in ptx | NVIDIA RTX PRO 6000 Blackwell Workstation EditionYes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/rtx-pro-6000 sm_120 tf-fp32in sass | NVIDIA RTX PRO 6000 Blackwell Workstation EditionYes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/rtx-pro-6000 sm_120 tf-fp32in ptx | NVIDIA RTX PRO 6000 Blackwell Workstation EditionYes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/rtx-pro-6000 sm_120 fp64in sass | NVIDIA RTX PRO 6000 Blackwell Workstation EditionYes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/rtx-pro-6000 sm_120 fp64in ptx | NVIDIA RTX PRO 6000 Blackwell Workstation EditionYes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/rtx-pro-6000 sm_120 motivating sass | D=191.875000 bits=0x433fe000 rc=0
+nvidia/rtx-pro-6000 sm_120 motivating ptx | D=191.875000 bits=0x433fe000 rc=0
+nvidia/rtx-pro-6000-server sm_120 fp16in sass | NVIDIA RTX PRO 6000 Blackwell Server EditionYes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/rtx-pro-6000-server sm_120 fp16in ptx | NVIDIA RTX PRO 6000 Blackwell Server EditionYes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/rtx-pro-6000-server sm_120 bf16in sass | NVIDIA RTX PRO 6000 Blackwell Server EditionYes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/rtx-pro-6000-server sm_120 bf16in ptx | NVIDIA RTX PRO 6000 Blackwell Server EditionYes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/rtx-pro-6000-server sm_120 tf-fp32in sass | NVIDIA RTX PRO 6000 Blackwell Server EditionYes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/rtx-pro-6000-server sm_120 tf-fp32in ptx | NVIDIA RTX PRO 6000 Blackwell Server EditionYes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/rtx-pro-6000-server sm_120 fp64in sass | NVIDIA RTX PRO 6000 Blackwell Server EditionYes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/rtx-pro-6000-server sm_120 fp64in ptx | NVIDIA RTX PRO 6000 Blackwell Server EditionYes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/rtx-pro-6000-server sm_120 motivating sass | D=191.875000 bits=0x433fe000 rc=0
+nvidia/rtx-pro-6000-server sm_120 motivating ptx | D=191.875000 bits=0x433fe000 rc=0
+nvidia/rtx5090 sm_120 fp16in sass | NVIDIA GeForce RTX 5090 Yes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/rtx5090 sm_120 fp16in ptx | NVIDIA GeForce RTX 5090 Yes 1 Trucate N.A. N.A. 16 RTN  rc=0
+nvidia/rtx5090 sm_120 bf16in sass | NVIDIA GeForce RTX 5090 Yes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/rtx5090 sm_120 bf16in ptx | NVIDIA GeForce RTX 5090 Yes 1 Trucate N.A. N.A. 10 N.A.  rc=0
+nvidia/rtx5090 sm_120 tf-fp32in sass | NVIDIA GeForce RTX 5090 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/rtx5090 sm_120 tf-fp32in ptx | NVIDIA GeForce RTX 5090 Yes 1 Trucate N.A. N.A. 4 N.A.  rc=0
+nvidia/rtx5090 sm_120 fp64in sass | NVIDIA GeForce RTX 5090 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/rtx5090 sm_120 fp64in ptx | NVIDIA GeForce RTX 5090 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/rtx5090 sm_120 motivating sass | D=191.875000 bits=0x433fe000 rc=0
+nvidia/rtx5090 sm_120 motivating ptx | D=191.875000 bits=0x433fe000 rc=0
+nvidia/gb10 sm_120 fp16in sass | NVIDIA GB10 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/gb10 sm_120 fp16in ptx | NVIDIA GB10 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/gb10 sm_120 bf16in sass | NVIDIA GB10 Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/gb10 sm_120 bf16in ptx | NVIDIA GB10 Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/gb10 sm_120 tf-fp32in sass | NVIDIA GB10 Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/gb10 sm_120 tf-fp32in ptx | NVIDIA GB10 Yes 3 RTN Yes Yes 1 N.A.  rc=0
+nvidia/gb10 sm_120 fp64in sass | NVIDIA GB10 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/gb10 sm_120 fp64in ptx | NVIDIA GB10 Yes 3 RTN Yes Yes 1 RTN  rc=0
+nvidia/gb10 sm_120 motivating sass | D=0.000000 bits=0x00000000 rc=0
+nvidia/gb10 sm_120 motivating ptx | D=0.000000 bits=0x00000000 rc=0
