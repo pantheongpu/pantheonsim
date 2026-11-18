@@ -185,6 +185,10 @@ int cmd_info(const std::string& gpu, bool json) {
                     p.numerics.tensor_sum_chunk, p.numerics.tensor_sum_chunk_tf32, p.numerics.tensor_sum_grid);
       if (p.numerics.tensor_sum_published != vgpu::TensorSum::Sequential)
         std::printf(",\n    \"tensor_sum_published\": \"%s\"", vgpu::tensor_sum_name(p.numerics.tensor_sum_published));
+      if (p.numerics.tensor_sum_fp8 != vgpu::Fp8Sum::Sequential) std::printf(",\n    \"tensor_sum_fp8\": \"%s\"", vgpu::fp8_sum_name(p.numerics.tensor_sum_fp8));
+      if (vgpu::fp8_sum_rule(p.numerics.tensor_sum_fp8))
+        std::printf(",\n    \"tensor_sum_fp8_chunk\": %u,\n    \"tensor_sum_fp8_grid\": %d,\n    \"tensor_sum_fp8_out_bits\": %d",
+                    p.numerics.tensor_sum_fp8_chunk, p.numerics.tensor_sum_fp8_grid, p.numerics.tensor_sum_fp8_out_bits);
       std::printf("\n  ");
     }
     std::printf("},\n  \"provenance\": {");
@@ -250,6 +254,13 @@ int cmd_info(const std::string& gpu, bool json) {
       if (p.numerics.tensor_sum_published != vgpu::TensorSum::Sequential)
         std::printf("    tensor_sum_published:  %-10s [%s]  (not in force: VGPU_TC_EXACT=published)\n",
                     vgpu::tensor_sum_name(p.numerics.tensor_sum_published), tag_of("numerics.tensor_sum_published"));
+      if (p.numerics.tensor_sum_fp8 != vgpu::Fp8Sum::Sequential)
+        std::printf("    tensor_sum_fp8:        %-10s [%s]\n", vgpu::fp8_sum_name(p.numerics.tensor_sum_fp8), tag_of("numerics.tensor_sum_fp8"));
+      if (vgpu::fp8_sum_rule(p.numerics.tensor_sum_fp8)) {
+        std::printf("    tensor_sum_fp8_chunk:  %-10u [%s]\n", p.numerics.tensor_sum_fp8_chunk, tag_of("numerics.tensor_sum_fp8_chunk"));
+        std::printf("    tensor_sum_fp8_grid:   %-10d [%s]\n", p.numerics.tensor_sum_fp8_grid, tag_of("numerics.tensor_sum_fp8_grid"));
+        std::printf("    tensor_sum_fp8_out_bits: %-8d [%s]\n", p.numerics.tensor_sum_fp8_out_bits, tag_of("numerics.tensor_sum_fp8_out_bits"));
+      }
     }
     bool other = false;
     for (auto& [k, c] : p.provenance) {

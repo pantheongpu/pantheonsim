@@ -81,7 +81,7 @@ run; the other four were built for each architecture the simulator has a profile
   the paper's A100 row (extra alignment bits 1, FMA 8, truncation). The h100 profile prints 2 bits and FMA "0" (the program tops out
   below 16), carry 4: the Hopper rule's own numbers; not compared with a card. See `external-programs.txt`.
 - **Recorded vectors, the real comparison.** `model_validation/` of their repository holds 5,000 dot products a card and format with
-  the result of the card: V100, A100, A2, Ada, L40S, H100, H200, B200 (and FP8 sets we did not run). `khattak_vectors.cu` runs a
+  the result of the card: V100, A100, A2, Ada, L40S, H100, H200, B200 (and the FP8 sets, run in [fp8-vectors.md](fp8-vectors.md)). `khattak_vectors.cu` runs a
   vector as a wmma with the vector in row 0 of A and column 0 of B and compares bits. Mismatches out of 5,000, per file
   (f16 with f32 accumulator / f16 with f16 accumulator / bf16 / tf32):
 
@@ -142,8 +142,8 @@ Two things the method taught us, on the way:
 
 ## Not done
 
-- **FP8 (E4M3, E5M2) vectors.** The data sets hold 5,000 vectors for Ada, L40S, H100, H200 and B200; the simulator's `mma` FP8 forms
-  and Hopper's `wgmma` keep the sequential sum. A program through those instructions would run them; not written.
+- **FP8 (E4M3, E5M2) vectors.** Done since 2026-11-18 for `mma.sync` on both engines, 70,000 vectors: [fp8-vectors.md](fp8-vectors.md). Not done: `wgmma`
+  with FP8 (a rule fits the H100 and H200 files, the simulator's `wgmma` keeps the sequential sum) and the sparse forms.
 - **Making Blackwell's published rule the default** for the profiles with no recorded data. Done on 2026-11-16 for b200 and gb200 only
   (their B200 vectors agree with it, 0 of 20,000, and the sequential sum does not, 8,020). sm_103 (b300), sm_120 (RTX PRO 6000, 5090),
   thor, gb10 and vr200 stay sequential by default: no recorded data covers them. A one-line change per profile

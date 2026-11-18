@@ -60,6 +60,7 @@ asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.skip 2816\n.popsection")
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/sass_atomics.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
+#include "vgpu/exec/tc_fp8.hpp"
 #include "vgpu/exec/tile_mma.hpp"
 #include "vgpu/exec/wgmma.hpp"
 #include "vgpu/exec/tensormap.hpp"
@@ -284,6 +285,9 @@ struct WordShadow {
   uint32_t read_epoch = 0xFFFFFFFF;
   uint32_t write_epoch = 0xFFFFFFFF;
   uint16_t writer = 0xFFFF;         // warp that wrote it, 0xFFFF for none
+  // Atomics are ordered against each other, so they are kept apart from plain accesses: up to two different warps that did one this epoch.
+  uint32_t atomic_epoch = 0xFFFFFFFF;
+  uint16_t atomic_a = 0xFFFF, atomic_b = 0xFFFF;
 };
 
 struct SharedShadow {
@@ -725,6 +729,8 @@ std::atomic<bool> g_race{false};
 // default -- see the comment on `unobservable_write` for why those are not
 // races -- but the strict definition has its uses, so it stays reachable.
 std::atomic<bool> g_race_strict{false};
+// VGPU_RACE_CONTINUE=1: print each race and go on, instead of stopping the launch at the first.
+std::atomic<bool> g_race_continue{false};
 
 // Sampled together, once per launch. Caching either in a function-local static
 // makes it depend on which kernel in a process ran first -- which is how the
@@ -737,6 +743,7 @@ void refresh_modes(const LaunchEnv& env) {
   const char* race = env.race;
   g_race.store(race && (race[0] == '1' || race[0] == '2'), std::memory_order_relaxed);
   g_race_strict.store(race && race[0] == '2', std::memory_order_relaxed);
+  g_race_continue.store(env.race_continue && env.race_continue[0] == '1', std::memory_order_relaxed);
   const char* fast = env.fastpath;
   g_fast_path.store(!(fast && fast[0] == '0'), std::memory_order_relaxed);
   vgpu::exec::tc86::refresh_exact(env.tc_exact);   // VGPU_TC_EXACT=0: the earlier sequential tensor sums (include/vgpu/exec/tc_ampere.hpp)
@@ -3526,8 +3533,15 @@ class Interpreter {
   // How long a path may wait to issue before select_path gives it the turn.
   static constexpr uint64_t kStarvedSteps = 1024;
 
-  // Merges paths sitting at the same pc and returns the index of the one with
-  // the lowest pc, which is the path that runs next.
+  // Where a path at pc stands in the order paths run in: the pc itself, or the pc's place in EntryFn::order for a body that is not laid out
+  // with every forward branch going up.
+  size_t path_rank(size_t pc) const {
+    const auto& order = cur_->order;
+    return order.empty() ? pc : pc < order.size() ? order[pc] : order.size() + pc;
+  }
+
+  // Merges paths sitting at the same pc and returns the index of the one that
+  // runs next: the lowest pc, or the lowest place in the body's order.
   size_t select_path(Warp& w) {
     if (w.paths.size() == 1) {
       w.paths[0].parked = Path::kRunnable;   // alone: nothing left to wait for
@@ -3548,7 +3562,7 @@ class Interpreter {
     // Lowest pc first, among the paths not waiting at a barrier.
     size_t best = w.paths.size();
     for (size_t i = 0; i < w.paths.size(); ++i)
-      if (!w.paths[i].parked && (best == w.paths.size() || w.paths[i].pc < w.paths[best].pc))
+      if (!w.paths[i].parked && (best == w.paths.size() || path_rank(w.paths[i].pc) < path_rank(w.paths[best].pc)))
         best = i;
     if (best == w.paths.size()) best = 0;   // cannot happen: bar.sync keeps one runnable
     // Lowest pc first is what reconverges a warp promptly, but on its own it
@@ -3756,7 +3770,7 @@ class Interpreter {
         // this pc (it merges the two), or is lower, or has waited past kStarvedSteps. Otherwise it stamps this one.
         bool other = false;
         for (size_t i = 0; i < nothers; ++i) other |= others[i] == pc;
-        for (size_t i = 0; i < nlive; ++i) other |= live_pc[i] < pc || steps - live_issued[i] > kStarvedSteps;
+        for (size_t i = 0; i < nlive; ++i) other |= path_rank(live_pc[i]) < path_rank(pc) || steps - live_issued[i] > kStarvedSteps;
         if (other) break;
         path.issued_at = steps;
       }
@@ -5525,15 +5539,25 @@ class Interpreter {
   static bool detect_races() { return g_race.load(std::memory_order_relaxed); }
   static bool races_strict() { return g_race_strict.load(std::memory_order_relaxed); }
 
-  [[noreturn]] void report_race(const Instr& ins, const char* what, uint64_t word,
-                                uint32_t other_warp) {
-    ctx_fail(ins, -1, Err::DataRace,
-             std::string(what) + " on shared memory at byte offset " +
-                 std::to_string(word * 4) + ": warp " + std::to_string(cur_warp_) +
-                 " and warp " + std::to_string(other_warp) +
-                 " both reach it with no bar.sync between them, so which one wins is not "
-                 "something the program decided. Hardware usually hides this because warps "
-                 "advance together; it is a real race either way");
+  // Stops the launch with the race, or with VGPU_RACE_CONTINUE=1 prints it once per place and goes on.
+  void report_race(const Instr& ins, const char* what, uint64_t word, uint32_t other_warp) {
+    const std::string msg = std::string(what) + " on shared memory at byte offset " + std::to_string(word * 4) + ": warp " +
+                            std::to_string(cur_warp_) + " and warp " + std::to_string(other_warp) +
+                            " both reach it with no bar.sync between them, so which one wins is not "
+                            "something the program decided. Hardware usually hides this because warps "
+                            "advance together; it is a real race either way";
+    if (!g_race_continue.load(std::memory_order_relaxed)) ctx_fail(ins, -1, Err::DataRace, msg);
+    static std::mutex m;
+    static std::set<std::string> seen;
+    std::lock_guard<std::mutex> lock(m);
+    if (seen.size() >= 50) return;
+    if (!seen.insert(cur_->name + ":" + std::to_string(ins.line) + ":" + what).second) return;
+    try {
+      ctx_fail(ins, -1, Err::DataRace, msg);
+    } catch (const Error& e) {
+      std::fprintf(stderr, "%s\n", e.what());   // VGPU_RACE_CONTINUE: the launch goes on
+    }
+    if (seen.size() == 50) std::fprintf(stderr, "VirtualGPU: 50 races reported, the rest are not printed\n");
   }
 
   // True when the store leaves shared memory exactly as it found it.
@@ -5566,11 +5590,17 @@ class Interpreter {
                           bool is_write, uint64_t value = 0) {
     if (!ctx.shadow) return;
     SharedShadow& sh = *ctx.shadow;
-    const bool silent = is_write && unobservable_write(ctx, addr, bytes, value);
+    const bool atomic = in_atomic_;
+    const bool silent = !atomic && is_write && unobservable_write(ctx, addr, bytes, value);
     const uint64_t first = (addr - kSharedVaBase) / 4;
     const uint64_t last = (addr - kSharedVaBase + (bytes ? bytes - 1 : 0)) / 4;
     for (uint64_t w = first; w <= last && w < sh.words.size(); ++w) {
       WordShadow& s = sh.words[w];
+      // Another warp's atomic on the word this epoch: a plain access is not ordered against it.
+      if (!atomic && !silent && s.atomic_epoch == sh.epoch) {
+        const uint16_t other = s.atomic_a != cur_warp_ ? s.atomic_a : s.atomic_b;
+        if (other != 0xFFFF) report_race(ins, is_write ? "write-write race" : "write-read race", w, other);
+      }
       if (is_write) {
         if (!silent && s.write_epoch == sh.epoch && s.writer != 0xFFFF && s.writer != cur_warp_)
           report_race(ins, "write-write race", w, s.writer);
@@ -5583,16 +5613,29 @@ class Interpreter {
               break;
             }
         }
-        s.writer = static_cast<uint16_t>(cur_warp_);
-        s.write_epoch = sh.epoch;
+        if (!atomic) {
+          s.writer = static_cast<uint16_t>(cur_warp_);
+          s.write_epoch = sh.epoch;
+        }
       } else {
         if (s.write_epoch == sh.epoch && s.writer != 0xFFFF && s.writer != cur_warp_)
           report_race(ins, "write-read race", w, s.writer);
-        if (s.read_epoch != sh.epoch) {
-          s.readers = WarpSet{};
-          s.read_epoch = sh.epoch;
+        if (!atomic) {
+          if (s.read_epoch != sh.epoch) {
+            s.readers = WarpSet{};
+            s.read_epoch = sh.epoch;
+          }
+          s.readers.add(cur_warp_);
         }
-        s.readers.add(cur_warp_);
+      }
+      if (atomic) {
+        if (s.atomic_epoch != sh.epoch) {
+          s.atomic_epoch = sh.epoch;
+          s.atomic_a = static_cast<uint16_t>(cur_warp_);
+          s.atomic_b = 0xFFFF;
+        } else if (s.atomic_a != cur_warp_ && s.atomic_b == 0xFFFF) {
+          s.atomic_b = static_cast<uint16_t>(cur_warp_);
+        }
       }
     }
   }
@@ -10182,6 +10225,9 @@ class Interpreter {
           K % (op.ab_type == MmaElem::TF32 ? 4 : 8) == 0)
         return false;   // the chunked sum of an RTX 3060
       if (profile_.cc_major == 12 && narrow(op.ab_type) && narrow(op.b_type) && !op.acc_f16) return false;   // sm_120's narrow-float sum
+      if (narrow(op.ab_type) && narrow(op.b_type) && !op.sparse && profile_.cc_major != 12 &&
+          (vgpu::exec::tc86::fp8_rule(profile_) || vgpu::exec::tc86::fp8_via_f16(profile_)))
+        return false;   // the device's own FP8 sum (tc_fp8.hpp)
     }
     const uint32_t bits = b1 ? 1 : f64 ? 64 : frag_bits(ta), per_reg = f64 ? 1 : 32 / bits;
     const uint32_t a_regs = (M * K / (op.sparse ? 2 : 1)) / (W_ * per_reg), b_regs = (K * kN) / (W_ * per_reg);
@@ -10535,19 +10581,41 @@ class Interpreter {
     // An RTX 3060's tensor core (sm_86) sums f16, bf16 and tf32 products in chunks (include/vgpu/exec/tc_ampere.hpp), not one at a time
     // in f32: D for the whole tile first, then taken instead of the sequential sum below. Not the sparse, block-scaled or narrow forms.
     const vgpu::exec::tc86::SumRule* const tc_rule = vgpu::exec::tc86::sum_rule(profile_);
-    const bool tc86_sum = tc_rule && !op.sparse && !op.block_scale &&
-                          (op.ab_type == MmaElem::F16 || op.ab_type == MmaElem::BF16 || op.ab_type == MmaElem::TF32) &&
-                          op.b_type == op.ab_type && !op.acc_int && !op.acc_f64 && K % (op.ab_type == MmaElem::TF32 ? 4 : 8) == 0;
+    // The e4m3 and e5m2 forms (vgpu/exec/tc_fp8.hpp): an Ada core's own sum, or, where ptxas lowers them to f16 and HMMA (Hopper, datacenter
+    // Blackwell), the f16 sum of the device. sm_120's narrow-float core is the branch below.
+    const auto fp8_elem = [](MmaElem t) { return t == MmaElem::E4M3 || t == MmaElem::E5M2; };
+    const bool fp8_forms = fp8_elem(op.ab_type) && fp8_elem(op.b_type) && !op.sparse && !op.block_scale && !op.acc_int && !op.acc_f64;
+    const vgpu::Fp8SumRule* const fp8_rule = fp8_forms && profile_.cc_major != 12 ? vgpu::exec::tc86::fp8_rule(profile_) : nullptr;
+    const bool fp8_f16 = fp8_forms && tc_rule && K % 8 == 0 && vgpu::exec::tc86::fp8_via_f16(profile_);
+    const bool tc86_sum = (tc_rule && !op.sparse && !op.block_scale &&
+                           (op.ab_type == MmaElem::F16 || op.ab_type == MmaElem::BF16 || op.ab_type == MmaElem::TF32) &&
+                           op.b_type == op.ab_type && !op.acc_int && !op.acc_f64 && K % (op.ab_type == MmaElem::TF32 ? 4 : 8) == 0) ||
+                          fp8_f16;
     std::array<float, 16 * kN> Dtc{};
     if (tc86_sum) {
-      std::array<float, 16 * 16> Af{};
-      std::array<float, 16 * kN> Bf{}, Cf{};
-      for (uint32_t x = 0; x < M * K; ++x) Af[x] = static_cast<float>(A[x]);
-      for (uint32_t x = 0; x < K * kN; ++x) Bf[x] = static_cast<float>(B[x]);
+      std::array<float, 16 * 32> Af{};
+      std::array<float, 32 * kN> Bf{};
+      std::array<float, 16 * kN> Cf{};
+      // An FP8 form is, on these devices, two HMMA.16816 on f16 operands for K = 32 (the second starting from the first's result) that
+      // start from zero, and then the accumulator added on its own by an FADD (HADD2 for an f16 accumulator): not inside the sum. And ptxas
+      // splits K by bit 1 of the index, not in halves: the first takes k = 0 1 4 5 8 9 ..., the second k = 2 3 6 7 10 11 ... (the SASS of
+      // sm_90 and sm_100 says so, and the SASS engine runs it; the recorded B200 and H100 vectors agree).
+      uint32_t kmap[32];
+      for (uint32_t n = 0; n < K; ++n) kmap[n] = fp8_f16 && K == 32 ? (n < 16 ? (n / 2) * 4 + n % 2 : ((n - 16) / 2) * 4 + 2 + n % 2) : n;
+      for (uint32_t i = 0; i < M; ++i)
+        for (uint32_t n = 0; n < K; ++n) Af[i * K + n] = static_cast<float>(A[i * K + kmap[n]]);
+      for (uint32_t n = 0; n < K; ++n)
+        for (uint32_t j = 0; j < kN; ++j) Bf[n * kN + j] = static_cast<float>(B[kmap[n] * kN + j]);
       for (uint32_t x = 0; x < M * kN; ++x) Cf[x] = static_cast<float>(C[x]);
-      vgpu::exec::tc86::mma(*tc_rule, op.ab_type == MmaElem::TF32, M, kN, K,
-                            op.ab_type == MmaElem::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide, op.acc_f16, Af.data(), K,
-                            Bf.data(), kN, Cf.data(), kN, Dtc.data(), kN);
+      const int emin = op.ab_type == MmaElem::F16 || fp8_f16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide;
+      const uint32_t step = fp8_f16 ? 16 : K;
+      const std::array<float, 16 * kN> zero{};
+      for (uint32_t k0 = 0; k0 < K; k0 += step)
+        vgpu::exec::tc86::mma(*tc_rule, op.ab_type == MmaElem::TF32, M, kN, step, emin, op.acc_f16, Af.data() + k0, K, Bf.data() + k0 * kN, kN,
+                              k0 ? Dtc.data() : fp8_f16 ? zero.data() : Cf.data(), kN, Dtc.data(), kN);
+      if (fp8_f16)
+        for (uint32_t x = 0; x < M * kN; ++x)
+          Dtc[x] = op.acc_f16 ? static_cast<float>(f16_to_double(double_to_f16(static_cast<double>(Cf[x]) + static_cast<double>(Dtc[x])))) : Cf[x] + Dtc[x];
     }
     const int prev_round = std::fegetround();
     if (op.acc_f64) {
@@ -10586,6 +10654,10 @@ class Interpreter {
           double acc = C[i * kN + j];
           for (uint32_t k = 0; k < K; ++k) acc = std::fma(A[i * K + k], B[k * kN + j], acc);
           D[i * kN + j] = acc;
+        } else if (fp8_rule) {
+          D[i * kN + j] = vgpu::exec::tc86::fp8_dot(*fp8_rule, op.acc_f16, op.ab_type == MmaElem::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3,
+                                                    op.b_type == MmaElem::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3,
+                                                    &A[i * K], 1, &B[j], kN, K, C[i * kN + j]);
         } else if (narrow_tensor_core) {
           // sm_120's narrow-float tensor core: the exact sum, rounded once toward zero (mma_narrow_sum).
           double terms[256];
@@ -14354,6 +14426,7 @@ class Interpreter {
   // (exch), or by c if they equal b (cas), under the same striped lock the
   // other atomics take -- 16-byte atomicity is promised against other atomics.
   void exec_atom128(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    AtomicScope atomic_scope(in_atomic_);
     Lanes _s_base, s1, s2, s3, s4;
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     const Lanes& blo = read_operand(w, ctx, ins, op.b, s1);
@@ -14584,6 +14657,7 @@ class Interpreter {
   // packed .f16x2/.bf16x2 element is a word, and two .f16/.bf16 elements share
   // one: register 2i is its low half and 2i+1 its high.
   void exec_atom_vec(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    AtomicScope atomic_scope(in_atomic_);
     const bool wide = op.ty.bits == 32 || op.packed_half;   // one register per word
     const uint32_t nwords = wide ? op.vec : op.vec / 2u;
     const uint32_t bytes = nwords * 4u;
@@ -14651,6 +14725,7 @@ class Interpreter {
   }
 
   void exec_atom(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    AtomicScope atomic_scope(in_atomic_);
     if (op.vec > 1) {
       exec_atom_vec(w, ctx, ins, op, m);
       return;
@@ -16010,6 +16085,13 @@ class Interpreter {
   mutable const EntryFn* func_class_fn_ = nullptr;
   mutable const uint8_t* func_class_ = nullptr;
   uint32_t cur_warp_ = 0;     // which warp of the block is running, for race reports
+  bool in_atomic_ = false;    // inside atom/red: its shared-memory accesses are atomic ones for the race detector
+  struct AtomicScope {
+    bool& flag;
+    const bool was;
+    explicit AtomicScope(bool& f) : flag(f), was(f) { flag = true; }
+    ~AtomicScope() { flag = was; }
+  };
   bool fast_enabled_ = true;   // VGPU_FASTPATH, sampled at launch
   // The word that is non-zero while an arithmetic fault is armed (MemoryManager::alu_fault_armed's, taken once: the
   // hook is set when the device is made). Read at every instruction that could be hit, so not through mem_ each time.

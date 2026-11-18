@@ -1,0 +1,95 @@
+# fit_fp8.py output, host container, 2026-11-18. First: the Ada and L40S files (c rounded to binary16 for the f16 files); then the H100, H200 and B200 files (zero-C lines: --zero-c).
+vec/Ada.e4m3.fp32.txt: 300 finite vectors
+  L=16 F=13 rz13: 300/300
+  L=16 F=13 rz23: 240/300
+  L=32 F=13 rz13: 239/300
+  L= 8 F=13 rz13: 233/300
+  L=16 F=14 rz13: 209/300
+vec/Ada.e5m2.fp32.txt: 300 finite vectors
+  L=16 F=13 rz13: 300/300
+  L=32 F=13 rz13: 267/300
+  L= 8 F=13 rz13: 251/300
+  L=16 F=13 rz23: 239/300
+  L=16 F=14 rz13: 225/300
+vec/L40S.e4m3.fp32.txt: 300 finite vectors
+  L=16 F=13 rz13: 300/300
+  L=16 F=13 rz23: 240/300
+  L=32 F=13 rz13: 239/300
+  L= 8 F=13 rz13: 233/300
+  L=16 F=14 rz13: 209/300
+vec/L40S.e5m2.fp32.txt: 300 finite vectors
+  L=16 F=13 rz13: 300/300
+  L=32 F=13 rz13: 267/300
+  L= 8 F=13 rz13: 251/300
+  L=16 F=13 rz23: 239/300
+  L=16 F=14 rz13: 225/300
+vec/Ada.e4m3.fp16.txt: 150 finite vectors
+  L=16 F=13 rne16: 150/150
+  L=16 F=14 rne16: 143/150
+  L=16 F=16 rne16: 142/150
+  L=16 F=15 rne16: 142/150
+  L=16 F=28 rne16: 141/150
+vec/Ada.e5m2.fp16.txt: 150 finite vectors
+  L=16 F=13 rne16: 150/150
+  L=16 F=14 rne16: 142/150
+  L=16 F=12 rne16: 141/150
+  L=16 F=28 rne16: 139/150
+  L=16 F=27 rne16: 139/150
+# H100, H200, B200 (first 100 vectors, L 16 and 32; every line is the best 3 only of the sweep)
+== H100.e4m3.fp32 
+vec/H100.e4m3.fp32.txt: 100 finite vectors
+  L=32 F=28 rz23: 0/100
+  L=32 F=28 rz13: 0/100
+  L=32 F=27 rz23: 0/100
+  L=32 F=27 rz13: 0/100
+  L=32 F=26 rz23: 0/100
+== H100.e4m3.fp32 --zero-c
+vec/H100.e4m3.fp32.txt: 100 finite vectors
+  L=32 F=13 rz13: 100/100
+  L=16 F=13 rz13: 84/100
+  L=32 F=14 rz13: 79/100
+  L=32 F=15 rz13: 78/100
+  L=32 F=13 rz23: 76/100
+== B200.e4m3.fp32 
+vec/B200.e4m3.fp32.txt: 100 finite vectors
+  L=32 F=28 rz23: 64/100
+  L=32 F=27 rz23: 64/100
+  L=32 F=26 rz23: 64/100
+  L=32 F=25 rz23: 64/100
+  L=32 F=24 rz23: 61/100
+== B200.e4m3.fp32 --zero-c
+vec/B200.e4m3.fp32.txt: 100 finite vectors
+  L=32 F=28 rz23: 0/100
+  L=32 F=28 rz13: 0/100
+  L=32 F=27 rz23: 0/100
+  L=32 F=27 rz13: 0/100
+  L=32 F=26 rz23: 0/100
+== H200.e4m3.fp32 
+vec/H200.e4m3.fp32.txt: 100 finite vectors
+  L=32 F=28 rz23: 0/100
+  L=32 F=28 rz13: 0/100
+  L=32 F=27 rz23: 0/100
+  L=32 F=27 rz13: 0/100
+  L=32 F=26 rz23: 0/100
+== H200.e4m3.fp32 --zero-c
+vec/H200.e4m3.fp32.txt: 100 finite vectors
+  L=32 F=13 rz13: 100/100
+  L=16 F=13 rz13: 84/100
+  L=32 F=14 rz13: 79/100
+  L=32 F=15 rz13: 78/100
+  L=32 F=13 rz23: 76/100
+== H100.e5m2.fp32 
+vec/H100.e5m2.fp32.txt: 100 finite vectors
+  L=32 F=28 rz23: 0/100
+  L=32 F=28 rz13: 0/100
+  L=32 F=27 rz23: 0/100
+  L=32 F=27 rz13: 0/100
+  L=32 F=26 rz23: 0/100
+== H100.e5m2.fp32 --zero-c
+vec/H100.e5m2.fp32.txt: 100 finite vectors
+  L=32 F=13 rz13: 100/100
+  L=16 F=13 rz13: 93/100
+  L=32 F=14 rz13: 90/100
+  L=16 F=14 rz13: 90/100
+  L=32 F=15 rz13: 87/100
+DONE
