@@ -20,7 +20,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import app_smoke_ref as ref  # noqa: E402
 
-REF = os.path.join(os.environ.get('VGPU_E2E_DATA', os.path.join(HERE, '..', 'data')), 'pytorch_app_smoke.rtx3060.ref')
+DATA = os.environ.get('VGPU_E2E_DATA', os.path.join(HERE, '..', 'data'))
+# card slug -> what its header names
+CARDS = {'rtx3060': 'RTX 3060', 'a10g': 'A10G'}
 failures = []
 
 
@@ -34,9 +36,9 @@ def flip_last_bit(v):
     return struct.unpack('<f', struct.pack('<I', b ^ 1))[0]
 
 
-def main():
-    header, entries = ref.read_ref(REF)
-    expect(header and 'RTX 3060' in header[0] and 'torch' in header[0], 'the header names the card and torch version')
+def check_file(slug):
+    header, entries = ref.read_ref(os.path.join(DATA, 'pytorch_app_smoke.%s.ref' % slug))
+    expect(header and CARDS[slug] in header[0] and 'torch' in header[0], '%s: the header names the card and torch version' % slug)
     expect(list(entries) == list(ref.TOLERANCES), 'entries %s differ from the workloads %s' % (list(entries), list(ref.TOLERANCES)))
     # app_smoke.py's workload list is checked against the tolerance table in its own module (an assert at import);
     # here the source is read so the same holds without torch.
@@ -71,6 +73,15 @@ def main():
                 moved[i] = vals[i] + factor * tol * scale
                 ok, msg = ref.compare(e, shape, moved)
                 expect(ok == want, '%s: an error of %gx the tolerance gives %s (%s), wanted %s' % (name, factor, ok, msg, want))
+    return entries
+
+
+def main():
+    import glob
+    on_disk = sorted(os.path.basename(f).split('.')[1] for f in glob.glob(os.path.join(DATA, 'pytorch_app_smoke.*.ref')))
+    expect(on_disk == sorted(CARDS), 'reference files %s, the test knows %s' % (on_disk, sorted(CARDS)))
+    for slug in CARDS:
+        entries = check_file(slug)
     # Round trip through write_ref.
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, 'x.ref')

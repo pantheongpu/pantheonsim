@@ -36,10 +36,11 @@ expect() {  # expect <name> <expected> <actual>
 
 # What a real card replied (tests/e2e/ollama_card_ref.py): sixteen greedy tokens and their log-probabilities,
 # recorded on an RTX 3060 with this Ollama version. Checked only for the model it was recorded for.
-card_ref="$root/nvidia/tests/data/ollama_smollm2_rtx3060.card.json"
-card_check() {  # card_check <profile>: the server on $api against the card's reply
-  local out rc
-  out=$(python3 "$root/tests/e2e/ollama_card_ref.py" check --api "$api" --model "$model" --ref "$card_ref" 2>&1); rc=$?
+card_check() {  # card_check <profile>: the server on $api against the reply of a real card: the profile's own card (an A10G for
+                # nvidia/a10g), else the RTX 3060's
+  local out rc ref="$root/nvidia/tests/data/ollama_smollm2_${1#nvidia/}.card.json"
+  [[ -f $ref ]] || ref="$root/nvidia/tests/data/ollama_smollm2_rtx3060.card.json"
+  out=$(python3 "$root/tests/e2e/ollama_card_ref.py" check --api "$api" --model "$model" --ref "$ref" 2>&1); rc=$?
   sed "s|^|$1: vs the card: |" <<< "$out"
   [[ $rc == 0 ]] || fail=1
 }

@@ -6,7 +6,8 @@ application meets on a card: cuBLAS and cuDNN choose their own kernels, and the 
 of float16 results and the TF32 cut all differ. This script runs programs of the shapes real workloads
 have (gemm in four precisions, convolution forward and backward, a cuDNN LSTM, an MLP, a CNN with batch
 norm and a decoder trained a few steps, with logits, losses and greedy tokens) and compares what they
-produce with the tensors a real card produced, recorded in nvidia/tests/data/pytorch_app_smoke.rtx3060.ref.
+produce with the tensors a real card produced, recorded in nvidia/tests/data/pytorch_app_smoke.<card>.ref (rtx3060, a10g;
+APP_SMOKE_REF_CARD picks the file, rtx3060 by default).
 app_smoke_ref.py says, per workload, what is allowed to differ and why.
 
   app_smoke.py             run on the simulated GPU (run it with `vgpu run --preload`, as run_pytorch.sh
@@ -41,8 +42,10 @@ if not torch.version.cuda:
     print("SKIP: this PyTorch is not a CUDA build")
     sys.exit(0)
 
+# The card the reference was recorded on: APP_SMOKE_REF_CARD=a10g reads pytorch_app_smoke.a10g.ref (rtx3060 by default).
+REF_CARD = os.environ.get('APP_SMOKE_REF_CARD', 'rtx3060')
 REF_PATH = os.path.join(os.environ.get('VGPU_E2E_DATA', os.path.join(HERE, '..', 'data')),
-                        'pytorch_app_smoke.rtx3060.ref')
+                        f'pytorch_app_smoke.{REF_CARD}.ref')
 GPU = 'cuda'
 MIN_MARGIN = 0.02  # the top two logits of a recorded greedy token differ by at least this
 MARGINS = []
@@ -294,7 +297,9 @@ def record(path):
             noise = max(abs(x - y) for x, y in zip(a[1], b[1])) / scale
             if tol < 4 * noise:
                 bad.append(f"{name}: tolerance {tol:g} is under four times the card's run-to-run difference {noise:g}")
-    if min(MARGINS) < MIN_MARGIN:
+    if not MARGINS:
+        bad.append("gpt_greedy_tokens: no top-two logit gap was measured")
+    elif min(MARGINS) < MIN_MARGIN:
         bad.append(f"gpt_greedy_tokens: top-two logit gap {min(MARGINS):g} is under {MIN_MARGIN:g}; a token could flip")
     if bad:
         print("refusing to record:")

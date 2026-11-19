@@ -73,6 +73,17 @@ def main():
         got_rc, out = run(api, model, **change)
         if got_rc != rc or text not in out:
             bad.append('%s: exit %d, wanted %d; output %r' % (what, got_rc, rc, out[-300:]))
+    # Every card's file (rtx3060, a10g) is a whole record of the same request: run_ollama.sh picks one by profile.
+    import glob
+    for f in sorted(glob.glob(os.path.join(os.path.dirname(REF), 'ollama_smollm2_*.card.json'))):
+        r = json.load(open(f))
+        for k in ('card', 'ollama', 'model', 'digest', 'prompt', 'response', 'tokens', 'logprobs'):
+            if k not in r:
+                bad.append('%s has no %s' % (os.path.basename(f), k))
+        if r.get('model') != ref['model'] or r.get('prompt') != ref['prompt'] or len(r.get('logprobs', [])) != len(ref['logprobs']):
+            bad.append('%s records another request than the RTX 3060 file' % os.path.basename(f))
+        if r.get('digest') != ref['digest']:
+            bad.append('%s was recorded for another model digest' % os.path.basename(f))
     srv.shutdown()
     if bad:
         for b in bad:

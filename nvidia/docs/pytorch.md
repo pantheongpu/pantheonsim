@@ -142,7 +142,9 @@ paths tested here do not call them.
   reference is run on one profile per SASS image nightly (`app-smoke-nightly.yml`). Ollama's
   reply is held to a card's in the same way: `e2e_ollama` checks sixteen greedy tokens and their
   log-probabilities against `nvidia/tests/data/ollama_smollm2_rtx3060.card.json`
-  (`tests/e2e/ollama_card_ref.py`; drift detection tested by `ollama_card_ref`). Regenerate on a
+  (`tests/e2e/ollama_card_ref.py`; drift detection tested by `ollama_card_ref`). The `a10g` profile is held to an A10G's own records (`pytorch_app_smoke.a10g.ref` through `APP_SMOKE_REF_CARD=a10g`, as the nightly sets it;
+  `ollama_smollm2_a10g.card.json`, picked by `e2e_ollama` for `nvidia/a10g`), recorded 2026-11-19 on an AWS g5.xlarge (driver 595.112.07, torch 2.10.0+cu130,
+  Ollama 0.21.0). Its tensors equal the RTX 3060's bit for bit; Ollama's log-probabilities differ by up to 0.017. Regenerate on a
   real GPU with `app_smoke.py --write <file>` and `ollama_card_ref.py record`.
 - `e2e_pytorch_distributed`: `torch.distributed` across two processes, each its
   own simulated GPU, launched as torchrun launches them
