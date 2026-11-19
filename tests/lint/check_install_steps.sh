@@ -19,13 +19,15 @@ for s in prereqs build docker cuda hello-cuda rocm hello-hip; do
 done
 for f in hello.cu hello.hip; do check "install.md has file $f" "$([[ $names == *"file $f"* ]] && echo ok)"; done
 
-script=$("$runner" --print prereqs build cuda hello-cuda rocm hello-hip 2>&1)
+script=$("$runner" --print prereqs cuda rocm build hello-cuda hello-hip 2>&1)
 check "the steps make a script bash accepts" "$(bash -n <(printf '%s\n' "$script") 2>/dev/null && echo ok)"
 rm -f "$here/hello.cu" "$here/hello.hip"
 
 wf=$here/.github/workflows/clean-install.yml
 used=$(sed -n 's/^ *run: tests\/install\/run_doc_steps.sh //p' "$wf")
 for s in $used; do check "the workflow's step $s exists" "$([[ $names == *"step $s"* ]] && echo ok)"; done
+case " $used " in *" cuda "*" build "*) order=ok ;; *) order= ;; esac
+check "the workflow installs the toolkit before it builds (the shims are built against it)" "${order:-no}"
 check "the workflow is nightly" "$(grep -q '^  schedule:' "$wf" && echo ok)"
 
 cuda=$(sed -n 's/^CUDA=\${CUDA:-\(.*\)}$/\1/p' "$here/docs/install.md")

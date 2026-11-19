@@ -49,7 +49,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: The documented steps, in the page's order
-        run: tests/install/run_doc_steps.sh prereqs build cuda hello-cuda rocm hello-hip
+        run: tests/install/run_doc_steps.sh prereqs cuda rocm build hello-cuda hello-hip
 
   docker:
     name: the documented docker command

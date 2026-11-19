@@ -71,15 +71,16 @@ int main() {
     if (std::fabs(x[i].x - 1.f) > 1e-5f || std::fabs(x[i].y) > 1e-5f) { std::printf("FAIL fft bin %d\n", i); return 1; }
   CK(cufftDestroy(plan));
 
-  // cuRAND: uniform floats are in (0, 1], and the same seed gives the same numbers twice.
+  // cuRAND: uniform floats are in (0, 1], and two generators with the same seed give the same numbers.
   float *dr;
   CK(cudaMalloc(&dr, 2 * 256 * sizeof(float)));
-  curandGenerator_t g;
+  curandGenerator_t g, g2;
   CK(curandCreateGenerator(&g, CURAND_RNG_PSEUDO_DEFAULT));
+  CK(curandCreateGenerator(&g2, CURAND_RNG_PSEUDO_DEFAULT));
   CK(curandSetPseudoRandomGeneratorSeed(g, 1234));
+  CK(curandSetPseudoRandomGeneratorSeed(g2, 1234));
   CK(curandGenerateUniform(g, dr, 256));
-  CK(curandSetPseudoRandomGeneratorSeed(g, 1234));
-  CK(curandGenerateUniform(g, dr + 256, 256));
+  CK(curandGenerateUniform(g2, dr + 256, 256));
   std::vector<float> r(512);
   CK(cudaMemcpy(r.data(), dr, 512 * sizeof(float), cudaMemcpyDeviceToHost));
   for (int i = 0; i < 256; ++i) {
@@ -87,6 +88,7 @@ int main() {
     if (r[i] != r[256 + i]) { std::printf("FAIL curand repeat %d\n", i); return 1; }
   }
   CK(curandDestroyGenerator(g));
+  CK(curandDestroyGenerator(g2));
   std::printf("PASS\n");
   return 0;
 }
