@@ -27,3 +27,20 @@ A runner takes any job whose labels it has, so a pool is just one label on sever
 
 Public repositories need a runner group that allows them, and the repository's Settings > Actions > General should
 require approval for all outside collaborators, so a fork's pull request runs nothing until a maintainer approves it.
+
+## Changing a runner's registration
+
+Notes kept from the move of the runners to the organisation.
+
+* **Wait for an idle moment.** Stop a runner only while it has no `Runner.Worker` process, and check again right before
+  the stop: a job can start in the second between the check and the stop.
+* **Fetch the registration token last.** It lasts one hour, so get it after the wait, not before.
+* **Without root.** A runner can change its registration with nothing but `systemctl stop|start` of its own unit: stop
+  the unit, delete the old registration through the API, remove `.runner*` and `.credentials*` in the runner's
+  directory, run `config.sh --replace` with the new token and labels, start the unit. The unit keeps its old name,
+  which is cosmetic. `config.sh remove` needs root and is not required.
+* **"Still counts a job".** GitHub refuses to delete a runner it thinks is running a job. A lost job clears after a
+  minute or two: retry every 20 seconds.
+* **Keep what is beside the registration.** The runner's `.env` (memory-gate and clean-up hooks), its `_work` folder and
+  the systemd drop-in (`Slice=ci.slice`, `Restart=always`, `RestartSec=30`) are not part of the registration. Copy the
+  `.env` and write the drop-in again when a runner is added or its service is reinstalled.

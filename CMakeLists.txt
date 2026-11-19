@@ -17,6 +17,13 @@ if(VGPU_WERROR)
   add_compile_options(-Werror)
 endif()
 
+# Threads: the core library, the shims and most tests start host threads (std::thread, pthread_create). Before glibc 2.34 those
+# symbols are in a separate libpthread, so without this the link fails there with "undefined reference to pthread_create"
+# (seen on Rocky 8, glibc 2.28). For every target, because nearly every one either starts threads or links a library that does;
+# on glibc 2.34 and later, where libc has them, Threads::Threads is empty and the link lines do not change.
+find_package(Threads REQUIRED)
+link_libraries(Threads::Threads)
+
 # The interpreter is the hot path and benefits measurably from cross-TU
 # inlining. Enabled only for Release builds, and only if the toolchain
 # supports it, so debug builds and odd toolchains are unaffected.
@@ -1584,6 +1591,10 @@ set_tests_properties(test_sass_alu_runs_simd_base PROPERTIES ENVIRONMENT "VGPU_S
 vgpu_unit_test(test_sass_store_gate)
 add_test(NAME test_sass_store_gate_tier0 COMMAND test_sass_store_gate)
 set_tests_properties(test_sass_store_gate_tier0 PROPERTIES ENVIRONMENT "VGPU_TIER=0")
+# ELECT in the two spellings of ptxas (the predicate form of nvcc 12.8 and 13.0, the register-mask form of nvcc 12.4): one leader a warp, whichever toolchain built the kernel.
+vgpu_unit_test(test_sass_elect_forms)
+add_test(NAME test_sass_elect_forms_tier0 COMMAND test_sass_elect_forms)
+set_tests_properties(test_sass_elect_forms_tier0 PROPERTIES ENVIRONMENT "VGPU_TIER=0")
 # The run loop going on past S2R, ULDC, UMOV, USEL, PLOP3 and SEL where the chain would have started the next call there: same words, counters and clocks as the interpreter.
 vgpu_unit_test(test_sass_chain_cont)
 target_include_directories(test_sass_chain_cont PRIVATE src)   # (src/sass/jit.hpp: the statistics the linking check reads)

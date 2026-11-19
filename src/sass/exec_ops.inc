@@ -791,10 +791,10 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       });
       return;
     }
-    case Op::ELECT: {   // elect.sync: the lowest thread with the predicate leads
+    case Op::ELECT: {   // elect.sync: the lowest thread with the predicate leads (f[0] = 1: the threads in the register's mask, the sm_90 form of ptxas 12.4)
       Mask cand = 0;
       each_lane(ex, [&](unsigned l) {
-        if (pred(w, ins.src[0], l)) cand |= Mask{1} << l;
+        if (ins.f[0] ? ((ival(w, ins.src[0], l) >> l) & 1u) != 0 : pred(w, ins.src[0], l)) cand |= Mask{1} << l;
       });
       const unsigned leader = cand ? static_cast<unsigned>(std::countr_zero(cand)) : 32;
       each_lane(ex, [&](unsigned l) { set_pred(w, ins.dst[0], l, l == leader); });
