@@ -42,7 +42,7 @@ nvcc_host_compiler_fix
 if ! grep -rq VGPU_SASS_LOG "$root/nvidia/src" 2>/dev/null; then echo "SKIP: this simulator has no SASS path"; exit 0; fi
 work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-diffdet.XXXXXX")"
 keep=0
-trap '[[ $keep == 1 && -n ${VGPU_DIFF_KEEP:-} ]] && cp -r "$work" "$VGPU_DIFF_KEEP"; rm -rf "$work"' EXIT
+trap '[[ ( $keep == 1 || -n ${VGPU_DIFF_KEEP_ALWAYS:-} ) && -n ${VGPU_DIFF_KEEP:-} ]] && cp -r "$work" "$VGPU_DIFF_KEEP"; rm -rf "$work"' EXIT
 
 declare -A gpu=([sm_75]=nvidia/t4 [sm_80]=nvidia/a100 [sm_86]=nvidia/rtx3060 [sm_89]=nvidia/l4
                 [sm_90]=nvidia/h100 [sm_100]=nvidia/b200 [sm_120]=nvidia/rtx5090)
@@ -59,7 +59,7 @@ if [[ -n ${VGPU_NIGHTLY:-} ]]; then
     constant_table_xor:75 jit_loops:75 narrow_cvt:100 packed_f32x2:100:100"
 else
   def_archs="sm_86 sm_90"
-  def_progs="vector_add:75 device_intrinsics:75 atomic_cas:75 block_semaphore:75 cooperative_grid:75 alloca_stack:75
+  def_progs="vector_add:75 surface_formatted:75 sass_archs:75 group_ballot_barrier:75 device_intrinsics:75 atomic_cas:75 block_semaphore:75 cooperative_grid:75 alloca_stack:75
     named_barriers:75 textures:75 wmma_gemm:80 dsmem_cluster:90"
 fi
 archs=(${VGPU_DIFF_ARCHS:-$def_archs})
@@ -139,13 +139,10 @@ declare -A known=(
   [dig:lockstep_blocks]="a global lock: which block takes it first differs by engine, and the kernel records the order"
   [out:bsync_recursive_abi]="sinf, cosf and the Horner steps in float and double: ptxas contracts to FMA where the PTX engine does not, a last-bit difference on sm_100 and sm_120 (the program checks to a tolerance)"
   [dig:bsync_recursive_abi]="the same last-bit differences, in memory"
-  [cnt:surface_formatted]="bytes written by surface stores (sust): not the same count on the two engines (SASS counts the footprint of the element, PTX the data); recorded for a follow-up"
-  [cnt:waterfall]="TMA tensor stores: the SASS engine counts their bytes as global writes, the PTX engine counts none; recorded for a follow-up"
-  [cnt:sass_archs]="mbarrier pipeline: shared bytes written differ by 16; recorded for a follow-up"
-  [rc:group_ballot_barrier:sm_75]="UNRESOLVED: the SASS engine deadlocks on Turing's code (a WARPSYNC with the full mask is let go while the lanes it names spin, then the block barrier waits for the lanes it left behind)"
-  [out:group_ballot_barrier:sm_75]="(the same deadlock)"
-  [dig:group_ballot_barrier:sm_75]="(the same deadlock)"
-  [cnt:group_ballot_barrier:sm_75]="(the same deadlock)"
+  [cnt:waterfall]="cp.async.bulk.tensor stores from 32 lanes: each lane stores its box on the PTX engine; ptxas's waterfall runs the instruction once for lanes that name the same operands, so the SASS engine counts 16 boxes, not 32 (the bytes are counted now by both)"
+  [cnt:sass_archs:sm_90]="mbarrier.init is a SYNCS.EXCH.64 here: the SASS engine counts it as an 8-byte shared store (+16 for two), the PTX engine does not, and no sm_90 card has said what the hardware counts. Before sm_90 it is an STS.64 and both engines count it"
+  [cnt:sass_archs:sm_100]="(the same SYNCS.EXCH.64 question)"
+  [cnt:sass_archs:sm_120]="(the same SYNCS.EXCH.64 question)"
 )
 known_n=0
 runs=0 compared=0 fellback=0
@@ -175,6 +172,19 @@ check_diff() {
   cmp -s "$bin.sass.txt" "$bin.ptx.out" || flag out "the output differs"
   cmp -s "$bin.sass.dstrip" "$bin.ptx.dstrip" || flag dig "memory after a launch differs"
   cmp -s "$bin.sass.cmp" "$bin.ptx.cmp" || flag cnt "counters differ"
+  # Whatever else differs, one engine counting no bytes written where the other counts some is a gap (the PTX engine once counted nothing for
+  # wmma.store and for TMA stores), and is never excused by the table.
+  if [[ $(wc -l < "$bin.sass.cmp") == "$(wc -l < "$bin.ptx.cmp")" ]] &&
+     paste -d'|' "$bin.sass.cmp" "$bin.ptx.cmp" | awk -F'|' '{
+       for (k = 1; k <= 2; k++) {
+         key = (k == 1) ? "global_bytes_written" : "shared_bytes_written"
+         a = b = -1
+         if (match($1, "\"" key "\":[0-9]+")) a = substr($1, RSTART + length(key) + 3, RLENGTH - length(key) - 3) + 0
+         if (match($2, "\"" key "\":[0-9]+")) b = substr($2, RSTART + length(key) + 3, RLENGTH - length(key) - 3) + 0
+         if ((a == 0) != (b == 0)) bad = 1
+       } } END { exit bad ? 0 : 1 }'; then
+    why="${why:+$why; }one engine counts no bytes written where the other counts some"
+  fi
   if [[ -n ${VGPU_DIFF_INFO:-} ]]; then
     local k a b
     for k in $all_keys; do
