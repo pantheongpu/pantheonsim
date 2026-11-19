@@ -24,7 +24,7 @@ echo '__global__ void k() { asm volatile("wgmma.fence.sync.aligned;"); }' > "$pr
 if ! nvcc -arch=compute_90a -code=compute_90a -c "$probe" -o /dev/null 2>/dev/null; then
   echo "SKIP: this nvcc cannot target sm_90a (wgmma needs CUDA 12.0 or later)"; exit 0
 fi
-if ! nvcc -std=c++17 -O1 -arch=sm_90a -cudart shared -w $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out/prog" 2> "$out/b.txt"; then
+if ! nvcc -std=c++17 -O1 -gencode "arch=compute_90a,code=[sm_90a,compute_90a]" -cudart shared -w $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out/prog" 2> "$out/b.txt"; then
   echo "FAIL: the program does not build for sm_90a"; cat "$out/b.txt"; exit 1
 fi
 if ! require_shim_libs "$shim" "$out/prog"; then exit 0; fi
