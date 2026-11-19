@@ -1,0 +1,61 @@
+name: Clean install
+
+# A user who follows docs/install.md on a bare machine. The steps are not written
+# here: tests/install/run_doc_steps.sh pulls them out of the page, so a package the
+# page forgets or a command it gets wrong fails this job. Nightly, by hand, and on a
+# pull request that changes the page, the script or this file.
+on:
+  pull_request:
+    paths: [docs/install.md, tests/install/**, .github/workflows/clean-install.yml, scripts/apt-retry.sh]
+  schedule:
+    - cron: '37 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  from-source:
+    name: bare ubuntu:24.04, build, CUDA ${{ matrix.cuda }} and ROCm ${{ matrix.rocm }} hello world
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cuda: '13.0', rocm: '7.1' }
+    defaults:
+      run:
+        shell: bash
+    env:
+      CUDA: ${{ matrix.cuda }}
+      ROCM: ${{ matrix.rocm }}
+    steps:
+      # The bare image has no git and no tar helpers the checkout wants; this is
+      # the runner's own plumbing, not a documented step.
+      - name: Fetch the source
+        run: |
+          # Before the checkout there is no scripts/apt-retry.sh to use, so a bad mirror gets three tries here.
+          for attempt in 1 2 3; do
+            apt-get update -qq && apt-get install -y -qq --no-install-recommends git ca-certificates && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 20
+          done
+      - uses: actions/checkout@v4
+
+      - name: The documented steps, in the page's order
+        run: tests/install/run_doc_steps.sh prereqs build cuda hello-cuda rocm hello-hip
+
+  docker:
+    name: the documented docker command
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: The documented step
+        run: tests/install/run_doc_steps.sh docker

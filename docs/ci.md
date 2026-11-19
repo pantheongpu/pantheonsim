@@ -84,6 +84,24 @@ hosted runner (the test sizes its compiles from the memory free when it starts,
 so it takes one compile at a time there). If a sanitizer job is killed with exit
 137 in its test step, or the build job in a CUTLASS compile, revert the commit.
 
+## Clean-install and version-matrix
+
+Two scheduled workflows check what a user meets, not what the tests build:
+
+- `clean-install.yml` (nightly) starts a bare `ubuntu:24.04` container and runs the steps of
+  [install.md](install.md), and nothing else, with `tests/install/run_doc_steps.sh`: the build, the CUDA and ROCm
+  toolkit installs, and a hello-world CUDA and HIP program built and run on simulated GPUs. A step that names a
+  missing package or a wrong command fails the job; fix the page, not the workflow. A second job runs the Docker
+  command of the page.
+- `version-matrix.yml` (nightly) installs each CUDA from 12.4 to 13.2 and each ROCm from 6.4 to 7.2 through the
+  setup action, builds the checks in `tests/version-matrix/` (a kernel, cuBLAS, cuFFT and cuRAND; HIP shared
+  memory, atomics, streams and events) and runs them under `vgpu run`. The heavy suites stay in
+  `cuda-toolkits.yml` (12.4, 12.8, 12.9, nightly), `rocm-libraries.yml` (ROCm's own libraries, weekly) and `ci.yml`;
+  `tests/lint/check_version_matrix.py` fails when a version of the range is in none of them.
+
+Both also run on a pull request that changes their own files, and by hand (`gh workflow run`). They use
+`scripts/apt-retry.sh` for apt when the repository has it.
+
 ## Shards and the compile cache
 
 A survey of run 41545325796 on main found about 26,500 runner-seconds per run. Three tests were 35% of the unit job's CPU, and
