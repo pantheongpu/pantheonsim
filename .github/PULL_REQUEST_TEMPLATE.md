@@ -5,7 +5,7 @@
 - [ ] A test that CI runs covers it, and it fails without the change
 - [ ] I ran the tests for what I touched (`ctest --test-dir build -R <regex>`) and say below which, and which I could not run (`nvcc`, `hipcc`, a card)
 - [ ] Anything left unsupported fails with a message that names it, and is in `TODO.md`
-- [ ] The documentation that describes this is updated (and `CHANGELOG.md`, for anything a user would notice)
+- [ ] The documentation that describes this is updated
 
 **Where the behaviour comes from**
 

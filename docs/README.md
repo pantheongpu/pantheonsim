@@ -1,7 +1,7 @@
 # Documentation index
 
-One line per document. Start with the repository [README](../README.md); the design is in [ARCHITECTURE](../ARCHITECTURE.md), release notes in
-[CHANGELOG](../CHANGELOG.md), open work in [TODO](../TODO.md). Vendor-specific documents live in `nvidia/docs/` and `amd/` (see the
+One line per document. Start with the repository [README](../README.md); the design is in [ARCHITECTURE](../ARCHITECTURE.md), release notes on the
+[releases page](https://github.com/pantheongpu/pantheonsim/releases), open work in [TODO](../TODO.md). Vendor-specific documents live in `nvidia/docs/` and `amd/` (see the
 [ARCHITECTURE](../ARCHITECTURE.md) layout).
 
 ## Users

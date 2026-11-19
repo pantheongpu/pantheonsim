@@ -98,8 +98,9 @@ them. Say in the pull request which you ran.
   counts in [docs/status.md](docs/status.md) if you add or change a profile or a
   library. `tests/lint/` checks several of these (the settings table, the
   example settings file, the commands in the README).
-- **A changelog line** for anything a user would notice, in
-  [CHANGELOG.md](CHANGELOG.md) under the newest unreleased version.
+- **No changelog file.** Release notes are written on the
+  [releases page](https://github.com/pantheongpu/pantheonsim/releases) when a version is tagged; say what a user
+  would notice in the pull request description.
 
 ### Changes that make it faster
 

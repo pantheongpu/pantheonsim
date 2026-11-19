@@ -4637,7 +4637,7 @@ set_tests_properties(lint_hip_tests_runner PROPERTIES TIMEOUT 120)
 # The "workloads failing on main" issue (ci/track-workloads-issue.sh) against a fake
 # gh: a failure opens or updates it, a pass closes it, a cancelled run touches nothing.
 add_test(NAME lint_workloads_issue COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_workloads_issue.sh)
-# The version in CMakeLists.txt is the newest entry of CHANGELOG.md, and no source file writes a version of its own.
+# The version is written once, in CMakeLists.txt's project(), and no source file writes a version of its own.
 add_test(NAME lint_version COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_version.sh)
 set_tests_properties(lint_workloads_issue PROPERTIES TIMEOUT 120)
 
