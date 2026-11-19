@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '19 5 * * *'
   workflow_dispatch:
     inputs:
       ml_tests:
@@ -163,7 +165,7 @@ jobs:
   workloads:
     name: pantheon workloads
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
-    if: ${{ !inputs.nvidia_only }}
+    if: ${{ github.event_name != 'push' && !inputs.nvidia_only }}
     # GitHub's hosted runner unless the repository variable SIM_RUNS_ON names
     # another, e.g. ["self-hosted", "pantheonsim-ci"] for the runner on the
     # pantheonsim.com host (pantheonsim-web/deploy/gh-runner). Its image has
@@ -244,6 +246,7 @@ jobs:
 
   sass:
     name: SASS on every architecture
+    if: github.event_name != 'push'
     # The build job's toolkit is Ubuntu's CUDA 12.0, which targets up to
     # sm_90a; Blackwell's SASS (sm_100, sm_120) needs CUDA 12.8 or later. This
     # job builds against CUDA 13 and runs the SASS tests: the decoder against
@@ -367,7 +370,7 @@ jobs:
   ollama:
     name: ollama on every GPU
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
-    if: ${{ !inputs.nvidia_only }}
+    if: ${{ github.event_name != 'push' && !inputs.nvidia_only }}
     # GitHub's hosted runner unless BURST_RUNS_ON names a pool (see the SASS job).
     runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # Fourteen GPUs take about 18 minutes on 8 cores; a 4-core runner is slower.
@@ -512,7 +515,7 @@ jobs:
   ollama-amd:
     name: ollama on ${{ matrix.gpu }}
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
-    if: ${{ !inputs.nvidia_only }}
+    if: ${{ github.event_name != 'push' && !inputs.nvidia_only }}
     # GitHub's hosted runner unless BURST_RUNS_ON names a pool (see the SASS job).
     runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # A simulated GPU takes some 3 to 17 minutes to load a model and generate
@@ -650,7 +653,7 @@ jobs:
   amd-code-objects:
     name: AMD code objects and CDNA decoding
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
-    if: ${{ !inputs.nvidia_only }}
+    if: ${{ github.event_name != 'push' && !inputs.nvidia_only }}
     # GitHub's hosted runner unless the repository variable SIM_RUNS_ON names
     # another, e.g. ["self-hosted", "pantheonsim-ci"] for the runner on the
     # pantheonsim.com host (pantheonsim-web/deploy/gh-runner). Its image has
@@ -751,7 +754,7 @@ jobs:
     # The other jobs stay on GitHub's hosted runners, which there are many of;
     # this one runner takes this job alone. Where the variable is unset the
     # job does not run.
-    if: vars.ML_RUNS_ON != ''
+    if: github.event_name != 'push' && vars.ML_RUNS_ON != ''
     runs-on: ${{ fromJSON(vars.ML_RUNS_ON || '"ubuntu-24.04"') }}
     timeout-minutes: 240
     permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
@@ -881,6 +884,7 @@ jobs:
 
   sanitizers:
     name: ASan + UBSan
+    if: github.event_name != 'push'
     # GitHub's hosted runner unless the repository variable BURST_RUNS_ON names
     # another pool, e.g. ["pantheonsim-burst"]: AWS instances
     # started while the pull request backlog is long and terminated when it is
@@ -994,6 +998,7 @@ jobs:
 
   threads:
     name: ThreadSanitizer
+    if: github.event_name != 'push'
     # GitHub's hosted runner unless the repository variable BURST_RUNS_ON names
     # another pool, e.g. ["pantheonsim-burst"]: AWS instances
     # started while the pull request backlog is long and terminated when it is
