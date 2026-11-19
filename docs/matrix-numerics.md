@@ -175,14 +175,15 @@ none carries a class for its matrix arithmetic, and none could honestly be anyth
 
 | Target | Profiles | f16 / bf16 MFMA, WMMA | f32 MFMA | f64 MFMA | Status |
 |---|---|---|---|---|---|
-| gfx90a (CDNA2) | mi250x | default: the K products and C summed in double, in order, rounded once. Opt-in `VGPU_MFMA_CDNA2=fttn`: see below | double sum of the instruction's K, rounded once | fused multiply-add chain | unmeasured; opt-in rule from the FTTN paper alone |
-| gfx942 (CDNA3) | mi300x, mi325x | double sum, rounded once | same | chain | unmeasured |
+| gfx90a (CDNA2) | mi250x | default: the K products and C summed in double, in order, rounded once. Opt-in `VGPU_MFMA_CDNA2=fttn`, or `VGPU_MFMA_MODEL=khattak`: see below | double sum of the instruction's K, rounded once | fused multiply-add chain | unmeasured; the two opt-in rules are from papers alone, and disagree |
+| gfx942 (CDNA3) | mi300x, mi325x | double sum, rounded once. Opt-in `VGPU_MFMA_MODEL=khattak` (f16, bf16, xf32, fp8) | same | chain | unmeasured; the opt-in model is from one paper |
 | gfx950, gfx1250 | mi350x, mi455x | double sum, rounded once | same | chain | unmeasured; no published model |
 | gfx1100, gfx1201 (RDNA3, RDNA4) | rx7900xtx, rx9070xt | WMMA: double sum, rounded once | - | - | unmeasured |
 
-The published bit-level models (MMA-Sim) give CDNA1, CDNA2 and CDNA3 three different sums, none of them the double sum, and the
-f32 forms a chain of f32 fused multiply-adds. They are not implemented: no card or published hardware vector checks them, and a
-paper-only model does not become a default here.
+The published bit-level models (MMA-Sim; Khattak, Mikaitis and Graziani) give CDNA1, CDNA2 and CDNA3 three different sums, none of
+them the double sum, and the f32 forms a chain of f32 fused multiply-adds. MMA-Sim's are not implemented (they are transcribed in
+`tools/mmasim/`, to compare against). Khattak, Mikaitis and Graziani's are, opt-in, below. No card or recorded hardware vector checks
+either, and a paper-only model does not become a default here.
 
 ### The opt-in MI250X rule and what the two papers say
 
@@ -214,6 +215,57 @@ AMD is about the chain of instructions, not the sum inside one. The simulator pr
 
 Adding an MI100 (gfx908, CDNA1) profile would take a profile file, the gfx908 target in the AMD decoder and executor (not
 there today), and a sum for its f16 and bf16 forms.
+
+### The opt-in models of Khattak, Mikaitis and Graziani (2026-11-19)
+
+Khattak, Mikaitis and Graziani, "Accurate Models of AMD Matrix Cores", arXiv 2609.14845, give MATLAB models of MI100 (CDNA1), MI210
+and MI250 (CDNA2) and MI300A and MI300X (CDNA3), refined until they matched hardware bit for bit on random inputs (their claim; we have
+not read the full text, and the repository's `model_validation/` holds no AMD vectors). The models are in
+`north-numerical-computing/MATLAB-tensor-core` (BSD-2-Clause; read at commit 6fd05208). `VGPU_MFMA_MODEL=khattak` runs them
+(`amd/src/mfma_models.hpp`, written from the MATLAB files, not copied; class **published**: no card of ours has run one):
+
+| Model | Form | One block of `fma` products and the running sum |
+|---|---|---|
+| CDNA1 (MI100) | f16 (`fma` 4), bf16 (2) | exact sum, rounded once to nearest even, subnormals kept. No gfx908 target here: the function is tested, not wired |
+| CDNA2 (gfx90a) | f16, bf16 (`fma` 4) | subnormal inputs read as zero, each product rounded to f32, the 4 added as a tree of f32 additions, then the running sum, every sum below 2^-126 flushed |
+| CDNA3 (gfx942) | f16, bf16 (8), xf32 (4), fp8 (16) | products aligned to the largest exponent with one extra bit, bits shifted out cut toward zero, summed as integers, then added to the running sum (eight more bits kept when the sum is the bigger; what is shifted out cut toward minus infinity), one rounding to nearest even. fp8: the even-numbered and the odd-numbered products are summed separately, then together |
+
+The blocks of an instruction's K chain through the running sum. On gfx90a the model takes the place of `VGPU_MFMA_CDNA2=fttn`. It
+covers the tile path and the reference path; not the sparse, scaled, f32, f64 and integer forms, nor gfx950 (no model). Off by default.
+
+**How it was checked, and what that is not.** MATLAB and Octave were not at hand, so none of it is checked against the paper's own code.
+(1) `tools/mfma-models/model_ref.py` is a second writing of the MATLAB files in exact rational arithmetic; the C++ agrees with it on
+all 600 pinned vectors (`amd/tests/data/mfma_models/`, CTest `test_amd_mfma_models`) and on 30,000 more (3,000 for each of the ten groups, seed 7,
+`tools/mfma-models/mfma_models_check.cpp`): both are one reader's reading. (2) Three vectors worked out by hand are in the test. (3)
+rocWMMA's 16x16x16 f16 and bf16 instructions on gfx90a and gfx942 give the model's answers, on both paths. The xf32 and fp8 forms are wired
+the same way but only checked as functions, not through an instruction (no code object for them is built here).
+
+**What the models say, against the other sources:**
+
+| `D = C - A x B`, K = 2^13 (the paper's section V) | D |
+|---|---|
+| CDNA1 model (MI100) | 255.875: the value the FTTN paper reports for an MI100 |
+| CDNA2 model (MI250) | 255.875, as MMA-Sim's CDNA2 model; **the FTTN paper reports 0 for an MI250X** |
+| CDNA3 model (MI300) | 191.8125 (the real-number answer is 191.984375; the paper gives 191.875 for an H100; no MI300 value) |
+
+So the CDNA1 model reproduces the paper's MI100 number, and both bit-level models of the CDNA2 card (this one and MMA-Sim's) disagree with
+the one MI250X result on record. Two papers about the same hardware say different things, and the models' authors claim a bit-for-bit
+match on random inputs while FTTN's GEMM goes through rocWMMA (which may not issue the one instruction the models describe). We cannot
+tell which; only an MI250X can. That is why neither is a default.
+
+Against MMA-Sim's transcription (40,000 vectors a form, two seeds: [mmasim-crosscheck.md](numerics/mmasim-crosscheck.md)), the models agree on
+the results that are finite: CDNA1 f16 0 mismatches, CDNA2 f16 and bf16 `_1k` 0, CDNA3 f16 3 to 10 of 40,000 (one unit in the last place), bf16 2 to 5, xf32 1 to
+11; CDNA2 bf16 without `_1k` about 600 (MMA-Sim sums in pairs there, the model in fours, see below). The other mismatches are at the
+overflow edge, with inputs near 2^64: about 2,100 to 3,400 of 40,000 for CDNA2 bf16 and CDNA3 bf16 and xf32, and 5 to 10 for CDNA1 bf16 and CDNA2 f16
+(a subnormal times an infinity, below).
+
+**What the MATLAB files do that looks unintended** (followed as written; each is a place a card could show the model wrong):
+- CDNA2 bf16 without `_1k`: the comment in `MI210MC.m` says `fma = 2` and MMA-Sim has pairs, the code sets 4 for every input format.
+- CDNA3 `rd_norm_aware = 1` in `MI300AMC.m` never reaches the arithmetic: `Generic_BFMA_TC.m` reads it only if the field `rd_borrow_carry` exists, and nothing sets that.
+- A product past 2^128: both signs give NaN, one sign gives infinity of the sign of `max(prd)`, which is the wrong one when a negative overflow meets a positive product (about half of the overflow mismatches against MMA-Sim).
+- Infinities and NaN are settled over the whole row before subnormal inputs are flushed, so a subnormal times infinity is infinity (MMA-Sim flushes first: NaN).
+- The sum of two overflowing partial sums is not an overflow check (MMA-Sim's f32 additions overflow and meet the opposite infinity).
+- A result of zero is +0 whatever the signs; `GEMM.m` does not list xf32 with tf32 (its CPFloat rounding of inputs would not apply to it).
 
 ## Recreating the FTTN paper on the simulator
 

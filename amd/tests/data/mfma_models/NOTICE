@@ -1,0 +1,22 @@
+vectors.txt: 600 test vectors (60 for each of ten model and format groups) written by tools/mfma-models/model_ref.py (`gen vectors.txt --n 60 --seed 1`).
+The inputs are random and the answers are that script's: its author's second reading of the AMD models in
+https://github.com/north-numerical-computing/MATLAB-tensor-core (models/MI100MC.m, MI210MC.m, MI300AMC.m and models/tools/Generic_BFMA_TC.m,
+GEMM.m; commit 6fd0520850164bdd1c37f901954e27ec63eada56), paper: Khattak, Mikaitis and Graziani, "Accurate Models of AMD Matrix Cores",
+arXiv 2609.14845. No file of that repository, and no data recorded on a card, is in this directory; MATLAB and Octave were not available, so
+none of these answers was produced by the paper's own code. amd/src/mfma_models.hpp is written from the same files, not copied.
+
+Those files are under the licence below (their LICENCE file); it is kept here because the models' structure and parameters in
+amd/src/mfma_models.hpp and tools/mfma-models/model_ref.py come from them.
+
+BSD 2-Clause License
+Copyright (c) 2025, Faizan A. Khattak and Mantas Mikaitis. All rights reserved.
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

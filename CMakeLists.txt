@@ -2490,6 +2490,14 @@ vgpu_unit_test(test_amd_cdna2_matrix amd/tests/unit/test_cdna2_matrix.cpp)
 target_compile_definitions(test_amd_cdna2_matrix PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME test_amd_cdna2_matrix_switched_on COMMAND test_amd_cdna2_matrix)
 set_tests_properties(test_amd_cdna2_matrix_switched_on PROPERTIES ENVIRONMENT "VGPU_MFMA_CDNA2=fttn")
+# The opt-in models of AMD's matrix cores by Khattak, Mikaitis and Graziani (arXiv 2609.14845; amd/src/mfma_models.hpp): the port against a
+# second writing of the MATLAB models (tools/mfma-models/model_ref.py) on pinned vectors, a few worked by hand, the 16x16x16 binary16 and
+# bfloat16 instructions of gfx90a and gfx942 on both paths with the switch on and off; and once more with VGPU_MFMA_MODEL=khattak set.
+vgpu_unit_test(test_amd_mfma_models amd/tests/unit/test_mfma_models.cpp)
+target_compile_definitions(test_amd_mfma_models PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_include_directories(test_amd_mfma_models PRIVATE amd/src)
+add_test(NAME test_amd_mfma_models_switched_on COMMAND test_amd_mfma_models)
+set_tests_properties(test_amd_mfma_models_switched_on PROPERTIES ENVIRONMENT "VGPU_MFMA_MODEL=khattak")
 
 vgpu_unit_test(test_amd_gcn_globals amd/tests/unit/test_gcn_globals.cpp)
 target_compile_definitions(test_amd_gcn_globals PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
