@@ -116,7 +116,7 @@ for entry in "${tests[@]}"; do
   echo "$name: $summary(ran in $((SECONDS - run_start)) s)"
   grep -E '^\[ +OK \]' <<<"$result" | sed 's/^/    /'
   if ! grep -q '^\[  PASSED  \]' <<<"$result" || grep -q '^\[  FAILED  \]' <<<"$result"; then
-    grep -E 'FAILED|Failure|VirtualGPU|timed out' <<<"$result" | head -20
+    grep -E -A6 'FAILED|Failure|VirtualGPU|timed out' <<<"$result" | grep -v '^\[ \+OK \]' | head -60
     fail=1
   fi
   cutlass_sass_check "$name" "$result" || fail=1

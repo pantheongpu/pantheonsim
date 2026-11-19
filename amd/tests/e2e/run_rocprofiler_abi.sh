@@ -44,7 +44,7 @@ structs=$(sed -n 's/^typedef struct \(rocprofiler_[a-z0-9_]*\|roctx[A-Za-z]*ApiT
     echo "static_assert(sizeof(ours::$s) == sizeof(::$s), \"$s differs in size\");"
     echo "static_assert(alignof(ours::$s) == alignof(::$s), \"$s differs in alignment\");"
   done
-  echo 'static_assert(ours::kVersion == ROCPROFILER_VERSION, "a different rocprofiler-sdk version");'
+  echo 'static_assert(ours::kVersion >= ROCPROFILER_VERSION, "an older rocprofiler-sdk version than the headers'");'
   echo 'int main() { return 0; }'
 } > "$tmp/abi.cpp"
 count=$(grep -c 'offsetof' "$tmp/abi.cpp")

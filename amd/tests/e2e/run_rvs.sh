@@ -160,4 +160,11 @@ expect "gst: SGEMM matches the host's and itself, run to run" "1 PASS 0 FAIL" "$
 expect "and no check reports an error" "0" "$(grep -cE 'self-check error|accu-check error' "$work/gst_clean.out" | head -1)"
 expect "gst: an element made wrong on purpose is caught by both checks" "yes" \
   "$(grep -q 'self-check error' "$work/gst_injected.out" && grep -q 'accu-check error' "$work/gst_injected.out" && echo yes || echo no)"
+if (( fail )); then  # what RVS and the session said, for the log: the work directory is removed on exit
+  echo "---- session log (tail)"; tail -20 "$work/session.log"
+  for f in list gpup_single peqt_single smqt babel gst_clean; do
+    [[ -s "$work/$f.out" ]] && { echo "---- $f.out (head)"; head -12 "$work/$f.out"; }
+  done
+  [[ -s "$work/status" ]] && { echo "---- status"; cat "$work/status"; }
+fi
 exit $fail
