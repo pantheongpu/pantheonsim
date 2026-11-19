@@ -67,10 +67,10 @@ jobs:
         if: runner.environment == 'github-hosted'
         run: |
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
+          scripts/apt-retry.sh update -qq
           # nvidia-profiler is nvprof, an unmodified profiler run against the
           # simulator by e2e_nvprof; without it that test skips.
-          sudo apt-get install -y -qq --no-install-recommends \
+          scripts/apt-retry.sh install -y -qq --no-install-recommends \
             build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit nvidia-profiler
           nvcc --version | tail -2
           cmake --version | head -1
@@ -201,8 +201,8 @@ jobs:
         if: runner.environment == 'github-hosted' && !job.container.id
         run: |
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends \
             build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit
 
       # Compile cache (.github/actions/ccache): the library's objects from an earlier build, when the source and the compiler are the same.
@@ -689,8 +689,8 @@ jobs:
         if: runner.environment == 'github-hosted' && !job.container.id
         run: |
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build clang llvm
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends build-essential cmake ninja-build clang llvm
 
       - name: Check the toolchain
         run: |

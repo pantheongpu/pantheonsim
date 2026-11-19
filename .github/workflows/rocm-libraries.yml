@@ -50,8 +50,8 @@ jobs:
       - name: Install toolchain
         run: |
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build python3-venv
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends build-essential cmake ninja-build python3-venv
           cmake --version | head -1
 
       - name: Install PyTorch for ROCm
@@ -108,8 +108,8 @@ jobs:
       - name: Install toolchain
         run: |
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build python3-venv
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends build-essential cmake ninja-build python3-venv
           cmake --version | head -1
 
       - name: Install PyTorch for ROCm
@@ -155,8 +155,8 @@ jobs:
       - name: Install toolchain
         run: |
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build ocl-icd-opencl-dev
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends build-essential cmake ninja-build ocl-icd-opencl-dev
 
       - name: Unpack ROCm's LLVM and OpenCL runtime
         run: |

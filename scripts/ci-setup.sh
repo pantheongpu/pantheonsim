@@ -109,30 +109,26 @@ pkgs="cmake ninja-build g++ ca-certificates wget gnupg python3"
 # The simulator is C++20 and needs gcc 12 or newer; 22.04's default is 11.
 [[ $old_ubuntu ]] && pkgs="$pkgs g++-12"
 [[ -x "$(dirname "$0")/apt-mirror-fallback.sh" ]] && "$(dirname "$0")/apt-mirror-fallback.sh"
-$sudo apt-get update -qq
-# Unpacking the NVIDIA runtime libraries that nvidia-cuda-toolkit pulls in has hung a
-# hosted runner for 45 minutes. Bound each attempt, and finish what dpkg left
-# half-configured before the next.
-for attempt in 1 2 3; do
-  # shellcheck disable=SC2086  # $pkgs is a word list
-  $sudo timeout 900 apt-get install -y -qq --no-install-recommends $pkgs && break
-  [[ $attempt == 3 ]] && err "apt-get install of $pkgs did not finish in three attempts"
-  warn "apt-get install failed or timed out (attempt $attempt of 3); retrying"
-  $sudo dpkg --configure -a || true
-done
+# apt-retry.sh bounds each attempt (the NVIDIA runtime libraries nvidia-cuda-toolkit pulls in have hung
+# a hosted runner for 45 minutes, and security.ubuntu.com has answered 503 for an hour), finishes what
+# dpkg left half-configured, and moves to another Ubuntu mirror before the next one.
+apt_retry() { SUDO="$sudo" "$(dirname "$0")/apt-retry.sh" "$@"; }
+apt_retry update -qq
+# shellcheck disable=SC2086  # $pkgs is a word list
+APT_TIMEOUT=900 apt_retry install -y -qq --no-install-recommends $pkgs || err "apt-get install of $pkgs did not succeed"
 
 if [[ "$TOOLKIT" != apt && "$TOOLKIT" != none ]]; then
   repo="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${VERSION_ID//./}/x86_64"
   wget -qO "$TMPD/cuda-keyring.deb" "$repo/cuda-keyring_1.1-1_all.deb"
   $sudo dpkg -i "$TMPD/cuda-keyring.deb"
-  $sudo apt-get update -qq
+  apt_retry update -qq
   v="${TOOLKIT//./-}"
   # CUDA 13 renamed the NVVM package.
   nvvm="cuda-nvvm-$v"; [[ "${TOOLKIT%%.*}" -ge 13 ]] && nvvm="libnvvm-$v"
   # nvcc, plus the headers of every library the simulator stands in for (it
   # builds each one against the toolkit's own declarations), and nvJitLink,
   # which the toolkit's cuSPARSE needs to link a program against it.
-  $sudo apt-get install -y -qq --no-install-recommends \
+  APT_TIMEOUT=900 apt_retry install -y -qq --no-install-recommends \
     "cuda-nvcc-$v" "cuda-cudart-dev-$v" "cuda-crt-$v" "$nvvm" \
     "cuda-nvml-dev-$v" "cuda-cupti-dev-$v" "cuda-nvrtc-dev-$v" "libcublas-dev-$v" \
     "libcufft-dev-$v" "libcurand-dev-$v" "libcusparse-dev-$v" "libnvjpeg-dev-$v" \
@@ -148,14 +144,14 @@ fi
 if [[ "$ROCM" != none ]]; then
   # Ubuntu 24.04 renamed libelf1; 22.04 knows the new name but has no package for it.
   elf=libelf1t64; apt-cache policy libelf1t64 2>/dev/null | grep -q 'Candidate: [0-9]' || elf=libelf1
-  $sudo apt-get install -y -qq --no-install-recommends libxml2 libnuma1 "$elf"
+  apt_retry install -y -qq --no-install-recommends libxml2 libnuma1 "$elf"
   $sudo mkdir -p /etc/apt/keyrings
   wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor | $sudo tee /etc/apt/keyrings/rocm.gpg >/dev/null
   echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM $VERSION_CODENAME main" \
     | $sudo tee /etc/apt/sources.list.d/rocm.list >/dev/null
   # AMD's packages, not Ubuntu's hipcc of the same name.
   printf 'Package: *\nPin: origin repo.radeon.com\nPin-Priority: 1001\n' | $sudo tee /etc/apt/preferences.d/rocm >/dev/null
-  $sudo apt-get update -qq
+  apt_retry update -qq
   dir="$TMPD/rocm-debs"; mkdir -p "$dir"
   (cd "$dir" && apt-get download hipcc hip-dev rocm-llvm rocm-device-libs rocm-core hsa-rocr-dev) \
     || err "could not download ROCm $ROCM for Ubuntu $VERSION_ID from repo.radeon.com"
