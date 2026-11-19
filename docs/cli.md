@@ -213,7 +213,7 @@ is not.
 vgpu debug [-x FILE] [vgpu run options] -- ./program [args]
 ```
 
-Runs an AMD program with the kernel debugger on. Commands come from `FILE` (`-x`)
+Runs an AMD program with the kernel debugger on. Commands come from `FILE` (`-x` or `--commands`)
 or from a `(vgpu)` prompt on the terminal: `break KERNEL[+OFFSET]`, `continue`,
 `step [N]`, `where`, `disas [N]`, `info registers`, `print[/x|/d|/f] REG`,
 `lane N`, `x/N ADDR`, `x/N lds:ADDR`, `set REG[LANE] = VALUE`, `delete [N]`,
@@ -327,6 +327,27 @@ variable is unset by default.
 | `VGPU_TC_EXACT` | `0` turns the RTX 3060 (sm_86) tensor-core sum model off: wmma, `mma.sync` and SASS `HMMA` in f16, bf16 and tf32 then add the products one at a time in f32, as earlier releases did. The model (chunks of 8 products, truncating, measured on a card, `include/vgpu/exec/tc_ampere.hpp`) is what makes random-data results equal the card's, and costs 3.5 to 4.5 times the time of those instructions in the SASS and PTX engines (the bench workloads `wmma` and `mma_ptx`; a program that does little else spends that much more, one that mostly does other work little), except `mma.sync` on the PTX engine, where it is the faster of the two. Only sm_86 devices and cubins are affected; counters never change. **Since the card runs of 2026-11-15 the model follows the device, not the cubin, and covers more of them**: compute capability 7.5, 8.0, 8.6 and 8.9 sum by the RTX 3060's rule and 9.0 by an H100's (chunks of 16, cut one bit lower), each measured on a card; `force` puts the RTX 3060's rule on the devices without a measured one, and `published` gives the sm_120 Blackwell profiles (rtx5090, rtx-pro-*) the published model, which no card of ours has checked ([matrix-numerics.md](matrix-numerics.md)). **Since 2026-11-16 the b200 and gb200 profiles (10.0) sum by the Hopper rule by default**, inferred from 20,000 vectors others recorded on a B200 (not a card run of ours); `0` gives their earlier sequential sum back, as it does on every device. The other Blackwell profiles (b300, vr200, thor, gb10, sm_120) still sum sequentially by default. The H100's rule and tiles with an f16 accumulator run in scalar code and are slower than the figures above. The model of each device is written in its profile (`numerics.tensor_sum`, with `numerics.tensor_sum_published` for the published one), and `vgpu info --gpu <id>` prints it and what it rests on; so "only sm_86 devices and cubins are affected" above describes the first release of the model, not this one. Read at every launch, so it can be set between launches. `vgpu run` passes it through. | unset (on) |
 | `VGPU_MUFU_EXACT` | `0` turns the model of the card's approximate-math unit off: `MUFU` (SASS) and the PTX `.approx` forms are then the function at the host's precision, rounded once, and `div.full.f32` the exact quotient, as in every release before the model. Unset, both engines give what an RTX 3060 gives for each of the ten `MUFU` sub-operations on every operand (measured; a Tesla T4, an L4 and an A10G print the same math-library results; an H100 PCIe printed the same instruction hashes over every operand (measured); the other Hopper profiles and the Blackwell ones get the same model, inferred: [numerics/math-functions.md](numerics/math-functions.md)). It changes the last bits of `expf`, `powf`, `tanhf`, `rsqrtf` and the other library functions built on those instructions, and of everything compiled with `-use_fast_math`; IEEE operations (`+`, `*`, `/`, `sqrtf`) and counters never change. Read at every launch, so it can be set between launches. `vgpu run` passes it through. | unset (on) |
 | `VGPU_MFMA_CDNA2` | `fttn`: on the mi250x profile (gfx90a) the f16 and bf16 matrix instructions with an f32 accumulator sum as the FTTN paper's MI250X row reads: subnormal inputs and outputs as zero, one f32 rounding after every product. From that paper alone, no card, and the published bit-level model of the same card is a different sum ([matrix-numerics.md](matrix-numerics.md)). Read once, when the process starts. | unset (off: the products and the accumulator summed in double, rounded once) |
+
+**Fault injection, host resources and tool settings**
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `VGPU_FAIL_ALLOC` | Make allocations fail with out-of-memory, to test a program's error paths: `3` fails the 3rd (counted from 1, per process), `2,5,9` those three, `all` every one. | off |
+| `VGPU_FAIL_LAUNCH` | The same for kernel launches: `1` fails the 1st launch. | off |
+| `VGPU_FAIL_MEMCPY` | The same for copies: `4` fails the 4th. | off |
+| `VGPU_STREAM_WAIT_TIMEOUT_MS` | How long a driver-API stream wait on a memory value (`cuStreamWaitValue32/64`) polls before it returns `CUDA_ERROR_LAUNCH_TIMEOUT`. | `60000` |
+| `VGPU_HOST_STATS` | `1` prints one line of the host kernel's view of the process (CPU time, page faults, context switches, threads) on stderr at exit; a number `N` also prints one every `N` seconds. For finding out why a run is slower on one host kernel than another. | off |
+| `VGPU_HOST_STATS_FILE` | Append the `VGPU_HOST_STATS` lines to this file instead of stderr. | stderr |
+| `VGPU_HOST_HEAP` | `0` leaves glibc's malloc thresholds alone; by default the simulator fixes them (allocations up to 32 MiB from the heap, up to 64 MiB of free heap kept) so that a library call that allocates and frees large buffers does not fault its pages in again each time. Setting `MALLOC_MMAP_THRESHOLD_`, `MALLOC_TRIM_THRESHOLD_`, `MALLOC_TOP_PAD_` or `GLIBC_TUNABLES` has the same effect. | tuned |
+| `VGPU_HOSTMAP_CACHE` | `0` turns off the cache of lookups of host-mapped device memory; for ruling the cache out when a result looks wrong. | on |
+| `VGPU_POOL_SPIN` | AMD: how many loop turns (tens of nanoseconds each) an idle worker thread spins before it sleeps; `0` never spins. | `400` |
+| `VGPU_QUEUE_SPIN` | AMD: the same for a thread waiting on a stream's queue (always `0` when the process may use one CPU only). | `400` |
+| `VGPU_DUMP_CODE_OBJECTS=<dir>` | AMD: keep a copy of every code object a program loads, named for its first kernel, in this existing directory. What a library builds at run time (MIOpen's convolutions, rocFFT's plans) is otherwise nowhere to disassemble. | off |
+| `VGPU_NVML_VERSION` | The NVML library version `nvidia-smi --version` prints. | the CUDA major version and the driver version |
+| `VGPU_PCI_IDS` | The `pci.ids` file `lspci` names devices from; a path that does not exist behaves as a machine without pciutils. | the system's `pci.ids` |
+| `VGPU_SESSION` | Set by `vgpu shell` to the directory of the running session; `smi`, `amd-smi` and `rocm-smi` read the simulated machine's files from it. Not for you to set. | set in a session |
+| `VGPU_NVSHMEM_DIR` | Directory for the files that NVSHMEM's processes rendezvous through. | `/dev/shm`, else `$TMPDIR` |
+| `VGPU_NVSHMEM_TIMEOUT` | Seconds an NVSHMEM operation waits for its peers before it gives up. | `300` |
 
 **Checks and counters** (see [diagnostics](diagnostics.md))
 
