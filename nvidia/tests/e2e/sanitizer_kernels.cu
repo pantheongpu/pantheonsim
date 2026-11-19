@@ -21,7 +21,7 @@ __global__ void k_global_write(int* p, int last) {   // thread `last` is one ele
   if (t <= last) p[t] = t;
 }
 __global__ void k_global_read_byte(const volatile char* p, int off, int* out) { out[0] = p[off]; }
-__global__ void k_global_read8(const volatile long long* p, int* out) { out[0] = static_cast<int>(p[1]); }
+__global__ void k_global_read8(const volatile long long* p, long long* out) { out[0] = p[1]; }   // (all 8 bytes used: ptxas would narrow a load whose upper half nobody reads)
 __global__ void k_global_store(volatile int* p, int v) { p[0] = v; }
 __global__ void k_misaligned_load(const volatile char* p, int off, int* out) { out[0] = *reinterpret_cast<const volatile int*>(p + off); }
 __global__ void k_misaligned_store8(volatile char* p, int off) { *reinterpret_cast<volatile long long*>(p + off) = 1; }
@@ -162,7 +162,7 @@ int main(int argc, char** argv) {
   } else if (is("global-read-straddling-the-end")) {
     cudaMalloc(&buf, 12);   // an 8-byte read at byte 8 covers bytes 8..15 of 12
     cudaMemset(buf, 0, 12);
-    k_global_read8<<<1, 1>>>(reinterpret_cast<long long*>(buf), out);
+    k_global_read8<<<1, 1>>>(reinterpret_cast<long long*>(buf), reinterpret_cast<long long*>(out));
     finish(out);
   } else if (is("global-use-after-free")) {
     cudaMalloc(&buf, 64);

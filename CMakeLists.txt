@@ -3650,6 +3650,16 @@ if(TARGET vgpucublas)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
 
+  # What compute-sanitizer reports for kernels with a known defect (memcheck: invalid and misaligned global and shared accesses;
+  # racecheck: hazards between warps), against what the simulator reports, on the SASS and the PTX engine, sm_86 and sm_75; the
+  # kernels that must run clean included. A misaligned access in the SASS engine used to run.
+  add_test(NAME e2e_sanitizer_kernels COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sanitizer_kernels.sh)
+  set_tests_properties(e2e_sanitizer_kernels PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 900)
+
   add_test(NAME e2e_ret_condition_predicate
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ret_condition_predicate.sh)
   set_tests_properties(e2e_ret_condition_predicate PROPERTIES

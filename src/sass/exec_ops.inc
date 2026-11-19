@@ -3302,6 +3302,7 @@ inline bool with_lane_width(unsigned bytes, F&& f) {
 }
 
 void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
+  if (race_) g_race_ins = &ins;   // (a race report names the instruction)
   const unsigned size = ins.f[0];
   const uint32_t bytes = size <= 1 ? 1 : size <= 3 ? 2 : size == 4 ? 4 : size == 5 ? 8 : size == 8 ? 32 : 16;
   // A loaded byte or half to 32 bits: zero- or sign-extended (sizes 0 to 3: u8, s8, u16, s16), or the word as it is. (As shifts, not
@@ -3555,6 +3556,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         const bool in_const = g >= kConstWindow && g < kConstWindow + (uint64_t{1} << 32);
         const Space sp = generic || in_const ? classify(g, &off) : (off = g, Space::Global);
         addrs[l] = off;
+        check_aligned(w, ins, l, off, bytes, store ? "store" : "load");
         space = sp == Space::Global || sp == Space::Param ? 0 : sp == Space::Shared ? 1 : 2;
         // A 32-byte access (ENL2.256) moves two register quads: a store's low
         // 16 bytes from the first printed, a load's into the second.
@@ -3611,13 +3613,15 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         row_addresses(a, false, ur, store ? 64 : 32, ex, sa, stride);
         // (Every lane in this block's window and its last byte inside the array, with no branch per lane: see window_check.hpp.)
         exec::SharedWindowCheck window;
+        uint64_t odd = 0;   // (the addresses' low bits: a misaligned access is the loop's to fault)
         for (Mask m = ex; m; m &= m - 1) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
           const uint64_t off = static_cast<uint32_t>(sa[l]);
           addrs[l] = off;
+          odd |= off;
           window.add(off, blk.rank);
         }
-        const bool inside = window.inside(ssize, bytes, ex != 0);
+        const bool inside = window.inside(ssize, bytes, ex != 0) && (odd & (bytes - 1)) == 0 && !race_;
         if (inside) {
           uint8_t* sh = blk.shared.data();
           const bool moved = with_lane_width(bytes, [&](auto width) {
@@ -3670,13 +3674,15 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         uint64_t la[32];
         row_addresses(a, false, ur, store ? 64 : 32, ex, la);
         exec::LocalWindowCheck window;
+        uint64_t odd = 0;
         for (Mask m = ex; m; m &= m - 1) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
           const uint64_t off = static_cast<uint32_t>(la[l]);
           addrs[l] = off;
+          odd |= off;
           window.add(off);
         }
-        const bool inside = window.inside(w.local_size, bytes, ex != 0);
+        const bool inside = window.inside(w.local_size, bytes, ex != 0) && (odd & (bytes - 1)) == 0;
         if (inside) {
           if (w.local.empty()) w.local.assign(size_t{w.local_size} * 32, 0);
           const Operand& d = store ? ins.src[1] : ins.dst[0];
@@ -3717,6 +3723,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       each_lane(ex, [&](unsigned l) {
         const uint64_t off = static_cast<uint32_t>(address(a, l, false, ur, store ? 64 : 32, stride));
         addrs[l] = off;
+        check_aligned(w, ins, l, off, bytes, store ? "store" : "load");
         const Space sp = shared ? Space::Shared : Space::Local;
         if (store) {
           const Operand& d = ins.src[1];
@@ -3962,7 +3969,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
           const uint32_t addr = static_cast<uint32_t>(sa[l]);
           soff[l] = addr & 0xffffff;
-          ok = (addr >> 24) == blk.rank && uint64_t{soff[l]} + n <= blk.shared.size();
+          ok = (addr >> 24) == blk.rank && uint64_t{soff[l]} + n <= blk.shared.size() && (soff[l] & (n - 1)) == 0 && !race_;
         }
         if (ok) {
           const Operand& d = ins.dst[0];
@@ -4198,6 +4205,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         // The vector forms (sm_90's F32x2/x4, F16x4/x8, BF16x4/x8): f[7] words
         // in consecutive registers, aligned to all of them, each its own atomic.
         const unsigned nwords = ins.f[7] ? ins.f[7] : 1;
+        check_aligned(w, ins, l, addr, n, "atomic");
         if (nwords > 1 && addr % (4ull * nwords))
           fault(w, ins, l, "a vector atomic of " + std::to_string(4 * nwords) + " bytes at an address not aligned to them",
                 Err::MisalignedAccess);
@@ -4241,9 +4249,11 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         if (host && reinterpret_cast<uintptr_t>(host) % n == 0) {
           old = exec::host_atomic_rmw(host, n, compute);
         } else {
+          g_race_atomic = true;   // (VGPU_RACE: one atomic, not a load and a store)
           mem_read(blk, w, l, sp, addr, &old, n);
           const uint64_t nw = compute(old);
           mem_write(blk, w, l, sp, addr, &nw, n);
+          g_race_atomic = false;
         }
         w.idle_yields = changed ? 0 : idle0;
         ++blk.st.atomics;
@@ -5537,6 +5547,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
     for (const Warp& ww : blk.warps) live += static_cast<uint32_t>(std::popcount(ww.alive & ~ww.exited));
     const uint32_t expected = b.expected ? b.expected : live;
     if (b.arrived < expected) return;
+    if (race_) ++blk.race_epoch;   // the barrier orders what came before it against what comes after
     for (Warp& ww : blk.warps)
       for (unsigned l = 0; l < 32; ++l)
         if (((ww.waiting >> l) & 1) && ww.wait_kind[l] == Wait::Bar && ww.wait_arg[l] == id) {
@@ -6646,6 +6657,8 @@ void Runner::cluster_barrier_check(Block& blk) {
     }
   if (!any) return;
   ++cl.phase;
+  if (race_)
+    for (Block* b : cl.blocks) ++b->race_epoch;
   for (Block* b : cl.blocks)
     for (Warp& w : b->warps) {
       w.cga_arrived = 0;
@@ -6711,6 +6724,7 @@ uint64_t Runner::mbar_arrive(Block& blk, uint32_t off, uint32_t arrivals, int64_
   side.tx += tx;
   uint32_t phase = hi >> 31, count;
   if (remaining == 0 && side.tx == 0) {
+    if (race_) ++blk.race_epoch;   // a completed phase is what a waiter's acquire pairs with
     phase ^= 1;
     count = reload;
     side.arrived_all = false;
@@ -6735,6 +6749,7 @@ uint64_t Runner::mbar_arrive80(Block& blk, uint32_t off) {
   const uint32_t lo = static_cast<uint32_t>(old);
   uint32_t hi = static_cast<uint32_t>(old >> 32);
   const uint32_t count = (hi & 0x7fffffffu) + 1;
+  if (count >= 0x80000000u && race_) ++blk.race_epoch;
   if (count >= 0x80000000u) hi = ((hi ^ 0x80000000u) & 0x80000000u) | ((lo + 0x40000000u) & 0x7fffffffu);
   else hi = (hi & 0x80000000u) | count;
   const uint64_t now = lo | (static_cast<uint64_t>(hi) << 32);

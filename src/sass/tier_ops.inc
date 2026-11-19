@@ -1367,7 +1367,8 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
       for (unsigned l = 0; l < 32; ++l) offs[l] = base[l] * stride + add32;
     }
   }
-  if (!exec::shared_window_inside_warp(offs, ex, static_cast<uint32_t>(blk.rank), ssize, bytes)) {   // (as exec_mem: see window_check.hpp)
+  if (!exec::shared_window_inside_warp(offs, ex, static_cast<uint32_t>(blk.rank), ssize, bytes) ||
+      !exec::lanes_aligned(offs, ex, bytes)) {   // (as exec_mem: see window_check.hpp; a misaligned access is the loop's to fault)
     c.r->tier_exec_mem(blk, w, *op.ins, ex);
     return;
   }
@@ -1496,7 +1497,7 @@ static void h_local(void* vc, const tier::MOp& op, Mask ex) {
       window.add(off);
     }
   }
-  const bool inside = window.inside(w.local_size, bytes, ex != 0);
+  const bool inside = window.inside(w.local_size, bytes, ex != 0) && exec::lanes_aligned(addrs, ex, bytes);
   if (!inside) {
     c.r->tier_exec_mem(blk, w, *op.ins, ex);   // the lane that faults, and the words of the fault, are its
     return;
@@ -1960,7 +1961,7 @@ static void h_generic(void* vc, const tier::MOp& op, Mask ex) {
     addrs[l] -= kSharedWindow;   // the offset in the window (< 2^32), as classify gives it
     window.add(addrs[l], blk.rank);
   }
-  if (!window.inside(blk.shared.size(), bytes, true)) {
+  if (!window.inside(blk.shared.size(), bytes, true) || !exec::lanes_aligned(addrs, ex, bytes)) {
     c.r->tier_exec_mem(blk, w, *op.ins, ex);
     return;
   }
