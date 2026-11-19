@@ -10,6 +10,8 @@
 #                                                       them too, by default since 2026-11-16 (RE-RECORDED: it needed VGPU_TC_EXACT=published).
 #   nvidia/tests/data/tcpapers/tc_features.*.txt        the features of Fasi et al. (PeerJ CS 2021) and Khattak and Mikaitis (arXiv 2512.07004):
 #                                                       rtx3060 measured, h100 the simulator's.
+#   nvidia/tests/data/tcpapers/valpey.rtx3060.txt      inputs that tell truncation from round-to-zero (Valpey et al., arXiv 2502.15999, table 3) and the order of the
+#                                                       products: an RTX 3060's lines, measured 2026-11-19; the simulator agrees on both engines.
 #   nvidia/tests/data/tcpapers/<card>.<fmt>.<out>.txt   24 recorded test vectors each of an A100, an H100 and a B200 (Khattak and Mikaitis's
 #                                                       model_validation, BSD-2, see NOTICE): the simulator must reproduce them bit for bit with the
 #                                                       profile of the card (b200 by default since 2026-11-16; before, with VGPU_TC_EXACT=published), and the wrong rule must not.
@@ -17,7 +19,7 @@
 #                                                       accumulator) an H100, same source and notice. The simulator must reproduce them with the profile of the card on both engines
 #                                                       (l40s for Ada, b200, h100), and the sequential sum (VGPU_TC_EXACT=0) must not. FP8 sums: include/vgpu/exec/tc_fp8.hpp.
 #   VGPU_KHATTAK_VECTORS=<dir>   the full sets (tools/tcpapers/khattak-fetch.sh <x> then <x>/vectors): 5,000 vectors a file, 28 files.
-#   VGPU_TCPAPERS_BIN=<dir>      programs already built: <dir>/sm<NN>/{fprev_probe,tc_features,khattak_vectors} (skips nvcc).
+#   VGPU_TCPAPERS_BIN=<dir>      programs already built: <dir>/sm<NN>/{fprev_probe,tc_features,khattak_vectors,valpey_probe} (skips nvcc).
 # The sum is the device's, not the cubin's architecture, so each profile runs the program built for its own architecture.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -42,6 +44,9 @@ if [[ -z "${VGPU_TCPAPERS_BIN:-}" ]]; then
     nvcc -std=c++17 -O1 -arch=sm_$a -cudart shared -w -DNO_CUBLAS $(shim_sanitizer_nvcc_flags "$shim") "$tool/fprev_probe.cu" -o "$bin/sm$a/fprev_probe" 2> "$out/b.txt" || ok=0
     nvcc -std=c++17 -O1 -arch=sm_$a -cudart shared -w $(shim_sanitizer_nvcc_flags "$shim") "$tool/tc_features.cu" -o "$bin/sm$a/tc_features" 2>> "$out/b.txt" || ok=0
     nvcc -std=c++17 -O1 -arch=sm_$a -cudart shared -w $(shim_sanitizer_nvcc_flags "$shim") "$tool/khattak_vectors.cu" -o "$bin/sm$a/khattak_vectors" 2>> "$out/b.txt" || ok=0
+    if [[ $a == 86 || $a == 80 ]]; then
+      nvcc -std=c++17 -O1 -arch=sm_$a -cudart shared -w $(shim_sanitizer_nvcc_flags "$shim") "$tool/valpey_probe.cu" -o "$bin/sm$a/valpey_probe" 2>> "$out/b.txt" || ok=0
+    fi
     if (( ! ok )); then
       if [[ $a == 86 ]]; then echo "FAIL: the programs do not build for sm_86"; cat "$out/b.txt"; exit 1; fi
       echo "SKIP sm_$a: this toolkit does not build it ($(head -1 "$out/b.txt"))"; rm -rf "$bin/sm$a"
@@ -82,6 +87,11 @@ for prog in fprev_probe tc_features; do
     # (RE-RECORDED 2026-11-17: the sm_120 profiles sum by the Hopper rule by default, measured on an RTX PRO 6000 Blackwell Server Edition; it needed VGPU_TC_EXACT=published.)
     [[ -x "$bin/sm120/$prog" ]] && { run $prog 120 rtx-pro-6000-server $eng "$out/o.txt"; expect "$name sm_120 rtx-pro-6000-server (default: the Hopper rule, measured on the card) $eng (the h100's lines)" "$data/$name.h100.txt" "$out/o.txt"; }
   done
+done
+# Valpey et al.'s truncation inputs (table 3) and the order of the products: an RTX 3060's lines; the a100 profile prints them too.
+for eng in sass ptx; do
+  run valpey_probe 86 rtx3060 $eng "$out/o.txt"; expect "valpey_probe sm_86 rtx3060 $eng" "$data/valpey.rtx3060.txt" "$out/o.txt"
+  [[ -x "$bin/sm80/valpey_probe" ]] && { run valpey_probe 80 a100 $eng "$out/o.txt"; expect "valpey_probe sm_80 a100 $eng (the RTX 3060's lines)" "$data/valpey.rtx3060.txt" "$out/o.txt"; }
 done
 # the switches reach the programs: the sequential sum is not the card's, and b200 with VGPU_TC_EXACT=0 (the way back to the earlier
 # sequential results) is not Hopper's

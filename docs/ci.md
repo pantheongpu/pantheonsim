@@ -299,3 +299,14 @@ affinity, niceness and environment size, once with `VGPU_EXACT_THREADS=4`, and t
 twice; output, every counter and the memory must be the same. A short list runs in ctest (`e2e_differential_diff`,
 `e2e_differential_determinism`); `differential.yml` runs the full lists nightly with 20 repetitions. Differences that are understood are
 in the `known` table of the script, each with its reason; anything else fails. Found so far, all fixed: the PTX engine counted nothing for `wmma.load`, `wmma.store` and bulk-copy (TMA) traffic and one fewer shared store for `mbarrier.init` before sm_90; the SASS engine counted 16 bytes for every `SUST.P` whatever the lane stored; its fast global store paths did not count a store as progress (`Warp::idle_yields`); and a YIELD loop that does new work on every pass was taken for a spin-wait, so `break_spin_wait` let lanes go from a BSYNC early (`group_ballot_barrier` for sm_75: wrong ballots, and a deadlock). Left in the `known` table with the reason: the TMA store count of lanes that name the same operands (ptxas runs them once) and `mbarrier.init` on sm_90 and later (`SYNCS.EXCH.64`, not settled without an sm_90 card).
+
+## What runs after a merge (2026-11-19)
+
+A pull request already ran everything, so a push to main used to repeat it on the same tree (CI, Action, CUDA toolkits and ROCm
+libraries, about 40 jobs per merge, on a pool where queue time is most of the wait). Now a push to main runs only `build + unit tests`
+of ci.yml (a smoke test of main that also refreshes its ccache entry). The rest runs every night on main instead: ci.yml at 05:19 UTC,
+Action at 05:29, ROCm libraries at 05:37 (the weekly PyTorch models run stays weekly), CUDA toolkits at 05:07. Costs: a merge that
+breaks main in a way only a heavy job sees (two green pull requests that break each other) shows up the next night, not within the
+hour; and the shared ccache entries written by the SASS and workloads jobs are now one a night, not one a merge, so a pull request
+may rebuild a day's worth of changed files. `workloads.yml` is unchanged: no pull request runs it. If branches must be up to date
+before merging (a branch protection setting, off today), the post-merge run would add nothing and the smoke job could go too.

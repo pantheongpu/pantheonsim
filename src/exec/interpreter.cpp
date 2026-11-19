@@ -14829,9 +14829,12 @@ class Interpreter {
           if (size == 4) {
             float x = std::bit_cast<float>(static_cast<uint32_t>(old));
             float y = std::bit_cast<float>(static_cast<uint32_t>(b));
-            // atom/red.add.f32 flush subnormal inputs and results to signed
-            // zero (the ISA's .ftz, which the card applies).
-            auto ftz = [](float v) { return std::fpclassify(v) == FP_SUBNORMAL ? std::copysign(0.0f, v) : v; };
+            // atom/red.add.f32 in global memory flush subnormal inputs and results
+            // to signed zero (the ISA's .ftz, which the card applies). In shared
+            // memory ptxas makes a compare-and-swap loop around a plain FADD, which
+            // keeps them (an RTX 3060, with and without -ftz).
+            const bool flush = op.space != Space::Shared;
+            auto ftz = [flush](float v) { return flush && std::fpclassify(v) == FP_SUBNORMAL ? std::copysign(0.0f, v) : v; };
             float res = x;
             switch (op.op) {
               case AtomOp::Add: res = ftz(ftz(x) + ftz(y)); break;

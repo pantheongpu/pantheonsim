@@ -3721,6 +3721,14 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  # atomicAdd with subnormal operands: flushed for float in global memory only (an RTX 3060's lines), both engines, with and without -ftz.
+  add_test(NAME e2e_atomic_subnormal
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_atomic_subnormal.sh)
+  set_tests_properties(e2e_atomic_subnormal PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   # Device atomics from many blocks on the lock road (fewer than four host threads) and the lock-free one, SASS and PTX.
   add_test(NAME e2e_atomics_threads
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_atomics_threads.sh)
