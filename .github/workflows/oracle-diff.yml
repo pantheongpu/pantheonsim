@@ -48,30 +48,38 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
-      image: ${{ needs.image.outputs.cuda12_0 }}
+      image: ${{ needs.image.outputs.cuda13_0 }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
       options: --shm-size=2g
     env:
-      NVCC_PREPEND_FLAGS: -ccbin g++-12
+      NVCC_PREPEND_FLAGS: ''
     permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/pr-guard
 
-      - name: Install toolchain
+      # CUDA 13.0, the toolkit the pinned files were checked with: CUDA 12.0 (the other image) cannot build sm_120 or bf16 forms of
+      # the probes, which would leave sub-cases uncompared.
+      - name: Install CUDA 13
         if: ${{ !job.container.id }}
         run: |
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
-            build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit nvidia-profiler
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
+          wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/keyring.deb
+          [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0
+          echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
 
-      - name: Build
+      - name: Build the shims the probes load
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(ci/jobs.sh -p release)"
+          cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpu_cli vgpucudart vgpucuda
 
       - name: Oracle diff, simulator
         env:

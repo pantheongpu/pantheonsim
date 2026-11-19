@@ -28,6 +28,7 @@ d="$(mktemp -d "${TMPDIR:-/tmp}/oracle_selftest.XXXXXX")"; trap 'rm -rf "$d"' EX
 mk() { printf '#!/usr/bin/env bash\n%s\n' "$2" > "$d/$1"; chmod +x "$d/$1"; }
 mk ok.sh 'echo "PASS (stub, 3 lines)"'
 mk skip.sh 'echo "SKIP: no nvcc"; exit 0'
+mk partial.sh 'echo "SKIP sm_120: this toolkit does not build it"; echo "PASS"'
 mk fail.sh 'echo "FAIL: differs"; exit 1'
 mk silent.sh 'exit 0'
 run() { # run <expected rc> <label> <manifest lines...>
@@ -40,6 +41,7 @@ run() { # run <expected rc> <label> <manifest lines...>
 run 0 "all pass" ok.sh "# comment" ok.sh
 run 1 "a failure" ok.sh fail.sh
 run 1 "a skip is a failure" ok.sh skip.sh
+run 0 "a sub-case a toolkit cannot build is not" partial.sh
 run 1 "no PASS line" silent.sh
 run 1 "missing script" nonexistent.sh
 run 1 "empty manifest" "# nothing"

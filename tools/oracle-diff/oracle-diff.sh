@@ -5,7 +5,8 @@
 #   oracle-diff.sh --card     NVIDIA's runtime on the real GPU vs the same pinned files (needs nvcc, nvidia-smi, no build)
 #
 # Both modes diff against one pinned file, so a pass in both is simulator == card, line by line. The card mode is what notices a
-# card, driver or library that now answers differently from the file. A script that skips (no nvcc, no shim) counts as a failure:
+# card, driver or library that now answers differently from the file. A script that skips as a whole (a `SKIP:` line: no nvcc, no shim) counts as a failure; a sub-case a toolkit cannot build
+# (`SKIP sm_120: ...` inside a run that prints PASS) is counted in the table:
 # a nightly that compared nothing must not be green. Output: a table on stdout, a copy in $GITHUB_STEP_SUMMARY and in
 # $ORACLE_DIFF_OUT/summary.md (default: a temp dir), each script's log beside it. Exit 0 only if every script passed.
 #
@@ -38,9 +39,9 @@ for s in "${scripts[@]}"; do
   else
     timeout "${ORACLE_TIMEOUT:-1800}" "$e2e/$s" "${args[@]}" >"$log" 2>&1; rc=$?
     if (( rc != 0 )); then verdict="FAIL (exit $rc)"; bad=1
-    elif grep -q '^SKIP' "$log"; then verdict="FAIL (skipped: nothing was compared)"; bad=1
+    elif grep -q '^SKIP:' "$log"; then verdict="FAIL (skipped: nothing was compared)"; bad=1
     elif ! grep -q '^PASS' "$log"; then verdict="FAIL (no PASS line)"; bad=1
-    else d="$(grep '^PASS' "$log" | tail -1)"; d="${d#PASS}"; verdict="PASS${d:+ }${d# }"; fi
+    else d="$(grep '^PASS' "$log" | tail -1)"; d="${d#PASS}"; n=$(grep -c '^SKIP ' "$log"); verdict="PASS${d:+ }${d# }"; (( n )) && verdict+=" [$n sub-case(s) skipped by this toolkit]"; fi
   fi
   [[ $verdict == FAIL* ]] && failed+=("$s")
   rows+=("| $s | $verdict |")
