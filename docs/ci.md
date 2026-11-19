@@ -288,3 +288,15 @@ If a job in the pool died with exit 137: check the host's memory
 (`ci/jobs.sh --available`, `free -g`), look for a second runner process
 building at the same time, and re-run the job once the host is quiet. Raising
 the per-job GiB of a profile in `ci/jobs.sh` makes the builds narrower.
+
+## Differential execution and determinism
+
+`nvidia/tests/e2e/run_differential.sh diff` runs each program on the SASS engine and on the PTX interpreter (one host thread) and
+requires the same output, the same memory after every launch, the same launches, and the same blocks, warps and bytes written to
+global and shared memory. The instruction counts, load counts, requests, sectors and bank conflicts are not compared: they follow the
+instruction set (PTX or SASS) and what ptxas made of the loads. `... determinism` runs each program several times with other CPU
+affinity, niceness and environment size, once with `VGPU_EXACT_THREADS=4`, and the PTX random and adversarial schedulers with one seed
+twice; output, every counter and the memory must be the same. A short list runs in ctest (`e2e_differential_diff`,
+`e2e_differential_determinism`); `differential.yml` runs the full lists nightly with 20 repetitions. Differences that are understood are
+in the `known` table of the script, each with its reason; anything else fails. Found so far: the PTX engine counted nothing for
+`wmma.load` and `wmma.store` (fixed), and a SASS-engine deadlock on Turing's `group_ballot_barrier` code (recorded, not fixed).
