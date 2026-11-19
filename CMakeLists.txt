@@ -17,6 +17,13 @@ if(VGPU_WERROR)
   add_compile_options(-Werror)
 endif()
 
+# Threads: the core library, the shims and most tests start host threads (std::thread, pthread_create). Before glibc 2.34 those
+# symbols are in a separate libpthread, so without this the link fails there with "undefined reference to pthread_create"
+# (seen on Rocky 8, glibc 2.28). For every target, because nearly every one either starts threads or links a library that does;
+# on glibc 2.34 and later, where libc has them, Threads::Threads is empty and the link lines do not change.
+find_package(Threads REQUIRED)
+link_libraries(Threads::Threads)
+
 # The interpreter is the hot path and benefits measurably from cross-TU
 # inlining. Enabled only for Release builds, and only if the toolchain
 # supports it, so debug builds and odd toolchains are unaffected.
