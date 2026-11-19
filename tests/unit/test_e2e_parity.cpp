@@ -1012,8 +1012,10 @@ VTEST(a_device_reset_releases_everything_and_starts_over) {
 // ---------------------------------------------------------------------------
 // Mirrors wmma_gemm.cu, found by the differential run (nvidia/tests/e2e/run_differential.sh): the PTX engine counted nothing for wmma.load and
 // wmma.store, so the same kernel reported 0 bytes of global traffic on PTX and 2048 read and 1024 written on SASS (where the loads and stores
-// are LDG and STG). One m16n16k16 tile with f16 A and B and f32 C and D reads 512 + 512 + 1024 bytes and writes 1024 -- the bytes the elements
-// of the tiles hold, whatever vector width ptxas picks -- and a store to shared memory is shared traffic.
+// are LDG and STG). One m16n16k16 tile with f16 A and B and f32 C and D writes 1024 bytes (D has no element twice, so the SASS engine's
+// figure is the PTX engine's) and reads 1024 + 1024 + 1024: the fragments of A and B hold each f16 element in two registers, which PTX loads
+// twice and ptxas (sm_80 and up) once, so the load counts are of the PTX instruction and are not compared against SASS. A store to shared
+// memory is shared traffic.
 VTEST(wmma_load_and_store_are_counted) {
   const std::string ptx = std::string(kHeader) + R"(
 .visible .entry tile(.param .u64 pa, .param .u64 pb, .param .u64 pc, .param .u64 pd)
@@ -1069,9 +1071,9 @@ VTEST(wmma_load_and_store_are_counted) {
   mem.write(b, zero.data(), 512);
   mem.write(c, zero.data(), 1024);
   exec::LaunchStats st = exec::launch(entry("tile"), block_of(32), {arg_u64(a), arg_u64(b), arg_u64(c), arg_u64(d)}, mem, prof);
-  VCHECK_EQ(st.global_bytes_read, uint64_t{2048});
+  VCHECK_EQ(st.global_bytes_read, uint64_t{3072});
   VCHECK_EQ(st.global_bytes_written, uint64_t{1024});
-  VCHECK_EQ(st.global_bytes_ld, uint64_t{2048});
+  VCHECK_EQ(st.global_bytes_ld, uint64_t{3072});
   VCHECK_EQ(st.global_bytes_st, uint64_t{1024});
   VCHECK(st.global_loads > 0 && st.global_stores > 0);
   VCHECK(st.global_requests_ld > 0 && st.global_requests_st > 0);
