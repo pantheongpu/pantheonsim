@@ -297,3 +297,14 @@ Hosted runners install their toolchain with apt, and `security.ubuntu.com` answe
 Ubuntu mirror (archive.ubuntu.com, then kernel.org, Princeton, xtom, Leaseweb) before the next attempt, four attempts in
 all. `scripts/apt-mirror-fallback.sh` still switches mirrors up front when the image's mirror name does not resolve.
 `tests/lint/check_apt_mirror_fallback.sh` checks both with a fake apt-get, and fails if a workflow calls apt-get directly.
+
+## What runs after a merge (2026-11-19)
+
+A pull request already ran everything, so a push to main used to repeat it on the same tree (CI, Action, CUDA toolkits and ROCm
+libraries, about 40 jobs per merge, on a pool where queue time is most of the wait). Now a push to main runs only `build + unit tests`
+of ci.yml (a smoke test of main that also refreshes its ccache entry). The rest runs every night on main instead: ci.yml at 05:19 UTC,
+Action at 05:29, ROCm libraries at 05:37 (the weekly PyTorch models run stays weekly), CUDA toolkits at 05:07. Costs: a merge that
+breaks main in a way only a heavy job sees (two green pull requests that break each other) shows up the next night, not within the
+hour; and the shared ccache entries written by the SASS and workloads jobs are now one a night, not one a merge, so a pull request
+may rebuild a day's worth of changed files. `workloads.yml` is unchanged: no pull request runs it. If branches must be up to date
+before merging (a branch protection setting, off today), the post-merge run would add nothing and the smoke job could go too.

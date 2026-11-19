@@ -17,9 +17,6 @@ name: CUDA toolkits
 # On pull requests that touch the NVIDIA side, when a change lands, nightly
 # and by hand. Another 12.x is one more row.
 on:
-  push:
-    branches: [main]
-    paths: ["nvidia/**", "src/**", "include/**", "tests/**", "CMakeLists.txt", ".github/workflows/cuda-toolkits.yml"]
   pull_request:
     paths: ["nvidia/**", "include/**", "tests/shim_guard.sh", "CMakeLists.txt", ".github/workflows/cuda-toolkits.yml"]
   schedule:

@@ -11,13 +11,11 @@ name: ROCm libraries
 # changes to the AMD side or to what it is built on, weekly, and by hand.
 
 on:
-  push:
-    branches: [main]
-    paths: ["amd/**", "src/**", "include/**", "CMakeLists.txt", ".github/workflows/rocm-libraries.yml"]
   pull_request:
     paths: ["amd/**", "src/**", "include/**", "CMakeLists.txt", ".github/workflows/rocm-libraries.yml"]
   schedule:
     - cron: "17 6 * * 1"
+    - cron: "37 5 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -85,7 +83,7 @@ jobs:
   pytorch-models:
     name: PyTorch models on ${{ matrix.test }}
     # Weekly and by hand only: one runner per test, as each takes 45 minutes or more.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event.schedule == '17 6 * * 1' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
