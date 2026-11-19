@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Documentation links and file references resolve.
 
-Checks every Markdown file of the repository (README, ARCHITECTURE, CONTRIBUTING, CHANGELOG, TODO, docs/, nvidia/docs/, amd/README):
+Checks every Markdown file of the repository (README, ARCHITECTURE, CONTRIBUTING, TODO, docs/, nvidia/docs/, amd/README):
   1. each relative link [text](path) or [text](path#anchor) points at a file or directory that exists, and an anchor names a heading of
      the target (GitHub's slug rules, duplicates numbered -1, -2, ...) when the target is a Markdown file;
   2. each in-page link (#anchor) names a heading of the same file;

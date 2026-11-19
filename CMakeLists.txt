@@ -4625,6 +4625,10 @@ set_tests_properties(lint_thp_always PROPERTIES TIMEOUT 60)
 add_test(NAME lint_pr_guard COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_pr_guard.sh)
 set_tests_properties(lint_pr_guard PROPERTIES TIMEOUT 120)
 
+# ci/cancel-stale-runs.sh (the runs of merged, closed and superseded pull requests) against a fake gh.
+add_test(NAME lint_cancel_stale_runs COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_cancel_stale_runs.sh)
+set_tests_properties(lint_cancel_stale_runs PROPERTIES TIMEOUT 60)
+
 # ci/external/hip-tests.sh's per-case limits against a fake Catch2 suite: a case of a slow suite
 # (HT_SLOW_SUITES) that does not finish is SLOW, not a failure; other suites still fail on a timeout.
 add_test(NAME lint_hip_tests_runner COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_hip_tests_runner.sh)
@@ -4633,7 +4637,7 @@ set_tests_properties(lint_hip_tests_runner PROPERTIES TIMEOUT 120)
 # The "workloads failing on main" issue (ci/track-workloads-issue.sh) against a fake
 # gh: a failure opens or updates it, a pass closes it, a cancelled run touches nothing.
 add_test(NAME lint_workloads_issue COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_workloads_issue.sh)
-# The version in CMakeLists.txt is the newest entry of CHANGELOG.md, and no source file writes a version of its own.
+# The version is written once, in CMakeLists.txt's project(), and no source file writes a version of its own.
 add_test(NAME lint_version COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_version.sh)
 set_tests_properties(lint_workloads_issue PROPERTIES TIMEOUT 120)
 
