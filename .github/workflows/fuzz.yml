@@ -68,9 +68,10 @@ jobs:
           CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
           CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
         run: |
+          # Clang takes no #pragma GCC target, which the AVX2 units use: the fuzz build makes AVX2, FMA and F16C its baseline (the runners have them).
           export CC=clang CXX=clang++
           cmake -S . -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=Debug -DVGPU_FUZZ=ON \
-            -DCMAKE_CXX_FLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined,fuzzer-no-link" \
+            -DCMAKE_CXX_FLAGS="-O1 -g -march=haswell -fno-omit-frame-pointer -fsanitize=address,undefined,fuzzer-no-link" \
             -DCMAKE_C_FLAGS="-O1 -g -fsanitize=address,undefined" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
             -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
