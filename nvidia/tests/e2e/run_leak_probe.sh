@@ -26,11 +26,14 @@ nvcc -std=c++17 -cudart shared --gpu-architecture=sm_86 -Wno-deprecated-gpu-targ
      $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" -lcuda "${extra[@]}"
 if ! require_shim_libs "$shim" "$out"; then exit 0; fi
 
+# (a sanitizer's own leak detector would fail the processes that leak on purpose)
+export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0"
+
 status=0
 run_case() {   # <case> <mode> <expected ending of the line> <expected exit status>
   local c="$1" mode="$2" want="$3" want_status="$4" got rc=0 line
   : > "$log"
-  got="$(env $(both_shims_env "$shim") VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 VGPU_LEAK_CHECK="$mode" VGPU_LEAK_CHECK_FILE="$log" \
+  got="$(env $(both_shims_env "$shim") VGPU_QUIET=1 VGPU_THREADS=1 VGPU_GPU=nvidia/rtx3060 VGPU_LEAK_CHECK="$mode" VGPU_LEAK_CHECK_FILE="$log" \
          LD_LIBRARY_PATH="$shim" "$out" "$c" 2>&1)" || rc=$?
   line="$(grep '^vgpu-leak-check: device_bytes' "$log" || true)"
   echo "leak probe, $c ($mode): $line [exit $rc]"

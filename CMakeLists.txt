@@ -3660,6 +3660,15 @@ if(TARGET vgpucublas)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 900)
 
+  # Growth over 400 repeats of a workload through the runtime, the driver and cuBLAS (device memory, descriptors, threads,
+  # resident memory, mappings), and each deliberate leak named.
+  add_test(NAME e2e_leak_soak COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_leak_soak.sh)
+  set_tests_properties(e2e_leak_soak PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 900)
+
   add_test(NAME e2e_ret_condition_predicate
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ret_condition_predicate.sh)
   set_tests_properties(e2e_ret_condition_predicate PROPERTIES
