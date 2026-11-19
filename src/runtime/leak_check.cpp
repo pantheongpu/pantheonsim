@@ -110,7 +110,6 @@ std::string leak_check_line(Runtime* rt, bool* leaked) {
   add(pinned != 0, "pinned_allocs");
   add(dfd > 0, "fds");
   add(dth > 0, "threads");
-  add(dmap > 0, "maps");
   char buf[512];
   std::snprintf(buf, sizeof buf,
                 "vgpu-leak-check: device_bytes=%llu device_allocs=%llu pinned_allocs=%llu pinned_bytes=%llu fds=%+ld threads=%+ld "

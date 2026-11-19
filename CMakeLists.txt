@@ -1499,7 +1499,7 @@ vgpu_unit_test(test_ptx_block_reuse)
 vgpu_unit_test(test_worker_pool)
 # VGPU_HOST_STATS: the host-kernel counters line for a run that is slower on one kernel than another (#551).
 vgpu_unit_test(test_host_stats)
-# VGPU_LEAK_CHECK: the exit line is clean when everything came back and names each resource that did not (device bytes and allocations, pinned blocks, descriptors, threads, mappings).
+# VGPU_LEAK_CHECK: the exit line is clean when everything came back and names each resource that did not (device bytes and allocations, pinned blocks, descriptors, threads).
 vgpu_unit_test(test_leak_check)
 # Device memory is madvised for huge pages, and making a device fixes glibc's heap thresholds (#551).
 vgpu_unit_test(test_host_heap)

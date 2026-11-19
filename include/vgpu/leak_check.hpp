@@ -9,8 +9,9 @@
 // A line reads
 //   vgpu-leak-check: device_bytes=0 device_allocs=0 pinned_allocs=0 pinned_bytes=0 fds=+0 threads=+0 maps=+0 rss_kb=81234 -> clean
 // or ends "-> LEAK device_bytes,fds" naming each resource that grew. device_bytes and device_allocs are the allocator's own
-// accounting (what cudaMemGetInfo shows missing), summed over the devices; pinned_* are cudaMallocHost/cudaHostAlloc blocks; fds,
-// threads and maps (lines of /proc/self/maps) are the growth since the machine was made, with the worker pool's threads left out.
+// accounting (what cudaMemGetInfo shows missing), summed over the devices; pinned_* are cudaMallocHost/cudaHostAlloc blocks; fds and
+// threads are the growth since the machine was made, with the worker pool's threads left out. maps (lines of /proc/self/maps) is
+// shown, not judged: a library loaded on first use maps a dozen segments and that is not a leak.
 // A program that frees everything it allocates, closes what it opens and joins what it starts must read clean: a library handle
 // destroyed with memory still allocated for it, a stream whose thread stays, a file the simulator keeps open, each show here.
 // A program that leaks on purpose reads LEAK, which is how the check is shown to bite (nvidia/tests/e2e/leak_probe.cu).

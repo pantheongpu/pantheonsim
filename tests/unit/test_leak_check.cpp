@@ -1,8 +1,6 @@
 // VGPU_LEAK_CHECK (vgpu/leak_check.hpp): the line is clean for a machine whose program gave everything back, and names each
-// resource that did not come back -- device memory (bytes and allocations), pinned host blocks, file descriptors, threads and
-// mappings. A check that has never failed proves nothing, so every resource has a case that leaks on purpose.
+// resource that did not come back -- device memory (bytes and allocations), pinned host blocks, file descriptors and threads. A check that has never failed proves nothing, so every resource has a case that leaks on purpose.
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -64,7 +62,7 @@ VTEST(device_memory_not_freed_is_a_leak_in_bytes_and_in_allocations) {
   VCHECK(!leaked);
 }
 
-VTEST(a_descriptor_a_thread_and_a_mapping_left_behind_are_leaks) {
+VTEST(a_descriptor_and_a_thread_left_behind_are_leaks) {
   runtime::Runtime& rt = machine();
   bool leaked = false;
   const int fd = open("/dev/null", O_RDONLY);
@@ -83,17 +81,6 @@ VTEST(a_descriptor_a_thread_and_a_mapping_left_behind_are_leaks) {
   VCHECK_CONTAINS(line, "threads=+1");
   stop = true;
   t.join();
-  line_of(rt, &leaked);
-  VCHECK(!leaked);
-
-  // A mapping with a different protection from its neighbours is a line of its own in /proc/self/maps.
-  void* m = mmap(nullptr, 1 << 16, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  void* guard = mmap(nullptr, 1 << 16, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  line = line_of(rt, &leaked);
-  VCHECK(leaked);
-  VCHECK_CONTAINS(line, "maps=");
-  munmap(m, 1 << 16);
-  munmap(guard, 1 << 16);
   line_of(rt, &leaked);
   VCHECK(!leaked);
 }
