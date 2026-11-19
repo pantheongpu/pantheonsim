@@ -288,3 +288,14 @@ If a job in the pool died with exit 137: check the host's memory
 (`ci/jobs.sh --available`, `free -g`), look for a second runner process
 building at the same time, and re-run the job once the host is quiet. Raising
 the per-job GiB of a profile in `ci/jobs.sh` makes the builds narrower.
+
+## What runs after a merge (2026-11-19)
+
+A pull request already ran everything, so a push to main used to repeat it on the same tree (CI, Action, CUDA toolkits and ROCm
+libraries, about 40 jobs per merge, on a pool where queue time is most of the wait). Now a push to main runs only `build + unit tests`
+of ci.yml (a smoke test of main that also refreshes its ccache entry). The rest runs every night on main instead: ci.yml at 05:19 UTC,
+Action at 05:29, ROCm libraries at 05:37 (the weekly PyTorch models run stays weekly), CUDA toolkits at 05:07. Costs: a merge that
+breaks main in a way only a heavy job sees (two green pull requests that break each other) shows up the next night, not within the
+hour; and the shared ccache entries written by the SASS and workloads jobs are now one a night, not one a merge, so a pull request
+may rebuild a day's worth of changed files. `workloads.yml` is unchanged: no pull request runs it. If branches must be up to date
+before merging (a branch protection setting, off today), the post-merge run would add nothing and the smoke job could go too.

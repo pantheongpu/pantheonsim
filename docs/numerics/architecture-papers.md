@@ -1,0 +1,72 @@
+# More papers on how architectures differ: what was checked (issue #708)
+
+Follow-up to [tcpapers.md](tcpapers.md). Everything here was run on the local RTX 3060 (sm_86, driver 610.88, nvcc 13.0.88, GPU 0 alone) on
+2026-11-19 and on the simulator (both engines). Words as there: **measured** (a card of ours printed it), **published** (a paper or data
+set says it), **inferred**, **unknown**.
+
+## Valpey et al., arXiv 2502.15999 (Volta, Turing, Ampere; Titan V, RTX 2080 Ti, RTX A6000, CUDA 11.8)
+
+What the paper says of an Ampere tensor core, against our rule ([tc_ampere.hpp](../../include/vgpu/exec/tc_ampere.hpp)):
+
+| Claim of the paper | Our rule | Result |
+|---|---|---|
+| Products are exact in f32 (table 1) | exact products | agrees (`tc_features product_exact`, [tcpapers.md](tcpapers.md)) |
+| All terms, C included, are aligned to the largest and added in one group; order does not matter (property 3) | a chunk is the 8 products and C, summed in one step | agrees: eight products of very different size give the same bits forwards and in reverse (`valpey_probe`, `eight_forward`, `eight_reverse`, both `3f801c00`) |
+| Ampere keeps one bit more than the 24-bit mantissa below the largest term; the rest is discarded | terms truncated toward zero at `2^(top-25)` | agrees (`align_max_j` 24 in `tc_features`) |
+| The accumulation truncates; it is **not** round-to-zero, the two differ in an effective subtraction with a large exponent gap (section 4.2, table 3: a = 2, c = -2^-40 gives 2, not 2 - 2^-23) | truncation of the aligned terms, then of the sum | agrees: `p2_c-2^-40` is `40000000` on the card and on both engines; the ones around it (below) say where the cut is |
+| Intermediate sums are not normalised (property 4) | exact sum of the aligned terms | agrees: `1 + 2^-24 + 2^-24` is `3f800001` (1 + 2^-23), in either order |
+| Final f16 result is rounded to nearest by the tensor core | f16 accumulator rounds to nearest even | agrees (`tc_features` `round_pos`, `round_neg` for f16h) |
+| 9-term (Ampere) accumulator needs 4 carry-out bits (solver timed out; not proved) | the aligned terms are added exactly: no carry can be lost | not testable as stated; `carry_sum` in `tc_features` (sixteen equal products) agrees |
+| Volta and Turing: 4 products and C (5 terms), **all** shifted-out bits discarded; identical on both | the `Ampere` rule on Turing too: 8 products, one kept bit (measured on a Tesla T4 with `mma.sync m16n8k8`, [matrix-numerics.md](../matrix-numerics.md)) | **not comparable here**, see below |
+
+The truncation cases (`valpey_probe`, f16 inputs, f32 accumulator; one product `p` and an accumulator `c`; bits of the result; the card, and the
+simulator's `sass` and `ptx` engines, which agree: `nvidia/tests/data/tcpapers/valpey.rtx3060.txt`, in `e2e_tcpapers`):
+
+| p | c | result | reading |
+|---|---|---|---|
+| 2 | -2^-40, -2^-26, -2^-25, -2^-24, -1.5 * 2^-24 | `40000000` (2) | c lies below the cut at `2^-23`: dropped, even where round-to-zero would give `3fffffff` |
+| 2 | -2^-23 | `3fffffff` | on the cut: kept |
+| 2, -2 | +2^-25, +2^-24 | `40000000`, `c0000000` | dropped |
+| 1 | -2^-26, -2^-25 | `3f800000` (1) | below the cut at `2^-24`: dropped |
+| 1 | -2^-24, -3 * 2^-25 | `3f7fffff` | on and above the cut (-3 * 2^-25 is cut to -2^-24) |
+| 1.5 | -2^-25, -2^-24 | `3fc00000`, `3fbfffff` | the cut follows the largest term's exponent |
+
+**What could not be settled.** The paper's Volta and Turing model describes `HMMA.884` (`mma.m8n8k4`, 4 products), which a Volta runs. Our Turing
+measurement is of `mma.m16n8k8` (`HMMA.1688`, 8 products). The two forms can differ on one chip, so "Turing" in the paper and "Turing" here
+are not the same claim. The simulator's `m8n8k4` form keeps the sequential f32 sum (a known gap, #664), and the paper's Algorithm 1 (5 terms, shifted bits
+discarded) plus the 5,000 recorded V100 vectors of [MATLAB-tensor-core](https://github.com/north-numerical-computing/MATLAB-tensor-core)
+(1,200 mismatches of 5,000 for the f32 accumulator on the RTX 3060) are what a rule for it would be written and checked against. No V100 profile exists
+(CUDA 13 cannot build sm_70). Not done.
+
+The paper's table 5 (an error-correction case) is not reproduced: its inputs print garbled in the HTML version we read.
+
+## The MATLAB models that were not compared before
+
+`north-numerical-computing/MATLAB-tensor-core` holds, at our pinned commit 79143bd (and at 6fd05208, 2026-11-18: only the README changed, and
+`models/` and `model_validation/` are byte-identical), models we had not read:
+
+| Model | What it is | Against our rules |
+|---|---|---|
+| `RTXPRO6000TC.m` | calls `B200TC.m` | `B200TC`: 16 products and C, 2 extra alignment bits, truncating, f32 result `rz`; f16 result `rne`. That is our `hopper` rule, which is the default for sm_120 (measured on an RTX PRO 6000 Blackwell Server Edition, 2026-11-17). Agrees for f16, bf16, tf32. Its FP8 branch (32 products, interleaved, `neab` 2) is **not** what we measured for sm_120 FP8 ("exact sum cut toward zero", 18 of 27 forms): the model is a hypothesis for the other nine forms, **not tested** (the card's raw results are not in the repository) |
+| `A30TC.m` | calls `A100TC.m` | `A100TC`: 8 products, 1 extra bit, truncating (tf32: 4), `rne` for an f16 result: our `Ampere` rule; a30 has it |
+| `B200TCRN.m` | `B200TC` with the final f32 rounding `rne` (not `rz`), f16 minimum exponent -15 (not -21) | no recorded vectors in the repository use it; the recorded B200 vectors all agree with `rz` (0 mismatches of 20,000). Nothing to change. It may describe a different instruction (`tcgen05.mma`), which has no recorded data: a hypothesis only |
+| `H100TC.m` FP8 branch | 32 products, `neab` -10, `rne` | looks like the `wgmma` FP8 rule found in [fp8-vectors.md](fp8-vectors.md) (one chunk of 32, 13 bits below the largest): same family; not checked number by number |
+
+The model comments also say `A100TC` takes 2 products for bf16 "without `_1k`"; our rule takes 8 for bf16 on the forms we probed (`mma.m16n8k8`, wmma)
+and reproduces 5,000 recorded A100 bf16 vectors, so that note concerns a form we do not have. Not investigated further.
+
+## `atomicAdd` with subnormal operands (forum reports, not a paper)
+
+Probe: [atomic_subnormal.cu](../../tools/tcpapers/atomic_subnormal.cu), 8 float and 6 double cases, global and shared memory, result used (`ATOM`) and
+unused (`RED`), built with and without `-ftz=true`. RTX 3060, 2026-11-19; the output is identical with and without `-ftz`:
+
+| | global memory | shared memory |
+|---|---|---|
+| float | flushes subnormal inputs and results to a signed zero (`ATOMG.E.ADD.F32.FTZ.RN`, `RED.E.ADD.F32.FTZ.RN`): `0x1 + 0x0` is 0, `0x7fffff + 0x7fffff` is 0, `0x00c00000 - 0x00800000` is 0 | **keeps them**: `0x1 + 0x0` is `0x1`, `0x7fffff + 0x7fffff` is `0xfffffe`, `0x00c00000 - 0x00800000` is `0x400000` (ptxas makes `LDS`, `FADD`, `ATOMS.CAST.SPIN`, a compare-and-swap loop; the `FADD` has no `.FTZ`, with or without `-ftz=true`) |
+| double | keeps them (`0x1 + 0x1` is `0x2`) | keeps them |
+
+So the forum report holds on this card: global float atomics flush whatever `-ftz` says, shared ones do not. The simulator had flushed in both. Fixed in
+the PTX interpreter (`atom` and `red` with `.shared` no longer flush; `src/exec/interpreter.cpp`). The SASS engine already ran the card's real
+compare-and-swap loop for shared memory, and `ATOMG`'s `.FTZ` for global, so it matched. Not covered: a generic-address float atomic that points into
+shared memory (the card's `ATOM.E.ADD.F32.FTZ` on a shared window was not probed; the interpreter keeps flushing there), and `atomicAdd` on f16 and
+bf16 pairs. The test is `e2e_atomic_subnormal` (the card's 56 lines, both engines, both `-ftz` settings).

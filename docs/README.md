@@ -22,6 +22,7 @@ One line per document. Start with the repository [README](../README.md); the des
 * [cooperative.md](cooperative.md): cooperative launch and the grid barrier.
 * [matrix-numerics.md](matrix-numerics.md): which sum each profile's tensor core or matrix core makes, and whether that is measured on a card, published, or unmeasured.
 * [numerics/tcpapers.md](numerics/tcpapers.md): three more papers on matrix-unit numerics (Fasi et al., Khattak and Mikaitis, FPRev) run on an RTX 3060 and the simulator: what matched, the recorded A100 / H100 / B200 test vectors, the one cuBLAS mismatch.
+* [numerics/architecture-papers.md](numerics/architecture-papers.md): Valpey et al. (truncation, products and order) against an RTX 3060 and the simulator, the MATLAB models of the RTX PRO 6000, A30 and B200 variants, and `atomicAdd` with subnormals (flushed in global memory only).
 * [numerics/per-profile.md](numerics/per-profile.md): for every profile, which matrix numerics are measured on a card, inferred or unknown (generated from `vgpu info`).
 * [numerics/fttn-simulators.md](numerics/fttn-simulators.md): FTTN on the simulator, every NVIDIA profile with a tensor core, both engines, against the paper's Table IV and the cards of ours.
 * [numerics/fp8-vectors.md](numerics/fp8-vectors.md): the e4m3 and e5m2 `mma.sync` forms against 70,000 recorded vectors (RTX 1000 Ada, L40S, H100, H200, B200): the `ada` and `via_f16` sums, and why the PTX interpreter had disagreed with the SASS executor.
