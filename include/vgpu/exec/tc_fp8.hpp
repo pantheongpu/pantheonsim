@@ -1,5 +1,7 @@
 // The sum an Ada (sm_89) tensor core makes of e4m3 and e5m2 products (mma.sync m16n8k32, QMMA), and the choice between the FP8 sums a profile
 // can name (vgpu::Fp8Sum, include/vgpu/profile.hpp; the evidence is in docs/matrix-numerics.md).
+// The same arithmetic, with the numbers of kHopperWgmmaFp8Rule (one chunk of 32, grid 14, 13 result bits), is the sum of the dense FP8 forms of wgmma
+// and QGMMA on a Hopper device (vgpu::WgmmaFp8Sum; docs/numerics/fp8-vectors.md).
 //
 // K is cut into chunks of `chunk` products, in order. A chunk is its exact products and the accumulator, each cut toward zero at
 // 2^(e_max - (grid - 1)), where e_max is the largest of the terms' exponents (a product's exponent is the sum of its factors', each
@@ -20,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 #include "vgpu/exec/tc_ampere.hpp"
 #include "vgpu/profile.hpp"
@@ -137,6 +140,27 @@ inline double fp8_dot(const vgpu::Fp8SumRule& r, bool acc_f16, int emin_a, int e
     if (acc_f16 && std::fabs(acc) > 65504.0) acc = acc > 0 ? inf : -inf;   // a binary16 accumulator that overflows is an infinity from then on
   }
   return acc;
+}
+
+// The rule in force on a device for the e4m3 / e5m2 forms of wgmma and QGMMA: null for the sequential sum (and with VGPU_TC_EXACT=0). Dense
+// forms only: the caller does not ask for a sparse one.
+inline const vgpu::Fp8SumRule* wgmma_fp8_rule(const vgpu::DeviceProfile& p) {
+  return exact_enabled() ? vgpu::wgmma_fp8_sum_rule(p.numerics.tensor_sum_wgmma_fp8) : nullptr;
+}
+
+// D = A * B + C for a rows x N tile of an FP8 wgmma: A is rows x K, B is K x N (values, row-major), C and D rows x N (the accumulator's values,
+// f16 ones already widened; D is exact in the accumulator's format).
+inline void fp8_tile(const vgpu::Fp8SumRule& r, bool acc_f16, int emin_a, int emin_b, uint32_t rows, uint32_t N, uint32_t K, const float* A,
+                     const float* B, const float* C, float* D) {
+  thread_local std::vector<double> Ad, Bd;
+  Ad.assign(A, A + size_t{rows} * K);
+  Bd.assign(B, B + size_t{K} * N);
+  // (a NaN is the canonical 0x7fffffff, as the tile kernels write it)
+  for (uint32_t i = 0; i < rows; ++i)
+    for (uint32_t j = 0; j < N; ++j) {
+      const float x = static_cast<float>(fp8_dot(r, acc_f16, emin_a, emin_b, &Ad[size_t{i} * K], 1, &Bd[j], N, K, C[size_t{i} * N + j]));
+      D[size_t{i} * N + j] = x != x ? std::bit_cast<float>(0x7fffffffu) : x;
+    }
 }
 
 }  // namespace vgpu::exec::tc86

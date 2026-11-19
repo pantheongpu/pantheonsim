@@ -135,8 +135,9 @@ f16 vectors, 63 percent of bf16 ones); it is not MMA-Sim's own `exact_sum`.
    (sequential); the family at chunk 4, G 24 matches MMA-Sim on 880,000 vectors, but a V100 and a T4 `m8n8k4` run is what would make it a rule.
    (b) `wgmma` and `tcgen05.mma` f16, bf16, tf32: the simulator keeps the sequential sum ("unmeasured" on the main page) while MMA-Sim gives them the
    Hopper numbers (F 25, L = 32 bytes); the rule on its own agrees with MMA-Sim on these forms (rows `Hopper wgmma` and `Blackwell tcgen05` above), so
-   enabling it there needs only a card: an H100 `wgmma` with `mmasim_kernels` vectors, and a B200 for `tcgen05`. (c) Ada's FP8 (F 13, result
-   `RZ-E8M13`), Hopper's `wgmma` FP8 (F 13), Blackwell's FP8 and FP6/FP4 and the block-scaled forms (`ST_FDPA`, F 25, L 32; `GST_FDPA` for k64,
+   enabling it there needs only a card: an H100 `wgmma` with `mmasim_kernels` vectors, and a B200 for `tcgen05`. (c) Hopper's `wgmma` FP8 (F 13) is
+   implemented since 2026-11-19 (it reproduces all 20,000 recorded H100 and H200 vectors; [fp8-vectors.md](fp8-vectors.md)); Ada's FP8 (F 13, result
+   `RZ-E8M13`) is `ada` there. Not implemented: Blackwell's FP8 and FP6/FP4 and the block-scaled forms (`ST_FDPA`, F 25, L 32; `GST_FDPA` for k64,
    G 16, F 35): no rule here; unmeasured.
 7. **No NVIDIA disagreement** was found. Where our `Hopper` rule is `inferred` (b200, gb200, rtx5090 and the other sm_120 profiles) MMA-Sim
    is the third source that gives the same numbers; it is not a card of ours.

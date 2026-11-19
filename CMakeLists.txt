@@ -1684,6 +1684,9 @@ vgpu_unit_test(test_mma_fast)
 vgpu_unit_test(test_tile_mma)
 # The PTX engine's SIMD wgmma route against its general form (VGPU_FASTPATH=0), bit for bit.
 vgpu_unit_test(test_wgmma_fast)
+# The e4m3 / e5m2 sum of wgmma on a Hopper device (tc_fp8.hpp, kHopperWgmmaFp8Rule): recorded H100 and H200 vectors through the rule and through a
+# real wgmma (both PTX routes), the sequential sum for VGPU_TC_EXACT=0, and what each profile names.
+vgpu_unit_test(test_wgmma_fp8)
 # tcgen05.mma reading its operands whole from shared memory against the element reads, bit for bit.
 vgpu_unit_test(test_tcgen05_fast)
 # tcgen05.mma through the tile kernels for the forms the whole-operand route leaves to the row loop (f16 D, layouts F, B, G, A in Tensor Memory, sparse A,
@@ -4789,6 +4792,12 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 900)
+  # The e4m3 / e5m2 sum of wgmma on an H100 profile, recorded H100 and H200 vectors through a real wgmma, SASS and PTX engines (tc_fp8.hpp).
+  add_test(NAME e2e_wgmma_fp8_vectors COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_wgmma_fp8_vectors.sh)
+  set_tests_properties(e2e_wgmma_fp8_vectors PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
 endif()
 
 # TMA: a CUTLASS-style Hopper GEMM (clusters, a TMA pipeline, wgmma) checked
