@@ -8,5 +8,11 @@ cd "$(dirname "$0")/.."
 if [[ -z ${CI_JOBS:-} && -z ${CI_JOBS_MAX:-} && -z ${CI:-} ]]; then
   CI_JOBS_MAX=$(( ($(nproc) + 1) / 2 )); export CI_JOBS_MAX
 fi
+# `make deps` can install a compiler that is not the default one (g++-14 with no g++ on a bare Ubuntu 24.04, g++-12 on 22.04),
+# which `make` alone hands to the build; `make build` after `make deps` gets it the same way.
+if [[ -z ${CXX:-} ]]; then
+  cxx=$(./scripts/deps.sh --cxx 2>/dev/null || true)
+  if [[ -n $cxx ]]; then export CXX=$cxx; fi
+fi
 cmake -S . -B build -DCMAKE_BUILD_TYPE="${VGPU_BUILD_TYPE:-Release}" >/dev/null
 cmake --build build -j"$(ci/jobs.sh -p release)"
