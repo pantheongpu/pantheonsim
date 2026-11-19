@@ -1,0 +1,32 @@
+# Skipped-test budget for the "rest of the suite" job of ci.yml (the ml job on the
+# pantheonsim.com runner, whose image lacks some software). A test that skips there
+# fails the job unless it is listed here, and the skips together may not exceed the
+# total. Checked by ci/skip_budget.py (lint_skip_budget, the ml job, and a ratchet
+# step in build-and-test that fails a pull request which raises the total or adds a
+# test). To add a skip you must say why it cannot run; to remove one, delete its line
+# and lower the total.
+#
+# Format, one line each, fields separated by " | ":
+#   test name or regex | number of tests | where it runs instead | why it skips here
+# "where" is a workflow file, or "-" when nothing runs it yet (then the line is also a
+# candidate to un-skip by adding the software to the image).
+total 54
+e2e_sass_jit_full | 1 | sass-ptx.yml | the full tier 2 (JIT) matrix is an hour of work and runs only in the nightly (VGPU_NIGHTLY=1); e2e_sass_jit is the pull request gate
+bench_amd_counters | 1 | skipped-tests-weekly.yml | needs ROCm 7.2.0's hipcc and rocprofv3; the image's ROCm is 7.1
+bench_amd_counters_blocks | 1 | - | needs ROCm 7.2.0's hipcc and rocprofv3; the image's ROCm is 7.1 (the weekly job's -R names bench_amd_counters only, so nothing runs this one)
+e2e_nvprof | 1 | - | nvprof ships only up to CUDA 12; the shim is CUDA 13 (the CUDA 12.0 job of ci.yml runs it)
+amd_rocprofiler_abi | 1 | skipped-tests-weekly.yml | the image's ROCm has no rocprofiler-sdk
+amd_rocprofv3 | 1 | skipped-tests-weekly.yml | the image's ROCm has no rocprofv3 of release 7.2.0
+amd_rocprofiler_pcsampling | 1 | skipped-tests-weekly.yml | the image's ROCm has no rocprofiler-sdk
+amd_rvs | 1 | skipped-tests-weekly.yml | the image's ROCm has no rocm-validation-suite
+amd_rocprof_.* | 36 | skipped-tests-weekly.yml | the image has no rocprofv3 7.2.0, which the recordings in amd/tests/data were made with
+e2e_jit_frameworks | 1 | skipped-tests-weekly.yml | numba and triton are not in the image
+e2e_nvshmem_device | 1 | skipped-tests-weekly.yml | NVIDIA's NVSHMEM headers and libnvshmem_device.a are not in the image
+e2e_nvshmem_bootstrap | 1 | skipped-tests-weekly.yml | the image has no Open MPI (mpicxx)
+e2e_cupti_compat12 | 1 | cuda-toolkits.yml | it builds against the CUDA 12.3 to 12.9 headers and the image has CUDA 13 only
+amd_opencl | 1 | rocm-libraries.yml | ROCm's OpenCL runtime (rocm-opencl) is not in the image
+e2e_fft_lto_callbacks | 1 | skipped-tests-weekly.yml | libnvJitLink is nowhere on the image (libnvjitlink-13-0 would turn it on)
+e2e_packed_int_forms | 1 | skipped-tests-weekly.yml | the image's ptxas does not assemble PTX ISA 9.2 packed integer forms for sm_120f
+e2e_runtime_132 | 1 | skipped-tests-weekly.yml | needs a runtime shim built with the CUDA 13.2 headers; the image has CUDA 13.0
+e2e_rdc_clones | 1 | - | only meaningful where the device link clones pow into two or more copies; this image's nvcc makes none and the test says so
+e2e_npp_stream_context | 1 | - | checks the CUDA 12 NPP stream-context functions, which CUDA 13 removed; the CUDA 12 legs run it
