@@ -11765,6 +11765,10 @@ class Interpreter {
     const WmmaGeom g = wmma_geom(wmma_frag(op.which), op.shape, op.type);
     const uint32_t per_reg = g.reg_bits / g.bits;
     const uint64_t mask = g.bits == 64 ? ~0ull : (1ull << g.bits) - 1;
+    // The traffic is the elements the lanes read, one request for each element of a register (the sub-byte types a byte each, as wmma_read reads
+    // them): the bytes, the per-lane operations and the sectors of those addresses, as the loads the SASS engine runs for the same wmma.load count.
+    const uint32_t ebytes = g.bits >= 8 ? g.bits / 8 : 1;
+    Lanes ats[32];
     for (uint32_t reg = 0; reg < g.regs; ++reg) {
       Lanes r{};
       for (uint32_t lane = 0; lane < W_; ++lane) {
@@ -11773,10 +11777,15 @@ class Interpreter {
         for (uint32_t e = 0; e < per_reg; ++e) {
           const auto [row, col] = wmma_slot(g, lane, reg, e);
           const uint64_t elem = op.layout == MatLayout::Row ? uint64_t{row} * ld + col : uint64_t{col} * ld + row;
+          ats[e][lane] = g.bits >= 8 ? addr0 + elem * ebytes : addr0 + elem * g.bits / 8;
           uint64_t v = wmma_read(w, ctx, ins, lane, addr0, elem, g.bits) & mask;
           packed |= v << (e * g.bits);
         }
         r[lane] = packed;
+      }
+      for (uint32_t e = 0; e < per_reg; ++e) {
+        count_memory(op.space, ebytes, popcount_mask(m), /*is_store=*/false);
+        count_addresses(op.space, ats[e], m, ebytes, 1, /*is_store=*/false);
       }
       write_reg(w, op.dsts[reg], m, r, g.reg_bits);
     }
@@ -11792,6 +11801,8 @@ class Interpreter {
     const WmmaGeom g = wmma_geom('d', op.shape, op.type);
     const uint32_t per_reg = g.reg_bits / g.bits;
     const uint64_t mask = g.bits == 64 ? ~0ull : (1ull << g.bits) - 1;
+    // Counted as wmma.load is (exec_wmma_load_generic): a request for each element of a register.
+    Lanes ats[32];
     for (uint32_t reg = 0; reg < g.regs; ++reg) {
       Lanes _s_v;
       const Lanes v = read_operand(w, ctx, ins, op.src[reg], _s_v);
@@ -11800,8 +11811,13 @@ class Interpreter {
         for (uint32_t e = 0; e < per_reg; ++e) {
           const auto [row, col] = wmma_slot(g, lane, reg, e);
           const uint64_t elem = op.layout == MatLayout::Row ? uint64_t{row} * ld + col : uint64_t{col} * ld + row;
+          ats[e][lane] = addr0 + elem * (g.bits / 8);
           store_routed(w, ctx, ins, lane, addr0 + elem * (g.bits / 8), g.bits / 8, (v[lane] >> (e * g.bits)) & mask);
         }
+      }
+      for (uint32_t e = 0; e < per_reg; ++e) {
+        count_memory(op.space, g.bits / 8, popcount_mask(m), /*is_store=*/true);
+        count_addresses(op.space, ats[e], m, g.bits / 8, 1, /*is_store=*/true);
       }
     }
   }
