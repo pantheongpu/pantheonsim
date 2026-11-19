@@ -40,7 +40,7 @@ for s in "${scripts[@]}"; do
     if (( rc != 0 )); then verdict="FAIL (exit $rc)"; bad=1
     elif grep -q '^SKIP' "$log"; then verdict="FAIL (skipped: nothing was compared)"; bad=1
     elif ! grep -q '^PASS' "$log"; then verdict="FAIL (no PASS line)"; bad=1
-    else verdict="PASS ($(grep '^PASS' "$log" | tail -1))"; fi
+    else d="$(grep '^PASS' "$log" | tail -1)"; d="${d#PASS}"; verdict="PASS${d:+ }${d# }"; fi
   fi
   [[ $verdict == FAIL* ]] && failed+=("$s")
   rows+=("| $s | $verdict |")
