@@ -1,0 +1,5 @@
+# Tests whose programs keep something when they end, by the resources the leak line names (device_bytes, device_allocs, pinned_allocs,
+# fds, threads), each with the reason. check_leak_sweep.py reads it: a leak that is not here fails the CI step "Leak sweep", and an entry
+# whose test no longer leaks fails it too. A leak in the simulator itself is fixed, not listed.
+#
+# <test> <resources>  # <reason>

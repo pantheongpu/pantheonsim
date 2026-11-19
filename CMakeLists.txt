@@ -4598,6 +4598,10 @@ if(Python3_Interpreter_FOUND)
     ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
     SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 endif()
+# The leak sweep (below, and the CI step "Leak sweep") reads the logs of the e2e tests; this checks that it finds a leak, a second
+# resource beside a listed one, and a listed entry that is stale.
+add_test(NAME lint_leak_sweep_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_leak_sweep_selftest.sh)
+set_tests_properties(lint_leak_sweep_selftest PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
 add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_symbols.sh)
 set_tests_properties(lint_shim_symbols PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
@@ -5385,3 +5389,19 @@ foreach(_pair test_amd_gcn_same_bits:500 e2e_sass_archs:210 test_host_gemm:180 e
     set_property(TEST ${_t} PROPERTY COST ${_cost})
   endif()
 endforeach()
+
+# The leak sweep. Every end-to-end test runs its programs with VGPU_LEAK_CHECK=1 and a log of its own, build/leak-check/<test>.log
+# (include/vgpu/leak_check.hpp: what the process still holds when its machine goes away); `tests/lint/check_leak_sweep.py
+# build/leak-check tests/lint/leak_known.txt` reads the logs after the tests (the CI step "Leak sweep") and fails on a leak the known
+# list does not name. Not in a sanitizer build: a sanitizer's own threads and quarantine are not the program's. Logs append, so a build
+# directory that has run the tests before needs `rm -rf build/leak-check` first.
+if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize")
+  file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/leak-check")
+  get_property(_leak_tests DIRECTORY PROPERTY TESTS)
+  foreach(_t ${_leak_tests})
+    if(_t MATCHES "^e2e_" AND NOT _t MATCHES "^e2e_leak_")
+      set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT
+        "VGPU_LEAK_CHECK=1" "VGPU_LEAK_CHECK_FILE=${CMAKE_BINARY_DIR}/leak-check/${_t}.log")
+    endif()
+  endforeach()
+endif()

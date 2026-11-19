@@ -110,13 +110,19 @@ std::string leak_check_line(Runtime* rt, bool* leaked) {
   add(pinned != 0, "pinned_allocs");
   add(dfd > 0, "fds");
   add(dth > 0, "threads");
-  char buf[512];
+  // The program, so that a line in a log shared by several processes (a test that starts a few) says whose it is.
+  char exe[512] = "?";
+  if (const ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1); n > 0) {
+    exe[n] = 0;
+    if (const char* slash = std::strrchr(exe, '/')) std::memmove(exe, slash + 1, std::strlen(slash));
+  }
+  char buf[768];
   std::snprintf(buf, sizeof buf,
                 "vgpu-leak-check: device_bytes=%llu device_allocs=%llu pinned_allocs=%llu pinned_bytes=%llu fds=%+ld threads=%+ld "
-                "maps=%+ld rss_kb=%llu -> ",
+                "maps=%+ld rss_kb=%llu exe=%s -> ",
                 static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(allocs),
                 static_cast<unsigned long long>(pinned), static_cast<unsigned long long>(pinned_bytes), dfd, dth, dmap,
-                static_cast<unsigned long long>(now.rss_kb));
+                static_cast<unsigned long long>(now.rss_kb), exe);
   std::string line = buf;
   line += what.empty() ? "clean" : "LEAK " + what;
   if (dfd > 0) {

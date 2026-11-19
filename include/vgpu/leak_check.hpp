@@ -7,7 +7,7 @@
 //   VGPU_LEAK_CHECK_FILE=    append the line to this file instead of stderr
 //
 // A line reads
-//   vgpu-leak-check: device_bytes=0 device_allocs=0 pinned_allocs=0 pinned_bytes=0 fds=+0 threads=+0 maps=+0 rss_kb=81234 -> clean
+//   vgpu-leak-check: device_bytes=0 device_allocs=0 pinned_allocs=0 pinned_bytes=0 fds=+0 threads=+0 maps=+0 rss_kb=81234 exe=my_app -> clean
 // or ends "-> LEAK device_bytes,fds" naming each resource that grew. device_bytes and device_allocs are the allocator's own
 // accounting (what cudaMemGetInfo shows missing), summed over the devices; pinned_* are cudaMallocHost/cudaHostAlloc blocks; fds and
 // threads are the growth since the machine was made, with the worker pool's threads left out. maps (lines of /proc/self/maps) is
