@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <regex>
 #include <string>
 #include <vector>
 
@@ -264,8 +265,24 @@ Result expected(const Case& k, const std::vector<uint8_t>& in) {
   return r;
 }
 
+// A launch whose access is misaligned stops with a fault on a card; the tier must stop with the interpreter's, word for word, and there is nothing else
+// to compare. True when it did (either faulting for another reason fails).
+bool misaligned_alike(Env& e, const Case& k, const std::vector<uint8_t>& input, Result& tier, Result& ref) {
+  std::string te, re;
+  try { tier = run(e, k, input, false); } catch (const std::exception& x) { te = x.what(); }
+  try { ref = run(e, k, input, true); } catch (const std::exception& x) { re = x.what(); }
+  if (te.empty() && re.empty()) return false;
+  // (the two runs are in one world, so the buffer is at two places: the addresses are not what is compared)
+  const auto plain = [](std::string t) { return std::regex_replace(t, std::regex("0x[0-9a-f]+"), "0x#"); };
+  if (plain(te) != plain(re)) throw vtest::Failure(k.name() + ": the tier's error is \"" + te + "\", the interpreter's \"" + re + "\"");
+  if (te.find("not aligned") == std::string::npos) throw vtest::Failure(k.name() + ": faulted, and not for a misaligned access: " + te);
+  return true;
+}
+
 void check(Env& e, const Case& k, const std::vector<uint8_t>& input) {
-  const Result tier = run(e, k, input, false), ref = run(e, k, input, true), want = expected(k, input);
+  Result tier, ref;
+  if (misaligned_alike(e, k, input, tier, ref)) return;
+  const Result want = expected(k, input);
   for (size_t i = 0; i < want.out.size(); ++i) {
     if (ref.out[i] != want.out[i])
       throw vtest::Failure(k.name() + " (interpreter): thread " + std::to_string(i / 8) + " word " + std::to_string(i % 8) + " is " + std::to_string(ref.out[i]) + ", not " + std::to_string(want.out[i]));
@@ -286,7 +303,8 @@ void check(Env& e, const Case& k, const std::vector<uint8_t>& input) {
 // The tier against the interpreter alone (words, bytes, counters): for the cases whose rule `expected` does not model (an access that reaches past the buffer
 // under test into the output area).
 void check_against_interpreter(Env& e, const Case& k, const std::vector<uint8_t>& input) {
-  const Result tier = run(e, k, input, false), ref = run(e, k, input, true);
+  Result tier, ref;
+  if (misaligned_alike(e, k, input, tier, ref)) return;
   if (tier.out != ref.out) throw vtest::Failure(k.name() + ": the registers differ from the interpreter's");
   if (tier.global != ref.global) throw vtest::Failure(k.name() + ": the global buffer differs from the interpreter's");
   if (std::memcmp(&tier.stats, &ref.stats, exec::kCounterWords * sizeof(uint64_t)) != 0) throw vtest::Failure(k.name() + ": the counters differ from the interpreter's");

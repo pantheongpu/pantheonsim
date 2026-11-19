@@ -99,7 +99,12 @@ int main(int argc, char** argv) {
     everything_and_give_it_back();
     leak_one(leak);
   }
-  const Sample b = measure();
+  Sample b = measure();
+  // (a joined thread can stay in /proc/self/task for a moment: a thread still there after 400 ms is a leak)
+  for (int i = 0; i < 40 && b.threads > a.threads; ++i) {
+    usleep(10000);
+    b = measure();
+  }
   std::string bad;
   const auto add = [&](bool cond, const char* name) {
     if (cond) bad += (bad.empty() ? "" : ",") + std::string(name);

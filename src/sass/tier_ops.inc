@@ -912,7 +912,7 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
     const unsigned first = static_cast<unsigned>(std::countr_zero(ex)), count = popc(ex);
     uint64_t g0;
     if (exec::sassmem::global_run(blo, bhi, urv + imm, first, count, 16, g0) &&
-        (g0 >= kWinEnd || g0 + uint64_t{count} * 16 - 1 < kConstWindow)) {
+        (g0 & 15) == 0 && (g0 >= kWinEnd || g0 + uint64_t{count} * 16 - 1 < kConstWindow)) {   // (a misaligned piece is exec_mem's to fault)
       uint32_t buf[32 * 4];
       bool done;
       if (Store) {
@@ -933,6 +933,10 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
   }
   uint64_t addrs[32];
   tier_global_addresses(blo, bhi, urv + imm, ex, addrs);
+  if (!exec::lanes_aligned(addrs, ex, 16)) {   // nothing is done yet: the interpreter runs the whole instruction and faults on the lane
+    c.r->tier_exec_mem(blk, w, *op.ins, ex);
+    return;
+  }
   for (Mask m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
     if (addrs[l] >= kConstWindow && addrs[l] < kWinEnd) {   // nothing is done yet: the interpreter runs the whole instruction

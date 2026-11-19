@@ -97,7 +97,13 @@ std::string leak_check_line(Runtime* rt, bool* leaked) {
       pinned_bytes += r.size;
       ++pinned;
     }
-  const Counts now = count_now();
+  Counts now = count_now();
+  // A thread that has been joined can stay in /proc/self/task for a moment (join returns when it has stopped running, not when the
+  // kernel has let go of it): a thread still there after 400 ms is the program's to answer for.
+  for (int i = 0; i < 40 && now.threads > g_base.threads; ++i) {
+    usleep(10000);
+    now = count_now();
+  }
   const long dfd = now.fds - g_base.fds, dth = now.threads - g_base.threads, dmap = now.maps - g_base.maps;
   std::string what;
   auto add = [&](bool bad, const char* name) {
