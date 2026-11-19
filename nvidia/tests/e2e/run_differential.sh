@@ -38,7 +38,7 @@ shopt -u nullglob
 nvcc_bin="$(pick_nvcc_for_shim "$shim")"
 [[ -n "$nvcc_bin" ]] || { echo "SKIP: no nvcc matching this shim's toolkit"; exit 0; }
 nvcc_host_compiler_fix
-if ! grep -q VGPU_SASS_LOG "$root/nvidia/src/fatbin.cpp" 2>/dev/null; then echo "SKIP: this simulator has no SASS path"; exit 0; fi
+if ! grep -rq VGPU_SASS_LOG "$root/nvidia/src" 2>/dev/null; then echo "SKIP: this simulator has no SASS path"; exit 0; fi
 work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-diffdet.XXXXXX")"
 keep=0
 trap '[[ $keep == 1 && -n ${VGPU_DIFF_KEEP:-} ]] && cp -r "$work" "$VGPU_DIFF_KEEP"; rm -rf "$work"' EXIT
