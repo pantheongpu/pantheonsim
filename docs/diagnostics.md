@@ -117,8 +117,7 @@ sweep" (`tests/lint/check_leak_sweep.py`) fails on a leak that `tests/lint/leak_
 longer leaks, so the list only shrinks. Growth over many repeats, which a line at exit cannot show, is `e2e_leak_soak`: a workload
 through the runtime, the driver and cuBLAS repeated 400 times, and device memory, descriptors, threads, resident memory and
 mappings must not have grown. Both checks are shown to bite: `e2e_leak_probe` and `e2e_leak_soak` keep a device allocation, pinned
-memory, a descriptor or a thread on purpose, and must name it. The `e2e_ret_condition_predicate` leak was found only by AddressSanitizer
-before these existed.
+memory, a descriptor or a thread on purpose, and must name it.
 
 `VGPU_STRICT` is off by default for a reason worth knowing. Its two checks,
 integer division by zero and storing a register nothing has written, find real bugs, and both fire on code that is perfectly correct: ptxas
