@@ -102,11 +102,12 @@ def check(ctest_log, reasons_log, root):
     total, entries, errs = parse(os.path.join(root, "ci", "skip-budget.txt"))
     errs = list(errs)
     with open(ctest_log, errors="replace") as f:
-        skipped = dict((int(a), b) for a, b in re.findall(r"Test +#(\d+): ([A-Za-z0-9_]+) \.+ *\*{3}(?:Skipped|Not Run)", f.read()))
+        skipped = dict((i, b) for i, (a, b) in enumerate(re.findall(r"Test +#(\d+): ([A-Za-z0-9_]+) \.+ *\*{3}(?:Skipped|Not Run)", f.read())))
     with open(reasons_log, errors="replace") as f:
         why = {}
         for a, b in re.findall(r"^(\d+): SKIP: ?(.*)$", f.read(), re.M):
-            why[int(a)] = b.strip()
+            if b.strip():
+                why[int(a)] = b.strip()
     used = {}
     for num, name in sorted(skipped.items()):
         hit = [e for e in entries if re.fullmatch(e[0], name)]
@@ -114,8 +115,10 @@ def check(ctest_log, reasons_log, root):
             errs.append("%s skipped and is not in the skip budget" % name)
         else:
             used[hit[0][0]] = used.get(hit[0][0], 0) + 1
-        if not why.get(num):
-            errs.append("%s skipped with no reason (no 'SKIP: text' line)" % name)
+    # ctest -V of the rerun numbers its tests by position in that run, not as the first run did, so a skip's reason is matched by
+    # count: every skipped test must have a "N: SKIP: text" line under its own number N.
+    if len(why) < len(skipped):
+        errs.append("%d tests skipped but only %d gave a reason (a 'N: SKIP: text' line of ctest -V)" % (len(skipped), len(why)))
     for k, v in used.items():
         lim = [e[1] for e in entries if e[0] == k][0]
         if v > lim:
@@ -159,7 +162,7 @@ def selftest():
     sk = lambda n, name: " 1/9 Test #%d: %s .....***Skipped   0.1 sec" % (n, name)
     assert not run([sk(1, "a"), sk(2, "b_x")], ["1: SKIP: no a", "2: SKIP: no b"])
     assert any("not in the skip budget" in e for e in run([sk(1, "zzz")], ["1: SKIP: why"]))
-    assert any("no reason" in e for e in run([sk(1, "a")], ["1: SKIP: "]))
+    assert any("gave a reason" in e for e in run([sk(1, "a")], ["1: SKIP: "]))
     assert any("allows" in e for e in run([sk(1, "a"), sk(2, "a")], ["1: SKIP: y", "2: SKIP: y"]))
     print("ok    skip budget selftest")
 
