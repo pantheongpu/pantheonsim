@@ -1,0 +1,64 @@
+name: Application smoke nightly
+
+# Small PyTorch programs (gemm in four precisions, convolutions, a cuDNN LSTM, an MLP, a CNN and a decoder
+# trained a few steps) and Ollama's reply, on simulated NVIDIA GPUs, with their outputs compared against
+# tensors and text a real RTX 3060 produced (nvidia/tests/data/pytorch_app_smoke.rtx3060.ref,
+# ollama_smollm2_rtx3060.card.json), bit for bit or within the bound nvidia/tests/pytorch/app_smoke_ref.py
+# states. The RTX 3060 profile runs in every ci.yml `ml` job (e2e_pytorch_app_smoke); the nightly adds one
+# profile per SASS image PyTorch's wheel carries, which must stay inside the same bounds: the card's numbers
+# are the reference for a bound, not an exact answer for another architecture's tensor cores.
+# Run it by hand with `gh workflow run app-smoke-nightly.yml --ref <branch>`.
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      gpus:
+        description: "profiles to run, space separated (the nightly set if empty)"
+        required: false
+        default: ''
+  pull_request:
+    paths: [".github/workflows/app-smoke-nightly.yml", "nvidia/tests/pytorch/app_smoke*.py", "nvidia/tests/data/pytorch_app_smoke*", "nvidia/tests/e2e/run_pytorch.sh"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: PyTorch application smoke against the card, on the pantheonsim.com runner
+    # The same runner as ci.yml's ml job (PyTorch for CUDA 13 in its image); where ML_RUNS_ON is unset the job does not run.
+    if: vars.ML_RUNS_ON != ''
+    runs-on: ${{ fromJSON(vars.ML_RUNS_ON || '"ubuntu-24.04"') }}
+    timeout-minutes: 120
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+      - name: This is the host with CUDA 13 and its PyTorch
+        run: ci/ml-runner-preflight.sh cuda13 torch13
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(ci/jobs.sh -p release)"
+      - name: The drift detection of the comparisons
+        run: ctest --test-dir build --output-on-failure -R '^(app_smoke_ref|ollama_card_ref)$'
+      - name: Every profile against the card's tensors
+        env:
+          GPUS: ${{ inputs.gpus }}
+        run: |
+          set -o pipefail
+          fail=0
+          for gpu in ${GPUS:-rtx3060 t4 a100 h100 b200 rtx5090}; do
+            echo "::group::$gpu"
+            VGPU_BUILD_DIR="$PWD/build" VGPU_E2E_DATA="$PWD/nvidia/tests/data" \
+              nvidia/tests/e2e/run_pytorch.sh "$PWD/nvidia/tests/pytorch/app_smoke.py" 18 "nvidia/$gpu" 2>&1 | tee "smoke-$gpu.log" || fail=1
+            echo "::endgroup::"
+            # A skip means the runner's image lost PyTorch: here that is a failure.
+            if grep -q '^SKIP' "smoke-$gpu.log"; then echo "::error::the smoke check skipped on $gpu"; fail=1; fi
+          done
+          exit $fail
+      - name: Clean the runner
+        if: always() && hashFiles('.github/actions/clean-runner/action.yml') != ''
+        uses: ./.github/actions/clean-runner

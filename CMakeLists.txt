@@ -5007,6 +5007,24 @@ if(TARGET vgpucudart)
   if(VGPU_PYTHON)
     add_test(NAME sweep_exit COMMAND "${VGPU_PYTHON}" ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/test_sweep_exit.py)
   endif()
+  # Application smoke checks (nvidia/tests/pytorch/app_smoke.py): gemm in four precisions, convolutions
+  # forward and backward, a cuDNN LSTM, an MLP, a CNN and a decoder trained a few steps, their tensors
+  # compared with those a real RTX 3060 produced (nvidia/tests/data/pytorch_app_smoke.rtx3060.ref), bit for
+  # bit or within the bound app_smoke_ref.py states. 18 checks. The simulated GPU is the RTX 3060 (sm_86
+  # SASS, whose tensor-core sums are measured); the nightly adds the other profiles.
+  add_test(NAME e2e_pytorch_app_smoke COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
+           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/app_smoke.py 18 nvidia/rtx3060)
+  set_tests_properties(e2e_pytorch_app_smoke PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_E2E_DATA=${CMAKE_SOURCE_DIR}/nvidia/tests/data"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
+  # The comparison itself: a changed bit, a shape, a NaN or an error past the tolerance must fail; needs
+  # neither torch nor a GPU.
+  if(VGPU_PYTHON)
+    add_test(NAME app_smoke_ref COMMAND "${VGPU_PYTHON}" ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/test_app_smoke_ref.py)
+  endif()
   add_test(NAME e2e_pytorch_sweep_full COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch_sweep.sh full nvidia/rtx5090)
   set_tests_properties(e2e_pytorch_sweep_full PROPERTIES
     DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
@@ -5268,6 +5286,12 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 3600)
+  # The drift detection of the comparison with the card's reply (run_ollama.sh's card_check), against a fake
+  # server: no Ollama or GPU needed, so it runs in every job.
+  find_program(VGPU_PYTHON NAMES python3 python)
+  if(VGPU_PYTHON)
+    add_test(NAME ollama_card_ref COMMAND "${VGPU_PYTHON}" ${CMAKE_SOURCE_DIR}/tests/e2e/test_ollama_card_ref.py)
+  endif()
 endif()
 # And on every simulated AMD GPU, through Ollama's ROCm backend (llama.cpp's
 # HIP kernels, rocBLAS, hipBLAS). Skips without ollama and its ROCm backend.

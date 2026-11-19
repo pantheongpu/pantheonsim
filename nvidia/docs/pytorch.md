@@ -130,6 +130,20 @@ paths tested here do not call them.
 - `e2e_pytorch_profiler`: `torch.profiler` (Kineto) over the simulator's CUPTI, its
   kernel, copy, fill and runtime-call names against NVIDIA's libcupti's on a card
   (`nvidia/docs/cupti.md`).
+- `e2e_pytorch_app_smoke`: `nvidia/tests/pytorch/app_smoke.py`, application-shaped programs
+  (gemm in float32, float16, bfloat16 and TF32, convolutions forward and backward, a cuDNN LSTM,
+  an MLP, a CNN with batch norm, a two-layer decoder's logits, greedy tokens and three AdamW
+  steps) on the simulated RTX 3060, compared with the tensors a real RTX 3060 produced
+  (`nvidia/tests/data/pytorch_app_smoke.rtx3060.ref`: torch 2.10.0+cu130, cuDNN 9.15.1, recorded
+  2026-11-19, each workload run twice on the card). Integer and elementwise results and the
+  greedy tokens must match bit for bit; the rest within a normwise bound that
+  `nvidia/tests/pytorch/app_smoke_ref.py` states per workload with the reason. `app_smoke_ref`
+  (ctest) checks that a changed bit, shape, NaN or an error past the bound fails. The same
+  reference is run on one profile per SASS image nightly (`app-smoke-nightly.yml`). Ollama's
+  reply is held to a card's in the same way: `e2e_ollama` checks sixteen greedy tokens and their
+  log-probabilities against `nvidia/tests/data/ollama_smollm2_rtx3060.card.json`
+  (`tests/e2e/ollama_card_ref.py`; drift detection tested by `ollama_card_ref`). Regenerate on a
+  real GPU with `app_smoke.py --write <file>` and `ollama_card_ref.py record`.
 - `e2e_pytorch_distributed`: `torch.distributed` across two processes, each its
   own simulated GPU, launched as torchrun launches them
   (`nvidia/tests/pytorch/distributed.py`). The collectives (all-reduce,
