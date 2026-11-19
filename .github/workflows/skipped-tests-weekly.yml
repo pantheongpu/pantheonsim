@@ -76,6 +76,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build python3 \
             libnuma1 libdrm2 libdrm-amdgpu1 libelf1 libtinfo6 zlib1g libzstd1
+          # rocprofv3 runs inside an isolated session, which needs user namespaces; 24.04 restricts them.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Unpack ROCm 7.2.0
         # rocprofv3 and the profiler tool (rocprofiler-sdk), hipcc with its compiler, the device
         # libraries it links every kernel with (without them clang stops at "cannot find ROCm
@@ -119,7 +121,7 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Unpack ROCm 7.2.0's validation suite, with rocBLAS and hipBLASLt
         run: |
-          amd/tests/e2e/fetch_rocm_release.sh "$HOME/rocm" "$ROCM_REPO_RELEASE" rocm-validation-suite
+          amd/tests/e2e/fetch_rocm_release.sh "$HOME/rocm" "$ROCM_REPO_RELEASE" rocm-validation-suite rocrand
           test -x "$ROCM_PREFIX/bin/rvs"
           # Libraries RVS needs that neither the unpacked packages nor the system have.
           LD_LIBRARY_PATH="$ROCM_PREFIX/lib:$ROCM_PREFIX/lib/rvs" ldd "$ROCM_PREFIX/bin/rvs" | grep 'not found' || true
@@ -168,7 +170,7 @@ jobs:
           python3 -m venv "$HOME/nvvenv"
           "$HOME/nvvenv/bin/pip" install -q nvidia-nvshmem-cu13
           echo "$HOME/nvvenv/bin" >> "$GITHUB_PATH"
-          "$HOME/nvvenv/bin/python" -c 'import nvidia.nvshmem as m; d = list(m.__path__)[0]; print(d); assert os.path.exists(d + "/include/nvshmem.h") and os.path.exists(d + "/lib/libnvshmem_device.a")'
+          "$HOME/nvvenv/bin/python" -c 'import os, nvidia.nvshmem as m; d = list(m.__path__)[0]; print(d); assert os.path.exists(d + "/include/nvshmem.h") and os.path.exists(d + "/lib/libnvshmem_device.a")'
       - name: Build
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
