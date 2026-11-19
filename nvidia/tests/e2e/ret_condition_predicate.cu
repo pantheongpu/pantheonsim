@@ -66,6 +66,12 @@ Pusher make() {
   return p;
 }
 
+void drop(Pusher& p) {
+  cudaFree(p.counts);
+  cudaFree(p.slots);
+  cudaFree(p.particles);
+}
+
 int main() {
   Pusher host = make(), dev = make();
   for (int b = 0; b < blocks; ++b)
@@ -75,5 +81,7 @@ int main() {
   u64 want = 0, got = 0;
   for (int b = 0; b < blocks; ++b) want += host.counts[b], got += dev.counts[b];
   std::printf("registered %llu, host %llu: %s\n", got, want, got == want ? "PASS" : "FAIL");
+  drop(host);
+  drop(dev);
   return got != want;
 }
