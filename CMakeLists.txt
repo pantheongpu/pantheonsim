@@ -291,6 +291,7 @@ add_library(vgpu STATIC
   src/runtime/runtime.cpp
   src/runtime/memo.cpp
   src/runtime/host_stats.cpp
+  src/runtime/leak_check.cpp
   src/runtime/shared_runtime.cpp
   src/runtime/visible_devices.cpp
   nvidia/src/device_attributes.cpp
@@ -1498,6 +1499,8 @@ vgpu_unit_test(test_ptx_block_reuse)
 vgpu_unit_test(test_worker_pool)
 # VGPU_HOST_STATS: the host-kernel counters line for a run that is slower on one kernel than another (#551).
 vgpu_unit_test(test_host_stats)
+# VGPU_LEAK_CHECK: the exit line is clean when everything came back and names each resource that did not (device bytes and allocations, pinned blocks, descriptors, threads, mappings).
+vgpu_unit_test(test_leak_check)
 # Device memory is madvised for huge pages, and making a device fixes glibc's heap thresholds (#551).
 vgpu_unit_test(test_host_heap)
 vgpu_unit_test(test_sched)
@@ -3637,6 +3640,15 @@ if(TARGET vgpucublas)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
+
+  # VGPU_LEAK_CHECK: clean for a program that gives everything back (runtime, driver, cuBLAS), and the resource named for one that
+  # keeps device memory, pinned memory, a descriptor or a thread; strict mode's exit status.
+  add_test(NAME e2e_leak_probe COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_leak_probe.sh)
+  set_tests_properties(e2e_leak_probe PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
 
   add_test(NAME e2e_ret_condition_predicate
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ret_condition_predicate.sh)
