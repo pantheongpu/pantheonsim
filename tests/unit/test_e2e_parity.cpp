@@ -17,6 +17,8 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
+#include "vgpu/memory.hpp"
+#include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
 #include "vtest.hpp"
@@ -1013,8 +1015,6 @@ VTEST(a_device_reset_releases_everything_and_starts_over) {
 // are LDG and STG). One m16n16k16 tile with f16 A and B and f32 C and D reads 512 + 512 + 1024 bytes and writes 1024 -- the bytes the elements
 // of the tiles hold, whatever vector width ptxas picks -- and a store to shared memory is shared traffic.
 VTEST(wmma_load_and_store_are_counted) {
-  runtime::Runtime rt(load_gpu("nvidia/rtx3060"));
-  auto& dev = rt.device(0);
   const std::string ptx = std::string(kHeader) + R"(
 .visible .entry tile(.param .u64 pa, .param .u64 pb, .param .u64 pc, .param .u64 pd)
 {
@@ -1055,14 +1055,20 @@ VTEST(wmma_load_and_store_are_counted) {
     ret;
 }
 )";
-  const uint64_t mod = dev.load_module(ptx);
-  const uint64_t a = dev.memory().alloc(512), b = dev.memory().alloc(512), c = dev.memory().alloc(1024), d = dev.memory().alloc(1024);
+  ptx::Module m = ptx::parse(ptx);
+  const auto entry = [&](const char* name) -> const ptx::EntryFn& {
+    for (const ptx::EntryFn& e : m.entries)
+      if (e.name == name) return e;
+    throw vtest::Failure(std::string("no entry ") + name);
+  };
+  MemoryManager mem(1 << 20);
+  DeviceProfile prof = load_gpu("nvidia/rtx3060");
+  const uint64_t a = mem.alloc(512), b = mem.alloc(512), c = mem.alloc(1024), d = mem.alloc(1024);
   std::vector<uint8_t> zero(1024, 0);
-  dev.memory().write(a, zero.data(), 512);
-  dev.memory().write(b, zero.data(), 512);
-  dev.memory().write(c, zero.data(), 1024);
-  exec::LaunchStats st;
-  dev.launch(*dev.get_function(mod, "tile"), block_of(32), {arg_u64(a), arg_u64(b), arg_u64(c), arg_u64(d)}, dev.symbols(mod), &st);
+  mem.write(a, zero.data(), 512);
+  mem.write(b, zero.data(), 512);
+  mem.write(c, zero.data(), 1024);
+  exec::LaunchStats st = exec::launch(entry("tile"), block_of(32), {arg_u64(a), arg_u64(b), arg_u64(c), arg_u64(d)}, mem, prof);
   VCHECK_EQ(st.global_bytes_read, uint64_t{2048});
   VCHECK_EQ(st.global_bytes_written, uint64_t{1024});
   VCHECK_EQ(st.global_bytes_ld, uint64_t{2048});
@@ -1070,12 +1076,10 @@ VTEST(wmma_load_and_store_are_counted) {
   VCHECK(st.global_loads > 0 && st.global_stores > 0);
   VCHECK(st.global_requests_ld > 0 && st.global_requests_st > 0);
   VCHECK(st.global_sectors_ld > 0 && st.global_sectors_st > 0);
-  // A row-major f32 tile of 16 columns is 64 bytes a row: 1024 bytes are 32 sectors, and no request touches more than
-  // the 32 sectors the lanes can reach.
+  // A row-major f32 tile of 16 columns is 64 bytes a row: 1024 bytes are 32 sectors at the least.
   VCHECK(st.global_sectors_st >= 32);
 
-  exec::LaunchStats sh;
-  dev.launch(*dev.get_function(mod, "tile_shared"), block_of(32), {arg_u64(c)}, dev.symbols(mod), &sh);
+  exec::LaunchStats sh = exec::launch(entry("tile_shared"), block_of(32), {arg_u64(c)}, mem, prof);
   VCHECK_EQ(sh.global_bytes_read, uint64_t{1024});
   VCHECK_EQ(sh.global_bytes_written, uint64_t{0});
   VCHECK_EQ(sh.shared_bytes_written, uint64_t{1024});
