@@ -281,3 +281,5 @@ VTEST(the_model_is_off_unless_the_environment_asks_for_it) {
   ac[0] = 0x3f00, bc[0] = 0x0001, ac[1] = 0x3c00, bc[1] = 0x3c00;
   VCHECK_EQ(d00(object("gfx942"), 'h', ac, bc, 0), on ? bits(1.0f) : bits(1.0f + 0x1p-23f));
 }
+
+VTEST_MAIN
