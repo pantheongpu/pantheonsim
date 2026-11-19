@@ -2906,12 +2906,25 @@ void dec_lepc_target(Instr& ins, const Word& w) {
 
 // ELECT Pd, URd, Ps: one leader among the threads with Ps; Pd says which,
 // URd gets its lane.
+// ptxas 12.4 spells the same `elect.sync` another way (measured: cuobjdump of nvcc 12.4.131 output, sm_90; 12.8 and 13.0 give the Ps form): bit 72 is set,
+// bits 87-89 are clear, and the third operand is a uniform register at bits 24-31 with bit 91 as its bitwise not, printed `ELECT P0, URZ, ~URZ`
+// (low word 0x000000003f3f782f, high word 0x000fe20008000100). Read as a predicate source that word named P0, which is false, so no thread was
+// elected and `elect.sync` answered "nobody" (inferred: the register is the membermask operand, and ~URZ is the all-ones mask of
+// `elect.sync _|%p, 0xffffffff`; ptxas 12.4 gave this same operand for masks 0xffff0000 and a register as well, so the value of any other
+// register here has no card evidence). f[0] = 1 marks the register form.
 void dec_elect(Instr& ins, const Word& w) {
   ins.op = Op::ELECT;
   ins.mnemonic = "ELECT";
   ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
   ins.dst.push_back(UR(static_cast<unsigned>(w.field(16, ureg_bits(ins.sm))), ins.sm));
-  ins.src.push_back(pred_src(w, 87, 90));
+  if (w.bit(72)) {
+    Operand m = UR(static_cast<unsigned>(w.field(24, ureg_bits(ins.sm))), ins.sm);
+    m.bnot = w.bit(91);
+    ins.src.push_back(m);
+    ins.f[0] = 1;
+  } else {
+    ins.src.push_back(pred_src(w, 87, 90));
+  }
 }
 
 // Operand-less housekeeping the executor treats as no-ops or waits.

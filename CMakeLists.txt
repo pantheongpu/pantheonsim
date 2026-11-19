@@ -1591,6 +1591,10 @@ set_tests_properties(test_sass_alu_runs_simd_base PROPERTIES ENVIRONMENT "VGPU_S
 vgpu_unit_test(test_sass_store_gate)
 add_test(NAME test_sass_store_gate_tier0 COMMAND test_sass_store_gate)
 set_tests_properties(test_sass_store_gate_tier0 PROPERTIES ENVIRONMENT "VGPU_TIER=0")
+# ELECT in the two spellings of ptxas (the predicate form of nvcc 12.8 and 13.0, the register-mask form of nvcc 12.4): one leader a warp, whichever toolchain built the kernel.
+vgpu_unit_test(test_sass_elect_forms)
+add_test(NAME test_sass_elect_forms_tier0 COMMAND test_sass_elect_forms)
+set_tests_properties(test_sass_elect_forms_tier0 PROPERTIES ENVIRONMENT "VGPU_TIER=0")
 # The run loop going on past S2R, ULDC, UMOV, USEL, PLOP3 and SEL where the chain would have started the next call there: same words, counters and clocks as the interpreter.
 vgpu_unit_test(test_sass_chain_cont)
 target_include_directories(test_sass_chain_cont PRIVATE src)   # (src/sass/jit.hpp: the statistics the linking check reads)
