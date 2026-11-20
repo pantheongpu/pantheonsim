@@ -28,6 +28,10 @@ if ! require_shim_libs "$shim" "$out"; then exit 0; fi
 
 # (a sanitizer's own leak detector would fail the processes that leak on purpose)
 export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0"
+export TSAN_OPTIONS="${TSAN_OPTIONS:+$TSAN_OPTIONS:}report_thread_leaks=0"
+# ThreadSanitizer runs a thread of its own, started after the machine is made, so under a sanitizer "threads" is left out of every
+# verdict but the case that leaks a thread on purpose.
+sanitized="$(shim_sanitizer "$shim")"
 
 status=0
 run_case() {   # <case> <mode> <expected ending of the line> <expected exit status>
@@ -37,8 +41,14 @@ run_case() {   # <case> <mode> <expected ending of the line> <expected exit stat
          LD_LIBRARY_PATH="$shim" "$out" "$c" 2>&1)" || rc=$?
   line="$(grep '^vgpu-leak-check: device_bytes' "$log" || true)"
   echo "leak probe, $c ($mode): $line [exit $rc]"
-  if [[ "$line" != *"-> $want" ]]; then echo "  FAIL: wanted the line to end '-> $want'"; echo "$got" | sed 's/^/  | /'; status=1; fi
-  if [[ "$rc" != "$want_status" ]]; then echo "  FAIL: exit status $rc, wanted $want_status"; echo "$got" | sed 's/^/  | /'; status=1; fi
+  local verdict="${line##*-> }"
+  if [[ -n "$sanitized" && "$c" != leak-thread && "$verdict" == LEAK* ]]; then
+    local list
+    list="$(tr ',' '\n' <<<"${verdict#LEAK }" | grep -vx threads | paste -sd, - || true)"
+    if [[ -z "$list" ]]; then verdict=clean; else verdict="LEAK $list"; fi
+  fi
+  if [[ "$verdict" != "$want" ]]; then echo "  FAIL: wanted the line to end '-> $want'"; echo "$got" | sed 's/^/  | /'; status=1; fi
+  if [[ "$rc" != "$want_status" && ! ( -n "$sanitized" && "$mode" == strict && "$want_status" == 0 ) ]]; then echo "  FAIL: exit status $rc, wanted $want_status"; echo "$got" | sed 's/^/  | /'; status=1; fi
 }
 run_case clean       1      "clean"                          0
 run_case clean       strict "clean"                          0

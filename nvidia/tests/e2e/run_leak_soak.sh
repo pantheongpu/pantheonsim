@@ -28,6 +28,7 @@ if ! require_shim_libs "$shim" "$out"; then exit 0; fi
 # A sanitizer build keeps freed memory in a quarantine, so resident memory and mappings say nothing there; its leak detector would
 # also fail the processes that leak on purpose.
 export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0"
+export TSAN_OPTIONS="${TSAN_OPTIONS:+$TSAN_OPTIONS:}report_thread_leaks=0"
 sanitized="$(shim_sanitizer "$shim")"
 [[ -n "$sanitized" ]] && export SOAK_NO_RSS=1
 
