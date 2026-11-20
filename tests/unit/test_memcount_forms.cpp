@@ -471,4 +471,29 @@ VTEST(shared_window_inside_warp_at_its_edges) {
   }
 }
 
+VTEST(lanes_aligned_is_the_per_lane_test_for_any_subset_and_width) {
+  // The fast paths decline a misaligned access (a card faults on one): the answer is "every active lane's address is a multiple of the
+  // width", for 32-bit and 64-bit addresses, a whole warp or any subset, and an inactive lane's address does not count.
+  uint32_t a32[32];
+  uint64_t a64[32];
+  uint32_t seed = 12345;
+  const auto next = [&] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+  for (int iter = 0; iter < 20000; ++iter) {
+    const uint32_t bytes = 1u << (next() % 5);   // 1, 2, 4, 8, 16
+    uint32_t mask = next() % 4 == 0 ? 0xffffffffu : next();
+    if (next() % 8 == 0) mask = 0;
+    bool want = true;
+    for (unsigned l = 0; l < 32; ++l) {
+      // mostly aligned, sometimes one lane off by a byte
+      const uint32_t base = (next() & 0xffff) * bytes;
+      const bool off = next() % 40 == 0;
+      a32[l] = base + (off ? 1 + next() % (bytes > 1 ? bytes - 1 : 1) : 0);
+      a64[l] = (uint64_t{next()} << 32) | a32[l];
+      if ((mask >> l & 1) && (a32[l] % bytes) != 0) want = false;
+    }
+    VCHECK(vgpu::exec::lanes_aligned(a32, mask, bytes) == want);
+    VCHECK(vgpu::exec::lanes_aligned(a64, mask, bytes) == want);
+  }
+}
+
 VTEST_MAIN
