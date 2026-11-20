@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "mfma_math.hpp"
+#include "mfma_models.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
 
 namespace tc = vgpu::exec::tc86;
@@ -337,6 +338,15 @@ static u32 ours_amd(const Group& g, const Vec& v, bool optin) {
   return bitsof(r);
 }
 
+// The model of Khattak, Mikaitis and Graziani for the group's architecture (amd/src/mfma_models.hpp; VGPU_MFMA_MODEL=khattak).
+static u32 ours_khattak(const Group& g, const Vec& v) {
+  double a[16], b[16];
+  for (unsigned k = 0; k < g.K; ++k) a[k] = v.a[k], b[k] = v.b[k];
+  const vgpu::amd::khattak::Model m = g.arch == "CDNA1" ? vgpu::amd::khattak::Model::Cdna1 : g.arch == "CDNA2" ? vgpu::amd::khattak::Model::Cdna2 : vgpu::amd::khattak::Model::Cdna3;
+  const char t = g.fmt == Fmt::F16 ? 'h' : g.fmt == Fmt::BF16 ? 'b' : 'F';
+  return bitsof(static_cast<float>(vgpu::amd::khattak::dot(m, t, t, a, b, 1, g.K, v.c)));
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------
 // Theirs: a transcription of MMA-Sim's arithmetic (commit pinned in docs/numerics/mmasim-crosscheck.md)
 // ---------------------------------------------------------------------------------------------------------------------------
@@ -581,9 +591,9 @@ struct Col {
   std::function<u32(const Group&, const Vec&)> f;
 };
 struct Stat {
-  unsigned long n = 0, bad = 0, skipped = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, other = 0;
+  unsigned long n = 0, bad = 0, skipped = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, other = 0, finite_bad = 0;   // finite_bad (AMD): mismatches where both results are finite
   unsigned long cov[4] = {0, 0, 0, 0};   // vectors in each corner's neighbourhood, matching or not (how well the corners were exercised)
-  std::vector<std::string> first, first_other;
+  std::vector<std::string> first, first_other, first_finite;
 };
 
 static bool both_nan_amd(u32 a, u32 b) { return (a & 0x7fffffffu) > 0x7f800000u && (b & 0x7fffffffu) > 0x7f800000u; }
@@ -649,6 +659,7 @@ static void score(const Group& g, const Vec& v, u32 ours, u32 theirs, bool nan_a
   if (g.side == "nv" && r4_neighbourhood(g, v, ours)) ++st.cov[3];
   if (ours == theirs || (nan_any && both_nan_amd(ours, theirs))) return;
   ++st.bad;
+  if (g.side == "amd" && (ours & 0x7f800000u) != 0x7f800000u && (theirs & 0x7f800000u) != 0x7f800000u) ++st.finite_bad;
   if (m & 1) ++st.r1;
   if (m & 2) ++st.r2;
   if (m & 4) ++st.r3;
@@ -661,6 +672,7 @@ static void score(const Group& g, const Vec& v, u32 ours, u32 theirs, bool nan_a
   std::string line = vec_str(g, v) + "  ours=" + b1 + " mmasim=" + b2 + "  corners:" + ((m & 1) ? " R1" : "") + ((m & 2) ? " R2" : "") + ((m & 4) ? " R3" : "") +
                      ((m & 8) ? " R4" : "") + (m ? "" : " none");
   if (static_cast<int>(st.first.size()) < show) st.first.push_back(line);
+  if (g.side == "amd" && (ours & 0x7f800000u) != 0x7f800000u && (theirs & 0x7f800000u) != 0x7f800000u && static_cast<int>(st.first_finite.size()) < show) st.first_finite.push_back(line);
   if (!m && static_cast<int>(st.first_other.size()) < show) st.first_other.push_back(line);
 }
 
@@ -671,6 +683,7 @@ static std::vector<Col> columns(const Group& g) {
   } else {
     c.push_back({"ours: double sum, rounded once (default)", [](const Group& gg, const Vec& v) { return ours_amd(gg, v, false); }});
     if (g.amd_optin) c.push_back({"ours: gfx90a opt-in (VGPU_MFMA_CDNA2=fttn)", [](const Group& gg, const Vec& v) { return ours_amd(gg, v, true); }});
+    if (g.amd_kind != 'f') c.push_back({"ours: Khattak et al. model (VGPU_MFMA_MODEL=khattak)", [](const Group& gg, const Vec& v) { return ours_khattak(gg, v); }});
   }
   return c;
 }
@@ -681,11 +694,13 @@ static void report(const Group& g, const std::vector<Col>& cols, const std::vect
   std::printf("\n### %s | %s %s (K=%u, %s accumulator) [%s]\n", g.arch.c_str(), g.api.c_str(), g.instr.c_str(), g.K, g.acc16 ? "f16" : "f32", source);
   for (size_t i = 0; i < cols.size(); ++i) {
     const Stat& s = st[i];
-    std::printf("  %-52s vectors %lu, mismatches %lu (R1 %lu, R2 %lu, R3 %lu, R4 %lu, none of the four %lu)%s\n", cols[i].name.c_str(), s.n, s.bad, s.r1, s.r2, s.r3, s.r4,
-                s.other, s.skipped ? (", skipped outside the exact window: " + std::to_string(s.skipped)).c_str() : "");
+    std::printf("  %-52s vectors %lu, mismatches %lu (R1 %lu, R2 %lu, R3 %lu, R4 %lu, none of the four %lu)%s%s\n", cols[i].name.c_str(), s.n, s.bad, s.r1, s.r2, s.r3, s.r4,
+                s.other, g.side == "amd" ? (", both results finite: " + std::to_string(s.finite_bad)).c_str() : "",
+                s.skipped ? (", skipped outside the exact window: " + std::to_string(s.skipped)).c_str() : "");
     if (g.side == "nv") std::printf("    corner coverage (vectors in each corner's neighbourhood): R1 %lu, R2 %lu, R3 %lu, R4 %lu\n", s.cov[0], s.cov[1], s.cov[2], s.cov[3]);
     for (const std::string& l : s.first) std::printf("    first: %s\n", l.c_str());
     for (const std::string& l : s.first_other) std::printf("    non-corner: %s\n", l.c_str());
+    for (const std::string& l : s.first_finite) std::printf("    finite: %s\n", l.c_str());
   }
 }
 

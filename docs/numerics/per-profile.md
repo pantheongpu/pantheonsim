@@ -77,8 +77,8 @@ none of it carries a class in the profile. What the simulator does, and what a p
 
 | Profile | gfx | f16, bf16 MFMA / WMMA | f32 and f64 MFMA | Class | What a paper says |
 |---|---|---|---|---|---|
-| mi250x | gfx90a | sum in double, in order, rounded once (default); opt-in `VGPU_MFMA_CDNA2=fttn` is FTTN's MI250X row | double sum / FMA chain | **unknown** (the opt-in rule: published, FTTN's summary row) | FTTN: no subnormals, 3 extra bits, RTN-TE, width 1; MMA-Sim (arXiv 2511.10909): pairs, then fours, each rounded and flushed |
-| mi300x, mi325x | gfx942 | sum in double, in order, rounded once | same | **unknown** | MMA-Sim has a CDNA3 model (a third sum); no FTTN row |
+| mi250x | gfx90a | sum in double, in order, rounded once (default); opt-in `VGPU_MFMA_CDNA2=fttn` is FTTN's MI250X row; opt-in `VGPU_MFMA_MODEL=khattak` is Khattak et al.'s CDNA2 model | double sum / FMA chain | **unknown** (the opt-in rules: published, and they disagree) | FTTN: no subnormals, 3 extra bits, RTN-TE, width 1; MMA-Sim (arXiv 2511.10909): pairs, then fours, each rounded and flushed |
+| mi300x, mi325x | gfx942 | sum in double, in order, rounded once; opt-in `VGPU_MFMA_MODEL=khattak` is Khattak et al.'s CDNA3 model | same | **unknown** (the opt-in model: published) | MMA-Sim has a CDNA3 model (a third sum); no FTTN row |
 | mi350x, mi455x | gfx950, gfx1250 | sum in double, in order, rounded once | same | **unknown** | no published model |
 | rx7900xtx, rx9070xt | gfx1100, gfx1201 | WMMA: sum in double, in order, rounded once | none (RDNA has no f32 or f64 matrix instruction) | **unknown** | none |
 | rx6800, rx6700xt, rx6900xt | gfx1030, gfx1031 | none (no matrix instruction) | none | not applicable | |
