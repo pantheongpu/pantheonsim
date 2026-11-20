@@ -4520,6 +4520,18 @@ if(Python3_Interpreter_FOUND)
   # Relative links, anchors and docs/*.md references in the Markdown files resolve (seconds, no build).
   add_test(NAME lint_doc_links
            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lint/check_doc_links.py ${CMAKE_SOURCE_DIR})
+  # Every VGPU_*/PSIM_* variable and --flag the user documentation names exists in the source, and the source's user-facing ones are
+  # documented (or listed with a reason in tests/lint/doc_drift_internal.txt); the checker's rules run on a synthetic tree.
+  add_test(NAME lint_doc_drift
+           COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lint/check_doc_drift.py ${CMAKE_SOURCE_DIR})
+  add_test(NAME lint_doc_drift_selftest
+           COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lint/check_doc_drift.py selftest)
+  # The skipped-test budget (ci/skip-budget.txt): every entry has a reason, the total adds up, ci.yml allows exactly the
+  # budgeted skips; the checker's own rules run on synthetic input (seconds, no build).
+  add_test(NAME lint_skip_budget
+           COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/ci/skip_budget.py lint ${CMAKE_SOURCE_DIR})
+  add_test(NAME lint_skip_budget_selftest
+           COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/ci/skip_budget.py selftest)
   # The profile counts in docs/status.md (and the digits restated in README, CONTRIBUTING, ARCHITECTURE) match the profile files.
   add_test(NAME lint_profile_counts
            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lint/check_profile_counts.py ${CMAKE_SOURCE_DIR})

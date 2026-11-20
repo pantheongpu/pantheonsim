@@ -213,7 +213,7 @@ is not.
 vgpu debug [-x FILE] [vgpu run options] -- ./program [args]
 ```
 
-Runs an AMD program with the kernel debugger on. Commands come from `FILE` (`-x`)
+Runs an AMD program with the kernel debugger on. Commands come from `FILE` (`-x` or `--commands`)
 or from a `(vgpu)` prompt on the terminal: `break KERNEL[+OFFSET]`, `continue`,
 `step [N]`, `where`, `disas [N]`, `info registers`, `print[/x|/d|/f] REG`,
 `lane N`, `x/N ADDR`, `x/N lds:ADDR`, `set REG[LANE] = VALUE`, `delete [N]`,
@@ -328,6 +328,27 @@ variable is unset by default.
 | `VGPU_MUFU_EXACT` | `0` turns the model of the card's approximate-math unit off: `MUFU` (SASS) and the PTX `.approx` forms are then the function at the host's precision, rounded once, and `div.full.f32` the exact quotient, as in every release before the model. Unset, both engines give what an RTX 3060 gives for each of the ten `MUFU` sub-operations on every operand (measured; a Tesla T4, an L4 and an A10G print the same math-library results; an H100 PCIe printed the same instruction hashes over every operand (measured); the other Hopper profiles and the Blackwell ones get the same model, inferred: [numerics/math-functions.md](numerics/math-functions.md)). It changes the last bits of `expf`, `powf`, `tanhf`, `rsqrtf` and the other library functions built on those instructions, and of everything compiled with `-use_fast_math`; IEEE operations (`+`, `*`, `/`, `sqrtf`) and counters never change. Read at every launch, so it can be set between launches. `vgpu run` passes it through. | unset (on) |
 | `VGPU_MFMA_MODEL` | `khattak`: the f16 and bf16 matrix instructions with an f32 accumulator of the mi250x profile (gfx90a: CDNA2), and those and the xf32 and fp8 ones of the mi300x and mi325x profiles (gfx942: CDNA3), sum as the models of Khattak, Mikaitis and Graziani (arXiv 2609.14845) say: on gfx90a subnormals as zero and a tree of f32 additions, on gfx942 products aligned and cut, summed as integers, rounded once. Published, not measured; takes the place of `VGPU_MFMA_CDNA2=fttn` on gfx90a ([matrix-numerics.md](matrix-numerics.md)). Read once, when the process starts. | unset (off) |
 | `VGPU_MFMA_CDNA2` | `fttn`: on the mi250x profile (gfx90a) the f16 and bf16 matrix instructions with an f32 accumulator sum as the FTTN paper's MI250X row reads: subnormal inputs and outputs as zero, one f32 rounding after every product. From that paper alone, no card, and the published bit-level model of the same card is a different sum ([matrix-numerics.md](matrix-numerics.md)). Read once, when the process starts. | unset (off: the products and the accumulator summed in double, rounded once) |
+
+**Fault injection, host resources and tool settings**
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `VGPU_FAIL_ALLOC` | Make allocations fail with out-of-memory, to test a program's error paths: `3` fails the 3rd (counted from 1, per process), `2,5,9` those three, `all` every one. | off |
+| `VGPU_FAIL_LAUNCH` | The same for kernel launches: `1` fails the 1st launch. | off |
+| `VGPU_FAIL_MEMCPY` | The same for copies: `4` fails the 4th. | off |
+| `VGPU_STREAM_WAIT_TIMEOUT_MS` | How long a driver-API stream wait on a memory value (`cuStreamWaitValue32/64`) polls before it returns `CUDA_ERROR_LAUNCH_TIMEOUT`. | `60000` |
+| `VGPU_HOST_STATS` | `1` prints one line of the host kernel's view of the process (CPU time, page faults, context switches, threads) on stderr at exit; a number `N` also prints one every `N` seconds. For finding out why a run is slower on one host kernel than another. | off |
+| `VGPU_HOST_STATS_FILE` | Append the `VGPU_HOST_STATS` lines to this file instead of stderr. | stderr |
+| `VGPU_HOST_HEAP` | `0` leaves glibc's malloc thresholds alone; by default the simulator fixes them (allocations up to 32 MiB from the heap, up to 64 MiB of free heap kept) so that a library call that allocates and frees large buffers does not fault its pages in again each time. Setting `MALLOC_MMAP_THRESHOLD_`, `MALLOC_TRIM_THRESHOLD_`, `MALLOC_TOP_PAD_` or `GLIBC_TUNABLES` has the same effect. | tuned |
+| `VGPU_HOSTMAP_CACHE` | `0` turns off the cache of lookups of host-mapped device memory; for ruling the cache out when a result looks wrong. | on |
+| `VGPU_POOL_SPIN` | AMD: how many loop turns (tens of nanoseconds each) an idle worker thread spins before it sleeps; `0` never spins. | `400` |
+| `VGPU_QUEUE_SPIN` | AMD: the same for a thread waiting on a stream's queue (always `0` when the process may use one CPU only). | `400` |
+| `VGPU_DUMP_CODE_OBJECTS=<dir>` | AMD: keep a copy of every code object a program loads, named for its first kernel, in this existing directory. What a library builds at run time (MIOpen's convolutions, rocFFT's plans) is otherwise nowhere to disassemble. | off |
+| `VGPU_NVML_VERSION` | The NVML library version `nvidia-smi --version` prints. | the CUDA major version and the driver version |
+| `VGPU_PCI_IDS` | The `pci.ids` file `lspci` names devices from; a path that does not exist behaves as a machine without pciutils. | the system's `pci.ids` |
+| `VGPU_SESSION` | Set by `vgpu shell` to the directory of the running session; `smi`, `amd-smi` and `rocm-smi` read the simulated machine's files from it. Not for you to set. | set in a session |
+| `VGPU_NVSHMEM_DIR` | Directory for the files that NVSHMEM's processes rendezvous through. | `/dev/shm`, else `$TMPDIR` |
+| `VGPU_NVSHMEM_TIMEOUT` | Seconds an NVSHMEM operation waits for its peers before it gives up. | `300` |
 
 **Checks and counters** (see [diagnostics](diagnostics.md))
 
