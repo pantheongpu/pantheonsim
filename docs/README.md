@@ -34,6 +34,7 @@ One line per document. Start with the repository [README](../README.md); the des
 
 * [../CONTRIBUTING.md](../CONTRIBUTING.md): how to change the project, tests, new profiles.
 * [ci.md](ci.md): where CI jobs run, how long they take, how they fail.
+* [fuzzing.md](fuzzing.md): the libFuzzer targets for the PTX parser, the SASS decoder and the driver API, and how to run them.
 * [ci-runners.md](ci-runners.md): which runner a job uses.
 * [ci-merge-conflicts.md](ci-merge-conflicts.md): CI and merge conflicts.
 * [ci-card-check.md](ci-card-check.md): the e2e programs on a real GPU (design, not enabled).

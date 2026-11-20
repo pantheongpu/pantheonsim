@@ -1,0 +1,116 @@
+name: Fuzzing
+
+# libFuzzer targets (tests/fuzz) for the three places untrusted bytes enter the simulator: the PTX parser, the SASS decoder and
+# cubin reader, and the CUDA driver API (module images, memory calls). Built with clang under ASan and UBSan. Untrusted input must
+# come back as an error: a crash, a sanitizer report or a hang fails the job and uploads the input (fuzz-artifacts).
+#
+#   pull requests   a short budget per target (60 s), from the seed corpus and the inputs of past crashes
+#   nightly         15 minutes per target, resuming from the corpus the last night kept
+#   by hand         seconds per target as asked
+#
+# A crash a fuzzer finds is fixed with its input added to tests/fuzz/regress/<target>/, which the ordinary test suite (and the ASan
+# job) replays as fuzz_replay_<target>.
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: '300'
+  pull_request:
+    paths:
+      - src/**
+      - include/**
+      - nvidia/src/**
+      - nvidia/include/**
+      - tests/fuzz/**
+      - CMakeLists.txt
+      - .github/workflows/fuzz.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fuzz:
+    name: libFuzzer, ASan + UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      SECONDS_PER_TARGET: ${{ inputs.seconds || (github.event_name == 'schedule' && '900') || '60' }}
+    permissions: { contents: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+
+      - name: Install toolchain
+        run: |
+          [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build clang llvm libclang-rt-dev python3
+
+      - name: Compile cache
+        id: ccache
+        uses: ./.github/actions/ccache
+        with:
+          key: fuzz-clang
+
+      - name: Build the fuzz targets
+        env:
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.launcher }}
+        run: |
+          # Clang takes no #pragma GCC target, which the AVX2 units use: the fuzz build makes AVX2, FMA and F16C its baseline (the runners have them).
+          export CC=clang CXX=clang++
+          cmake -S . -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=Debug -DVGPU_FUZZ=ON \
+            -DCMAKE_CXX_FLAGS="-O1 -g -march=haswell -fno-omit-frame-pointer -fsanitize=address,undefined,fuzzer-no-link" \
+            -DCMAKE_C_FLAGS="-O1 -g -fsanitize=address,undefined" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build-fuzz -j"$(ci/jobs.sh -p asan)" --target fuzz_ptx fuzz_sass fuzz_driver
+
+      - name: The corpus of the last nightly runs
+        if: github.event_name != 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: build-fuzz/fuzz-corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+
+      - name: Fuzz the PTX parser
+        run: tests/fuzz/run_fuzz.sh build-fuzz ptx "$SECONDS_PER_TARGET"
+
+      - name: Fuzz the SASS decoder and cubin reader
+        run: tests/fuzz/run_fuzz.sh build-fuzz sass "$SECONDS_PER_TARGET"
+
+      - name: Fuzz the driver API
+        run: tests/fuzz/run_fuzz.sh build-fuzz driver "$SECONDS_PER_TARGET"
+
+      - name: Keep the corpus
+        if: github.event_name != 'pull_request' && always()
+        uses: actions/cache/save@v4
+        with:
+          path: build-fuzz/fuzz-corpus
+          key: fuzz-corpus-${{ github.run_id }}
+
+      - name: The input that failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz-artifacts
+          if-no-files-found: ignore
+
+      - name: Save the compile cache
+        if: always()
+        uses: ./.github/actions/ccache-save
+        with:
+          key: fuzz-clang

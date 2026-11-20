@@ -77,11 +77,12 @@ struct Msgpack {
   bool b = false;
   std::string s;
   std::vector<Msgpack> list;
-  std::vector<std::pair<Msgpack, Msgpack>> map;
+  // A map's keys and values side by side (a vector of pairs of Msgpack is a vector of an incomplete type here, which clang's libstdc++ refuses).
+  std::vector<Msgpack> map_keys, map_values;
 
   const Msgpack* at(std::string_view key) const {
-    for (const auto& [k, v] : map)
-      if (k.kind == Kind::Str && k.s == key) return &v;
+    for (size_t n = 0; n < map_keys.size(); ++n)
+      if (map_keys[n].kind == Kind::Str && map_keys[n].s == key) return &map_values[n];
     return nullptr;
   }
   int64_t number(std::string_view key, int64_t fallback = 0) const {
@@ -121,10 +122,12 @@ Msgpack parse_msgpack(const Reader& r, uint64_t& at, uint64_t end, int depth = 0
   };
   const auto fill_map = [&](uint64_t n) {
     v.kind = Msgpack::Kind::Map;
-    v.map.reserve(room(n));
+    v.map_keys.reserve(room(n));
+    v.map_values.reserve(room(n));
     for (uint64_t i = 0; i < n; ++i) {
       Msgpack key = parse_msgpack(r, at, end, depth + 1);
-      v.map.emplace_back(std::move(key), parse_msgpack(r, at, end, depth + 1));
+      v.map_keys.push_back(std::move(key));
+      v.map_values.push_back(parse_msgpack(r, at, end, depth + 1));
     }
   };
   if (tag <= 0x7F) {   // positive fixint
