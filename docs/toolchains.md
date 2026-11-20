@@ -15,6 +15,8 @@ You need no GPU driver. Install only the toolkit, not the driver packages (on NV
 package, not `cuda` or `cuda-drivers`; on AMD's, the user-space ROCm packages without
 the `amdgpu-dkms` kernel driver).
 
+The commands, step by step, for Ubuntu are in [install.md](install.md).
+
 ## Using them
 
 ```bash

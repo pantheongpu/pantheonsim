@@ -4623,6 +4623,12 @@ add_test(NAME lint_ci_reservation
 add_test(NAME lint_apt_mirror_fallback COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_apt_mirror_fallback.sh)
 set_tests_properties(lint_apt_mirror_fallback PROPERTIES TIMEOUT 60)
 
+# The nightly version matrix (CUDA 12.4 to 13.2, ROCm 6.4 to 7.2) covers its whole range and is not per-PR, and docs/install.md,
+# which the clean-install workflow runs step by step, extracts and is complete.
+add_test(NAME lint_version_matrix COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_version_matrix.py)
+add_test(NAME lint_install_steps COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_install_steps.sh)
+set_tests_properties(lint_install_steps PROPERTIES TIMEOUT 60)
+
 # scripts/thp-always.sh sets transparent huge pages to always on a GitHub-hosted runner shipped with madvise, when it can,
 # and never fails the action's step (#551).
 add_test(NAME lint_thp_always COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_thp_always.sh)

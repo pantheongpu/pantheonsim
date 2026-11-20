@@ -1,0 +1,93 @@
+name: Version matrix
+
+# Every CUDA toolkit from 12.4 to 13.2 and every ROCm from 6.4 to 7.2, installed the way the setup action does for a
+# user, with a program built by that toolkit's compiler and run on a simulated GPU: a kernel and the libraries the
+# simulator stands in for (tests/version-matrix/). The heavy suites per version stay where they are: cuda-toolkits.yml
+# (12.4, 12.8, 12.9), rocm-libraries.yml (ROCm's own libraries), ci.yml (12.0 and 13.0). tests/lint/check_version_matrix.py
+# fails when a version of the range is in none of them.
+#
+# Nightly and by hand, not on every pull request; a pull request that changes this file or its programs runs it once.
+on:
+  pull_request:
+    paths: [.github/workflows/version-matrix.yml, tests/version-matrix/**, action.yml, scripts/apt-retry.sh]
+  schedule:
+    - cron: '47 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cuda:
+    name: CUDA ${{ matrix.cuda }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # NVIDIA's Ubuntu 24.04 repository starts at 12.5, so 12.4 runs on 22.04.
+          - { cuda: '12.4', os: ubuntu-22.04 }
+          - { cuda: '12.5', os: ubuntu-24.04 }
+          - { cuda: '12.6', os: ubuntu-24.04 }
+          - { cuda: '12.8', os: ubuntu-24.04 }
+          - { cuda: '12.9', os: ubuntu-24.04 }
+          - { cuda: '13.0', os: ubuntu-24.04 }
+          - { cuda: '13.1', os: ubuntu-24.04 }
+          - { cuda: '13.2', os: ubuntu-24.04 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+
+      - name: PantheonSim with CUDA ${{ matrix.cuda }}
+        uses: ./
+        with:
+          gpu: nvidia/t4
+          cuda-toolkit: ${{ matrix.cuda }}
+          # Linked against the toolkit's own cuBLAS, cuFFT and cuRAND, run under vgpu run.
+          library-path: 'false'
+
+      - name: The toolkit is the one asked for
+        env:
+          CUDA: ${{ matrix.cuda }}
+        run: nvcc --version | grep -q "release $CUDA"
+
+      - name: Build and run the checks
+        run: |
+          nvcc -cudart shared -arch=compute_75 -code=compute_75 tests/version-matrix/cuda_libs.cu -o cuda_libs -lcublas -lcufft -lcurand
+          vgpu run ./cuda_libs | tee out.txt
+          grep -qx PASS out.txt
+
+  rocm:
+    name: ROCm ${{ matrix.rocm }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { rocm: '6.4' }
+          - { rocm: '7.0' }
+          - { rocm: '7.1' }
+          - { rocm: '7.2' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+
+      - name: PantheonSim with ROCm ${{ matrix.rocm }}
+        uses: ./
+        with:
+          gpu: amd/mi300x
+          rocm: ${{ matrix.rocm }}
+
+      - name: Build and run the check
+        run: |
+          hipcc --offload-arch=gfx942 tests/version-matrix/hip_check.hip -o hip_check
+          vgpu run ./hip_check | tee out.txt
+          grep -qx PASS out.txt
