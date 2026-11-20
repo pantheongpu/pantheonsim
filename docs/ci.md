@@ -289,6 +289,15 @@ If a job in the pool died with exit 137: check the host's memory
 building at the same time, and re-run the job once the host is quiet. Raising
 the per-job GiB of a profile in `ci/jobs.sh` makes the builds narrower.
 
+## When Ubuntu's mirrors fail (2026-11-19)
+
+Hosted runners install their toolchain with apt, and `security.ubuntu.com` answered 503 for over an hour, which failed
+`build + unit tests` and the Action jobs on two PRs. Every hosted-runner `apt-get update` and `install` now goes through
+`scripts/apt-retry.sh`: apt's own retries and timeouts, a time limit per attempt, and on failure a move to the next full
+Ubuntu mirror (archive.ubuntu.com, then kernel.org, Princeton, xtom, Leaseweb) before the next attempt, four attempts in
+all. `scripts/apt-mirror-fallback.sh` still switches mirrors up front when the image's mirror name does not resolve.
+`tests/lint/check_apt_mirror_fallback.sh` checks both with a fake apt-get, and fails if a workflow calls apt-get directly.
+
 ## What runs after a merge (2026-11-19)
 
 A pull request already ran everything, so a push to main used to repeat it on the same tree (CI, Action, CUDA toolkits and ROCm
