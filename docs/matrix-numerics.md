@@ -52,8 +52,8 @@ here is `inferred`.** Profile key `numerics.tensor_sum_fp8`; `VGPU_TC_EXACT=0` g
 | `via_f16` | sm_90 and sm_100: the h100, h200 and gh200 profiles, b200, gb200 | ptxas converts to f16 and issues two f16 `HMMA.16816` that start from zero, K split by bit 1 of the index; C is added afterwards by `FADD` (`HADD2` for f16). The device's own f16 rule (`tensor_sum`, Hopper numbers) sums each `HMMA` | 40,000 of 40,000 recorded H100 (f16 accumulator), H200 (f16) and B200 (f32 and f16) vectors; the SASS of both cubins |
 | (absent: sequential) | sm_120: its own narrow-float sum, measured, see below; b300, vr200, thor, gb10: unknown | | |
 
-The H100 and H200 f32-accumulator files were recorded through `wgmma` and are not `mma.sync` results; a rule fits them (one chunk of 32, cut 13 bits
-down, result cut to 13 bits) and is **not implemented** (`wgmma` keeps the sequential f32 sum). The SASS engine runs a cubin as built, so it
+The H100 and H200 f32-accumulator files were recorded through `wgmma` and are not `mma.sync` results; a rule fits all 20,000 of them (one chunk of 32, cut
+13 bits down, result cut to 13 bits) and is the `wgmma` FP8 rule since 2026-11-19 (profile key `numerics.tensor_sum_wgmma_fp8: hopper`, `inferred`; dense forms; numerics/fp8-vectors.md). The SASS engine runs a cubin as built, so it
 had the right chain on sm_90 and sm_100 already; the PTX interpreter had the sequential sum and disagreed with it on a third of the vectors.
 
 ## NVIDIA profiles
@@ -144,6 +144,10 @@ rtx4090 and rtx6000-ada profiles (sequential to `Ampere`); the h100*, h200* and 
 SASS engine an sm_86 cubin on a profile that is not 8.6 (it took the RTX 3060's sum whatever the profile: now the device's, as
 the PTX engine always did) and an sm_75 / sm_80 / sm_89 cubin on an 8.6 profile; and the four corners on every `Ampere` profile.
 `VGPU_TC_EXACT=0` gives the sequential sums back; the corners have no switch (the earlier answers were wrong on the card).
+
+**2026-11-19: the dense FP8 `wgmma` forms changed** on the sm_90 profiles (h100, h100-pcie, h100-nvl, h200, h200-nvl, gh200-480gb) in both engines (PTX `wgmma`, SASS `QGMMA`):
+sequential f32 sum to one chunk of 32 products, terms cut 13 bits below the largest, result cut to 13 bits. e4m3 and e5m2, f32 and f16 accumulators. Evidence: 20,000 vectors recorded
+on an H100 and an H200, `inferred` (numerics/fp8-vectors.md). `VGPU_TC_EXACT=0` gives the old results back. The sparse forms, `wgmma` f16, bf16 and tf32, and `tcgen05.mma` are unchanged.
 
 **2026-11-18: the FP8 `mma.sync` forms changed** on the sm_89 profiles (l4, l40, l40s, rtx4080, rtx4090, rtx6000-ada: sequential to `ada`) and, on the PTX engine, on the
 sm_90 and sm_100 profiles (h100*, h200*, gh200-480gb, b200, gb200: sequential to `via_f16`; the SASS engine's results are unchanged, they were this already). e4m3 and
@@ -352,7 +356,7 @@ class `measured` and the run as its evidence, and into the other profiles of its
 | B200 (sm_100) | no run of ours; the Hopper rule is in force on b200 and gb200 as `inferred` from others' recorded vectors, until a card of ours says `measured` (tcgen05 and the GB200 itself are unmeasured) |
 | any Ampere, Ada or Hopper card | the corners R1, R3, R4 (S1 and S2 are on the RTX 3060 only; an H100's S1 and S2 are the published model's word) |
 | any Ada, Hopper or datacenter Blackwell card | an FP8 `mma.sync` run: `khattak_fp8_vectors` on the card makes the `ada` and `via_f16` rules `measured` (and says whether a driver's own `ptxas` lowers it as ours does) |
-| H100 | FP8 `wgmma` with a nonzero accumulator, and f16, bf16, tf32 `wgmma`: the rule for a zero accumulator is fitted on recorded vectors, not implemented |
+| H100 | FP8 `wgmma` with a nonzero accumulator or an f16 accumulator (the rule is implemented from zero-accumulator vectors), and f16, bf16, tf32 `wgmma`: no recorded data |
 | V100 (sm_70) | block 4 and no extra bit are published; needs a CUDA 12 toolkit and a new profile |
 | MI250X, MI300X, MI100 | everything AMD |
 

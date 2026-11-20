@@ -189,6 +189,10 @@ int cmd_info(const std::string& gpu, bool json) {
       if (vgpu::fp8_sum_rule(p.numerics.tensor_sum_fp8))
         std::printf(",\n    \"tensor_sum_fp8_chunk\": %u,\n    \"tensor_sum_fp8_grid\": %d,\n    \"tensor_sum_fp8_out_bits\": %d",
                     p.numerics.tensor_sum_fp8_chunk, p.numerics.tensor_sum_fp8_grid, p.numerics.tensor_sum_fp8_out_bits);
+      if (p.numerics.tensor_sum_wgmma_fp8 != vgpu::WgmmaFp8Sum::Sequential)
+        std::printf(",\n    \"tensor_sum_wgmma_fp8\": \"%s\",\n    \"tensor_sum_wgmma_fp8_chunk\": %u,\n    \"tensor_sum_wgmma_fp8_grid\": %d,\n    \"tensor_sum_wgmma_fp8_out_bits\": %d",
+                    vgpu::wgmma_fp8_sum_name(p.numerics.tensor_sum_wgmma_fp8), p.numerics.tensor_sum_wgmma_fp8_chunk,
+                    p.numerics.tensor_sum_wgmma_fp8_grid, p.numerics.tensor_sum_wgmma_fp8_out_bits);
       std::printf("\n  ");
     }
     std::printf("},\n  \"provenance\": {");
@@ -260,6 +264,12 @@ int cmd_info(const std::string& gpu, bool json) {
         std::printf("    tensor_sum_fp8_chunk:  %-10u [%s]\n", p.numerics.tensor_sum_fp8_chunk, tag_of("numerics.tensor_sum_fp8_chunk"));
         std::printf("    tensor_sum_fp8_grid:   %-10d [%s]\n", p.numerics.tensor_sum_fp8_grid, tag_of("numerics.tensor_sum_fp8_grid"));
         std::printf("    tensor_sum_fp8_out_bits: %-8d [%s]\n", p.numerics.tensor_sum_fp8_out_bits, tag_of("numerics.tensor_sum_fp8_out_bits"));
+      }
+      if (p.numerics.tensor_sum_wgmma_fp8 != vgpu::WgmmaFp8Sum::Sequential) {
+        std::printf("    tensor_sum_wgmma_fp8:  %-10s [%s]\n", vgpu::wgmma_fp8_sum_name(p.numerics.tensor_sum_wgmma_fp8), tag_of("numerics.tensor_sum_wgmma_fp8"));
+        std::printf("    tensor_sum_wgmma_fp8_chunk: %-5u [%s]\n", p.numerics.tensor_sum_wgmma_fp8_chunk, tag_of("numerics.tensor_sum_wgmma_fp8_chunk"));
+        std::printf("    tensor_sum_wgmma_fp8_grid: %-6d [%s]\n", p.numerics.tensor_sum_wgmma_fp8_grid, tag_of("numerics.tensor_sum_wgmma_fp8_grid"));
+        std::printf("    tensor_sum_wgmma_fp8_out_bits: %-3d [%s]\n", p.numerics.tensor_sum_wgmma_fp8_out_bits, tag_of("numerics.tensor_sum_wgmma_fp8_out_bits"));
       }
     }
     bool other = false;

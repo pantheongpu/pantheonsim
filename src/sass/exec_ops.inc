@@ -4865,6 +4865,8 @@ void Runner::exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const unsigned rd = ins.dst[0].reg, rc = ins.src[reg_a ? 2 : 1].reg;
   const bool accumulate = keep && rc != kRZ;
   const uint32_t elems = N / 2;   // accumulator elements per lane
+  // QGMMA on a device that has its own e4m3 / e5m2 sum for wgmma (vgpu/exec/tc_fp8.hpp).
+  const vgpu::Fp8SumRule* const fp8_rule = ins.op == Op::QGMMA && !sparse && !int_form ? vgpu::exec::tc86::wgmma_fp8_rule(profile_) : nullptr;
   each_lane(ex, [&](unsigned l) {
     std::vector<uint32_t> out(acc32 || int_form ? elems : (elems + 1) / 2);
     for (size_t i = 0; i < out.size(); ++i) out[i] = rc == kRZ ? 0 : w.reg(rc + static_cast<unsigned>(i), l);
@@ -4886,8 +4888,13 @@ void Runner::exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       uint32_t& slot = out[acc32 ? e : e / 2];
       float acc = 0.0f;
       if (accumulate) acc = acc32 ? as_f32(slot) : half_to_f32(static_cast<uint16_t>(slot >> shift));
-      for (uint32_t k = 0; k < K; ++k)
-        acc += static_cast<float>(A[row * K + k]) * static_cast<float>(B[size_t{k} * N + col]);
+      if (fp8_rule)
+        acc = static_cast<float>(vgpu::exec::tc86::fp8_dot(*fp8_rule, !acc32, at == T::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3,
+                                                           bt == T::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3, &A[row * K], 1,
+                                                           &B[col], N, K, acc));
+      else
+        for (uint32_t k = 0; k < K; ++k)
+          acc += static_cast<float>(A[row * K + k]) * static_cast<float>(B[size_t{k} * N + col]);
       // (A NaN is the canonical 0x7fffffff (0x7fff in an f16 accumulator), not whichever the host's add handed on when two met -- the
       // first source operand's, which the compiler picks; derived from the HMMA path and the PTX documentation, no card has wgmma.)
       if (acc32) slot = acc != acc ? 0x7fffffffu : f32_bits(acc);
@@ -5000,7 +5007,14 @@ bool Runner::gmma_fast(Block& blk, Warp& w, const Instr& ins, Mask ex, const Gmm
     Cf.resize(size_t{16} * N);
     Df.resize(size_t{16} * N);
     exec::wgmma_acc_to_tile(cw.data(), N, f16_acc, Cf.data());
-    simd::kernels().tile_f32c(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
+    // QGMMA (the e4m3 and e5m2 forms) on a device that has its own sum for it (vgpu/exec/tc_fp8.hpp): that, in place of the sequential one.
+    const vgpu::Fp8SumRule* const wr = ins.op == Op::QGMMA && !f.sparse ? vgpu::exec::tc86::wgmma_fp8_rule(profile_) : nullptr;
+    if (wr)
+      vgpu::exec::tc86::fp8_tile(*wr, f16_acc, f.at == exec::TileElem::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3,
+                                 f.bt == exec::TileElem::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3, 16, N, K, Af.data(), snap.Bf.data(),
+                                 Cf.data(), Df.data());
+    else
+      simd::kernels().tile_f32c(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
     exec::wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data(), true);
   }
   if (rd != kRZ) {
