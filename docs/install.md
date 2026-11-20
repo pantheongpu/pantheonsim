@@ -51,7 +51,7 @@ wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor | sudo tee /
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM $VERSION_CODENAME main" | sudo tee /etc/apt/sources.list.d/rocm.list
 printf 'Package: *\nPin: origin repo.radeon.com\nPin-Priority: 1001\n' | sudo tee /etc/apt/preferences.d/rocm > /dev/null
 sudo apt-get update
-sudo apt-get install -y --no-install-recommends hipcc hip-dev
+sudo apt-get install -y --no-install-recommends hipcc hip-dev rocm-llvm rocm-device-libs
 export PATH="/opt/rocm/bin:$PATH"
 hipcc --version
 ```
