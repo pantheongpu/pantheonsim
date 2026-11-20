@@ -1,0 +1,119 @@
+name: Card-oracle diff
+
+# A fixed set of kernels (tools/oracle-diff/manifest.txt: the SIMD-lane and float/half form probes) whose outputs are compared bit for
+# bit against what a real NVIDIA card printed. Two modes of one script, tools/oracle-diff/oracle-diff.sh, diff against the same
+# pinned files under nvidia/tests/data/:
+#
+#   pinned  the simulator vs the pinned card files. Runs on GitHub's runners every night and on a pull request that touches the
+#           probes, their pinned files, a profile or this file. Red means the simulator's bits moved.
+#   card    NVIDIA's own runtime on a real GPU vs the pinned files. Needs a self-hosted runner with a GPU, nvcc and nvidia-smi, and
+#           runs only when the repository variable ORACLE_CARD_RUNNER is 'true' (ORACLE_CARD_RUNS_ON, a JSON list of labels,
+#           overrides the default). Never on a pull request: a fork's code does not run on a card host. Red means the card, its
+#           driver or its libraries now answer differently from the file (or the pinned file was wrong).
+#
+# Both green means simulator == card for every kernel of the set. The card is one GPU: with an sm_86 card the files are the RTX 3060's,
+# with an sm_90 or sm_120 card the H100's (the scripts choose from nvidia-smi's compute capability). Docs: docs/ci-card-check.md.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/oracle-diff.yml"
+      - "tools/oracle-diff/**"
+      - "nvidia/tests/e2e/run_simd_lane_forms.sh"
+      - "nvidia/tests/e2e/run_float_half_forms.sh"
+      - "nvidia/tests/e2e/simd_lane_forms.cu"
+      - "nvidia/tests/e2e/float_half_forms.cu"
+      - "nvidia/tests/data/simd_lane_forms.*"
+      - "nvidia/tests/data/float_half_forms.*"
+      - "nvidia/profiles/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  image:
+    uses: ./.github/workflows/ci-image-ref.yml
+
+  pinned:
+    name: simulator vs the pinned card files
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: ${{ needs.image.outputs.cuda13_0 }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: --shm-size=2g
+    env:
+      NVCC_PREPEND_FLAGS: ''
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+
+      # CUDA 13.0, the toolkit the pinned files were checked with: CUDA 12.0 (the other image) cannot build sm_120 or bf16 forms of
+      # the probes, which would leave sub-cases uncompared.
+      - name: Install CUDA 13
+        if: ${{ !job.container.id }}
+        run: |
+          [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
+          wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/keyring.deb
+          [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0
+          echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
+
+      - name: Build the shims the probes load
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpu_cli vgpucudart vgpucuda
+
+      - name: Oracle diff, simulator
+        env:
+          ORACLE_DIFF_OUT: ${{ runner.temp }}/oracle-diff
+        run: tools/oracle-diff/oracle-diff.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: oracle-diff-pinned
+          path: ${{ runner.temp }}/oracle-diff
+          if-no-files-found: ignore
+
+  card:
+    name: the real card vs the pinned card files
+    if: ${{ github.event_name != 'pull_request' && vars.ORACLE_CARD_RUNNER == 'true' }}
+    runs-on: ${{ fromJSON(vars.ORACLE_CARD_RUNS_ON || '["self-hosted","linux","gpu-card"]') }}
+    timeout-minutes: 60
+    env:
+      ORACLE_DIFF_OUT: ${{ github.workspace }}/oracle-diff-out
+    permissions: { contents: read, actions: write, pull-requests: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+
+      - name: The card
+        run: nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv
+
+      - name: Oracle diff, card
+        run: tools/oracle-diff/oracle-diff.sh --card
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: oracle-diff-card
+          path: oracle-diff-out
+          if-no-files-found: ignore

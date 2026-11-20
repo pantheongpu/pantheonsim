@@ -154,6 +154,9 @@ Rules the loader enforces:
 - A listed key must be one the profile has, so a mistyped name cannot tag nothing.
 - `measured`, `documented` and `inferred` are claims and need an evidence entry (the key's own or its section's).
 - A key in `placeholders:` can only be `unknown`.
+- (CI lint, `tests/lint/check_provenance_vectors.py`, not the loader) **`measured` needs a vectors file**: the evidence that applies to the key must cite a
+  non-empty data file in the repository (under `nvidia/tests/data/`, `amd/tests/data/`, `amd/registers/measurements/` or `docs/numerics/`; not a
+  document or source file), and every data path it cites must exist.
 
 **A key that is not listed has no per-key class.** That is the default, and it is deliberate: nothing is turned into `measured`
 or `documented` by a rule. What is said of an unlisted key is what was said before these sections existed:

@@ -72,7 +72,7 @@ provenance:
   inferred: [numerics.tensor_sum_fp8, numerics.tensor_sum_fp8_chunk, numerics.tensor_sum_fp8_grid, numerics.tensor_sum_fp8_out_bits]
   measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]
 evidence:
-  numerics: "card: NVIDIA L4 (this model), AWS; driver: 595.112.07; toolkit: CUDA 13.0; date: 2026-11-15. Both probes, sm_86 and sm_89 builds, print the RTX 3060 lines; FTTN. docs/matrix-numerics.md"
+  numerics: "card: NVIDIA L4 (this model), AWS; driver: 595.112.07; toolkit: CUDA 13.0; date: 2026-11-15. Both probes, sm_86 and sm_89 builds, print the RTX 3060 lines (nvidia/tests/data/simd_lane_forms.rtx3060.txt, float_half_forms.rtx3060.txt); FTTN. docs/matrix-numerics.md"
   numerics.tensor_sum_fp8: "inferred from data recorded by others, NOT run by us on a card. Khattak and Mikaitis (arXiv 2512.07004) recorded 5,000 e4m3 and 5,000 e5m2 mma.sync m16n8k32 vectors with an f32 accumulator on an L40S and on an RTX 1000 Ada, and the same with an f16 accumulator on the RTX 1000 Ada; MMA-Sim (arXiv 2511.10909) gives the same numbers (chunks of 16, terms cut 13 bits below the largest, an f32 result cut to 13 fraction bits). The rule reproduces them (docs/numerics/fp8-vectors.md). Before this the sum was sequential in f32, which reproduces none of the f32 vectors. docs/matrix-numerics.md"
   numerics.tensor_sum_fp8_chunk: "see numerics.tensor_sum_fp8"
   numerics.tensor_sum_fp8_grid: "see numerics.tensor_sum_fp8"
