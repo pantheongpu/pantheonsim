@@ -3380,6 +3380,11 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     case Op::LDG: case Op::LD: case Op::STG: case Op::ST: {
       const bool store = ins.op == Op::STG || ins.op == Op::ST;
       const bool generic = ins.op == Op::LD || ins.op == Op::ST;
+      // A store is progress for a warp that waits on another's (Runner::mem_write says so). The coalesced and scattered fast paths below
+      // write without it, and a warp that was doing nothing but storing then counted as idle, which let break_spin_wait release lanes
+      // parked at a BSYNC before the others had arrived (group_ballot_barrier built for sm_75: ballots over part of a group, with
+      // VGPU_FASTPATH=1 only).
+      if (store) w.idle_yields = 0;
       const bool e = ins.w.bit(72);
       const bool wide = e || ins.w.bit(90);
       const bool ur = ins.w.bit(91) && !e;
@@ -3596,6 +3601,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     case Op::LDS: case Op::STS: case Op::LDL: case Op::STL: {
       const bool store = ins.op == Op::STS || ins.op == Op::STL;
       const bool shared = ins.op == Op::LDS || ins.op == Op::STS;
+      if (store) w.idle_yields = 0;   // (see LDG: a store is progress on every path)
       const unsigned strides[] = {0, 4, 8, 16};
       const unsigned stride = shared ? strides[ins.f[3]] : 0;
       const bool ur = ins.w.bit(91);
@@ -4535,7 +4541,8 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       if (const std::optional<uint64_t> at = exec::surface_address(d, a)) mem_.write(*at, texel, nb);
     });
     blk.st.global_stores += n;
-    blk.st.global_bytes_written += n * 16;
+    // The values the lane stores, as the PTX engine counts a sust.p (its vector of 32-bit values), not the 16 bytes of the widest.
+    blk.st.global_bytes_written += n * 4 * static_cast<uint64_t>(std::popcount(mask));
     return;
   }
   if (surface) {
@@ -5435,6 +5442,18 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
 
 // ---- control -------------------------------------------------------------------
 
+// A YIELD ran for `group`. A spin-wait yields over and over in one state; a loop that does new work between its YIELDs does not. The
+// registers of the group's lowest lane are hashed and compared with those that lane had at its previous YIELD: when they moved, the YIELD is not
+// idle (break_spin_wait must not take the lanes parked at a BSYNC for the spinners' prize).
+void Runner::note_yield(Warp& w, Mask group) {
+  const unsigned l = static_cast<unsigned>(std::countr_zero(group ? group : 1u));
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (uint32_t r = 0; r < w.nregs; ++r) h = (h ^ w.reg(r, l)) * 0x100000001b3ull;
+  w.yield_moved = h != w.yield_sig[l];
+  w.yield_sig[l] = h;
+  if (w.yield_moved) w.idle_yields = 1;   // (this YIELD, the first of a new stretch)
+}
+
 // Every lane waiting at a WARPSYNC is released once every lane its mask names has arrived at one or exited (WARPSYNC in exec_control, and
 // the tier's own WARPSYNC, which ends a run: tier_ops.inc).
 void Runner::release_warpsync(Warp& w) {
@@ -5457,7 +5476,8 @@ void Runner::release_warpsync(Warp& w) {
   } else {
     each_lane(waiting_ws, [&](unsigned l) {
       const Mask need = w.wait_arg[l] & w.alive & ~w.exited;
-      if ((need & ~waiting_ws) == 0 || ((w.ws_held >> l) & 1)) release |= Mask{1} << l;
+      const bool arrived = (need & ~waiting_ws) == 0;
+      if (arrived || ((w.ws_held >> l) & 1)) release |= Mask{1} << l;
     });
   }
   // Lanes that named different masks do not come out of it together: ptxas's
@@ -5613,6 +5633,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       w.forced = false;
       w.yield = true;
       ++w.idle_yields;
+      note_yield(w, group);
       w.yield_pc = w.pc[std::countr_zero(group)] + 16;   // where the lanes that yielded stand once the YIELD is done
       return false;
     case Op::BPT:

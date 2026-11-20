@@ -11765,6 +11765,10 @@ class Interpreter {
     const WmmaGeom g = wmma_geom(wmma_frag(op.which), op.shape, op.type);
     const uint32_t per_reg = g.reg_bits / g.bits;
     const uint64_t mask = g.bits == 64 ? ~0ull : (1ull << g.bits) - 1;
+    // The traffic is the elements the lanes read, one request for each element of a register (the sub-byte types a byte each, as wmma_read reads
+    // them): the bytes, the per-lane operations and the sectors of those addresses, as the loads the SASS engine runs for the same wmma.load count.
+    const uint32_t ebytes = g.bits >= 8 ? g.bits / 8 : 1;
+    Lanes ats[32];
     for (uint32_t reg = 0; reg < g.regs; ++reg) {
       Lanes r{};
       for (uint32_t lane = 0; lane < W_; ++lane) {
@@ -11773,10 +11777,15 @@ class Interpreter {
         for (uint32_t e = 0; e < per_reg; ++e) {
           const auto [row, col] = wmma_slot(g, lane, reg, e);
           const uint64_t elem = op.layout == MatLayout::Row ? uint64_t{row} * ld + col : uint64_t{col} * ld + row;
+          ats[e][lane] = g.bits >= 8 ? addr0 + elem * ebytes : addr0 + elem * g.bits / 8;
           uint64_t v = wmma_read(w, ctx, ins, lane, addr0, elem, g.bits) & mask;
           packed |= v << (e * g.bits);
         }
         r[lane] = packed;
+      }
+      for (uint32_t e = 0; e < per_reg; ++e) {
+        count_memory(op.space, ebytes, popcount_mask(m), /*is_store=*/false);
+        count_addresses(op.space, ats[e], m, ebytes, 1, /*is_store=*/false);
       }
       write_reg(w, op.dsts[reg], m, r, g.reg_bits);
     }
@@ -11792,6 +11801,8 @@ class Interpreter {
     const WmmaGeom g = wmma_geom('d', op.shape, op.type);
     const uint32_t per_reg = g.reg_bits / g.bits;
     const uint64_t mask = g.bits == 64 ? ~0ull : (1ull << g.bits) - 1;
+    // Counted as wmma.load is (exec_wmma_load_generic): a request for each element of a register.
+    Lanes ats[32];
     for (uint32_t reg = 0; reg < g.regs; ++reg) {
       Lanes _s_v;
       const Lanes v = read_operand(w, ctx, ins, op.src[reg], _s_v);
@@ -11800,8 +11811,13 @@ class Interpreter {
         for (uint32_t e = 0; e < per_reg; ++e) {
           const auto [row, col] = wmma_slot(g, lane, reg, e);
           const uint64_t elem = op.layout == MatLayout::Row ? uint64_t{row} * ld + col : uint64_t{col} * ld + row;
+          ats[e][lane] = addr0 + elem * (g.bits / 8);
           store_routed(w, ctx, ins, lane, addr0 + elem * (g.bits / 8), g.bits / 8, (v[lane] >> (e * g.bits)) & mask);
         }
+      }
+      for (uint32_t e = 0; e < per_reg; ++e) {
+        count_memory(op.space, g.bits / 8, popcount_mask(m), /*is_store=*/true);
+        count_addresses(op.space, ats[e], m, g.bits / 8, 1, /*is_store=*/true);
       }
     }
   }
@@ -13926,7 +13942,6 @@ class Interpreter {
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
       const int li = static_cast<int>(lane);
-      if (!op.shared_to_shared) ++stats_.global_loads;
       // The shared side, which a load may put in another block of the
       // cluster: `smem` is the offset within whichever block that is.
       const SharedRef dst = shared_ref(ctx, ins, li, kSharedVaBase + smem_base[lane] +
@@ -13940,6 +13955,7 @@ class Interpreter {
         ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
                  "a bulk copy's shared-memory address must be 16-byte aligned");
       PendingBulk pb;
+      uint64_t wrote = 0;   // the bytes a store puts into global memory (a tensor store: the elements inside the tensor)
       auto add_run = [&](uint64_t off, uint32_t len) {
         if (off + len > shared_size)
           ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
@@ -13987,6 +14003,7 @@ class Interpreter {
           if (op.reduce) {
             reduce_global(ins, li, g, ctx.shared->data() + smem, n, op.red_ty, op.red_op);
           } else {
+            wrote = n;
             try {
               mem_.write(g, ctx.shared->data() + smem, n);
             } catch (const Error& e) {
@@ -14040,8 +14057,9 @@ class Interpreter {
               if (soff + es > shared_size) ok = false;
               else std::memcpy(row_buf.data() + (k - lo) * es, ctx.shared->data() + soff, es);
             }
-            return ok && mem_.store_run(row_addr + static_cast<uint64_t>(box.start[0] + lo) * es, row_buf.data(),
-                                        row_buf.size(), es);
+            if (!(ok && mem_.store_run(row_addr + static_cast<uint64_t>(box.start[0] + lo) * es, row_buf.data(), row_buf.size(), es))) return false;
+            if (!op.reduce) wrote += static_cast<uint64_t>(hi - lo) * es;
+            return true;
           }
           uint8_t* rowp = pb.data.data() + e * es;
           if ((map.oob_nan && !(lo == 0 && hi == n0)) ||
@@ -14055,6 +14073,7 @@ class Interpreter {
           return true;
         };
         exec::tma_walk(map, box, cs + 1, off, op.four_rows, [&](uint64_t e, uint64_t gaddr, bool inside) {
+          if (inside && !op.to_shared && !op.reduce) wrote += gs;
           // Shared position: the box packed densely, then swizzled by
           // address the same way wgmma reads it back.
           const uint64_t soff = exec::swizzle_address(smem + e * es, swz, exec::TensorMap::swizzle_atom(map.swizzle));
@@ -14125,6 +14144,13 @@ class Interpreter {
         // (a 128 x 128 .b6x16_p32 tile completes 12288, as CUTLASS's
         // block-scaled kernels expect).
         pb.tx = total * gs;
+      }
+      // The traffic with global memory, as the SASS engine counts a UBLKCP or UTMALDG / UTMASTG: one operation and the bytes of the box (a load's
+      // zero-filled ones too) or of what a store wrote. A reduction is counted by neither engine. A request is made by each lane here; ptxas's code
+      // for lanes that name the same operands runs the instruction once (a waterfall), so the two engines' counts agree only for one lane.
+      if (!op.shared_to_shared && !op.reduce) {
+        if (op.to_shared) { ++stats_.global_loads; stats_.global_bytes_read += pb.tx; }
+        else { ++stats_.global_stores; stats_.global_bytes_written += wrote; }
       }
       if (!op.to_shared) continue;
       // The barrier the load completes on, in the destination block.
@@ -14293,6 +14319,14 @@ class Interpreter {
         b = Mbarrier{};
         b.expected = want;
         b.valid = true;
+        // Before sm_90 ptxas writes the barrier with an STS.64 (the one lane's, as the SASS engine runs it), which a shared-memory store
+        // counter sees. From sm_90 it is a SYNCS.EXCH.64, whose count is not settled (no sm_90 card has been asked), and is not counted here.
+        if (profile_.cc_major < 9) {
+          Lanes at{};
+          at[lead] = addr;
+          count_memory(Space::Shared, 8, 1, /*is_store=*/true);
+          count_addresses(Space::Shared, at, Mask{1} << lead, 8, 1, /*is_store=*/true);
+        }
         return;
       }
       case MbarOp::Inval:

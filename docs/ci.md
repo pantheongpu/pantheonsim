@@ -289,6 +289,17 @@ If a job in the pool died with exit 137: check the host's memory
 building at the same time, and re-run the job once the host is quiet. Raising
 the per-job GiB of a profile in `ci/jobs.sh` makes the builds narrower.
 
+## Differential execution and determinism
+
+`nvidia/tests/e2e/run_differential.sh diff` runs each program on the SASS engine and on the PTX interpreter (one host thread) and
+requires the same output, the same memory after every launch, the same launches, and the same blocks, warps and bytes written to
+global and shared memory. The instruction counts, load counts, requests, sectors and bank conflicts are not compared: they follow the
+instruction set (PTX or SASS) and what ptxas made of the loads. `... determinism` runs each program several times with other CPU
+affinity, niceness and environment size, once with `VGPU_EXACT_THREADS=4`, and the PTX random and adversarial schedulers with one seed
+twice; output, every counter and the memory must be the same. A short list runs in ctest (`e2e_differential_diff`,
+`e2e_differential_determinism`); `differential.yml` runs the full lists nightly with 20 repetitions. Differences that are understood are
+in the `known` table of the script, each with its reason; anything else fails. Found so far, all fixed: the PTX engine counted nothing for `wmma.load`, `wmma.store` and bulk-copy (TMA) traffic and one fewer shared store for `mbarrier.init` before sm_90; the SASS engine counted 16 bytes for every `SUST.P` whatever the lane stored; its fast global store paths did not count a store as progress (`Warp::idle_yields`); and a YIELD loop that does new work on every pass was taken for a spin-wait, so `break_spin_wait` let lanes go from a BSYNC early (`group_ballot_barrier` for sm_75: wrong ballots, and a deadlock). Left in the `known` table with the reason: the TMA store count of lanes that name the same operands (ptxas runs them once) and `mbarrier.init` on sm_90 and later (`SYNCS.EXCH.64`, not settled without an sm_90 card).
+
 ## What runs after a merge (2026-11-19)
 
 A pull request already ran everything, so a push to main used to repeat it on the same tree (CI, Action, CUDA toolkits and ROCm

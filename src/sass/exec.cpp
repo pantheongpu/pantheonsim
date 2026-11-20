@@ -156,6 +156,10 @@ struct Warp {
   // taking turns or not: a warp whose groups all spin on words only another warp's lanes can change is not
   // making progress either, and spin_yields alone never sees it.
   uint32_t idle_yields = 0;
+  // The registers of the lowest lane of the group that yielded, hashed (Runner::note_yield), and whether they differ from what that lane's
+  // previous YIELD saw: a loop that yields on every pass but does new work on each (its registers move) is not a spin-wait.
+  uint64_t yield_sig[32] = {};   // (a lane's own: the groups of a warp take turns yielding)
+  bool yield_moved = false;
   // The group that last gave way (a YIELD, or a backward branch taken often enough while other lanes waited) and
   // where it stands now: the next group to run is the one after it in address order, wrapping round.
   uint64_t yield_pc = 0;
@@ -219,6 +223,8 @@ struct Warp {
     forced = false;
     ur_saved.clear();
     idle_yields = 0;
+    std::memset(yield_sig, 0, sizeof yield_sig);
+    yield_moved = false;
     yield_pc = 0;
     slice = 0;
     b2r = 0;
@@ -238,7 +244,7 @@ struct Warp {
 };
 // Warp::reset names every member. A member added changes this size (or not, if it fits in padding, which the debug build's
 // expect_new_warp would then catch): add it to reset() and to expect_new_warp, then change the number.
-static_assert(sizeof(Warp) == 2528, "Warp has a new member: see Warp::reset");
+static_assert(sizeof(Warp) == 2792, "Warp has a new member: see Warp::reset");
 
 // A warpgroup MMA's shared-memory operands, read by the first of its four
 // warps (exec_gmma).
@@ -889,6 +895,7 @@ class Runner {
   void exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex);
   void exec_warp(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask group);
   void release_warpsync(Warp& w);   // exec_ops.inc
+  void note_yield(Warp& w, Mask group);   // exec_ops.inc: a YIELD ran; does the group's state differ from the last one's?
   bool exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask group);   // true: it set the pcs
   void exec_mma(Block& blk, Warp& w, const Instr& ins, Mask ex);
   void exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex);   // warpgroup MMA
@@ -1473,7 +1480,7 @@ static void expect_new_warp(const Warp& w) {
             w.mactive_force == f.mactive_force && same(w.bssy_stamp, f.bssy_stamp) && w.gmma_issued == f.gmma_issued &&
             w.code_hint == f.code_hint && w.budget == f.budget && w.extra == f.extra && w.local.empty() && w.steps == f.steps &&
             w.timer_extra == f.timer_extra && w.spins == f.spins && w.give_way == f.give_way && w.spin_yields == f.spin_yields && w.forced == f.forced &&
-            w.ur_saved.empty() && w.idle_yields == f.idle_yields &&
+            w.ur_saved.empty() && w.idle_yields == f.idle_yields && same(w.yield_sig, f.yield_sig) && w.yield_moved == f.yield_moved &&
             w.yield_pc == f.yield_pc && w.slice == f.slice && w.b2r == f.b2r && w.b2r_pred == f.b2r_pred && w.yield == f.yield &&
             w.store_gate == f.store_gate && w.cga_arrived == f.cga_arrived && same(w.rare(), f.rare()) && !w.rare_dirty;
   for (uint32_t v : w.r) ok = ok && v == 0;
@@ -2277,7 +2284,10 @@ bool Runner::step_warp(Block& blk, Warp& w) {
       // the loop, waiting for the lanes that are spinning because it holds the lock). NVIDIA's scheduler
       // guarantees forward progress for a thread in a YIELD loop, so after a while the parked lanes go on
       // (break_spin_wait).
-      ++w.spin_yields;   // run_block decides, with every warp in view, whether the parked lanes go on
+      // (Not when the group's registers moved since its last YIELD: a loop that yields on every pass and does new work in each, as
+      // group_ballot_barrier's cell loop does, is not waiting for the parked lanes, which only need to wait for the loop to end.)
+      if (w.yield_moved) w.spin_yields = 0;
+      else ++w.spin_yields;   // run_block decides, with every warp in view, whether the parked lanes go on
     } else {
       w.spin_yields = 0;
     }
