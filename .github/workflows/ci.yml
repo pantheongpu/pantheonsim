@@ -65,6 +65,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/pr-guard
 
+      - name: The skip budget does not grow
+        # ci/skip-budget.txt may not gain a test or a higher total in a pull request (ci/skip_budget.py ratchet).
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          git fetch -q --depth=1 origin "$BASE"
+          if git show "origin/$BASE:ci/skip-budget.txt" > "$RUNNER_TEMP/base-skip-budget.txt" 2>/dev/null; then
+            python3 ci/skip_budget.py ratchet "$RUNNER_TEMP/base-skip-budget.txt"
+          fi
+
       - name: Install toolchain
         if: runner.environment == 'github-hosted'
         run: |
@@ -866,12 +877,15 @@ jobs:
           if [[ -n "$skipped" ]]; then
             # ctest hides a skipped test's output; the reason is its SKIP line.
             echo "Skipped tests and why:"
-            ctest --test-dir build -V -R "^($(grep . <<<"$skipped" | paste -sd'|'))$" 2>&1 | grep -E '^[0-9]+: SKIP:' | sed 's/^/  /' || true
+            ctest --test-dir build -V -R "^($(grep . <<<"$skipped" | paste -sd'|'))$" 2>&1 | tee skip-reasons.log | grep -E '^[0-9]+: SKIP:' | sed 's/^/  /' || true
           fi
           if [[ -n "$unexpected" ]]; then
             echo "::error::tests skipped on the runner, which should run them: $(tr '\n' ' ' <<<"$unexpected")"
             exit 1
           fi
+          # The skip budget (ci/skip-budget.txt): every skip has a reason and the count stays within the recorded total.
+          touch skip-reasons.log
+          python3 ci/skip_budget.py check rest.log skip-reasons.log
 
       - name: Slowest tests of the rest of the suite
         # The longest tests of the run above, in the job's summary; a test over 25 minutes warns and one over 30 fails (ci/slowest_tests.sh).

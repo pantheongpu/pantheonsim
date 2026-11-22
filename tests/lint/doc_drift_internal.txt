@@ -1,0 +1,29 @@
+# Variables and flags the source defines that the documentation deliberately does not name, and flags it shows that are another tool's.
+# One per line: NAME | reason. Checked by check_doc_drift.py; a name that gets documented, or leaves the source, must leave this list.
+#
+# Maintainer tools (tools/, nvidia/tools, amd/tools): not part of the installed simulator.
+VGPU_BENCH_CACHE | read by tools/bench/bench.py, the maintainers' benchmark driver
+VGPU_BENCH_DIR | read by the maintainers' cloud trace scripts in nvidia/tools
+VGPU_BENCH_DUMP | read by amd/tools/exec-bench.cpp, a maintainers' benchmark program
+VGPU_BENCH_REPEAT | read by amd/tools/exec-bench.cpp, a maintainers' benchmark program
+VGPU_CLOUD_OUT | output directory of the maintainers' cloud scripts (amd/tools, nvidia/tools)
+VGPU_PANTHEON_BIN | read by tools/bench/bench.py, the maintainers' benchmark driver
+VGPU_NVCC | the maintainers' benchmark driver's nvcc path (and a CMake cache variable)
+VGPU_SOURCE_DIR | the source tree, for a maintainers' benchmark program (nvidia/tools/tensor-bench.cpp)
+# Debug switches of the engines, for the developers who work on them; they print or keep internal state and are not a stable interface.
+VGPU_SAME_BITS_DUMP | AMD executor debug print of one instruction's result
+VGPU_SAME_BITS_DUMP_V | AMD executor debug print, verbose form
+VGPU_MEM_SAME_BITS_DUMP | AMD executor debug print of a memory instruction's result
+VGPU_JIT_ESCAPE_ONLY | SASS JIT developer switch: every op is an escape to the tier handler
+VGPU_JIT_KEEP | SASS JIT developer switch: keep the generated C++ source
+VGPU_JIT_RES_ROWS | SASS JIT developer switch: cap on the resident register rows
+VGPU_POOL_MIN_WORK_US | worker-pool scheduling threshold, set by the unit tests (test_sched) to force a choice
+VGPU_POOL_TRIAL_LOG | worker-pool developer log of each trial's verdict
+VGPU_H264_NODEBLOCK | H.264 decoder developer switch: skip the deblocking filter
+VGPU_H264_TRACE | H.264 decoder developer trace of macroblocks
+# Set by the simulator for its own child.
+VGPU_PS1 | set by vgpu shell for the rc file it writes, to carry the prompt; not an input
+# Flags that are internal or another tool's.
+--offload-arch | hipcc's flag, shown in an example of compiling for the simulated card
+--stage2 | vgpu shell re-executing itself inside the namespaces it made; not for users
+--rcfile | bash's flag, which vgpu shell passes to the shell it starts

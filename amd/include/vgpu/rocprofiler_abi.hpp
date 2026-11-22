@@ -45,8 +45,10 @@
 
 namespace vgpu::amd::rocprof {
 
-// The interface version this answers to: rocprofiler-sdk 1.0.0, ROCm 7.1's.
-constexpr uint32_t kVersionMajor = 1, kVersionMinor = 0, kVersionPatch = 0;
+// The interface version this answers to: rocprofiler-sdk 1.1.0, ROCm 7.2's. The structures
+// are the same as 1.0.0's (ROCm 7.1's), which amd_rocprofiler_abi checks field by field
+// against either release's headers; a tool built for the older one runs on this.
+constexpr uint32_t kVersionMajor = 1, kVersionMinor = 1, kVersionPatch = 0;
 constexpr uint32_t kVersion = kVersionMajor * 10000 + kVersionMinor * 100 + kVersionPatch;
 
 // ---- fwd.h ----------------------------------------------------------------

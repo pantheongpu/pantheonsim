@@ -137,7 +137,7 @@ runs:
         # runner for the whole 45 minutes, twice running. Bound each attempt, and finish whatever dpkg
         # left half-configured before the next.
         for attempt in 1 2 3; do
-          $SUDO timeout 900 apt-get install -y -qq --no-install-recommends $pkgs && break
+          $SUDO env INITRD=No timeout 900 apt-get install -y -qq -o DPkg::Lock::Timeout=300 --no-install-recommends $pkgs && break
           if [[ $attempt == 3 ]]; then
             echo "::error::apt-get install of $pkgs did not finish in three attempts"
             exit 1
