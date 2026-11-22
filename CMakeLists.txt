@@ -4535,6 +4535,13 @@ if(Python3_Interpreter_FOUND)
   # The profile counts in docs/status.md (and the digits restated in README, CONTRIBUTING, ARCHITECTURE) match the profile files.
   add_test(NAME lint_profile_counts
            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lint/check_profile_counts.py ${CMAKE_SOURCE_DIR})
+  # A profile's `measured` provenance needs a vectors file that backs it (selftest, then the tree).
+  add_test(NAME lint_provenance_vectors_selftest
+           COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lint/check_provenance_vectors.py --selftest)
+  add_test(NAME lint_provenance_vectors
+           COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lint/check_provenance_vectors.py ${CMAKE_SOURCE_DIR})
+  # The card-oracle diff: manifest, driver verdicts (on stubs) and workflow (seconds, no build, no GPU).
+  add_test(NAME lint_oracle_diff COMMAND bash ${CMAKE_SOURCE_DIR}/tests/lint/check_oracle_diff.sh)
   # tools/bench/real/short.py puts every perf sample of a short program in a start-up phase by its call chain; the
   # rules are checked against chains of the shapes perf gives (seconds, no build, no perf).
   add_test(NAME lint_short_split_selftest

@@ -69,4 +69,4 @@ numerics:
 provenance:
   measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]
 evidence:
-  numerics: "card: NVIDIA A100-SXM4-40GB (this model), Lambda; driver: 570.148.08; toolkit: nvcc 12.8.93; date: 2026-11-15. Both probes print the RTX 3060 lines; FTTN; a dump of 8,388,608 wmma results, every one the ampere rule (tools/fttn/tc_dump_check.cpp). docs/matrix-numerics.md"
+  numerics: "card: NVIDIA A100-SXM4-40GB (this model), Lambda; driver: 570.148.08; toolkit: nvcc 12.8.93; date: 2026-11-15. Both probes print the RTX 3060 lines (nvidia/tests/data/simd_lane_forms.rtx3060.txt, float_half_forms.rtx3060.txt); FTTN; a dump of 8,388,608 wmma results, every one the ampere rule (tools/fttn/tc_dump_check.cpp). docs/matrix-numerics.md"
