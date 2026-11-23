@@ -1272,9 +1272,22 @@ struct LaneSet {
 
 // The position of an instruction kind in the Op variant, for switching on
 // ins.op.index() instead of testing the alternatives one at a time.
+// (Counted from the variant's type list: building an Op in a constant expression, as this once did, is one clang with libstdc++ refuses.)
+template <class T, class V>
+struct variant_index_of;
+template <class T, class... Ts>
+struct variant_index_of<T, std::variant<Ts...>> {
+  static constexpr size_t value = [] {
+    constexpr bool same[] = {std::is_same_v<T, Ts>...};
+    for (size_t i = 0; i < sizeof...(Ts); ++i)
+      if (same[i]) return i;
+    return size_t{static_cast<size_t>(-1)};
+  }();
+  static_assert(value != static_cast<size_t>(-1), "not an alternative of the variant");
+};
 template <class T>
 constexpr size_t op_index() {
-  return Op(std::in_place_type<T>).index();
+  return variant_index_of<T, Op>::value;
 }
 
 // tcgen05.mma's rows: acc[i] += a[k] * b[k * ldb + i] for k = 0..K-1 in order,
