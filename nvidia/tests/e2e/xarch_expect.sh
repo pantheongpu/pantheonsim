@@ -14,7 +14,7 @@ xarch_groups[round9_probe@native]="a100 a10g l4 | h100 h200 | b200 rtx5090"   # 
 # --- real hardware: what the architecture has.
 xarch_groups[mma_accumulate_probe]="t4 a100 a10g l4 h100 h200 b200"   # block-scaled mma.sync exists on compute capability 12 only (it SKIPs on b200)
 xarch_groups[mma_forms@native]="a100 a10g l4 h100 h200 b200"          # the same: sm_120's block-scaled forms are built there only
-xarch_groups[vector_atomics@native]="t4 a100 a10g l4 | h100 h200 b200 rtx5090"   # red/atom .v2/.v4 need sm_90 (the program says SKIP below it)
+xarch_groups[vector_atomics]="t4 a100 a10g l4 | h100 h200 b200 rtx5090"   # red/atom .v2/.v4 need sm_90 (the program says SKIP below it)
 xarch_groups[smem_size_regs@native]="t4 a100 a10g l4 | h100 h200 b200 rtx5090"   # %aggr_smem_size is from sm_90 (PTX ISA 7.8)
 xarch_groups[launch_refusals]="t4 a100 a10g l4 | h100 h200 b200 rtx5090"          # clusters are from sm_90: cudaErrorInvalidClusterSize below
 xarch_groups[device_limits]="t4 a100 a10g l4 | h100 h200 b200 rtx5090"           # cudaLimitDevRuntimeSyncDepth is unsupported from 9.0 (CUDA docs)

@@ -40,6 +40,13 @@
 // every one an ELECT word with bit 72 set, and the differences are only that source operand (a UR with its not, where a predicate was), f[0] = 1 and the text;
 // the corpora digest is UNCHANGED (no word of the real-code corpora has bit 72 set in an ELECT). The digests are the same on a CUDA 12.4 and a 13.0 build. ***
 //
+// *** 2026-11-23 (xarch, #749): all three digests were RE-RECORDED on purpose for the sm_100+ `IADD` word (opcode 0x35): dec_iadd now reads the
+// carry-out predicate (bits 81-83, when not PT) as a second destination and, with bit 74 (.X), the carry-in predicate (bits 87-90) as a third source, with
+// a negated source of a carry-in form a one's complement, as IADD3's. `add.cc.u64` is `IADD.64 RZ, P0, R2, UR8` and `addc` the `IADD.X` after it. Verified by dumping
+// both passes (VGPU_DECODE_DUMP) from a build with the old dec_iadd and one with the new and diffing them: 45 dump lines differ in "corpora", 148 in "flipped"
+// and 134 in "random", every one an IADD word decoded for sm_100, sm_103 or sm_120 (the corpora's other-architecture words that decode as IADD there), and the
+// differences are only the carry-out destination, the carry-in source and the X modifier. ***
+//
 // VGPU_DECODE_PRINT=1 prints the digests (to regenerate the table after a decoder change that is meant to change
 // them); VGPU_DECODE_DUMP=<dir> writes the full dump of every pass, so two builds can be diffed to see which
 // instruction differs; VGPU_DECODE_BENCH=1 times decode and to_text over the corpora.
@@ -175,7 +182,7 @@ VTEST(the_corpora_decode_to_the_same_bits_on_every_architecture) {
   uint64_t pc = 0;
   for (const sass::Word& w : corpus_words()) words.push_back({w, (pc += 16) & 0xfffff0});
   const std::vector<int> archs(std::begin(kArchs), std::end(kArchs));
-  check("corpora", run_pass("corpora", words, archs), "0c5a1b5bc7c28e0bfea506c3d4eea68c");
+  check("corpora", run_pass("corpora", words, archs), "58343ad8c0f1fb6e73bc5b95b1d259d7");
 }
 
 VTEST(words_with_flipped_bits_decode_to_the_same_bits) {
@@ -192,7 +199,7 @@ VTEST(words_with_flipped_bits_decode_to_the_same_bits) {
     words.push_back({w, 16 * (rng.next() % 4096)});
   }
   const std::vector<int> archs = {75, 86, 90, 100, 120};
-  check("flipped", run_pass("flipped", words, archs), "da351bb3d321143d42d9acfe91eed066");
+  check("flipped", run_pass("flipped", words, archs), "47b07a0f78bf31698c9609744e52b639");
 }
 
 VTEST(random_opcodes_decode_to_the_same_bits) {
@@ -205,7 +212,7 @@ VTEST(random_opcodes_decode_to_the_same_bits) {
     words.push_back({w, 16 * (rng.next() % 4096)});
   }
   const std::vector<int> archs = {80, 89, 103, 120};
-  check("random", run_pass("random", words, archs), "64b70dc8e5f3263b13a15b2a0527ff5e");
+  check("random", run_pass("random", words, archs), "912ce8a6c57091999e2693f3bdfa83b5");
 }
 
 VTEST(bench_decode) {
