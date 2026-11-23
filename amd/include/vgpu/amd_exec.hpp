@@ -293,6 +293,12 @@ void set_matrix_fast_path(bool on);
 // machine is made (a dispatch). set_cdna2_matrix_model(1 / 0) overrides the environment for the tests, -1 gives it back.
 bool cdna2_matrix_model();
 void set_cdna2_matrix_model(int on);
+// Whether the matrix instructions of gfx90a (an MI250X: CDNA2) and gfx942 (an MI300X: CDNA3) sum as the models of Khattak, Mikaitis and
+// Graziani (arXiv 2609.14845; amd/src/mfma_models.hpp) say: binary16 and bfloat16 on both, xf32 and fp8 on gfx942. OFF by default: the
+// models are published, no card of ours has run them. VGPU_MFMA_MODEL=khattak turns it on; on gfx90a it takes the place of
+// VGPU_MFMA_CDNA2=fttn. Read as a machine is made (a dispatch). set_khattak_matrix_model(1 / 0) overrides the environment for the tests, -1 gives it back.
+bool khattak_matrix_model();
+void set_khattak_matrix_model(int on);
 // How many matrix instructions the tile path has done on the calling thread since it began (those it does not do go to the reference path).
 uint64_t matrix_tile_count();
 // How many vector register files (64 KB each) the process has made new -- allocated and zeroed whole -- rather than taken from a

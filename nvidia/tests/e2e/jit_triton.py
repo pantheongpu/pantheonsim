@@ -79,7 +79,17 @@ dA, dB = cuda.to_device(A), cuda.to_device(B)
 dC = cuda.device_array((M, N), dtype=np.float32)
 matmul_kernel[(4, 4)](P(dA), P(dB), P(dC), M, N, K, BM=32, BN=32, BK=32)
 C = dC.copy_to_host()
-check("tl.dot matmul", np.allclose(C, A @ B, atol=2e-2), f"maxerr={np.abs(C-A@B).max():.2e}")
+# tl.dot on float32 runs mma.sync in tf32. Triton 3.9 hands the float32 operands to it as they are, and
+# the tensor core drops their low 13 mantissa bits (truncation), so the result sits up to ~3e-2 from the
+# float32 product for 128 terms of [0, 1): that is the card's behaviour, not an error. Older Triton rounds
+# to nearest first (~4e-3). So the check is against the product of the operands as the tensor core reads
+# them, in float64, which agrees to float32 accumulation error (~1e-5) -- far tighter than the float32
+# product, and sensitive to a wrong tf32 conversion -- for either form.
+def tf32_truncate(x): return (x.view(np.uint32) & np.uint32(0xFFFFE000)).view(np.float32)
+def tf32_round(x): return ((x.view(np.uint32).astype(np.uint64) + 0x1000) & 0xFFFFE000).astype(np.uint32).view(np.float32)
+errs = {f.__name__: np.abs(C - f(A).astype(np.float64) @ f(B).astype(np.float64)).max() for f in (tf32_truncate, tf32_round)}
+check("tl.dot matmul", min(errs.values()) < 1e-3 and np.allclose(C, A @ B, atol=5e-2),
+      " ".join(f"{k}_maxerr={v:.2e}" for k, v in errs.items()))
 
 # --- 3. atomics ---
 @triton.jit

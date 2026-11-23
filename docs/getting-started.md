@@ -10,7 +10,8 @@ problems people hit.
 `make` on its own does the next three things in order. Do them one at a time when
 you want to see each result.
 
-You need a Linux machine with a C++ compiler and CMake, and no GPU. The first
+You need a Linux machine with a C++ compiler and CMake, and no GPU (on a bare
+machine, [install.md](install.md) starts from `make` and `git`). The first
 command checks for them:
 
 ```bash

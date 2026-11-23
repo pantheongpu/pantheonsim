@@ -76,6 +76,20 @@ inline bool shared_window_inside_warp(const uint32_t* a, uint32_t active, uint32
 #endif
 }
 
+// Whether every active lane's address is a multiple of `bytes` (a power of two). A card faults on a load or store that is not
+// (cudaErrorMisalignedAddress); the fast paths decline such an access, and the general loop that finds the lane faults.
+template <class T>
+inline bool lanes_aligned(const T* a, uint32_t active, uint32_t bytes) {
+  if (bytes <= 1) return true;
+  T odd = 0;
+  if (active == 0xffffffffu) {
+    for (unsigned l = 0; l < 32; ++l) odd |= a[l];
+  } else {
+    for (uint32_t m = active; m; m &= m - 1) odd |= a[__builtin_ctz(m)];
+  }
+  return (odd & (bytes - 1)) == 0;
+}
+
 // A local-memory offset is inside the lane's frame when the access's last byte is.
 struct LocalWindowCheck {
   uint64_t highest = 0;

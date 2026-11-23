@@ -110,13 +110,14 @@ for entry in "${tests[@]}"; do
   name="${path##*/}"
   if ! require_shim_libs "$shim" "$work/$name"; then exit 0; fi
   run_start=$SECONDS
-  result="$(VGPU_QUIET=1 VGPU_SASS_LOG=1 VGPU_GPU=nvidia/b200 LD_LIBRARY_PATH="$shim" \
+  result="$(VGPU_SASS_LOG=1 VGPU_GPU=nvidia/b200 LD_LIBRARY_PATH="$shim" \
             "$work/$name" --gtest_filter="$filter" 2>&1 || true)"
   summary="$(grep -E '^\[  (PASSED|FAILED)  \]' <<<"$result" | head -2 | tr '\n' ' ')"
   echo "$name: $summary(ran in $((SECONDS - run_start)) s)"
   grep -E '^\[ +OK \]' <<<"$result" | sed 's/^/    /'
   if ! grep -q '^\[  PASSED  \]' <<<"$result" || grep -q '^\[  FAILED  \]' <<<"$result"; then
-    grep -E 'FAILED|Failure|VirtualGPU|timed out' <<<"$result" | head -20
+    grep -E -A6 'FAILED|Failure|VirtualGPU|timed out' <<<"$result" | grep -v '^\[ \+OK \]' | head -60
+    echo "the simulator's own messages:"; grep '^\[vgpu\]' <<<"$result" | sort | uniq -c | sort -rn | head -10
     fail=1
   fi
   cutlass_sass_check "$name" "$result" || fail=1

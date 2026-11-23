@@ -443,16 +443,28 @@ void check_golden(const Result& r, const std::string& key) {
   throw vtest::Failure(key + ": no recorded answer");
 }
 
+// What a launch that faults gave, for the cases that read memory at an address a card faults on (misaligned): the tier must stop with the interpreter's
+// error, word for word, and there is nothing else to compare. Returns true when the launch faulted (in either).
+bool both_fault_alike(const std::string& tier_err, const std::string& ref_err, const std::string& name) {
+  if (tier_err.empty() && ref_err.empty()) return false;
+  if (tier_err != ref_err) throw vtest::Failure(name + ": the tier's error is \"" + tier_err + "\", the interpreter's \"" + ref_err + "\"");
+  if (tier_err.find("not aligned") == std::string::npos) throw vtest::Failure(name + ": faulted, and not for a misaligned access: " + tier_err);
+  return true;
+}
+
 // The kernel run by the tier and by the interpreter, over the block sizes given.
 void compare(const std::vector<Insn>& code, std::initializer_list<uint32_t> sizes, const std::string& name) {
   Scoped scoped;
   Env e;
   const auto m = e.load(code);
   for (uint32_t threads : sizes) {
-    const Result tier = e.run(*m, 3, threads);
+    Result tier, ref;
+    std::string tier_err, ref_err;
+    try { tier = e.run(*m, 3, threads); } catch (const std::exception& x) { tier_err = x.what(); }
     ::setenv("VGPU_FASTPATH", "0", 1);
-    const Result ref = e.run(*m, 3, threads);
+    try { ref = e.run(*m, 3, threads); } catch (const std::exception& x) { ref_err = x.what(); }
     ::unsetenv("VGPU_FASTPATH");
+    if (both_fault_alike(tier_err, ref_err, name + ", " + std::to_string(threads) + " threads")) continue;
     expect_same(tier, ref, name + ", " + std::to_string(threads) + " threads");
     check_golden(tier, name + ", " + std::to_string(threads) + " threads");
   }
@@ -570,10 +582,13 @@ void compare_interpreter(const std::vector<Insn>& code, std::initializer_list<ui
   Env e;
   const auto m = e.load(code);
   for (uint32_t threads : sizes) {
-    const Result tier = e.run(*m, 3, threads);
+    Result tier, ref;
+    std::string tier_err, ref_err;
+    try { tier = e.run(*m, 3, threads); } catch (const std::exception& x) { tier_err = x.what(); }
     ::setenv("VGPU_FASTPATH", "0", 1);
-    const Result ref = e.run(*m, 3, threads);
+    try { ref = e.run(*m, 3, threads); } catch (const std::exception& x) { ref_err = x.what(); }
     ::unsetenv("VGPU_FASTPATH");
+    if (both_fault_alike(tier_err, ref_err, name + ", " + std::to_string(threads) + " threads")) continue;
     expect_same(tier, ref, name + ", " + std::to_string(threads) + " threads");
     if (threads == 32 && conflicts_at_32) *conflicts_at_32 = tier.stats.shared_bank_conflicts;
   }
@@ -621,10 +636,12 @@ VTEST(a_warp_of_consecutive_wide_elements_takes_bytes_over_four_passes) {
   uint64_t c128 = 0, c64 = 0, c128u = 0;
   compare_interpreter(wide_kernel(0), {32}, "128 bit run", &c128);
   compare_interpreter(wide_kernel(1), {32}, "64 bit run", &c64);
+  // (A 128-bit access that is only word aligned faults on a card, and here: shape 2 stops both engines with the same misaligned-access error,
+  // which compare_interpreter checks, so it has no passes to count.)
   compare_interpreter(wide_kernel(2), {32}, "128 bit run, word aligned", &c128u);
   VCHECK_EQ(c128, uint64_t{3 * 2 * 3});
   VCHECK_EQ(c64, uint64_t{3 * 2 * 1});
-  VCHECK_EQ(c128u, uint64_t{3 * 2 * 3});
+  VCHECK_EQ(c128u, uint64_t{0});
 }
 
 #ifndef SASS_CALL_RET_NO_TIER_FORMS   // (not in the tree the answers were taken from)

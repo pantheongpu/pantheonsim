@@ -232,7 +232,7 @@ and moving any part of either arrangement makes them fail. Sums are formed in
 double (fused, for doubles) and rounded once; where a sum is not exact, a card
 may round it differently. (No AMD matrix-core card has been measured: which sum
 each profile makes, what the FTTN and MMA-Sim papers report of MI100, MI250X and
-MI300X instead, and the opt-in MI250X rule `VGPU_MFMA_CDNA2=fttn`, are in
+MI300X instead, the opt-in MI250X rule `VGPU_MFMA_CDNA2=fttn` and the opt-in models `VGPU_MFMA_MODEL=khattak`, are in
 [docs/matrix-numerics.md](../docs/matrix-numerics.md).) The reduced-precision xf32 forms (`v_mfma_f32_16x16x8_xf32`
 and `32x32x4`, gfx940 to gfx942) multiply floats whose mantissa is cut to 10 bits,
 as the MI300 ISA guide describes them: the guide says "round" once and

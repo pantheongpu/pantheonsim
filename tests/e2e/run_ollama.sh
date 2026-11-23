@@ -34,6 +34,17 @@ expect() {  # expect <name> <expected> <actual>
     echo "FAIL  $1"; echo "      expected: $2"; echo "      actual:   $3"; fail=1; fi
 }
 
+# What a real card replied (tests/e2e/ollama_card_ref.py): sixteen greedy tokens and their log-probabilities,
+# recorded on an RTX 3060 with this Ollama version. Checked only for the model it was recorded for.
+card_check() {  # card_check <profile>: the server on $api against the reply of a real card: the profile's own card (an A10G for
+                # nvidia/a10g), else the RTX 3060's
+  local out rc ref="$root/nvidia/tests/data/ollama_smollm2_${1#nvidia/}.card.json"
+  [[ -f $ref ]] || ref="$root/nvidia/tests/data/ollama_smollm2_rtx3060.card.json"
+  out=$(python3 "$root/tests/e2e/ollama_card_ref.py" check --api "$api" --model "$model" --ref "$ref" 2>&1); rc=$?
+  sed "s|^|$1: vs the card: |" <<< "$out"
+  [[ $rc == 0 ]] || fail=1
+}
+
 port=$((20000 + RANDOM % 20000))
 api="http://127.0.0.1:$port"
 # serve <log> [env...]: an ollama server with the given environment, ready.
@@ -114,6 +125,7 @@ for gpu in $profiles; do
   expect "$gpu ($vram_mb MiB): every layer on the GPU, the whole model resident" "yes yes" \
     "$([[ "$layers" =~ offloaded\ ([0-9]+)/([0-9]+) && ${BASH_REMATCH[1]} == "${BASH_REMATCH[2]}" ]] && echo yes || echo "no ($layers)") $([[ -n "$size" && "$size" == "$vram" ]] && echo yes || echo "no ($size in, $vram on the GPU)")"
   expect "$gpu: generates what the CPU backend does" "$reference" "$reply"
+  card_check "$gpu"
   stop
 done
 

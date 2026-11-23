@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '19 5 * * *'
   workflow_dispatch:
     inputs:
       ml_tests:
@@ -62,6 +64,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/pr-guard
+
+      - name: The skip budget does not grow
+        # ci/skip-budget.txt may not gain a test or a higher total in a pull request (ci/skip_budget.py ratchet).
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          git fetch -q --depth=1 origin "$BASE"
+          if git show "origin/$BASE:ci/skip-budget.txt" > "$RUNNER_TEMP/base-skip-budget.txt" 2>/dev/null; then
+            python3 ci/skip_budget.py ratchet "$RUNNER_TEMP/base-skip-budget.txt"
+          fi
 
       - name: Install toolchain
         if: runner.environment == 'github-hosted'
@@ -136,6 +149,13 @@ jobs:
         # tests at -j2 already.
         run: ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 6 -m 4)" -E '^(pantheon_workloads|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'
 
+      - name: Leak sweep
+        # The end-to-end tests ran with VGPU_LEAK_CHECK=1 (CMakeLists.txt, the end): what each program's processes still held when their
+        # machine went away (device memory, pinned memory, descriptors, threads) is in build/leak-check/<test>.log. A leak that
+        # tests/lint/leak_known.txt does not name fails here, and so does a listed one that is gone.
+        if: success()
+        run: python3 tests/lint/check_leak_sweep.py build/leak-check tests/lint/leak_known.txt
+
       - name: Slowest tests
         # The longest tests of the run above, in the job's summary; a test over 25 minutes warns and one over 30 fails (ci/slowest_tests.sh).
         if: always()
@@ -163,7 +183,7 @@ jobs:
   workloads:
     name: pantheon workloads
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
-    if: ${{ !inputs.nvidia_only }}
+    if: ${{ github.event_name != 'push' && !inputs.nvidia_only }}
     # GitHub's hosted runner unless the repository variable SIM_RUNS_ON names
     # another, e.g. ["self-hosted", "pantheonsim-ci"] for the runner on the
     # pantheonsim.com host (pantheonsim-web/deploy/gh-runner). Its image has
@@ -244,6 +264,7 @@ jobs:
 
   sass:
     name: SASS on every architecture
+    if: github.event_name != 'push'
     # The build job's toolkit is Ubuntu's CUDA 12.0, which targets up to
     # sm_90a; Blackwell's SASS (sm_100, sm_120) needs CUDA 12.8 or later. This
     # job builds against CUDA 13 and runs the SASS tests: the decoder against
@@ -367,7 +388,7 @@ jobs:
   ollama:
     name: ollama on every GPU
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
-    if: ${{ !inputs.nvidia_only }}
+    if: ${{ github.event_name != 'push' && !inputs.nvidia_only }}
     # GitHub's hosted runner unless BURST_RUNS_ON names a pool (see the SASS job).
     runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # Fourteen GPUs take about 18 minutes on 8 cores; a 4-core runner is slower.
@@ -512,7 +533,7 @@ jobs:
   ollama-amd:
     name: ollama on ${{ matrix.gpu }}
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
-    if: ${{ !inputs.nvidia_only }}
+    if: ${{ github.event_name != 'push' && !inputs.nvidia_only }}
     # GitHub's hosted runner unless BURST_RUNS_ON names a pool (see the SASS job).
     runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # A simulated GPU takes some 3 to 17 minutes to load a model and generate
@@ -650,7 +671,7 @@ jobs:
   amd-code-objects:
     name: AMD code objects and CDNA decoding
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
-    if: ${{ !inputs.nvidia_only }}
+    if: ${{ github.event_name != 'push' && !inputs.nvidia_only }}
     # GitHub's hosted runner unless the repository variable SIM_RUNS_ON names
     # another, e.g. ["self-hosted", "pantheonsim-ci"] for the runner on the
     # pantheonsim.com host (pantheonsim-web/deploy/gh-runner). Its image has
@@ -751,7 +772,7 @@ jobs:
     # The other jobs stay on GitHub's hosted runners, which there are many of;
     # this one runner takes this job alone. Where the variable is unset the
     # job does not run.
-    if: vars.ML_RUNS_ON != ''
+    if: github.event_name != 'push' && vars.ML_RUNS_ON != ''
     runs-on: ${{ fromJSON(vars.ML_RUNS_ON || '"ubuntu-24.04"') }}
     timeout-minutes: 240
     permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
@@ -863,12 +884,15 @@ jobs:
           if [[ -n "$skipped" ]]; then
             # ctest hides a skipped test's output; the reason is its SKIP line.
             echo "Skipped tests and why:"
-            ctest --test-dir build -V -R "^($(grep . <<<"$skipped" | paste -sd'|'))$" 2>&1 | grep -E '^[0-9]+: SKIP:' | sed 's/^/  /' || true
+            ctest --test-dir build -V -R "^($(grep . <<<"$skipped" | paste -sd'|'))$" 2>&1 | tee skip-reasons.log | grep -E '^[0-9]+: SKIP:' | sed 's/^/  /' || true
           fi
           if [[ -n "$unexpected" ]]; then
             echo "::error::tests skipped on the runner, which should run them: $(tr '\n' ' ' <<<"$unexpected")"
             exit 1
           fi
+          # The skip budget (ci/skip-budget.txt): every skip has a reason and the count stays within the recorded total.
+          touch skip-reasons.log
+          python3 ci/skip_budget.py check rest.log skip-reasons.log
 
       - name: Slowest tests of the rest of the suite
         # The longest tests of the run above, in the job's summary; a test over 25 minutes warns and one over 30 fails (ci/slowest_tests.sh).
@@ -881,6 +905,7 @@ jobs:
 
   sanitizers:
     name: ASan + UBSan
+    if: github.event_name != 'push'
     # GitHub's hosted runner unless the repository variable BURST_RUNS_ON names
     # another pool, e.g. ["pantheonsim-burst"]: AWS instances
     # started while the pull request backlog is long and terminated when it is
@@ -994,6 +1019,7 @@ jobs:
 
   threads:
     name: ThreadSanitizer
+    if: github.event_name != 'push'
     # GitHub's hosted runner unless the repository variable BURST_RUNS_ON names
     # another pool, e.g. ["pantheonsim-burst"]: AWS instances
     # started while the pull request backlog is long and terminated when it is

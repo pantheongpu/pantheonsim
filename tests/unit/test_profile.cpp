@@ -645,3 +645,27 @@ VTEST(the_fp8_sum_is_named_with_its_numbers_and_only_the_implemented_ones_are_ac
   refused(std::string(kAmpereNumerics) + "  tensor_sum_fp8_chunk: 16\n" + tail(true), "need numerics.tensor_sum_fp8");
   refused(std::string(kAmpereNumerics) + ada + tail(false), "numerics.tensor_sum_fp8_chunk has no provenance class");
 }
+
+// The FP8 sum of wgmma (numerics.tensor_sum_wgmma_fp8): optional, named, written out with its numbers, and only the sum the engines implement.
+VTEST(the_wgmma_fp8_sum_is_named_with_its_numbers_and_only_the_implemented_one_is_accepted) {
+  const std::string keys = "numerics.tensor_sum_wgmma_fp8, numerics.tensor_sum_wgmma_fp8_chunk, numerics.tensor_sum_wgmma_fp8_grid, numerics.tensor_sum_wgmma_fp8_out_bits";
+  const auto tail = [&](bool numbers) {
+    return std::string("provenance:\n  inferred: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid, ") +
+           (numbers ? keys : "numerics.tensor_sum_wgmma_fp8") + "]\nevidence:\n  numerics: \"data recorded by others\"\n";
+  };
+  const std::string hopper = "  tensor_sum_wgmma_fp8: hopper\n  tensor_sum_wgmma_fp8_chunk: 32\n  tensor_sum_wgmma_fp8_grid: 14\n  tensor_sum_wgmma_fp8_out_bits: 13\n";
+  const DeviceProfile p = with_sections(std::string(kAmpereNumerics) + hopper + tail(true));
+  VCHECK(p.numerics.tensor_sum_wgmma_fp8 == vgpu::WgmmaFp8Sum::Hopper);
+  VCHECK_EQ(p.numerics.tensor_sum_wgmma_fp8_chunk, 32u);
+  VCHECK_EQ(p.numerics.tensor_sum_wgmma_fp8_grid, 14);
+  VCHECK_EQ(p.numerics.tensor_sum_wgmma_fp8_out_bits, 13);
+  VCHECK(p.provenance_of("numerics.tensor_sum_wgmma_fp8_grid") == Provenance::Inferred);
+  const DeviceProfile q = with_sections(std::string(kAmpereNumerics) + "  tensor_sum_wgmma_fp8: sequential\n" + tail(false));
+  VCHECK(q.numerics.tensor_sum_wgmma_fp8 == vgpu::WgmmaFp8Sum::Sequential && q.numerics.tensor_sum_wgmma_fp8_chunk == 0);
+  refused(std::string(kAmpereNumerics) + "  tensor_sum_wgmma_fp8: sequential\n  tensor_sum_wgmma_fp8_grid: 14\n" + tail(true), "have no meaning with tensor_sum_wgmma_fp8: sequential");
+  refused(std::string(kAmpereNumerics) + "  tensor_sum_wgmma_fp8: hopper\n  tensor_sum_wgmma_fp8_chunk: 16\n  tensor_sum_wgmma_fp8_grid: 14\n  tensor_sum_wgmma_fp8_out_bits: 13\n" + tail(true),
+          "the engines have no such sum");
+  refused(std::string(kAmpereNumerics) + "  tensor_sum_wgmma_fp8: ada\n" + tail(false), "must be sequential or hopper");
+  refused(std::string(kAmpereNumerics) + "  tensor_sum_wgmma_fp8_chunk: 32\n" + tail(true), "need numerics.tensor_sum_wgmma_fp8");
+  refused(std::string(kAmpereNumerics) + hopper + tail(false), "numerics.tensor_sum_wgmma_fp8_chunk has no provenance class");
+}

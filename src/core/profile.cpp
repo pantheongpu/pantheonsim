@@ -104,7 +104,8 @@ void parse_numerics(const Value& doc, DeviceProfile& p, const std::string& origi
     (void)value;
     if (key != "tensor_sum" && key != "tensor_sum_chunk" && key != "tensor_sum_chunk_tf32" && key != "tensor_sum_grid" &&
         key != "tensor_sum_published" && key != "tensor_sum_fp8" && key != "tensor_sum_fp8_chunk" && key != "tensor_sum_fp8_grid" &&
-        key != "tensor_sum_fp8_out_bits")
+        key != "tensor_sum_fp8_out_bits" && key != "tensor_sum_wgmma_fp8" && key != "tensor_sum_wgmma_fp8_chunk" &&
+        key != "tensor_sum_wgmma_fp8_grid" && key != "tensor_sum_wgmma_fp8_out_bits")
       fail(origin, "numerics: unknown key '" + key + "'");
   }
   // The tensor-core sum is read by the NVIDIA engines only. On another vendor's profile it would be a property nothing consults.
@@ -166,6 +167,35 @@ void parse_numerics(const Value& doc, DeviceProfile& p, const std::string& origi
     }
   } else if (fp8_numbers) {
     fail(origin, "numerics.tensor_sum_fp8_* need numerics.tensor_sum_fp8");
+  }
+  // The FP8 sum of wgmma: optional; named, it is written out with its numbers.
+  const bool wg_numbers = n.map.count("tensor_sum_wgmma_fp8_chunk") || n.map.count("tensor_sum_wgmma_fp8_grid") ||
+                          n.map.count("tensor_sum_wgmma_fp8_out_bits");
+  if (n.map.count("tensor_sum_wgmma_fp8")) {
+    const std::string name = get_str(n, "tensor_sum_wgmma_fp8", origin);
+    bool known = false;
+    for (WgmmaFp8Sum m : {WgmmaFp8Sum::Sequential, WgmmaFp8Sum::Hopper})
+      if (name == wgmma_fp8_sum_name(m)) {
+        p.numerics.tensor_sum_wgmma_fp8 = m;
+        known = true;
+      }
+    if (!known) fail(origin, "numerics.tensor_sum_wgmma_fp8 must be sequential or hopper, got: " + name);
+    const Fp8SumRule* rw = wgmma_fp8_sum_rule(p.numerics.tensor_sum_wgmma_fp8);
+    if (!rw) {
+      if (wg_numbers) fail(origin, "numerics.tensor_sum_wgmma_fp8_* have no meaning with tensor_sum_wgmma_fp8: " + name);
+    } else {
+      const int64_t chunk = get_int(n, "tensor_sum_wgmma_fp8_chunk", origin), grid = get_int(n, "tensor_sum_wgmma_fp8_grid", origin),
+                    out_bits = get_int(n, "tensor_sum_wgmma_fp8_out_bits", origin);
+      if (chunk != rw->chunk || grid != rw->grid || out_bits != rw->out_bits)
+        fail(origin, "numerics: tensor_sum_wgmma_fp8 " + name + " is chunks of " + std::to_string(rw->chunk) + ", grid " + std::to_string(rw->grid) +
+                         ", " + std::to_string(rw->out_bits) + " result bits; the profile says " + std::to_string(chunk) + ", " +
+                         std::to_string(grid) + ", " + std::to_string(out_bits) + ", and the engines have no such sum");
+      p.numerics.tensor_sum_wgmma_fp8_chunk = static_cast<uint32_t>(chunk);
+      p.numerics.tensor_sum_wgmma_fp8_grid = static_cast<int32_t>(grid);
+      p.numerics.tensor_sum_wgmma_fp8_out_bits = static_cast<int32_t>(out_bits);
+    }
+  } else if (wg_numbers) {
+    fail(origin, "numerics.tensor_sum_wgmma_fp8_* need numerics.tensor_sum_wgmma_fp8");
   }
 }
 

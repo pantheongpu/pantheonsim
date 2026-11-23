@@ -48,7 +48,14 @@ def other_cell(d):
     if v == (7, 5):
         return "`m8n8k4`: sequential f32 sum, **unknown**"
     if v in ((9, 0), (10, 0)):
-        return "`wgmma`, " + ("`tcgen05.mma`, " if v == (10, 0) else "") + "sparse: sequential f32 sum, **unknown** (for the H100 and H200 a rule fits recorded FP8 `wgmma` vectors: not implemented)"
+        if v == (9, 0):
+            n = d["numerics"]
+            if n.get("tensor_sum_wgmma_fp8") == "hopper":
+                return (f"`wgmma` e4m3, e5m2 (dense): `hopper`, one chunk of {n['tensor_sum_wgmma_fp8_chunk']}, grid {n['tensor_sum_wgmma_fp8_grid']}, result cut to "
+                        f"{n['tensor_sum_wgmma_fp8_out_bits']} bits; **{cls(d, 'numerics.tensor_sum_wgmma_fp8')}** (vectors recorded by others on an H100 and an H200, zero accumulator). "
+                        "`wgmma` f16, bf16, tf32, FP8 sparse: sequential f32 sum, **unknown**")
+            return "`wgmma`, sparse: sequential f32 sum, **unknown**"
+        return "`wgmma`, `tcgen05.mma`, sparse: sequential f32 sum, **unknown**"
     if v[0] in (10, 11) or v == (12, 1):
         return "all of them: sequential f32 sum, **unknown**"
     return "sparse (`mma.sp`): sequential f32 sum, **unknown**"
