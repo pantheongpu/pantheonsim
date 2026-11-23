@@ -203,3 +203,10 @@ fi
 #   hipcc --genco --offload-arch=gfx942 -O1 devmalloc.cpp -o devmalloc.co
 #   clang-offload-bundler --unbundle --type=o --targets=hipv4-amdgcn-amd-amdhsa--gfx942 \
 #       --input=devmalloc.co --output=devmalloc.gfx942.hsaco
+
+# One-instruction kernels for the cross-architecture census (test_amd_cross_arch), every AMD target the simulator runs. gfx1250 needs
+# a clang that knows it (ROCm 7.2's).
+for t in gfx90a gfx942 gfx950 gfx1030 gfx1100 gfx1201 gfx1250; do
+  "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=$t -nogpulib -O2 -c xarch.c -o "xarch.$t.o"
+  echo "wrote $(pwd)/xarch.$t.o"
+done

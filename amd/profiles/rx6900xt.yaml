@@ -19,16 +19,16 @@ verified: false
 limits:
   max_threads_per_block: 1024
   max_block_dim: [1024, 1024, 1024]
-  max_grid_dim: [2147483647, 2147483647, 2147483647]
+  max_grid_dim: [2147483647, 65536, 65536]   # as HIP reports it on the RX 6800 and RX 6700 XT (same ISA): y and z are 65536, not 2^31-1
   shared_mem_per_block_bytes: 65536
   shared_mem_per_block_optin_bytes: 65536
-  registers_per_block: 65536
+  registers_per_block: 131072   # the RX 6800's and RX 6700 XT's (HIP, gfx1030 and gfx1031)
   multiprocessors: 40          # workgroup processors, as HIP counts them; 80 compute units
-  registers_per_sm: 65536
+  registers_per_sm: 131072
   max_threads_per_sm: 2048
   max_blocks_per_sm: 32
-  max_registers_per_thread: 255
-  shared_mem_per_sm: 131072    # 128 KB of LDS per workgroup processor
+  max_registers_per_thread: 256
+  shared_mem_per_sm: 65536     # as HIP and HSA report it on the RX 6800 and RX 6700 XT (64 KB of the workgroup processor's LDS a work-group may use)
   l2_cache_bytes: 4194304      # 4 MB L2 (the 128 MB Infinity Cache behind it HIP does not report)
 features:
   fp16: true
@@ -46,3 +46,15 @@ telemetry:
   memory: gddr                 # GDDR6
   memory_temperature: true     # rocm-smi reports a memory sensor on RDNA2 boards
   pcie_link: "Gen4 x16"
+
+# Provenance. The limits below were not read from an RX 6900 XT: they are the RX 6800's and the RX 6700 XT's (same gfx1030 ISA and, for the
+# first, the same Navi 21 die), which HIP reported identically on both cards (amd/registers/measurements/). Until 2026-11-23 this profile held
+# values that disagreed with both cards (issue #725). Nothing else in this file is tagged.
+provenance:
+  inferred: [limits.max_grid_dim, limits.registers_per_block, limits.registers_per_sm, limits.max_registers_per_thread, limits.shared_mem_per_sm]
+evidence:
+  limits.max_grid_dim: "not read from an RX 6900 XT: the RX 6800's and RX 6700 XT's HIP device properties (amd/registers/measurements/rx6800/characterize-hip.txt, rx6700xt/characterize-hip.txt; ROCm 7.2.0, 2026-10-09), both gfx1030-family cards, which report the same value."
+  limits.registers_per_block: "not read from an RX 6900 XT: the RX 6800's and RX 6700 XT's HIP device properties (amd/registers/measurements/rx6800/characterize-hip.txt; ROCm 7.2.0, 2026-10-09), the same die and ISA."
+  limits.registers_per_sm: "not read from an RX 6900 XT: the RX 6800's and RX 6700 XT's HIP device properties (amd/registers/measurements/rx6800/characterize-hip.txt; ROCm 7.2.0, 2026-10-09), the same die and ISA."
+  limits.max_registers_per_thread: "not read from an RX 6900 XT: the RX 6800's and RX 6700 XT's HIP device properties (amd/registers/measurements/rx6800/characterize-hip.txt; ROCm 7.2.0, 2026-10-09), the same die and ISA."
+  limits.shared_mem_per_sm: "not read from an RX 6900 XT: the RX 6800's and RX 6700 XT's HIP device properties (amd/registers/measurements/rx6800/characterize-hip.txt; ROCm 7.2.0, 2026-10-09), the same die and ISA."

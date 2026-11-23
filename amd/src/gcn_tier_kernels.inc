@@ -205,12 +205,12 @@ TIER_F(k_ffma, r[i] = __builtin_fmaf(a[i], b[i], c[i]))
 // (v_min_f32, v_max_f32: libm's fmin and fmax, as the interpreter calls them; a NaN in one operand gives the other, both give a NaN.)
 TIER_F(k_fmin, r[i] = __builtin_fminf(a[i], b[i]))
 TIER_F(k_fmax, r[i] = __builtin_fmaxf(a[i], b[i]))
-TIER_F(k_frcp, r[i] = 1.0f / a[i])
+TIER_F(k_frcp, r[i] = vgpu::amd::trans::rcp(a[i]))
 // (the one-input functions of the vector unit: the host's own, as the interpreter calls them; a NaN result goes back to the interpreter)
-TIER_F(k_fsqrt, r[i] = __builtin_sqrtf(a[i]))
-TIER_F(k_frsq, r[i] = 1.0f / __builtin_sqrtf(a[i]))
-TIER_F(k_fexp, r[i] = __builtin_exp2f(a[i]))
-TIER_F(k_flog, r[i] = __builtin_log2f(a[i]))
+TIER_F(k_fsqrt, r[i] = vgpu::amd::trans::sqrt(a[i]))
+TIER_F(k_frsq, r[i] = vgpu::amd::trans::rsq(a[i]))
+TIER_F(k_fexp, r[i] = vgpu::amd::trans::exp2(a[i]))
+TIER_F(k_flog, r[i] = vgpu::amd::trans::log2(a[i]))
 // (floor, ceil and trunc of a value of 2^23 or more in magnitude are the value, as the interpreter's floor_inline and the rest have it)
 TIER_F(k_ffloor, r[i] = __builtin_fabsf(a[i]) < 8388608.0f ? __builtin_floorf(a[i]) : a[i])
 TIER_F(k_fceil, r[i] = __builtin_fabsf(a[i]) < 8388608.0f ? __builtin_ceilf(a[i]) : a[i])
@@ -221,17 +221,9 @@ TIER_F(k_ffract, r[i] = a[i] != a[i] ? a[i] : __builtin_isinf(a[i]) ? __builtin_
 // v_sin_f32 and v_cos_f32 count their angle in turns. The host's sin and cos of the angle in radians (the architectures the guides
 // cover keep only the fraction of a turn, which is exact in a double, so the argument stays small).
 TIER_F(k_fsin_r, r[i] = static_cast<float>(__builtin_sin(static_cast<double>(a[i]) * 6.283185307179586476925286766559)))
-TIER_F(k_fsin_t, {
-  const double turns = static_cast<double>(a[i]);
-  const double frac = turns == 0 ? turns : turns - __builtin_trunc(turns);
-  r[i] = static_cast<float>(__builtin_sin(frac * 6.283185307179586476925286766559));
-})
+TIER_F(k_fsin_t, r[i] = vgpu::amd::trans::turns_trig(static_cast<double>(a[i]), true))
 TIER_F(k_fcos_r, r[i] = static_cast<float>(__builtin_cos(static_cast<double>(a[i]) * 6.283185307179586476925286766559)))
-TIER_F(k_fcos_t, {
-  const double turns = static_cast<double>(a[i]);
-  const double frac = turns == 0 ? turns : turns - __builtin_trunc(turns);
-  r[i] = static_cast<float>(__builtin_cos(frac * 6.283185307179586476925286766559));
-})
+TIER_F(k_fcos_t, r[i] = vgpu::amd::trans::turns_trig(static_cast<double>(a[i]), false))
 // v_cvt_f32_f16: the half in the low 16 bits of the register, widened (a NaN stays one, quieted, its payload shifted up).
 TIER_F(k_fcvt_f32_f16, r[i] = vgpu::amd::packed::half_to_float(static_cast<uint16_t>(ua[i])))
 // (the exponent is the second source's bits as an integer)

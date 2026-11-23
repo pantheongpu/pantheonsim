@@ -610,8 +610,21 @@ VTEST(every_builtin_profile_tags_its_numerics) {
     VCHECK_CONTAINS(p.evidence_of("limits.multiprocessors"), "amd/registers/measurements/");
     VCHECK(!p.provenance_of("features.tensor_cores").has_value());
   }
+  // The RX 6900 XT is the RX 6800's ISA and die and no card of ours: its limits are the measured ones, tagged inferred (issue #725).
+  {
+    const DeviceProfile p = vgpu::load_gpu("amd/rx6900xt");
+    const DeviceProfile q = vgpu::load_gpu("amd/rx6800");
+    VCHECK(p.provenance_of("limits.registers_per_sm") == Provenance::Inferred);
+    VCHECK_CONTAINS(p.evidence_of("limits.registers_per_sm"), "amd/registers/measurements/rx6800");
+    VCHECK(!p.provenance_of("limits.multiprocessors").has_value());   // (its own: 40 workgroup processors, not the RX 6800's 30)
+    VCHECK_EQ(p.limits.registers_per_sm, q.limits.registers_per_sm);
+    VCHECK_EQ(p.limits.registers_per_block, q.limits.registers_per_block);
+    VCHECK_EQ(p.limits.shared_mem_per_sm, q.limits.shared_mem_per_sm);
+    VCHECK_EQ(p.limits.max_registers_per_thread, q.limits.max_registers_per_thread);
+    VCHECK(p.limits.max_grid_dim[1] == q.limits.max_grid_dim[1] && p.limits.max_grid_dim[2] == q.limits.max_grid_dim[2]);
+  }
   // No other AMD profile claims anything per key.
-  for (const char* id : {"amd/mi250x", "amd/mi300x", "amd/mi325x", "amd/mi350x", "amd/mi455x", "amd/rx7900xtx", "amd/rx9070xt", "amd/rx6900xt"})
+  for (const char* id : {"amd/mi250x", "amd/mi300x", "amd/mi325x", "amd/mi350x", "amd/mi455x", "amd/rx7900xtx", "amd/rx9070xt"})
     VCHECK(vgpu::load_gpu(id).provenance.empty());
 }
 

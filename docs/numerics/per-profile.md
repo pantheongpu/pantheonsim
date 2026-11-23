@@ -85,3 +85,8 @@ none of it carries a class in the profile. What the simulator does, and what a p
 
 MI100 (gfx908, CDNA1) has no profile. MMA-Sim's CDNA1, CDNA2 and CDNA3 models are three different algorithms, none the simulator's default, and no
 AMD vectors we could check were published, so they stay opt-in or absent until a card or recorded data decides.
+
+Not matrix arithmetic, but also per profile and also mostly unmeasured: the NaN a float instruction returns (payload and sign; measured on gfx1030 only, so
+`unknown` on the other six AMD targets, issue #727), the low bits of `v_rcp`, `v_rsq`, `v_sqrt`, `v_exp`, `v_log`, `v_sin`, `v_cos` (the host's on all
+targets; measured on gfx1030 and gfx1031, issue #729), and the f64 forms of the first three (exact in the simulator, 24 bits on gfx1030 and gfx1031, issue #728).
+[../amd-cross-arch.md](../amd-cross-arch.md) lists what the targets do differently from one another and which side was right.
