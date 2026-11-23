@@ -24,7 +24,7 @@ for ((n = 1; n <= attempts; n++)); do
   $sudo dpkg --configure -a || true
   "$here/apt-mirror-fallback.sh" --next || echo "::warning::no other mirror; retrying the same one"
   if [[ $1 != update ]]; then
-    $sudo timeout 300 apt-get -o Acquire::Retries=3 update -qq || true
+    $sudo env DEBIAN_FRONTEND=noninteractive timeout 300 apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update -qq || true
   fi
 done
 echo "::error::apt-get $* did not succeed in $attempts attempts"
