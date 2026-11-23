@@ -47,6 +47,7 @@ asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.popsection");
 #include <new>
 #include <unordered_map>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <tuple>
 
@@ -98,6 +99,12 @@ inline unsigned popc(uint32_t v) { return simd::popcount32(v); }
 
 // Why a lane is not runnable.
 enum class Wait : uint8_t { None, BSync, WarpSync, Bar, Cluster };
+
+// VGPU_RACE: the accesses this host thread is making now are one atomic's (atomics are ordered against each other). A thread-local, not
+// a member of Warp: a warp runs inside one call on one thread, and Warp's size is pinned (see Warp::reset).
+inline thread_local bool g_race_atomic = false;
+// The memory instruction this host thread is executing, for a race report to name (set by exec_mem while the detector is on).
+inline thread_local const Instr* g_race_ins = nullptr;
 
 struct Warp {
   uint32_t index = 0;                 // within the block
@@ -299,6 +306,16 @@ struct Block {
   std::unordered_map<uint32_t, MbarSide> mbar;
   exec::TensorMemory tmem;      // sm_100's Tensor Memory (tcgen05)
   exec::LaunchStats st;   // this block's counts, folded into the launch's
+  // VGPU_RACE: what each 4-byte word of the block's shared memory has seen since the last barrier (Runner::race_note); empty when
+  // the detector is off. The epoch counts the barriers (and mbarrier phases) the block has completed, so "no barrier between two
+  // accesses" is "the same epoch".
+  struct RaceWord {
+    uint32_t read_epoch = ~0u, write_epoch = ~0u, atomic_epoch = ~0u;
+    uint32_t readers = 0;   // the warps that read it this epoch (a block has at most 32 warps)
+    uint16_t writer = 0xFFFF, atomic_a = 0xFFFF, atomic_b = 0xFFFF;
+  };
+  std::vector<RaceWord> race_words;
+  uint32_t race_epoch = 0;
 };
 
 // A block's state, kept by the host thread between launches: the warps' register files and local memory, the shared memory and the
@@ -754,11 +771,14 @@ class Runner {
     if (cfg_.env) env_ = *cfg_.env;   // (the runtime's one pass over the environment for all of the launch's variables, or one of our own)
     else env_ = exec::read_launch_env();
     if (const char* f = env_.fastpath; f && f[0] == '0') fast_ = false;
+    race_ = env_.race && (env_.race[0] == '1' || env_.race[0] == '2');
+    race_strict_ = race_ && env_.race[0] == '2';
+    race_continue_ = env_.race_continue && env_.race_continue[0] == '1';
     vgpu::exec::tc86::refresh_exact(env_.tc_exact);   // VGPU_TC_EXACT=0: the earlier sequential tensor sums
     vgpu::mufu::refresh(env_.mufu_exact);             // VGPU_MUFU_EXACT=0: MUFU at the host's precision, as before the card's unit was modelled
     if (tier::requested()) {
       const char* tr = env_.sass_trace;
-      tier_ = fast_ && simd::enabled() && !(tr && *tr);
+      tier_ = fast_ && simd::enabled() && !(tr && *tr) && !race_;   // (the tier's shared accesses do not go through the detector)
       const char* ts = env_.tier_stats;
       tier_stats_ = tier_ && ts && (ts[0] == '1' || ts[0] == '2');
       const char* tc = env_.tier_chain;
@@ -882,6 +902,13 @@ class Runner {
 
   [[noreturn]] void fault(const Warp& w, const Instr& ins, unsigned lane, const std::string& why,
                           Err code = Err::OutOfBounds) const;
+  // A load, store or atomic of `bytes` (a power of two) at an address that is not a multiple of it faults on a card
+  // (cudaErrorMisalignedAddress, 716), whatever the space; compute-sanitizer reports it as a misaligned access.
+  void check_aligned(const Warp& w, const Instr& ins, unsigned lane, uint64_t addr, uint32_t bytes, const char* what) const {
+    if (bytes > 1 && (addr & (bytes - 1))) [[unlikely]]
+      misaligned(w, ins, lane, addr, bytes, what);
+  }
+  [[noreturn]] void misaligned(const Warp& w, const Instr& ins, unsigned lane, uint64_t addr, uint32_t bytes, const char* what) const;
 
   // ---- instruction groups (exec_ops.inc) ----
   void exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex);
@@ -939,6 +966,11 @@ class Runner {
   MemoryManager& mem_;
   const DeviceProfile& profile_;
   const uint64_t max_steps_;   // the step budget of a warp (cfg_.max_steps, or VGPU_MAX_STEPS)
+  // VGPU_RACE=1 (2: stores that change nothing count too), VGPU_RACE_CONTINUE=1: shared-memory accesses between warps with no barrier
+  // between them are reported, as the PTX engine's detector does (vgpu/diagnostics.md). Sampled at launch.
+  bool race_ = false, race_strict_ = false, race_continue_ = false;
+  void race_note(Block& blk, Warp& w, unsigned lane, uint64_t off, uint32_t n, bool is_write, const void* data);
+  void race_report(const Warp& w, unsigned lane, const char* what, uint64_t word, uint32_t other_warp, uint32_t n);
   exec::LaunchEnv env_;   // the launch's environment variables, read once at its start
   bool fast_ = true;   // VGPU_FASTPATH, sampled at launch
   bool fastcount_ = exec::memcount::fast();   // VGPU_FASTCOUNT, sampled at launch (the tier asks it for every global access: the function-static answer is two loads through the GOT)
@@ -1375,6 +1407,7 @@ void Runner::mem_read(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, v
       if (uint64_t{off} + n > b.shared.size())
         throw Fault("shared read of " + std::to_string(n) + " bytes at 0x" + [&] { char t[24]; std::snprintf(t, sizeof t, "%llx", (unsigned long long)a); return std::string(t); }() +
                     ", past the block's " + std::to_string(b.shared.size()) + " bytes");
+      if (race_ && &b == &blk) [[unlikely]] race_note(blk, w, lane, off, n, false, nullptr);
       std::memcpy(out, &b.shared[off], n);
       return;
     }
@@ -1410,6 +1443,7 @@ void Runner::mem_write(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, 
       Block& b = shared_block(blk, a, &off);
       if (uint64_t{off} + n > b.shared.size())
         throw Fault("shared write of " + std::to_string(n) + " bytes past the block's " + std::to_string(b.shared.size()) + " bytes");
+      if (race_ && &b == &blk) [[unlikely]] race_note(blk, w, lane, off, n, true, in);
       std::memcpy(&b.shared[off], in, n);
       return;
     }
@@ -1438,6 +1472,91 @@ void Runner::mem_write(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, 
   char at[64];
   std::snprintf(at, sizeof at, ", warp %u lane %u, at 0x%llx (", w.index, lane, static_cast<unsigned long long>(ins.pc));
   throw Error(code, "SASS kernel " + k_.name + at + to_text(ins) + "): " + why);
+}
+
+void Runner::race_report(const Warp& w, unsigned lane, const char* what, uint64_t word, uint32_t other_warp, uint32_t) {
+  std::string at = ", warp " + std::to_string(w.index) + " lane " + std::to_string(lane);
+  if (const Instr* ins = g_race_ins) {
+    char pc[48];
+    std::snprintf(pc, sizeof pc, ", at 0x%llx (", static_cast<unsigned long long>(ins->pc));
+    at += pc + to_text(*ins) + ")";
+  }
+  const std::string msg = "SASS kernel " + k_.name + at + ": " + what + " on shared memory at byte offset " + std::to_string(word * 4) +
+                          ": warp " + std::to_string(w.index) + " and warp " + std::to_string(other_warp) +
+                          " both reach it with no bar.sync between them, so which one wins is not "
+                          "something the program decided. Hardware usually hides this because warps "
+                          "advance together; it is a real race either way";
+  if (!race_continue_) throw Error(Err::DataRace, msg);
+  // VGPU_RACE_CONTINUE: once per place and kind, 50 at most, and the launch goes on.
+  static std::mutex m;
+  static std::set<std::string> seen;
+  std::lock_guard<std::mutex> lock(m);
+  if (seen.size() >= 50) return;
+  if (!seen.insert(k_.name + ":" + std::to_string(w.pc[lane]) + ":" + what).second) return;
+  std::fprintf(stderr, "VirtualGPU error [data-race]: %s\n  GPU profile: %s\n", msg.c_str(), profile_.id.c_str());
+  if (seen.size() == 50) std::fprintf(stderr, "VirtualGPU: 50 races reported, the rest are not printed\n");
+}
+
+// The detector's rule (the PTX engine's, src/exec/interpreter.cpp note_shared_access): two warps may touch a shared word with no
+// barrier between them only if both read it; atomics from different warps are ordered against each other, a plain access beside
+// another warp's atomic is not; a store that leaves the bytes as they were cannot be told apart from no store, so it is recorded
+// (a later store of other bytes is caught against it) and not reported, unless VGPU_RACE=2.
+void Runner::race_note(Block& blk, Warp& w, unsigned lane, uint64_t off, uint32_t n, bool is_write, const void* data) {
+  if (blk.race_words.empty()) return;
+  const bool atomic = g_race_atomic;
+  bool silent = false;
+  if (!atomic && is_write && !race_strict_ && n <= 8) {
+    silent = std::memcmp(&blk.shared[off], data, n) == 0;
+  }
+  const uint32_t me = w.index;
+  const uint32_t epoch = blk.race_epoch;
+  const uint64_t last = (off + (n ? n - 1 : 0)) / 4;
+  for (uint64_t i = off / 4; i <= last && i < blk.race_words.size(); ++i) {
+    Block::RaceWord& s = blk.race_words[i];
+    if (!atomic && !silent && s.atomic_epoch == epoch) {
+      const uint32_t other = s.atomic_a != me ? s.atomic_a : s.atomic_b;
+      if (other != 0xFFFF) race_report(w, lane, is_write ? "write-write race" : "write-read race", i, other, n);
+    }
+    if (is_write) {
+      if (!silent && s.write_epoch == epoch && s.writer != 0xFFFF && s.writer != me)
+        race_report(w, lane, "write-write race", i, s.writer, n);
+      if (!silent && s.read_epoch == epoch) {
+        const uint32_t others = s.readers & ~(uint32_t{1} << me);
+        if (others) race_report(w, lane, "read-write race", i, static_cast<uint32_t>(std::countr_zero(others)), n);
+      }
+      if (!atomic) {
+        s.writer = static_cast<uint16_t>(me);
+        s.write_epoch = epoch;
+      }
+    } else {
+      if (s.write_epoch == epoch && s.writer != 0xFFFF && s.writer != me) race_report(w, lane, "write-read race", i, s.writer, n);
+      if (!atomic) {
+        if (s.read_epoch != epoch) {
+          s.readers = 0;
+          s.read_epoch = epoch;
+        }
+        s.readers |= uint32_t{1} << me;
+      }
+    }
+    if (atomic) {
+      if (s.atomic_epoch != epoch) {
+        s.atomic_epoch = epoch;
+        s.atomic_a = static_cast<uint16_t>(me);
+        s.atomic_b = 0xFFFF;
+      } else if (s.atomic_a != me && s.atomic_b == 0xFFFF) {
+        s.atomic_b = static_cast<uint16_t>(me);
+      }
+    }
+  }
+}
+
+[[noreturn]] void Runner::misaligned(const Warp& w, const Instr& ins, unsigned lane, uint64_t addr, uint32_t bytes,
+                                     const char* what) const {
+  char at[32];
+  std::snprintf(at, sizeof at, "0x%llx", static_cast<unsigned long long>(addr));
+  fault(w, ins, lane, std::string(what) + " of " + std::to_string(bytes) + " bytes at " + at + " is not aligned to " +
+                          std::to_string(bytes) + " bytes (a card faults on this: cudaErrorMisalignedAddress)",
+        Err::MisalignedAccess);
 }
 
 // ---- the grid ------------------------------------------------------------------
@@ -1490,6 +1609,12 @@ void Runner::init_block(Block& blk, uint64_t linear) {
   blk.ctaid[1] = static_cast<uint32_t>((linear / cfg_.grid[0]) % cfg_.grid[1]);
   blk.ctaid[2] = static_cast<uint32_t>(linear / (static_cast<uint64_t>(cfg_.grid[0]) * cfg_.grid[1]));
   blk.shared.assign(shared_size_, 0);
+  if (race_) {
+    blk.race_words.assign(shared_size_ / 4 + 1, Block::RaceWord{});
+    blk.race_epoch = 0;
+  } else if (!blk.race_words.empty()) {
+    std::vector<Block::RaceWord>().swap(blk.race_words);
+  }
   seed_alloc_handshake(blk);
   // The block's counts, back to zero in place: the counters are the words before inst_by_opcode (see LaunchStats::add), and what the
   // vector holds, if anything, goes.

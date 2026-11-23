@@ -149,6 +149,13 @@ jobs:
         # tests at -j2 already.
         run: ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 6 -m 4)" -E '^(pantheon_workloads|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'
 
+      - name: Leak sweep
+        # The end-to-end tests ran with VGPU_LEAK_CHECK=1 (CMakeLists.txt, the end): what each program's processes still held when their
+        # machine went away (device memory, pinned memory, descriptors, threads) is in build/leak-check/<test>.log. A leak that
+        # tests/lint/leak_known.txt does not name fails here, and so does a listed one that is gone.
+        if: success()
+        run: python3 tests/lint/check_leak_sweep.py build/leak-check tests/lint/leak_known.txt
+
       - name: Slowest tests
         # The longest tests of the run above, in the job's summary; a test over 25 minutes warns and one over 30 fails (ci/slowest_tests.sh).
         if: always()

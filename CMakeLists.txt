@@ -291,6 +291,7 @@ add_library(vgpu STATIC
   src/runtime/runtime.cpp
   src/runtime/memo.cpp
   src/runtime/host_stats.cpp
+  src/runtime/leak_check.cpp
   src/runtime/shared_runtime.cpp
   src/runtime/visible_devices.cpp
   nvidia/src/device_attributes.cpp
@@ -1498,6 +1499,8 @@ vgpu_unit_test(test_ptx_block_reuse)
 vgpu_unit_test(test_worker_pool)
 # VGPU_HOST_STATS: the host-kernel counters line for a run that is slower on one kernel than another (#551).
 vgpu_unit_test(test_host_stats)
+# VGPU_LEAK_CHECK: the exit line is clean when everything came back and names each resource that did not (device bytes and allocations, pinned blocks, descriptors, threads).
+vgpu_unit_test(test_leak_check)
 # Device memory is madvised for huge pages, and making a device fixes glibc's heap thresholds (#551).
 vgpu_unit_test(test_host_heap)
 vgpu_unit_test(test_sched)
@@ -3646,6 +3649,34 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  # VGPU_LEAK_CHECK: clean for a program that gives everything back (runtime, driver, cuBLAS), and the resource named for one that
+  # keeps device memory, pinned memory, a descriptor or a thread; strict mode's exit status.
+  add_test(NAME e2e_leak_probe COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_leak_probe.sh)
+  set_tests_properties(e2e_leak_probe PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+
+  # What compute-sanitizer reports for kernels with a known defect (memcheck: invalid and misaligned global and shared accesses;
+  # racecheck: hazards between warps), against what the simulator reports, on the SASS and the PTX engine, sm_86 and sm_75; the
+  # kernels that must run clean included. A misaligned access in the SASS engine used to run.
+  add_test(NAME e2e_sanitizer_kernels COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sanitizer_kernels.sh)
+  set_tests_properties(e2e_sanitizer_kernels PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 900)
+
+  # Growth over 400 repeats of a workload through the runtime, the driver and cuBLAS (device memory, descriptors, threads,
+  # resident memory, mappings), and each deliberate leak named.
+  add_test(NAME e2e_leak_soak COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_leak_soak.sh)
+  set_tests_properties(e2e_leak_soak PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 900)
+
   add_test(NAME e2e_ret_condition_predicate
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ret_condition_predicate.sh)
   set_tests_properties(e2e_ret_condition_predicate PROPERTIES
@@ -4602,6 +4633,10 @@ if(Python3_Interpreter_FOUND)
     ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
     SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 endif()
+# The leak sweep (below, and the CI step "Leak sweep") reads the logs of the e2e tests; this checks that it finds a leak, a second
+# resource beside a listed one, and a listed entry that is stale.
+add_test(NAME lint_leak_sweep_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_leak_sweep_selftest.sh)
+set_tests_properties(lint_leak_sweep_selftest PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
 add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_symbols.sh)
 set_tests_properties(lint_shim_symbols PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
@@ -5413,3 +5448,19 @@ foreach(_pair test_amd_gcn_same_bits:500 e2e_sass_archs:210 test_host_gemm:180 e
     set_property(TEST ${_t} PROPERTY COST ${_cost})
   endif()
 endforeach()
+
+# The leak sweep. Every end-to-end test runs its programs with VGPU_LEAK_CHECK=1 and a log of its own, build/leak-check/<test>.log
+# (include/vgpu/leak_check.hpp: what the process still holds when its machine goes away); `tests/lint/check_leak_sweep.py
+# build/leak-check tests/lint/leak_known.txt` reads the logs after the tests (the CI step "Leak sweep") and fails on a leak the known
+# list does not name. Not in a sanitizer build: a sanitizer's own threads and quarantine are not the program's. Logs append, so a build
+# directory that has run the tests before needs `rm -rf build/leak-check` first.
+if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize")
+  file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/leak-check")
+  get_property(_leak_tests DIRECTORY PROPERTY TESTS)
+  foreach(_t ${_leak_tests})
+    if(_t MATCHES "^e2e_" AND NOT _t MATCHES "^e2e_leak_")
+      set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT
+        "VGPU_LEAK_CHECK=1" "VGPU_LEAK_CHECK_FILE=${CMAKE_BINARY_DIR}/leak-check/${_t}.log")
+    endif()
+  endforeach()
+endif()

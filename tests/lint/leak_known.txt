@@ -1,0 +1,64 @@
+# Tests whose programs keep something when they end, by the resources the leak line names (device_bytes, device_allocs, pinned_allocs,
+# fds, threads), each with the reason. check_leak_sweep.py reads it: a leak that is not here fails the CI step "Leak sweep", and an entry
+# whose test no longer leaks fails it too. A leak in the simulator itself is fixed, not listed.
+#
+# <test> <resource>=<figure>,...  # <reason>
+e2e_alloca_stack device_allocs=1,device_bytes=256  # the program does not free it before it exits
+e2e_async_host_copies device_allocs=1,device_bytes=4  # the program does not free it before it exits
+e2e_async_host_events_driver device_allocs=1,device_bytes=4,pinned_allocs=1  # the program does not free it before it exits
+e2e_async_launch_events device_allocs=1,device_bytes=4  # the program does not free it before it exits
+e2e_atomic_cas device_allocs=4,device_bytes=28  # the program does not free it before it exits
+e2e_atomics_threads device_allocs=14,device_bytes=1574384  # the program does not free it before it exits
+e2e_bar_red_named device_allocs=1,device_bytes=6144  # the program does not free it before it exits
+e2e_block_semaphore device_allocs=2,device_bytes=4128  # the program does not free it before it exits
+e2e_border_colour device_allocs=5,device_bytes=2388  # the program does not free it before it exits
+e2e_bsync_across_calls device_allocs=5,device_bytes=16048  # the program does not free it before it exits
+e2e_bsync_recursive_abi device_allocs=4,device_bytes=688  # the program does not free it before it exits
+e2e_capture_streams device_bytes=2097152  # the program does not free it before it exits
+e2e_cg_multi_warp_tiles device_allocs=4,device_bytes=7282  # the program does not free it before it exits
+e2e_constant_global_load device_allocs=3,device_bytes=6576  # the program does not free it before it exits
+e2e_constant_table_xor device_allocs=5,device_bytes=393968  # the program does not free it before it exits
+e2e_cooperative_grid device_allocs=2,device_bytes=2048  # the program does not free it before it exits
+e2e_deferred_errors device_allocs=3,device_bytes=121  # the program does not free it before it exits
+e2e_device_function_barriers device_allocs=1,device_bytes=6144  # the program does not free it before it exits
+e2e_device_functions device_allocs=3,device_bytes=1048  # the program does not free it before it exits
+e2e_device_graph_launch device_allocs=4,device_bytes=15425  # the program does not free it before it exits
+e2e_device_heap device_allocs=5,device_bytes=160  # the program does not free it before it exits
+e2e_device_intrinsics device_allocs=7,device_bytes=354  # the program does not free it before it exits
+e2e_divergent_indirect_calls device_allocs=6,device_bytes=2320  # the program does not free it before it exits
+e2e_dynamic_parallelism device_allocs=8,device_bytes=368  # the program does not free it before it exits
+e2e_fault_datapath device_allocs=2,device_bytes=32768  # the program does not free it before it exits
+e2e_float_half_forms device_allocs=4,device_bytes=360  # the program does not free it before it exits
+e2e_graph_conditional device_allocs=3,device_bytes=20  # the program does not free it before it exits
+e2e_graph_memory device_bytes=10485760  # the program does not free it before it exits
+e2e_graph_shapes device_allocs=1,device_bytes=256  # the program does not free it before it exits
+e2e_host_atomics device_allocs=1,device_bytes=8  # the program does not free it before it exits
+e2e_inplace_scalar_update device_allocs=3,device_bytes=4104  # the program does not free it before it exits
+e2e_launch_cache device_allocs=1,device_bytes=256  # the program does not free it before it exits
+e2e_launch_refusals device_allocs=2,device_bytes=20480  # the program does not free it before it exits
+e2e_libraries device_allocs=50,device_bytes=32817  # the program does not free it before it exits
+e2e_lockstep_blocks device_allocs=6,device_bytes=8216  # the program does not free it before it exits
+e2e_lop3_pred_chain device_allocs=2,device_bytes=14336  # the program does not free it before it exits
+e2e_memo_api_matrix device_allocs=4,device_bytes=88  # the program does not free it before it exits
+e2e_memtest_patterns device_allocs=3,device_bytes=131088  # the program does not free it before it exits
+e2e_mma_forms device_allocs=1,device_bytes=2048  # the program does not free it before it exits
+e2e_mma_layout device_allocs=3,device_bytes=1280  # the program does not free it before it exits
+e2e_modern_dtypes device_allocs=3,device_bytes=164  # the program does not free it before it exits
+e2e_multiarch_modules device_allocs=1,device_bytes=128  # the program does not free it before it exits
+e2e_ncu device_allocs=2,device_bytes=32768  # the program does not free it before it exits
+e2e_numerics_mathfn device_allocs=6,device_bytes=3160  # the program does not free it before it exits
+e2e_peer_kernel device_allocs=4,device_bytes=4016  # the program does not free it before it exits
+e2e_per_thread_stream device_allocs=1,device_bytes=4,threads=1  # the program does not free it before it exits
+e2e_pool_cap device_allocs=4,device_bytes=139332  # the program does not free it before it exits
+e2e_printf_formats device_allocs=2,device_bytes=471  # the program does not free it before it exits
+e2e_private_loads device_allocs=1,device_bytes=16  # the program does not free it before it exits
+e2e_ptx_forms device_allocs=3,device_bytes=4844  # the program does not free it before it exits
+e2e_ptx_half_forms device_allocs=3,device_bytes=6124  # the program does not free it before it exits
+e2e_ptx_memory_forms device_allocs=4,device_bytes=7652  # the program does not free it before it exits
+e2e_ptx_sweep device_allocs=2,device_bytes=4096  # the program does not free it before it exits
+e2e_ptx_warp_mem device_allocs=4,device_bytes=8032  # the program does not free it before it exits
+e2e_rdc_clones device_allocs=8,device_bytes=3512  # the program does not free it before it exits
+e2e_rdc_link device_allocs=7,device_bytes=1048  # the program does not free it before it exits
+e2e_round9_probe device_allocs=18,device_bytes=239008  # the program does not free it before it exits
+e2e_runtime_conformance device_allocs=2,device_bytes=272  # the program does not free it before it exits
+e2e_sass_fastpath device_allocs=7,device_bytes=8256  # the program does not free it before it exits
