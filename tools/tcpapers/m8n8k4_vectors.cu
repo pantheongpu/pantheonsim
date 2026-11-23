@@ -8,7 +8,7 @@
 // A line of <file>:  a_0..a_3 b_0..b_3 c d    (8 hex digits a token: the bits of the float32 holding the value; for fp16 the accumulator is rounded to
 //                    binary16 on the way in and d is a float32 that holds a binary16 value, as khattak_vectors does). The vector is row 0 of A and column 0
 //                    of B of an 8x8x4 product, every other element zero; D(0,0) is what is compared.
-// Prints  m8n8k4 out=<fp32|fp16> vectors=<n> mismatches=<m>  and the first mismatches; with --dump, one line a vector: the inputs and the result
+// Prints  m8n8k4 out=<fp32|fp16> vectors=<n> mismatches=<m>  and the first mismatches; with --dump, one line a vector on stdout (and the summary on stderr): the inputs and the result
 // computed here (a file of results of a card, which a test replays).
 // Build: nvcc -std=c++17 -arch=sm_75 -cudart shared m8n8k4_vectors.cu -o m8n8k4_vectors      (a Volta or Turing card; CUDA 13 does not build sm_70)
 #include <cstdio>
@@ -92,6 +92,6 @@ int main(int argc, char** argv) {
     if (bad < show) fprintf(stderr, "  vector %d: recorded %08x  here %08x\n", i, f2bits(d[i]), f2bits(r[i]));
     ++bad;
   }
-  printf("m8n8k4 out=%s vectors=%d mismatches=%d\n", out.c_str(), N, bad);
+  fprintf(dump ? stderr : stdout, "m8n8k4 out=%s vectors=%d mismatches=%d\n", out.c_str(), N, bad);
   return 0;
 }

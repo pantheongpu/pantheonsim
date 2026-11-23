@@ -10225,6 +10225,7 @@ class Interpreter {
       if (vgpu::exec::tc86::applies(profile_) && !op.sparse && sum86(op.ab_type) && op.b_type == op.ab_type &&
           K % (op.ab_type == MmaElem::TF32 ? 4 : 8) == 0)
         return false;   // the chunked sum of an RTX 3060
+      if (op.sparse && sum86(op.ab_type) && op.b_type == op.ab_type && vgpu::exec::tc86::sparse_rule(profile_)) return false;   // the sparse forms' own sum (tc_forms.hpp)
       if (profile_.cc_major == 12 && narrow(op.ab_type) && narrow(op.b_type) && !op.acc_f16) return false;   // sm_120's narrow-float sum
       if (narrow(op.ab_type) && narrow(op.b_type) && !op.sparse && profile_.cc_major != 12 &&
           (vgpu::exec::tc86::fp8_rule(profile_) || vgpu::exec::tc86::fp8_via_f16(profile_)))
@@ -10441,6 +10442,7 @@ class Interpreter {
       ctx_fail(ins, -1, Err::UnsupportedPtx, "mma fragment arity does not match the shape");
     // The largest shape is m16n8k256 (.b1): A 16 x 256, B 256 x 8.
     std::vector<double> A(size_t{M} * K, 0.0), B(size_t{K} * kN, 0.0);
+    std::vector<uint8_t> stored_at(op.sparse ? size_t{M} * K : 0, 0);   // the places a sparse A stores a value
     std::array<double, 16 * kN> C{};
     if (op.sparse) {
       // Sparse A (PTX ISA 9.7.16.6). Each K-wide row is cut into chunks --
@@ -10474,6 +10476,7 @@ class Interpreter {
             const uint32_t chunk = tid * cpr + (reg / 2) * 4 * cpr + e / stored;
             const uint32_t col = sparse_column(mma_bits(op.ab_type), K, sel, meta, row, chunk, e % stored);
             A[row * K + col] = mma_elem(op.ab_type, op.ab_signed, v[lane], e);
+            stored_at[row * K + col] = 1;
           }
         }
       }
@@ -10593,6 +10596,16 @@ class Interpreter {
                            op.b_type == op.ab_type && !op.acc_int && !op.acc_f64 && K % (op.ab_type == MmaElem::TF32 ? 4 : 8) == 0) ||
                           fp8_f16;
     std::array<float, 16 * kN> Dtc{};
+    // The sparse forms (f16, bf16, tf32) on a device with its own sum for them: the rule over the stored products (tc_forms.hpp).
+    const vgpu::exec::tc86::SumRule* const sp_rule =
+        op.sparse && !op.block_scale && (op.ab_type == MmaElem::F16 || op.ab_type == MmaElem::BF16 || op.ab_type == MmaElem::TF32) && op.b_type == op.ab_type &&
+                !op.acc_int && !op.acc_f64 && K <= 32
+            ? vgpu::exec::tc86::sparse_rule(profile_)
+            : nullptr;
+    std::array<double, 16 * kN> Dsp{};
+    if (sp_rule)
+      vgpu::exec::tc86::sparse_tile(*sp_rule, op.ab_type == MmaElem::TF32, op.ab_type == MmaElem::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide,
+                                    op.acc_f16, M, kN, K, A.data(), stored_at.data(), B.data(), C.data(), Dsp.data());
     if (tc86_sum) {
       std::array<float, 16 * 32> Af{};
       std::array<float, 32 * kN> Bf{};
@@ -10668,6 +10681,8 @@ class Interpreter {
           D[i * kN + j] = static_cast<double>(vgpu::exec::mma_narrow_sum(terms, K, static_cast<float>(C[i * kN + j])));
         } else if (tc86_sum) {
           D[i * kN + j] = static_cast<double>(Dtc[i * kN + j]);
+        } else if (sp_rule) {
+          D[i * kN + j] = Dsp[i * kN + j];
         } else {
           float acc = static_cast<float>(C[i * kN + j]);
           if (op.block_scale)
@@ -10762,6 +10777,14 @@ class Interpreter {
       // this form, the four products and C in one step (vgpu/exec/tc_forms.hpp).
       if (const vgpu::exec::tc86::SumRule* const vr = vgpu::exec::tc86::m8n8k4_rule(profile_)) {
         vgpu::exec::tc86::form_tile(*vr, false, vgpu::exec::tc86::kEminF16, op.acc_f16, 8, 8, 4, &A[0][0], &B[0][0], &C[0][0], &D[0][0]);
+      } else if (!op.acc_f16 && vgpu::exec::tc86::m8n8k4_chain_c_last(profile_)) {
+        // ptxas's emulation on sm_80 and later: the four products first, in order, and C last, each add rounded to f32.
+        for (uint32_t r = 0; r < 8; ++r)
+          for (uint32_t c = 0; c < 8; ++c) {
+            float acc = A[r][0] * B[0][c];
+            for (uint32_t k = 1; k < 4; ++k) acc += A[r][k] * B[k][c];
+            D[r][c] = acc + C[r][c];
+          }
       } else if (tile) {
         simd::kernels().tile_f32(8, 8, 4, &A[0][0], &B[0][0], &C[0][0], 8, &D[0][0], 8);
       } else {

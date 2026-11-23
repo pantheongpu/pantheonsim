@@ -338,6 +338,54 @@ VTEST(m8n8k4_instruction) {
   VCHECK_EQ(differ_other, differ_off);
 }
 
+VTEST(m8n8k4_emulation_on_sm_80_and_later) {
+  // an A10G's results (nvidia/tests/data/tcpapers/m8n8k4.a10g.fp32.txt: 800 inputs of ours: subnormals, cancellation, large and small terms): ptxas emulates
+  // the form, the four products added in order and C last, each add rounded to f32; the simulator's PTX engine gives them on every profile of 8.x
+  const std::vector<Vec> vs = read_vectors("m8n8k4.a10g.fp32.txt", 4);
+  VCHECK_EQ(vs.size(), size_t{800});
+  for (const char* id : {"nvidia/a10g", "nvidia/rtx3060", "nvidia/a100", "nvidia/l40s"}) {
+    const DeviceProfile p = load_gpu(id);
+    VCHECK(p.numerics.tensor_sum_m8n8k4 == FormSum::ChainCLast);
+    for (const char* fast : {"1", "0"}) {
+      setenv("VGPU_FASTPATH", fast, 1);
+      for (const Vec& v : vs) {
+        const float got = run_m8n8k4(v, false, p);
+        if (bits(got) != bits(v.d) && !(got != got && v.d != v.d)) {
+          unsetenv("VGPU_FASTPATH");
+          throw vtest::Failure(std::string(id) + " vector " + std::to_string(&v - vs.data()) + ", fast path " + fast + ": gave " + std::to_string(got) + ", the A10G " + std::to_string(v.d));
+        }
+      }
+    }
+    unsetenv("VGPU_FASTPATH");
+  }
+  // not the T4's rule: an A10G's results are not a Volta step's, and a T4 profile does not give them
+  int volta_differs = 0;
+  for (const Vec& v : vs) {
+    Vec u = v;
+    if (bits(rule_dot(kVoltaSumRule, false, kEminF16, false, u, 4)) != bits(v.d)) ++volta_differs;
+  }
+  VCHECK(volta_differs >= 50);
+  setenv("VGPU_TC_EXACT", "0", 1);
+  refresh_exact("0");
+  int seq_differs = 0;
+  const DeviceProfile a = load_gpu("nvidia/a10g");
+  for (const Vec& v : vs)
+    if (bits(run_m8n8k4(v, false, a)) != bits(v.d)) ++seq_differs;
+  refresh_exact(nullptr);
+  unsetenv("VGPU_TC_EXACT");
+  VCHECK(seq_differs >= 50);
+  // the T4's 800 results, both accumulators, through the t4 profile
+  for (const bool acc16 : {false, true}) {
+    const std::vector<Vec> ts = read_vectors(acc16 ? "m8n8k4.t4.fp16.txt" : "m8n8k4.t4.fp32.txt", 4);
+    const DeviceProfile t4 = load_gpu("nvidia/t4");
+    for (const Vec& v : ts) {
+      const float got = run_m8n8k4(v, acc16, t4);
+      if (bits(got) != bits(v.d) && !(got != got && v.d != v.d))
+        throw vtest::Failure(std::string(acc16 ? "T4 f16" : "T4 f32") + " vector " + std::to_string(&v - ts.data()) + ": gave " + std::to_string(got) + ", the T4 " + std::to_string(v.d));
+    }
+  }
+}
+
 VTEST(wgmma_instruction) {
   const DeviceProfile h = load_gpu("nvidia/h100");
   VCHECK(h.numerics.tensor_sum_wgmma == FormSum::Hopper);
@@ -387,13 +435,15 @@ VTEST(wgmma_instruction) {
 }
 
 VTEST(profiles_name_their_form_sums) {
-  int wg = 0, tc = 0, m8 = 0;
+  int wg = 0, tc = 0, m8 = 0, sp = 0;
   for (const std::string& id : available_gpus()) {
     const DeviceProfile p = load_gpu(id);
     const bool nv = p.vendor == "nvidia";
     const FormSum want_wg = nv && p.cc_major == 9 && p.cc_minor == 0 ? FormSum::Hopper : FormSum::Sequential;
     const FormSum want_tc = nv && p.cc_major == 10 && p.cc_minor == 0 ? FormSum::Hopper : FormSum::Sequential;
-    const FormSum want_m8 = nv && p.cc_major == 7 && p.cc_minor == 5 ? FormSum::Volta : FormSum::Sequential;
+    const bool cc8 = nv && p.cc_major == 8 && (p.cc_minor == 0 || p.cc_minor == 6 || p.cc_minor == 9);
+    const FormSum want_m8 = nv && p.cc_major == 7 && p.cc_minor == 5 ? FormSum::Volta : cc8 ? FormSum::ChainCLast : FormSum::Sequential;
+    const FormSum want_sp = cc8 ? FormSum::Ampere : FormSum::Sequential;
     if (p.numerics.tensor_sum_wgmma != want_wg) throw vtest::Failure(id + ": numerics.tensor_sum_wgmma is not what its compute capability's evidence gives");
     if (p.numerics.tensor_sum_tcgen05 != want_tc) throw vtest::Failure(id + ": numerics.tensor_sum_tcgen05 is not what its compute capability's evidence gives");
     if (p.numerics.tensor_sum_m8n8k4 != want_m8) throw vtest::Failure(id + ": numerics.tensor_sum_m8n8k4 is not what its compute capability's evidence gives");
@@ -411,13 +461,20 @@ VTEST(profiles_name_their_form_sums) {
     named(p.numerics.tensor_sum_wgmma, "numerics.tensor_sum_wgmma", wg);
     named(p.numerics.tensor_sum_tcgen05, "numerics.tensor_sum_tcgen05", tc);
     named(p.numerics.tensor_sum_m8n8k4, "numerics.tensor_sum_m8n8k4", m8);
+    if (p.numerics.tensor_sum_sparse != want_sp) throw vtest::Failure(id + ": numerics.tensor_sum_sparse is not what its compute capability's evidence gives");
+    named(p.numerics.tensor_sum_sparse, "numerics.tensor_sum_sparse", sp);
+    // measured is for the cards that ran: the T4's m8n8k4 and the A10G's m8n8k4 and sparse forms; every other profile of those compute capabilities is inferred
+    const auto cls = [&](const char* key) { return *p.provenance_of(key); };
+    if (want_m8 != FormSum::Sequential) VCHECK((cls("numerics.tensor_sum_m8n8k4") == Provenance::Measured) == (id == "nvidia/t4" || id == "nvidia/a10g"));
+    if (want_sp != FormSum::Sequential) VCHECK((cls("numerics.tensor_sum_sparse") == Provenance::Measured) == (id == "nvidia/a10g"));
     // no card of ours ran a wgmma or a tcgen05: those are inferred, never measured
     if (want_wg != FormSum::Sequential) VCHECK(*p.provenance_of("numerics.tensor_sum_wgmma") == Provenance::Inferred);
     if (want_tc != FormSum::Sequential) VCHECK(*p.provenance_of("numerics.tensor_sum_tcgen05") == Provenance::Inferred);
   }
   VCHECK_EQ(wg, 6);   // h100 h100-pcie h100-nvl h200 h200-nvl gh200-480gb
   VCHECK_EQ(tc, 2);   // b200 gb200
-  VCHECK_EQ(m8, 2);   // t4 rtx2080ti
+  VCHECK_EQ(m8, 21);   // t4 rtx2080ti, and the 19 profiles of compute capability 8.0, 8.6 and 8.9
+  VCHECK_EQ(sp, 19);
   const DeviceProfile h = load_gpu("nvidia/h100"), l = load_gpu("nvidia/l40s");
   VCHECK(wgmma_rule(h) != nullptr && wgmma_rule(l) == nullptr);
   refresh_exact("0");

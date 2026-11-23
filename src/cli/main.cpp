@@ -199,6 +199,8 @@ int cmd_info(const std::string& gpu, bool json) {
         std::printf(",\n    \"tensor_sum_tcgen05\": \"%s\"", vgpu::form_sum_name(p.numerics.tensor_sum_tcgen05));
       if (p.numerics.tensor_sum_m8n8k4 != vgpu::FormSum::Sequential)
         std::printf(",\n    \"tensor_sum_m8n8k4\": \"%s\"", vgpu::form_sum_name(p.numerics.tensor_sum_m8n8k4));
+      if (p.numerics.tensor_sum_sparse != vgpu::FormSum::Sequential)
+        std::printf(",\n    \"tensor_sum_sparse\": \"%s\"", vgpu::form_sum_name(p.numerics.tensor_sum_sparse));
       std::printf("\n  ");
     }
     std::printf("},\n  \"provenance\": {");
@@ -283,6 +285,8 @@ int cmd_info(const std::string& gpu, bool json) {
         std::printf("    tensor_sum_tcgen05:    %-10s [%s]\n", vgpu::form_sum_name(p.numerics.tensor_sum_tcgen05), tag_of("numerics.tensor_sum_tcgen05"));
       if (p.numerics.tensor_sum_m8n8k4 != vgpu::FormSum::Sequential)
         std::printf("    tensor_sum_m8n8k4:     %-10s [%s]\n", vgpu::form_sum_name(p.numerics.tensor_sum_m8n8k4), tag_of("numerics.tensor_sum_m8n8k4"));
+      if (p.numerics.tensor_sum_sparse != vgpu::FormSum::Sequential)
+        std::printf("    tensor_sum_sparse:     %-10s [%s]\n", vgpu::form_sum_name(p.numerics.tensor_sum_sparse), tag_of("numerics.tensor_sum_sparse"));
     }
     bool other = false;
     for (auto& [k, c] : p.provenance) {

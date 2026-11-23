@@ -54,7 +54,11 @@ numerics:
   tensor_sum_chunk: 8              # products to a chunk, f16 and bf16
   tensor_sum_chunk_tf32: 4         # ... tf32
   tensor_sum_grid: 25              # a chunk's terms are cut at 2^(top - 25)
+  tensor_sum_m8n8k4: chain_c_last   # sequential | volta | chain_c_last: mma.m8n8k4 (f32 accumulator; PTX engine)
+  tensor_sum_sparse: ampere         # sequential | ampere: mma.sp / HMMA.SP with f16, bf16, tf32 operands
 provenance:
-  measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]
+  measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid, numerics.tensor_sum_m8n8k4, numerics.tensor_sum_sparse]
 evidence:
   numerics: "card: NVIDIA A10G (this model), AWS; driver: 595.112.07; toolkit: CUDA 13.0; date: 2026-11-15. Both probes print the RTX 3060 lines (nvidia/tests/data/simd_lane_forms.rtx3060.txt, float_half_forms.rtx3060.txt), 60 of 60 and 169 of 169; FTTN. docs/matrix-numerics.md"
+  numerics.tensor_sum_m8n8k4: "card: A10G (AWS g5.xlarge), driver 595.112.07, nvcc 13.0.88, 2026-11-23. tools/tcpapers/m8n8k4_vectors.cu ran the 5,000 f32-accumulator vectors Khattak and Mikaitis recorded on a V100 (arXiv 2512.07004) through an sm_86 build: the results are D = (((p0 + p1) + p2) + p3) + C in f32, each add rounded to nearest even, 5,000 of 5,000, and 800 more of our own inputs (subnormals, cancellation, large and small terms) 800 of 800. ptxas emulates the form on sm_80 and later, so this is code, not a tensor core. An f16 accumulator is NOT this sum (a different order: 796 of 800 fit c + p0 + p1 + ...) and keeps the sequential sum here. Data: nvidia/tests/data/tcpapers/m8n8k4.a10g.fp32.txt. docs/numerics/m8n8k4-and-sparse.md"
+  numerics.tensor_sum_sparse: "card: A10G (AWS g5.xlarge), driver 595.112.07, nvcc 13.0.88, 2026-11-23. tools/tcpapers/sparse_vectors.cu ran 800 vectors a form of mma.sp m16n8k16 and m16n8k32 (f16, bf16, f16 accumulator) and m16n8k8 and m16n8k16 (tf32), 2:4 and 1:2 positions chosen by uniform metadata, subnormals and cancellation among the inputs: the Ampere rule (grid 25) over the STORED products, chunks of 8 (tf32 4), reproduces every finite result, 800 of 800 in each of the eight modes (nvidia/tests/data/tcpapers/sparse/). docs/numerics/m8n8k4-and-sparse.md"

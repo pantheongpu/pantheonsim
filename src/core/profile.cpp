@@ -1,3 +1,4 @@
+#include <initializer_list>
 #include <algorithm>
 #include <cstdio>
 #include <string>
@@ -106,7 +107,7 @@ void parse_numerics(const Value& doc, DeviceProfile& p, const std::string& origi
         key != "tensor_sum_published" && key != "tensor_sum_fp8" && key != "tensor_sum_fp8_chunk" && key != "tensor_sum_fp8_grid" &&
         key != "tensor_sum_fp8_out_bits" && key != "tensor_sum_wgmma_fp8" && key != "tensor_sum_wgmma_fp8_chunk" &&
         key != "tensor_sum_wgmma_fp8_grid" && key != "tensor_sum_wgmma_fp8_out_bits" && key != "tensor_sum_wgmma" &&
-        key != "tensor_sum_tcgen05" && key != "tensor_sum_m8n8k4")
+        key != "tensor_sum_tcgen05" && key != "tensor_sum_m8n8k4" && key != "tensor_sum_sparse")
       fail(origin, "numerics: unknown key '" + key + "'");
   }
   // The tensor-core sum is read by the NVIDIA engines only. On another vendor's profile it would be a property nothing consults.
@@ -198,17 +199,27 @@ void parse_numerics(const Value& doc, DeviceProfile& p, const std::string& origi
   } else if (wg_numbers) {
     fail(origin, "numerics.tensor_sum_wgmma_fp8_* need numerics.tensor_sum_wgmma_fp8");
   }
-  // The sums of wgmma, tcgen05.mma and m8n8k4 on f16, bf16 and tf32 operands: optional; sequential, or the one rule the form has.
-  const auto form_sum = [&](const char* key, FormSum named, FormSum& out) {
+  // The sums of wgmma, tcgen05.mma, m8n8k4 and the sparse forms on f16, bf16 and tf32 operands: optional; sequential, or one of the rules the form has.
+  const auto form_sum = [&](const char* key, std::initializer_list<FormSum> allowed, FormSum& out) {
     if (!n.map.count(key)) return;
     const std::string name = get_str(n, key, origin);
-    if (name == form_sum_name(FormSum::Sequential)) out = FormSum::Sequential;
-    else if (name == form_sum_name(named)) out = named;
-    else fail(origin, std::string("numerics.") + key + " must be sequential or " + form_sum_name(named) + ", got: " + name);
+    std::string list = "sequential";
+    for (FormSum m : allowed) list += std::string(", ") + form_sum_name(m);
+    if (name == form_sum_name(FormSum::Sequential)) {
+      out = FormSum::Sequential;
+      return;
+    }
+    for (FormSum m : allowed)
+      if (name == form_sum_name(m)) {
+        out = m;
+        return;
+      }
+    fail(origin, std::string("numerics.") + key + " must be one of " + list + ", got: " + name);
   };
-  form_sum("tensor_sum_wgmma", FormSum::Hopper, p.numerics.tensor_sum_wgmma);
-  form_sum("tensor_sum_tcgen05", FormSum::Hopper, p.numerics.tensor_sum_tcgen05);
-  form_sum("tensor_sum_m8n8k4", FormSum::Volta, p.numerics.tensor_sum_m8n8k4);
+  form_sum("tensor_sum_wgmma", {FormSum::Hopper}, p.numerics.tensor_sum_wgmma);
+  form_sum("tensor_sum_tcgen05", {FormSum::Hopper}, p.numerics.tensor_sum_tcgen05);
+  form_sum("tensor_sum_m8n8k4", {FormSum::Volta, FormSum::ChainCLast}, p.numerics.tensor_sum_m8n8k4);
+  form_sum("tensor_sum_sparse", {FormSum::Ampere}, p.numerics.tensor_sum_sparse);
 }
 
 // The `provenance:` and `evidence:` sections (Provenance in profile.hpp), and the rule that every numerics key is tagged.

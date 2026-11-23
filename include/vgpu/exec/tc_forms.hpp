@@ -12,6 +12,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include "vgpu/exec/tc_ampere.hpp"
 #include "vgpu/profile.hpp"
@@ -23,6 +24,9 @@ inline const SumRule* form_rule(vgpu::FormSum m) { return exact_enabled() ? vgpu
 inline const SumRule* wgmma_rule(const vgpu::DeviceProfile& p) { return form_rule(p.numerics.tensor_sum_wgmma); }
 inline const SumRule* tcgen05_rule(const vgpu::DeviceProfile& p) { return form_rule(p.numerics.tensor_sum_tcgen05); }
 inline const SumRule* m8n8k4_rule(const vgpu::DeviceProfile& p) { return form_rule(p.numerics.tensor_sum_m8n8k4); }
+// The sum ptxas's emulation of m8n8k4 makes on sm_80 and later, for an f32 accumulator: D = (((p0 + p1) + p2) + p3) + C.
+inline bool m8n8k4_chain_c_last(const vgpu::DeviceProfile& p) { return exact_enabled() && p.numerics.tensor_sum_m8n8k4 == vgpu::FormSum::ChainCLast; }
+inline const SumRule* sparse_rule(const vgpu::DeviceProfile& p) { return form_rule(p.numerics.tensor_sum_sparse); }
 
 // The widest K one call takes (an instruction's: 16 f16 or bf16 products, 8 tf32 ones, 4 for m8n8k4).
 inline constexpr unsigned kFormMaxK = 16;
@@ -61,6 +65,33 @@ inline float form_dot(const SumRule& r, bool tf32, int emin, bool acc_f16, const
   }
   mma_wide(1, 1, K, std::min(tf32 ? r.chunk_tf32 : r.chunk, kFormMaxK), r.grid, emin, acc_f16, fa, K, fb, 1, &acc, 1, &d, 1);
   return d != d ? std::bit_cast<float>(0x7fffffffu) : d;
+}
+
+// D = C + A x B for a sparse form (mma.sp, HMMA.SP): A is M x K (K the dense length) with the stored values where the metadata puts them and zeros
+// elsewhere, `stored[i * K + k]` saying which places hold a value; B is K x N and C, D are M x N, all row-major (an f16 accumulator's values widened).
+// The sum is the rule's over the stored products only: in row i, a place A does not store is zeroed in B first, so that an infinity or a NaN of B
+// there does not turn a zero product into a NaN. K is taken in blocks of kFormMaxK, each one or more chunks of the rule.
+inline void sparse_tile(const SumRule& r, bool tf32, int emin, bool acc_f16, uint32_t M, uint32_t N, uint32_t K, const double* A, const uint8_t* stored,
+                        const double* B, const double* C, double* D) {
+  thread_local std::vector<float> af, bf, cf;
+  // (the rule's chunk counts products, and a chunk of 8 stored products of a 2:4 row spans 16 dense columns, a chunk of 4 stored tf32 products 8)
+  const SumRule dense{r.name, 2 * r.chunk, 2 * r.chunk_tf32, r.grid};
+  for (uint32_t i = 0; i < M; ++i) {
+    cf.assign(N, 0.0f);
+    for (uint32_t j = 0; j < N; ++j) cf[j] = static_cast<float>(C[size_t{i} * N + j]);
+    for (uint32_t k0 = 0; k0 < K; k0 += kFormMaxK) {
+      const uint32_t kb = std::min(kFormMaxK, K - k0);
+      af.assign(kb, 0.0f);
+      bf.assign(size_t{kb} * N, 0.0f);
+      for (uint32_t k = 0; k < kb; ++k) {
+        af[k] = static_cast<float>(A[size_t{i} * K + k0 + k]);
+        if (stored[size_t{i} * K + k0 + k])
+          for (uint32_t j = 0; j < N; ++j) bf[size_t{k} * N + j] = static_cast<float>(B[size_t{k0 + k} * N + j]);
+      }
+      form_tile(dense, tf32, emin, acc_f16, 1, N, kb, af.data(), bf.data(), N, cf.data(), N, cf.data(), N);
+    }
+    for (uint32_t j = 0; j < N; ++j) D[size_t{i} * N + j] = cf[j];
+  }
 }
 
 }  // namespace vgpu::exec::tc86

@@ -5219,6 +5219,7 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
       if (vgpu::exec::tc86::applies(profile_) && ins.op == Op::HMMA && !is_sparse && sum86(at) && bt == at && K <= 16 &&
           K % (at == MmaT::TF32 ? 4 : 8) == 0)
         ok = false;   // the chunked sum of an RTX 3060
+      if (is_sparse && ins.op == Op::HMMA && sum86(at) && bt == at && vgpu::exec::tc86::sparse_rule(profile_)) ok = false;   // the sparse forms' own sum (tc_forms.hpp)
       if (m_.sm / 10 == 12 && narrow(at) && narrow(bt) && acc == AccF32) ok = false;   // sm_120's narrow-float sum
       if (ins.op == Op::QMMA && narrow(at) && narrow(bt) && m_.sm / 10 != 12 && vgpu::exec::tc86::fp8_rule(profile_)) ok = false;   // Ada's FP8 sum (tc_fp8.hpp)
     }
@@ -5307,6 +5308,7 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
     }
   }
   std::vector<double> A(M * K, 0.0), B(K * kN, 0.0);
+  std::vector<uint8_t> stored_at(M * K, 0);   // the places a sparse A stores a value
   double C[16 * kN] = {};
   // The block-scaled forms (QMMA.SF, OMMA.SF): one factor per row of A and
   // column of B for each K/vec block, picked as the PTX engine picks them
@@ -5351,7 +5353,10 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
         for (unsigned e = 0; e < per_reg; ++e) {
           const unsigned chunk = t * cpr + (r / 2) * 4 * cpr + e / stored;
           const unsigned col = exec::mma_sparse_column(bits, K, ins.f[7], meta, row, chunk, e % stored);
-          if (col < K) A[row * K + col] = mma_elem(at, v, e);
+          if (col < K) {
+            A[row * K + col] = mma_elem(at, v, e);
+            stored_at[row * K + col] = 1;
+          }
         }
       }
   } else {
@@ -5390,6 +5395,15 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
   const bool tc86_sum = tc_rule && ins.op == Op::HMMA && !sparse && (at == MmaT::F16 || at == MmaT::BF16 || at == MmaT::TF32) && bt == at &&
                         (acc == AccF32 || acc == AccF16) && K <= 16 && K % (at == MmaT::TF32 ? 4 : 8) == 0;
   float Dtc[16 * kN] = {};
+  // The sparse forms (f16, bf16, tf32) on a device with its own sum for them: the rule over the stored products (vgpu/exec/tc_forms.hpp).
+  const vgpu::exec::tc86::SumRule* const sp_rule = sparse && ins.op == Op::HMMA && !block_scaled && (at == MmaT::F16 || at == MmaT::BF16 || at == MmaT::TF32) && bt == at &&
+                                                   (acc == AccF32 || acc == AccF16) && K <= 32
+                                                       ? vgpu::exec::tc86::sparse_rule(profile_)
+                                                       : nullptr;
+  double Dsp[16 * kN] = {};
+  if (sp_rule)
+    vgpu::exec::tc86::sparse_tile(*sp_rule, at == MmaT::TF32, at == MmaT::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide, acc == AccF16, M, kN, K, A.data(),
+                                  stored_at.data(), B.data(), C, Dsp);
   if (tc86_sum) {
     float Af[16 * 16], Bf[16 * kN], Cf[16 * kN];
     for (unsigned x = 0; x < M * K; ++x) Af[x] = static_cast<float>(A[x]);
@@ -5445,6 +5459,8 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
         D[i * kN + j] = exec::mma_narrow_sum(terms, K, static_cast<float>(C[i * kN + j]));
       } else if (tc86_sum) {
         D[i * kN + j] = Dtc[i * kN + j];
+      } else if (sp_rule) {
+        D[i * kN + j] = Dsp[i * kN + j];
       } else {
         float a = static_cast<float>(C[i * kN + j]);
         const unsigned sblock = K / scale_vec;
