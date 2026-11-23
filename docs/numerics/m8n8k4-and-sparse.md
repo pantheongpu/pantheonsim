@@ -55,8 +55,8 @@ What the cards showed:
 
 | Instance | Type | Launched (UTC) | Terminated | Cost |
 |---|---|---|---|---|
-| i-0b1b0d0d635615f92 | g4dn.xlarge (T4), us-east-1, on demand | about 21:05 | about 22:35 (verified: see the pull request) | about 0.8 USD |
-| i-01954203c23d44787 | g5.xlarge (A10G), us-east-1, on demand | about 21:05 | about 22:35 (verified) | about 1.6 USD |
+| i-0b1b0d0d635615f92 | g4dn.xlarge (T4), us-east-1, on demand | 20:59 | 21:10 (TerminateInstances; no volume left: `DescribeVolumes` on the project tag is empty) | about 0.1 USD |
+| i-01954203c23d44787 | g5.xlarge (A10G), us-east-1, on demand | 20:59 | 21:10 (same) | about 0.2 USD |
 
 100 GB gp3 root volumes with DeleteOnTermination, no other storage, a 200-minute dead-man shutdown in user data, tags `Project=pantheonsim-matrix`.
 No V100, H100, H200 or B200 was launched.
