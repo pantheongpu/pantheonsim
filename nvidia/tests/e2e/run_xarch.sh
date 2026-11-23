@@ -54,10 +54,10 @@ else
   progs=($short)
 fi
 [[ -n ${VGPU_XARCH_PROGRAMS:-} ]] && progs=(${VGPU_XARCH_PROGRAMS})
-rdc=" dynamic_parallelism cdp_device_api rdc_device_api "
+rdc=" dynamic_parallelism cdp_device_api rdc_device_api cdp1_device_sync device_last_error "
 two_devices=" managed_vars runtime_conformance p2p_managed "
 # Not meaningful as one program on every profile: they name an architecture or a profile themselves, or link what nvcc here cannot.
-skip=" arch_specific_cubin arch_specific_cubins card_edges_module_arch managed_module jitlink_lib sass_link_lib sass_tier sass_path sass_fastpath "
+skip=" arch_specific_cubin arch_specific_cubins card_edges_module_arch managed_module jitlink_lib sass_link_lib sass_tier sass_path sass_fastpath device_heap exports_sweep_module func_attributes_module "
 
 # What may differ, from xarch_expect.sh: xarch_groups[<program>] = the profiles that must agree with each other, groups separated by "|"
 # (a program not there: all of them; <program>@ptx or <program>@native for one mode); xarch_nodigest = programs whose memory digest

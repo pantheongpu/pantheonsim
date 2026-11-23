@@ -8,7 +8,8 @@
 tc="t4 a100 a10g l4 | h100 h200 b200 rtx5090"
 xarch_groups[float_half_forms]="$tc"      # mma.sync / wmma results (nvidia/tests/data/float_half_forms.h100.txt, .rtx3060.txt)
 xarch_groups[simd_lane_forms]="$tc"       # nvidia/tests/data/simd_lane_forms.{t4,rtx3060,h100}.txt
-xarch_groups[round9_probe]="$tc"
+xarch_groups[round9_probe@ptx]="$tc"
+xarch_groups[round9_probe@native]="a100 a10g l4 | h100 h200 | b200 rtx5090"   # the probe builds other f64 and NaN forms for sm_100 and sm_120 (__CUDA_ARCH__); the PTX engine agrees across them
 
 # --- real hardware: what the architecture has.
 xarch_groups[mma_accumulate_probe]="t4 a100 a10g l4 h100 h200 b200"   # block-scaled mma.sync exists on compute capability 12 only (it SKIPs on b200)
@@ -27,11 +28,12 @@ xarch_groups[memo_api_matrix@native]="a100 a10g l4 h100 h200 b200 rtx5090"      
 
 # --- programs that ask the device what it is: SM count, memory, resident blocks. Profiles of one generation with the same SM count agree.
 all_apart="t4 | a100 | a10g | l4 | h100 | h200 | b200 | rtx5090"
-for p in async_launch_events cdp_device_api device_graph_launch leak_soak lockstep_blocks occupancy_rules; do xarch_groups[$p]="$all_apart"; done
+for p in limits_probe async_launch_events cdp_device_api device_graph_launch leak_soak lockstep_blocks occupancy_rules; do xarch_groups[$p]="$all_apart"; done
 xarch_groups[cluster_occupancy]="a10g l4 | h100 h200"      # the cluster counts follow the GPC layout of each profile (nvidia/docs/clusters.md); #750
 xarch_groups[smid]="h100 h200"
 xarch_groups[libraries]="h100 h200"                         # the names of the CUB kernels carry the architecture
-xarch_groups[sass_archs]="t4 a100 a10g l4 | h100 h200 | b200 rtx5090"   # the program tests what each generation has (clusters, CLC from sm_100)
+xarch_groups[sass_archs@ptx]="t4 a100 a10g l4 | h100 h200 | b200 rtx5090"      # the program tests what each generation has (clusters, CLC from sm_100)
+xarch_groups[sass_archs@native]="a100 a10g l4 | h100 h200 | b200 rtx5090"      # (mbarrier from sm_80: the T4 build runs other kernels)
 
 # --- programs that read the device's compute capability at run time and gate their code on __CUDA_ARCH__ at build time: the PTX mode runs a build for
 # a lower architecture on a higher device, which tries forms the build lacks. In native mode each profile runs its own build, so they differ only by form.

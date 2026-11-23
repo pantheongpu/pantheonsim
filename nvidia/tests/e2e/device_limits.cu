@@ -49,8 +49,9 @@ int main() {
   CHECK(limit(cudaLimitMallocHeapSize) == 8 * kMiB);
   CHECK(limit(cudaLimitDevRuntimePendingLaunchCount) == 2048);
   CHECK(limit(cudaLimitDevRuntimeSyncDepth) == 2);   // an A10 is below 9.0
-  CHECK(most > 0 && unit > 0);                       // an A10 has an access policy window
-  CHECK(limit(cudaLimitPersistingL2CacheSize) == 3 * unit);
+  const bool persisting = most > 0;                  // from compute capability 8.0 (the T4 profile has none)
+  if (persisting) CHECK(unit > 0 && limit(cudaLimitPersistingL2CacheSize) == 3 * unit);
+  else WANT(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 4 * kMiB), cudaErrorUnsupportedLimit);
 
   // ---- what the driver may round or refuse -----------------------------------
   CK(cudaDeviceSetLimit(cudaLimitStackSize, 1000));
@@ -64,19 +65,21 @@ int main() {
   CHECK(limit(cudaLimitDevRuntimeSyncDepth) == 2);
   CK(cudaDeviceSetLimit(cudaLimitDevRuntimeSyncDepth, 24));
   CHECK(limit(cudaLimitDevRuntimeSyncDepth) == 24);
-  // The persisting-L2 limit: a request is rounded up to a whole sixteenth of the L2, one past the maximum is refused, 0 turns it off.
-  CK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 4 * kMiB));
-  CHECK(limit(cudaLimitPersistingL2CacheSize) == (4 * kMiB + unit - 1) / unit * unit);
-  CK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 1000));
-  CHECK(limit(cudaLimitPersistingL2CacheSize) == unit);
-  WANT(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, most + 1), cudaErrorInvalidValue);
-  CHECK(limit(cudaLimitPersistingL2CacheSize) == unit);
-  CK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, most));
-  CHECK(limit(cudaLimitPersistingL2CacheSize) == most);
-  CK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0));
-  CHECK(limit(cudaLimitPersistingL2CacheSize) == 0);
-  CK(cudaCtxResetPersistingL2Cache());
-  CHECK(limit(cudaLimitPersistingL2CacheSize) == 3 * unit);   // back to the default
+  if (persisting) {
+    // The persisting-L2 limit: a request is rounded up to a whole sixteenth of the L2, one past the maximum is refused, 0 turns it off.
+    CK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 4 * kMiB));
+    CHECK(limit(cudaLimitPersistingL2CacheSize) == (4 * kMiB + unit - 1) / unit * unit);
+    CK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 1000));
+    CHECK(limit(cudaLimitPersistingL2CacheSize) == unit);
+    WANT(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, most + 1), cudaErrorInvalidValue);
+    CHECK(limit(cudaLimitPersistingL2CacheSize) == unit);
+    CK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, most));
+    CHECK(limit(cudaLimitPersistingL2CacheSize) == most);
+    CK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0));
+    CHECK(limit(cudaLimitPersistingL2CacheSize) == 0);
+    CK(cudaCtxResetPersistingL2Cache());
+    CHECK(limit(cudaLimitPersistingL2CacheSize) == 3 * unit);   // back to the default
+  }
   // 7 is not a limit, and still a value the enum can hold; casting a number
   // outside its range would itself be undefined behaviour.
   WANT(cudaDeviceSetLimit(static_cast<cudaLimit>(7), 1), cudaErrorUnsupportedLimit);
