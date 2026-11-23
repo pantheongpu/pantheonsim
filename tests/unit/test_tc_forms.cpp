@@ -3,7 +3,7 @@
 //     (nvidia/tests/data/tcpapers/V100.*.txt, BSD-2, NOTICE): the Volta rule (chunks of 4, cut at 2^(top - 24)) gives every one, and the rules next to
 //     it (Ampere's grid 25, grid 23, chunks of 2) do not.
 //   * m8n8k4_instruction: the same vectors through a real mma.sync.aligned.m8n8k4 in the PTX engine on the t4 profile; VGPU_TC_EXACT=0 and a profile
-//     with no rule for the form (rtx3060) give the sequential sum, which differs.
+//     with no rule for the form (h100) give the sequential sum, which differs.
 //   * wgmma_instruction: 24 recorded H100 vectors of each f16, bf16, tf32 (f32 accumulator) and f16 (f16 accumulator), with the accumulator in the
 //     registers, through a real wgmma.mma_async in the PTX engine on the h100 profile (the SIMD route and the general form). These are mma.sync
 //     records: that wgmma sums as the same device's mma.sync is MMA-Sim's claim (Xie et al., arXiv 2511.10909), which is what the profile says
@@ -330,7 +330,7 @@ VTEST(m8n8k4_instruction) {
     if (bits(run_m8n8k4(v, false, t4)) != bits(v.d)) ++differ_off;
   refresh_exact(nullptr);
   unsetenv("VGPU_TC_EXACT");
-  const DeviceProfile r = load_gpu("nvidia/rtx3060");
+  const DeviceProfile r = load_gpu("nvidia/h100");   // (no card of ours has run the form on a Hopper device: the sequential sum)
   VCHECK(r.numerics.tensor_sum_m8n8k4 == FormSum::Sequential);
   for (const Vec& v : vs)
     if (bits(run_m8n8k4(v, false, r)) != bits(v.d)) ++differ_other;

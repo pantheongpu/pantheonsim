@@ -70,3 +70,30 @@ the PTX interpreter (`atom` and `red` with `.shared` no longer flush; `src/exec/
 compare-and-swap loop for shared memory, and `ATOMG`'s `.FTZ` for global, so it matched. Not covered: a generic-address float atomic that points into
 shared memory (the card's `ATOM.E.ADD.F32.FTZ` on a shared window was not probed; the interpreter keeps flushing there), and `atomicAdd` on f16 and
 bf16 pairs. The test is `e2e_atomic_subnormal` (the card's 56 lines, both engines, both `-ftz` settings).
+
+## Feature checklists: Hopper (Luo et al.) and Blackwell (Jarmusch et al.), added 2026-11-23
+
+Items 4 and 5 of #708. A program-visible feature is one whose result, error or limit a program can read. No timing is listed (the simulator has none). "Test" names what holds
+the simulator to something; **card** says whether any of ours has run the feature (none of Hopper or datacenter Blackwell has, except the numbers marked measured below).
+
+### Hopper (arXiv 2501.12084; Luo et al. also give memory and speed results, not listed)
+
+| Feature | What a program can see | Test in the repository | Held to a card? | Open |
+|---|---|---|---|---|
+| Distributed shared memory (clusters, `mapa`, `ld.shared::cluster`, cluster barriers) | values through a peer block's shared memory, cluster size and occupancy limits, the errors for a bad rank | `test_dsmem`, `e2e_dsmem_cluster`, `e2e_sass_archs` (`cooperative_cluster`), `e2e_cluster_occupancy` (occupancy: an RTX 3060's `cluster_occupancy.rtx3060.expected` for the rule, not Hopper's limits) | no | the maximum portable and non-portable cluster size, `cudaOccupancyMaxActiveClusters` on an H100: a probe is `cluster_occupancy.cu`; needs an H100 |
+| Tensor Memory Accelerator (`cp.async.bulk.tensor`, tensor maps, im2col, reduce, multicast) | tile contents for every layout, swizzle and out-of-bounds fill, the error for a bad map | `test_hopper`, `e2e_tma_gemm_cute`, `e2e_tma_im2col`, `e2e_tma_reduce_cute`, CUTLASS Hopper | no | whether a card faults on the same bad maps; the fill values for out-of-bounds NaN |
+| DPX instructions (`__vimax3_s32_relu`, `__viaddmax_s16x2`, `__vibmin_u32`, ...) | integer results | `e2e_dpx_intrinsics`: NVIDIA's own host implementations (`crt/device_functions.hpp`) as the oracle, SASS (`VIMNMX`, `VIADDMNMX`, `VIMNMX3`) and PTX, sm_80 to sm_120 | the host implementation is NVIDIA's; no H100 output file | an H100 run of the same program would make the oracle a card |
+| `wgmma` numerics | f16, bf16, tf32 (this change) and FP8 (#711) results | `test_wgmma_fp8`, `test_tc_forms`, `e2e_wgmma_vectors`, `e2e_wgmma_fp8_vectors` | no: **inferred** from MMA-Sim and from vectors recorded by others with `mma.sync` | [`khattak_wgmma_vectors.cu`](../../tools/tcpapers/khattak_wgmma_vectors.cu) on an H100, zero and non-zero C, f32 and f16 accumulators |
+| `setmaxnreg`, `elect.sync`, `fence.proxy.async`, `mbarrier` transaction counts | register-count errors, ordering | `e2e_sass_archs` (`setmaxnreg`), `test_hopper` | no | |
+
+### Blackwell (arXiv 2507.10789 on an RTX 5080, 2512.02189 on a B200)
+
+| Feature | What a program can see | Test in the repository | Held to a card? | Open |
+|---|---|---|---|---|
+| `tcgen05.mma` (f16, tf32, f8f6f4, mxf8f6f4, mxf4, nvf4, i8; `.ws`; `.cta_group::2`) | results, the descriptors the ISA allows, the errors for the rest | `test_blackwell`, `test_tcgen05_fast`, `test_tcgen05_tiles`, `e2e_sass_archs` (`tcgen05_gemm`), CUTLASS sm_100 | no. Numerics: `.kind::f16` and `.kind::tf32` dense are the Hopper rule, **inferred** (this change); the other kinds keep the sequential sum | recorded `tcgen05` vectors, or a B200 run (B200TCRN.m of Khattak and Mikaitis is a round-to-nearest variant that could be this instruction) |
+| Tensor Memory (`tcgen05.alloc`, `.ld`, `.st`, `.cp`, `.shift`) | the 512 columns, allocation failures, the lane windows of a warp | `test_blackwell`, `e2e_sass_archs` (`tmem_alloc_pair`) | no | |
+| FP4, FP6, block-scaled MMA (`.kind::mxf4`, `mxf8f6f4`, sm_120 `mma.sync` with e2m1, e3m2, e2m3) | results | `test_sass_mma_tiles`, `e2e_tcpapers` (sm_120: 18 of 27 forms bit for bit on an RTX PRO 6000 Blackwell Server Edition) | sm_120 yes, partly (**measured**); sm_100 no | the nine sm_120 forms that differ; MMA-Sim's `ST_FDPA` and `GST_FDPA` for sm_100 are not implemented (no recorded vectors) |
+| Sparse GEMM (`tcgen05.mma.sp`, `mma.sp` on sm_120) | results, metadata layouts | `test_tcgen05_tiles` (layouts), `test_mma_tiles` | layouts of `mma.sp` on sm_86 only; numerics of the sparse forms on an A10G (**measured**, this change) | Hopper and Blackwell `mma.sp` and `tcgen05.mma.sp` numerics |
+| Decompression engine (`tcgen05.cp` with `.b4x16_p64`, `.b6x16_p32`) | the expanded bits | `test_blackwell` | no | |
+
+Not listed because it is timing or energy: every latency, throughput, power and clock result of both papers.

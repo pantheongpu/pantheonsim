@@ -4893,6 +4893,12 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
+  # The f16, bf16 and tf32 sum of wgmma on an H100 profile: recorded H100 mma.sync vectors through a real wgmma with a non-zero accumulator, SASS and PTX engines (tc_forms.hpp).
+  add_test(NAME e2e_wgmma_vectors COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_wgmma_vectors.sh)
+  set_tests_properties(e2e_wgmma_vectors PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
 endif()
 
 # TMA: a CUTLASS-style Hopper GEMM (clusters, a TMA pipeline, wgmma) checked
