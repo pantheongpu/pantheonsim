@@ -4421,6 +4421,21 @@ if(TARGET vgpucudart)
     TIMEOUT 3600)
 endif()
 
+# One program on every NVIDIA profile (nvidia/tests/e2e/run_xarch.sh): built once as PTX and run on t4, a100, a10g, l4, h100, h200, b200 and rtx5090
+# (ptx), or built for each generation and run on the SASS engine (native). Profiles must agree except where nvidia/tests/e2e/xarch_expect.sh says
+# why not. A short list on pull requests; VGPU_NIGHTLY=1 (differential.yml) runs every standalone program of nvidia/tests/e2e.
+if(TARGET vgpucudart)
+  foreach(_m ptx native)
+    add_test(NAME e2e_xarch_${_m} COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_xarch.sh)
+    set_tests_properties(e2e_xarch_${_m} PROPERTIES
+      DEPENDS vgpucudart
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_XARCH_MODE=${_m}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      RESOURCE_LOCK nvcc_memory
+      TIMEOUT 3600)
+  endforeach()
+endif()
+
 # Differential execution and determinism in exact mode (nvidia/tests/e2e/run_differential.sh). diff: the SASS engine against the PTX interpreter, one
 # host thread each: output, memory after every launch, the launches and the counters both engines define alike. determinism: one program, several
 # runs (CPU affinity, niceness, environment size, VGPU_EXACT_THREADS, replayable warp schedulers) that must leave the same output, counters and memory.
@@ -4856,6 +4871,13 @@ if(TARGET vgpucudart)
   set_tests_properties(e2e_device_limits PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+  # The limits as a Tesla T4 and an A10G answered them (printf FIFO default, refused values, persisting L2, access policy window).
+  add_test(NAME e2e_limits_card COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_limits_card.sh)
+  set_tests_properties(e2e_limits_card PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
   # The device heap is one per device, for both engines, and a reset empties it.
   add_test(NAME e2e_device_heap COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_heap.sh)

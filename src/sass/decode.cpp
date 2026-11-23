@@ -3228,7 +3228,15 @@ void dec_iadd(Instr& ins, const Word& w) {
   if (wide)
     for (Operand& o : ins.src)
       if (o.kind == Kind::Reg) o.width = 2;
-  if (x) ins.src.push_back(pred_src(w, 87, 90));
+  if (x) {
+    // With a carry in, "negation" is the one's complement (IADD.X R3, ~R5, R9, P0): the + 1 is the carry.
+    for (Operand& o : ins.src)
+      if (o.neg) {
+        o.neg = false;
+        o.bnot = true;
+      }
+    ins.src.push_back(pred_src(w, 87, 90));
+  }
 }
 
 // FMNMX3 d, a, b, c, p (sm_100): the min (p) or max of three.

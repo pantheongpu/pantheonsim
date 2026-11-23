@@ -1,0 +1,34 @@
+Tesla T4 l2 4194304 persistMax 0 accessWindowMax 0
+get default                                  cudaErrorUnsupportedLimit 999
+set 4194304                                  cudaErrorUnsupportedLimit 0
+  get                                        cudaErrorUnsupportedLimit 999
+set 1048576                                  cudaErrorUnsupportedLimit 0
+  get                                        cudaErrorUnsupportedLimit 999
+set 1000                                     cudaErrorUnsupportedLimit 0
+  get                                        cudaErrorUnsupportedLimit 999
+set 0                                        cudaErrorUnsupportedLimit 0
+  get                                        cudaErrorUnsupportedLimit 999
+set 1                                        cudaErrorUnsupportedLimit 0
+  get                                        cudaErrorUnsupportedLimit 999
+set 0                                        cudaErrorUnsupportedLimit 0
+  get                                        cudaErrorUnsupportedLimit 999
+set 4194304                                  cudaErrorUnsupportedLimit 0
+  get                                        cudaErrorUnsupportedLimit 999
+set 0                                        cudaErrorUnsupportedLimit 0
+  get                                        cudaErrorUnsupportedLimit 999
+reset                                        cudaSuccess 0
+get after reset                              cudaErrorUnsupportedLimit 999
+set fetch gran 64 -> get                     cudaSuccess 64
+window 1MiB                                  cudaErrorInvalidValue 0
+window max+1                                 cudaErrorInvalidValue 0
+Tesla T4 sm_75
+stack      cudaSuccess 1024
+printf     cudaSuccess 1310720
+heap       cudaSuccess 8388608
+syncdepth  cudaSuccess 2
+pending    cudaSuccess 2048
+fetch      cudaSuccess 64
+stack after 1000: 1008
+syncdepth set 100: cudaErrorInvalidValue -> 2
+printf set 4MiB: cudaSuccess -> 4194304
+fetch set 4096: cudaErrorInvalidValue -> 64

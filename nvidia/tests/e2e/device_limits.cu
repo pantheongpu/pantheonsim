@@ -38,23 +38,45 @@ static size_t limit(cudaLimit which) {
 }
 
 int main() {
-  // ---- the defaults ---------------------------------------------------------
+  // The defaults follow the device (nvidia/src/device_limits.hpp): a Tesla T4 and an A10G, both on driver 595.91, give a printf FIFO of
+  // 32 bytes for every thread the device can hold (1310720 and 3932160), not the 1 MiB the documentation names, and an A10G's
+  // persisting-L2 limit starts at 3/16 of its L2 and moves in sixteenths of it.
+  cudaDeviceProp prop;
+  CK(cudaGetDeviceProperties(&prop, 0));
+  const size_t unit = static_cast<size_t>(prop.l2CacheSize) / 16, most = static_cast<size_t>(prop.persistingL2CacheMaxSize);
   CHECK(limit(cudaLimitStackSize) == 1024);
-  CHECK(limit(cudaLimitPrintfFifoSize) == kMiB);
+  CHECK(limit(cudaLimitPrintfFifoSize) == size_t(prop.multiProcessorCount) * prop.maxThreadsPerMultiProcessor * 32);
   CHECK(limit(cudaLimitMallocHeapSize) == 8 * kMiB);
   CHECK(limit(cudaLimitDevRuntimePendingLaunchCount) == 2048);
   CHECK(limit(cudaLimitDevRuntimeSyncDepth) == 2);   // an A10 is below 9.0
-  CHECK(limit(cudaLimitPersistingL2CacheSize) == 0);
+  CHECK(most > 0 && unit > 0);                       // an A10 has an access policy window
+  CHECK(limit(cudaLimitPersistingL2CacheSize) == 3 * unit);
 
-  // ---- what the driver may round or clamp ----------------------------------
+  // ---- what the driver may round or refuse -----------------------------------
   CK(cudaDeviceSetLimit(cudaLimitStackSize, 1000));
   CHECK(limit(cudaLimitStackSize) == 1008);           // rounded up to 16 bytes
-  CK(cudaDeviceSetLimit(cudaLimitMaxL2FetchGranularity, 4096));
-  CHECK(limit(cudaLimitMaxL2FetchGranularity) == 128);
-  CK(cudaDeviceSetLimit(cudaLimitDevRuntimeSyncDepth, 100));
+  // More than the largest is refused and changes nothing (an A10G and a T4); the driver API says the same.
+  WANT(cudaDeviceSetLimit(cudaLimitMaxL2FetchGranularity, 4096), cudaErrorInvalidValue);
+  CHECK(limit(cudaLimitMaxL2FetchGranularity) == 64);
+  CK(cudaDeviceSetLimit(cudaLimitMaxL2FetchGranularity, 100));
+  CHECK(limit(cudaLimitMaxL2FetchGranularity) == 100);
+  WANT(cudaDeviceSetLimit(cudaLimitDevRuntimeSyncDepth, 100), cudaErrorInvalidValue);
+  CHECK(limit(cudaLimitDevRuntimeSyncDepth) == 2);
+  CK(cudaDeviceSetLimit(cudaLimitDevRuntimeSyncDepth, 24));
   CHECK(limit(cudaLimitDevRuntimeSyncDepth) == 24);
+  // The persisting-L2 limit: a request is rounded up to a whole sixteenth of the L2, one past the maximum is refused, 0 turns it off.
   CK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 4 * kMiB));
-  CHECK(limit(cudaLimitPersistingL2CacheSize) == 0);   // the device sets none aside
+  CHECK(limit(cudaLimitPersistingL2CacheSize) == (4 * kMiB + unit - 1) / unit * unit);
+  CK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 1000));
+  CHECK(limit(cudaLimitPersistingL2CacheSize) == unit);
+  WANT(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, most + 1), cudaErrorInvalidValue);
+  CHECK(limit(cudaLimitPersistingL2CacheSize) == unit);
+  CK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, most));
+  CHECK(limit(cudaLimitPersistingL2CacheSize) == most);
+  CK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0));
+  CHECK(limit(cudaLimitPersistingL2CacheSize) == 0);
+  CK(cudaCtxResetPersistingL2Cache());
+  CHECK(limit(cudaLimitPersistingL2CacheSize) == 3 * unit);   // back to the default
   // 7 is not a limit, and still a value the enum can hold; casting a number
   // outside its range would itself be undefined behaviour.
   WANT(cudaDeviceSetLimit(static_cast<cudaLimit>(7), 1), cudaErrorUnsupportedLimit);

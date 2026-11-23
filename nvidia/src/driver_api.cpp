@@ -43,6 +43,7 @@
 #include "platform.hpp"
 #include "driver_graph.hpp"
 #include "func_attrs.hpp"
+#include "device_limits.hpp"
 #include "vgpu_cuda_graph.h"
 #include "error_names.hpp"
 #include "vgpu/exec/cluster.hpp"
@@ -267,12 +268,12 @@ struct ShimState {
   // reads them.
   struct Limits {
     size_t stack = 1024;
-    size_t printf_fifo = 1u << 20;
+    size_t printf_fifo = vgpu::nv_limits::kUnset;   // the device's default until a program sets it (vgpu::nv_limits)
     size_t malloc_heap = 8u << 20;
     size_t sync_depth = 2;
     size_t pending_launches = 2048;
     size_t l2_fetch_granularity = 64;
-    size_t persisting_l2 = 0;
+    size_t persisting_l2 = vgpu::nv_limits::kUnset;
   };
   std::map<int, Limits> limits;
   ~ShimState();
@@ -2754,7 +2755,7 @@ CUresult limit_value(const ShimState::Limits& l, const vgpu::DeviceProfile& prof
   const int cc_major = profile.cc_major;
   switch (limit) {
     case 0: *v = l.stack; return CUDA_SUCCESS;
-    case 1: *v = l.printf_fifo; return CUDA_SUCCESS;
+    case 1: *v = l.printf_fifo != vgpu::nv_limits::kUnset ? l.printf_fifo : vgpu::nv_limits::default_printf_fifo(profile); return CUDA_SUCCESS;
     case 2: *v = l.malloc_heap; return CUDA_SUCCESS;
     case 3:
       if (cc_major >= 9) return kUnsupportedLimit;
@@ -2762,7 +2763,10 @@ CUresult limit_value(const ShimState::Limits& l, const vgpu::DeviceProfile& prof
       return CUDA_SUCCESS;
     case 4: *v = l.pending_launches; return CUDA_SUCCESS;
     case 5: *v = l.l2_fetch_granularity; return CUDA_SUCCESS;
-    case 6: *v = l.persisting_l2; return CUDA_SUCCESS;
+    case 6:
+      if (!vgpu::nv_limits::persisting_supported(profile)) return kUnsupportedLimit;
+      *v = l.persisting_l2 != vgpu::nv_limits::kUnset ? l.persisting_l2 : vgpu::nv_limits::default_persisting(profile);
+      return CUDA_SUCCESS;
     // The shared memory a multiprocessor offers less what the system keeps back (an RTX 3060: 100 KiB
     // less 1 KiB, 101376), and whether CUDA in Graphics is enabled (never).
     case 7: *v = profile.limits.shared_mem_per_sm - profile.reserved_smem_per_block(); return CUDA_SUCCESS;
@@ -6311,7 +6315,15 @@ static CUresult cuCtxSetLimit_impl(int limit, size_t value) {
         if (value > 128) return CUDA_ERROR_INVALID_VALUE;
         l.l2_fetch_granularity = value;
         return CUDA_SUCCESS;
-      case 6: l.persisting_l2 = 0; return CUDA_SUCCESS;   // nothing to set aside
+      case 6: {
+        // What the device can set aside at most (the runtime's cudaLimitPersistingL2CacheSize says the same: an A10G and a T4).
+        const vgpu::DeviceProfile& p = s.rt->device(device).profile();
+        if (!vgpu::nv_limits::persisting_supported(p)) return kUnsupportedLimit;
+        size_t v = 0;
+        if (vgpu::nv_limits::set_persisting(p, value, &v) != vgpu::nv_limits::Set::Ok) return CUDA_ERROR_INVALID_VALUE;
+        l.persisting_l2 = v;
+        return CUDA_SUCCESS;
+      }
       case 7:
       case 8: return static_cast<CUresult>(800);   // CUDA_ERROR_NOT_PERMITTED
       case 9: return kUnsupportedLimit;

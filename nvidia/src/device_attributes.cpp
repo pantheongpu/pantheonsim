@@ -15,6 +15,7 @@
 #include <cstring>
 
 #include "vgpu/telemetry.hpp"
+#include "device_limits.hpp"
 
 namespace vgpu::cuda {
 
@@ -226,7 +227,7 @@ bool device_attribute(const DeviceProfile& p, int physical, int id, int* out) {
     // 128 MiB less a page, from compute capability 8.0 (an RTX 3060 answers it;
     // there is no access policy window before).
     // The RTX PRO 6000 Blackwell Server Edition (sm_120, AWS g7e, 2026-10-09) answers exactly 128 MiB.
-    case kMaxAccessPolicyWindowSize: v = ampere ? (cc >= 120 ? 134217728 : 134213632) : 0; break;
+    case kMaxAccessPolicyWindowSize: v = static_cast<int>(vgpu::nv_limits::max_access_window(p)); break;
     case kGpuDirectRdmaWithCudaVmmSupported: v = 0; break;
     case kReservedSharedMemoryPerBlock: v = static_cast<int>(p.reserved_smem_per_block()); break;
     // Sparse and deferred-mapped CUDA arrays are not implemented: a card
