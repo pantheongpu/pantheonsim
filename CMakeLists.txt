@@ -291,6 +291,7 @@ add_library(vgpu STATIC
   src/runtime/runtime.cpp
   src/runtime/memo.cpp
   src/runtime/host_stats.cpp
+  src/runtime/leak_check.cpp
   src/runtime/shared_runtime.cpp
   src/runtime/visible_devices.cpp
   nvidia/src/device_attributes.cpp
@@ -1498,6 +1499,8 @@ vgpu_unit_test(test_ptx_block_reuse)
 vgpu_unit_test(test_worker_pool)
 # VGPU_HOST_STATS: the host-kernel counters line for a run that is slower on one kernel than another (#551).
 vgpu_unit_test(test_host_stats)
+# VGPU_LEAK_CHECK: the exit line is clean when everything came back and names each resource that did not (device bytes and allocations, pinned blocks, descriptors, threads).
+vgpu_unit_test(test_leak_check)
 # Device memory is madvised for huge pages, and making a device fixes glibc's heap thresholds (#551).
 vgpu_unit_test(test_host_heap)
 vgpu_unit_test(test_sched)
@@ -1684,6 +1687,9 @@ vgpu_unit_test(test_mma_fast)
 vgpu_unit_test(test_tile_mma)
 # The PTX engine's SIMD wgmma route against its general form (VGPU_FASTPATH=0), bit for bit.
 vgpu_unit_test(test_wgmma_fast)
+# The e4m3 / e5m2 sum of wgmma on a Hopper device (tc_fp8.hpp, kHopperWgmmaFp8Rule): recorded H100 and H200 vectors through the rule and through a
+# real wgmma (both PTX routes), the sequential sum for VGPU_TC_EXACT=0, and what each profile names.
+vgpu_unit_test(test_wgmma_fp8)
 # tcgen05.mma reading its operands whole from shared memory against the element reads, bit for bit.
 vgpu_unit_test(test_tcgen05_fast)
 # tcgen05.mma through the tile kernels for the forms the whole-operand route leaves to the row loop (f16 D, layouts F, B, G, A in Tensor Memory, sparse A,
@@ -2490,6 +2496,14 @@ vgpu_unit_test(test_amd_cdna2_matrix amd/tests/unit/test_cdna2_matrix.cpp)
 target_compile_definitions(test_amd_cdna2_matrix PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME test_amd_cdna2_matrix_switched_on COMMAND test_amd_cdna2_matrix)
 set_tests_properties(test_amd_cdna2_matrix_switched_on PROPERTIES ENVIRONMENT "VGPU_MFMA_CDNA2=fttn")
+# The opt-in models of AMD's matrix cores by Khattak, Mikaitis and Graziani (arXiv 2609.14845; amd/src/mfma_models.hpp): the port against a
+# second writing of the MATLAB models (tools/mfma-models/model_ref.py) on pinned vectors, a few worked by hand, the 16x16x16 binary16 and
+# bfloat16 instructions of gfx90a and gfx942 on both paths with the switch on and off; and once more with VGPU_MFMA_MODEL=khattak set.
+vgpu_unit_test(test_amd_mfma_models amd/tests/unit/test_mfma_models.cpp)
+target_compile_definitions(test_amd_mfma_models PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_include_directories(test_amd_mfma_models PRIVATE amd/src)
+add_test(NAME test_amd_mfma_models_switched_on COMMAND test_amd_mfma_models)
+set_tests_properties(test_amd_mfma_models_switched_on PROPERTIES ENVIRONMENT "VGPU_MFMA_MODEL=khattak")
 
 vgpu_unit_test(test_amd_gcn_globals amd/tests/unit/test_gcn_globals.cpp)
 target_compile_definitions(test_amd_gcn_globals PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -3638,6 +3652,34 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  # VGPU_LEAK_CHECK: clean for a program that gives everything back (runtime, driver, cuBLAS), and the resource named for one that
+  # keeps device memory, pinned memory, a descriptor or a thread; strict mode's exit status.
+  add_test(NAME e2e_leak_probe COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_leak_probe.sh)
+  set_tests_properties(e2e_leak_probe PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+
+  # What compute-sanitizer reports for kernels with a known defect (memcheck: invalid and misaligned global and shared accesses;
+  # racecheck: hazards between warps), against what the simulator reports, on the SASS and the PTX engine, sm_86 and sm_75; the
+  # kernels that must run clean included. A misaligned access in the SASS engine used to run.
+  add_test(NAME e2e_sanitizer_kernels COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sanitizer_kernels.sh)
+  set_tests_properties(e2e_sanitizer_kernels PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 900)
+
+  # Growth over 400 repeats of a workload through the runtime, the driver and cuBLAS (device memory, descriptors, threads,
+  # resident memory, mappings), and each deliberate leak named.
+  add_test(NAME e2e_leak_soak COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_leak_soak.sh)
+  set_tests_properties(e2e_leak_soak PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 900)
+
   add_test(NAME e2e_ret_condition_predicate
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ret_condition_predicate.sh)
   set_tests_properties(e2e_ret_condition_predicate PROPERTIES
@@ -4379,6 +4421,22 @@ if(TARGET vgpucudart)
     TIMEOUT 3600)
 endif()
 
+# Differential execution and determinism in exact mode (nvidia/tests/e2e/run_differential.sh). diff: the SASS engine against the PTX interpreter, one
+# host thread each: output, memory after every launch, the launches and the counters both engines define alike. determinism: one program, several
+# runs (CPU affinity, niceness, environment size, VGPU_EXACT_THREADS, replayable warp schedulers) that must leave the same output, counters and memory.
+# A short list on pull requests; VGPU_NIGHTLY=1 (the `differential` job of .github/workflows/sass-ptx.yml) runs every program on every architecture.
+if(TARGET vgpucudart)
+  foreach(_m diff determinism)
+    add_test(NAME e2e_differential_${_m} COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_differential.sh ${_m})
+    set_tests_properties(e2e_differential_${_m} PROPERTIES
+      DEPENDS vgpucudart
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      RESOURCE_LOCK nvcc_memory
+      TIMEOUT 3600)
+  endforeach()
+endif()
+
 # The device runtime (cudadevrt): cdp_device_api and cdp1_device_sync alone, on four generations,
 # as e2e_sass_archs runs them among the rest (nvidia/docs/sass.md, "Device runtime").
 if(TARGET vgpucudart)
@@ -4512,9 +4570,28 @@ if(Python3_Interpreter_FOUND)
   # Relative links, anchors and docs/*.md references in the Markdown files resolve (seconds, no build).
   add_test(NAME lint_doc_links
            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lint/check_doc_links.py ${CMAKE_SOURCE_DIR})
+  # Every VGPU_*/PSIM_* variable and --flag the user documentation names exists in the source, and the source's user-facing ones are
+  # documented (or listed with a reason in tests/lint/doc_drift_internal.txt); the checker's rules run on a synthetic tree.
+  add_test(NAME lint_doc_drift
+           COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lint/check_doc_drift.py ${CMAKE_SOURCE_DIR})
+  add_test(NAME lint_doc_drift_selftest
+           COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lint/check_doc_drift.py selftest)
+  # The skipped-test budget (ci/skip-budget.txt): every entry has a reason, the total adds up, ci.yml allows exactly the
+  # budgeted skips; the checker's own rules run on synthetic input (seconds, no build).
+  add_test(NAME lint_skip_budget
+           COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/ci/skip_budget.py lint ${CMAKE_SOURCE_DIR})
+  add_test(NAME lint_skip_budget_selftest
+           COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/ci/skip_budget.py selftest)
   # The profile counts in docs/status.md (and the digits restated in README, CONTRIBUTING, ARCHITECTURE) match the profile files.
   add_test(NAME lint_profile_counts
            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lint/check_profile_counts.py ${CMAKE_SOURCE_DIR})
+  # A profile's `measured` provenance needs a vectors file that backs it (selftest, then the tree).
+  add_test(NAME lint_provenance_vectors_selftest
+           COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lint/check_provenance_vectors.py --selftest)
+  add_test(NAME lint_provenance_vectors
+           COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lint/check_provenance_vectors.py ${CMAKE_SOURCE_DIR})
+  # The card-oracle diff: manifest, driver verdicts (on stubs) and workflow (seconds, no build, no GPU).
+  add_test(NAME lint_oracle_diff COMMAND bash ${CMAKE_SOURCE_DIR}/tests/lint/check_oracle_diff.sh)
   # tools/bench/real/short.py puts every perf sample of a short program in a start-up phase by its call chain; the
   # rules are checked against chains of the shapes perf gives (seconds, no build, no perf).
   add_test(NAME lint_short_split_selftest
@@ -4575,6 +4652,10 @@ if(Python3_Interpreter_FOUND)
     ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
     SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 endif()
+# The leak sweep (below, and the CI step "Leak sweep") reads the logs of the e2e tests; this checks that it finds a leak, a second
+# resource beside a listed one, and a listed entry that is stale.
+add_test(NAME lint_leak_sweep_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_leak_sweep_selftest.sh)
+set_tests_properties(lint_leak_sweep_selftest PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
 add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_symbols.sh)
 set_tests_properties(lint_shim_symbols PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
@@ -4623,6 +4704,12 @@ add_test(NAME lint_ci_reservation
 # every hosted-runner apt-get goes through the second.
 add_test(NAME lint_apt_mirror_fallback COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_apt_mirror_fallback.sh)
 set_tests_properties(lint_apt_mirror_fallback PROPERTIES TIMEOUT 60)
+
+# The nightly version matrix (CUDA 12.4 to 13.2, ROCm 6.4 to 7.2) covers its whole range and is not per-PR, and docs/install.md,
+# which the clean-install workflow runs step by step, extracts and is complete.
+add_test(NAME lint_version_matrix COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_version_matrix.py)
+add_test(NAME lint_install_steps COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_install_steps.sh)
+set_tests_properties(lint_install_steps PROPERTIES TIMEOUT 60)
 
 # scripts/thp-always.sh sets transparent huge pages to always on a GitHub-hosted runner shipped with madvise, when it can,
 # and never fails the action's step (#551).
@@ -4798,6 +4885,12 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 900)
+  # The e4m3 / e5m2 sum of wgmma on an H100 profile, recorded H100 and H200 vectors through a real wgmma, SASS and PTX engines (tc_fp8.hpp).
+  add_test(NAME e2e_wgmma_fp8_vectors COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_wgmma_fp8_vectors.sh)
+  set_tests_properties(e2e_wgmma_fp8_vectors PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
 endif()
 
 # TMA: a CUTLASS-style Hopper GEMM (clusters, a TMA pipeline, wgmma) checked
@@ -5015,6 +5108,24 @@ if(TARGET vgpucudart)
   find_program(VGPU_PYTHON NAMES python3 python)
   if(VGPU_PYTHON)
     add_test(NAME sweep_exit COMMAND "${VGPU_PYTHON}" ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/test_sweep_exit.py)
+  endif()
+  # Application smoke checks (nvidia/tests/pytorch/app_smoke.py): gemm in four precisions, convolutions
+  # forward and backward, a cuDNN LSTM, an MLP, a CNN and a decoder trained a few steps, their tensors
+  # compared with those a real RTX 3060 produced (nvidia/tests/data/pytorch_app_smoke.rtx3060.ref), bit for
+  # bit or within the bound app_smoke_ref.py states. 18 checks. The simulated GPU is the RTX 3060 (sm_86
+  # SASS, whose tensor-core sums are measured); the nightly adds the other profiles.
+  add_test(NAME e2e_pytorch_app_smoke COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
+           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/app_smoke.py 18 nvidia/rtx3060)
+  set_tests_properties(e2e_pytorch_app_smoke PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_E2E_DATA=${CMAKE_SOURCE_DIR}/nvidia/tests/data"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
+  # The comparison itself: a changed bit, a shape, a NaN or an error past the tolerance must fail; needs
+  # neither torch nor a GPU.
+  if(VGPU_PYTHON)
+    add_test(NAME app_smoke_ref COMMAND "${VGPU_PYTHON}" ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/test_app_smoke_ref.py)
   endif()
   add_test(NAME e2e_pytorch_sweep_full COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch_sweep.sh full nvidia/rtx5090)
   set_tests_properties(e2e_pytorch_sweep_full PROPERTIES
@@ -5277,6 +5388,12 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 3600)
+  # The drift detection of the comparison with the card's reply (run_ollama.sh's card_check), against a fake
+  # server: no Ollama or GPU needed, so it runs in every job.
+  find_program(VGPU_PYTHON NAMES python3 python)
+  if(VGPU_PYTHON)
+    add_test(NAME ollama_card_ref COMMAND "${VGPU_PYTHON}" ${CMAKE_SOURCE_DIR}/tests/e2e/test_ollama_card_ref.py)
+  endif()
 endif()
 # And on every simulated AMD GPU, through Ollama's ROCm backend (llama.cpp's
 # HIP kernels, rocBLAS, hipBLAS). Skips without ollama and its ROCm backend.
@@ -5363,3 +5480,19 @@ foreach(_pair test_amd_gcn_same_bits:500 e2e_sass_archs:210 test_host_gemm:180 e
     set_property(TEST ${_t} PROPERTY COST ${_cost})
   endif()
 endforeach()
+
+# The leak sweep. Every end-to-end test runs its programs with VGPU_LEAK_CHECK=1 and a log of its own, build/leak-check/<test>.log
+# (include/vgpu/leak_check.hpp: what the process still holds when its machine goes away); `tests/lint/check_leak_sweep.py
+# build/leak-check tests/lint/leak_known.txt` reads the logs after the tests (the CI step "Leak sweep") and fails on a leak the known
+# list does not name. Not in a sanitizer build: a sanitizer's own threads and quarantine are not the program's. Logs append, so a build
+# directory that has run the tests before needs `rm -rf build/leak-check` first.
+if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize")
+  file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/leak-check")
+  get_property(_leak_tests DIRECTORY PROPERTY TESTS)
+  foreach(_t ${_leak_tests})
+    if(_t MATCHES "^e2e_" AND NOT _t MATCHES "^e2e_leak_")
+      set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT
+        "VGPU_LEAK_CHECK=1" "VGPU_LEAK_CHECK_FILE=${CMAKE_BINARY_DIR}/leak-check/${_t}.log")
+    endif()
+  endforeach()
+endif()

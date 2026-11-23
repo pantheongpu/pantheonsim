@@ -14,7 +14,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 if [[ -n ${SUDO+x} ]]; then sudo=$SUDO; elif [[ $(id -u) == 0 ]]; then sudo=; else sudo=sudo; fi
 attempts=${APT_ATTEMPTS:-4}
 for ((n = 1; n <= attempts; n++)); do
-  if DEBIAN_FRONTEND=noninteractive $sudo timeout "${APT_TIMEOUT:-600}" apt-get -o Acquire::Retries=3 \
+  if $sudo env DEBIAN_FRONTEND=noninteractive INITRD=No timeout "${APT_TIMEOUT:-600}" \
+       apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 \
        -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; then
     exit 0
   fi

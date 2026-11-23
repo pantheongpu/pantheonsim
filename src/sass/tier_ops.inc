@@ -912,7 +912,7 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
     const unsigned first = static_cast<unsigned>(std::countr_zero(ex)), count = popc(ex);
     uint64_t g0;
     if (exec::sassmem::global_run(blo, bhi, urv + imm, first, count, 16, g0) &&
-        (g0 >= kWinEnd || g0 + uint64_t{count} * 16 - 1 < kConstWindow)) {
+        (g0 & 15) == 0 && (g0 >= kWinEnd || g0 + uint64_t{count} * 16 - 1 < kConstWindow)) {   // (a misaligned piece is exec_mem's to fault)
       uint32_t buf[32 * 4];
       bool done;
       if (Store) {
@@ -933,6 +933,10 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
   }
   uint64_t addrs[32];
   tier_global_addresses(blo, bhi, urv + imm, ex, addrs);
+  if (!exec::lanes_aligned(addrs, ex, 16)) {   // nothing is done yet: the interpreter runs the whole instruction and faults on the lane
+    c.r->tier_exec_mem(blk, w, *op.ins, ex);
+    return;
+  }
   for (Mask m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
     if (addrs[l] >= kConstWindow && addrs[l] < kWinEnd) {   // nothing is done yet: the interpreter runs the whole instruction
@@ -1367,7 +1371,8 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
       for (unsigned l = 0; l < 32; ++l) offs[l] = base[l] * stride + add32;
     }
   }
-  if (!exec::shared_window_inside_warp(offs, ex, static_cast<uint32_t>(blk.rank), ssize, bytes)) {   // (as exec_mem: see window_check.hpp)
+  if (!exec::shared_window_inside_warp(offs, ex, static_cast<uint32_t>(blk.rank), ssize, bytes) ||
+      !exec::lanes_aligned(offs, ex, bytes)) {   // (as exec_mem: see window_check.hpp; a misaligned access is the loop's to fault)
     c.r->tier_exec_mem(blk, w, *op.ins, ex);
     return;
   }
@@ -1496,7 +1501,7 @@ static void h_local(void* vc, const tier::MOp& op, Mask ex) {
       window.add(off);
     }
   }
-  const bool inside = window.inside(w.local_size, bytes, ex != 0);
+  const bool inside = window.inside(w.local_size, bytes, ex != 0) && exec::lanes_aligned(addrs, ex, bytes);
   if (!inside) {
     c.r->tier_exec_mem(blk, w, *op.ins, ex);   // the lane that faults, and the words of the fault, are its
     return;
@@ -1960,7 +1965,7 @@ static void h_generic(void* vc, const tier::MOp& op, Mask ex) {
     addrs[l] -= kSharedWindow;   // the offset in the window (< 2^32), as classify gives it
     window.add(addrs[l], blk.rank);
   }
-  if (!window.inside(blk.shared.size(), bytes, true)) {
+  if (!window.inside(blk.shared.size(), bytes, true) || !exec::lanes_aligned(addrs, ex, bytes)) {
     c.r->tier_exec_mem(blk, w, *op.ins, ex);
     return;
   }
@@ -2904,6 +2909,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       w.forced = false;
       w.yield = true;
       ++w.idle_yields;
+      note_yield(w, group);
       w.yield_pc = here + 16;   // where the lanes that yielded stand once the YIELD is done (exec_control's YIELD)
       tier_set_pcs(w, group, here + 16);
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::YIELD)].fetch_add(1, std::memory_order_relaxed);

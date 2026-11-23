@@ -22,8 +22,8 @@ root="$(cd "$(dirname "$0")/../.." && pwd)"
 build="$(cd "${1:-${VGPU_BUILD_DIR:-$root/build}}" && pwd)" || { echo "FAIL: no build directory"; exit 1; }
 shim="$build/shim"
 
-if ! grep -q VGPU_SASS_LOG "$root/nvidia/src/fatbin.cpp" 2>/dev/null; then
-  echo "SKIP: this simulator has no SASS path (no VGPU_SASS_LOG in nvidia/src/fatbin.cpp); nothing to compare"
+if ! grep -rq VGPU_SASS_LOG "$root/nvidia/src" 2>/dev/null; then
+  echo "SKIP: this simulator has no SASS path (no VGPU_SASS_LOG in nvidia/src); nothing to compare"
   exit 0
 fi
 shopt -s nullglob

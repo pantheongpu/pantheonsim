@@ -3302,6 +3302,7 @@ inline bool with_lane_width(unsigned bytes, F&& f) {
 }
 
 void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
+  if (race_) g_race_ins = &ins;   // (a race report names the instruction)
   const unsigned size = ins.f[0];
   const uint32_t bytes = size <= 1 ? 1 : size <= 3 ? 2 : size == 4 ? 4 : size == 5 ? 8 : size == 8 ? 32 : 16;
   // A loaded byte or half to 32 bits: zero- or sign-extended (sizes 0 to 3: u8, s8, u16, s16), or the word as it is. (As shifts, not
@@ -3380,6 +3381,11 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     case Op::LDG: case Op::LD: case Op::STG: case Op::ST: {
       const bool store = ins.op == Op::STG || ins.op == Op::ST;
       const bool generic = ins.op == Op::LD || ins.op == Op::ST;
+      // A store is progress for a warp that waits on another's (Runner::mem_write says so). The coalesced and scattered fast paths below
+      // write without it, and a warp that was doing nothing but storing then counted as idle, which let break_spin_wait release lanes
+      // parked at a BSYNC before the others had arrived (group_ballot_barrier built for sm_75: ballots over part of a group, with
+      // VGPU_FASTPATH=1 only).
+      if (store) w.idle_yields = 0;
       const bool e = ins.w.bit(72);
       const bool wide = e || ins.w.bit(90);
       const bool ur = ins.w.bit(91) && !e;
@@ -3555,6 +3561,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         const bool in_const = g >= kConstWindow && g < kConstWindow + (uint64_t{1} << 32);
         const Space sp = generic || in_const ? classify(g, &off) : (off = g, Space::Global);
         addrs[l] = off;
+        check_aligned(w, ins, l, off, bytes, store ? "store" : "load");
         space = sp == Space::Global || sp == Space::Param ? 0 : sp == Space::Shared ? 1 : 2;
         // A 32-byte access (ENL2.256) moves two register quads: a store's low
         // 16 bytes from the first printed, a load's into the second.
@@ -3596,6 +3603,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     case Op::LDS: case Op::STS: case Op::LDL: case Op::STL: {
       const bool store = ins.op == Op::STS || ins.op == Op::STL;
       const bool shared = ins.op == Op::LDS || ins.op == Op::STS;
+      if (store) w.idle_yields = 0;   // (see LDG: a store is progress on every path)
       const unsigned strides[] = {0, 4, 8, 16};
       const unsigned stride = shared ? strides[ins.f[3]] : 0;
       const bool ur = ins.w.bit(91);
@@ -3611,13 +3619,15 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         row_addresses(a, false, ur, store ? 64 : 32, ex, sa, stride);
         // (Every lane in this block's window and its last byte inside the array, with no branch per lane: see window_check.hpp.)
         exec::SharedWindowCheck window;
+        uint64_t odd = 0;   // (the addresses' low bits: a misaligned access is the loop's to fault)
         for (Mask m = ex; m; m &= m - 1) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
           const uint64_t off = static_cast<uint32_t>(sa[l]);
           addrs[l] = off;
+          odd |= off;
           window.add(off, blk.rank);
         }
-        const bool inside = window.inside(ssize, bytes, ex != 0);
+        const bool inside = window.inside(ssize, bytes, ex != 0) && (odd & (bytes - 1)) == 0 && !race_;
         if (inside) {
           uint8_t* sh = blk.shared.data();
           const bool moved = with_lane_width(bytes, [&](auto width) {
@@ -3670,13 +3680,15 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         uint64_t la[32];
         row_addresses(a, false, ur, store ? 64 : 32, ex, la);
         exec::LocalWindowCheck window;
+        uint64_t odd = 0;
         for (Mask m = ex; m; m &= m - 1) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
           const uint64_t off = static_cast<uint32_t>(la[l]);
           addrs[l] = off;
+          odd |= off;
           window.add(off);
         }
-        const bool inside = window.inside(w.local_size, bytes, ex != 0);
+        const bool inside = window.inside(w.local_size, bytes, ex != 0) && (odd & (bytes - 1)) == 0;
         if (inside) {
           if (w.local.empty()) w.local.assign(size_t{w.local_size} * 32, 0);
           const Operand& d = store ? ins.src[1] : ins.dst[0];
@@ -3717,6 +3729,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       each_lane(ex, [&](unsigned l) {
         const uint64_t off = static_cast<uint32_t>(address(a, l, false, ur, store ? 64 : 32, stride));
         addrs[l] = off;
+        check_aligned(w, ins, l, off, bytes, store ? "store" : "load");
         const Space sp = shared ? Space::Shared : Space::Local;
         if (store) {
           const Operand& d = ins.src[1];
@@ -3962,7 +3975,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
           const uint32_t addr = static_cast<uint32_t>(sa[l]);
           soff[l] = addr & 0xffffff;
-          ok = (addr >> 24) == blk.rank && uint64_t{soff[l]} + n <= blk.shared.size();
+          ok = (addr >> 24) == blk.rank && uint64_t{soff[l]} + n <= blk.shared.size() && (soff[l] & (n - 1)) == 0 && !race_;
         }
         if (ok) {
           const Operand& d = ins.dst[0];
@@ -4198,6 +4211,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         // The vector forms (sm_90's F32x2/x4, F16x4/x8, BF16x4/x8): f[7] words
         // in consecutive registers, aligned to all of them, each its own atomic.
         const unsigned nwords = ins.f[7] ? ins.f[7] : 1;
+        check_aligned(w, ins, l, addr, n, "atomic");
         if (nwords > 1 && addr % (4ull * nwords))
           fault(w, ins, l, "a vector atomic of " + std::to_string(4 * nwords) + " bytes at an address not aligned to them",
                 Err::MisalignedAccess);
@@ -4241,9 +4255,11 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         if (host && reinterpret_cast<uintptr_t>(host) % n == 0) {
           old = exec::host_atomic_rmw(host, n, compute);
         } else {
+          g_race_atomic = true;   // (VGPU_RACE: one atomic, not a load and a store)
           mem_read(blk, w, l, sp, addr, &old, n);
           const uint64_t nw = compute(old);
           mem_write(blk, w, l, sp, addr, &nw, n);
+          g_race_atomic = false;
         }
         w.idle_yields = changed ? 0 : idle0;
         ++blk.st.atomics;
@@ -4535,7 +4551,8 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       if (const std::optional<uint64_t> at = exec::surface_address(d, a)) mem_.write(*at, texel, nb);
     });
     blk.st.global_stores += n;
-    blk.st.global_bytes_written += n * 16;
+    // The values the lane stores, as the PTX engine counts a sust.p (its vector of 32-bit values), not the 16 bytes of the widest.
+    blk.st.global_bytes_written += n * 4 * static_cast<uint64_t>(std::popcount(mask));
     return;
   }
   if (surface) {
@@ -4865,6 +4882,8 @@ void Runner::exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const unsigned rd = ins.dst[0].reg, rc = ins.src[reg_a ? 2 : 1].reg;
   const bool accumulate = keep && rc != kRZ;
   const uint32_t elems = N / 2;   // accumulator elements per lane
+  // QGMMA on a device that has its own e4m3 / e5m2 sum for wgmma (vgpu/exec/tc_fp8.hpp).
+  const vgpu::Fp8SumRule* const fp8_rule = ins.op == Op::QGMMA && !sparse && !int_form ? vgpu::exec::tc86::wgmma_fp8_rule(profile_) : nullptr;
   each_lane(ex, [&](unsigned l) {
     std::vector<uint32_t> out(acc32 || int_form ? elems : (elems + 1) / 2);
     for (size_t i = 0; i < out.size(); ++i) out[i] = rc == kRZ ? 0 : w.reg(rc + static_cast<unsigned>(i), l);
@@ -4886,8 +4905,13 @@ void Runner::exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       uint32_t& slot = out[acc32 ? e : e / 2];
       float acc = 0.0f;
       if (accumulate) acc = acc32 ? as_f32(slot) : half_to_f32(static_cast<uint16_t>(slot >> shift));
-      for (uint32_t k = 0; k < K; ++k)
-        acc += static_cast<float>(A[row * K + k]) * static_cast<float>(B[size_t{k} * N + col]);
+      if (fp8_rule)
+        acc = static_cast<float>(vgpu::exec::tc86::fp8_dot(*fp8_rule, !acc32, at == T::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3,
+                                                           bt == T::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3, &A[row * K], 1,
+                                                           &B[col], N, K, acc));
+      else
+        for (uint32_t k = 0; k < K; ++k)
+          acc += static_cast<float>(A[row * K + k]) * static_cast<float>(B[size_t{k} * N + col]);
       // (A NaN is the canonical 0x7fffffff (0x7fff in an f16 accumulator), not whichever the host's add handed on when two met -- the
       // first source operand's, which the compiler picks; derived from the HMMA path and the PTX documentation, no card has wgmma.)
       if (acc32) slot = acc != acc ? 0x7fffffffu : f32_bits(acc);
@@ -5000,7 +5024,14 @@ bool Runner::gmma_fast(Block& blk, Warp& w, const Instr& ins, Mask ex, const Gmm
     Cf.resize(size_t{16} * N);
     Df.resize(size_t{16} * N);
     exec::wgmma_acc_to_tile(cw.data(), N, f16_acc, Cf.data());
-    simd::kernels().tile_f32c(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
+    // QGMMA (the e4m3 and e5m2 forms) on a device that has its own sum for it (vgpu/exec/tc_fp8.hpp): that, in place of the sequential one.
+    const vgpu::Fp8SumRule* const wr = ins.op == Op::QGMMA && !f.sparse ? vgpu::exec::tc86::wgmma_fp8_rule(profile_) : nullptr;
+    if (wr)
+      vgpu::exec::tc86::fp8_tile(*wr, f16_acc, f.at == exec::TileElem::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3,
+                                 f.bt == exec::TileElem::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3, 16, N, K, Af.data(), snap.Bf.data(),
+                                 Cf.data(), Df.data());
+    else
+      simd::kernels().tile_f32c(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
     exec::wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data(), true);
   }
   if (rd != kRZ) {
@@ -5435,6 +5466,18 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
 
 // ---- control -------------------------------------------------------------------
 
+// A YIELD ran for `group`. A spin-wait yields over and over in one state; a loop that does new work between its YIELDs does not. The
+// registers of the group's lowest lane are hashed and compared with those that lane had at its previous YIELD: when they moved, the YIELD is not
+// idle (break_spin_wait must not take the lanes parked at a BSYNC for the spinners' prize).
+void Runner::note_yield(Warp& w, Mask group) {
+  const unsigned l = static_cast<unsigned>(std::countr_zero(group ? group : 1u));
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (uint32_t r = 0; r < w.nregs; ++r) h = (h ^ w.reg(r, l)) * 0x100000001b3ull;
+  w.yield_moved = h != w.yield_sig[l];
+  w.yield_sig[l] = h;
+  if (w.yield_moved) w.idle_yields = 1;   // (this YIELD, the first of a new stretch)
+}
+
 // Every lane waiting at a WARPSYNC is released once every lane its mask names has arrived at one or exited (WARPSYNC in exec_control, and
 // the tier's own WARPSYNC, which ends a run: tier_ops.inc).
 void Runner::release_warpsync(Warp& w) {
@@ -5457,7 +5500,8 @@ void Runner::release_warpsync(Warp& w) {
   } else {
     each_lane(waiting_ws, [&](unsigned l) {
       const Mask need = w.wait_arg[l] & w.alive & ~w.exited;
-      if ((need & ~waiting_ws) == 0 || ((w.ws_held >> l) & 1)) release |= Mask{1} << l;
+      const bool arrived = (need & ~waiting_ws) == 0;
+      if (arrived || ((w.ws_held >> l) & 1)) release |= Mask{1} << l;
     });
   }
   // Lanes that named different masks do not come out of it together: ptxas's
@@ -5537,6 +5581,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
     for (const Warp& ww : blk.warps) live += static_cast<uint32_t>(std::popcount(ww.alive & ~ww.exited));
     const uint32_t expected = b.expected ? b.expected : live;
     if (b.arrived < expected) return;
+    if (race_) ++blk.race_epoch;   // the barrier orders what came before it against what comes after
     for (Warp& ww : blk.warps)
       for (unsigned l = 0; l < 32; ++l)
         if (((ww.waiting >> l) & 1) && ww.wait_kind[l] == Wait::Bar && ww.wait_arg[l] == id) {
@@ -5613,6 +5658,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       w.forced = false;
       w.yield = true;
       ++w.idle_yields;
+      note_yield(w, group);
       w.yield_pc = w.pc[std::countr_zero(group)] + 16;   // where the lanes that yielded stand once the YIELD is done
       return false;
     case Op::BPT:
@@ -6646,6 +6692,8 @@ void Runner::cluster_barrier_check(Block& blk) {
     }
   if (!any) return;
   ++cl.phase;
+  if (race_)
+    for (Block* b : cl.blocks) ++b->race_epoch;
   for (Block* b : cl.blocks)
     for (Warp& w : b->warps) {
       w.cga_arrived = 0;
@@ -6711,6 +6759,7 @@ uint64_t Runner::mbar_arrive(Block& blk, uint32_t off, uint32_t arrivals, int64_
   side.tx += tx;
   uint32_t phase = hi >> 31, count;
   if (remaining == 0 && side.tx == 0) {
+    if (race_) ++blk.race_epoch;   // a completed phase is what a waiter's acquire pairs with
     phase ^= 1;
     count = reload;
     side.arrived_all = false;
@@ -6735,6 +6784,7 @@ uint64_t Runner::mbar_arrive80(Block& blk, uint32_t off) {
   const uint32_t lo = static_cast<uint32_t>(old);
   uint32_t hi = static_cast<uint32_t>(old >> 32);
   const uint32_t count = (hi & 0x7fffffffu) + 1;
+  if (count >= 0x80000000u && race_) ++blk.race_epoch;
   if (count >= 0x80000000u) hi = ((hi ^ 0x80000000u) & 0x80000000u) | ((lo + 0x40000000u) & 0x7fffffffu);
   else hi = (hi & 0x80000000u) | count;
   const uint64_t now = lo | (static_cast<uint64_t>(hi) << 32);

@@ -91,6 +91,7 @@ check "apt-retry succeeds once a later mirror works" "$([[ $rc == 0 ]] && echo o
 check "it installed three times (the image's mirror, archive, kernel.org)" "$([[ $(grep -c 'install -y foo' "$tmp/calls") == 3 ]] && echo ok)"
 check "it refreshed the lists after switching" "$([[ $(grep -c 'update' "$tmp/calls") == 2 ]] && echo ok)"
 check "every call carries apt's own retries" "$([[ $(grep -c 'Acquire::Retries=3' "$tmp/calls") == $(wc -l < "$tmp/calls") ]] && echo ok)"
+check "every call waits for the dpkg lock instead of failing on an orphaned one" "$([[ $(grep -c 'DPkg::Lock::Timeout=300' "$tmp/calls") == $(wc -l < "$tmp/calls") ]] && echo ok)"
 
 rm -f "$tmp/calls" "$tmp/state"; mk_etc
 out=$(PATH="$tmp/bin:$PATH" APT_ETC="$tmp/etc" APT_STATE="$tmp/state" APT_ATTEMPTS=2 SUDO= "$tmp/apt-retry.sh" install -y foo 2>&1); rc=$?
@@ -100,12 +101,12 @@ PATH="$tmp/bin:$PATH" SUDO= "$tmp/apt-retry.sh" update -qq >/dev/null 2>&1
 check "a working apt-get is run once and exits 0" "$([[ $? == 0 ]] && echo ok)"
 
 # Every hosted-runner apt-get in the workflows and action.yml goes through apt-retry.sh (the self-hosted pool steps take a
-# flock and are not hosted; cuda-toolkits.yml has its own retry; apt-get download is not an install).
+# flock and are not hosted; cuda-toolkits.yml has its own retry; clean-install.yml's first step runs in a bare container before the checkout and has its own loop; apt-get download is not an install).
 missing=$(cd "$here" && python3 -I - <<'PY'
 import glob, re
 bad = []
 for f in glob.glob(".github/workflows/*.yml") + ["action.yml"]:
-    if f.endswith("cuda-toolkits.yml"):
+    if f.endswith(("cuda-toolkits.yml", "clean-install.yml")):
         continue
     for i, l in enumerate(open(f).read().split("\n")):
         if re.match(r"^\s*(sudo |\$SUDO )?apt-get (update|install)\b", l):

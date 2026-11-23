@@ -114,11 +114,14 @@ from the loaded profile**; no engine compares a compute capability for it (`tc86
 
 | `tensor_sum_fp8` | `sequential`, `ada` or `via_f16` (optional) | The sum of the e4m3 and e5m2 `mma.sync` forms (`vgpu::Fp8Sum`, `include/vgpu/exec/tc_fp8.hpp`). Absent is `sequential`. `ada`: chunks of 16, terms cut at `2^(top - 14)`, an f32 result cut to 13 fraction bits. `via_f16`: ptxas turns the form into f16 `HMMA`s, so the `tensor_sum` rule sums them and C is added afterwards (needs a `tensor_sum` that is not `sequential`). |
 | `tensor_sum_fp8_chunk`, `_grid`, `_out_bits` | integers (with `ada` only) | 16, 14, 13: written out as the f16 numbers are. Absent with `sequential` and `via_f16`. |
+| `tensor_sum_wgmma_fp8` | `sequential` or `hopper` (optional) | The sum of the dense e4m3 and e5m2 forms of `wgmma` (PTX) and `QGMMA` (SASS) (`vgpu::WgmmaFp8Sum`, `include/vgpu/exec/tc_fp8.hpp`). Absent is `sequential`. `hopper`: one chunk of 32 products and the accumulator, terms cut at `2^(top - 14)`, an f32 result cut to 13 fraction bits. |
+| `tensor_sum_wgmma_fp8_chunk`, `_grid`, `_out_bits` | integers (with `hopper` only) | 32, 14, 13: written out as the others are. Absent with `sequential`. |
 
 Rules the loader enforces (a profile that breaks one does not load, and the message names the file and the key):
 
 - `tensor_sum_fp8: ada` needs its three numbers and they must be 16, 14 and 13; `sequential` and `via_f16` must have none; `via_f16` needs a
   `tensor_sum` other than `sequential`; the numbers without the name are refused (`test_profile`).
+- `tensor_sum_wgmma_fp8: hopper` needs its three numbers and they must be 32, 14 and 13; `sequential` must have none; the numbers without the name are refused (`test_profile`).
 
 - The three numbers are required with `ampere` and `hopper` and must be that model's (8 / 4 / 25, 16 / 8 / 26); with `sequential`
   they must be absent. The engines implement these two rules (scalar code for both, vector kernels for the first), not a sum of any
@@ -154,6 +157,9 @@ Rules the loader enforces:
 - A listed key must be one the profile has, so a mistyped name cannot tag nothing.
 - `measured`, `documented` and `inferred` are claims and need an evidence entry (the key's own or its section's).
 - A key in `placeholders:` can only be `unknown`.
+- (CI lint, `tests/lint/check_provenance_vectors.py`, not the loader) **`measured` needs a vectors file**: the evidence that applies to the key must cite a
+  non-empty data file in the repository (under `nvidia/tests/data/`, `amd/tests/data/`, `amd/registers/measurements/` or `docs/numerics/`; not a
+  document or source file), and every data path it cites must exist.
 
 **A key that is not listed has no per-key class.** That is the default, and it is deliberate: nothing is turned into `measured`
 or `documented` by a rule. What is said of an unlisted key is what was said before these sections existed:

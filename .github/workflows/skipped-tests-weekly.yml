@@ -14,7 +14,8 @@ name: Skipped tests weekly
 #   rocm-profiler  ROCm 7.2.0's rocprofv3, hipcc, rocprofiler-sdk and its headers and
 #                  samples: the 36 amd_rocprof_* tests (the simulated RX 6800 and RX 6700 XT
 #                  against what the real cards recorded, in amd/tests/data), amd_rocprofv3,
-#                  amd_rocprofiler_abi, amd_rocprofiler_pcsampling and bench_amd_counters.
+#                  amd_rocprofiler_abi, amd_rocprofiler_pcsampling, bench_amd_counters and
+#                  bench_amd_counters_blocks.
 #                  It must be 7.2.0: the recordings are from rocprofv3 1.1.0 of that release and
 #                  tools/bench-amd/expected is keyed by hipcc 7.2.26015.
 #   rvs            ROCm Validation Suite 7.2.0 (amd_rvs).
@@ -75,12 +76,15 @@ jobs:
           scripts/apt-retry.sh update -qq
           scripts/apt-retry.sh install -y -qq --no-install-recommends build-essential cmake ninja-build python3 \
             libnuma1 libdrm2 libdrm-amdgpu1 libelf1 libtinfo6 zlib1g libzstd1
+          # rocprofv3 runs inside an isolated session, which needs user namespaces; 24.04 restricts them.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Unpack ROCm 7.2.0
-        # rocprofv3 and the profiler tool (rocprofiler-sdk), hipcc with its compiler and HIP's and
-        # HSA's headers, and the SDK's samples for the PC sampling test.
+        # rocprofv3 and the profiler tool (rocprofiler-sdk), hipcc with its compiler, the device
+        # libraries it links every kernel with (without them clang stops at "cannot find ROCm
+        # device library") and HIP's and HSA's headers, and the SDK's samples for the PC sampling test.
         run: |
           amd/tests/e2e/fetch_rocm_release.sh "$HOME/rocm" "$ROCM_REPO_RELEASE" \
-            hipcc hip-dev hsa-rocr-dev rocprofiler-sdk rocprofiler-sdk-roctx rocprofiler-sdk-rocpd
+            hipcc hip-dev hsa-rocr-dev rocm-device-libs rocprofiler-sdk rocprofiler-sdk-roctx rocprofiler-sdk-rocpd
           "$ROCM_PREFIX/bin/rocprofv3" --version | head -3
           "$ROCM_PREFIX/bin/hipcc" --version | head -2
       - name: Build the simulator's AMD side
@@ -94,7 +98,7 @@ jobs:
           ALLOW: '^$'
         run: |
           ci/ctest-no-skips.sh build "$ALLOW" -j"$(ci/jobs.sh -g 3 -m 2)" \
-            -R '^(amd_rocprof_.*|amd_rocprofv3|amd_rocprofiler_abi|amd_rocprofiler_pcsampling|bench_amd_counters)$'
+            -R '^(amd_rocprof_.*|amd_rocprofv3|amd_rocprofiler_abi|amd_rocprofiler_pcsampling|bench_amd_counters(_blocks)?)$'
 
   rvs:
     name: ROCm Validation Suite (ROCm 7.2.0)
@@ -117,8 +121,10 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Unpack ROCm 7.2.0's validation suite, with rocBLAS and hipBLASLt
         run: |
-          amd/tests/e2e/fetch_rocm_release.sh "$HOME/rocm" "$ROCM_REPO_RELEASE" rocm-validation-suite
+          amd/tests/e2e/fetch_rocm_release.sh "$HOME/rocm" "$ROCM_REPO_RELEASE" rocm-validation-suite rocrand
           test -x "$ROCM_PREFIX/bin/rvs"
+          # Libraries RVS needs that neither the unpacked packages nor the system have.
+          LD_LIBRARY_PATH="$ROCM_PREFIX/lib:$ROCM_PREFIX/lib/rvs" ldd "$ROCM_PREFIX/bin/rvs" | grep 'not found' || true
       - name: Build the simulator's AMD side
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -164,7 +170,7 @@ jobs:
           python3 -m venv "$HOME/nvvenv"
           "$HOME/nvvenv/bin/pip" install -q nvidia-nvshmem-cu13
           echo "$HOME/nvvenv/bin" >> "$GITHUB_PATH"
-          "$HOME/nvvenv/bin/python" -c 'import os, nvidia.nvshmem as m; d = os.path.dirname(m.__file__); print(d); assert os.path.exists(d + "/include/nvshmem.h") and os.path.exists(d + "/lib/libnvshmem_device.a")'
+          "$HOME/nvvenv/bin/python" -c 'import os, nvidia.nvshmem as m; d = list(m.__path__)[0]; print(d); assert os.path.exists(d + "/include/nvshmem.h") and os.path.exists(d + "/lib/libnvshmem_device.a")'
       - name: Build
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -205,7 +211,8 @@ jobs:
         # NVVM and NVRTC wheels Numba compiles with.
         run: |
           python3 -m venv "$HOME/jitvenv"
-          "$HOME/jitvenv/bin/pip" install -q numba "numba-cuda[cu13]" triton
+          # numpy below 2.4: numba-cuda still calls np.row_stack, which numpy 2.4 removed.
+          "$HOME/jitvenv/bin/pip" install -q numba "numba-cuda[cu13]" triton "numpy<2.4"
           "$HOME/jitvenv/bin/python" -c 'import numba, triton; print(numba.__version__, triton.__version__)'
       - name: Build
         run: |

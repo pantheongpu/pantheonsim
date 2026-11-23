@@ -109,6 +109,34 @@ columns are NVIDIA-only):
 "In-window": the exact-sum transcription works in 128-bit fixed point and skips a vector whose terms span more than 120 bits (25 percent of
 f16 vectors, 63 percent of bf16 ones); it is not MMA-Sim's own `exact_sum`.
 
+## The models of Khattak, Mikaitis and Graziani against the same transcription (2026-11-19)
+
+A second published model per AMD card, opt-in `VGPU_MFMA_MODEL=khattak` ([../matrix-numerics.md](../matrix-numerics.md)), run as one more column of
+`mmasim_xcheck` (`g++ -std=c++20 -O2 -I include -I amd/src tools/mmasim/mmasim_xcheck.cpp`, then `run --n 40000 --seed S --filter CDNA --show 3`;
+on the pantheonsim.com host, 2 cores, no network). 40,000 vectors a form; the E_FDPA transcription handles only part of the vectors (the "exact
+window"). "Finite" is the mismatches in which neither result is an infinity or a NaN. Full output: [mmasim/khattak-run-seed1.txt](mmasim/khattak-run-seed1.txt),
+[seed 2](mmasim/khattak-run-seed2.txt). Neither side is a card: this is two published models against each other, as read by us.
+
+| Form | MMA-Sim model | Mismatches, seed 1 (finite) | Seed 2 (finite) |
+|---|---|---|---|
+| CDNA1 f16 | `E_FDPA` | 0 of 29,959 (0) | 0 of 30,100 (0) |
+| CDNA1 bf16 | `E_FDPA` | 5 of 14,771 (0) | 5 of 14,737 (0) |
+| CDNA2 f16 | `FTZ_MUL_ADD` P = 4 | 10 (0) | 7 (0) |
+| CDNA2 bf16 `_1k` | `FTZ_MUL_ADD` P = 4 | 3,425 (0) | 3,321 (0) |
+| CDNA2 bf16 | `FTZ_MUL_ADD` P = 2 | 2,785 (612) | 2,739 (603) |
+| CDNA3 f16 | `TR_FDPA` | 10 (10) | 3 (3) |
+| CDNA3 bf16 | `TR_FDPA` | 2,878 (2) | 2,737 (5) |
+| CDNA3 xf32 | `TR_FDPA` | 2,202 (1) | 2,126 (11) |
+
+What the mismatches are:
+- **Finite, CDNA2 bf16 without `_1k` (about 600):** MMA-Sim adds the products of this form in pairs (P = 2); the MATLAB code sums them in fours (its comment says 2, its code does not).
+- **Finite, CDNA3 (1 to 11 in 40,000):** one unit in the last place, the two models cut or keep the bits of the smaller operand differently in rare cases (an example: `c = 0.5`, results `3f00001b` and `3f00001a`). Not analysed further.
+- **Overflow edge, bf16 and xf32 (2,100 to 3,400):** the sign of an infinity when a product passes 2^128 (the MATLAB code takes `max(prd) * Inf`; with the sign taken from the overflowing product instead, the CDNA2 bf16 `_1k` count falls from 3,425 to 1,854, CDNA3 bf16 from 2,878 to 966 and xf32 from 2,202 to 496, on seed 1; that variant is not in the code), and sums that overflow in MMA-Sim's f32 additions but not in the per-product check of the MATLAB code (NaN against an infinity).
+- **A subnormal times an infinity, f16 (CDNA2, 7 to 10) and CDNA1 bf16 (5):** the MATLAB code settles infinities before flushing (infinity), MMA-Sim flushes first (NaN).
+
+Where the two agree, they are two readings of one set of hardware behaviour, not an independent confirmation: both papers' authors say they matched cards.
+On the finite results of f16 on CDNA1 and CDNA2 they agree on every vector.
+
 ## Disagreements and which side is wrong
 
 1. **AMD default (the double sum) against every MMA-Sim AMD model.** Hypothesis: ours is wrong. The double sum is a placeholder that this
@@ -135,8 +163,9 @@ f16 vectors, 63 percent of bf16 ones); it is not MMA-Sim's own `exact_sum`.
    (sequential); the family at chunk 4, G 24 matches MMA-Sim on 880,000 vectors, but a V100 and a T4 `m8n8k4` run is what would make it a rule.
    (b) `wgmma` and `tcgen05.mma` f16, bf16, tf32: the simulator keeps the sequential sum ("unmeasured" on the main page) while MMA-Sim gives them the
    Hopper numbers (F 25, L = 32 bytes); the rule on its own agrees with MMA-Sim on these forms (rows `Hopper wgmma` and `Blackwell tcgen05` above), so
-   enabling it there needs only a card: an H100 `wgmma` with `mmasim_kernels` vectors, and a B200 for `tcgen05`. (c) Ada's FP8 (F 13, result
-   `RZ-E8M13`), Hopper's `wgmma` FP8 (F 13), Blackwell's FP8 and FP6/FP4 and the block-scaled forms (`ST_FDPA`, F 25, L 32; `GST_FDPA` for k64,
+   enabling it there needs only a card: an H100 `wgmma` with `mmasim_kernels` vectors, and a B200 for `tcgen05`. (c) Hopper's `wgmma` FP8 (F 13) is
+   implemented since 2026-11-19 (it reproduces all 20,000 recorded H100 and H200 vectors; [fp8-vectors.md](fp8-vectors.md)); Ada's FP8 (F 13, result
+   `RZ-E8M13`) is `ada` there. Not implemented: Blackwell's FP8 and FP6/FP4 and the block-scaled forms (`ST_FDPA`, F 25, L 32; `GST_FDPA` for k64,
    G 16, F 35): no rule here; unmeasured.
 7. **No NVIDIA disagreement** was found. Where our `Hopper` rule is `inferred` (b200, gb200, rtx5090 and the other sm_120 profiles) MMA-Sim
    is the third source that gives the same numbers; it is not a card of ours.

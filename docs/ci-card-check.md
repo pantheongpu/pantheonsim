@@ -1,6 +1,12 @@
 # Card check: the e2e programs on a real GPU (design, not enabled)
 
-Status: a proposal. **`card-check.yml` does not exist in `.github/workflows/`**, no runner is registered and nothing runs it. (There is no other real-card workflow in the tree.) Turning it
+**Smaller version that exists:** `.github/workflows/oracle-diff.yml` runs `tools/oracle-diff/oracle-diff.sh`, a fixed set of probes
+(`tools/oracle-diff/manifest.txt`: `simd_lane_forms`, `float_half_forms`), nightly. Its `pinned` job diffs the simulator against the
+pinned card files; its `card` job diffs a real card against the same files and runs only on a self-hosted GPU runner when the repository
+variable `ORACLE_CARD_RUNNER` is `true` (labels: `ORACLE_CARD_RUNS_ON`, default `["self-hosted","linux","gpu-card"]`). No such runner is
+registered yet, so only the pinned job runs. `tests/lint/check_oracle_diff.sh` checks the manifest, the driver's verdicts and the workflow.
+
+Status of the larger design below: a proposal. **`card-check.yml` does not exist in `.github/workflows/`**, no runner is registered and nothing runs it. (There is no other real-card workflow in the tree.) Turning it
 on is the steps under [Enabling it](#enabling-it), all of which are the
 maintainer's to take.
 

@@ -44,6 +44,7 @@
 #include "vgpu/host_cores.hpp"
 #include "vgpu/host_cpus.hpp"
 #include "mfma_math.hpp"
+#include "mfma_models.hpp"
 #include "gcn_matrix_kernels.hpp"
 #include "tile_buf.hpp"
 #include "nan_order.hpp"
@@ -703,6 +704,18 @@ struct Machine {
   const bool cdna2_seq = cdna2_matrix_model();
   bool cdna2_sum(char in, char in_b, char out) const {
     return cdna2_seq && out == 'f' && (in == 'h' || in == 'b') && (in_b == 0 || in_b == in) && target() == gcn::Target::Gfx90a;
+  }
+  // Whether the Khattak, Mikaitis and Graziani model of this target's matrix cores sums the form (khattak_matrix_model; mfma_models.hpp):
+  // opt-in. It takes precedence over the FTTN rule on gfx90a. gfx950 has no model.
+  const bool khattak_on = khattak_matrix_model();
+  bool khattak_for(char in, char in_b, char out, khattak::Model& m) const {
+    if (!khattak_on || out != 'f') return false;
+    switch (target()) {
+      case gcn::Target::Gfx90a: m = khattak::Model::Cdna2; break;
+      case gcn::Target::Gfx942: m = khattak::Model::Cdna3; break;
+      default: return false;
+    }
+    return khattak::supports(m, in) && khattak::supports(m, in_b ? in_b : in);
   }
   // Across threads, an atomic on an ordinary word of device memory is a compare-and-swap on the word, not a lock.
   const bool lock_free = atomics_lock_free(), runs_on = memory_runs();
@@ -12367,7 +12380,9 @@ struct Machine {
       if (ta == 'f' && std::any_of(plan.fa.begin(), plan.fa.end(), denormal)) return false;
       if (tb == 'f' && std::any_of(plan.fbk.begin(), plan.fbk.end(), denormal)) return false;
     }
-    const bool seq32 = !sparse && !in.scaled && cdna2_sum(s.in, s.in_b, s.out);
+    khattak::Model km = khattak::Model::Cdna2;
+    const bool kh = !sparse && !in.scaled && khattak_for(s.in, s.in_b, s.out, km);
+    const bool seq32 = !kh && !sparse && !in.scaled && cdna2_sum(s.in, s.in_b, s.out);
     if (seq32) {   // (an MI250X reads a subnormal binary16 or bfloat16 as zero)
       const double min_normal = s.in == 'h' ? 0x1p-14 : 0x1p-126;
       cdna2_flush_inputs(plan.fa.data(), plan.fa.size(), min_normal);
@@ -12406,6 +12421,7 @@ struct Machine {
       const double* const c = plan.fc.data() + size_t{ob} * s.m * s.n;
       double* const o = plan.fo.data() + size_t{ob} * s.m * s.n;
       if (s.out == 'd') mfma_tile_fma(s.m, s.n, s.k, a, b, c, o);
+      else if (kh) khattak::tile(km, s.in, s.in_b ? s.in_b : s.in, s.m, s.n, s.k, a, b, c, o);
       else if (seq32) cdna2_tile_seq32<kMfmaOrder>(s.m, s.n, s.k, a, b, c, o);
       else mfma_tile_f(s.m, s.n, s.k, a, b, c, o);
     }
@@ -12628,7 +12644,9 @@ struct Machine {
     }
     // gfx90a's binary16 and bfloat16 forms as the FTTN paper reports of an MI250X (mfma_math.hpp): subnormals read as zero, then
     // one binary32 rounding a product.
-    const bool seq32 = !sparse && !in.scaled && cdna2_sum(s.in, s.in_b, s.out);
+    khattak::Model km = khattak::Model::Cdna2;
+    const bool kh = !sparse && !in.scaled && khattak_for(s.in, s.in_b, s.out, km);
+    const bool seq32 = !kh && !sparse && !in.scaled && cdna2_sum(s.in, s.in_b, s.out);
     if (seq32) {
       const double min_normal = s.in == 'h' ? 0x1p-14 : 0x1p-126;
       cdna2_flush_inputs(ap, plan.a.size(), min_normal);
@@ -12640,6 +12658,10 @@ struct Machine {
       const uint32_t* const as = &plan.a_off[size_t{lane} * outs];
       const uint32_t* const bs = &plan.b_off[size_t{lane} * outs];
       uint32_t r = 0;
+      if (kh) {
+        for (; r < outs; ++r)
+          set_word(w, in.dst[0], r, lane, as_bits(static_cast<float>(khattak::dot(km, s.in, s.in_b ? s.in_b : s.in, ap + as[r], bp + bs[r], 1, s.k, cp[cs[r]]))));
+      }
       if (seq32) {
         for (; r < outs; ++r) {
           double sum = cdna2_dot_seq32(ap + as[r], bp + bs[r], 1, s.k, cp[cs[r]]);
@@ -14555,6 +14577,19 @@ bool cdna2_matrix_model() {
   return from_env;
 }
 void set_cdna2_matrix_model(int on) { g_cdna2_model.store(on); }
+namespace {
+std::atomic<int> g_khattak_model{-1};   // -1: as the environment says
+}
+bool khattak_matrix_model() {
+  const int v = g_khattak_model.load(std::memory_order_relaxed);
+  if (v >= 0) return v != 0;
+  static const bool from_env = [] {
+    const char* e = std::getenv("VGPU_MFMA_MODEL");
+    return e && (e[0] == 'k' || e[0] == 'K');   // "khattak": off unless asked for
+  }();
+  return from_env;
+}
+void set_khattak_matrix_model(int on) { g_khattak_model.store(on); }
 
 void abandon_dispatches() { g_abandoned.store(true); }
 bool dispatches_abandoned() { return g_abandoned.load(); }

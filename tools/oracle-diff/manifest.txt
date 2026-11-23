@@ -1,0 +1,9 @@
+# The fixed kernel set of the card-oracle diff (tools/oracle-diff/oracle-diff.sh).
+# One e2e script per line, relative to nvidia/tests/e2e/. Each must (a) run the simulator against pinned card output when given no
+# argument and (b) run NVIDIA's runtime on a real GPU against the same pinned file with --card, so a pass in both modes means the
+# simulator's bits are the card's bits. Add a script only if it supports --card and its pinned file is a card's output.
+#
+# simd_lane_forms: 60 lines, SIMD-within-a-register, packed and tensor-core forms (wmma, mma.sync, HMMA), per form hashes.
+run_simd_lane_forms.sh
+# float_half_forms: 169 lines, f32/f16/f64 forms with flush, saturation, rounding mode and NaN rules, hashed per form.
+run_float_half_forms.sh

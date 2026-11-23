@@ -57,4 +57,4 @@ numerics:
 provenance:
   measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]
 evidence:
-  numerics: "card: NVIDIA A10G (this model), AWS; driver: 595.112.07; toolkit: CUDA 13.0; date: 2026-11-15. Both probes print the RTX 3060 lines, 60 of 60 and 169 of 169; FTTN. docs/matrix-numerics.md"
+  numerics: "card: NVIDIA A10G (this model), AWS; driver: 595.112.07; toolkit: CUDA 13.0; date: 2026-11-15. Both probes print the RTX 3060 lines (nvidia/tests/data/simd_lane_forms.rtx3060.txt, float_half_forms.rtx3060.txt), 60 of 60 and 169 of 169; FTTN. docs/matrix-numerics.md"

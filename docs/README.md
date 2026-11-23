@@ -10,6 +10,7 @@ One line per document. Start with the repository [README](../README.md); the des
 * [config.md](config.md): every setting of `pantheonsim.yaml` and its `VGPU_*` variable.
 * [cli.md](cli.md): every command and every `VGPU_*` environment variable.
 * [status.md](status.md): what runs today, what does not, the GPU profiles.
+* [install.md](install.md): every step on a clean Ubuntu machine, run by CI.
 * [toolchains.md](toolchains.md): compilers for your own programs (nvcc, hipcc).
 * [driver-api.md](driver-api.md): running a driver-API program.
 * [docker.md](docker.md): the container image.

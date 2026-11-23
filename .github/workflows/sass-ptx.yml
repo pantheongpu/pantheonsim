@@ -75,7 +75,7 @@ jobs:
       - name: Is there a SASS path?
         id: sass
         run: |
-          if grep -q VGPU_SASS_LOG nvidia/src/fatbin.cpp; then echo "here=yes" >> "$GITHUB_OUTPUT"
+          if grep -rq VGPU_SASS_LOG nvidia/src; then echo "here=yes" >> "$GITHUB_OUTPUT"
           else echo "::notice::no SASS executor in this tree: every kernel already runs on PTX, nothing to repeat"; fi
 
       - name: Install toolchain
@@ -126,7 +126,7 @@ jobs:
       - name: Is there a SASS path?
         id: sass
         run: |
-          if grep -q VGPU_SASS_LOG nvidia/src/fatbin.cpp; then echo "here=yes" >> "$GITHUB_OUTPUT"
+          if grep -rq VGPU_SASS_LOG nvidia/src; then echo "here=yes" >> "$GITHUB_OUTPUT"
           else echo "::notice::no SASS executor in this tree: nothing to repeat"; fi
 
       - name: Install toolchain
@@ -178,7 +178,7 @@ jobs:
       - name: Is there a SASS path?
         id: sass
         run: |
-          if grep -q VGPU_SASS_LOG nvidia/src/fatbin.cpp; then echo "here=yes" >> "$GITHUB_OUTPUT"
+          if grep -rq VGPU_SASS_LOG nvidia/src; then echo "here=yes" >> "$GITHUB_OUTPUT"
           else echo "::notice::no SASS executor in this tree: nothing to repeat"; fi
 
       - name: Install toolchain
@@ -236,7 +236,7 @@ jobs:
       - name: Is there a SASS path?
         id: sass
         run: |
-          if grep -q VGPU_SASS_LOG nvidia/src/fatbin.cpp; then echo "here=yes" >> "$GITHUB_OUTPUT"
+          if grep -rq VGPU_SASS_LOG nvidia/src; then echo "here=yes" >> "$GITHUB_OUTPUT"
           else echo "::notice::no SASS executor in this tree: nothing to compare"; fi
 
       - name: Install CUDA 13

@@ -17,6 +17,8 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
+#include "vgpu/memory.hpp"
+#include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
 #include "vtest.hpp"
@@ -1005,6 +1007,85 @@ VTEST(a_device_reset_releases_everything_and_starts_over) {
   const uint64_t out = dev.memory().alloc(4);
   dev.launch(*dev.get_function(mod2, "read_g"), LaunchConfig{}, {arg_u64(out)}, dev.symbols(mod2));
   VCHECK_EQ(u32_at(dev, out), 7u);
+}
+
+// ---------------------------------------------------------------------------
+// Mirrors wmma_gemm.cu, found by the differential run (nvidia/tests/e2e/run_differential.sh): the PTX engine counted nothing for wmma.load and
+// wmma.store, so the same kernel reported 0 bytes of global traffic on PTX and 2048 read and 1024 written on SASS (where the loads and stores
+// are LDG and STG). One m16n16k16 tile with f16 A and B and f32 C and D writes 1024 bytes (D has no element twice, so the SASS engine's
+// figure is the PTX engine's) and reads 1024 + 1024 + 1024: the fragments of A and B hold each f16 element in two registers, which PTX loads
+// twice and ptxas (sm_80 and up) once, so the load counts are of the PTX instruction and are not compared against SASS. A store to shared
+// memory is shared traffic.
+VTEST(wmma_load_and_store_are_counted) {
+  const std::string ptx = std::string(kHeader) + R"(
+.visible .entry tile(.param .u64 pa, .param .u64 pb, .param .u64 pc, .param .u64 pd)
+{
+    .reg .b32 %r<17>;
+    .reg .f32 %f<16>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [pa];
+    ld.param.u64 %rd2, [pb];
+    ld.param.u64 %rd3, [pc];
+    ld.param.u64 %rd4, [pd];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    cvta.to.global.u64 %rd3, %rd3;
+    cvta.to.global.u64 %rd4, %rd4;
+    mov.u32 %r16, 16;
+    wmma.load.a.sync.aligned.row.m16n16k16.f16 {%r0, %r1, %r2, %r3, %r4, %r5, %r6, %r7}, [%rd1], %r16;
+    wmma.load.b.sync.aligned.col.m16n16k16.f16 {%r8, %r9, %r10, %r11, %r12, %r13, %r14, %r15}, [%rd2], 16;
+    wmma.load.c.sync.aligned.row.m16n16k16.f32 {%f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7}, [%rd3], 16;
+    wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32
+        {%f8, %f9, %f10, %f11, %f12, %f13, %f14, %f15},
+        {%r0, %r1, %r2, %r3, %r4, %r5, %r6, %r7},
+        {%r8, %r9, %r10, %r11, %r12, %r13, %r14, %r15},
+        {%f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7};
+    wmma.store.d.sync.aligned.row.m16n16k16.f32 [%rd4], {%f8, %f9, %f10, %f11, %f12, %f13, %f14, %f15}, 16;
+    ret;
+}
+.visible .entry tile_shared(.param .u64 pc)
+{
+    .shared .align 16 .b8 tile[1024];
+    .reg .b32 %r<4>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [pc];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, tile;
+    wmma.load.c.sync.aligned.row.m16n16k16.f32 {%f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7}, [%rd1], 16;
+    wmma.store.d.sync.aligned.row.m16n16k16.shared.f32 [%r1], {%f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7}, 16;
+    ret;
+}
+)";
+  ptx::Module m = ptx::parse(ptx);
+  const auto entry = [&](const char* name) -> const ptx::EntryFn& {
+    for (const ptx::EntryFn& e : m.entries)
+      if (e.name == name) return e;
+    throw vtest::Failure(std::string("no entry ") + name);
+  };
+  MemoryManager mem(1 << 20);
+  DeviceProfile prof = load_gpu("nvidia/rtx3060");
+  const uint64_t a = mem.alloc(512), b = mem.alloc(512), c = mem.alloc(1024), d = mem.alloc(1024);
+  std::vector<uint8_t> zero(1024, 0);
+  mem.write(a, zero.data(), 512);
+  mem.write(b, zero.data(), 512);
+  mem.write(c, zero.data(), 1024);
+  exec::LaunchStats st = exec::launch(entry("tile"), block_of(32), {arg_u64(a), arg_u64(b), arg_u64(c), arg_u64(d)}, mem, prof);
+  VCHECK_EQ(st.global_bytes_read, uint64_t{3072});
+  VCHECK_EQ(st.global_bytes_written, uint64_t{1024});
+  VCHECK_EQ(st.global_bytes_ld, uint64_t{3072});
+  VCHECK_EQ(st.global_bytes_st, uint64_t{1024});
+  VCHECK(st.global_loads > 0 && st.global_stores > 0);
+  VCHECK(st.global_requests_ld > 0 && st.global_requests_st > 0);
+  VCHECK(st.global_sectors_ld > 0 && st.global_sectors_st > 0);
+  // A row-major f32 tile of 16 columns is 64 bytes a row: 1024 bytes are 32 sectors at the least.
+  VCHECK(st.global_sectors_st >= 32);
+
+  exec::LaunchStats sh = exec::launch(entry("tile_shared"), block_of(32), {arg_u64(c)}, mem, prof);
+  VCHECK_EQ(sh.global_bytes_read, uint64_t{1024});
+  VCHECK_EQ(sh.global_bytes_written, uint64_t{0});
+  VCHECK_EQ(sh.shared_bytes_written, uint64_t{1024});
+  VCHECK(sh.shared_stores > 0 && sh.shared_requests_st > 0);
 }
 
 VTEST_MAIN

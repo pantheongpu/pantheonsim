@@ -84,6 +84,24 @@ hosted runner (the test sizes its compiles from the memory free when it starts,
 so it takes one compile at a time there). If a sanitizer job is killed with exit
 137 in its test step, or the build job in a CUTLASS compile, revert the commit.
 
+## Clean-install and version-matrix
+
+Two scheduled workflows check what a user meets, not what the tests build:
+
+- `clean-install.yml` (nightly) starts a bare `ubuntu:24.04` container and runs the steps of
+  [install.md](install.md), and nothing else, with `tests/install/run_doc_steps.sh`: the build, the CUDA and ROCm
+  toolkit installs, and a hello-world CUDA and HIP program built and run on simulated GPUs. A step that names a
+  missing package or a wrong command fails the job; fix the page, not the workflow. A second job runs the Docker
+  command of the page.
+- `version-matrix.yml` (nightly) installs each CUDA from 12.4 to 13.2 and each ROCm from 6.4 to 7.2 through the
+  setup action, builds the checks in `tests/version-matrix/` (a kernel, cuBLAS, cuFFT and cuRAND; HIP shared
+  memory, atomics, streams and events) and runs them under `vgpu run`. The heavy suites stay in
+  `cuda-toolkits.yml` (12.4, 12.8, 12.9, nightly), `rocm-libraries.yml` (ROCm's own libraries, weekly) and `ci.yml`;
+  `tests/lint/check_version_matrix.py` fails when a version of the range is in none of them.
+
+Both also run on a pull request that changes their own files, and by hand (`gh workflow run`). They use
+`scripts/apt-retry.sh` for apt when the repository has it.
+
 ## Shards and the compile cache
 
 A survey of run 41545325796 on main found about 26,500 runner-seconds per run. Three tests were 35% of the unit job's CPU, and
@@ -297,6 +315,17 @@ Hosted runners install their toolchain with apt, and `security.ubuntu.com` answe
 Ubuntu mirror (archive.ubuntu.com, then kernel.org, Princeton, xtom, Leaseweb) before the next attempt, four attempts in
 all. `scripts/apt-mirror-fallback.sh` still switches mirrors up front when the image's mirror name does not resolve.
 `tests/lint/check_apt_mirror_fallback.sh` checks both with a fake apt-get, and fails if a workflow calls apt-get directly.
+
+## Differential execution and determinism
+
+`nvidia/tests/e2e/run_differential.sh diff` runs each program on the SASS engine and on the PTX interpreter (one host thread) and
+requires the same output, the same memory after every launch, the same launches, and the same blocks, warps and bytes written to
+global and shared memory. The instruction counts, load counts, requests, sectors and bank conflicts are not compared: they follow the
+instruction set (PTX or SASS) and what ptxas made of the loads. `... determinism` runs each program several times with other CPU
+affinity, niceness and environment size, once with `VGPU_EXACT_THREADS=4`, and the PTX random and adversarial schedulers with one seed
+twice; output, every counter and the memory must be the same. A short list runs in ctest (`e2e_differential_diff`,
+`e2e_differential_determinism`); `differential.yml` runs the full lists nightly with 20 repetitions. Differences that are understood are
+in the `known` table of the script, each with its reason; anything else fails. Found so far, all fixed: the PTX engine counted nothing for `wmma.load`, `wmma.store` and bulk-copy (TMA) traffic and one fewer shared store for `mbarrier.init` before sm_90; the SASS engine counted 16 bytes for every `SUST.P` whatever the lane stored; its fast global store paths did not count a store as progress (`Warp::idle_yields`); and a YIELD loop that does new work on every pass was taken for a spin-wait, so `break_spin_wait` let lanes go from a BSYNC early (`group_ballot_barrier` for sm_75: wrong ballots, and a deadlock). Left in the `known` table with the reason: the TMA store count of lanes that name the same operands (ptxas runs them once) and `mbarrier.init` on sm_90 and later (`SYNCS.EXCH.64`, not settled without an sm_90 card).
 
 ## What runs after a merge (2026-11-19)
 

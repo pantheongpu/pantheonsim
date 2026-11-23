@@ -18,6 +18,7 @@
 #include <mutex>
 #include <string>
 
+#include "vgpu/leak_check.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
 #include "vgpu/runtime/visible_devices.hpp"
@@ -27,7 +28,17 @@ namespace {
 std::mutex g_rt_mu;
 // Owned here, in the library whose definition the loader chose, and
 // destroyed with it at exit -- which is when its telemetry segment goes.
-std::unique_ptr<vgpu::runtime::Runtime> g_rt;
+//
+// The deleter is where VGPU_LEAK_CHECK looks at the machine (vgpu/leak_check.hpp): the last point at which the program's own
+// static destructors have run and the devices are still there.
+struct RuntimeDelete {
+  RuntimeDelete() = default;
+  void operator()(vgpu::runtime::Runtime* r) const {
+    vgpu::runtime::leak_check_finish(r);
+    delete r;
+  }
+};
+std::unique_ptr<vgpu::runtime::Runtime, RuntimeDelete> g_rt;
 }  // namespace
 
 // This copy's machine, if it has made one, without making one.
@@ -54,12 +65,12 @@ extern "C" __attribute__((visibility("default"))) vgpu::runtime::Runtime* vgpu_s
     const vgpu::runtime::VisibleDevices shown = vgpu::runtime::cuda_visible_devices(
         profile, count, std::getenv("CUDA_VISIBLE_DEVICES"), std::getenv("CUDA_DEVICE_ORDER"));
     if (shown.error == 0) {
-      rt = std::make_unique<vgpu::runtime::Runtime>(profile, static_cast<int>(shown.physical.size()),
-                                                    shown.physical, count);
+      rt.reset(new vgpu::runtime::Runtime(profile, static_cast<int>(shown.physical.size()), shown.physical, count));
     } else {
-      rt = std::make_unique<vgpu::runtime::Runtime>(profile, 1, std::vector<int>{0}, count);
+      rt.reset(new vgpu::runtime::Runtime(profile, 1, std::vector<int>{0}, count));
       rt->set_visibility_error(shown.error);
     }
+    vgpu::runtime::leak_check_arm();   // VGPU_LEAK_CHECK: what the machine holds now is the baseline
     const char* q = std::getenv("VGPU_QUIET");
     if (!(q && q[0] == '1')) {
       if (shown.error == 0)

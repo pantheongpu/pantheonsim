@@ -578,6 +578,8 @@ Hash128 profile_hash(const DeviceProfile& p) {
   h.u64(static_cast<uint64_t>(static_cast<int64_t>(n.tensor_sum_grid))), h.u64(static_cast<uint64_t>(n.tensor_sum_published));
   h.u64(static_cast<uint64_t>(n.tensor_sum_fp8)), h.u64(n.tensor_sum_fp8_chunk);
   h.u64(static_cast<uint64_t>(static_cast<int64_t>(n.tensor_sum_fp8_grid))), h.u64(static_cast<uint64_t>(static_cast<int64_t>(n.tensor_sum_fp8_out_bits)));
+  h.u64(static_cast<uint64_t>(n.tensor_sum_wgmma_fp8)), h.u64(n.tensor_sum_wgmma_fp8_chunk);
+  h.u64(static_cast<uint64_t>(static_cast<int64_t>(n.tensor_sum_wgmma_fp8_grid))), h.u64(static_cast<uint64_t>(static_cast<int64_t>(n.tensor_sum_wgmma_fp8_out_bits)));
   return h.done();
 }
 

@@ -222,6 +222,16 @@ inline constexpr Fp8SumRule kAdaFp8Rule{"ada: chunks of 16, cut at 2^(top-14), f
 inline constexpr const Fp8SumRule* fp8_sum_rule(Fp8Sum m) { return m == Fp8Sum::Ada ? &kAdaFp8Rule : nullptr; }   // ViaF16 has no numbers of its own
 inline constexpr const char* fp8_sum_name(Fp8Sum m) { return m == Fp8Sum::Ada ? "ada" : m == Fp8Sum::ViaF16 ? "via_f16" : "sequential"; }
 
+// The sum of the e4m3 and e5m2 forms of wgmma (Hopper's warpgroup MMA, HGMMA/QGMMA in SASS), which is not the sum of the same operands in
+// mma.sync. Same arithmetic as Fp8Sum::Ada (vgpu/exec/tc_fp8.hpp) with other numbers; dense forms only.
+//
+//   Sequential  products and sums in f32, k in order.
+//   Hopper      one chunk of 32 products (all of K) and the accumulator, cut at 2^(top - 14), an f32 result cut to 13 fraction bits.
+enum class WgmmaFp8Sum : uint8_t { Sequential, Hopper };
+inline constexpr Fp8SumRule kHopperWgmmaFp8Rule{"hopper wgmma: one chunk of 32, cut at 2^(top-14), f32 results cut to 13 fraction bits", 32, 14, 13};
+inline constexpr const Fp8SumRule* wgmma_fp8_sum_rule(WgmmaFp8Sum m) { return m == WgmmaFp8Sum::Hopper ? &kHopperWgmmaFp8Rule : nullptr; }
+inline constexpr const char* wgmma_fp8_sum_name(WgmmaFp8Sum m) { return m == WgmmaFp8Sum::Hopper ? "hopper" : "sequential"; }
+
 // A profile's `numerics:` section. Absent (present == false): the sequential sum and no published model, which is what an AMD or
 // Intel profile has -- their engines do not read this.
 struct Numerics {
@@ -242,6 +252,12 @@ struct Numerics {
   uint32_t tensor_sum_fp8_chunk = 0;
   int32_t tensor_sum_fp8_grid = 0;
   int32_t tensor_sum_fp8_out_bits = 0;
+  // numerics.tensor_sum_wgmma_fp8 and its numbers (_chunk, _grid, _out_bits): the same for the e4m3 and e5m2 forms of wgmma. Optional, with the
+  // numbers those of wgmma_fp8_sum_rule(tensor_sum_wgmma_fp8).
+  WgmmaFp8Sum tensor_sum_wgmma_fp8 = WgmmaFp8Sum::Sequential;
+  uint32_t tensor_sum_wgmma_fp8_chunk = 0;
+  int32_t tensor_sum_wgmma_fp8_grid = 0;
+  int32_t tensor_sum_wgmma_fp8_out_bits = 0;
 };
 
 // What a value in a profile rests on. Exactly four classes; a key carries at most one.
