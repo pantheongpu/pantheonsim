@@ -4418,6 +4418,22 @@ if(TARGET vgpucudart)
     TIMEOUT 3600)
 endif()
 
+# Differential execution and determinism in exact mode (nvidia/tests/e2e/run_differential.sh). diff: the SASS engine against the PTX interpreter, one
+# host thread each: output, memory after every launch, the launches and the counters both engines define alike. determinism: one program, several
+# runs (CPU affinity, niceness, environment size, VGPU_EXACT_THREADS, replayable warp schedulers) that must leave the same output, counters and memory.
+# A short list on pull requests; VGPU_NIGHTLY=1 (the `differential` job of .github/workflows/sass-ptx.yml) runs every program on every architecture.
+if(TARGET vgpucudart)
+  foreach(_m diff determinism)
+    add_test(NAME e2e_differential_${_m} COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_differential.sh ${_m})
+    set_tests_properties(e2e_differential_${_m} PROPERTIES
+      DEPENDS vgpucudart
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      RESOURCE_LOCK nvcc_memory
+      TIMEOUT 3600)
+  endforeach()
+endif()
+
 # The device runtime (cudadevrt): cdp_device_api and cdp1_device_sync alone, on four generations,
 # as e2e_sass_archs runs them among the rest (nvidia/docs/sass.md, "Device runtime").
 if(TARGET vgpucudart)

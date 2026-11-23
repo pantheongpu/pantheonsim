@@ -1,0 +1,91 @@
+name: Differential and determinism
+
+# Exact mode must not depend on how a program is run (nvidia/tests/e2e/run_differential.sh):
+#
+#   diff         every program of the full list on every architecture: the SASS
+#                engine against the PTX interpreter, one host thread each. The
+#                output, the memory after every launch, the launches and the
+#                counters both engines define alike must be the same bits.
+#   determinism  each of them run 20 times (CPU affinity, niceness, environment
+#                size, VGPU_EXACT_THREADS=4, replayed random and adversarial warp
+#                schedulers): output, every counter and the memory must not move.
+#
+# The pull request gate is the short list in ctest (e2e_differential_diff and
+# e2e_differential_determinism, in the build job); this runs the full lists, nightly
+# and by hand.
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - nvidia/tests/e2e/run_differential.sh
+      - .github/workflows/differential.yml
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  image:
+    uses: ./.github/workflows/ci-image-ref.yml
+
+  differential:
+    name: ${{ matrix.mode }} (full lists)
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [diff, determinism]
+    container:
+      # CUDA 13: the only toolkit here that targets every generation (12.0 stops at sm_90).
+      image: ${{ needs.image.outputs.cuda13_0 }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: --shm-size=2g
+    env:
+      NVCC_PREPEND_FLAGS: ''
+      VGPU_NIGHTLY: '1'
+      VGPU_DET_REPS: '20'
+      VGPU_DIFF_INFO: '1'
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+
+      - name: Check the memory
+        env:
+          CI_RESERVE: '0'
+        run: ci/jobs.sh --check sass
+
+      - name: Build the runtime shims
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpucudart vgpucuda
+
+      - name: Run
+        env:
+          MODE: ${{ matrix.mode }}
+        run: |
+          mkdir -p logs
+          VGPU_BUILD_DIR="$PWD/build" VGPU_DIFF_KEEP="$PWD/logs/work" nvidia/tests/e2e/run_differential.sh "$MODE" 2>&1 | tee "logs/$MODE.txt"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: differential-${{ matrix.mode }}
+          path: logs
+          retention-days: 14
