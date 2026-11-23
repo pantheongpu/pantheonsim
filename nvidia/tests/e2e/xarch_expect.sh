@@ -40,6 +40,8 @@ xarch_groups[sass_archs@native]="a100 a10g l4 | h100 h200 | b200 rtx5090"      #
 xarch_groups[minmax_forms@ptx]="a10g l4 h100 h200 | b200 rtx5090"
 xarch_groups[minmax_forms@native]="a10g l4 h100 h200 | b200 rtx5090"   # a100 lacks the xorsign forms (sm_86), b200 and rtx5090 the 3-input forms (sm_100)
 
+xarch_groups[packed_f32x2@native]="b200 | rtx5090"   # two NaN-payload slots (171, 172) differ between the sm_100 and the sm_120 build: other SASS for the same PTX; the program says NaN payloads are unchecked on hardware, and the PTX engine agrees on both profiles
+
 # --- test programs whose output depends on host threads or on the order of host callbacks: their memory digests are not comparable.
 xarch_nodigest=" sched_pool "
 
