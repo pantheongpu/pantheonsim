@@ -10788,6 +10788,14 @@ class Interpreter {
     }
   }
 
+  // The e4m3 / e5m2 sum of the device's wgmma (vgpu/exec/tc_fp8.hpp): null for every other form, a sparse one, and a device without one.
+  const vgpu::Fp8SumRule* wgmma_fp8_rule_of(const OpWgmma& op) const {
+    const auto fp8 = [](WgmmaElem t) { return t == WgmmaElem::E4M3 || t == WgmmaElem::E5M2; };
+    if (op.sparse || op.d_type == WgmmaAcc::S32 || !fp8(op.a_type) || !fp8(op.b_type)) return nullptr;
+    return vgpu::exec::tc86::wgmma_fp8_rule(profile_);
+  }
+  static int wgmma_fp8_emin(WgmmaElem t) { return t == WgmmaElem::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3; }
+
   // ---- Hopper warpgroup MMA (wgmma, sm_90a) ----
   //
   // Four consecutive warps form a warpgroup and compute one 64xNxK product,
@@ -10980,7 +10988,10 @@ class Interpreter {
       Cf.resize(size_t{16} * N);
       Df.resize(size_t{16} * N);
       wgmma_acc_to_tile(cw.data(), N, f16_acc, Cf.data());
-      simd::kernels().tile_f32c(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
+      if (const vgpu::Fp8SumRule* wr = wgmma_fp8_rule_of(op))
+        vgpu::exec::tc86::fp8_tile(*wr, f16_acc, wgmma_fp8_emin(op.a_type), wgmma_fp8_emin(op.b_type), 16, N, K, Af.data(), snap.Bf.data(), Cf.data(), Df.data());
+      else
+        simd::kernels().tile_f32c(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
       wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data(), true);
     }
     for (uint32_t reg = 0; reg < nregs; ++reg) scatter_words(w, op.d[reg], m, &dw[size_t{reg} * 32], !int_form);
@@ -11126,6 +11137,7 @@ class Interpreter {
       *col = 8 * j + 2 * t + (s % 2);
     };
     const bool f16_acc = op.d_type == WgmmaAcc::F16;
+    const vgpu::Fp8SumRule* const fp8_rule = wgmma_fp8_rule_of(op);
     const uint32_t elems = N / 2;   // accumulator elements per lane
     std::vector<Lanes> out(op.d.size());
     for (uint32_t reg = 0; reg < op.d.size(); ++reg) {
@@ -11156,9 +11168,14 @@ class Interpreter {
                         : f32(slot);
         // Products of every input type here are exact in f32, and the sum is
         // kept in f32 -- "at least single precision" for an f32 accumulator,
-        // and more than the half precision an f16 one promises.
-        for (uint32_t k = 0; k < K; ++k)
-          acc += static_cast<float>(A[row * K + k]) * static_cast<float>(B[size_t{k} * N + col]);
+        // and more than the half precision an f16 one promises. The e4m3 and
+        // e5m2 forms of a device that has its own sum use that.
+        if (fp8_rule)
+          acc = static_cast<float>(vgpu::exec::tc86::fp8_dot(*fp8_rule, f16_acc, wgmma_fp8_emin(op.a_type), wgmma_fp8_emin(op.b_type), &A[row * K], 1,
+                                                             &B[col], N, K, acc));
+        else
+          for (uint32_t k = 0; k < K; ++k)
+            acc += static_cast<float>(A[row * K + k]) * static_cast<float>(B[size_t{k} * N + col]);
         if (f16_acc) {
           const uint64_t h = double_to_f16(acc) & 0xFFFF;
           slot = (slot & ~(uint64_t{0xFFFF} << shift) & 0xFFFFFFFFu) | (h << shift);

@@ -55,14 +55,22 @@ over 150 vectors of each f16 file (c rounded to binary16 first) 150 of 150, and 
 MMA-Sim also gives a zero term the exponent -132 (-20 for an f16 accumulator); with FP8 operands every product's exponent is at least -12 and
 an accumulator's at least -126 (f16: -14), so that floor is below every other term and cannot change a result: it is left out.
 
+## `wgmma` with FP8 on Hopper (2026-11-19)
+
+The H100 and H200 f32-accumulator files were recorded with a zero accumulator (the paper's own validation script zeroes C for them: `wgmma`, not
+`mma.sync`): neither the Ada nor the `via_f16` rule fits them (the simulator's `mma.sync` gives 500 and 307 mismatches of 500, with and without the
+file's C). A rule of the same family does: **one chunk of 32 products, terms cut 13 bits below the largest, result cut to 13 fraction bits**
+(`fit_fp8.py ... --zero-c --L 32 --n 5000`: **5,000 of 5,000** vectors of each of H100 e4m3, H100 e5m2, H200 e4m3 and H200 e5m2; the next best grid, 14, gives
+4,133, 4,548, 4,133 and 4,548). It is MMA-Sim's Hopper `wgmma` FP8 rule. Since 2026-11-19 the simulator's `wgmma` (PTX engine) and `QGMMA` (SASS engine) use it for the
+dense e4m3 and e5m2 forms with an f32 or f16 accumulator, on the sm_90 profiles (`numerics.tensor_sum_wgmma_fp8: hopper`, class **inferred**: the vectors are
+others' and no card of ours ran a `wgmma`). It is `fp8_dot` with `kHopperWgmmaFp8Rule` (chunk 32, grid 14, 13 result bits), the accumulator joining the chunk as it
+does on Ada. `tests/unit/test_wgmma_fp8.cpp` holds 48 of the recorded vectors (those the sequential sum gets wrong) to the rule and to a real `wgmma.mma_async`, both PTX routes. `nvidia/tests/e2e/run_wgmma_fp8_vectors.sh` runs 24 vectors of each file through a real `wgmma.mma_async` m64n8k32 on both engines (ptxas's `QGMMA` and the PTX engine); with `VGPU_KHATTAK_VECTORS` it runs all 5,000 of each: **0 mismatches of 20,000 on both engines**, 2026-11-19 (the sequential sum, `VGPU_TC_EXACT=0`, misses 9 to 13 of each 24).
+
+What is not known: the rule is checked with a zero accumulator only (a non-zero accumulator joining the chunk is MMA-Sim's model, not something these files show);
+an f16 accumulator has no recorded data for `wgmma`; the sparse FP8 forms keep the sequential sum; `wgmma` f16, bf16, tf32 and `tcgen05.mma` have no recorded data at all.
+
 ## What the data also says, not implemented
 
-- **`wgmma` with FP8 on Hopper.** The H100 and H200 f32-accumulator files were recorded with a zero accumulator (the paper's own validation
-  script zeroes C for them: `wgmma`, not `mma.sync`): neither the Ada nor the `via_f16` rule fits them (the simulator's `mma.sync` gives 500 and 307
-  mismatches of 500, with and without the file's C). A rule of the same family does: **one chunk of 32 products, terms cut 13 bits below the largest,
-  result cut to 13 fraction bits** (`fit_fp8.py ... --zero-c`: H100 e4m3 100 of 100, H200 e4m3 100 of 100, H100 e5m2 100 of 100). It is MMA-Sim's
-  Hopper `wgmma` FP8 rule. The simulator's `wgmma` keeps the sequential f32 sum; changing it is the next step (the `wgmma` path is separate code
-  with its own tile kernels), with these files as the check. `wgmma` f16, bf16 and tf32 and `tcgen05.mma` have no recorded data at all.
 - **sm_120.** The B200 vectors do not describe an RTX PRO 6000 Blackwell: the sm_120 profiles give 164 to 183 mismatches of 500 on them. The card
   of ours measured the narrow-float sum there (exact sum cut toward zero: 18 of 27 forms bit for bit, nine not).
 - **Sparse forms, the FP6 and FP4 forms, block-scaled forms on sm_90 and sm_100:** no recorded data.

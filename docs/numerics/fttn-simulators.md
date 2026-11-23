@@ -76,5 +76,5 @@ Reading it:
 
 - V100 (the paper's block of 4, no extra bit): no profile and CUDA 13 cannot build sm_70.
 - MI100 (the paper's block of 4, 3 bits, RTN-TE): no gfx908 profile or target.
-- The FP8 forms and `wgmma`: FTTN has no FP8 program. The FP8 `mma.sync` forms are checked against recorded vectors in
+- The FP8 forms and `wgmma`: FTTN has no FP8 program. The FP8 `mma.sync` and dense FP8 `wgmma` forms are checked against recorded vectors in
   [fp8-vectors.md](fp8-vectors.md).

@@ -142,8 +142,7 @@ Two things the method taught us, on the way:
 
 ## Not done
 
-- **FP8 (E4M3, E5M2) vectors.** Done since 2026-11-18 for `mma.sync` on both engines, 70,000 vectors: [fp8-vectors.md](fp8-vectors.md). Not done: `wgmma`
-  with FP8 (a rule fits the H100 and H200 files, the simulator's `wgmma` keeps the sequential sum) and the sparse forms.
+- **FP8 (E4M3, E5M2) vectors.** Done since 2026-11-18 for `mma.sync` on both engines, 70,000 vectors: [fp8-vectors.md](fp8-vectors.md). `wgmma` with FP8 done 2026-11-19 (the rule fits all 20,000 H100 and H200 vectors; `inferred`). Not done: the sparse forms.
 - **Making Blackwell's published rule the default** for the profiles with no recorded data. Done on 2026-11-16 for b200 and gb200 only
   (their B200 vectors agree with it, 0 of 20,000, and the sequential sum does not, 8,020). sm_103 (b300), sm_120 (RTX PRO 6000, 5090),
   thor, gb10 and vr200 stay sequential by default: no recorded data covers them. A one-line change per profile
