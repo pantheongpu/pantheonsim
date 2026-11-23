@@ -1,10 +1,11 @@
 fp8/*.txt (the e4m3 and e5m2 samples: 24 vectors each of an RTX 1000 Ada, a B200 and, f16 accumulator, an H100: the first 24 of each file, same source commit, same conversion) and
 fp8-wgmma/*.txt (the e4m3 and e5m2 f32-accumulator samples: 24 vectors each of an H100 and an H200, recorded through wgmma with a zero accumulator: the first 24 of each file, same source commit, same conversion) and
-khattak_sample files (A100.*.txt, H100.*.txt, B200.*.txt): 24 test vectors each, copied from the model_validation/ directory of
+khattak_sample files (A100.*.txt, H100.*.txt, B200.*.txt, V100.*.txt): 24 test vectors each, copied from the model_validation/ directory of
 https://github.com/north-numerical-computing/MATLAB-tensor-core (commit 79143bd29a4a71dc7c2ed47741b63572498b17f6), converted by
 tools/tcpapers/khattak_convert.py to one line a vector. They are the recorded results of A100, H100 and B200 cards; the full sets
 are 5,000 vectors a file (tools/tcpapers/khattak-fetch.sh downloads them). Which 24: for the A100 files the first 24; for H100 and
-B200 the first 8 vectors an RTX 3060 reproduces and the first 16 it does not (so the sample can tell an Ampere sum from a Hopper one).
+B200 the first 8 vectors an RTX 3060 reproduces and the first 16 it does not (so the sample can tell an Ampere sum from a Hopper one); for V100.fp16.fp32.txt
+(K = 4, m8n8k4) the first 8 vectors the Ampere rule reproduces and the first 16 it does not (it tells grid 25 from the Volta grid 24), for V100.fp16.fp16.txt the first 24.
 
 Copyright (c) 2025, Faizan A. Khattak and Mantas Mikaitis. All rights reserved.
 BSD 2-Clause License. Redistribution and use in source and binary forms, with or without modification, are permitted provided that

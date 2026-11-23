@@ -1690,6 +1690,9 @@ vgpu_unit_test(test_wgmma_fast)
 # The e4m3 / e5m2 sum of wgmma on a Hopper device (tc_fp8.hpp, kHopperWgmmaFp8Rule): recorded H100 and H200 vectors through the rule and through a
 # real wgmma (both PTX routes), the sequential sum for VGPU_TC_EXACT=0, and what each profile names.
 vgpu_unit_test(test_wgmma_fp8)
+# The sums of mma.m8n8k4 (Volta's rule, recorded V100 vectors), wgmma (f16, bf16, tf32: recorded H100 vectors, MMA-Sim's claim) and tcgen05.mma, what each profile names.
+vgpu_unit_test(test_tc_forms)
+target_compile_definitions(test_tc_forms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # tcgen05.mma reading its operands whole from shared memory against the element reads, bit for bit.
 vgpu_unit_test(test_tcgen05_fast)
 # tcgen05.mma through the tile kernels for the forms the whole-operand route leaves to the row loop (f16 D, layouts F, B, G, A in Tensor Memory, sparse A,

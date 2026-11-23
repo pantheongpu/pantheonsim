@@ -4884,6 +4884,11 @@ void Runner::exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const uint32_t elems = N / 2;   // accumulator elements per lane
   // QGMMA on a device that has its own e4m3 / e5m2 sum for wgmma (vgpu/exec/tc_fp8.hpp).
   const vgpu::Fp8SumRule* const fp8_rule = ins.op == Op::QGMMA && !sparse && !int_form ? vgpu::exec::tc86::wgmma_fp8_rule(profile_) : nullptr;
+  // HGMMA (f16, bf16 and tf32 operands, dense) on a device that has its own sum for it (vgpu/exec/tc_forms.hpp).
+  const vgpu::exec::tc86::SumRule* const form_rule =
+      ins.op == Op::HGMMA && !sparse && !int_form && bt == at && (at == T::F16 || at == T::BF16 || at == T::TF32) && K <= vgpu::exec::tc86::kFormMaxK
+          ? vgpu::exec::tc86::wgmma_rule(profile_)
+          : nullptr;
   each_lane(ex, [&](unsigned l) {
     std::vector<uint32_t> out(acc32 || int_form ? elems : (elems + 1) / 2);
     for (size_t i = 0; i < out.size(); ++i) out[i] = rc == kRZ ? 0 : w.reg(rc + static_cast<unsigned>(i), l);
@@ -4909,6 +4914,9 @@ void Runner::exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         acc = static_cast<float>(vgpu::exec::tc86::fp8_dot(*fp8_rule, !acc32, at == T::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3,
                                                            bt == T::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3, &A[row * K], 1,
                                                            &B[col], N, K, acc));
+      else if (form_rule)
+        acc = vgpu::exec::tc86::form_dot(*form_rule, at == T::TF32, at == T::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide, !acc32, &A[row * K], 1,
+                                         &B[col], N, K, acc);
       else
         for (uint32_t k = 0; k < K; ++k)
           acc += static_cast<float>(A[row * K + k]) * static_cast<float>(B[size_t{k} * N + col]);
@@ -5030,6 +5038,13 @@ bool Runner::gmma_fast(Block& blk, Warp& w, const Instr& ins, Mask ex, const Gmm
       vgpu::exec::tc86::fp8_tile(*wr, f16_acc, f.at == exec::TileElem::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3,
                                  f.bt == exec::TileElem::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3, 16, N, K, Af.data(), snap.Bf.data(),
                                  Cf.data(), Df.data());
+    else if (const vgpu::exec::tc86::SumRule* fr =
+                 ins.op == Op::HGMMA && !f.sparse && f.bt == f.at && K <= vgpu::exec::tc86::kFormMaxK &&
+                         (f.at == exec::TileElem::F16 || f.at == exec::TileElem::BF16 || f.at == exec::TileElem::TF32)
+                     ? vgpu::exec::tc86::wgmma_rule(profile_)
+                     : nullptr)
+      vgpu::exec::tc86::form_tile(*fr, f.at == exec::TileElem::TF32, f.at == exec::TileElem::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide, f16_acc,
+                                  16, N, K, Af.data(), snap.Bf.data(), Cf.data(), Df.data());
     else
       simd::kernels().tile_f32c(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
     exec::wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data(), true);
@@ -7380,6 +7395,7 @@ void Runner::exec_tcgen05(Block& blk, Warp& w, const Instr& ins, Mask ex) {
                       : reuse          ? ptx::Tcgen05Collector::LastUse
                                        : ptx::Tcgen05Collector::Discard;
       }
+      m.sum = vgpu::exec::tc86::tcgen05_rule(profile_);
       SassTcHost h(group(ins.f[1]), &blk);
       exec::tcgen05_mma(m, h);
       return;

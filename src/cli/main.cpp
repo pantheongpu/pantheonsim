@@ -193,6 +193,12 @@ int cmd_info(const std::string& gpu, bool json) {
         std::printf(",\n    \"tensor_sum_wgmma_fp8\": \"%s\",\n    \"tensor_sum_wgmma_fp8_chunk\": %u,\n    \"tensor_sum_wgmma_fp8_grid\": %d,\n    \"tensor_sum_wgmma_fp8_out_bits\": %d",
                     vgpu::wgmma_fp8_sum_name(p.numerics.tensor_sum_wgmma_fp8), p.numerics.tensor_sum_wgmma_fp8_chunk,
                     p.numerics.tensor_sum_wgmma_fp8_grid, p.numerics.tensor_sum_wgmma_fp8_out_bits);
+      if (p.numerics.tensor_sum_wgmma != vgpu::FormSum::Sequential)
+        std::printf(",\n    \"tensor_sum_wgmma\": \"%s\"", vgpu::form_sum_name(p.numerics.tensor_sum_wgmma));
+      if (p.numerics.tensor_sum_tcgen05 != vgpu::FormSum::Sequential)
+        std::printf(",\n    \"tensor_sum_tcgen05\": \"%s\"", vgpu::form_sum_name(p.numerics.tensor_sum_tcgen05));
+      if (p.numerics.tensor_sum_m8n8k4 != vgpu::FormSum::Sequential)
+        std::printf(",\n    \"tensor_sum_m8n8k4\": \"%s\"", vgpu::form_sum_name(p.numerics.tensor_sum_m8n8k4));
       std::printf("\n  ");
     }
     std::printf("},\n  \"provenance\": {");
@@ -271,6 +277,12 @@ int cmd_info(const std::string& gpu, bool json) {
         std::printf("    tensor_sum_wgmma_fp8_grid: %-6d [%s]\n", p.numerics.tensor_sum_wgmma_fp8_grid, tag_of("numerics.tensor_sum_wgmma_fp8_grid"));
         std::printf("    tensor_sum_wgmma_fp8_out_bits: %-3d [%s]\n", p.numerics.tensor_sum_wgmma_fp8_out_bits, tag_of("numerics.tensor_sum_wgmma_fp8_out_bits"));
       }
+      if (p.numerics.tensor_sum_wgmma != vgpu::FormSum::Sequential)
+        std::printf("    tensor_sum_wgmma:      %-10s [%s]\n", vgpu::form_sum_name(p.numerics.tensor_sum_wgmma), tag_of("numerics.tensor_sum_wgmma"));
+      if (p.numerics.tensor_sum_tcgen05 != vgpu::FormSum::Sequential)
+        std::printf("    tensor_sum_tcgen05:    %-10s [%s]\n", vgpu::form_sum_name(p.numerics.tensor_sum_tcgen05), tag_of("numerics.tensor_sum_tcgen05"));
+      if (p.numerics.tensor_sum_m8n8k4 != vgpu::FormSum::Sequential)
+        std::printf("    tensor_sum_m8n8k4:     %-10s [%s]\n", vgpu::form_sum_name(p.numerics.tensor_sum_m8n8k4), tag_of("numerics.tensor_sum_m8n8k4"));
     }
     bool other = false;
     for (auto& [k, c] : p.provenance) {
