@@ -215,8 +215,17 @@ signature() {
 }
 
 check_determinism() {
-  local p=$1 arch=$2 bin="$work/$1.$2" why="" reps="${VGPU_DET_REPS:-5}" i ncpu last
-  ncpu=$(nproc); last=$((ncpu - 1))
+  local p=$1 arch=$2 bin="$work/$1.$2" why="" reps="${VGPU_DET_REPS:-5}" i
+  # The CPUs this process may use, which a container's cpuset can make other than 0 to nproc-1 (the ML runner's are not): pin to the
+  # first, the last and all of those, and not at all where taskset refuses.
+  local allowed first last cpu_all
+  allowed="$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status 2>/dev/null)"
+  first=""; last=""; cpu_all="$allowed"
+  for part in ${allowed//,/ }; do
+    [[ -n $first ]] || first=${part%%-*}
+    last=${part##*-}
+  done
+  if ! command -v taskset >/dev/null || [[ -z $first ]] || ! taskset -c "$first" true 2>/dev/null; then first=""; fi
   run_one "$p" "$arch" r0 VGPU_THREADS=1 VGPU_SASS_LOG=1 --
   if ! grep -q "running SASS" "$bin.r0.out" || grep -q "running PTX instead of SASS" "$bin.r0.out"; then
     echo "note $arch $p: ran PTX, no SASS to run twice"; fellback=$((fellback + 1))
@@ -226,15 +235,15 @@ check_determinism() {
   for ((i = 1; i < reps; i++)); do
     local pre=() envs=(VGPU_THREADS=1 VGPU_SASS_LOG=1)
     case $((i % 5)) in
-      1) command -v taskset >/dev/null && pre=(taskset -c 0) ;;
-      2) command -v taskset >/dev/null && pre=(taskset -c "$last") ;;
+      1) [[ -n $first ]] && pre=(taskset -c "$first") ;;
+      2) [[ -n $first ]] && pre=(taskset -c "$last") ;;
       3) pre=(nice -n 10) ;;
       4) envs+=("CI_ENV_PADDING_$i=$(printf 'x%.0s' $(seq 1 $((i * 997))))") ;;
-      0) command -v taskset >/dev/null && pre=(taskset -c "0-$last") ;;
+      0) [[ -n $first ]] && pre=(taskset -c "$cpu_all") ;;
     esac
     run_one "$p" "$arch" r$i "${envs[@]}" -- "${pre[@]}"
     signature "$bin" r$i
-    cmp -s "$bin.r0.sig" "$bin.r$i.sig" || { why="${why:+$why; }run $i (${pre[*]:-env pad}) differs from run 0"; diff "$bin.r0.sig" "$bin.r$i.sig" | head -6 | cut -c1-240 | sed 's/^/    /'; }
+    cmp -s "$bin.r0.sig" "$bin.r$i.sig" || { why="${why:+$why; }run $i (${pre[*]:-env pad}) differs from run 0"; diff "$bin.r0.sig" "$bin.r$i.sig" | head -6 | cut -c1-240 | sed 's/^/    /'; head -3 "$bin.r$i.out" | cut -c1-200 | sed 's/^/    its output: /'; }
   done
   # The promise of docs/exact-threads.md: four host threads that prove the blocks independent give one thread's answer.
   run_one "$p" "$arch" ex VGPU_THREADS=1 VGPU_EXACT_THREADS=4 VGPU_SASS_LOG=1 --
