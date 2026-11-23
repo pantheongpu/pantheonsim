@@ -489,7 +489,7 @@ a denormal operand of `v_rcp_f32`, `v_rsq_f32`, `v_sqrt_f32`, `v_log_f32` is a z
 the NaN of a negative operand to `v_rsq_f32`/`v_sqrt_f32`/`v_log_f32` is `0xffc00000` on the card (read from the
 vectors file; the host's `-nan` is the same bits on x86).
 
-**Run on 2026-11-23 (issues #721, #722, `test_amd_cross_arch`):** the simulator's gfx1030 differed from the card on 82 of the
+**Run on 2026-11-23 (issues #721, #722, `test_amd_gcn_cross_arch`):** the simulator's gfx1030 differed from the card on 82 of the
 7 x 77 selected operands: every denormal operand and result of the first five, and the cosine (and the sine of an operand that
 is not a whole number of turns) of the largest floats. Now the interpreter and the tier share `amd/src/transcendental.hpp`:
 the five flush a denormal operand and a denormal result to a zero of its sign (measured on gfx1030 and gfx1031, **inferred** for

@@ -1,9 +1,9 @@
 # AMD: the same instruction on different architectures
 
 Found 2026-11-23 by running one-instruction kernels (`amd/tests/data/xarch.c`, built for gfx90a, gfx942, gfx950, gfx1030, gfx1100,
-gfx1201 and gfx1250 by `amd/tests/data/build.sh`; `amd/tests/unit/test_amd_cross_arch.cpp`) on the same 4,761 edge-case operand
+gfx1201 and gfx1250 by `amd/tests/data/build.sh`; `amd/tests/unit/test_gcn_cross_arch.cpp`) on the same 4,761 edge-case operand
 pairs (zeros of both signs, denormals, infinities, NaNs with payloads, the ends of the half and float ranges) and diffing the
-targets. `VGPU_XARCH_DUMP=<dir> build/test_amd_cross_arch` writes every target's results for a diff of your own. The census covers about 120 instruction
+targets. `VGPU_XARCH_DUMP=<dir> build/test_amd_gcn_cross_arch` writes every target's results for a diff of your own. The census covers about 120 instruction
 forms: f32, f16 and f64 arithmetic, minimum and maximum, the transcendentals, conversions, the integer byte and dot forms, 8-bit floats,
 the cube-map instructions, the wave-wide forms (ballot, lane reads and permutes, DPP, `mbcnt`) and one f16 matrix instruction.
 Where two targets differ, the question is always which is the hardware's; the answer is one of three kinds:

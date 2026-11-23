@@ -204,6 +204,13 @@ data/vector_add.gfx1201.o	a7ad690ecab2d218
 data/vector_add.gfx1250.o	971c83eb5b7515f9
 data/vector_add.gfx942.hsaco	f2847b3068d857a8
 data/vector_add.gfx942.o	908f1dc844b3ae1
+data/xarch.gfx1030.o	d2e8fdb23554d62a
+data/xarch.gfx1100.o	9c7f9b1fcc38a789
+data/xarch.gfx1201.o	c111a70f4632853
+data/xarch.gfx1250.o	131fc5bc774c1ba6
+data/xarch.gfx90a.o	97e914f4fb2f95e0
+data/xarch.gfx942.o	2d016caa4e900213
+data/xarch.gfx950.o	8f1167d7f471a78c
 hipcc/alu1250.gfx1250#0:gfx1250	47508e6151a867b4
 hipcc/api.gfx942#0:gfx942	53102da1b7b17dd3
 hipcc/async1250.gfx1250#0:gfx1250	c39d7fb920b19b2c

@@ -1,4 +1,4 @@
-// One lane-wise operation per kernel, for the cross-architecture census (test_amd_cross_arch): the same kernel is built for every AMD
+// One lane-wise operation per kernel, for the cross-architecture census (test_amd_gcn_cross_arch): the same kernel is built for every AMD
 // target and run on the same edge-case operands (NaNs with payloads, denormals, infinities, signed zeros), and where the targets'
 // results differ the test says which side is the hardware's. Built for gfx90a, gfx942, gfx950, gfx1030, gfx1100, gfx1201 and gfx1250
 // by build.sh. Every kernel is out[i] = f(a[i], b[i], c[i]) with i the global work-item; f is one builtin, which is one instruction
