@@ -38,6 +38,9 @@ EXEMPT = {
         "its `if:` runs it on schedule and workflow_dispatch only, never on a pull request",
     ("action.yml", "container"):
         "runs in the bare ubuntu:24.04 image, which has neither gh nor curl, so the guard could not ask the API",
+    ("clean-install.yml", "from-source"):
+        "runs in the bare ubuntu:24.04 image, as a new user's machine is, with neither gh nor curl; and only "
+        "when docs/install.md, its runner script or the workflow itself changes",
     ("ci-setup-script.yml", "ci-setup"):
         "runs in the bare ubuntu:24.04 image, as another CI system would, with neither gh nor curl; and only "
         "when scripts/ci-setup.sh or the workflow itself changes",
