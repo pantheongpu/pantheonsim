@@ -5,6 +5,9 @@
 # count), DOITGEN (does not compile), and 2MM, FDTD-2D and GRAMSCHM, which match but take
 # 3 to 11 minutes each even at MINI_DATASET (2048^2 here), more than the nightly's
 # 10-minute limit on the runner's 4 CPUs.
+# GESUMMV is in the list but reads two host arrays it never initialises (`tmp` and `y` are copied to the device as they are, and the kernel
+# does `+=` on them): its count is 0 only while the process heap is clean. An A10G card gives 0 with a clean heap and 512 of 512 under
+# MALLOC_PERTURB_=170; the simulator gives 342 (a10g), 39 (h100) or 0 depending on what the heap held (2026-11-23, issue #757).
 2DCONV|2DCONV|0
 3DCONV|3DCONV|0
 3MM|3MM|0
