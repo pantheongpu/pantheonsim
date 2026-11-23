@@ -47,6 +47,7 @@
 #include "enum_value.hpp"
 #include "fixed_point_gemm.hpp"
 #include "gemm_input_rounding.hpp"
+#include "gemm_tensor_sum.hpp"
 #include "host_gemm.hpp"
 #include "host_trsm.hpp"
 
@@ -457,7 +458,29 @@ bool gemm_mixed(cublasOperation_t transa, cublasOperation_t transb, int m, int n
   auto run = [&](const auto& LA, const auto& LB) {
     vgpu::hostgemm::gemm_with<float>(ta, tb, m, n, k, LA, lda, LB, ldb, epi);
   };
-  if (Atype == CUDA_R_16F) run(HalfLoader{rawA.data(), half_table()}, HalfLoader{rawB.data(), half_table()});
+  // A tensor-core kernel (a card of an architecture with a tensor-core sum model, and a shape the card gives one): the sum is
+  // the architecture's chunked one (gemm_tensor_sum.hpp), the epilogue as above.
+  bool tc_done = false;
+  if (const auto fmt = Atype == CUDA_R_16F ? vgpu::gemmtc::Format::F16 : vgpu::gemmtc::Format::Bf16;
+      (Atype == CUDA_R_16F || Atype == CUDA_R_16BF) && m >= 4 && n >= 2 && k > 0) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const auto md = vgpu::gemmtc::model_of(dev);
+    if (md.takes(fmt)) {
+      const size_t at = Atype == CUDA_R_16F ? 0 : 1;
+      std::vector<float> fa(rawA.size() / 2), fb(rawB.size() / 2), P;
+      for (size_t i = 0; i < fa.size(); ++i)
+        fa[i] = at == 0 ? HalfLoader{rawA.data(), half_table()}(static_cast<int64_t>(i), 0, 0) : Bf16Loader{rawA.data()}(static_cast<int64_t>(i), 0, 0);
+      for (size_t i = 0; i < fb.size(); ++i)
+        fb[i] = at == 0 ? HalfLoader{rawB.data(), half_table()}(static_cast<int64_t>(i), 0, 0) : Bf16Loader{rawB.data()}(static_cast<int64_t>(i), 0, 0);
+      vgpu::gemmtc::product(md, fmt, ta, tb, m, n, k, fa.data(), lda, fb.data(), ldb, P);
+      for (int j = 0; j < n; ++j)
+        for (int i = 0; i < m; ++i) epi(i, j, P[static_cast<size_t>(i) + static_cast<size_t>(j) * m]);
+      tc_done = true;
+    }
+  }
+  if (tc_done) {}
+  else if (Atype == CUDA_R_16F) run(HalfLoader{rawA.data(), half_table()}, HalfLoader{rawB.data(), half_table()});
   else if (Atype == CUDA_R_16BF) run(Bf16Loader{rawA.data()}, Bf16Loader{rawB.data()});
   else run(Int8Loader{rawA.data()}, Int8Loader{rawB.data()});
   // The cells the product does not write (the padding of a leading dimension) went through float and back before,
@@ -710,8 +733,16 @@ struct GemmRoundScope {
 vgpu::gemmround::Kind gemm_round_kind(const Handle* h, int64_t m, int64_t n, int64_t k) {
   int math_mode;   // as an integer: a caller may have set a value the enum does not name
   std::memcpy(&math_mode, &h->math_mode, sizeof math_mode);
-  return vgpu::gemmround::effective(t_gemm_round.kind, t_gemm_round.explicit_kind, t_gemm_round.pedantic, math_mode, m,
-                                    n, k);
+  auto kind = vgpu::gemmround::effective(t_gemm_round.kind, t_gemm_round.explicit_kind, t_gemm_round.pedantic, math_mode, m,
+                                         n, k);
+  // A card before Ampere has no TF32 tensor core: a Tesla T4's TF32 math mode and FAST_TF32 compute type give the plain FP32
+  // product, bit for bit (nvidia/tests/data/cublas_tc_gemm.t4.txt, 2026-11-23). Before this the inputs were rounded to TF32 there.
+  if (kind == vgpu::gemmround::Kind::Tf32) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (vgpu::gemmtc::model_of(dev).cc < 80) kind = vgpu::gemmround::Kind::None;
+  }
+  return kind;
 }
 // CUBLAS_EMULATION_STRATEGY is read once, when the library is first used: on
 // the card a variable set later in the process, before a new handle or a
@@ -768,6 +799,26 @@ cublasStatus_t do_gemm(cublasHandle_t handle, cublasOperation_t transa, cublasOp
     const auto kind = gemm_round_kind(reinterpret_cast<const Handle*>(handle), m, n, k);
     vgpu::gemmround::round_in_place(hA.data(), hA.size(), kind);
     vgpu::gemmround::round_in_place(hB.data(), hB.size(), kind);
+    if (kind != vgpu::gemmround::Kind::None) {
+      // A tensor-core kernel: the architecture's chunked sum of the rounded operands (gemm_tensor_sum.hpp).
+      using vgpu::gemmround::Kind;
+      const auto fmt = kind == Kind::Tf32 ? vgpu::gemmtc::Format::Tf32 : kind == Kind::Fp16 ? vgpu::gemmtc::Format::F16 : vgpu::gemmtc::Format::Bf16;
+      int dev = 0;
+      cudaGetDevice(&dev);
+      const auto md = vgpu::gemmtc::model_of(dev);
+      if (md.takes(fmt) && k > 0) {
+        std::vector<float> P;
+        vgpu::gemmtc::product(md, fmt, transa != CUBLAS_OP_N, transb != CUBLAS_OP_N, m, n, k, hA.data(), lda, hB.data(), ldb, P);
+        for (int j = 0; j < n; ++j)
+          for (int i = 0; i < m; ++i) {
+            float& c = hC[idx(i, j, ldc)];
+            const float acc = P[static_cast<size_t>(i) + static_cast<size_t>(j) * m];
+            c = beta == 0.0f ? alpha * acc : alpha * acc + beta * c;
+          }
+        store(C, hC);
+        return CUBLAS_STATUS_SUCCESS;
+      }
+    }
   }
   if constexpr (std::is_same_v<T, double>) {
     const Handle* hh = reinterpret_cast<const Handle*>(handle);

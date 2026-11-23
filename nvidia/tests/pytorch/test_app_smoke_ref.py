@@ -22,7 +22,7 @@ import app_smoke_ref as ref  # noqa: E402
 
 DATA = os.environ.get('VGPU_E2E_DATA', os.path.join(HERE, '..', 'data'))
 # card slug -> what its header names
-CARDS = {'rtx3060': 'RTX 3060', 'a10g': 'A10G'}
+CARDS = {'rtx3060': 'RTX 3060', 'a10g': 'A10G', 't4': 'Tesla T4'}
 failures = []
 
 
@@ -82,6 +82,13 @@ def main():
     expect(on_disk == sorted(CARDS), 'reference files %s, the test knows %s' % (on_disk, sorted(CARDS)))
     for slug in CARDS:
         entries = check_file(slug)
+    # Which card a device is held to: a recorded one of its compute capability, else the RTX 3060's, and only the first is "the
+    # architecture's own". Every slug the table names has a file; a card recorded for one compute capability stays there.
+    expect(ref.card_for((7, 5)) == ('t4', True), 'sm_75 is held to the T4: %r' % (ref.card_for((7, 5)),))
+    expect(ref.card_for((8, 6)) == ('a10g', True), 'sm_86 is held to the A10G: %r' % (ref.card_for((8, 6)),))
+    for cc in ((8, 0), (8, 9), (9, 0), (10, 0), (12, 0), (7, 0)):
+        expect(ref.card_for(cc) == ('rtx3060', False), 'sm_%d%d has no card of its own, so the RTX 3060 is a bound only: %r' % (cc[0], cc[1], ref.card_for(cc)))
+    expect(set(ref.CARD_OF_CC.values()) | {ref.FALLBACK_CARD} <= set(CARDS), 'card_for names a card without a reference file')
     # Round trip through write_ref.
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, 'x.ref')

@@ -3299,6 +3299,17 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
 
+  # cuBLAS tensor-core GEMMs (FP16, BF16, TF32 inputs) against what a Tesla T4 and an A10G printed: the sum of a half-precision
+  # product is the architecture's tensor-core chain, not the host's sequential FP32 sum; a Turing card has no TF32 (nvidia/tests/e2e/
+  # cublas_tc_gemm.cu, nvidia/tests/data/cublas_tc_gemm.<card>.txt).
+  add_test(NAME e2e_cublas_tc_gemm
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cublas_tc_gemm.sh)
+  set_tests_properties(e2e_cublas_tc_gemm PROPERTIES
+    DEPENDS "vgpucudart;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+
   # The error each refused launch configuration reports, runtime and driver, against an RTX 3060's CUDA 13.0.
   add_test(NAME e2e_launch_refusals
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_launch_refusals.sh)

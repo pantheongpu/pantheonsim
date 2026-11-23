@@ -73,8 +73,12 @@ def main():
         got_rc, out = run(api, model, **change)
         if got_rc != rc or text not in out:
             bad.append('%s: exit %d, wanted %d; output %r' % (what, got_rc, rc, out[-300:]))
-    # Every card's file (rtx3060, a10g) is a whole record of the same request: run_ollama.sh picks one by profile.
+    # Every card's file (rtx3060, a10g, t4) is a whole record of the same request: run_ollama.sh picks one by profile.
     import glob
+    # run_ollama.sh's card_check names these: a Turing profile is held to the T4's reply, an sm_86 one to the A10G's, the rest to the RTX 3060's.
+    for slug in ('t4', 'a10g', 'rtx3060'):
+        if not os.path.exists(os.path.join(os.path.dirname(REF), 'ollama_smollm2_%s.card.json' % slug)):
+            bad.append('run_ollama.sh names ollama_smollm2_%s.card.json, which does not exist' % slug)
     for f in sorted(glob.glob(os.path.join(os.path.dirname(REF), 'ollama_smollm2_*.card.json'))):
         r = json.load(open(f))
         for k in ('card', 'ollama', 'model', 'digest', 'prompt', 'response', 'tokens', 'logprobs'):
