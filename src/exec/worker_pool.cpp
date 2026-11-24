@@ -342,6 +342,7 @@ uint64_t unit_cost_from_busy(uint64_t units, uint64_t busy_ns) {
 
 void note_busy_ns(uint64_t ns) { t_busy_ns += ns; }
 
+
 bool pool_trial_allows(PoolTrial& t) {
   if (t.hold == 0) return true;
   --t.hold;
@@ -409,11 +410,16 @@ uint64_t min_work_ns(bool* set_by_hand = nullptr) {
 // The work per thread a kernel on trial must have (see PoolTrial).
 constexpr uint64_t kTrialMinWorkNs = 12 * 1000;
 
+std::atomic<uint64_t (*)()> g_test_clock{nullptr};
+
 uint64_t now_ns() {
+  if (auto* f = g_test_clock.load(std::memory_order_relaxed)) [[unlikely]] return f();
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
 }
 
 }  // namespace
+
+void set_test_clock(uint64_t (*now)()) { g_test_clock.store(now, std::memory_order_relaxed); }
 
 LaunchWidth::LaunchWidth(const void* key, uint64_t units, unsigned& threads)
     : key_(key), units_(units), used_(threads), begin_ns_(0) {
