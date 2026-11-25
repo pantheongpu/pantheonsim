@@ -3217,7 +3217,10 @@ if(TARGET vgpucublas)
   target_link_libraries(test_cublas_gemmex_mixed PRIVATE vgpucublas vgpucudart)
   target_include_directories(test_cublas_gemmex_mixed PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
   add_test(NAME test_cublas_gemmex_mixed COMMAND test_cublas_gemmex_mixed)
-  set_tests_properties(test_cublas_gemmex_mixed PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;VGPU_THREADS=2" TIMEOUT 600)
+  # On the h100 profile: the host's sequential FP32 sum is what a GemmEx of FP16 or BF16 computes there (gemm_tensor_sum.hpp keeps the
+  # Hopper rule out), the loops this test holds it to. An Ampere-rule profile (rtx3060) sums by a tensor core's chunks instead, which
+  # e2e_cublas_tc_gemm holds to the cards.
+  set_tests_properties(test_cublas_gemmex_mixed PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100;VGPU_QUIET=1;VGPU_THREADS=2" TIMEOUT 600)
 endif()
 
 # A cuBLAS call captured into a CUDA graph. The library computes on the host,
@@ -3304,6 +3307,17 @@ if(TARGET vgpucublas)
   set_tests_properties(e2e_bmma_gemm PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+
+  # cuBLAS tensor-core GEMMs (FP16, BF16, TF32 inputs) against what a Tesla T4 and an A10G printed: the sum of a half-precision
+  # product is the architecture's tensor-core chain, not the host's sequential FP32 sum; a Turing card has no TF32 (nvidia/tests/e2e/
+  # cublas_tc_gemm.cu, nvidia/tests/data/cublas_tc_gemm.<card>.txt).
+  add_test(NAME e2e_cublas_tc_gemm
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cublas_tc_gemm.sh)
+  set_tests_properties(e2e_cublas_tc_gemm PROPERTIES
+    DEPENDS "vgpucudart;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
 
   # The error each refused launch configuration reports, runtime and driver, against an RTX 3060's CUDA 13.0.

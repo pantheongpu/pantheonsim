@@ -43,6 +43,20 @@ TOLERANCES = {
 }
 
 
+# The card whose tensors a device is held to: one of the same compute capability where one was recorded (cuBLAS and cuDNN pick kernels by
+# architecture, so a T4's tensors are not an A10G's: gemm_f32 differs in 999 of 1280 values between them), else the RTX 3060's, which
+# makes the comparison a bound on another architecture's numbers and not that architecture's. Every compute capability that has a card in
+# nvidia/tests/data (pytorch_app_smoke.<slug>.ref) is here.
+CARD_OF_CC = {(7, 5): 't4', (8, 6): 'a10g'}
+FALLBACK_CARD = 'rtx3060'
+
+
+def card_for(cc):
+    """-> (slug of the reference file, True when a card of this compute capability was recorded)."""
+    slug = CARD_OF_CC.get(tuple(cc))
+    return (slug, True) if slug else (FALLBACK_CARD, tuple(cc) == (8, 6))
+
+
 def bits_of(values):
     """Hex of a flat list of Python floats as float32 bits."""
     return ''.join('%08x' % struct.unpack('<I', struct.pack('<f', v))[0] for v in values)

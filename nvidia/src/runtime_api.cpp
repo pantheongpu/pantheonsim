@@ -63,6 +63,7 @@
 #include "texture_formats.hpp"
 #include "fatbin.hpp"
 #include "ptx_link.hpp"
+#include "vgpu/exec/tc_ampere.hpp"
 #include "vgpu/sass/exec.hpp"
 #include "vgpu/exec/cluster.hpp"
 #include "vgpu/exec/devrt.hpp"
@@ -7559,6 +7560,28 @@ static bool async_stream_busy(cudaStream_t stream) {
   for (const Lane* l : sync_lanes(lane_key(stream), legacy))
     if (lane_busy(l)) return true;
   return false;
+}
+
+// ---- What the libraries that compute on the host ask the device: its tensor-core sum -----------------------------------------
+// cuBLAS and cuBLASLt do their arithmetic on the host (nvidia/docs/cublas.md), but a half-precision or TF32 product on a card is a
+// tensor core's sum, and that sum is the architecture's (docs/matrix-numerics.md). This says which one the profile of `device` has:
+// the model (0 sequential f32 sum, 1 the Ampere rule, 2 the Hopper rule; VGPU_TC_EXACT applies), the products to a chunk (f16 and
+// bf16, tf32) and the compute capability times ten. A device that does not exist answers 0.
+extern "C" __attribute__((visibility("default"))) int vgpu_tensor_sum_v1(int device, unsigned* chunk, unsigned* chunk_tf32, int* cc) {
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  try {
+    ensure_init(s);
+    const vgpu::DeviceProfile& p = s.rt->device(device).profile();
+    const auto model = vgpu::exec::tc86::sum_model(p);
+    const vgpu::TensorSumRule* rule = vgpu::exec::tc86::rule_of(model);
+    if (chunk) *chunk = rule ? rule->chunk : 0;
+    if (chunk_tf32) *chunk_tf32 = rule ? rule->chunk_tf32 : 0;
+    if (cc) *cc = p.cc_major * 10 + p.cc_minor;
+    return model == vgpu::TensorSum::Ampere ? 1 : model == vgpu::TensorSum::Hopper ? 2 : 0;
+  } catch (const std::exception&) {
+    return 0;
+  }
 }
 
 // ---- What libcuda reaches by name, to order the driver API's work with the stream lanes (cuLaunchHostFunc, #487) -----------

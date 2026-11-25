@@ -77,8 +77,24 @@ the shapes real programs use (a 128x128x128 product converts on both, which is w
 measured over `m, n, k` in 1..1024 for `Sgemm`, `GemmEx` and `Lt`, all four transposes; it differs from the card for a few
 `(m, n, k)` where the card keeps the FP32 kernel up to `2^22`-`2^24` (large `m` and `n` with a small `k`), for batches
 (the card counts the batch, a batched `m = 3` product converts there and not here), and for FP16/BF16 kernels at `m = 3`.
-Other GPUs may switch at other sizes (an H100's heuristic was not measured). The sums themselves are the host's FP32
-sums, not a tensor core's accumulation order, so a result agrees with the card to FP32 rounding, not bit for bit.
+Other GPUs may switch at other sizes (an H100's heuristic was not measured).
+
+**The sum of a tensor-core product is the architecture's.** A FP16 or BF16 `GemmEx` (and a FP32 one taken to FP16, BF16 or TF32 by the
+math mode or a `FAST_*` compute type) is a chain of tensor-core steps on a card, each adding a chunk of products and the accumulator
+at once (`docs/matrix-numerics.md`), so its bits are neither the host's sequential FP32 sum nor the same on every architecture. On a
+profile whose model is the Ampere rule (`numerics.tensor_sum: ampere`; Turing, Ampere, Ada) these products are computed with it, K in
+chunks of 8 (TF32: 4), starting at zero, the `alpha` and `beta` epilogue in FP32 after
+(`nvidia/src/gemm_tensor_sum.hpp`). It needs a tensor core of that format: FP16 from compute capability 7.0, BF16 and TF32 from 8.0, so
+on a T4 profile a BF16 product is the sequential FP32 sum (a Turing card does it in its FP32 units) and a TF32 request is the plain
+FP32 product (it has no TF32 tensor core; before 2026-11-23 the inputs were rounded to TF32 there, which no Turing card does). Held by
+`e2e_cublas_tc_gemm` against a Tesla T4 and an A10G, bit for bit over 16 cases each (shapes 32x40x48 to 128x96x256, transposes, `alpha`
+and `beta`, FP16 and BF16 into FP16 and FP32).
+**Not covered:** Hopper and Blackwell profiles keep the host sequential sum (cuBLAS runs `wgmma` kernels there, whose FP16, BF16 and TF32
+sums nobody has measured: a card is wanted, see issue "Cross-architecture (cuBLAS tensor-core GEMM): Hopper and Blackwell"), and products
+cuBLAS splits over K (the choice depends on the card: an A10G's FP16 96x80x512 into FP32, TF32 of K 256 and more, a T4's K of 1024 and
+more) are not the chain on the card, so they are not on the simulator either. The FP32 `Sgemm` without a tensor core is the host's
+sequential sum on every profile, and no two architectures' cuBLAS kernels associate it alike (a T4 and an RTX 3060 differ in 999 of 1280
+elements of a 32x48x40 product), so it agrees with a card to FP32 rounding, not bit for bit.
 
 ## What is implemented
 

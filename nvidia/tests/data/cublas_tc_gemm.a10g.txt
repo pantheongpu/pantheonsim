@@ -1,0 +1,16 @@
+f16 f16 32x40x48 NN: status 0 checksum 0xf78d24bb10971631 first 48a2 4b3d 4469 44fe
+bf16 bf16 32x40x48 NN: status 0 checksum 0xddb5732f4812a1f6 first 4114 4168 408d 409f
+f16 f32 32x40x48 NN: status 0 checksum 0x8091b24dfc314af8 first 41144a8c 41679241 408d1e86 409fc200
+bf16 f32 32x40x48 NN: status 0 checksum 0xfb454bc7bbb020c3 first 411445e9 4167a46f 408cd7c6 409f6715
+f16 f16 64x64x64 NN: status 0 checksum 0x543d33d5a94296b9 first c54d c2a5 bec8 b864
+f16 f16 64x64x64 TN: status 0 checksum 0x793768c7ad6cfc47 first 376c c1c2 4287 48b4
+f16 f16 64x64x64 NT: status 0 checksum 0xbf922c80a7e45c70 first c8bb 41e0 cd96 48bf
+f16 f32 128x96x256 NN: status 0 checksum 0xff137234256f9bf7 first 414f013b c24d8113 4299ea1a 42466b28
+f16 f32 128x96x256 TN: status 0 checksum 0xb509d6b0af78080a first c1e4f406 c0a70424 41a6cb09 41ac119f
+bf16 f32 128x96x256 NN: status 0 checksum 0x64f5237155c5f0e7 first 414f91e8 c24d7229 4299d9da 42468476
+f16 f16 96x80x512 alpha beta: status 0 checksum 0xf848abb5b883df9d first cab7 4635 4812 b889
+f16 f32 64x64x16 NN: status 0 checksum 0xb9664b06b665db71 first 3f8655b8 3e7018a8 c01138dc 3f1478b4
+f16 f32 64x64x8 NN: status 0 checksum 0x5a29d25c3ecfe0db first 40ba190f bf3f05fc be900416 40e4db25
+tf32 f32 128x128x128 NN: status 0 class tf32 checksum 0x2a8fbbd226bc8a29 first 41ed40b5 4121c64b 4141b16c 41da2c77
+tf32 f32 128x128x128 TN: status 0 class tf32 checksum 0x170ce9633c480a71 first 40aadf24 bf140e38 41a08eab 4110762f
+tf32 f32 128x128x128 NT alpha beta: status 0 class tf32 checksum 0x571e0dda1025e65a first 404ef553 417f9873 c1304190 40289bae

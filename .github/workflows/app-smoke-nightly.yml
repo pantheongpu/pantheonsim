@@ -52,9 +52,10 @@ jobs:
           fail=0
           for gpu in ${GPUS:-rtx3060 a10g t4 a100 h100 b200 rtx5090}; do
             echo "::group::$gpu"
-            # a10g is held to the tensors an A10G produced (recorded 2026-11-19); the others to the RTX 3060's.
-            ref_card=rtx3060; [[ $gpu == a10g ]] && ref_card=a10g
-            APP_SMOKE_REF_CARD="$ref_card" VGPU_BUILD_DIR="$PWD/build" VGPU_E2E_DATA="$PWD/nvidia/tests/data" \
+            # A profile is held to the tensors of a card of its compute capability where one was recorded (a T4 for t4, an A10G
+            # for a10g: nvidia/tests/pytorch/app_smoke_ref.py card_for), else to the RTX 3060's: for those the check is a bound
+            # on another architecture's numbers, not their own.
+            VGPU_BUILD_DIR="$PWD/build" VGPU_E2E_DATA="$PWD/nvidia/tests/data" \
               nvidia/tests/e2e/run_pytorch.sh "$PWD/nvidia/tests/pytorch/app_smoke.py" 18 "nvidia/$gpu" 2>&1 | tee "smoke-$gpu.log" || fail=1
             echo "::endgroup::"
             # A skip means the runner's image lost PyTorch: here that is a failure.

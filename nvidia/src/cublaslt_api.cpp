@@ -45,6 +45,7 @@
 
 #include <cuda_runtime.h>
 
+#include "gemm_tensor_sum.hpp"
 #include "gemm_input_rounding.hpp"
 #include "host_gemm.hpp"
 #include "vgpu/profiling.hpp"
@@ -1449,7 +1450,13 @@ cublasStatus_t matmul_run(const MatmulDesc& md, const MatrixLayout& la, const Ma
       using vgpu::gemmround::Kind;
       const Kind want = md.compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? Kind::Tf32
                         : md.compute == CUBLAS_COMPUTE_32F_FAST_16F ? Kind::Fp16 : Kind::Bf16;
-      const Kind rk = vgpu::gemmround::effective(want, true, false, 0, m, n, k);
+      Kind rk = vgpu::gemmround::effective(want, true, false, 0, m, n, k);
+      // No TF32 tensor core before Ampere: the plain FP32 product (as in cublas_api.cpp's gemm_round_kind).
+      if (rk == Kind::Tf32) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (vgpu::gemmtc::model_of(dev).cc < 80) rk = Kind::None;
+      }
       auto round_f32 = [rk](Elems& e) {
         if (e.t != CUDA_R_32F || e.raw.size() < 4) return;
         for (size_t i = 0; i < e.raw.size() / 4; ++i) {

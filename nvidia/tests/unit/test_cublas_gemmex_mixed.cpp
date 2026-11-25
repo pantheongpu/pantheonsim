@@ -6,6 +6,9 @@
 // way it used to work: widen every matrix whole with CUDA's own conversions, run the plain loops on the floats,
 // convert every cell of C back (the cells a leading dimension leaves between columns go through float and back too,
 // which is not the identity for a NaN that is not the one the conversion makes).
+//
+// Runs on the h100 profile (CMakeLists.txt): there the sum is the host's sequential one. A profile with the Ampere tensor-core rule
+// (gemm_tensor_sum.hpp) sums half-precision products by chunks, and that, with the heap it holds, is nvidia/tests/e2e/cublas_tc_gemm.cu's.
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

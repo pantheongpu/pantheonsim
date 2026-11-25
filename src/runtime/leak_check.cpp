@@ -69,7 +69,9 @@ Counts count_now() {
   return c;
 }
 
-Counts g_base;
+// Never destroyed: the check runs from the shared runtime's destructor at exit, which can be after this file's statics are gone
+// (AddressSanitizer: heap-use-after-free reading fd_targets in the leak-fd case of e2e_leak_probe).
+Counts& g_base = *new Counts;
 bool g_armed = false;
 
 }  // namespace

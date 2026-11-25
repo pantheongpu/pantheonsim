@@ -36,12 +36,22 @@ expect() {  # expect <name> <expected> <actual>
 
 # What a real card replied (tests/e2e/ollama_card_ref.py): sixteen greedy tokens and their log-probabilities,
 # recorded on an RTX 3060 with this Ollama version. Checked only for the model it was recorded for.
-card_check() {  # card_check <profile>: the server on $api against the reply of a real card: the profile's own card (an A10G for
-                # nvidia/a10g), else the RTX 3060's
-  local out rc ref="$root/nvidia/tests/data/ollama_smollm2_${1#nvidia/}.card.json"
-  [[ -f $ref ]] || ref="$root/nvidia/tests/data/ollama_smollm2_rtx3060.card.json"
+card_check() {  # card_check <profile>: the server on $api against the reply of a real card of the profile's architecture
+  # The profile's own card (an A10G for nvidia/a10g, a T4 for nvidia/t4), else a card of the same compute capability (the T4 for a
+  # Turing profile, the A10G for an sm_86 one), else the RTX 3060's, which is a different architecture for every other profile:
+  # there the check says so, because it then holds the reply and a bound on the log-probabilities, not the architecture's numbers.
+  local out rc cc how ref="$root/nvidia/tests/data/ollama_smollm2_${1#nvidia/}.card.json"
+  how="the profile's own card"
+  if [[ ! -f $ref ]]; then
+    cc=$(VGPU_GPU=$1 "$build/vgpu" smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null)
+    case "$cc" in
+      7.5) ref="$root/nvidia/tests/data/ollama_smollm2_t4.card.json"; how="a Tesla T4, the same compute capability" ;;
+      8.6) ref="$root/nvidia/tests/data/ollama_smollm2_a10g.card.json"; how="an A10G, the same compute capability" ;;
+      *)   ref="$root/nvidia/tests/data/ollama_smollm2_rtx3060.card.json"; how="an RTX 3060 (compute capability 8.6; none of this architecture was recorded)" ;;
+    esac
+  fi
   out=$(python3 "$root/tests/e2e/ollama_card_ref.py" check --api "$api" --model "$model" --ref "$ref" 2>&1); rc=$?
-  sed "s|^|$1: vs the card: |" <<< "$out"
+  sed "s|^|$1: vs the card ($how): |" <<< "$out"
   [[ $rc == 0 ]] || fail=1
 }
 

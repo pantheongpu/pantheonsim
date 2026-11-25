@@ -6,8 +6,8 @@ application meets on a card: cuBLAS and cuDNN choose their own kernels, and the 
 of float16 results and the TF32 cut all differ. This script runs programs of the shapes real workloads
 have (gemm in four precisions, convolution forward and backward, a cuDNN LSTM, an MLP, a CNN with batch
 norm and a decoder trained a few steps, with logits, losses and greedy tokens) and compares what they
-produce with the tensors a real card produced, recorded in nvidia/tests/data/pytorch_app_smoke.<card>.ref (rtx3060, a10g;
-APP_SMOKE_REF_CARD picks the file, rtx3060 by default).
+produce with the tensors a real card produced, recorded in nvidia/tests/data/pytorch_app_smoke.<card>.ref (rtx3060, a10g, t4;
+the file of the device's compute capability, rtx3060 where none was recorded: app_smoke_ref.card_for; APP_SMOKE_REF_CARD overrides).
 app_smoke_ref.py says, per workload, what is allowed to differ and why.
 
   app_smoke.py             run on the simulated GPU (run it with `vgpu run --preload`, as run_pytorch.sh
@@ -42,8 +42,9 @@ if not torch.version.cuda:
     print("SKIP: this PyTorch is not a CUDA build")
     sys.exit(0)
 
-# The card the reference was recorded on: APP_SMOKE_REF_CARD=a10g reads pytorch_app_smoke.a10g.ref (rtx3060 by default).
-REF_CARD = os.environ.get('APP_SMOKE_REF_CARD', 'rtx3060')
+# The card the reference was recorded on: the one of the device's compute capability where there is one (app_smoke_ref.card_for: a T4
+# for sm_75, an A10G for sm_86, the RTX 3060 otherwise); APP_SMOKE_REF_CARD=<slug> reads pytorch_app_smoke.<slug>.ref instead.
+REF_CARD = os.environ.get('APP_SMOKE_REF_CARD') or ref.card_for(torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (8, 6))[0]
 REF_PATH = os.path.join(os.environ.get('VGPU_E2E_DATA', os.path.join(HERE, '..', 'data')),
                         f'pytorch_app_smoke.{REF_CARD}.ref')
 GPU = 'cuda'
