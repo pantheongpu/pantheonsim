@@ -162,6 +162,52 @@ fp8check() {   # <sm> <profile> <file glob> <what> <engines the sequential sum m
 fp8check 89 l40s "$data/fp8/Ada.*.txt" "Ada's own sum: chunks of 16, cut 13 bits down, result cut to 13 bits" "sass ptx"
 fp8check 90 h100 "$data/fp8/H100.*.txt" "ptxas lowers it to f16 and HMMA: the device's f16 rule" "ptx"
 fp8check 100 b200 "$data/fp8/B200.*.txt" "ptxas lowers it to f16 and HMMA: the device's f16 rule" "ptx"
+# 3c. mma.m8n8k4 (Volta's f16 form) and the sparse forms (mma.sp): results of a Tesla T4 and an A10G (docs/numerics/m8n8k4-and-sparse.md). m8n8k4_vectors and
+# sparse_vectors read inputs and the card's results; the simulator must give the same bits. The V100 files are the vectors Khattak and Mikaitis recorded on a V100.
+#   m8n8k4.t4.fp32.txt, m8n8k4.t4.fp16.txt   800 inputs of ours each, a T4's results: a Turing m8n8k4 is one step of 4 products and C (Volta's rule), PTX engine on the t4 profile
+#                                            (the sm_75 cubin holds HMMA.884, which the SASS engine does not decode)
+#   V100.fp16.fp32.txt, V100.fp16.fp16.txt   24 recorded V100 vectors each, the same
+#   m8n8k4.a10g.fp32.txt                     800 inputs, an A10G's results: ptxas's emulation (products added in order, C last), both engines
+#   sparse/a10g.<mode>.txt                   300 inputs a mode, an A10G's results for mma.sp: the Ampere rule over the stored products, both engines
+mk() {   # <sm> <program>: builds tools/tcpapers/<program>.cu for <sm> into $bin/sm<sm>/ (false when this toolkit cannot)
+  local a="$1" prog="$2"
+  [[ -x "$bin/sm$a/$prog" ]] && return 0
+  mkdir -p "$bin/sm$a"
+  nvcc -std=c++17 -O1 -arch=sm_$a -cudart shared -w $(shim_sanitizer_nvcc_flags "$shim") "$tool/$prog.cu" -o "$bin/sm$a/$prog" 2> "$out/b9.txt" \
+    || { echo "SKIP $prog sm_$a: this toolkit does not build it ($(head -1 "$out/b9.txt"))"; rm -f "$bin/sm$a/$prog"; return 1; }
+}
+vec() {   # <program> <sm> <profile> <engine> <mode> <file> [ENV=value]   the mismatch count of one file
+  local prog="$1" a="$2" gpu="$3" eng="$4" mode="$5" f="$6"; shift 6
+  run "$prog" "$a" "$gpu" "$eng" "$out/v.txt" "$@" "$mode" "$f" --show 0
+  mism "$out/v.txt"
+}
+vexpect() {   # <label> <want: 0 or ">=1"> <count>
+  local ok=0
+  if [[ "$2" == 0 ]]; then [[ "$3" == 0 ]] && ok=1; else [[ "$3" =~ ^[0-9]+$ ]] && (( $3 >= 1 )) && ok=1; fi
+  if (( ok )); then echo "ok   $1: $3 mismatches"; else echo "FAIL $1: expected $2 mismatches, got ${3:-none}"; fails=1; fi
+}
+if mk 75 m8n8k4_vectors; then
+  for o in fp32 fp16; do
+    vexpect "m8n8k4 T4 $o results on the t4 profile (ptx)" 0 "$(vec m8n8k4_vectors 75 t4 ptx $o "$data/m8n8k4.t4.$o.txt")"
+    vexpect "m8n8k4 recorded V100 $o vectors on the t4 profile (ptx)" 0 "$(vec m8n8k4_vectors 75 t4 ptx $o "$data/V100.fp16.$o.txt")"
+  done
+  vexpect "m8n8k4 T4 fp32 results with VGPU_TC_EXACT=0 (the sequential sum is not the card's)" ">=1" "$(vec m8n8k4_vectors 75 t4 ptx fp32 "$data/m8n8k4.t4.fp32.txt" VGPU_TC_EXACT=0)"
+fi
+if mk 86 m8n8k4_vectors; then
+  for eng in sass ptx; do
+    vexpect "m8n8k4 A10G fp32 results on the a10g profile ($eng)" 0 "$(vec m8n8k4_vectors 86 a10g $eng fp32 "$data/m8n8k4.a10g.fp32.txt")"
+  done
+  vexpect "m8n8k4 A10G fp32 results with VGPU_TC_EXACT=0 (ptx: the sequential sum is not the emulation's)" ">=1" "$(vec m8n8k4_vectors 86 a10g ptx fp32 "$data/m8n8k4.a10g.fp32.txt" VGPU_TC_EXACT=0)"
+fi
+if mk 86 sparse_vectors; then
+  for f in "$data"/sparse/a10g.*.txt; do
+    mode="$(basename "$f" .txt)"; mode="${mode#a10g.}"
+    for eng in sass ptx; do
+      vexpect "sparse $mode A10G results on the a10g profile ($eng)" 0 "$(vec sparse_vectors 86 a10g $eng "$mode" "$f")"
+    done
+    vexpect "sparse $mode with VGPU_TC_EXACT=0 (ptx: the sequential sum is not the card's)" ">=1" "$(vec sparse_vectors 86 a10g ptx "$mode" "$f" VGPU_TC_EXACT=0)"
+  done
+fi
 # 4. Optionally the full sets.
 if [[ -n "${VGPU_KHATTAK_VECTORS:-}" ]]; then
   for f in "$VGPU_KHATTAK_VECTORS"/*.e[45]m*.txt; do

@@ -70,6 +70,8 @@ had the right chain on sm_90 and sm_100 already; the PTX interpreter had the seq
 | 10.3, 10.7, 11.0, 12.1, 8.7 | b300, vr200, thor, gb10 | `Sequential` | unmeasured | no source covers them |
 | 7.0 (Volta) | no profile | - | published | block 4, no extra bit (`G` 24); a V100 profile would be new, and CUDA 13 cannot build sm_70 |
 
+For Turing (7.5) the same rule is **measured** for `mma.m8n8k4` (Tesla T4: the 10,000 vectors a V100 recorded, 0 mismatches), `numerics.tensor_sum_m8n8k4`.
+
 The Status column is per compute capability: a card of that capability was run. Per profile the profile says more, in
 `provenance:`. `measured` there means a card of **that model** was run; a profile of another model of the same compute capability
 is `inferred`; a profile whose capability no card of ours has run is `unknown` and keeps the sequential sum, except b200 and gb200, whose capability (10.0) a B200 *somebody else* recorded 20,000 vectors on: their Hopper rule is `inferred` from that data (`vgpu info --gpu
@@ -83,9 +85,10 @@ is `inferred`; a profile whose capability no card of ours has run is `unknown` a
 
 Everywhere: the f64 form (DMMA) is a chain of IEEE double fused multiply-adds in the order of K, which is what FTTN's fp64
 program prints on every card we ran it on (RTX 3060, A10G, L4, L40S, A100, H100: three extra bits, round to nearest even, sticky
-bit, width 1) and what the simulator has always done. `mma.m8n8k4`, the sparse forms, `wgmma` and
-`tcgen05.mma` are **unmeasured** and keep the sequential sum (or their own existing rule); the published models cover some of
-them and none is on by default. The FP8 `mma.sync` forms have rules since 2026-11-18, all `inferred` ("The FP8 forms" above).
+bit, width 1) and what the simulator has always done. The FP8 `mma.sync` forms have rules since 2026-11-18, all `inferred` ("The FP8 forms" above).
+Since 2026-11-23 `mma.m8n8k4`, the sparse forms (f16, bf16, tf32), `wgmma` f16, bf16, tf32 and `tcgen05.mma` `.kind::f16` and `.kind::tf32` have rules too, from two card runs
+(a Tesla T4 and an A10G) and from MMA-Sim; [numerics/m8n8k4-and-sparse.md](numerics/m8n8k4-and-sparse.md) says what each rests on. `tcgen05.mma` with FP8, FP6, FP4 and
+block-scaled operands, sparse `wgmma` and `tcgen05`, and `m8n8k4` with an f16 accumulator on sm_80 and later stay **unmeasured** and keep the sequential sum.
 
 ### Card runs behind the table
 
@@ -144,6 +147,12 @@ rtx4090 and rtx6000-ada profiles (sequential to `Ampere`); the h100*, h200* and 
 SASS engine an sm_86 cubin on a profile that is not 8.6 (it took the RTX 3060's sum whatever the profile: now the device's, as
 the PTX engine always did) and an sm_75 / sm_80 / sm_89 cubin on an 8.6 profile; and the four corners on every `Ampere` profile.
 `VGPU_TC_EXACT=0` gives the sequential sums back; the corners have no switch (the earlier answers were wrong on the card).
+
+**2026-11-23: four more forms changed** (profile keys `numerics.tensor_sum_m8n8k4`, `_sparse`, `_wgmma`, `_tcgen05`; `VGPU_TC_EXACT=0` gives the old results back for all). PTX engine `mma.m8n8k4` on t4 and
+rtx2080ti (sequential to Volta's step), on the 19 profiles of 8.0, 8.6 and 8.9 with an f32 accumulator (sequential `C + p0 + ...` to `(((p0 + p1) + p2) + p3) + C`, the A10G's results); `mma.sp` and
+`HMMA.SP` f16, bf16, tf32 on those 19 (sequential over the expanded matrix to the Ampere rule over the stored products; an infinity or NaN of B at a place A does not store no longer reaches the
+sum); dense `wgmma` and `HGMMA` f16, bf16, tf32 on the six sm_90 profiles and dense `tcgen05.mma` `.kind::f16` and `.kind::tf32` on b200 and gb200 (sequential to the Hopper rule, `inferred`).
+Evidence and open items: [numerics/m8n8k4-and-sparse.md](numerics/m8n8k4-and-sparse.md).
 
 **2026-11-19: the dense FP8 `wgmma` forms changed** on the sm_90 profiles (h100, h100-pcie, h100-nvl, h200, h200-nvl, gh200-480gb) in both engines (PTX `wgmma`, SASS `QGMMA`):
 sequential f32 sum to one chunk of 32 products, terms cut 13 bits below the largest, result cut to 13 bits. e4m3 and e5m2, f32 and f16 accumulators. Evidence: 20,000 vectors recorded

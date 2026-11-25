@@ -1690,6 +1690,9 @@ vgpu_unit_test(test_wgmma_fast)
 # The e4m3 / e5m2 sum of wgmma on a Hopper device (tc_fp8.hpp, kHopperWgmmaFp8Rule): recorded H100 and H200 vectors through the rule and through a
 # real wgmma (both PTX routes), the sequential sum for VGPU_TC_EXACT=0, and what each profile names.
 vgpu_unit_test(test_wgmma_fp8)
+# The sums of mma.m8n8k4 (Volta's rule, recorded V100 vectors), wgmma (f16, bf16, tf32: recorded H100 vectors, MMA-Sim's claim) and tcgen05.mma, what each profile names.
+vgpu_unit_test(test_tc_forms)
+target_compile_definitions(test_tc_forms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # tcgen05.mma reading its operands whole from shared memory against the element reads, bit for bit.
 vgpu_unit_test(test_tcgen05_fast)
 # tcgen05.mma through the tile kernels for the forms the whole-operand route leaves to the row loop (f16 D, layouts F, B, G, A in Tensor Memory, sparse A,
@@ -4887,6 +4890,12 @@ if(TARGET vgpucudart)
   # The e4m3 / e5m2 sum of wgmma on an H100 profile, recorded H100 and H200 vectors through a real wgmma, SASS and PTX engines (tc_fp8.hpp).
   add_test(NAME e2e_wgmma_fp8_vectors COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_wgmma_fp8_vectors.sh)
   set_tests_properties(e2e_wgmma_fp8_vectors PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+  # The f16, bf16 and tf32 sum of wgmma on an H100 profile: recorded H100 mma.sync vectors through a real wgmma with a non-zero accumulator, SASS and PTX engines (tc_forms.hpp).
+  add_test(NAME e2e_wgmma_vectors COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_wgmma_vectors.sh)
+  set_tests_properties(e2e_wgmma_vectors PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)

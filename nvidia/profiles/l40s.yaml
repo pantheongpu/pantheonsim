@@ -69,8 +69,10 @@ numerics:
   tensor_sum_fp8_chunk: 16         # products to a chunk
   tensor_sum_fp8_grid: 14          # a chunk's terms are cut at 2^(top - 14)
   tensor_sum_fp8_out_bits: 13      # fraction bits an f32 result keeps
+  tensor_sum_m8n8k4: chain_c_last   # sequential | volta | chain_c_last: mma.m8n8k4 (f32 accumulator; PTX engine)
+  tensor_sum_sparse: ampere         # sequential | ampere: mma.sp / HMMA.SP with f16, bf16, tf32 operands
 provenance:
-  inferred: [numerics.tensor_sum_fp8, numerics.tensor_sum_fp8_chunk, numerics.tensor_sum_fp8_grid, numerics.tensor_sum_fp8_out_bits]
+  inferred: [numerics.tensor_sum_fp8, numerics.tensor_sum_fp8_chunk, numerics.tensor_sum_fp8_grid, numerics.tensor_sum_fp8_out_bits, numerics.tensor_sum_m8n8k4, numerics.tensor_sum_sparse]
   measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]
 evidence:
   numerics: "card: NVIDIA L40S (this model), AWS; driver: 595.112.07; toolkit: CUDA 13.0; date: 2026-11-15. Both probes, sm_86 and sm_89 builds, print the RTX 3060 lines (nvidia/tests/data/simd_lane_forms.rtx3060.txt, float_half_forms.rtx3060.txt); FTTN. docs/matrix-numerics.md"
@@ -78,3 +80,5 @@ evidence:
   numerics.tensor_sum_fp8_chunk: "see numerics.tensor_sum_fp8"
   numerics.tensor_sum_fp8_grid: "see numerics.tensor_sum_fp8"
   numerics.tensor_sum_fp8_out_bits: "see numerics.tensor_sum_fp8"
+  numerics.tensor_sum_m8n8k4: "inferred from the A10G (sm_86, measured 2026-11-23, see numerics.tensor_sum_m8n8k4 of nvidia/profiles/a10g.yaml): ptxas emulates mma.m8n8k4 as f32 products added in order with C last on sm_80 and later; no card of this model was run, and the emulation is the cubin's (nvcc 13.0.88), not the hardware's. An f32 accumulator only. docs/numerics/m8n8k4-and-sparse.md"
+  numerics.tensor_sum_sparse: "inferred from the A10G (sm_86, measured 2026-11-23, see numerics.tensor_sum_sparse of nvidia/profiles/a10g.yaml): the Ampere rule over the stored products; no card of this model was run. docs/numerics/m8n8k4-and-sparse.md"

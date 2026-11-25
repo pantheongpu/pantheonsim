@@ -232,6 +232,30 @@ inline constexpr Fp8SumRule kHopperWgmmaFp8Rule{"hopper wgmma: one chunk of 32, 
 inline constexpr const Fp8SumRule* wgmma_fp8_sum_rule(WgmmaFp8Sum m) { return m == WgmmaFp8Sum::Hopper ? &kHopperWgmmaFp8Rule : nullptr; }
 inline constexpr const char* wgmma_fp8_sum_name(WgmmaFp8Sum m) { return m == WgmmaFp8Sum::Hopper ? "hopper" : "sequential"; }
 
+// The sum of more matrix forms of f16, bf16 and tf32 operands, which a card does not necessarily sum as its mma.sync (issue #664). The rules are of the
+// same family as TensorSum (vgpu/exec/tc_ampere.hpp, "chunks of products and the accumulator, terms cut toward zero at 2^(top - grid)") with the numbers
+// of the named model; dense forms only unless the key says otherwise.
+//
+//   numerics.tensor_sum_wgmma    wgmma (PTX) and HGMMA (SASS), f16, bf16 and tf32 operands: Sequential or Hopper.
+//   numerics.tensor_sum_tcgen05  tcgen05.mma (PTX) and UTCHMMA (SASS), .kind::f16 and .kind::tf32: Sequential or Hopper.
+//   numerics.tensor_sum_m8n8k4   mma.m8n8k4 with f16 operands (Volta's form): Sequential, Volta (an HMMA.884, Turing keeps it) or ChainCLast (ptxas
+//                                emulates it on sm_80 and later; an f32 accumulator only, an f16 one keeps the sequential sum).
+//   numerics.tensor_sum_sparse   mma.sp (PTX) and HMMA.SP (SASS), f16, bf16 and tf32 operands: Sequential or Ampere.
+//
+//   Hopper      chunks of 16 products (tf32: 8), cut at 2^(top - 26): the rule of an mma.sync on a Hopper device.
+//   Volta       chunks of 4 products, cut at 2^(top - 24): one HMMA.884 step, no extra alignment bit.
+//   ChainCLast  D = (((p0 + p1) + p2) + p3) + C in f32, each add rounded to nearest even (the products are exact in f32).
+//   Ampere      the Ampere rule over the stored products: chunks of 8 (tf32: 4), cut at 2^(top - 25). A stored product's partner in B is the one the
+//               metadata selects; the places A does not store take no part (an infinity or a NaN there does not reach the sum).
+enum class FormSum : uint8_t { Sequential, Hopper, Volta, ChainCLast, Ampere };
+inline constexpr TensorSumRule kVoltaSumRule{"volta: chunks of 4, cut at 2^(top-24)", 4, 4, 24};
+inline constexpr const TensorSumRule* form_sum_rule(FormSum m) {
+  return m == FormSum::Hopper ? &kHopperSumRule : m == FormSum::Volta ? &kVoltaSumRule : m == FormSum::Ampere ? &kAmpereSumRule : nullptr;
+}
+inline constexpr const char* form_sum_name(FormSum m) {
+  return m == FormSum::Hopper ? "hopper" : m == FormSum::Volta ? "volta" : m == FormSum::ChainCLast ? "chain_c_last" : m == FormSum::Ampere ? "ampere" : "sequential";
+}
+
 // A profile's `numerics:` section. Absent (present == false): the sequential sum and no published model, which is what an AMD or
 // Intel profile has -- their engines do not read this.
 struct Numerics {
@@ -258,6 +282,11 @@ struct Numerics {
   uint32_t tensor_sum_wgmma_fp8_chunk = 0;
   int32_t tensor_sum_wgmma_fp8_grid = 0;
   int32_t tensor_sum_wgmma_fp8_out_bits = 0;
+  // numerics.tensor_sum_wgmma, _tcgen05, _m8n8k4, _sparse (FormSum above). Optional, absent is sequential.
+  FormSum tensor_sum_wgmma = FormSum::Sequential;
+  FormSum tensor_sum_tcgen05 = FormSum::Sequential;
+  FormSum tensor_sum_m8n8k4 = FormSum::Sequential;
+  FormSum tensor_sum_sparse = FormSum::Sequential;
 };
 
 // What a value in a profile rests on. Exactly four classes; a key carries at most one.

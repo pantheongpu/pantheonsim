@@ -68,6 +68,7 @@ asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.popsection");
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
 #include "vgpu/exec/tc_fp8.hpp"
+#include "vgpu/exec/tc_forms.hpp"
 #include "vgpu/exec/texture_grad.hpp"
 #include "vgpu/exec/tma.hpp"
 #include "vgpu/exec/tcgen05.hpp"
