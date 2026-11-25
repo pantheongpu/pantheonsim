@@ -1958,6 +1958,10 @@ vgpu_unit_test(test_amd_gcn_ops amd/tests/unit/test_gcn_ops.cpp)
 target_compile_definitions(test_amd_gcn_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # Doubles, packed halves, the modifiers, the transcendentals and the atomics.
 vgpu_unit_test(test_amd_gcn_math amd/tests/unit/test_gcn_math.cpp)
+# The same one-instruction kernels on every AMD target and the same edge-case operands: where the targets differ, which side is the
+# hardware's (amd/tests/data/xarch.c, docs/amd-cross-arch.md).
+vgpu_unit_test(test_amd_gcn_cross_arch amd/tests/unit/test_gcn_cross_arch.cpp)
+target_compile_definitions(test_amd_gcn_cross_arch PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_compile_definitions(test_amd_gcn_math PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # Every instruction of the ISA corpora run once on pseudo-random state, bit for bit against the recorded
 # digests of the baseline build (amd/tests/unit/test_gcn_same_bits.cpp).

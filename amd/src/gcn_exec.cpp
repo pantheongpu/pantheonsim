@@ -48,6 +48,7 @@
 #include "gcn_matrix_kernels.hpp"
 #include "tile_buf.hpp"
 #include "nan_order.hpp"
+#include "transcendental.hpp"
 #ifndef SPARSE_ORDER
 #define SPARSE_ORDER 0   /* the sparse MFMA sum: which operand of the multiply and of the add a NaN takes the payload of */
 #endif
@@ -5168,8 +5169,10 @@ struct Machine {
         name.resize(name.size() - std::strlen(suffix));
         break;
       }
+    // (The cube-map instructions are in the machine-readable ISAs of RDNA2, RDNA3 and RDNA4 with the CDNA ones' description; no card of ours has run them.)
     static const std::set<std::string_view> kShared = {"v_sin_f16", "v_cos_f16", "v_frexp_mant_f16", "v_frexp_exp_i16_f16", "v_ldexp_f16",
-                                                       "v_sat_pk_u8_i16", "v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16"};
+                                                       "v_sat_pk_u8_i16", "v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16",
+                                                       "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32", "v_cubema_f32"};
     return kShared.count(name) != 0;
   }
   // The VALU instructions of the CDNA3 and CDNA4 guides that gfx942 and gfx950 have and that the gfx1250 and RDNA code already does by another
@@ -6166,11 +6169,11 @@ struct Machine {
     const InvariantSources invariant(*this, w, in);
     // gfx950 has the IEEE three-way minimum and maximum (CDNA4 ISA, V_MINIMUM3_F32, V_MAXIMUM3_F32, V_PK_MINIMUM3_F16,
     // V_PK_MAXIMUM3_F16), which gfx1250 has the same way ("IEEE minimum()/maximum()", a signaling NaN propagated).
-    if ((in.arch == gcn::Target::Gfx1250 ||
+    if ((in.arch == gcn::Target::Gfx1250 || (in.arch == gcn::Target::Gfx1200 && rdna4_ieee_family(in.name)) ||
          (in.arch == gcn::Target::Gfx950 && (op == "v_minimum3_f32"_op || op == "v_maximum3_f32"_op ||
                                              op == "v_pk_minimum3_f16"_op || op == "v_pk_maximum3_f16"_op))) &&
         cdna5_alu(w, in, op)) {return;} else if (gcn::is_rdna(in.arch) && rdna_alu(w, in, op)) {return;} else if (carry_alu(w, in)) {return;} else if (more_alu(w, in, op)) {return;} else if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950 || (in.arch == gcn::Target::Gfx90a && cdna2_defines(in.name)) ||
-         ((in.arch == gcn::Target::Gfx1030 || in.arch == gcn::Target::Gfx1100) && rdna2_shares(in.name))) &&
+         ((in.arch == gcn::Target::Gfx1030 || in.arch == gcn::Target::Gfx1100 || in.arch == gcn::Target::Gfx1200) && rdna2_shares(in.name))) &&
         gfx9_added_alu(w, in)) {return;} else {
   switch (op.hash()) {
     case "v_mov_b16_e32"_op.hash: case "v_mov_b16_e64"_op.hash: case "v_mov_b16"_op.hash:
@@ -6593,21 +6596,17 @@ struct Machine {
     if (!(op == "v_sin_f32_e32"_op || op == "v_cos_f32_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        // The argument is in turns: a whole turn is 1.0, not 2pi.
-        if (in.arch == gcn::Target::Gfx1250 || is_guide_arch(in)) {
-          const float x = lane_float(w, in.src[0], lane);
-          // (A NaN goes through as it came, a signaling one too: the round trip through a double that would quiet it is one the
-          // optimizer removes at -O1 and above and not at -O0, and the recorded bits are the removed one's.)
-          write_float(w, in, lane, std::isnan(x) ? x : turns_trig(static_cast<double>(x), op == "v_sin_f32_e32"_op));
+        // The argument is in turns, a whole turn 1.0, not 2pi, and only its fraction matters (the RX 6800's results over 77 operands,
+        // tools/numerics/amd/gfx1030.vectors.txt: the sine of any whole number of turns is +0, the cosine 1, up to the largest float;
+        // CDNA3, CDNA4 and CDNA5 guides, V_SIN_F32: "full range input is supported"). Every target has the card's rule.
+        const float x = lane_float(w, in.src[0], lane);
+        // (A NaN goes through as it came, a signaling one too on the targets whose guides say so: the round trip through a double that
+        // would quiet it is one the optimizer removes at -O1 and above and not at -O0, and the recorded bits are the removed one's.)
+        if (std::isnan(x) && !(in.arch == gcn::Target::Gfx1250 || is_guide_arch(in))) {
+          write_float(w, in, lane, static_cast<float>(op == "v_sin_f32_e32"_op ? std::sin(static_cast<double>(x)) : std::cos(static_cast<double>(x))));
           return;
         }
-        // The argument is in turns: a whole turn is 1.0, not 2pi.
-        const float turns = lane_float(w, in.src[0], lane);
-        // gfx1030 (an RX 6800, test_amd_gcn_nan): the sine of a nonzero whole number of turns is +0, not the rounding error of 2pi.
-        if (in.arch == gcn::Target::Gfx1030 && op == "v_sin_f32_e32"_op && turns != 0 && std::isfinite(turns) && turns == std::trunc(turns))
-          return write_float(w, in, lane, 0.0f);
-        const double radians = static_cast<double>(turns) * 6.283185307179586476925286766559;
-        write_float(w, in, lane, static_cast<float>(op == "v_sin_f32_e32"_op ? std::sin(radians) : std::cos(radians)));
+        write_float(w, in, lane, std::isnan(x) ? x : trans::turns_trig(static_cast<double>(x), op == "v_sin_f32_e32"_op));
       });
     }
     break;
@@ -7024,7 +7023,7 @@ struct Machine {
       each([&](uint32_t lane) {
         // As the reciprocal is: the host's exact answer, where a card's is a
         // table good to about one unit in the last place.
-        write_float(w, in, lane, 1.0f / std::sqrt(lane_float(w, in.src[0], lane)));
+        write_float(w, in, lane, trans::rsq(lane_float(w, in.src[0], lane)));
       });
     }
     break;
@@ -7645,7 +7644,7 @@ struct Machine {
     if (!(op == "v_sqrt_f32_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, std::sqrt(lane_float(w, in.src[0], lane)));
+        write_float(w, in, lane, trans::sqrt(lane_float(w, in.src[0], lane)));
       });
     }
     break;
@@ -7653,7 +7652,7 @@ struct Machine {
     if (!(op == "v_exp_f32_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, std::exp2(lane_float(w, in.src[0], lane)));
+        write_float(w, in, lane, trans::exp2(lane_float(w, in.src[0], lane)));
       });
     }
     break;
@@ -7661,7 +7660,7 @@ struct Machine {
     if (!(op == "v_log_f32_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, std::log2(lane_float(w, in.src[0], lane)));
+        write_float(w, in, lane, trans::log2(lane_float(w, in.src[0], lane)));
       });
     }
     break;
@@ -7781,8 +7780,8 @@ struct Machine {
           const float x = packed_half(w, in, 0, half, lane), y = packed_half(w, in, 1, half, lane);
           const float v = op == "v_pk_add_f16"_op   ? x + y
                           : op == "v_pk_mul_f16"_op ? x * y
-                          : op == "v_pk_min_f16"_op ? (ieee_minmax(in) || in.arch == gcn::Target::Gfx1250 ? hw_min(in, w.mode, x, y) : packed::pk_fminf(x, y))
-                          : op == "v_pk_max_f16"_op ? (ieee_minmax(in) || in.arch == gcn::Target::Gfx1250 ? hw_max(in, w.mode, x, y) : packed::pk_fmaxf(x, y))
+                          : op == "v_pk_min_f16"_op ? (ieee_minmax(in) || gcn::is_gfx12(in.arch) ? hw_min(in, w.mode, x, y) : packed::pk_fminf(x, y))
+                          : op == "v_pk_max_f16"_op ? (ieee_minmax(in) || gcn::is_gfx12(in.arch) ? hw_max(in, w.mode, x, y) : packed::pk_fmaxf(x, y))
                                                  : std::fma(x, y, packed_half(w, in, 2, half, lane));
           _Float16 h = half_out(w, static_cast<_Float16>(in.clamp ? clamp01(v) : v));
           if (rdna2 && h != h) h = as_half(rdna2_pk_nan(w, in, lane, half, op == "v_pk_fma_f16"_op, pk_minmax));
@@ -7804,7 +7803,7 @@ struct Machine {
         // (which is how the compiler divides) lands on the same answer. The
         // iflag form differs only in which exceptions it raises, and nothing
         // here raises any.
-        write_float(w, in, lane, 1.0f / lane_float(w, in.src[0], lane));
+        write_float(w, in, lane, trans::rcp(lane_float(w, in.src[0], lane)));
       });
     }
     break;
@@ -9212,9 +9211,9 @@ struct Machine {
   // quieted (the first operand first); otherwise a NaN operand gives the other; -0 is below +0; and the rest is the comparison.
   static bool is_guide_arch(const Inst& in) { return in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950; }
   // Who takes that rule: gfx942 and gfx950, gfx90a (the CDNA2 guide's V_MIN_F32 and V_MAX_F32 are the same pseudocode) and gfx1030 (an RX
-  // 6800: v_pk_max_f16 of -0 and +0 is +0, and of a signaling NaN with IEEE mode on a NaN, then held to 0 by the clamp). gfx11 and gfx12:
-  // not established, the host's fmin and fmax as before.
-  static bool ieee_minmax(const Inst& in) { return is_guide_arch(in) || in.arch == gcn::Target::Gfx90a || in.arch == gcn::Target::Gfx1030; }
+  // 6800: v_pk_max_f16 of -0 and +0 is +0, and of a signaling NaN with IEEE mode on a NaN, then held to 0 by the clamp). gfx1100 (RDNA3): inferred, from gfx1030's (no
+  // RDNA3 card of ours; the machine-readable RDNA3 ISA words V_MAX_F32 as RDNA2's); gfx12 (RDNA4, CDNA5): the "_num" instructions, hw_min and hw_max.
+  static bool ieee_minmax(const Inst& in) { return is_guide_arch(in) || in.arch == gcn::Target::Gfx90a || in.arch == gcn::Target::Gfx1030 || in.arch == gcn::Target::Gfx1100; }
   template <typename T>
   static T gfx9_minmax(T x, T y, bool is_min, bool ieee) {
     const auto signaling = [](T v) {
@@ -9246,14 +9245,22 @@ struct Machine {
   template <typename T>
   static T hw_min(const Inst& in, uint32_t mode, T x, T y) {
     if (ieee_minmax(in)) return gfx9_minmax(minmax_in(mode, x), minmax_in(mode, y), true, (mode >> 9) & 1);
-    if (in.arch != gcn::Target::Gfx1250) return nan_fmin<0>(x, y);
+    if (!gcn::is_gfx12(in.arch)) return nan_fmin<0>(x, y);
     return std::isnan(x) && std::isnan(y) ? quieted(x) : static_cast<T>(num_min(x, y));
   }
   template <typename T>
   static T hw_max(const Inst& in, uint32_t mode, T x, T y) {
     if (ieee_minmax(in)) return gfx9_minmax(minmax_in(mode, x), minmax_in(mode, y), false, (mode >> 9) & 1);
-    if (in.arch != gcn::Target::Gfx1250) return nan_fmax<0>(x, y);
+    if (!gcn::is_gfx12(in.arch)) return nan_fmax<0>(x, y);
     return std::isnan(x) && std::isnan(y) ? quieted(x) : static_cast<T>(num_max(x, y));
+  }
+  // The vector minimum and maximum instructions RDNA4 shares with gfx1250 (the machine-readable RDNA4 and CDNA5 ISAs describe each in the same words:
+  // V_MAX_NUM_F32 "IEEE maximumNumber()", V_MAXIMUM_F32 "IEEE maximum()"): the three-operand "_num" forms, the median, and the IEEE minimum and
+  // maximum. cdna5_alu runs them; the two-operand "_num" forms are hw_min and hw_max's.
+  static bool rdna4_ieee_family(const std::string& name) {
+    const auto has = [&](const char* part) { return name.find(part) != std::string::npos; };
+    if (name.rfind("v_", 0) != 0) return false;
+    return has("imum") || ((has("min3_num") || has("max3_num") || has("minmax_num") || has("maxmin_num") || has("med3_num")));
   }
   // The "_num" family on three values (minimumNumber and maximumNumber: a number beats a NaN), and the median.
   static double num3(const std::string_view kind, double x, double y, double z) {

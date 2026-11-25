@@ -487,9 +487,21 @@ a double), so it differs from the card on those percentages of inputs, and also 
 a denormal operand of `v_rcp_f32`, `v_rsq_f32`, `v_sqrt_f32`, `v_log_f32` is a zero on the card (`v_rcp`: infinity; `v_log`:
 -infinity) and a finite number on the host; a denormal result (`v_rcp_f32(2^127)`, `v_exp_f32(-127)`) is zero on the card;
 the NaN of a negative operand to `v_rsq_f32`/`v_sqrt_f32`/`v_log_f32` is `0xffc00000` on the card (read from the
-vectors file; the simulator's NaN for these was not run, the host's `-nan` is the same bits on x86). Whether the simulator's
-execution of each matches the card on those special operands was **not** run (no simulator build on the machine that took
-the measurement).
+vectors file; the host's `-nan` is the same bits on x86).
+
+**Run on 2026-11-23 (issues #721, #722, `test_amd_gcn_cross_arch`):** the simulator's gfx1030 differed from the card on 82 of the
+7 x 77 selected operands: every denormal operand and result of the first five, and the cosine (and the sine of an operand that
+is not a whole number of turns) of the largest floats. Now the interpreter and the tier share `amd/src/transcendental.hpp`:
+the five flush a denormal operand and a denormal result to a zero of its sign (measured on gfx1030 and gfx1031, **inferred** for
+every other target: LLVM's AMDGPU lowering scales a denormal operand of f32 sqrt, rsq, log and exp on every target because the
+instruction does not take one, and the machine-readable ISAs of CDNA3, RDNA2, RDNA3, RDNA4 and CDNA5 describe all seven in the same
+words); the sine and cosine count the angle in turns and keep its fraction for any size of argument, on every target (before,
+only gfx942, gfx950 and gfx1250 did: gfx90a, gfx1100 and gfx1201 took `sin(2 pi x)` in a double, and gfx1030 had the whole-turn sine
+only), with the card's exact zeros. The card's v_sin_f32 and v_cos_f32 of the multiples of 1/64 turn from -4 to 4 and of the
+floats next to the multiples from 1/64 to 1 (`tools/numerics/amd_trig_probe.cpp`, `tools/numerics/amd/gfx1030.trig64ths.txt`, the RX 6800
+on server2, ROCm 7.2.0): the sine of a multiple of 1/2 and the cosine of an odd multiple of 1/4 are +0, where 2 pi in a double
+leaves 1.2e-16 or 6.1e-17; everywhere else the card is within 4e-7 of the double's value on these 642 operands. What is still the host's:
+the low bits of the ordinary results, on every target (issue #729).
 
 **Measured: the double forms are about 24 bits.** `v_rcp_f64`, `v_rsq_f64`, `v_sqrt_f64` on 2^27 pseudo-random operands (and
 operands near 1): the result has 22 to 26 significant bits (the low 29 to 32 bits of the significand are zero; `v_sqrt_f64(1.0)`

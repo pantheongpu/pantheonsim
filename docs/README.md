@@ -27,6 +27,7 @@ One line per document. Start with the repository [README](../README.md); the des
 * [numerics/per-profile.md](numerics/per-profile.md): for every profile, which matrix numerics are measured on a card, inferred or unknown (generated from `vgpu info`).
 * [numerics/fttn-simulators.md](numerics/fttn-simulators.md): FTTN on the simulator, every NVIDIA profile with a tensor core, both engines, against the paper's Table IV and the cards of ours.
 * [numerics/fp8-vectors.md](numerics/fp8-vectors.md): the e4m3 and e5m2 `mma.sync` forms against 70,000 recorded vectors (RTX 1000 Ada, L40S, H100, H200, B200): the `ada` and `via_f16` sums, and why the PTX interpreter had disagreed with the SASS executor.
+* [amd-cross-arch.md](amd-cross-arch.md): where the AMD targets (gfx90a, gfx942, gfx950, gfx1030, gfx1100, gfx1201, gfx1250) gave different results for the same instruction, which side was right and on what evidence, and what no card of ours has settled (issues #721 to #730).
 * [numerics/math-functions.md](numerics/math-functions.md): the math functions against the published accuracy results (CUDA and ROCm) and against four cards, the test set of `tools/numerics/`, and the approximate-math unit (`MUFU`) of an RTX 3060: the probe over every input, the model that reproduces it bit for bit, `VGPU_MUFU_EXACT`.
 * [exact-threads.md](exact-threads.md): `VGPU_EXACT_THREADS`, blocks on several host threads with the bits of running them in order.
 * [pantheon-workloads.md](pantheon-workloads.md): running the pantheon workloads.

@@ -6,7 +6,9 @@
 // doubles with the special values among them, half the lanes off), and a digest of everything it left behind (or of the text of
 // the error it threw) is compared with amd/tests/data/packed_same_bits_digests.txt. The method is that of
 // test_amd_gcn_same_bits; the digests were recorded from the build before the change (VGPU_PACKED_SAME_BITS_UPDATE=<file>
-// writes them), never from the one under test.
+// writes them), never from the one under test. Sixteen lines were recorded again after the cross-architecture census (issue #721, from the tree
+// that has it): v_sin_f32 and v_cos_f32 of an angle that is a whole number of half or quarter turns, or an operand of the corpus's pseudo-random
+// registers, which now keep the fraction of a turn and give the card's exact zeros; no other line changed.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>

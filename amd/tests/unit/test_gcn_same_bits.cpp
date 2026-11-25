@@ -38,6 +38,10 @@
 // 14871-16054 whose result is a NaN (SDWA v_add/v_sub/v_min_f16, v_dot2c_f32_f16, and the doubles v_ceil, v_trunc, v_fract, v_frexp_mant, v_mul,
 // v_fma and v_div_fixup x4: now the cards' NaN), and v_cvt_f32_f64_e64 with a negated source on gfx950 and gfx90a (lines 3017 and 4906), which
 // the baseline converted without its neg.
+// One hundred and eight more after the cross-architecture census (test_amd_gcn_cross_arch, issues #721 to #724), from the tree that has it: the
+// transcendentals' denormal flush (v_rcp, v_rsq, v_sqrt, v_exp, v_log, e32, e64 and DPP, every target), the sine and cosine's fraction of a turn
+// (gfx90a, gfx1201, and gfx1250's DPP forms), and RDNA4's and gfx1100's minimum and maximum (v_min_num_f32, v_max3_num_f32, v_dual_max_num_f32
+// and the rest of gfx1201's "_num" lines, gfx1100's v_pk_min_f16): the lines of those instructions in isa_corpus*.txt, and no others.
 // Every other digest is the baseline's.
 #include <cstdint>
 #include <cstdio>

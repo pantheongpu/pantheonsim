@@ -25,6 +25,7 @@ asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.skip 1536\n.popsection")
 #include "gcn_divide.hpp"
 #include "gcn_tier_ds.hpp"
 #include "nan_order.hpp"
+#include "transcendental.hpp"
 #include "packed_math.hpp"
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/simd/simd.hpp"
@@ -2094,7 +2095,7 @@ constexpr uint32_t kConstMid = 4;    // fmamk: source 1 is the instruction's own
 constexpr uint32_t kConstLast = 8;   // fmaak: source 2 is the instruction's own constant
 constexpr uint32_t kFloatSrc = 32;   // an integer result from a float source: the source's modifiers apply
 constexpr uint32_t kIgnoreMods = 16;
-constexpr uint32_t kTrigTurns = 128;  // v_sin_f32, v_cos_f32: the kernel after the listed one on the architectures whose guides count the angle in whole turns (gfx942, gfx950)
+constexpr uint32_t kTrigTurns = 128;  // v_sin_f32, v_cos_f32: the kernel after the listed one, which keeps the fraction of a turn (every target)
 constexpr uint32_t kIntSrc1 = 256;    // v_ldexp_f32: the second source is an integer (its bits, no float modifiers)
 constexpr uint32_t kCdnaOnly = 512;   // 16-bit forms: only the CDNA parts (gfx90a, gfx942, gfx950), whose 16-bit results fill the low half of the register
 constexpr uint32_t kNoOmod = 1024;    // the instruction's output modifier means something the kernel does not do
@@ -2966,8 +2967,7 @@ void tier_classify(Inst& in) {
           default: break;   // v_min_f32 and v_max_f32 (MODE.IEEE decides), the rounding and the angles in turns: the interpreter's
         }
         if (in.arch == gcn::Target::Gfx1030) f.nan = kNanHandBack;   // (gfx1030's NaNs are the card's: the interpreter's rdna2_nan)
-        if (in.arch == gcn::Target::Gfx1030 && e.k == FSIN_R) return fail();   // (and its sine of a whole number of turns, +0)
-        const int kernel = (e.flags & kTrigTurns) && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) ? e.k + 1 : e.k;
+        const int kernel = (e.flags & kTrigTurns) ? e.k + 1 : e.k;   // (every target counts the angle in turns and keeps its fraction)
         f.kern = reinterpret_cast<AnyFn>(T.f32[kernel]);
         f.run = e.k == FLDEXP ? TIER_RUN(h_ldexp) : TIER_RUN(h_f32);
       } else {
