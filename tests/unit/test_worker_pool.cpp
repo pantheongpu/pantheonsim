@@ -373,12 +373,15 @@ VTEST(a_cheap_kernel_goes_wide_on_trial_and_stays_only_if_the_pool_pays) {
   using vgpu::exec::LaunchWidth;
   ::unsetenv("VGPU_POOL_MIN_WORK_US");
   const uint64_t kBlocks = 16, kBlockNs = 3000;
-  // (a busy wait: sleep_for rounds a few microseconds up to a timer tick)
-  const auto spin_us = [](int us) {
-    const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
-    while (std::chrono::steady_clock::now() < until) {
-    }
-  };
+  // A virtual clock: a launch "takes" what the test says it takes, however long a loaded runner lets the test run. (Timed with the steady
+  // clock this failed on a shared runner, where a launch preempted for milliseconds looks dear to every rule.)
+  static uint64_t virtual_ns;
+  virtual_ns = 1'000'000'000;
+  vgpu::exec::set_test_clock([]() -> uint64_t { return virtual_ns; });
+  struct ClockGuard {
+    ~ClockGuard() { vgpu::exec::set_test_clock(nullptr); }
+  } clock_guard;
+  const auto spin_us = [](int us) { virtual_ns += static_cast<uint64_t>(us) * 1000; };
   const auto launches = [&](int* key, int count, int pool_us) {
     std::vector<unsigned> used;
     for (int launch = 0; launch < count; ++launch) {

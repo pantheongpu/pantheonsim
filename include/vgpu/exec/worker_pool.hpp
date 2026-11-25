@@ -96,6 +96,9 @@ uint64_t unit_cost_from_busy(uint64_t units, uint64_t busy_ns);
 // empty tally (the bodies were not run through run_parallel) it uses the wall
 // time as before. Exposed for tests, which stand in for the pool.
 void note_busy_ns(uint64_t ns);
+// Tests: the clock LaunchWidth times launches with, in nanoseconds (never 0), so that a test that stands in for the pool does not depend on
+// how long the host let it run. nullptr: the steady clock.
+void set_test_clock(uint64_t (*now)());
 
 // A launch the default cap keeps on one thread may still pay on the pool: 100 us of work per thread is sized for a pool that has gone
 // cold (a futex wake each), and a pool that stays hot hands a launch over in about 10 us (PolyBench JACOBI1D: 20,000 launches of 48 us,
