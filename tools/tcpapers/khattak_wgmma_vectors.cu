@@ -122,5 +122,6 @@ int main(int argc, char** argv) {
     ++bad;
   }
   fprintf(dump ? stderr : stdout, "%s vectors=%d mismatches=%d\n", m.c_str(), N, bad);
+  cudaFree(da); cudaFree(db); cudaFree(dc); cudaFree(dd);   // free what was allocated: the leak sweep (tests/lint/leak_known.txt) lists no program of this test
   return 0;
 }
