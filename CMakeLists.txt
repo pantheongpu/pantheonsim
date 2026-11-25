@@ -5480,6 +5480,48 @@ foreach(_pair test_amd_gcn_same_bits:500 e2e_sass_archs:210 test_host_gemm:180 e
   endif()
 endforeach()
 
+# ---------------------------------------------------------------------------
+# Fuzz targets (tests/fuzz): the PTX parser, the SASS decoder and cubin reader, and the CUDA driver API.
+# Untrusted input must come back as an error, never a crash, a sanitizer report or a hang.
+#
+# Each target is a libFuzzer entry point (LLVMFuzzerTestOneInput). Built as they are by default, with tests/fuzz/standalone_main.cpp
+# for a main(), they run as ctest tests over the seed corpus (made from files the repository already has by tests/fuzz/make_seeds.py)
+# and over tests/fuzz/regress/<target>/, the input of every crash a fuzzer found; the ASan job runs them under the sanitizers.
+# With -DVGPU_FUZZ=ON (clang, -fsanitize=fuzzer-no-link,address,undefined in CMAKE_CXX_FLAGS: .github/workflows/fuzz.yml) they link libFuzzer
+# and are run by tests/fuzz/run_fuzz.sh.
+# ---------------------------------------------------------------------------
+option(VGPU_FUZZ "Link the fuzz targets with libFuzzer (clang) instead of the replay main" OFF)
+set(VGPU_FUZZ_SEEDS "${CMAKE_BINARY_DIR}/fuzz-seeds")
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  execute_process(COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/fuzz/make_seeds.py ${CMAKE_SOURCE_DIR} ${VGPU_FUZZ_SEEDS}
+                  RESULT_VARIABLE _seed_rc OUTPUT_VARIABLE _seed_out ERROR_VARIABLE _seed_err)
+  if(NOT _seed_rc EQUAL 0)
+    message(FATAL_ERROR "tests/fuzz/make_seeds.py failed: ${_seed_err}")
+  endif()
+  string(STRIP "${_seed_out}" _seed_out)
+  message(STATUS "fuzz ${_seed_out}")
+endif()
+foreach(_f ptx sass driver)
+  add_executable(fuzz_${_f} tests/fuzz/fuzz_${_f}.cpp)
+  target_link_libraries(fuzz_${_f} PRIVATE vgpu)
+  if(_f STREQUAL "driver")
+    target_include_directories(fuzz_driver PRIVATE nvidia/include)
+    target_link_libraries(fuzz_driver PRIVATE vgpucuda)
+  endif()
+  if(VGPU_FUZZ)
+    target_link_options(fuzz_${_f} PRIVATE -fsanitize=fuzzer)
+  else()
+    target_sources(fuzz_${_f} PRIVATE tests/fuzz/standalone_main.cpp)
+    set(_inputs "${VGPU_FUZZ_SEEDS}/${_f}")
+    if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/tests/fuzz/regress/${_f}")
+      list(APPEND _inputs "${CMAKE_SOURCE_DIR}/tests/fuzz/regress/${_f}")
+    endif()
+    add_test(NAME fuzz_replay_${_f} COMMAND fuzz_${_f} ${_inputs})
+    set_tests_properties(fuzz_replay_${_f} PROPERTIES TIMEOUT 900
+      ENVIRONMENT "VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
+  endif()
+endforeach()
 # The leak sweep. Every end-to-end test runs its programs with VGPU_LEAK_CHECK=1 and a log of its own, build/leak-check/<test>.log
 # (include/vgpu/leak_check.hpp: what the process still holds when its machine goes away); `tests/lint/check_leak_sweep.py
 # build/leak-check tests/lint/leak_known.txt` reads the logs after the tests (the CI step "Leak sweep") and fails on a leak the known

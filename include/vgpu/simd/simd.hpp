@@ -28,6 +28,14 @@
 // the table in use.
 #pragma once
 
+// A four-element shuffle of two vectors by a constant mask, in GCC's and in clang's spelling (the same lanes: clang has no
+// __builtin_shuffle). VGPU_SHUFFLE4(a, b, V4i, i0, i1, i2, i3), V4i being GCC's four-int vector type the mask would have.
+#if defined(__clang__)
+#define VGPU_SHUFFLE4(a, b, MaskType, i0, i1, i2, i3) __builtin_shufflevector(a, b, i0, i1, i2, i3)
+#else
+#define VGPU_SHUFFLE4(a, b, MaskType, i0, i1, i2, i3) __builtin_shuffle(a, b, (MaskType){i0, i1, i2, i3})
+#endif
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>

@@ -169,7 +169,7 @@ void words_to_tile(const uint32_t* regs, uint32_t N, uint32_t* tile) {
         V4u xv, yv;
         std::memcpy(&xv, x + 4 * g, sizeof xv);
         std::memcpy(&yv, y + 4 * g, sizeof yv);
-        const V4u lo = __builtin_shuffle(xv, yv, (V4i){0, 4, 1, 5}), hi = __builtin_shuffle(xv, yv, (V4i){2, 6, 3, 7});
+        const V4u lo = VGPU_SHUFFLE4(xv, yv, V4i, 0, 4, 1, 5), hi = VGPU_SHUFFLE4(xv, yv, V4i, 2, 6, 3, 7);
         std::memcpy(tile + size_t{g + 8 * h} * N + 8 * j, &lo, sizeof lo);
         std::memcpy(tile + size_t{g + 8 * h} * N + 8 * j + 4, &hi, sizeof hi);
       }
@@ -186,7 +186,7 @@ void tile_to_words(const uint32_t* tile, uint32_t N, uint32_t* regs) {
         V4u lo, hi;
         std::memcpy(&lo, tile + size_t{g + 8 * h} * N + 8 * j, sizeof lo);
         std::memcpy(&hi, tile + size_t{g + 8 * h} * N + 8 * j + 4, sizeof hi);
-        V4u e = __builtin_shuffle(lo, hi, (V4i){0, 2, 4, 6}), o = __builtin_shuffle(lo, hi, (V4i){1, 3, 5, 7});
+        V4u e = VGPU_SHUFFLE4(lo, hi, V4i, 0, 2, 4, 6), o = VGPU_SHUFFLE4(lo, hi, V4i, 1, 3, 5, 7);
         if (CanonNan) {
           // (the float compare is false for a NaN only)
           const V4u me = reinterpret_cast<V4u>(reinterpret_cast<V4f>(e) != reinterpret_cast<V4f>(e)),
