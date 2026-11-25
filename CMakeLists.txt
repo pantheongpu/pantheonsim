@@ -3210,7 +3210,10 @@ if(TARGET vgpucublas)
   target_link_libraries(test_cublas_gemmex_mixed PRIVATE vgpucublas vgpucudart)
   target_include_directories(test_cublas_gemmex_mixed PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
   add_test(NAME test_cublas_gemmex_mixed COMMAND test_cublas_gemmex_mixed)
-  set_tests_properties(test_cublas_gemmex_mixed PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;VGPU_THREADS=2" TIMEOUT 600)
+  # On the h100 profile: the host's sequential FP32 sum is what a GemmEx of FP16 or BF16 computes there (gemm_tensor_sum.hpp keeps the
+  # Hopper rule out), the loops this test holds it to. An Ampere-rule profile (rtx3060) sums by a tensor core's chunks instead, which
+  # e2e_cublas_tc_gemm holds to the cards.
+  set_tests_properties(test_cublas_gemmex_mixed PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100;VGPU_QUIET=1;VGPU_THREADS=2" TIMEOUT 600)
 endif()
 
 # A cuBLAS call captured into a CUDA graph. The library computes on the host,
