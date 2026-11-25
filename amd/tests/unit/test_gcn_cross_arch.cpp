@@ -136,7 +136,7 @@ std::vector<Vec> column(const char* file, int col, int columns) {
 
 float as_f(uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; }
 
-int check_column(const char* kernel, const std::vector<Vec>& rows, bool trig, const char* target = "gfx1030") {
+int check_column(const char* kernel, const std::vector<Vec>& rows, bool trig, const char* target = "gfx1030", bool exact = false) {
   Inputs in;
   for (size_t i = 0; i < (rows.size() + 63) / 64 * 64; ++i) {
     in.a.push_back(i < rows.size() ? rows[i].x : 0u);
@@ -149,7 +149,7 @@ int check_column(const char* kernel, const std::vector<Vec>& rows, bool trig, co
   for (size_t i = 0; i < rows.size(); ++i) {
     const uint32_t g = got.at(kernel)[i], w = rows[i].want;
     bool ok = g == w;
-    if (!ok && ordinary(rows[i].x) && ordinary(w) && ordinary(g) && (g >> 31) == (w >> 31)) ok = (g > w ? g - w : w - g) <= 1;
+    if (!ok && !exact && ordinary(rows[i].x) && ordinary(w) && ordinary(g) && (g >> 31) == (w >> 31)) ok = (g > w ? g - w : w - g) <= 1;
     if (!ok && trig && ordinary(g) && ordinary(w)) ok = std::fabs(as_f(g) - as_f(w)) <= 4e-7f;
     if (!ok && wrong++ < 12) std::fprintf(stderr, "  %s %s(%08x): %08x, the card gave %08x\n", target, kernel, rows[i].x, g, w);
   }
@@ -161,7 +161,9 @@ int check_column(const char* kernel, const std::vector<Vec>& rows, bool trig, co
 VTEST(gfx1030_transcendentals_on_the_cards_special_operands) {
   const char* const names[7] = {"k_rcp", "k_rsq", "k_sqrt", "k_exp", "k_log", "k_sin", "k_cos"};
   int wrong = 0;
-  for (int op = 0; op < 7; ++op) wrong += check_column(names[op], column("gfx1030.vectors.txt", op + 1, 8), op >= 5);
+  // (v_rcp_f32, v_rsq_f32 and v_sqrt_f32 are the card's bits on every operand, rdna2_trans.cpp, test_amd_rdna2_trans; the other four are the host's
+  // result, within one unit)
+  for (int op = 0; op < 7; ++op) wrong += check_column(names[op], column("gfx1030.vectors.txt", op + 1, 8), op >= 5, "gfx1030", op < 3);
   VCHECK_EQ(wrong, 0);
 }
 
@@ -241,6 +243,61 @@ std::string fail_text(const std::string& target, const char* kernel, const char*
 }
 
 }  // namespace
+
+// ---- v_rcp_f64 and v_rsq_f64 on the RX 6800's recorded operands (issue #728; tools/numerics/amd/gfx1030.vectors64.txt: 327 selected operands,
+// gfx1030.sample64.txt: 1024 pseudo-random ones; the RX 6700 XT gave the same results). Where the operand or the card's result is not an ordinary
+// number (zero, infinity, NaN) the result must be the card's, bit for bit. Where both are ordinary (a denormal operand or result too: 2^-1024 comes
+// back from the card as 2^-1074 away from the exact one) the card's result has 22 to 26
+// significant bits (its low bits are a table's; measured over 2^27 operands, docs/numerics/math-functions.md) and the simulator's is the correctly
+// rounded double on every target, so the two must agree to 2^-22 relative: what is pinned is the size of the difference, not its bits (a model of
+// them is not known, issue #728 stays open).
+namespace {
+
+struct Vec64 { uint64_t x, rcp, rsq, sqrt; };
+
+std::vector<Vec64> vectors64(const char* file) {
+  std::ifstream f(std::string(VGPU_SOURCE_DIR) + "/tools/numerics/amd/" + file);
+  if (!f) throw vtest::Failure(std::string("no vectors file ") + file);
+  std::vector<Vec64> rows;
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    unsigned long long v[4];
+    if (std::sscanf(line.c_str(), "%llx %llx %llx %llx", &v[0], &v[1], &v[2], &v[3]) == 4) rows.push_back({v[0], v[1], v[2], v[3]});
+  }
+  return rows;
+}
+
+bool ordinary64(uint64_t b) { return (b & 0x7fffffffffffffffull) != 0 && (b >> 52 & 0x7ff) != 0x7ff; }   // (finite, not zero: a denormal counts)
+double as_d(uint64_t b) { double d; std::memcpy(&d, &b, 8); return d; }
+
+int check64(const char* target, const char* kernel, const std::vector<Vec64>& rows, uint64_t Vec64::*column) {
+  std::vector<Case> cases;
+  for (const Vec64& r : rows) cases.push_back({static_cast<uint32_t>(r.x), static_cast<uint32_t>(r.x >> 32), 0});
+  const auto got = run_cases(target, kernel, cases);
+  int wrong = 0;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    const uint64_t w = rows[i].*column;
+    bool ok = got[i] == w;
+    if (!ok && ordinary64(rows[i].x) && ordinary64(w) && ordinary64(got[i]) && (got[i] >> 63) == (w >> 63))
+      ok = std::fabs(as_d(got[i]) - as_d(w)) <= std::ldexp(std::fabs(as_d(w)), -22);
+    if (!ok && wrong++ < 8) std::fprintf(stderr, "  %s %s(%016llx): %016llx, the card gave %016llx\n", target, kernel, static_cast<unsigned long long>(rows[i].x), static_cast<unsigned long long>(got[i]), static_cast<unsigned long long>(w));
+  }
+  return wrong;
+}
+
+}  // namespace
+
+VTEST(gfx1030_double_reciprocal_and_reciprocal_square_root_on_the_cards_operands) {
+  int wrong = 0;
+  for (const char* file : {"gfx1030.vectors64.txt", "gfx1030.sample64.txt"}) {
+    const auto rows = vectors64(file);
+    VCHECK(rows.size() >= 300);
+    wrong += check64("gfx1030", "k_d_rcp", rows, &Vec64::rcp);
+    wrong += check64("gfx1030", "k_d_rsq", rows, &Vec64::rsq);
+  }
+  VCHECK_EQ(wrong, 0);
+}
 
 // ---- issue #724: the minimum and maximum. Every target orders -0 below +0; the result of v_max_f32(2, a NaN) is the 2; RDNA4's and
 // gfx1250's "_num" and IEEE forms (RDNA4 ISA, V_MAX_NUM_F32: "IEEE maximumNumber()", V_MAXIMUM_F32: "IEEE maximum()") are one set of

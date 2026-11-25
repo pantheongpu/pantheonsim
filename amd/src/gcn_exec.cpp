@@ -48,6 +48,7 @@
 #include "gcn_matrix_kernels.hpp"
 #include "tile_buf.hpp"
 #include "nan_order.hpp"
+#include "rdna2_trans.hpp"
 #include "transcendental.hpp"
 #ifndef SPARSE_ORDER
 #define SPARSE_ORDER 0   /* the sparse MFMA sum: which operand of the multiply and of the add a NaN takes the payload of */
@@ -7022,8 +7023,9 @@ struct Machine {
     {
       each([&](uint32_t lane) {
         // As the reciprocal is: the host's exact answer, where a card's is a
-        // table good to about one unit in the last place.
-        write_float(w, in, lane, trans::rsq(lane_float(w, in.src[0], lane)));
+        // table good to about one unit in the last place (gfx1030: the card's).
+        const float x = lane_float(w, in.src[0], lane);
+        write_float(w, in, lane, in.arch == gcn::Target::Gfx1030 ? rdna2::rsq(x) : trans::rsq(x));
       });
     }
     break;
@@ -7644,7 +7646,8 @@ struct Machine {
     if (!(op == "v_sqrt_f32_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, trans::sqrt(lane_float(w, in.src[0], lane)));
+        const float x = lane_float(w, in.src[0], lane);
+        write_float(w, in, lane, in.arch == gcn::Target::Gfx1030 ? rdna2::sqrt(x) : trans::sqrt(x));
       });
     }
     break;
@@ -7802,8 +7805,10 @@ struct Machine {
         // last place; this is the exact one, so a program that refines it
         // (which is how the compiler divides) lands on the same answer. The
         // iflag form differs only in which exceptions it raises, and nothing
-        // here raises any.
-        write_float(w, in, lane, trans::rcp(lane_float(w, in.src[0], lane)));
+        // here raises any. gfx1030 (an RX 6800 and an RX 6700 XT) gives the
+        // card's bits (rdna2_trans.hpp).
+        const float x = lane_float(w, in.src[0], lane);
+        write_float(w, in, lane, in.arch == gcn::Target::Gfx1030 ? rdna2::rcp(x) : trans::rcp(x));
       });
     }
     break;

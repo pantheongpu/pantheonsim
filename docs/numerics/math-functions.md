@@ -501,9 +501,42 @@ only), with the card's exact zeros. The card's v_sin_f32 and v_cos_f32 of the mu
 floats next to the multiples from 1/64 to 1 (`tools/numerics/amd_trig_probe.cpp`, `tools/numerics/amd/gfx1030.trig64ths.txt`, the RX 6800
 on server2, ROCm 7.2.0): the sine of a multiple of 1/2 and the cosine of an odd multiple of 1/4 are +0, where 2 pi in a double
 leaves 1.2e-16 or 6.1e-17; everywhere else the card is within 4e-7 of the double's value on these 642 operands. What is still the host's:
-the low bits of the ordinary results, on every target (issue #729).
+the low bits of the ordinary results of `v_exp_f32`, `v_log_f32`, `v_sin_f32`, `v_cos_f32`, on every target, and of all seven on the targets
+but gfx1030 and gfx1031 (issues #729, #741).
 
-**Measured: the double forms are about 24 bits.** `v_rcp_f64`, `v_rsq_f64`, `v_sqrt_f64` on 2^27 pseudo-random operands (and
+**Run on 2026-11-25 (issues #729, #741, `test_amd_rdna2_trans`): `v_rcp_f32`, `v_rsq_f32` and `v_sqrt_f32` are the RX 6800's, bit for bit
+over all 2^32 operands, on gfx1030 and gfx1031 (measured).** `amd/src/rdna2_trans.cpp`; the other targets keep the host's result (no card).
+What the earlier attempts could not reach (a closed form) was not needed: the model is a table in another form, small enough to carry.
+- The result's mantissa depends on the operand's mantissa only. **Measured**, on dumps of seven binades each of `rcp`, `rsq` and `sqrt`:
+  the 23 result mantissa bits are the same function of the 23 operand bits in every binade (for `rsq` and `sqrt` one function for an even
+  exponent, one for an odd), the exponent is shifted as the function's exponent is, and a negative operand of `rcp` is the positive one's
+  result with the sign flipped (all 2^23 operands of one binade). So five dumps of 2^23 results (`amd_trans_probe <op> dump`: `rcp`
+  [1, 2), `rsq` [1, 2) and [2, 4), `sqrt` [1, 2) and [2, 4)) are the card's whole behaviour on normal operands.
+- Each is a least-squares cubic per 2^18 mantissas (32 segments; the squarer's operand with its low bit cleared for `rcp` and `rsq`, two bits for
+  `sqrt`, found by trying 0 to 8 bits), evaluated in 128-bit integers, plus a list of the mantissas where the card is one unit in the last place
+  away from the cubic's floor (65,945 of the 2^23 for `rcp`, 0.79 %; 66 to 74 thousand for each of the others; the direction is fixed by the
+  fraction of the cubic: up from one half). Nothing is fitted to hide a larger error: the cubic's own misses are 0.8 % at every segment width from
+  2^18 down to 2^10, the noise of the card's truncated terms (about 1/64 ulp), which is why no cubic, quadratic or table row is exact and why the earlier
+  attempts stopped at 99.2 %. The exceptions are the card's integer truncations written down, not a model of them.
+- `tools/numerics/amd_trans_table_fit.py` writes `amd/src/rdna2_trans_data.inc` (700 KB, the gaps of the lists as base64) from the five dumps;
+  the same arithmetic is `rdna2_trans.cpp`. `test_amd_rdna2_trans` runs all 2^32 operands of each function through it and compares the 64 chunk
+  hashes of each with `tools/numerics/amd/gfx1030.hashes.txt` (the card's, written 2026-11-16, before the model existed): all 192 chunks equal.
+  Special operands (zero, denormal, infinity, NaN, a negative operand of `rsq` and `sqrt`) are the rule above and are in the same hashes.
+- Not the card's but the same on both cards: an RX 6700 XT's hashes are the RX 6800's on all seven functions (2026-11-16), so gfx1031 gets
+  the same table; it was not dumped separately. gfx1032 and the other RDNA2 parts the loader maps to gfx1030 are **inferred**.
+- Not done, and why: `v_exp_f32`, `v_log_f32`, `v_sin_f32`, `v_cos_f32`. The same method needs the card's behaviour as a function of one
+  mantissa, and these are not: `v_exp_f32` of x uses a fraction of x finer than 2^-24 (adjacent operands of [0.25, 0.5) give different results
+  in 22 percent of pairs, even and odd alike), so its table is a function of the operand's binade too (about 130 of them), and `v_log_f32` and the
+  trigonometric forms add the exponent or the turn count to a fixed-point result. A table per binade is some two megabytes of exception lists for `exp`
+  alone; none was built.
+
+**Measured: the double forms are about 24 bits.** (Still not modelled. 2026-11-25: the instruction's result depends on the top 30 or so bits of the operand's mantissa, not 23
+(over 2^32 adjacent operands the result changes 434 times), the results of the operands that are floats are not the single-precision instruction's
+(`v_rcp_f32` is the double result rounded to nearest on 88 % of the 2^23 mantissas of [1, 2)), the result is a multiple of 2^-35 and its error is
+at most 0.47 of a single-precision ulp, and it is not a cubic of 2^18 mantissas (the cubic's residual is 0.3 ulp with a parity term of 31 units of 2^-35): a different pipeline, with
+2^30 inputs a binade, so the exception-list method above would need about 8 million entries a binade. Its special operands are the host's rule: the card's
+results on 327 selected operands and 1,024 random ones are `tools/numerics/amd/gfx1030.vectors64.txt` and `gfx1030.sample64.txt`, tested by
+`test_amd_gcn_cross_arch` with the size of the difference pinned (2^-22).) `v_rcp_f64`, `v_rsq_f64`, `v_sqrt_f64` on 2^27 pseudo-random operands (and
 operands near 1): the result has 22 to 26 significant bits (the low 29 to 32 bits of the significand are zero; `v_sqrt_f64(1.0)`
 is 1 + 2^-24), the largest distance from the correctly rounded double is 2^28 ulp (2.6e8 for `rcp`), and the results are
 never the correct double except near powers of two. The compiler refines them with fused multiply-adds. Both cards agree
@@ -696,8 +729,8 @@ larger than the figure by an amount not measured. No other program was timed.
 - The half-precision forms: the F16 forms are the card's on the RTX 3060 (the previous section), measured on that card alone;
   Turing, Ada and Blackwell were not measured for these forms. The bf16 forms (sm_90 and later) are measured on an H100 PCIe
   (the previous sections); Blackwell has the same encoding and is inferred.
-- The AMD math instructions (`v_rcp_f32`, `v_rsq_f32`, `v_exp_f32`, `v_log_f32`, `v_sin_f32`, `v_cos_f32`) are unchanged,
-  and no AMD card has run any of this.
+- The AMD math instructions (`v_rcp_f32`, `v_rsq_f32`, `v_exp_f32`, `v_log_f32`, `v_sin_f32`, `v_cos_f32`) were unchanged by
+  that round, and no AMD card had run any of it (`v_rcp_f32`, `v_rsq_f32` and `v_sqrt_f32` of gfx1030 are the card's since 2026-11-25, above).
 - The NaN an `erf(double)` of a NaN returns, and `hypot(double)` of a signaling NaN and a zero, still differ between the
   engines (three lines of 329). The SASS executor's is the card's; the PTX interpreter's instruction was not traced.
 - The PTX interpreter mirrors ptxas for the forms listed under "The PTX forms", from the SASS of nvcc 13.0 for sm_75, sm_86

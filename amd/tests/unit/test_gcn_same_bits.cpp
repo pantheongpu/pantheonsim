@@ -43,6 +43,8 @@
 // (gfx90a, gfx1201, and gfx1250's DPP forms), and RDNA4's and gfx1100's minimum and maximum (v_min_num_f32, v_max3_num_f32, v_dual_max_num_f32
 // and the rest of gfx1201's "_num" lines, gfx1100's v_pk_min_f16): the lines of those instructions in isa_corpus*.txt, and no others.
 // Every other digest is the baseline's.
+// Five more after gfx1030's v_rcp_f32 (e32, e64, iflag), v_rsq_f32 and v_sqrt_f32 became the RX 6800's bits (test_amd_rdna2_trans, issues #729 and #741), from the
+// tree that has it: lines 15973, 15974, 15976, 15989 and 15993 of same_bits_digests.txt (isa_corpus_gfx1030.txt) (found by a run with VGPU_SAME_BITS_ALL=1: nothing else differed).
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
