@@ -81,7 +81,7 @@ current sources.)
 - Real-GPU card check (design on a 3080 Ti, not enabled): [docs/ci-card-check.md](docs/ci-card-check.md).
 - AMD rows in `workloads.yml` and its `coverage` check; reconcile the hip-tests disabled-case lists and the SASS-vs-PTX digest differences
   ([docs/ci.md](docs/ci.md)).
-- CUDA Samples that still differ from the card (`UnifiedMemoryPerf`, `simpleCUFFT_callback`, `quasirandomGenerator`, `graphMemoryFootprint`,
+- CUDA Samples that still differ from the card (`UnifiedMemoryPerf`, `simpleCUFFT_callback`, `graphMemoryFootprint`,
   `simpleAttributes`) are listed in `ci/external/cuda-samples-known.txt`, with the reasons in [gap-register.md](docs/gap-register.md).
 - PyTorch sweep: no known failure listed since 2026-11-15. The one there was (tiny causal transformer after three AdamW steps,
   numeric, not a simulator bug) matches the CPU since the model of the card's math unit; it is noise-driven and can come back
