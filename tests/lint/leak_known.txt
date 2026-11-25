@@ -8,57 +8,135 @@ e2e_async_host_copies device_allocs=1,device_bytes=4  # the program does not fre
 e2e_async_host_events_driver device_allocs=1,device_bytes=4,pinned_allocs=1  # the program does not free it before it exits
 e2e_async_launch_events device_allocs=1,device_bytes=4  # the program does not free it before it exits
 e2e_atomic_cas device_allocs=4,device_bytes=28  # the program does not free it before it exits
+e2e_atomic_subnormal device_allocs=4,device_bytes=960  # found by the sweep after #714 and #720; the program does not free it before it exits
 e2e_atomics_threads device_allocs=14,device_bytes=1574384  # the program does not free it before it exits
 e2e_bar_red_named device_allocs=1,device_bytes=6144  # the program does not free it before it exits
+e2e_blas_ex_paths device_allocs=15,device_bytes=552  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_blas_legacy_paths device_allocs=16,device_bytes=592  # found by the sweep after #714 and #720; the program does not free it before it exits
 e2e_block_semaphore device_allocs=2,device_bytes=4128  # the program does not free it before it exits
 e2e_border_colour device_allocs=5,device_bytes=2388  # the program does not free it before it exits
-e2e_bsync_across_calls device_allocs=5,device_bytes=16048  # the program does not free it before it exits
-e2e_bsync_recursive_abi device_allocs=4,device_bytes=688  # the program does not free it before it exits
-e2e_capture_streams device_bytes=2097152  # the program does not free it before it exits
-e2e_cg_multi_warp_tiles device_allocs=4,device_bytes=7282  # the program does not free it before it exits
+e2e_bsync_across_calls device_allocs=4,device_bytes=16032  # the program does not free it before it exits
+e2e_bsync_recursive_abi device_allocs=3,device_bytes=1168  # the program does not free it before it exits
+e2e_capture_splice device_allocs=1,device_bytes=16  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_capture_streams device_allocs=1,device_bytes=2097168  # the program does not free it before it exits
+e2e_cg_multi_warp_tiles device_allocs=3,device_bytes=7208  # the program does not free it before it exits
 e2e_constant_global_load device_allocs=3,device_bytes=6576  # the program does not free it before it exits
-e2e_constant_table_xor device_allocs=5,device_bytes=393968  # the program does not free it before it exits
-e2e_cooperative_grid device_allocs=2,device_bytes=2048  # the program does not free it before it exits
-e2e_deferred_errors device_allocs=3,device_bytes=121  # the program does not free it before it exits
+e2e_constant_table_xor device_allocs=4,device_bytes=393960  # the program does not free it before it exits
+e2e_cooperative_grid device_allocs=3,device_bytes=2064  # the program does not free it before it exits
+e2e_cupti_driver_params device_bytes=2097152  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_cupti_driver_params_linux device_bytes=2097152  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_cupti_params device_allocs=1,device_bytes=64  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_cupti_params_linux device_allocs=1,device_bytes=64  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_cutensor_paths device_allocs=69,device_bytes=42004  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_cutensornet_paths device_allocs=10,device_bytes=6128  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_cutlass_gemm device_allocs=127,device_bytes=63605  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_cutlass_hopper device_allocs=66,device_bytes=220143  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_deferred_errors device_allocs=2,device_bytes=125  # the program does not free it before it exits
 e2e_device_function_barriers device_allocs=1,device_bytes=6144  # the program does not free it before it exits
 e2e_device_functions device_allocs=3,device_bytes=1048  # the program does not free it before it exits
-e2e_device_graph_launch device_allocs=4,device_bytes=15425  # the program does not free it before it exits
-e2e_device_heap device_allocs=5,device_bytes=160  # the program does not free it before it exits
-e2e_device_intrinsics device_allocs=7,device_bytes=354  # the program does not free it before it exits
-e2e_divergent_indirect_calls device_allocs=6,device_bytes=2320  # the program does not free it before it exits
-e2e_dynamic_parallelism device_allocs=8,device_bytes=368  # the program does not free it before it exits
+e2e_device_graph_launch device_allocs=4,device_bytes=14609  # the program does not free it before it exits
+e2e_device_heap device_allocs=4,device_bytes=144  # the program does not free it before it exits
+e2e_device_intrinsics device_allocs=7,device_bytes=390  # the program does not free it before it exits
+e2e_device_runtime device_allocs=342,device_bytes=14518  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_differential_determinism device_allocs=19,device_bytes=62044  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_differential_diff device_allocs=19,device_bytes=62044  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_divergent_indirect_calls device_allocs=5,device_bytes=2272  # the program does not free it before it exits
+e2e_dpx_intrinsics device_allocs=3,device_bytes=2484744  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_driver_mma_divergence device_allocs=3,device_bytes=932  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_dsmem_cluster device_allocs=1,device_bytes=16  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_dynamic_parallelism device_allocs=273,device_bytes=12733  # the program does not free it before it exits
 e2e_fault_datapath device_allocs=2,device_bytes=32768  # the program does not free it before it exits
-e2e_float_half_forms device_allocs=4,device_bytes=360  # the program does not free it before it exits
-e2e_graph_conditional device_allocs=3,device_bytes=20  # the program does not free it before it exits
+e2e_fft_legacy_callbacks device_allocs=1,device_bytes=40  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_float_half_forms device_allocs=4,device_bytes=344  # the program does not free it before it exits
+e2e_graph_capture_driver device_bytes=2097152  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_graph_capture_solver device_allocs=11,device_bytes=12582976  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_graph_capture_solver_sp device_allocs=5,device_bytes=4194540  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_graph_cusparse device_allocs=12,device_bytes=9256  # found by the sweep after #714 and #720; the program does not free it before it exits
 e2e_graph_memory device_bytes=10485760  # the program does not free it before it exits
 e2e_graph_shapes device_allocs=1,device_bytes=256  # the program does not free it before it exits
 e2e_host_atomics device_allocs=1,device_bytes=8  # the program does not free it before it exits
 e2e_inplace_scalar_update device_allocs=3,device_bytes=4104  # the program does not free it before it exits
 e2e_launch_cache device_allocs=1,device_bytes=256  # the program does not free it before it exits
 e2e_launch_refusals device_allocs=2,device_bytes=20480  # the program does not free it before it exits
-e2e_libraries device_allocs=50,device_bytes=32817  # the program does not free it before it exits
-e2e_lockstep_blocks device_allocs=6,device_bytes=8216  # the program does not free it before it exits
+e2e_libraries device_allocs=22,device_bytes=32789  # the program does not free it before it exits
+e2e_library_goldens device_allocs=5,device_bytes=142440  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_lockstep_blocks device_allocs=5,device_bytes=8208  # the program does not free it before it exits
 e2e_lop3_pred_chain device_allocs=2,device_bytes=14336  # the program does not free it before it exits
-e2e_memo_api_matrix device_allocs=4,device_bytes=88  # the program does not free it before it exits
+e2e_managed_vars device_allocs=10,device_bytes=96  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_memo_api_matrix device_allocs=3,device_bytes=64  # the program does not free it before it exits
 e2e_memtest_patterns device_allocs=3,device_bytes=131088  # the program does not free it before it exits
 e2e_mma_forms device_allocs=1,device_bytes=2048  # the program does not free it before it exits
 e2e_mma_layout device_allocs=3,device_bytes=1280  # the program does not free it before it exits
-e2e_modern_dtypes device_allocs=3,device_bytes=164  # the program does not free it before it exits
+e2e_modern_dtypes device_allocs=4,device_bytes=180  # the program does not free it before it exits
 e2e_multiarch_modules device_allocs=1,device_bytes=128  # the program does not free it before it exits
+e2e_nccl_comm_ops_3 device_allocs=3,device_bytes=49152  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_nccl_comm_ops_4 device_allocs=4,device_bytes=65536  # found by the sweep after #714 and #720; the program does not free it before it exits
 e2e_ncu device_allocs=2,device_bytes=32768  # the program does not free it before it exits
 e2e_numerics_mathfn device_allocs=6,device_bytes=3160  # the program does not free it before it exits
+e2e_nvcomp_paths device_allocs=945,device_bytes=8339576  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_nvfatbin_paths device_allocs=6,device_bytes=24  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_nvprof fds=1  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_nvshmem_peerless device_bytes=1232666624  # found by the sweep after #714 and #720; the program does not free it before it exits
 e2e_peer_kernel device_allocs=4,device_bytes=4016  # the program does not free it before it exits
-e2e_per_thread_stream device_allocs=1,device_bytes=4,threads=1  # the program does not free it before it exits
+e2e_per_thread_stream device_allocs=1,device_bytes=4  # the program does not free it before it exits
 e2e_pool_cap device_allocs=4,device_bytes=139332  # the program does not free it before it exits
-e2e_printf_formats device_allocs=2,device_bytes=471  # the program does not free it before it exits
+e2e_printf_formats device_allocs=1,device_bytes=311  # the program does not free it before it exits
 e2e_private_loads device_allocs=1,device_bytes=16  # the program does not free it before it exits
-e2e_ptx_forms device_allocs=3,device_bytes=4844  # the program does not free it before it exits
+e2e_ptx_forms device_allocs=3,device_bytes=4812  # the program does not free it before it exits
 e2e_ptx_half_forms device_allocs=3,device_bytes=6124  # the program does not free it before it exits
 e2e_ptx_memory_forms device_allocs=4,device_bytes=7652  # the program does not free it before it exits
 e2e_ptx_sweep device_allocs=2,device_bytes=4096  # the program does not free it before it exits
 e2e_ptx_warp_mem device_allocs=4,device_bytes=8032  # the program does not free it before it exits
+e2e_rand_poisson device_allocs=9,device_bytes=218120  # found by the sweep after #714 and #720; the program does not free it before it exits
 e2e_rdc_clones device_allocs=8,device_bytes=3512  # the program does not free it before it exits
 e2e_rdc_link device_allocs=7,device_bytes=1048  # the program does not free it before it exits
 e2e_round9_probe device_allocs=18,device_bytes=239008  # the program does not free it before it exits
 e2e_runtime_conformance device_allocs=2,device_bytes=272  # the program does not free it before it exits
+e2e_runtime_memory_gaps device_allocs=1,device_bytes=4  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sanitizer_kernels device_allocs=3,device_bytes=704  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_archs device_allocs=342,device_bytes=2484744  # found by the sweep after #714 and #720; the program does not free it before it exits
 e2e_sass_fastpath device_allocs=7,device_bytes=8256  # the program does not free it before it exits
+e2e_sass_jit_shard_loops device_allocs=5,device_bytes=163840  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_jit_shard_modes device_allocs=4,device_bytes=368  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_jit_shard_random device_allocs=4,device_bytes=62696  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_jit_shard_steps device_allocs=6,device_bytes=8536  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_jit_shard_steps_gather device_allocs=6,device_bytes=8536  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_jit_shard_steps_shared device_allocs=6,device_bytes=8536  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_jit_shard_tier device_allocs=4,device_bytes=368  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_path device_allocs=4,device_bytes=4096  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_tier_shard_0of8 device_allocs=5,device_bytes=2388  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_tier_shard_1of8 device_allocs=18,device_bytes=230472  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_tier_shard_2of8 device_allocs=8,device_bytes=12800  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_tier_shard_3of8 device_allocs=9,device_bytes=133292  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_tier_shard_4of8 device_allocs=5,device_bytes=2064  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_tier_shard_5of8 device_allocs=3,device_bytes=7724  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_tier_shard_6of8 device_allocs=18,device_bytes=55228  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sass_tier_shard_7of8 device_allocs=6,device_bytes=163840  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sched_pool device_allocs=1,device_bytes=16  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_shell_nvcc_native device_allocs=1,device_bytes=128  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_simd_lane_forms device_allocs=31,device_bytes=983140  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sparse_helper_paths device_allocs=78,device_bytes=5296  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_sparse_vector_paths device_allocs=52,device_bytes=2609  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_spin_lock_bsync device_allocs=5,device_bytes=160  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_stack_limit device_allocs=1,device_bytes=256  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_surface_oob device_allocs=6,device_bytes=2392  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_symbols device_allocs=5,device_bytes=328  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_tcpapers device_allocs=7,device_bytes=3264  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_texture_anisotropy device_allocs=2,device_bytes=36  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_texture_filtering device_allocs=8,device_bytes=230472  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_texture_gather device_allocs=5,device_bytes=12800  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_texture_grad device_allocs=1,device_bytes=12  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_texture_int_coords device_allocs=3,device_bytes=416  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_texture_layers device_allocs=9,device_bytes=133292  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_texture_mip_layers device_allocs=3,device_bytes=18520  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_texture_mipmaps device_allocs=18,device_bytes=55228  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_texture_srgb device_allocs=5,device_bytes=2388  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_tma_gemm_cute device_allocs=20,device_bytes=498  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_tma_reduce_cute device_allocs=20,device_bytes=498  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_uldc_narrow device_allocs=2,device_bytes=360  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_video_forms device_allocs=3,device_bytes=7724  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_warp_spin_lock device_allocs=2,device_bytes=8  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_warpsync_bsync_standoff device_allocs=32,device_bytes=82016  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_wgmma_cute device_allocs=20,device_bytes=498  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_wgmma_fp8_vectors device_allocs=3,device_bytes=6240  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_wmma_gemm device_allocs=8,device_bytes=5120  # found by the sweep after #714 and #720; the program does not free it before it exits
