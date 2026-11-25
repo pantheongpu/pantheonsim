@@ -46,7 +46,6 @@ xarch_groups[packed_f32x2@native]="b200 | rtx5090"   # two NaN-payload slots (17
 xarch_nodigest=" sched_pool "
 
 # --- known defects, each tracked: the profile listed last differs and should not. Delete the entry when its issue is fixed.
-xarch_groups[bulk_copy@native]="h100 h200 b200"             # sm_120's cp.async.bulk multicast is a call to __cuda_syscall_cp_async_bulk_multicast the SASS engine lacks; #751
 xarch_groups[cg_multi_warp_tiles@native]="a100 a10g l4 | h100 h200 | b200 rtx5090"   # %reserved_smem_offset_* read 0 in SASS from sm_90 on; needs an H100; #752
 xarch_groups[texture_grad@native]="t4 a100 a10g l4 | h100 h200 | b200 rtx5090"       # sm_90+ SASS: 37 of 131 tex.grad.3d cases differ from the PTX engine and the RTX 3060; needs an H100; #753
 xarch_groups[graph_capture_driver@native]="t4 a100 a10g l4 h100 h200 b200"           # sm_120's code makes other last bits (ptxas contracts differently); not a defect of the simulator; #754

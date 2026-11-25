@@ -431,6 +431,8 @@ struct Path {
   // instructions it is owed after waiting too long (see select_path).
   uint64_t issued_at = 0;
   uint32_t boost = 0;
+  // The pc of an activemask this path stepped back from while it was in a boost (see OpActiveMask in step); npos when none.
+  size_t am_pc = static_cast<size_t>(-1);
 };
 
 // One cp.async copy that has been issued but not yet awaited.
@@ -3546,6 +3548,16 @@ class Interpreter {
 
   // How long a path may wait to issue before select_path gives it the turn.
   static constexpr uint64_t kStarvedSteps = 1024;
+  // A path waiting at an activemask (a lane that left a data-dependent loop early, ahead of the lanes still in it) is owed its turn only after
+  // this many instructions: it is waiting for the warp to converge, as it does on a card (ptxas ends the loop with a convergence barrier), and a
+  // loop of a few thousand instructions per iteration must not hand the lanes that left it a partial mask (#759). The long wait is the bound on
+  // a spin that never lets the others reach it.
+  static constexpr uint64_t kStarvedActiveMaskSteps = uint64_t{1} << 24;
+
+  // How long a path at `pc` may wait to issue before select_path gives it the turn.
+  uint64_t starve_after(size_t pc) const {
+    return pc < cur_->body.size() && std::holds_alternative<OpActiveMask>(cur_->body[pc].op) ? kStarvedActiveMaskSteps : kStarvedSteps;
+  }
 
   // Where a path at pc stands in the order paths run in: the pc itself, or the pc's place in EntryFn::order for a body that is not laid out
   // with every forward branch going up.
@@ -3592,7 +3604,7 @@ class Interpreter {
       if (!w.paths[i].parked && w.paths[i].boost) pick = i;
     if (pick == w.paths.size()) {
       for (size_t i = 0; i < w.paths.size(); ++i)
-        if (!w.paths[i].parked && w.steps - w.paths[i].issued_at > kStarvedSteps &&
+        if (!w.paths[i].parked && w.steps - w.paths[i].issued_at > starve_after(w.paths[i].pc) &&
             (pick == w.paths.size() || w.paths[i].issued_at < w.paths[pick].issued_at))
           pick = i;
       if (pick != w.paths.size()) w.paths[pick].boost = kBoostSteps;
@@ -3757,7 +3769,7 @@ class Interpreter {
     // pc and the step at which each last issued (select_path's picks between instructions are worked out below).
     constexpr size_t kMaxOthers = 7;
     size_t others[kMaxOthers], live_pc[kMaxOthers];
-    uint64_t live_issued[kMaxOthers];
+    uint64_t live_issued[kMaxOthers], live_after[kMaxOthers];
     size_t nothers = 0, nlive = 0;
     const bool multi = w.paths.size() > 1;
     if (multi) {
@@ -3768,6 +3780,7 @@ class Interpreter {
         others[nothers++] = w.paths[i].pc;
         if (!w.paths[i].parked) {
           live_pc[nlive] = w.paths[i].pc;
+          live_after[nlive] = starve_after(w.paths[i].pc);
           live_issued[nlive++] = w.paths[i].issued_at;
         }
       }
@@ -3784,7 +3797,7 @@ class Interpreter {
         // this pc (it merges the two), or is lower, or has waited past kStarvedSteps. Otherwise it stamps this one.
         bool other = false;
         for (size_t i = 0; i < nothers; ++i) other |= others[i] == pc;
-        for (size_t i = 0; i < nlive; ++i) other |= path_rank(live_pc[i]) < path_rank(pc) || steps - live_issued[i] > kStarvedSteps;
+        for (size_t i = 0; i < nlive; ++i) other |= path_rank(live_pc[i]) < path_rank(pc) || steps - live_issued[i] > live_after[i];
         if (other) break;
         path.issued_at = steps;
       }
@@ -7306,6 +7319,19 @@ class Interpreter {
     }
     if (const auto* op = std::get_if<OpActiveMask>(&ins.op)) {
       require_warp_le32(ins, "activemask");
+      // A path that select_path boosted (it had waited past kStarvedSteps) must not read the mask while the lanes it left behind are still on
+      // their way here: on a card they reconverge at the end of the loop they split in, so the mask is the whole warp (#759). It steps back
+      // to wait at this instruction, which has the long wait (kStarvedActiveMaskSteps); the next boost there is the bound, and runs it.
+      {
+        Path& p = w.paths[idx];
+        if (p.boost && p.am_pc != p.pc && select_other_runnable(w, idx) != idx) {
+          p.am_pc = p.pc;
+          p.boost = 0;
+          p.issued_at = w.steps;
+          return;
+        }
+        p.am_pc = static_cast<size_t>(-1);
+      }
       Lanes r;  // every active lane sees the same membership
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) r[lane] = m;

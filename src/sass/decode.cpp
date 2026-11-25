@@ -2048,13 +2048,39 @@ void dec_bar(Instr& ins, const Word& w) {
   if (w.bit(80)) ins.mods.push_back("DEFER_BLOCKING");
   ins.f[0] = mode;
   ins.f[1] = red;
+  // The operand forms are four opcodes (ptxas gives the same words on every architecture from sm_80; compiled with distinct registers and
+  // read back with cuobjdump): 0xb1d an immediate barrier (54-57) and an immediate count (42-53); 0x51d a barrier in the register at 32 and an
+  // immediate count; 0x91d an immediate barrier and the count in the register at 32; 0x31d one register at 32 for both, which ptxas fills with
+  // the barrier in its low four bits and the count from bit 16 up (a `bar.sync %a, %b` with both in registers is
+  // `SHF.L R, count, 0x10; LOP3 R, R, 0xf, id, 0xf8` then BAR.SYNC R, R). f[3] says where the count comes from: 0 the instruction's own
+  // (f[2]), 1 the register in src[1], 2 the upper half of src[0]'s register.
+  const unsigned opc = static_cast<unsigned>(w.field(0, 12));
+  const unsigned count = static_cast<unsigned>(w.field(42, 12));
+  if (opc == 0x31d || opc == 0x51d || opc == 0x91d) {
+    const Operand reg = R(static_cast<unsigned>(w.field(32, 8)));
+    if (opc == 0x91d) {
+      ins.src.push_back(Imm(w.field(54, 4)));
+      ins.src.push_back(reg);
+      ins.f[3] = 1;
+    } else {
+      ins.src.push_back(reg);
+      if (opc == 0x31d) {
+        ins.src.push_back(reg);   // (printed twice: the one register is both operands)
+        ins.f[3] = 2;
+      } else {
+        if (mode == 1 || count) ins.src.push_back(Imm(count));
+        ins.f[2] = count;
+      }
+    }
+    if (mode == 2) ins.src.push_back(pred_src(w, 87, 90));
+    return;
+  }
   // The barrier: an immediate at 54-57 unless bit 90 says it is a register
   // (for .RED, bit 90 is the predicate's not).
   const bool breg = mode != 2 && w.bit(90);
   if (breg) ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));
   else ins.src.push_back(Imm(w.field(54, 4)));
   // A thread count at 42-53 (.ARV always has one).
-  const unsigned count = static_cast<unsigned>(w.field(42, 12));
   if (mode == 1 || count) ins.src.push_back(Imm(count));
   ins.f[2] = count;
   if (mode == 2) ins.src.push_back(pred_src(w, 87, 90));
@@ -3868,7 +3894,7 @@ const std::unordered_map<unsigned, Dec>& fixed_table() {
       {0x81c, [](Instr& i, const Word& w) { dec_plop3(i, w, false); }},
       {0x89c, [](Instr& i, const Word& w) { dec_plop3(i, w, true); }},
       {0x803, dec_p2r}, {0x804, dec_r2p},
-      {0x948, dec_warpsync}, {0x95d, dec_nanosleep}, {0xb1d, dec_bar},
+      {0x948, dec_warpsync}, {0x95d, dec_nanosleep}, {0xb1d, dec_bar}, {0x31d, dec_bar}, {0x51d, dec_bar}, {0x91d, dec_bar},
       {0x343, [](Instr& i, const Word& w) { dec_call(i, w, true); }},
       {0x943, [](Instr& i, const Word& w) { dec_call(i, w, false, false, true); }},
       {0x944, [](Instr& i, const Word& w) { dec_call(i, w, false); }},

@@ -1572,6 +1572,8 @@ vgpu_unit_test(test_atom_rmw)
 vgpu_unit_test(test_sass_code_at)
 # The SASS executor's block, kept between blocks and launches and set up again each time (Runner::init_block).
 vgpu_unit_test(test_sass_block_reuse)
+# BAR with its barrier or thread count in a register (opcodes 0x31d, 0x51d, 0x91d; #758).
+vgpu_unit_test(test_sass_bar_regs)
 # VGPU_EXACT_THREADS: a launch in order (VGPU_THREADS=1) on several host threads, kept only when a shadow of device memory proves it the
 # same (docs/exact-threads.md): same bits and counters as the run in order for independent, conflicting, faulting and SM-reading kernels; every
 # MemoryManager method noted by the shadow; a stopped trial undone to the byte.
