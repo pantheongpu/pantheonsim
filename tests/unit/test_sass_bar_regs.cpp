@@ -47,7 +47,7 @@ const Insn kStoreR9 = {0x000fe2000c101904ull, 0x000000090a007986ull, "STG.E [R10
 const Insn kExit = {0x000fea0003800000ull, 0x000000000000794dull, "EXIT"};
 const Insn kP0TidGe64 = {0x000fe40003f06070ull, 0x000000400000780cull, "ISETP.GE.U32.AND P0, PT, R0, 0x40, PT"};
 const Insn kP0TidGe8 = {0x000fe40003f06070ull, 0x000000080000780cull, "ISETP.GE.U32.AND P0, PT, R0, 0x8, PT"};
-const Insn kB2rR9 = {0x000e6200000e4000ull, 0x000000000009731cull, "B2R.RESULT R9"};
+const Insn kB2rR9 = {0x000e6200000e4000ull, 0x000000000009731cull, "B2R.RESULT R9, PT"};
 
 // Texts live as long as the program.
 const char* keep(std::string s) {

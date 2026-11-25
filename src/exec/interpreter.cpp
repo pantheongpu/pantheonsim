@@ -6060,6 +6060,19 @@ class Interpreter {
       deliver(red.result);
       return;
     }
+    if (std::holds_alternative<OpActiveMask>(ins.op)) {
+      // A path that select_path boosted (it had waited past kStarvedSteps) must not read the mask while the lanes it left behind are still on
+      // their way here: on a card they reconverge at the end of the loop they split in, so the mask is the whole warp (#759). It steps back
+      // to wait at this instruction, which has the long wait (kStarvedActiveMaskSteps); the next boost there is the bound, and runs it.
+      Path& p = w.paths[idx];
+      if (p.boost && p.am_pc != p.pc && select_other_runnable(w, idx) != idx) {
+        p.am_pc = p.pc;
+        p.boost = 0;
+        p.issued_at = w.steps;
+        return;
+      }
+      p.am_pc = static_cast<size_t>(-1);
+    }
     if (const auto* op = std::get_if<OpClusterBarrier>(&ins.op)) {
       if (!ctx.cluster_state)
         ctx_fail(ins, -1, Err::UnsupportedPtx, "barrier.cluster outside a block context");
@@ -7319,19 +7332,6 @@ class Interpreter {
     }
     if (const auto* op = std::get_if<OpActiveMask>(&ins.op)) {
       require_warp_le32(ins, "activemask");
-      // A path that select_path boosted (it had waited past kStarvedSteps) must not read the mask while the lanes it left behind are still on
-      // their way here: on a card they reconverge at the end of the loop they split in, so the mask is the whole warp (#759). It steps back
-      // to wait at this instruction, which has the long wait (kStarvedActiveMaskSteps); the next boost there is the bound, and runs it.
-      {
-        Path& p = w.paths[idx];
-        if (p.boost && p.am_pc != p.pc && select_other_runnable(w, idx) != idx) {
-          p.am_pc = p.pc;
-          p.boost = 0;
-          p.issued_at = w.steps;
-          return;
-        }
-        p.am_pc = static_cast<size_t>(-1);
-      }
       Lanes r;  // every active lane sees the same membership
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) r[lane] = m;

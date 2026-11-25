@@ -5925,11 +5925,16 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       }
       const unsigned mode = ins.f[0];
       // A barrier or a count in a register is the executing lanes' (the first one's: they all hold the same, as the PTX says): a count in
-      // the register at src[1] (f[3] 1), or both in src[0]'s register (f[3] 2), the barrier in its low four bits and the count from bit 16.
+      // the register at src[1] (f[3] 1), or both in src[0]'s register (f[3] 2), the barrier in its low four bits and the count in bits 16-27 (ptxas fills it
+      // with `(count & 0xfff0000) | id`).
+      if (!ex && (ins.f[3] || ins.src[0].kind != Kind::Imm)) {   // (a guarded-off BAR with a register names no barrier: it does nothing)
+        each_lane(group, [&](unsigned l) { w.pc[l] += 16; });
+        return true;
+      }
       const unsigned rl = ex ? static_cast<unsigned>(std::countr_zero(ex)) : 0;
       const uint32_t reg0 = ins.src[0].kind == Kind::Imm ? 0 : read32(w, ins.src[0], rl);
       const unsigned id = ins.src[0].kind == Kind::Imm ? static_cast<unsigned>(ins.src[0].imm) : reg0 & 15;
-      const uint32_t count = ins.f[3] == 1 ? read32(w, ins.src[1], rl) : ins.f[3] == 2 ? reg0 >> 16 : ins.f[2];
+      const uint32_t count = ins.f[3] == 1 ? read32(w, ins.src[1], rl) : ins.f[3] == 2 ? (reg0 >> 16) & 0xfff : ins.f[2];
       Block::Barrier& b = blk.bar(id);
       b.mode = mode;
       b.red = ins.f[1];
