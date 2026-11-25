@@ -28,6 +28,8 @@ static void persisting_and_window() {
   e = cudaStreamSetAttribute(s, cudaStreamAttributeAccessPolicyWindow, &a); show("window 1MiB", 0, e);
   a.accessPolicyWindow.num_bytes = (size_t)p.accessPolicyMaxWindowSize + 1;
   e = cudaStreamSetAttribute(s, cudaStreamAttributeAccessPolicyWindow, &a); show("window max+1", 0, e);
+  cudaStreamDestroy(s);
+  cudaFree(d);
 }
 
 static void limits() {
