@@ -116,6 +116,10 @@ from the loaded profile**; no engine compares a compute capability for it (`tc86
 | `tensor_sum_fp8_chunk`, `_grid`, `_out_bits` | integers (with `ada` only) | 16, 14, 13: written out as the f16 numbers are. Absent with `sequential` and `via_f16`. |
 | `tensor_sum_wgmma_fp8` | `sequential` or `hopper` (optional) | The sum of the dense e4m3 and e5m2 forms of `wgmma` (PTX) and `QGMMA` (SASS) (`vgpu::WgmmaFp8Sum`, `include/vgpu/exec/tc_fp8.hpp`). Absent is `sequential`. `hopper`: one chunk of 32 products and the accumulator, terms cut at `2^(top - 14)`, an f32 result cut to 13 fraction bits. |
 | `tensor_sum_wgmma_fp8_chunk`, `_grid`, `_out_bits` | integers (with `hopper` only) | 32, 14, 13: written out as the others are. Absent with `sequential`. |
+| `tensor_sum_wgmma` | `sequential` or `hopper` (optional) | The sum of the dense f16, bf16 and tf32 forms of `wgmma` (PTX) and `HGMMA` (SASS) (`vgpu::FormSum`, `include/vgpu/exec/tc_forms.hpp`): `hopper` is the rule of an `mma.sync` on a Hopper device (chunks of 16, tf32 8, terms cut at `2^(top - 26)`), the accumulator in the chunk. Absent is `sequential`. |
+| `tensor_sum_tcgen05` | `sequential` or `hopper` (optional) | The same for the dense `.kind::f16` and `.kind::tf32` of `tcgen05.mma` (PTX) and `UTCHMMA` (SASS). |
+| `tensor_sum_m8n8k4` | `sequential`, `volta` or `chain_c_last` (optional) | The sum of `mma.m8n8k4` with f16 operands in the PTX engine. `volta`: one `HMMA.884` step, 4 products and C, terms cut at `2^(top - 24)` (Turing, as on Volta). `chain_c_last`: ptxas's emulation on sm_80 and later, `(((p0 + p1) + p2) + p3) + C` in f32, f32 accumulator only. |
+| `tensor_sum_sparse` | `sequential` or `ampere` (optional) | The sum of `mma.sp` (PTX) and `HMMA.SP` (SASS) with f16, bf16 and tf32 operands: the Ampere rule over the stored products, chunks of 8 (tf32 4), terms cut at `2^(top - 25)`; the places A does not store take no part. |
 
 Rules the loader enforces (a profile that breaks one does not load, and the message names the file and the key):
 

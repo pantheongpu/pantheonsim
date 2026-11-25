@@ -1690,6 +1690,9 @@ vgpu_unit_test(test_wgmma_fast)
 # The e4m3 / e5m2 sum of wgmma on a Hopper device (tc_fp8.hpp, kHopperWgmmaFp8Rule): recorded H100 and H200 vectors through the rule and through a
 # real wgmma (both PTX routes), the sequential sum for VGPU_TC_EXACT=0, and what each profile names.
 vgpu_unit_test(test_wgmma_fp8)
+# The sums of mma.m8n8k4 (Volta's rule, recorded V100 vectors), wgmma (f16, bf16, tf32: recorded H100 vectors, MMA-Sim's claim) and tcgen05.mma, what each profile names.
+vgpu_unit_test(test_tc_forms)
+target_compile_definitions(test_tc_forms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # tcgen05.mma reading its operands whole from shared memory against the element reads, bit for bit.
 vgpu_unit_test(test_tcgen05_fast)
 # tcgen05.mma through the tile kernels for the forms the whole-operand route leaves to the row loop (f16 D, layouts F, B, G, A in Tensor Memory, sparse A,
@@ -1955,6 +1958,10 @@ vgpu_unit_test(test_amd_gcn_ops amd/tests/unit/test_gcn_ops.cpp)
 target_compile_definitions(test_amd_gcn_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # Doubles, packed halves, the modifiers, the transcendentals and the atomics.
 vgpu_unit_test(test_amd_gcn_math amd/tests/unit/test_gcn_math.cpp)
+# The same one-instruction kernels on every AMD target and the same edge-case operands: where the targets differ, which side is the
+# hardware's (amd/tests/data/xarch.c, docs/amd-cross-arch.md).
+vgpu_unit_test(test_amd_gcn_cross_arch amd/tests/unit/test_gcn_cross_arch.cpp)
+target_compile_definitions(test_amd_gcn_cross_arch PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_compile_definitions(test_amd_gcn_math PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # Every instruction of the ISA corpora run once on pseudo-random state, bit for bit against the recorded
 # digests of the baseline build (amd/tests/unit/test_gcn_same_bits.cpp).
@@ -4435,6 +4442,21 @@ if(TARGET vgpucudart)
     TIMEOUT 3600)
 endif()
 
+# One program on every NVIDIA profile (nvidia/tests/e2e/run_xarch.sh): built once as PTX and run on t4, a100, a10g, l4, h100, h200, b200 and rtx5090
+# (ptx), or built for each generation and run on the SASS engine (native). Profiles must agree except where nvidia/tests/e2e/xarch_expect.sh says
+# why not. A short list on pull requests; VGPU_NIGHTLY=1 (differential.yml) runs every standalone program of nvidia/tests/e2e.
+if(TARGET vgpucudart)
+  foreach(_m ptx native)
+    add_test(NAME e2e_xarch_${_m} COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_xarch.sh)
+    set_tests_properties(e2e_xarch_${_m} PROPERTIES
+      DEPENDS vgpucudart
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_XARCH_MODE=${_m}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      RESOURCE_LOCK nvcc_memory
+      TIMEOUT 3600)
+  endforeach()
+endif()
+
 # Differential execution and determinism in exact mode (nvidia/tests/e2e/run_differential.sh). diff: the SASS engine against the PTX interpreter, one
 # host thread each: output, memory after every launch, the launches and the counters both engines define alike. determinism: one program, several
 # runs (CPU affinity, niceness, environment size, VGPU_EXACT_THREADS, replayable warp schedulers) that must leave the same output, counters and memory.
@@ -4713,8 +4735,9 @@ set_tests_properties(lint_ci_jobs PROPERTIES TIMEOUT 120)
 add_test(NAME lint_ci_reservation
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_ci_reservation.py)
 
-# scripts/apt-mirror-fallback.sh points apt at archive.ubuntu.com when the runner image's mirror host does not resolve, and
-# every hosted-runner apt-get update runs it first.
+# scripts/apt-mirror-fallback.sh points apt at archive.ubuntu.com when the runner image's mirror host does not resolve, and scripts/apt-retry.sh
+# moves it to the next mirror when apt-get fails or stalls (a 503, a hang); the hosted-runner steps use them, and
+# every hosted-runner apt-get goes through the second.
 add_test(NAME lint_apt_mirror_fallback COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_apt_mirror_fallback.sh)
 set_tests_properties(lint_apt_mirror_fallback PROPERTIES TIMEOUT 60)
 
@@ -4871,6 +4894,13 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
+  # The limits as a Tesla T4 and an A10G answered them (printf FIFO default, refused values, persisting L2, access policy window).
+  add_test(NAME e2e_limits_card COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_limits_card.sh)
+  set_tests_properties(e2e_limits_card PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
   # The device heap is one per device, for both engines, and a reset empties it.
   add_test(NAME e2e_device_heap COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_heap.sh)
   set_tests_properties(e2e_device_heap PROPERTIES
@@ -4901,6 +4931,12 @@ if(TARGET vgpucudart)
   # The e4m3 / e5m2 sum of wgmma on an H100 profile, recorded H100 and H200 vectors through a real wgmma, SASS and PTX engines (tc_fp8.hpp).
   add_test(NAME e2e_wgmma_fp8_vectors COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_wgmma_fp8_vectors.sh)
   set_tests_properties(e2e_wgmma_fp8_vectors PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+  # The f16, bf16 and tf32 sum of wgmma on an H100 profile: recorded H100 mma.sync vectors through a real wgmma with a non-zero accumulator, SASS and PTX engines (tc_forms.hpp).
+  add_test(NAME e2e_wgmma_vectors COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_wgmma_vectors.sh)
+  set_tests_properties(e2e_wgmma_vectors PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
@@ -5494,6 +5530,48 @@ foreach(_pair test_amd_gcn_same_bits:500 e2e_sass_archs:210 test_host_gemm:180 e
   endif()
 endforeach()
 
+# ---------------------------------------------------------------------------
+# Fuzz targets (tests/fuzz): the PTX parser, the SASS decoder and cubin reader, and the CUDA driver API.
+# Untrusted input must come back as an error, never a crash, a sanitizer report or a hang.
+#
+# Each target is a libFuzzer entry point (LLVMFuzzerTestOneInput). Built as they are by default, with tests/fuzz/standalone_main.cpp
+# for a main(), they run as ctest tests over the seed corpus (made from files the repository already has by tests/fuzz/make_seeds.py)
+# and over tests/fuzz/regress/<target>/, the input of every crash a fuzzer found; the ASan job runs them under the sanitizers.
+# With -DVGPU_FUZZ=ON (clang, -fsanitize=fuzzer-no-link,address,undefined in CMAKE_CXX_FLAGS: .github/workflows/fuzz.yml) they link libFuzzer
+# and are run by tests/fuzz/run_fuzz.sh.
+# ---------------------------------------------------------------------------
+option(VGPU_FUZZ "Link the fuzz targets with libFuzzer (clang) instead of the replay main" OFF)
+set(VGPU_FUZZ_SEEDS "${CMAKE_BINARY_DIR}/fuzz-seeds")
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  execute_process(COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/fuzz/make_seeds.py ${CMAKE_SOURCE_DIR} ${VGPU_FUZZ_SEEDS}
+                  RESULT_VARIABLE _seed_rc OUTPUT_VARIABLE _seed_out ERROR_VARIABLE _seed_err)
+  if(NOT _seed_rc EQUAL 0)
+    message(FATAL_ERROR "tests/fuzz/make_seeds.py failed: ${_seed_err}")
+  endif()
+  string(STRIP "${_seed_out}" _seed_out)
+  message(STATUS "fuzz ${_seed_out}")
+endif()
+foreach(_f ptx sass driver)
+  add_executable(fuzz_${_f} tests/fuzz/fuzz_${_f}.cpp)
+  target_link_libraries(fuzz_${_f} PRIVATE vgpu)
+  if(_f STREQUAL "driver")
+    target_include_directories(fuzz_driver PRIVATE nvidia/include)
+    target_link_libraries(fuzz_driver PRIVATE vgpucuda)
+  endif()
+  if(VGPU_FUZZ)
+    target_link_options(fuzz_${_f} PRIVATE -fsanitize=fuzzer)
+  else()
+    target_sources(fuzz_${_f} PRIVATE tests/fuzz/standalone_main.cpp)
+    set(_inputs "${VGPU_FUZZ_SEEDS}/${_f}")
+    if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/tests/fuzz/regress/${_f}")
+      list(APPEND _inputs "${CMAKE_SOURCE_DIR}/tests/fuzz/regress/${_f}")
+    endif()
+    add_test(NAME fuzz_replay_${_f} COMMAND fuzz_${_f} ${_inputs})
+    set_tests_properties(fuzz_replay_${_f} PROPERTIES TIMEOUT 900
+      ENVIRONMENT "VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
+  endif()
+endforeach()
 # The leak sweep. Every end-to-end test runs its programs with VGPU_LEAK_CHECK=1 and a log of its own, build/leak-check/<test>.log
 # (include/vgpu/leak_check.hpp: what the process still holds when its machine goes away); `tests/lint/check_leak_sweep.py
 # build/leak-check tests/lint/leak_known.txt` reads the logs after the tests (the CI step "Leak sweep") and fails on a leak the known

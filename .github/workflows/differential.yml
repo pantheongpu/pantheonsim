@@ -13,6 +13,10 @@ name: Differential and determinism
 # The pull request gate is the short list in ctest (e2e_differential_diff and
 # e2e_differential_determinism, in the build job); this runs the full lists, nightly
 # and by hand.
+#
+# The xarch jobs run every standalone program of nvidia/tests/e2e on t4, a100, a10g, l4,
+# h100, h200, b200 and rtx5090 (nvidia/tests/e2e/run_xarch.sh) and fail on a difference
+# between generations that nvidia/tests/e2e/xarch_expect.sh does not explain.
 on:
   schedule:
     - cron: '23 4 * * *'
@@ -20,6 +24,8 @@ on:
   pull_request:
     paths:
       - nvidia/tests/e2e/run_differential.sh
+      - nvidia/tests/e2e/run_xarch.sh
+      - nvidia/tests/e2e/xarch_expect.sh
       - .github/workflows/differential.yml
 
 permissions:
@@ -87,5 +93,53 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: differential-${{ matrix.mode }}
+          path: logs
+          retention-days: 14
+
+  xarch:
+    name: xarch ${{ matrix.mode }} (full list)
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [ptx, native]
+    container:
+      image: ${{ needs.image.outputs.cuda13_0 }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: --shm-size=2g
+    env:
+      NVCC_PREPEND_FLAGS: ''
+      VGPU_NIGHTLY: '1'
+      VGPU_XARCH_MODE: ${{ matrix.mode }}
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+
+      - name: Check the memory
+        env:
+          CI_RESERVE: '0'
+        run: ci/jobs.sh --check sass
+
+      - name: Build the runtime shims
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpucudart vgpucuda
+
+      - name: Run
+        run: |
+          mkdir -p logs
+          VGPU_BUILD_DIR="$PWD/build" VGPU_XARCH_KEEP="$PWD/logs/work" nvidia/tests/e2e/run_xarch.sh 2>&1 | tee "logs/xarch-$VGPU_XARCH_MODE.txt"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xarch-${{ matrix.mode }}
           path: logs
           retention-days: 14

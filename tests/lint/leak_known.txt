@@ -140,3 +140,5 @@ e2e_warpsync_bsync_standoff device_allocs=32,device_bytes=82016  # found by the 
 e2e_wgmma_cute device_allocs=20,device_bytes=498  # found by the sweep after #714 and #720; the program does not free it before it exits
 e2e_wgmma_fp8_vectors device_allocs=3,device_bytes=6240  # found by the sweep after #714 and #720; the program does not free it before it exits
 e2e_wmma_gemm device_allocs=8,device_bytes=5120  # found by the sweep after #714 and #720; the program does not free it before it exits
+e2e_xarch_native device_allocs=31,device_bytes=1574384  # the programs of the short list do not free what they allocate (atomics_threads, simd_lane_forms ...)
+e2e_xarch_ptx device_allocs=28,device_bytes=1574384  # the same programs, on the PTX engine

@@ -132,19 +132,13 @@ runs:
         . /etc/os-release
         [[ "$ID" == ubuntu && "${VERSION_ID%%.*}" -lt 24 ]] && pkgs="$pkgs g++-12"
         [ ! -x "${GITHUB_ACTION_PATH}/scripts/apt-mirror-fallback.sh" ] || "${GITHUB_ACTION_PATH}/scripts/apt-mirror-fallback.sh"
-        $SUDO apt-get update -qq
+        retry_apt="${GITHUB_ACTION_PATH}/scripts/apt-retry.sh"
+        $retry_apt update -qq
         # Unpacking the NVIDIA runtime libraries that nvidia-cuda-toolkit pulls in has hung a hosted
-        # runner for the whole 45 minutes, twice running. Bound each attempt, and finish whatever dpkg
-        # left half-configured before the next.
-        for attempt in 1 2 3; do
-          $SUDO env INITRD=No timeout 900 apt-get install -y -qq -o DPkg::Lock::Timeout=300 --no-install-recommends $pkgs && break
-          if [[ $attempt == 3 ]]; then
-            echo "::error::apt-get install of $pkgs did not finish in three attempts"
-            exit 1
-          fi
-          echo "::warning::apt-get install failed or timed out (attempt $attempt of 3); retrying"
-          $SUDO dpkg --configure -a || true
-        done
+        # runner for the whole 45 minutes, twice running, and the security mirror has answered 503 for
+        # an hour. apt-retry.sh bounds each attempt, finishes whatever dpkg left half-configured, and
+        # moves to another Ubuntu mirror between attempts.
+        APT_TIMEOUT=900 $retry_apt install -y -qq --no-install-recommends $pkgs
 
     - name: Install CUDA ${{ steps.want.outputs.cuda }} from NVIDIA
       if: steps.want.outputs.cuda != 'apt' && steps.want.outputs.cuda != 'none'
@@ -171,8 +165,8 @@ runs:
           || { echo "::error::could not download the CUDA keyring from $repo"; exit 1; }
         $SUDO dpkg -i "$RUNNER_TEMP/cuda-keyring.deb"
         [ ! -x "${GITHUB_ACTION_PATH}/scripts/apt-mirror-fallback.sh" ] || "${GITHUB_ACTION_PATH}/scripts/apt-mirror-fallback.sh"
-        retry $SUDO timeout 300 apt-get update -qq \
-          || { echo "::error::apt-get update with NVIDIA's repository did not finish in three attempts"; exit 1; }
+        "${GITHUB_ACTION_PATH}/scripts/apt-retry.sh" update -qq \
+          || { echo "::error::apt-get update with NVIDIA's repository did not finish"; exit 1; }
         v="${TOOLKIT//./-}"
         # CUDA 13 renamed the NVVM package.
         nvvm="cuda-nvvm-$v"; [[ "${TOOLKIT%%.*}" -ge 13 ]] && nvvm="libnvvm-$v"
@@ -182,7 +176,7 @@ runs:
         # a profiler, and a full toolkit install has them). And nvJitLink, which
         # the toolkit's cuSPARSE needs to link a program against it, though
         # NVIDIA's packages do not say so.
-        retry $SUDO timeout 900 apt-get install -y -qq --no-install-recommends \
+        APT_TIMEOUT=900 "${GITHUB_ACTION_PATH}/scripts/apt-retry.sh" install -y -qq --no-install-recommends \
           "cuda-nvcc-$v" "cuda-cudart-dev-$v" "cuda-crt-$v" "$nvvm" \
           "cuda-nvml-dev-$v" "cuda-cupti-dev-$v" "cuda-nvrtc-dev-$v" "libcublas-dev-$v" \
           "libcufft-dev-$v" "libcurand-dev-$v" "libcusparse-dev-$v" "libnvjpeg-dev-$v" \
@@ -204,7 +198,7 @@ runs:
         . /etc/os-release
         # Ubuntu 24.04 renamed libelf1; 22.04 knows the new name but has no package for it.
         elf=libelf1t64; apt-cache policy libelf1t64 2>/dev/null | grep -q 'Candidate: [0-9]' || elf=libelf1
-        $SUDO apt-get install -y -qq --no-install-recommends libxml2 libnuma1 "$elf"
+        "${GITHUB_ACTION_PATH}/scripts/apt-retry.sh" install -y -qq --no-install-recommends libxml2 libnuma1 "$elf"
         $SUDO mkdir -p /etc/apt/keyrings
         wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor | $SUDO tee /etc/apt/keyrings/rocm.gpg > /dev/null
         echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM $VERSION_CODENAME main" \
@@ -212,7 +206,7 @@ runs:
         # AMD's packages, not Ubuntu's hipcc of the same name.
         printf 'Package: *\nPin: origin repo.radeon.com\nPin-Priority: 1001\n' | $SUDO tee /etc/apt/preferences.d/rocm > /dev/null
         [ ! -x "${GITHUB_ACTION_PATH}/scripts/apt-mirror-fallback.sh" ] || "${GITHUB_ACTION_PATH}/scripts/apt-mirror-fallback.sh"
-        $SUDO apt-get update -qq
+        "${GITHUB_ACTION_PATH}/scripts/apt-retry.sh" update -qq
         dir="$RUNNER_TEMP/rocm-debs"; mkdir -p "$dir"
         (cd "$dir" && apt-get download hipcc hip-dev rocm-llvm rocm-device-libs rocm-core hsa-rocr-dev) \
           || { echo "::error::could not download ROCm $ROCM for Ubuntu $VERSION_ID from repo.radeon.com"; exit 1; }

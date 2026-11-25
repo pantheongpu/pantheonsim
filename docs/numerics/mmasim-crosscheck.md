@@ -177,7 +177,7 @@ On the finite results of f16 on CDNA1 and CDNA2 they agree on every vector.
 - The AMD columns say "the transcription differs", not which side matches a card; no AMD card was used.
 - The vectors are mine, not MMA-Sim's own test vectors (theirs are uniform random 32-bit patterns); the exponent windows and the targeted
   classes are chosen for the corners.
-- A result "agrees" only for the forms in the table; sparse, FP8, FP6/FP4, block-scaled, `m8n8k4` on a real Turing, f64 and integer forms were not compared.
+- A result "agrees" only for the forms in the table; sparse, FP8, FP6/FP4, block-scaled, f64 and integer forms were not compared against MMA-Sim. (`m8n8k4` on a real Turing and the sparse forms on an Ampere card were run on 2026-11-23: [m8n8k4-and-sparse.md](m8n8k4-and-sparse.md); MMA-Sim has no sparse model.)
 
 ## Files
 

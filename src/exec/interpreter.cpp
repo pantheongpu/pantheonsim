@@ -65,6 +65,7 @@ asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.skip 2816\n.popsection")
 #include "vgpu/exec/wgmma.hpp"
 #include "vgpu/exec/tensormap.hpp"
 #include "vgpu/exec/tma.hpp"
+#include "vgpu/exec/tc_forms.hpp"
 #include "vgpu/exec/tcgen05.hpp"
 #include "vgpu/exec/texture_grad.hpp"
 #include "vgpu/error.hpp"
@@ -1272,9 +1273,22 @@ struct LaneSet {
 
 // The position of an instruction kind in the Op variant, for switching on
 // ins.op.index() instead of testing the alternatives one at a time.
+// (Counted from the variant's type list: building an Op in a constant expression, as this once did, is one clang with libstdc++ refuses.)
+template <class T, class V>
+struct variant_index_of;
+template <class T, class... Ts>
+struct variant_index_of<T, std::variant<Ts...>> {
+  static constexpr size_t value = [] {
+    constexpr bool same[] = {std::is_same_v<T, Ts>...};
+    for (size_t i = 0; i < sizeof...(Ts); ++i)
+      if (same[i]) return i;
+    return size_t{static_cast<size_t>(-1)};
+  }();
+  static_assert(value != static_cast<size_t>(-1), "not an alternative of the variant");
+};
 template <class T>
 constexpr size_t op_index() {
-  return Op(std::in_place_type<T>).index();
+  return variant_index_of<T, Op>::value;
 }
 
 // tcgen05.mma's rows: acc[i] += a[k] * b[k * ldb + i] for k = 0..K-1 in order,
@@ -10224,6 +10238,7 @@ class Interpreter {
       if (vgpu::exec::tc86::applies(profile_) && !op.sparse && sum86(op.ab_type) && op.b_type == op.ab_type &&
           K % (op.ab_type == MmaElem::TF32 ? 4 : 8) == 0)
         return false;   // the chunked sum of an RTX 3060
+      if (op.sparse && sum86(op.ab_type) && op.b_type == op.ab_type && vgpu::exec::tc86::sparse_rule(profile_)) return false;   // the sparse forms' own sum (tc_forms.hpp)
       if (profile_.cc_major == 12 && narrow(op.ab_type) && narrow(op.b_type) && !op.acc_f16) return false;   // sm_120's narrow-float sum
       if (narrow(op.ab_type) && narrow(op.b_type) && !op.sparse && profile_.cc_major != 12 &&
           (vgpu::exec::tc86::fp8_rule(profile_) || vgpu::exec::tc86::fp8_via_f16(profile_)))
@@ -10440,6 +10455,7 @@ class Interpreter {
       ctx_fail(ins, -1, Err::UnsupportedPtx, "mma fragment arity does not match the shape");
     // The largest shape is m16n8k256 (.b1): A 16 x 256, B 256 x 8.
     std::vector<double> A(size_t{M} * K, 0.0), B(size_t{K} * kN, 0.0);
+    std::vector<uint8_t> stored_at(op.sparse ? size_t{M} * K : 0, 0);   // the places a sparse A stores a value
     std::array<double, 16 * kN> C{};
     if (op.sparse) {
       // Sparse A (PTX ISA 9.7.16.6). Each K-wide row is cut into chunks --
@@ -10473,6 +10489,7 @@ class Interpreter {
             const uint32_t chunk = tid * cpr + (reg / 2) * 4 * cpr + e / stored;
             const uint32_t col = sparse_column(mma_bits(op.ab_type), K, sel, meta, row, chunk, e % stored);
             A[row * K + col] = mma_elem(op.ab_type, op.ab_signed, v[lane], e);
+            stored_at[row * K + col] = 1;
           }
         }
       }
@@ -10592,6 +10609,16 @@ class Interpreter {
                            op.b_type == op.ab_type && !op.acc_int && !op.acc_f64 && K % (op.ab_type == MmaElem::TF32 ? 4 : 8) == 0) ||
                           fp8_f16;
     std::array<float, 16 * kN> Dtc{};
+    // The sparse forms (f16, bf16, tf32) on a device with its own sum for them: the rule over the stored products (tc_forms.hpp).
+    const vgpu::exec::tc86::SumRule* const sp_rule =
+        op.sparse && !op.block_scale && (op.ab_type == MmaElem::F16 || op.ab_type == MmaElem::BF16 || op.ab_type == MmaElem::TF32) && op.b_type == op.ab_type &&
+                !op.acc_int && !op.acc_f64 && K <= 32
+            ? vgpu::exec::tc86::sparse_rule(profile_)
+            : nullptr;
+    std::array<double, 16 * kN> Dsp{};
+    if (sp_rule)
+      vgpu::exec::tc86::sparse_tile(*sp_rule, op.ab_type == MmaElem::TF32, op.ab_type == MmaElem::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide,
+                                    op.acc_f16, M, kN, K, A.data(), stored_at.data(), B.data(), C.data(), Dsp.data());
     if (tc86_sum) {
       std::array<float, 16 * 32> Af{};
       std::array<float, 32 * kN> Bf{};
@@ -10667,6 +10694,8 @@ class Interpreter {
           D[i * kN + j] = static_cast<double>(vgpu::exec::mma_narrow_sum(terms, K, static_cast<float>(C[i * kN + j])));
         } else if (tc86_sum) {
           D[i * kN + j] = static_cast<double>(Dtc[i * kN + j]);
+        } else if (sp_rule) {
+          D[i * kN + j] = Dsp[i * kN + j];
         } else {
           float acc = static_cast<float>(C[i * kN + j]);
           if (op.block_scale)
@@ -10757,8 +10786,19 @@ class Interpreter {
             C[r][c] = op.c_f16 ? static_cast<float>(f16_to_double((cv[i / 2][lane] >> (16 * (i % 2))) & 0xFFFF)) : f32(cv[i][lane]);
           }
         }
-      // D = C + A x B: each element its four products added in k order, each rounded to f32 first.
-      if (tile) {
+      // D = C + A x B: each element its four products added in k order, each rounded to f32 first; or, on a device that has the Volta sum for
+      // this form, the four products and C in one step (vgpu/exec/tc_forms.hpp).
+      if (const vgpu::exec::tc86::SumRule* const vr = vgpu::exec::tc86::m8n8k4_rule(profile_)) {
+        vgpu::exec::tc86::form_tile(*vr, false, vgpu::exec::tc86::kEminF16, op.acc_f16, 8, 8, 4, &A[0][0], &B[0][0], &C[0][0], &D[0][0]);
+      } else if (!op.acc_f16 && vgpu::exec::tc86::m8n8k4_chain_c_last(profile_)) {
+        // ptxas's emulation on sm_80 and later: the four products first, in order, and C last, each add rounded to f32.
+        for (uint32_t r = 0; r < 8; ++r)
+          for (uint32_t c = 0; c < 8; ++c) {
+            float acc = A[r][0] * B[0][c];
+            for (uint32_t k = 1; k < 4; ++k) acc += A[r][k] * B[k][c];
+            D[r][c] = acc + C[r][c];
+          }
+      } else if (tile) {
         simd::kernels().tile_f32(8, 8, 4, &A[0][0], &B[0][0], &C[0][0], 8, &D[0][0], 8);
       } else {
         for (uint32_t r = 0; r < 8; ++r)
@@ -10794,6 +10834,14 @@ class Interpreter {
     if (op.sparse || op.d_type == WgmmaAcc::S32 || !fp8(op.a_type) || !fp8(op.b_type)) return nullptr;
     return vgpu::exec::tc86::wgmma_fp8_rule(profile_);
   }
+  // The sum of the device's wgmma for f16, bf16 and tf32 operands (vgpu/exec/tc_forms.hpp): null for every other form, a sparse one, and a device
+  // without one.
+  const vgpu::exec::tc86::SumRule* wgmma_form_rule_of(const OpWgmma& op) const {
+    const bool wide = op.a_type == op.b_type && (op.a_type == WgmmaElem::F16 || op.a_type == WgmmaElem::BF16 || op.a_type == WgmmaElem::TF32);
+    if (op.sparse || op.d_type == WgmmaAcc::S32 || !wide || op.k > vgpu::exec::tc86::kFormMaxK) return nullptr;
+    return vgpu::exec::tc86::wgmma_rule(profile_);
+  }
+  static int wgmma_form_emin(WgmmaElem t) { return t == WgmmaElem::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide; }
   static int wgmma_fp8_emin(WgmmaElem t) { return t == WgmmaElem::E5M2 ? vgpu::exec::tc86::kEminE5M2 : vgpu::exec::tc86::kEminE4M3; }
 
   // ---- Hopper warpgroup MMA (wgmma, sm_90a) ----
@@ -10990,6 +11038,8 @@ class Interpreter {
       wgmma_acc_to_tile(cw.data(), N, f16_acc, Cf.data());
       if (const vgpu::Fp8SumRule* wr = wgmma_fp8_rule_of(op))
         vgpu::exec::tc86::fp8_tile(*wr, f16_acc, wgmma_fp8_emin(op.a_type), wgmma_fp8_emin(op.b_type), 16, N, K, Af.data(), snap.Bf.data(), Cf.data(), Df.data());
+      else if (const vgpu::exec::tc86::SumRule* fr = wgmma_form_rule_of(op))
+        vgpu::exec::tc86::form_tile(*fr, op.a_type == WgmmaElem::TF32, wgmma_form_emin(op.a_type), f16_acc, 16, N, K, Af.data(), snap.Bf.data(), Cf.data(), Df.data());
       else
         simd::kernels().tile_f32c(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
       wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data(), true);
@@ -11138,6 +11188,7 @@ class Interpreter {
     };
     const bool f16_acc = op.d_type == WgmmaAcc::F16;
     const vgpu::Fp8SumRule* const fp8_rule = wgmma_fp8_rule_of(op);
+    const vgpu::exec::tc86::SumRule* const form_rule = wgmma_form_rule_of(op);
     const uint32_t elems = N / 2;   // accumulator elements per lane
     std::vector<Lanes> out(op.d.size());
     for (uint32_t reg = 0; reg < op.d.size(); ++reg) {
@@ -11173,6 +11224,8 @@ class Interpreter {
         if (fp8_rule)
           acc = static_cast<float>(vgpu::exec::tc86::fp8_dot(*fp8_rule, f16_acc, wgmma_fp8_emin(op.a_type), wgmma_fp8_emin(op.b_type), &A[row * K], 1,
                                                              &B[col], N, K, acc));
+        else if (form_rule)
+          acc = vgpu::exec::tc86::form_dot(*form_rule, op.a_type == WgmmaElem::TF32, wgmma_form_emin(op.a_type), f16_acc, &A[row * K], 1, &B[col], N, K, acc);
         else
           for (uint32_t k = 0; k < K; ++k)
             acc += static_cast<float>(A[row * K + k]) * static_cast<float>(B[size_t{k} * N + col]);
@@ -11708,6 +11761,7 @@ class Interpreter {
     m.scale_d = op.scale_d;
     m.collector = op.collector;
     m.collector_buf = op.collector_buf;
+    m.sum = vgpu::exec::tc86::tcgen05_rule(profile_);
     PtxTcHost h(*this, w, ctx, ins, lane, op.cta_group);
     exec::tcgen05_mma(m, h);
   }
@@ -16886,6 +16940,11 @@ __attribute__((section(".text.unlikely"))) void tcgen05_mma(const Tcgen05Mma& op
   // arithmetic's own type.
   std::vector<float> Bf, Af, accf;
   std::vector<int64_t> Bi, Ai, acci;
+  // A dense .kind::f16 or .kind::tf32 on a device that has its own sum for it: all of K and C in the chunks of that rule (tc_forms.hpp).
+  const vgpu::TensorSumRule* const form_sum =
+      op.sum && !sp && !mx && !d_int && (op.kind == Tcgen05MmaKind::F16 || op.kind == Tcgen05MmaKind::TF32) && K <= vgpu::exec::tc86::kFormMaxK ? op.sum : nullptr;
+  const int form_emin = ea.t == TcType::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide;
+  const bool form_tf32 = ea.t == TcType::TF32;
   if (!mx) {
     if (d_int) {
       Bi.resize(B.size());
@@ -16952,7 +17011,7 @@ __attribute__((section(".text.unlikely"))) void tcgen05_mma(const Tcgen05Mma& op
     };
     // The plain case -- dense, A from shared memory, f32 or s32 D, no input scale, no lane disabled, each row of D in its own lane from
     // lane 0 (layouts D and A) -- is one tile product for the CTA's rows (vgpu/simd/simd.hpp), summing in k order as the rows below do.
-    if (!mx && !sp && !op.a_tmem && n_parts == 1 && !layout_f && !d_f16 && d_scale == 1.0 && simd::enabled() && h.smem_direct(v) &&
+    if (!mx && !sp && !op.a_tmem && n_parts == 1 && !layout_f && !d_f16 && d_scale == 1.0 && !form_sum && simd::enabled() && h.smem_direct(v) &&
         std::all_of(off_mask.begin(), off_mask.end(), [](uint32_t x) { return x == 0; })) {
       uint32_t* const base = &t.at(0, d_col0);
       constexpr size_t kLd = TensorMemory::kCols;
@@ -17046,12 +17105,21 @@ __attribute__((section(".text.unlikely"))) void tcgen05_mma(const Tcgen05Mma& op
             }
           }
         }
+        // (a C of zeros, for a D that is not accumulated, where the sum of a form takes one)
+        const auto zero_c = [&](size_t n) {
+          thread_local std::vector<float> z;
+          z.assign(n, 0.0f);
+          return z.data();
+        };
         // The product, a range of rows at a time (all of them, but for block scaling: the rows of one partition share their scaled B).
         const auto product = [&](uint32_t m0, uint32_t m1, const float* Bm, const int32_t* Bmi) {
           const uint32_t rows = m1 - m0;
           if (d_int)
             simd::kernels().tile_i32(rows, wp, K, &Ai_t[size_t{m0} * K], Bmi, accumulate ? &Ci_t[size_t{m0} * wp] : nullptr, wp, K, sat,
                                      &Di_t[size_t{m0} * wp], wp);
+          else if (form_sum)
+            vgpu::exec::tc86::form_tile(*form_sum, form_tf32, form_emin, d_f16, rows, wp, K, &Af_t[size_t{m0} * K], Bm, wp,
+                                        accumulate ? &Cf_t[size_t{m0} * wp] : zero_c(rows * size_t{wp}), wp, &Df_t[size_t{m0} * wp], wp);
           else
             simd::kernels().tile_f32c(rows, wp, K, &Af_t[size_t{m0} * K], Bm, accumulate ? &Cf_t[size_t{m0} * wp] : nullptr, wp, &Df_t[size_t{m0} * wp], wp);
         };
@@ -17143,7 +17211,8 @@ __attribute__((section(".text.unlikely"))) void tcgen05_mma(const Tcgen05Mma& op
             }
             accf[i] = acc;
           }
-          tc_rows_f32(accf.data(), Af.data(), Bf.data() + p * w, K, w, N);
+          if (form_sum) vgpu::exec::tc86::form_tile(*form_sum, form_tf32, form_emin, d_f16, 1, w, K, Af.data(), Bf.data() + p * w, N, accf.data(), w, accf.data(), w);
+          else tc_rows_f32(accf.data(), Af.data(), Bf.data() + p * w, K, w, N);
           // (A NaN in an f32 D is the canonical 0x7fffffff, whichever NaN the host's vector add kept when two met -- the compiler's
           // operand order picks it, and a -O2 and a ThreadSanitizer -O1 build differed. Derived from the HMMA/mma rule of an RTX 3060
           // and the PTX documentation: no card has tcgen05.)

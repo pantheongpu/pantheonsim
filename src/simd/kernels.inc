@@ -162,7 +162,7 @@ void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const ui
         V4u x, y;
         __builtin_memcpy(&x, c + (2 * h) * 32 + 4 * g, sizeof x);
         __builtin_memcpy(&y, c + (2 * h + 1) * 32 + 4 * g, sizeof y);
-        const V4u lo = __builtin_shuffle(x, y, (V4i){0, 4, 1, 5}), hi = __builtin_shuffle(x, y, (V4i){2, 6, 3, 7});
+        const V4u lo = VGPU_SHUFFLE4(x, y, V4i, 0, 4, 1, 5), hi = VGPU_SHUFFLE4(x, y, V4i, 2, 6, 3, 7);
         __builtin_memcpy(&Cm[(g + 8 * h) * 8], &lo, sizeof lo);
         __builtin_memcpy(&Cm[(g + 8 * h) * 8 + 4], &hi, sizeof hi);
       }
@@ -201,7 +201,7 @@ void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const ui
         V4f lo, hi;
         __builtin_memcpy(&lo, &Dm[(g + 8 * h) * 8], sizeof lo);
         __builtin_memcpy(&hi, &Dm[(g + 8 * h) * 8 + 4], sizeof hi);
-        const V4f e = __builtin_shuffle(lo, hi, (V4i){0, 2, 4, 6}), o = __builtin_shuffle(lo, hi, (V4i){1, 3, 5, 7});
+        const V4f e = VGPU_SHUFFLE4(lo, hi, V4i, 0, 2, 4, 6), o = VGPU_SHUFFLE4(lo, hi, V4i, 1, 3, 5, 7);
         // A NaN result is the canonical 0x7fffffff.
         const V4u me = e != e, mo = o != o;
         V4u ue = reinterpret_cast<V4u>(e), uo = reinterpret_cast<V4u>(o);

@@ -57,6 +57,7 @@
 #include "platform.hpp"
 #include "enum_value.hpp"
 #include "func_attrs.hpp"
+#include "device_limits.hpp"
 #include "kept_args.hpp"
 #include "error_names.hpp"
 #include "texture_formats.hpp"
@@ -368,12 +369,12 @@ struct State {
   // launched on the device, which is what the two flags record.
   struct DeviceLimits {
     size_t stack = 1024;
-    size_t printf_fifo = 1u << 20;
+    size_t printf_fifo = vgpu::nv_limits::kUnset;   // the device's default until a program sets it (vgpu::nv_limits)
     size_t malloc_heap = 8u << 20;
     size_t sync_depth = 2;
     size_t pending_launches = 2048;
     size_t l2_fetch_granularity = 64;
-    size_t persisting_l2 = 0;
+    size_t persisting_l2 = vgpu::nv_limits::kUnset;
     bool heap_used = false;     // a kernel that calls malloc() or free() has launched
     bool printf_used = false;   // a kernel that calls printf() has launched
   };
@@ -4208,6 +4209,16 @@ VGPU_EXPORT cudaError_t cudaStreamGetAttribute(cudaStream_t stream, cudaStreamAt
 static cudaError_t cudaStreamSetAttribute_traced(cudaStream_t stream, cudaStreamAttrID attr, const cudaStreamAttrValue* value) {
   if (!value || !is_stream_attribute(attr)) return cudaErrorInvalidValue;
   if (const cudaError_t legacy_ = legacy_capture_gate(stream)) return legacy_;
+  if (attr == cudaStreamAttributeAccessPolicyWindow) {
+    // A window is at most accessPolicyMaxWindowSize bytes, which is 0 before compute capability 8.0: a T4 refuses a window of any size
+    // (cudaErrorInvalidValue), an A10G one a byte over its maximum.
+    const cudaError_t fits = guard("cudaStreamSetAttribute", [&](State& s) {
+      const vgpu::DeviceProfile& p = s.rt->device(t_current_device).profile();
+      return vgpu::nv_limits::window_fits(value->accessPolicyWindow.num_bytes, vgpu::nv_limits::max_access_window(p)) ? cudaSuccess
+                                                                                                                      : cudaErrorInvalidValue;
+    });
+    if (fits != cudaSuccess) return fits;
+  }
   {
     std::lock_guard<std::mutex> lock(g_stream_mu);
     RtStream& r = attribute_record(stream);
@@ -4281,11 +4292,13 @@ int limit_id(cudaLimit limit) {
 }
 }  // namespace
 
-// Persisting L2 lines back to normal. There is no cache to hold them -- the
-// persisting-L2 limit is kept only to be read back -- so nothing changes; the
-// card succeeds.
+// Persisting L2 lines back to normal, and the limit back to the device's default (an A10G: 4325376 after a set, 1179648 after this). There
+// is no cache to hold the lines. The card succeeds on every device, the T4 (no persisting L2) too.
 static cudaError_t cudaCtxResetPersistingL2Cache_traced() {
-  return guard("cudaCtxResetPersistingL2Cache", [&](State&) { return cudaSuccess; });
+  return guard("cudaCtxResetPersistingL2Cache", [&](State& s) {
+    s.limits[t_current_device].persisting_l2 = vgpu::nv_limits::kUnset;
+    return cudaSuccess;
+  });
 }
 
 VGPU_EXPORT cudaError_t cudaCtxResetPersistingL2Cache() {
@@ -4313,22 +4326,31 @@ static cudaError_t cudaDeviceSetLimit_traced(cudaLimit limit, size_t value) {
         lim.malloc_heap = value;
         return cudaSuccess;
       case cudaLimitDevRuntimeSyncDepth: {
-        // Only below compute capability 9.0, and no deeper than 24 levels.
+        // Only below compute capability 9.0, and no deeper than 24 levels: a deeper request is cudaErrorInvalidValue and changes
+        // nothing (a T4 and an A10G, driver 595.91; the driver API already said so).
         const vgpu::DeviceProfile& p = s.rt->device(t_current_device).profile();
         if (p.cc_major >= 9) return cudaErrorUnsupportedLimit;
-        lim.sync_depth = std::min<size_t>(value, 24);
+        if (value > 24) return cudaErrorInvalidValue;
+        lim.sync_depth = value;
         return cudaSuccess;
       }
       case cudaLimitDevRuntimePendingLaunchCount:
         lim.pending_launches = value;
         return cudaSuccess;
       case cudaLimitMaxL2FetchGranularity:
-        lim.l2_fetch_granularity = std::min<size_t>(value, 128);   // 0 to 128 bytes
+        if (value > 128) return cudaErrorInvalidValue;   // 0 to 128 bytes; more is refused, not clamped (T4, A10G)
+        lim.l2_fetch_granularity = value;
         return cudaSuccess;
-      case cudaLimitPersistingL2CacheSize:
-        // Clamped to what the device reports it can set aside, which is none.
-        lim.persisting_l2 = 0;
+      case cudaLimitPersistingL2CacheSize: {
+        // What the device reports it can set aside (persistingL2CacheMaxSize): more is cudaErrorInvalidValue and changes nothing,
+        // less is rounded up to a sixteenth of the L2. A device with none (before compute capability 8.0) has no such limit.
+        const vgpu::DeviceProfile& p = s.rt->device(t_current_device).profile();
+        if (!vgpu::nv_limits::persisting_supported(p)) return cudaErrorUnsupportedLimit;
+        size_t v = 0;
+        if (vgpu::nv_limits::set_persisting(p, value, &v) != vgpu::nv_limits::Set::Ok) return cudaErrorInvalidValue;
+        lim.persisting_l2 = v;
         return cudaSuccess;
+      }
       default:
         return cudaErrorUnsupportedLimit;
     }
@@ -4346,7 +4368,10 @@ static cudaError_t device_limit(State& s, size_t* value, int device, int id) {
   const State::DeviceLimits& lim = s.limits[device];
   switch (id) {
     case cudaLimitStackSize: *value = lim.stack; return cudaSuccess;
-    case cudaLimitPrintfFifoSize: *value = lim.printf_fifo; return cudaSuccess;
+    case cudaLimitPrintfFifoSize:
+      *value = lim.printf_fifo != vgpu::nv_limits::kUnset ? lim.printf_fifo
+                                                           : vgpu::nv_limits::default_printf_fifo(s.rt->device(device).profile());
+      return cudaSuccess;
     case cudaLimitMallocHeapSize: *value = lim.malloc_heap; return cudaSuccess;
     case cudaLimitDevRuntimeSyncDepth: {
       const vgpu::DeviceProfile& p = s.rt->device(device).profile();
@@ -4356,7 +4381,12 @@ static cudaError_t device_limit(State& s, size_t* value, int device, int id) {
     }
     case cudaLimitDevRuntimePendingLaunchCount: *value = lim.pending_launches; return cudaSuccess;
     case cudaLimitMaxL2FetchGranularity: *value = lim.l2_fetch_granularity; return cudaSuccess;
-    case cudaLimitPersistingL2CacheSize: *value = lim.persisting_l2; return cudaSuccess;
+    case cudaLimitPersistingL2CacheSize: {
+      const vgpu::DeviceProfile& p = s.rt->device(device).profile();
+      if (!vgpu::nv_limits::persisting_supported(p)) return cudaErrorUnsupportedLimit;
+      *value = lim.persisting_l2 != vgpu::nv_limits::kUnset ? lim.persisting_l2 : vgpu::nv_limits::default_persisting(p);
+      return cudaSuccess;
+    }
     default: return cudaErrorUnsupportedLimit;
   }
 }

@@ -90,7 +90,7 @@ run; the other four were built for each architecture the simulator has a profile
 | A100, A2, Ada, L40S | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 (a100; rtx3060 for the A2, an sm_86 part; rtx6000-ada and l40s) | - |
 | H100, H200 | 1,757 / 1,311 / 1,080 / 498 (H100); 1,755 / 1,362 / 1,091 / 483 (H200) | 0 / 0 / 0 / 0 (h100, h200) | - |
 | B200 | 1,812 / 1,316 / 1,073 / 481 | 0 / 0 / 0 / 0 (b200 by default since 2026-11-16, `VGPU_TC_EXACT=published` before; rtx-pro-6000 with `published`, the same vectors) | 3,168 / 2 / 2,584 / 2,266 (b200 with `VGPU_TC_EXACT=0`) |
-| V100 | 1,200 (f32 accumulator), 0 (f16) | no profile | - |
+| V100 | 1,200 (f32 accumulator), 0 (f16) | no profile | - (`m8n8k4`: the Volta rule reproduces all 5,000 + 5,000, and a Tesla T4 does too: [m8n8k4-and-sparse.md](m8n8k4-and-sparse.md)) |
 
   The vectors were converted to the program's own format (`tools/tcpapers/khattak-fetch.sh`, pinned commit 79143bd). A sample of
   them (24 a file, chosen so that an Ampere sum fails on 16 of the H100 and B200 ones) is in the repository and runs in CI; the

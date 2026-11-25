@@ -43,22 +43,36 @@ def fp8_cell(d):
                 + (" (18 of 27 forms bit for bit on the card, 9 wide ones differ)" if who == "measured" else " (from the server edition)"))
     return "sequential f32 sum, **unknown**"
 
+def form_cell(d, key, label, what):
+    """One matrix form's cell: the rule the profile names for it and its class, or the sequential sum, unknown."""
+    v = d["numerics"].get(key)
+    if v:
+        return f"{label}: `{v}` ({what}); **{cls(d, 'numerics.' + key)}**"
+    return f"{label}: sequential f32 sum, **unknown**"
+
 def other_cell(d):
     v = ccv(d)
+    n = d["numerics"]
+    parts = []
     if v == (7, 5):
-        return "`m8n8k4`: sequential f32 sum, **unknown**"
-    if v in ((9, 0), (10, 0)):
-        if v == (9, 0):
-            n = d["numerics"]
-            if n.get("tensor_sum_wgmma_fp8") == "hopper":
-                return (f"`wgmma` e4m3, e5m2 (dense): `hopper`, one chunk of {n['tensor_sum_wgmma_fp8_chunk']}, grid {n['tensor_sum_wgmma_fp8_grid']}, result cut to "
-                        f"{n['tensor_sum_wgmma_fp8_out_bits']} bits; **{cls(d, 'numerics.tensor_sum_wgmma_fp8')}** (vectors recorded by others on an H100 and an H200, zero accumulator). "
-                        "`wgmma` f16, bf16, tf32, FP8 sparse: sequential f32 sum, **unknown**")
-            return "`wgmma`, sparse: sequential f32 sum, **unknown**"
-        return "`wgmma`, `tcgen05.mma`, sparse: sequential f32 sum, **unknown**"
-    if v[0] in (10, 11) or v == (12, 1):
-        return "all of them: sequential f32 sum, **unknown**"
-    return "sparse (`mma.sp`): sequential f32 sum, **unknown**"
+        parts.append(form_cell(d, "tensor_sum_m8n8k4", "`m8n8k4`", "one HMMA.884 step: 4 products and C, grid 24"))
+    elif v[0] == 8 and v != (8, 7):
+        parts.append(form_cell(d, "tensor_sum_m8n8k4", "`m8n8k4` f32 accumulator", "ptxas's emulation: products added in order, C last") + "; f16 accumulator: sequential f32 sum, **unknown**")
+        parts.append(form_cell(d, "tensor_sum_sparse", "`mma.sp` f16, bf16, tf32", "the Ampere rule over the stored products") + "; sparse int8, FP8: exact integers / sequential")
+    elif v == (9, 0):
+        if n.get("tensor_sum_wgmma_fp8") == "hopper":
+            parts.append(f"`wgmma` e4m3, e5m2 (dense): `hopper`, one chunk of {n['tensor_sum_wgmma_fp8_chunk']}, grid {n['tensor_sum_wgmma_fp8_grid']}, result cut to "
+                         f"{n['tensor_sum_wgmma_fp8_out_bits']} bits; **{cls(d, 'numerics.tensor_sum_wgmma_fp8')}** (vectors recorded by others on an H100 and an H200, zero accumulator)")
+        parts.append(form_cell(d, "tensor_sum_wgmma", "`wgmma` f16, bf16, tf32 (dense)", "MMA-Sim's claim: the device's mma.sync rule, C in the chunk"))
+        parts.append("`mma.sp`, `wgmma` sparse: sequential f32 sum, **unknown**")
+    elif v == (10, 0):
+        parts.append(form_cell(d, "tensor_sum_tcgen05", "`tcgen05.mma` .kind::f16, .kind::tf32 (dense)", "MMA-Sim's claim: the device's mma.sync rule, C in the chunk"))
+        parts.append("`tcgen05.mma` FP8 and block-scaled kinds, sparse, `mma.sp`: sequential f32 sum, **unknown**")
+    elif v[0] in (10, 11) or v == (12, 1):
+        parts.append("all of them: sequential f32 sum, **unknown**")
+    else:
+        parts.append("sparse (`mma.sp`), `m8n8k4`: sequential f32 sum, **unknown**")
+    return "; ".join(parts)
 
 def main():
     rows = []

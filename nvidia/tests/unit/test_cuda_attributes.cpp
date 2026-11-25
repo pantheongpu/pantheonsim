@@ -161,8 +161,8 @@ VTEST(every_nvidia_profile_answers_every_attribute_and_stays_consistent) {
     }
     // The L2 and the memory interface are facts of the card, not zeros -- except
     // where NVIDIA has not published the L2 (the profile leaves it unset).
-    const bool l2_unpublished = id == "nvidia/b200" || id == "nvidia/b300" || id == "nvidia/gb200" ||
-                                id == "nvidia/vr200" || id == "nvidia/thor" || id == "nvidia/gb10" ||
+    // (The B200 and GB200 have it since the Blackwell Tuning Guide gives 126 MB, nvidia/profiles/b200.yaml.)
+    const bool l2_unpublished = id == "nvidia/b300" || id == "nvidia/vr200" || id == "nvidia/thor" || id == "nvidia/gb10" ||
                                 id == "nvidia/a30";
     if (!l2_unpublished) VCHECK(attr(p, A::kL2CacheSize) > 0);
     VCHECK(attr(p, A::kGlobalMemoryBusWidth) >= 128);

@@ -14,6 +14,7 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/wgmma.hpp"
+#include "vgpu/profile.hpp"
 #include "vgpu/ptx/ast.hpp"
 
 namespace vgpu::exec {
@@ -119,6 +120,9 @@ struct Tcgen05Mma {
   // leading-dimension descriptors (9.7.18.2.1.1, 9.7.18.4.1.1).
   int target_sm = 0;
   bool target_arch = false;   // an architecture-specific ("a") target
+  // The sum of the device's tcgen05.mma for .kind::f16 and .kind::tf32 (numerics.tensor_sum_tcgen05, vgpu/exec/tc_forms.hpp): null for the sequential
+  // sum. Dense forms only; set by the engine, which knows the profile.
+  const vgpu::TensorSumRule* sum = nullptr;
 };
 void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h);
 

@@ -452,13 +452,23 @@ bool bank_window_k(const uint32_t* offs, uint32_t m, uint32_t bytes, uint32_t& o
 
 // The AVX-512 level: the tile kernels at 512 bits (kernels512.inc) and the SASS tier's binary64 kernel dop_m sixteen lanes to a step
 // (lanes512.inc), under the target pragma for the units they use; the other entries of the Avx512 table are the Avx2 ones.
+// (Clang takes no #pragma GCC target: its attribute pragma gives each function in the unit the same target, which is what the fuzz build, the only
+// clang build, needs.)
+#if defined(__clang__)
+#pragma clang attribute push(__attribute__((target("avx2,fma,f16c,avx512f,avx512bw,avx512dq,avx512vl,avx512vnni"))), apply_to = function)
+#else
 #pragma GCC push_options
 #pragma GCC target("avx2,fma,f16c,avx512f,avx512bw,avx512dq,avx512vl,avx512vnni")
+#endif
 namespace avx512_impl {
 #include "kernels512.inc"
 #include "lanes512.inc"
 }  // namespace avx512_impl
+#if defined(__clang__)
+#pragma clang attribute pop
+#else
 #pragma GCC pop_options
+#endif
 #endif
 
 namespace {

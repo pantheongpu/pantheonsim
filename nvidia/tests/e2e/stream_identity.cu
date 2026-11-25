@@ -102,17 +102,24 @@ int main() {
   v.accessPolicyWindow.hitRatio = 0.5f;
   v.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
   v.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-  CK(cudaStreamSetAttribute(a, cudaStreamAttributeAccessPolicyWindow, &v));
+  int window_max = 0;
+  CK(cudaDeviceGetAttribute(&window_max, cudaDevAttrMaxAccessPolicyWindowSize, 0));
   cudaStreamAttrValue got{};
-  CK(cudaStreamGetAttribute(a, cudaStreamAttributeAccessPolicyWindow, &got));
-  CHECK(got.accessPolicyWindow.base_ptr == x && got.accessPolicyWindow.num_bytes == 4096);
-  CHECK(got.accessPolicyWindow.hitProp == cudaAccessPropertyPersisting);
-  // Not set on b: it reads as unset.
-  CK(cudaStreamGetAttribute(b, cudaStreamAttributeAccessPolicyWindow, &got));
-  CHECK(got.accessPolicyWindow.base_ptr == nullptr && got.accessPolicyWindow.num_bytes == 0);
-  CK(cudaStreamCopyAttributes(b, a));
-  CK(cudaStreamGetAttribute(b, cudaStreamAttributeAccessPolicyWindow, &got));
-  CHECK(got.accessPolicyWindow.base_ptr == x && got.accessPolicyWindow.num_bytes == 4096);
+  if (window_max == 0) {
+    // Before compute capability 8.0 there is no access policy window: a window of any size is refused (a Tesla T4 answers so).
+    WANT(cudaStreamSetAttribute(a, cudaStreamAttributeAccessPolicyWindow, &v), cudaErrorInvalidValue);
+  } else {
+    CK(cudaStreamSetAttribute(a, cudaStreamAttributeAccessPolicyWindow, &v));
+    CK(cudaStreamGetAttribute(a, cudaStreamAttributeAccessPolicyWindow, &got));
+    CHECK(got.accessPolicyWindow.base_ptr == x && got.accessPolicyWindow.num_bytes == 4096);
+    CHECK(got.accessPolicyWindow.hitProp == cudaAccessPropertyPersisting);
+    // Not set on b: it reads as unset.
+    CK(cudaStreamGetAttribute(b, cudaStreamAttributeAccessPolicyWindow, &got));
+    CHECK(got.accessPolicyWindow.base_ptr == nullptr && got.accessPolicyWindow.num_bytes == 0);
+    CK(cudaStreamCopyAttributes(b, a));
+    CK(cudaStreamGetAttribute(b, cudaStreamAttributeAccessPolicyWindow, &got));
+    CHECK(got.accessPolicyWindow.base_ptr == x && got.accessPolicyWindow.num_bytes == 4096);
+  }
   // The priority attribute is the stream's priority.
   CK(cudaStreamGetAttribute(c, cudaStreamAttributePriority, &got));
   CHECK(got.priority == greatest);

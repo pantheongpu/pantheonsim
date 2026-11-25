@@ -279,7 +279,7 @@ void fill_image(std::vector<uint8_t>& img, const Kind& k, std::mt19937& g, bool 
 VTEST(tcgen05_tile_route_matches_the_row_loop) {
   std::mt19937 g(0x7c05);
   long compared = 0;
-  int cases = 0;
+  int cases = 0, form_checked = 0, form_differs = 0;
   for (const Kind& kind : kKinds)
     for (const Layout& lay : kLayouts)
       for (int trial = 0; trial < 6; ++trial) {
@@ -369,6 +369,15 @@ VTEST(tcgen05_tile_route_matches_the_row_loop) {
           throw vtest::Failure(std::string(kind.name) + kind.mods + " " + lay.name + " trial " + std::to_string(trial) + ": " + e.what());
         }
         unsetenv("VGPU_FASTPATH");
+        // The sum the b200 profile names for tcgen05.mma (numerics.tensor_sum_tcgen05, vgpu/exec/tc_forms.hpp) is in force on both routes: a dense
+        // .kind::f16 or .kind::tf32 with an f32 D comes out otherwise with VGPU_TC_EXACT=0 (the sequential sum), in some of the cases.
+        if (!c.sparse && !kind.mx && !kind.int_kind && c.dtype == 1 && (std::string(kind.name) == "f16" || std::string(kind.name) == "tf32") && form_checked < 60) {
+          ++form_checked;
+          setenv("VGPU_TC_EXACT", "0", 1);
+          const std::vector<uint32_t> seq = run(c, sa, sb, dcells, aux, da, db, id, lay.d_lane0);
+          unsetenv("VGPU_TC_EXACT");
+          if (seq != fast) ++form_differs;
+        }
         ++cases;
         for (size_t i = 0; i < fast.size(); ++i) {
           ++compared;
@@ -380,6 +389,8 @@ VTEST(tcgen05_tile_route_matches_the_row_loop) {
           }
         }
       }
+  VCHECK(form_checked >= 20);
+  VCHECK(form_differs >= 10);   // (the sequential sum is not the rule's on most random operands)
   VCHECK(cases >= 100);
   VCHECK(compared > 3000000);
 }

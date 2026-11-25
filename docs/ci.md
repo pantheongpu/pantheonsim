@@ -307,6 +307,15 @@ If a job in the pool died with exit 137: check the host's memory
 building at the same time, and re-run the job once the host is quiet. Raising
 the per-job GiB of a profile in `ci/jobs.sh` makes the builds narrower.
 
+## When Ubuntu's mirrors fail (2026-11-19)
+
+Hosted runners install their toolchain with apt, and `security.ubuntu.com` answered 503 for over an hour, which failed
+`build + unit tests` and the Action jobs on two PRs. Every hosted-runner `apt-get update` and `install` now goes through
+`scripts/apt-retry.sh`: apt's own retries and timeouts, a time limit per attempt, and on failure a move to the next full
+Ubuntu mirror (archive.ubuntu.com, then kernel.org, Princeton, xtom, Leaseweb) before the next attempt, four attempts in
+all. `scripts/apt-mirror-fallback.sh` still switches mirrors up front when the image's mirror name does not resolve.
+`tests/lint/check_apt_mirror_fallback.sh` checks both with a fake apt-get, and fails if a workflow calls apt-get directly.
+
 ## Differential execution and determinism
 
 `nvidia/tests/e2e/run_differential.sh diff` runs each program on the SASS engine and on the PTX interpreter (one host thread) and
@@ -317,6 +326,18 @@ affinity, niceness and environment size, once with `VGPU_EXACT_THREADS=4`, and t
 twice; output, every counter and the memory must be the same. A short list runs in ctest (`e2e_differential_diff`,
 `e2e_differential_determinism`); `differential.yml` runs the full lists nightly with 20 repetitions. Differences that are understood are
 in the `known` table of the script, each with its reason; anything else fails. Found so far, all fixed: the PTX engine counted nothing for `wmma.load`, `wmma.store` and bulk-copy (TMA) traffic and one fewer shared store for `mbarrier.init` before sm_90; the SASS engine counted 16 bytes for every `SUST.P` whatever the lane stored; its fast global store paths did not count a store as progress (`Warp::idle_yields`); and a YIELD loop that does new work on every pass was taken for a spin-wait, so `break_spin_wait` let lanes go from a BSYNC early (`group_ballot_barrier` for sm_75: wrong ballots, and a deadlock). Left in the `known` table with the reason: the TMA store count of lanes that name the same operands (ptxas runs them once) and `mbarrier.init` on sm_90 and later (`SYNCS.EXCH.64`, not settled without an sm_90 card).
+
+## One program on every generation
+
+`nvidia/tests/e2e/run_xarch.sh` runs each standalone program of `nvidia/tests/e2e` on the t4, a100, a10g, l4, h100, h200, b200 and rtx5090
+profiles and requires the same output and the same memory after every launch, except where `nvidia/tests/e2e/xarch_expect.sh` says
+which profiles must agree and why the others may not (real hardware: the tensor core's sum, the opt-in shared memory, features from sm_90;
+or a program that asks the device what it is). `ptx` mode builds each program once per virtual architecture as PTX and runs that one
+binary on the PTX interpreter, so what differs is the profile; `native` builds for each generation and runs the SASS engine, so a defect of
+one generation's encoding shows (the sm_120 `IADD` carry was found this way: `ptx_forms` failed on rtx5090 only). Ctest runs a short list
+of each (`e2e_xarch_ptx`, `e2e_xarch_native`); `differential.yml` runs the full list nightly. A difference that is a known defect is in the
+table with its issue number and is deleted from it when the issue closes. `e2e_limits_card` replays the device-limit probe on the t4 and
+a10g profiles against what a Tesla T4 and an A10G answered (`nvidia/tests/data/card/limits.*.txt`).
 
 ## What runs after a merge (2026-11-19)
 

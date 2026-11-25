@@ -228,7 +228,9 @@ std::string exec_name(const std::string& name, Enc enc, bool dpp) {
       "v_min3_num_f16", "v_max3_num_f16", "v_minmax_num_f16", "v_maxmin_num_f16", "v_med3_num_f16",
       // (gfx942's v_cvt_rpi_i32_f32 is now a gfx9 name too, and the specification's alias would send this one to it)
       "v_cvt_nearest_i32_f32"};
-  const bool own = g_cdna5 && kOwnNames.count(name);
+  // (RDNA4's ISA lists the same "_num" instructions as gfx1250's, V_MED3_NUM_F32 and the rest, in the same words: its decoder gives them their own names too;
+  // v_cvt_nearest_i32_f32 stays gfx1250's.)
+  const bool own = kOwnNames.count(name) && (g_cdna5 || (g_rdna4 && name != "v_cvt_nearest_i32_f32"));
   std::vector<std::string> candidates;
   if (const auto it = kRenamed.find(name); it != kRenamed.end()) candidates.push_back(it->second);
   if (const auto it = kAliases.find(name); it != kAliases.end() && !own)

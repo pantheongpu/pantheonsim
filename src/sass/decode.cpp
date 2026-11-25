@@ -3212,9 +3212,15 @@ void dec_iadd(Instr& ins, const Word& w) {
   ins.op = Op::IADD;
   ins.mnemonic = "IADD";
   const bool wide = w.bit(73);
+  // 74 .X (a carry in, the predicate at 87-90 as IADD3's), 81-83 the carry out when not PT: `add.cc.u64` is
+  // `IADD.64 RZ, P0, R2, UR8` and its `addc` the IADD3.X that reads P0 (nvdisasm, CUDA 13.0, sm_120).
+  const bool x = w.bit(74);
   if (wide) ins.mods.push_back("64");
+  if (x) ins.mods.push_back("X");
   ins.f[0] = wide;
+  ins.f[1] = x;
   ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), wide ? 2 : 1));
+  if (const unsigned p0 = static_cast<unsigned>(w.field(81, 3)); p0 != kPT) ins.dst.push_back(P(p0));
   alu2(ins, w, kSigned);
   ins.src[0].neg = w.bit(72);
   if (wide && ins.src[1].kind == Kind::Imm) ins.src[1].fwidth = 64;
@@ -3222,6 +3228,15 @@ void dec_iadd(Instr& ins, const Word& w) {
   if (wide)
     for (Operand& o : ins.src)
       if (o.kind == Kind::Reg) o.width = 2;
+  if (x) {
+    // With a carry in, "negation" is the one's complement (IADD.X R3, ~R5, R9, P0): the + 1 is the carry.
+    for (Operand& o : ins.src)
+      if (o.neg) {
+        o.neg = false;
+        o.bnot = true;
+      }
+    ins.src.push_back(pred_src(w, 87, 90));
+  }
 }
 
 // FMNMX3 d, a, b, c, p (sm_100): the min (p) or max of three.
