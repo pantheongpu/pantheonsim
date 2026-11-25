@@ -73,8 +73,8 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
             /usr/local/.ghcup /usr/share/swift
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build python3 \
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends build-essential cmake ninja-build python3 \
             libnuma1 libdrm2 libdrm-amdgpu1 libelf1 libtinfo6 zlib1g libzstd1
           # rocprofv3 runs inside an isolated session, which needs user namespaces; 24.04 restricts them.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
@@ -114,8 +114,8 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
             /usr/local/.ghcup /usr/share/swift
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build python3 \
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends build-essential cmake ninja-build python3 \
             libnuma1 libdrm2 libdrm-amdgpu1 libelf1 libtinfo6 zlib1g libzstd1 libpci3 libyaml-cpp0.8
           # RVS runs inside an isolated session, which needs user namespaces; 24.04 restricts them.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
@@ -150,14 +150,14 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
             /usr/local/.ghcup /usr/share/swift
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates \
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates \
             python3-venv openmpi-bin libopenmpi-dev
           wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i /tmp/keyring.deb
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends \
             cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
             cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0 \
             libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0 \
@@ -194,13 +194,13 @@ jobs:
       - name: Install CUDA 13.0
         run: |
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates python3-venv
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates python3-venv
           wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i /tmp/keyring.deb
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends \
             cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
             cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0 \
             libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0
@@ -236,13 +236,13 @@ jobs:
       - name: Install CUDA 13.2
         run: |
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
           wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i /tmp/keyring.deb
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends \
             cuda-nvcc-13-2 cuda-cudart-dev-13-2 cuda-crt-13-2 cuda-nvml-dev-13-2 cuda-cupti-dev-13-2 \
             cuda-nvrtc-dev-13-2 libcublas-dev-13-2 libcufft-dev-13-2 libcurand-dev-13-2 \
             libcusparse-dev-13-2 libnvjpeg-dev-13-2 libcusolver-dev-13-2 libnpp-dev-13-2 cuda-profiler-api-13-2
@@ -286,13 +286,13 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
             /usr/local/.ghcup /usr/share/swift
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
           wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i /tmp/keyring.deb
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends \
             cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
             cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0 \
             libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0

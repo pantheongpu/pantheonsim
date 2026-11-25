@@ -48,13 +48,22 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends cmake libgtest-dev libgmock-dev libopenblas-dev \
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends cmake libgtest-dev libgmock-dev libopenblas-dev \
             libnuma1 libdrm2 libdrm-dev libdrm-amdgpu1 libelf1 zlib1g-dev
           amd/tests/rocblas/nightly/fetch-rocm.sh "$HOME/rocm" build
           # Each of the client's translation units wants a few GB: three at a
           # time fit the runner's 16.
           JOBS=3 amd/tests/rocblas/nightly/build-client.sh "$HOME/rocm" "$HOME/rocblas-client"
+      # The shards take the client from an artifact, not from the cache: the
+      # repository's 10 GB cache limit is full of ccache entries, and the cache
+      # evicted this 22 MB entry between the client job and the shards
+      # (2026-11-25, every shard failed with a cache miss).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rocblas-client
+          path: ~/rocblas-client
+          retention-days: 1
 
   shards:
     name: rocblas-test ${{ matrix.gpu }} ${{ matrix.filter }} (${{ matrix.first }}-${{ matrix.last }} of 25)
@@ -95,16 +104,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/pr-guard
-      - uses: actions/cache/restore@v4
+      - uses: actions/download-artifact@v4
         with:
+          name: rocblas-client
           path: ~/rocblas-client
-          key: ${{ env.CLIENT_KEY }}
-          fail-on-cache-miss: true
+      - name: Artifacts lose file modes
+        run: find "$HOME/rocblas-client" -type f \( -name 'rocblas-test' -o -name '*.sh' -o -perm -u+x \) -exec chmod +x {} + ; chmod -R u+rX "$HOME/rocblas-client"
       - name: Build the simulator's HIP runtime
         run: |
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build \
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends build-essential cmake ninja-build \
             libopenblas0-pthread libgfortran5 libnuma1 libdrm2 libdrm-amdgpu1 libelf1
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpuhip

@@ -67,13 +67,13 @@ jobs:
         if: ${{ !job.container.id }}
         run: |
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
           wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i /tmp/keyring.deb
           [ ! -x scripts/apt-mirror-fallback.sh ] || scripts/apt-mirror-fallback.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
+          scripts/apt-retry.sh update -qq
+          scripts/apt-retry.sh install -y -qq --no-install-recommends \
             cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
             cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0 \
             libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0 cuda-profiler-api-13-0

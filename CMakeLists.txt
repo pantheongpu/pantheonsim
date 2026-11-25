@@ -4721,8 +4721,9 @@ set_tests_properties(lint_ci_jobs PROPERTIES TIMEOUT 120)
 add_test(NAME lint_ci_reservation
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_ci_reservation.py)
 
-# scripts/apt-mirror-fallback.sh points apt at archive.ubuntu.com when the runner image's mirror host does not resolve, and
-# every hosted-runner apt-get update runs it first.
+# scripts/apt-mirror-fallback.sh points apt at archive.ubuntu.com when the runner image's mirror host does not resolve, and scripts/apt-retry.sh
+# moves it to the next mirror when apt-get fails or stalls (a 503, a hang); the hosted-runner steps use them, and
+# every hosted-runner apt-get goes through the second.
 add_test(NAME lint_apt_mirror_fallback COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_apt_mirror_fallback.sh)
 set_tests_properties(lint_apt_mirror_fallback PROPERTIES TIMEOUT 60)
 
