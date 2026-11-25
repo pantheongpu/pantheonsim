@@ -83,14 +83,27 @@ VTEST(a_thread_left_running_is_a_leak) {
   runtime::Runtime& rt = machine();
   bool leaked = false;
   const long base = threads_of(line_of(rt, &leaked));
+  // The thread count the machine sees comes from the process's task list, which lags a thread's start and its end by a moment (more under a
+  // sanitizer, and on a loaded runner): ask again until it is what it must be, for up to two seconds.
+  const auto settle = [&](long want, std::string* line, bool at_most) {
+    for (int i = 0; i < 200; ++i) {
+      *line = line_of(rt, &leaked);
+      const long n = threads_of(*line);
+      if (at_most ? n <= want : n >= want) return;
+      usleep(10000);
+    }
+  };
   std::atomic<bool> stop{false};
   std::thread t([&] { while (!stop) usleep(1000); });
-  const std::string during = line_of(rt, &leaked);
+  std::string during, after;
+  settle(base + 1, &during, false);
   stop = true;
   t.join();
-  const long after = threads_of(line_of(rt, &leaked));
-  VCHECK_EQ(threads_of(during), base + 1);
-  VCHECK_EQ(after, base);
+  settle(threads_of(during) - 1, &after, true);
+  // (At least one more while it ran, and fewer once it was joined: a sanitizer may start a helper thread of its own beside ours -- ThreadSanitizer
+  // showed base + 2 -- so the figures are compared with each other, not with an exact count.)
+  VCHECK(threads_of(during) >= base + 1);
+  VCHECK(threads_of(after) < threads_of(during));
   VCHECK_CONTAINS(during, "LEAK");
 }
 
