@@ -70,6 +70,26 @@ Notes:
   infinities among the operands) do not, and no model tried explains them (`nvidia/docs/lowprec.md`).
   The RTX PRO's FP8 differs from the B200's (the B200's vectors give 164 to 183 mismatches of 500 on it): it is not the `via_f16` rule.
 
+### What differs between generations in a program's results (2026-11-23)
+
+`nvidia/tests/e2e/run_xarch.sh` runs every standalone e2e program on t4, a100, a10g, l4, h100, h200, b200 and rtx5090 and compares output and
+memory ([../ci.md](../ci.md)). What it found that is the hardware's, each with its evidence (the table in `nvidia/tests/e2e/xarch_expect.sh` is the
+authority; issue #754 is the list):
+
+| What | Generations | Evidence |
+|---|---|---|
+| mma.sync and wmma sums | Turing, Ampere and Ada give `ampere` results (chunks of 8); Hopper, Blackwell sm_100 and sm_120 give `hopper` (chunks of 16) | rows above; `nvidia/tests/data/float_half_forms.*.txt`, `simd_lane_forms.*.txt` |
+| opt-in shared memory per block | 64 KiB (sm_75), 163 KiB (sm_80), 99 KiB (sm_86, 89, 120), 227 KiB (sm_90, 100) | CUDA Programming Guide; A10G card dump |
+| printf FIFO default | 32 bytes for every thread the device holds: 1310720 on a T4, 3932160 on an A10G | cards, 2026-11-23 (`nvidia/tests/data/card/limits.*.txt`); other devices inferred |
+| persisting-L2 limit and access policy window | none before sm_80 (`cudaErrorUnsupportedLimit`, window `cudaErrorInvalidValue`); from sm_80 a default of 3/16 of the L2, requests rounded up to sixteenths, more than the maximum refused | the same cards; unit and default inferred for sm_80 and later but the A10G |
+| L2 size of the B200 and GB200 | 126 MiB (`documented`: Blackwell Tuning Guide); their persisting maximum is `inferred` (3/4) | `nvidia/profiles/b200.yaml` |
+| features from sm_90 | cluster launch, `%aggr_smem_size`, vector atomics, no device runtime sync depth; block-scaled `mma.sync` on compute capability 12 only | PTX ISA, CUDA docs |
+| PTX with `.target sm_80` | refused on a T4 (a card run agrees) | `launch_cache`, `driver_entry_late` |
+
+Not settled, each needing a card of that generation (listed in `xarch_expect.sh` with its issue): cluster occupancy on B200 (no published GPC layout, #750),
+the sm_120 multicast bulk copy in SASS (#751), `%reserved_smem_offset_*` in SASS on sm_90 and later (#752: an H100) and 3D `tex.grad` on sm_90 and
+later (#753: an H100).
+
 ## AMD
 
 No AMD matrix-core hardware was available to us, and no AMD profile has a `numerics:` section: nothing on the AMD side is `measured`, and

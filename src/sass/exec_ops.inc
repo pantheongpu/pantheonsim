@@ -699,7 +699,11 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
             r |= (static_cast<uint32_t>(v) & mask) << (bits * k);
           }
         } else if (mode == 2 && ins.f[1]) {   // .S32.ISAT: saturating
-          r = static_cast<uint32_t>(std::clamp<int64_t>(int64_t{static_cast<int32_t>(a)} + static_cast<int32_t>(b), INT32_MIN, INT32_MAX));
+          // A negated source is negated in 64 bits: sub.sat.s32 of INT_MIN is a sum that saturates, not one that wraps.
+          int64_t x = static_cast<int32_t>(read32(w, ins.src[0], l)), y = static_cast<int32_t>(read32(w, ins.src[1], l));
+          if (ins.src[0].neg) x = -x;
+          if (ins.src[1].neg) y = -y;
+          r = static_cast<uint32_t>(std::clamp<int64_t>(x + y, INT32_MIN, INT32_MAX));
         } else {
           r = (ins.src[0].neg ? 0u - a : a) + b;
         }
@@ -708,14 +712,25 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       return;
     case Op::IADD:   // sm_120: a + b, 32 or 64 bits
       each_lane(ex, [&](unsigned l) {
-        if (ins.f[0]) {
-          uint64_t a = read64(w, ins.src[0], l), b = read64(w, ins.src[1], l);
-          if (ins.src[0].neg) a = 0 - a;
-          if (ins.src[1].neg) b = 0 - b;
-          write64(w, ins.dst[0], l, a + b);
-        } else {
-          write32(w, ins.dst[0], l, ival(w, ins.src[0], l) + ival(w, ins.src[1], l));
+        // As IADD3: a negated operand is its complement plus one, so that the carry out is the sum's overflow;
+        // .X adds the carry in (src[2]); dst[1], when there is one, takes the carry out.
+        const bool wide = ins.f[0];
+        unsigned __int128 sum = 0;
+        for (int i = 0; i < 2; ++i) {
+          const Operand& o = ins.src[i];
+          uint64_t v = wide ? read64(w, o, l) : read32(w, o, l);
+          if (o.bnot) v = wide ? ~v : static_cast<uint32_t>(~v);
+          if (o.neg) {
+            sum += wide ? ~v : static_cast<uint32_t>(~v);
+            sum += 1;
+          } else {
+            sum += v;
+          }
         }
+        if (ins.f[1]) sum += pred(w, ins.src[2], l);
+        if (wide) write64(w, ins.dst[0], l, static_cast<uint64_t>(sum));
+        else write32(w, ins.dst[0], l, static_cast<uint32_t>(sum));
+        if (ins.dst.size() > 1) set_pred(w, ins.dst[1], l, (sum >> (wide ? 64 : 32)) != 0);
       });
       return;
     case Op::UP2UR:   // the uniform predicates (masked) into a register

@@ -16,7 +16,7 @@
 # 1000 W power limit (the page lists no TDP), the 90 C limit and the memory
 # sensor. The Grace link is NVLink-C2C, so the PCIe link is left out rather than
 # taken from the B200.
-#   - CUDA attributes (the `cuda:` section): the bus width is the B200's; the L2 is unpublished and left unset.
+#   - CUDA attributes (the `cuda:` section): the bus width is the B200's; the L2 is the B200's: NVIDIA's Blackwell Tuning Guide gives the GB200 GPU 126 MB.
 id: nvidia/gb200
 vendor: nvidia
 model: "NVIDIA GB200"
@@ -38,6 +38,7 @@ limits:
   max_blocks_per_sm: 32
   max_registers_per_thread: 255
   shared_mem_per_sm: 233472
+  l2_cache_bytes: 132120576      # 126 MiB: NVIDIA's Blackwell Tuning Guide (CUDA 12.8) gives the GB200 GPU 126 MB of L2; the same count of MiB as Hopper's 50 for 52428800. Documented, not read from a card.
 features:
   fp16: true
   bf16: true
@@ -61,9 +62,10 @@ telemetry:
 
 # What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
 # Memory interface 8192 bits: COPIED from nvidia/b200 (eight HBM3e stacks); NVIDIA's GB200 page gives no width.
-# The L2 size is not published, so it is left unset, as for the B200 and B300, and so is the persisting L2.
+# The L2 is the tuning guide's 126 MB (limits above); the persisting L2 is inferred as the B200's.
 cuda:
   memory_bus_width_bits: 8192
+  persisting_l2_bytes: 99090432   # 3/4 of the L2, twelve sixteenths, as the A100 and the H100 (31457280, 39321600): INFERRED, no Blackwell data-centre card has said (an A10G and an L4 are eleven sixteenths)
 
 # Numerics: the sum this device's tensor core makes of f16, bf16 and tf32 products (wmma, mma.sync, HMMA). The engines read it
 # from here. `provenance` gives each value one class (measured | documented | inferred | unknown) and `evidence` what the class
