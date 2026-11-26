@@ -5628,14 +5628,18 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
     const uint32_t expected = b.expected ? b.expected : live;
     if (b.arrived < expected) return;
     if (race_) ++blk.race_epoch;   // the barrier orders what came before it against what comes after
-    for (Warp& ww : blk.warps)
+    // The result goes to the warps that waited at this barrier only: a warp that waited at another one (barriers 1 and 2 release one after
+    // the other) reads, at its B2R, the result of its own, not whichever released last.
+    for (Warp& ww : blk.warps) {
+      bool woke = false;
       for (unsigned l = 0; l < 32; ++l)
         if (((ww.waiting >> l) & 1) && ww.wait_kind[l] == Wait::Bar && ww.wait_arg[l] == id) {
           ww.waiting &= ~(Mask{1} << l);
           ww.wait_kind[l] = Wait::None;
           ww.pc[l] += 16;
+          woke = true;
         }
-    for (Warp& ww : blk.warps) {
+      if (!woke) continue;
       ww.b2r = b.red == 0 ? b.popc : b.red == 1 ? b.and_ : b.or_;
       ww.b2r_pred = b.red == 0 ? b.popc != 0 : b.red == 1 ? b.and_ : b.or_;
     }

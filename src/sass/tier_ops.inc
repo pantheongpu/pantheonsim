@@ -2234,8 +2234,11 @@ inline void tier_release_bar(Block& blk, unsigned id) {
   Block::Barrier& b = blk.bar(id);
   const uint32_t expected = b.expected ? b.expected : blk.live;
   if (b.arrived < expected) return;
-  for (Warp& ww : blk.warps) tier_wake(ww, tier_waiting_on(ww, Wait::Bar, id));
+  // (the result goes to the warps that waited at this barrier only: a warp on another barrier, or none, reads the result of its own)
   for (Warp& ww : blk.warps) {
+    const Mask waiting = tier_waiting_on(ww, Wait::Bar, id);
+    tier_wake(ww, waiting);
+    if (!waiting) continue;
     ww.b2r = b.red == 0 ? b.popc : b.red == 1 ? b.and_ : b.or_;
     ww.b2r_pred = b.red == 0 ? b.popc != 0 : b.red == 1 ? b.and_ : b.or_;
   }
