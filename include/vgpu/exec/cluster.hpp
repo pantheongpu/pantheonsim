@@ -12,7 +12,10 @@
 // divided by the cluster size, and depends on the SMs in each GPC, which NVIDIA does
 // not publish for a part with TPCs disabled: GpuLayout (vgpu/profile.hpp) has the
 // counts a profile has a source for and spreads them evenly, so an answer that
-// needs more than one SM's worth of blocks per GPC is derived, and says so.
+// needs more than one SM's worth of blocks per GPC is derived, and says so. A profile's
+// layout keys carry a class (documented: NVIDIA's own figure for this part; inferred:
+// another part's or the die's figure; never measured, no card of ours has run this).
+// A part published with two GPC counts is answered only where both give one answer.
 //
 // What a card without clusters answers was measured on an RTX 3060 (sm_86):
 // a configuration with no cluster dimension is cudaSuccess with 0, one that names
@@ -41,6 +44,22 @@ struct ClusterAnswer {
   bool uses_layout = false;   // the answer rests on the SMs-per-GPC spread of the profile (derived)
   const char* why = "";       // for NotSupported: what is missing
 };
+
+inline constexpr const char* kTwoGpcCounts =
+    "NVIDIA publishes this part with two possible GPC counts (layout.gpcs and layout.gpcs_alt) and the answer differs between them";
+
+// Clusters of `size` blocks that fit a layout when an SM holds `per_sm` blocks: each GPC holds its SMs' blocks, in whole clusters.
+inline int64_t clusters_in(const GpuLayout& l, uint32_t size, uint32_t per_sm) {
+  int64_t total = 0;
+  for (uint32_t sms : l.gpc_sms()) total += int64_t{sms} * per_sm / static_cast<int64_t>(size);
+  return total;
+}
+// The most blocks one GPC holds: the largest cluster that can ever be co-scheduled.
+inline uint64_t biggest_gpc_blocks(const GpuLayout& l, uint32_t per_sm) {
+  uint64_t biggest = 0;
+  for (uint32_t sms : l.gpc_sms()) biggest = std::max<uint64_t>(biggest, uint64_t{sms} * per_sm);
+  return biggest;
+}
 
 inline uint64_t cluster_blocks(const std::array<uint32_t, 3>& d) { return uint64_t{d[0]} * d[1] * d[2]; }
 
@@ -91,8 +110,13 @@ inline ClusterAnswer cluster_occupancy(const DeviceProfile& p, bool want_active_
       a.why = "the GPC layout of this part (how many SMs each GPC has) is not published, and a cluster has to fit in one GPC";
       return a;
     }
-    int64_t total = 0;
-    for (uint32_t sms : p.layout.gpc_sms()) total += int64_t{sms} * blocks_per_sm / static_cast<int64_t>(size);
+    const GpuLayout alt = p.layout.alternative();
+    const int64_t total = clusters_in(p.layout, static_cast<uint32_t>(size), blocks_per_sm);
+    if (p.layout.gpcs_alt && total != clusters_in(alt, static_cast<uint32_t>(size), blocks_per_sm)) {
+      a.status = S::NotSupported;
+      a.why = kTwoGpcCounts;
+      return a;
+    }
     a.value = total;
     a.uses_layout = true;
     return a;
@@ -108,8 +132,13 @@ inline ClusterAnswer cluster_occupancy(const DeviceProfile& p, bool want_active_
     a.why = "the GPC layout of this part (how many SMs each GPC has) is not published, and a cluster has to fit in one GPC";
     return a;
   }
-  uint64_t biggest = 0;
-  for (uint32_t sms : p.layout.gpc_sms()) biggest = std::max<uint64_t>(biggest, uint64_t{sms} * blocks_per_sm);
+  const uint64_t biggest = biggest_gpc_blocks(p.layout, blocks_per_sm);
+  if (p.layout.gpcs_alt && std::min<uint64_t>(limit, biggest) !=
+                               std::min<uint64_t>(limit, biggest_gpc_blocks(p.layout.alternative(), blocks_per_sm))) {
+    a.status = S::NotSupported;
+    a.why = kTwoGpcCounts;
+    return a;
+  }
   a.value = static_cast<int64_t>(std::min<uint64_t>(limit, biggest));
   a.uses_layout = true;
   return a;

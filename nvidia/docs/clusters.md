@@ -57,14 +57,39 @@ H100 SXM5's SM count, and NVIDIA gives no GPC count of its own for it).
 Where NVIDIA has published no GPC count the call is **refused by name** (`cudaErrorNotSupported` /
 `CUDA_ERROR_NOT_SUPPORTED`, with a message once) rather than answered from a layout made up for it, for
 what needs the layout (a cluster larger than one block, or the largest size when non-portable sizes are allowed).
-That is the H100 PCIe ("7 or 8 GPCs": the TPC count, 57, is in the profile; the GPC count is not), the Blackwell
-datacenter parts (B200, B300, GB200: secondary sources disagree and NVIDIA's own do not say), GB10, Thor and Rubin.
+That is now GB10, Thor and Rubin (`vr200`: NVIDIA's Rubin architecture post gives 224 SMs and says the SMs are
+organised in GPCs, and states no count; press readings of its block diagram say 8 GPCs of unequal size, which is
+not NVIDIA's figure).
+
+Every key of a profile's `layout:` carries a class (`provenance:`, `evidence:`), and none is `measured`: no card of ours has
+run a cluster occupancy query on a part with clusters.
+
+* `documented`: NVIDIA's own figure for the part (the whitepaper or architecture post names the part's GPCs, TPCs and SMs).
+* `inferred`: carried over from the same die or from another part with the same SM count (`counts_derived: true`).
+  The spread of the enabled TPCs over the GPCs is derived on every profile and is never published.
+
+Two cases answer from what is published without a made-up number:
+
+* **B200, GB200, B300** (inferred): NVIDIA's Blackwell Ultra architecture post says the full two-die GPU has 160 SMs
+  in 8 GPCs and that the available SM count varies by SKU; the CUDA Blackwell tuning guide gives 16 as the
+  non-portable cluster size of a B200 and says to size a persistent grid with `cudaOccupancyMaxActiveClusters`,
+  without a GPC figure. The profiles' 148 SMs are 74 of the 80 TPCs, so the 8 GPCs are carried over: two GPCs of
+  20 SMs and six of 18 (the spread is derived). A cluster of 8 then gives 16 clusters of one block per SM, of 2 gives 74.
+  A real B200 may have its disabled TPCs elsewhere; one run of `cluster_occupancy.cu` on a B200 would settle it
+  (`run_cluster_occupancy.sh --card --update` with `CLUSTER_OCC_SLUG=b200 CLUSTER_OCC_ARCH=sm_100a`).
+* **H100 PCIe** (documented): the Hopper whitepaper gives `7 or 8 GPCs` with 57 TPCs. The profile keeps both
+  (`layout.gpcs: 7`, `layout.gpcs_alt: 8`) and a query is answered where both counts give the same number (for example
+  clusters of 2: 57 pairs of TPCs either way, so 114 with two blocks per SM) and refused by name where they differ
+  (clusters of 4: 28 against 25).
 
 | profiles with a layout | GPCs / TPCs / SMs | source |
 | --- | --- | --- |
 | H100 SXM5 (`h100`) | 8 / 66 / 132 | Hopper Architecture In-Depth |
 | `gh200-480gb`, `h200`, `h100-nvl`, `h200-nvl` | the same | derived: the same SM count |
 | `rtx5090` | 11 / 85 / 170 | RTX Blackwell whitepaper |
+| `h100-pcie` | 7 or 8 / 57 / 114 | Hopper Architecture In-Depth (both counts kept) |
+| `b200`, `gb200`, `b300` | 8 / 74 / 148 | inferred: full Blackwell GPU, 8 GPCs and 160 SMs (Blackwell Ultra post) |
+| `rtx-pro-4500` | 7 / 41 / 82 | inferred: GB203, 7 GPCs and 84 SMs (RTX Blackwell whitepaper) |
 | `rtx-pro-6000`, `-max-q` | 12 / 94 / 188 | RTX Blackwell whitepaper |
 | `rtx-pro-6000-server` | the same | derived: the same SM count |
 | Ampere: `a100*` 7/54/108, `a40`, `rtx-a6000` 7/42/84, `rtx3090` 7/41/82, `rtx3080ti` 7/40/80, `rtx3070` 6/23/46 | | A100 and GA102 whitepapers, Ada whitepaper Table 3 |
@@ -74,4 +99,4 @@ datacenter parts (B200, B300, GB200: secondary sources disagree and NVIDIA's own
 The Ampere, Turing and Ada layouts decide nothing (those parts have no clusters); they are recorded because
 the figures are published. No device attribute depends on the layout: `cudaDevAttrClusterLaunch` is the only
 cluster attribute CUDA has, and it is set from the compute capability. The RTX 3060 and the other profiles
-whose GPC count the whitepapers do not give (A10, A10G, A30, RTX A5000 and the like) have no layout.
+whose GPC count the whitepapers do not give (A10, A10G, A30, RTX A5000 and the like) have no layout, and neither have `gb10`, `thor` and `vr200`.

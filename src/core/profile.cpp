@@ -433,6 +433,7 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
     if (it->second.kind != Value::Kind::Map) fail(origin, "'layout' must be a map");
     const Value& l = it->second;
     p.layout.gpcs = static_cast<uint32_t>(opt_int(l, "gpcs", origin, 0));
+    p.layout.gpcs_alt = static_cast<uint32_t>(opt_int(l, "gpcs_alt", origin, 0));
     p.layout.tpcs = static_cast<uint32_t>(opt_int(l, "tpcs", origin, 0));
     p.layout.sms_per_tpc = static_cast<uint32_t>(opt_int(l, "sms_per_tpc", origin, 0));
     if (auto d = l.map.find("counts_derived"); d != l.map.end()) {
@@ -444,6 +445,8 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
       fail(origin, "layout: " + std::to_string(p.layout.tpcs) + " TPCs of " + std::to_string(p.layout.sms_per_tpc) +
                        " SMs are not the " + std::to_string(p.limits.multiprocessors) + " multiprocessors");
     if (p.layout.gpcs > p.layout.tpcs) fail(origin, "layout: more GPCs than TPCs");
+    if (p.layout.gpcs_alt && (!p.layout.gpcs || p.layout.gpcs_alt == p.layout.gpcs || p.layout.gpcs_alt > p.layout.tpcs))
+      fail(origin, "layout.gpcs_alt is a second GPC count: it needs gpcs, differs from it and cannot exceed the TPCs");
   }
 
   // Optional: presentation-only values for monitoring tools.

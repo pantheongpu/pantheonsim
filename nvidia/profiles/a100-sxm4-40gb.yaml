@@ -69,9 +69,11 @@ numerics:
   tensor_sum_m8n8k4: chain_c_last   # sequential | volta | chain_c_last: mma.m8n8k4 (f32 accumulator; PTX engine)
   tensor_sum_sparse: ampere         # sequential | ampere: mma.sp / HMMA.SP with f16, bf16, tf32 operands
 provenance:
+  documented: [layout.gpcs, layout.tpcs, layout.sms_per_tpc]
   inferred: [numerics.tensor_sum_m8n8k4, numerics.tensor_sum_sparse]
   measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]
 evidence:
+  layout: "NVIDIA A100 Tensor Core GPU Architecture whitepaper, Table 4 and its text: 'A100: 7 GPCs, 7 or 8 TPCs/GPC, 2 SMs/TPC, up to 16 SMs/GPC, 108 SMs', 54 TPCs. The spread of the TPCs over the GPCs is derived (even, larger first), never published. No card of ours has run a cluster occupancy query on this part, so nothing here is measured (nvidia/docs/clusters.md)."
   numerics: "card: NVIDIA A100-SXM4-40GB (this model), Lambda; driver: 570.148.08; toolkit: nvcc 12.8.93; date: 2026-11-15. Both probes print the RTX 3060 lines (nvidia/tests/data/simd_lane_forms.rtx3060.txt, float_half_forms.rtx3060.txt); FTTN; a dump of 8,388,608 wmma results, every one the ampere rule (tools/fttn/tc_dump_check.cpp). docs/matrix-numerics.md"
   numerics.tensor_sum_m8n8k4: "inferred from the A10G (sm_86, measured 2026-11-23, see numerics.tensor_sum_m8n8k4 of nvidia/profiles/a10g.yaml): ptxas emulates mma.m8n8k4 as f32 products added in order with C last on sm_80 and later; no card of this model was run, and the emulation is the cubin's (nvcc 13.0.88), not the hardware's. An f32 accumulator only. docs/numerics/m8n8k4-and-sparse.md"
   numerics.tensor_sum_sparse: "inferred from the A10G (sm_86, measured 2026-11-23, see numerics.tensor_sum_sparse of nvidia/profiles/a10g.yaml): the Ampere rule over the stored products; no card of this model was run. docs/numerics/m8n8k4-and-sparse.md"

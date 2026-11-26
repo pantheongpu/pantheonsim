@@ -14,7 +14,10 @@
 # nvidia/tests/data/cluster_occupancy.rtx3060.expected, and the shim's rtx3060 profile must print the same.
 # For a part with clusters there is no card here: the answers are checked against the layout NVIDIA
 # publishes for the part (GPCs and TPCs; the spread of the SMs over the GPCs is derived, evenly) by the
-# rules of the CUDA documentation, computed again below independently of the library.
+# rules of the CUDA documentation, computed again below independently of the library. Where the layout
+# is itself inferred (B200, GB200, B300: the Blackwell die's 8 GPCs; RTX PRO 4500: GB203's 7) or NVIDIA gives
+# two GPC counts (H100 PCIe: 7 or 8) the profile says so (nvidia/docs/clusters.md) and this checks the
+# same arithmetic; no card of ours has run any of these.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -88,17 +91,24 @@ import os, re, subprocess, sys
 shim, prog, root = sys.argv[1:4]
 def spread(gpcs, tpcs):   # the derived spread: even, larger first, two SMs a TPC
     return [(tpcs // gpcs + (1 if g < tpcs % gpcs else 0)) * 2 for g in range(gpcs)]
-# profile -> (SM list per GPC or None when NVIDIA does not publish the GPC count, SMs)
+# profile -> (list of candidate layouts, each the SMs per GPC; empty when NVIDIA does not publish the GPC count; SMs).
+# More than one candidate: NVIDIA publishes two GPC counts and an answer is given only where they agree.
 parts = {
-    "nvidia/h100": (spread(8, 66), 132),          # Hopper In-Depth: 8 GPCs, 66 TPCs
-    "nvidia/h200": (spread(8, 66), 132),          # derived from the H100 SXM5
-    "nvidia/rtx5090": (spread(11, 85), 170),      # RTX Blackwell whitepaper: 11 GPCs, 85 TPCs
-    "nvidia/rtx-pro-6000": (spread(12, 94), 188), # 12 GPCs, 94 TPCs
-    "nvidia/h100-pcie": (None, 114),              # '7 or 8 GPCs': not published
-    "nvidia/b200": (None, 148),                   # no published GPC layout
+    "nvidia/h100": ([spread(8, 66)], 132),          # Hopper In-Depth: 8 GPCs, 66 TPCs
+    "nvidia/h200": ([spread(8, 66)], 132),          # derived from the H100 SXM5
+    "nvidia/rtx5090": ([spread(11, 85)], 170),      # RTX Blackwell whitepaper: 11 GPCs, 85 TPCs
+    "nvidia/rtx-pro-6000": ([spread(12, 94)], 188), # 12 GPCs, 94 TPCs
+    "nvidia/h100-pcie": ([spread(7, 57), spread(8, 57)], 114),   # '7 or 8 GPCs', 57 TPCs: both published
+    "nvidia/b200": ([spread(8, 74)], 148),          # inferred: full Blackwell GPU 8 GPCs (Blackwell Ultra blog), 74 TPCs enabled
+    "nvidia/gb200": ([spread(8, 74)], 148),         # the same
+    "nvidia/b300": ([spread(8, 74)], 148),          # the same
+    "nvidia/rtx-pro-4500": ([spread(7, 41)], 82),   # inferred: GB203's 7 GPCs, 41 of 42 TPCs
+    "nvidia/vr200": ([], 224),                      # Rubin: 224 SMs, GPC count not stated by NVIDIA
+    "nvidia/gb10": ([], 48),                        # no GPC count published
+    "nvidia/thor": ([], 20),                        # no GPC count published
 }
 bad = 0
-for prof, (gpc, sms) in parts.items():
+for prof, (gpcs, sms) in parts.items():
     env = dict(os.environ, VGPU_QUIET="1", VGPU_GPU=prof, LD_LIBRARY_PATH=shim)
     r = subprocess.run([prog], env=env, capture_output=True, text=True)
     if r.returncode:
@@ -125,23 +135,25 @@ for prof, (gpc, sms) in parts.items():
                 want = ("cudaErrorInvalidClusterSize", "CUDA_ERROR_INVALID_CLUSTER_SIZE", -7)
             elif size == 1:
                 want = ("cudaSuccess", "CUDA_SUCCESS", per_sm * sms)
-            elif gpc is None:
+            elif not gpcs:
                 want = ("cudaErrorNotSupported", "CUDA_ERROR_NOT_SUPPORTED", -7)
             else:
-                want = ("cudaSuccess", "CUDA_SUCCESS", sum(g * per_sm // size for g in gpc))
+                vals = {sum(g * per_sm // size for g in gpc) for gpc in gpcs}
+                want = ("cudaSuccess", "CUDA_SUCCESS", vals.pop()) if len(vals) == 1 else ("cudaErrorNotSupported", "CUDA_ERROR_NOT_SUPPORTED", -7)
         else:
             if what.startswith("1 MiB"):
                 want = ("cudaSuccess", "CUDA_SUCCESS", 0)
             elif limit <= 8:
                 want = ("cudaSuccess", "CUDA_SUCCESS", 8)
-            elif gpc is None:
+            elif not gpcs:
                 want = ("cudaErrorNotSupported", "CUDA_ERROR_NOT_SUPPORTED", -7)
             else:
-                want = ("cudaSuccess", "CUDA_SUCCESS", min(16, max(gpc) * per_sm))
+                vals = {min(16, max(gpc) * per_sm) for gpc in gpcs}
+                want = ("cudaSuccess", "CUDA_SUCCESS", vals.pop()) if len(vals) == 1 else ("cudaErrorNotSupported", "CUDA_ERROR_NOT_SUPPORTED", -7)
         got = (code, int(val))
         if got != (want[0], want[2]) or (dcode is not None and (dcode, int(dval)) != (want[1], want[2])):
             print(f"FAIL: {prof} {'non-portable' if nonportable else 'portable'} {l}  (expected {want})"); bad += 1
-    print(f"{prof}: checked against the layout" + (" (derived spread)" if gpc else " (no published GPC layout: refused)"))
+    print(f"{prof}: checked against the layout" + (" (derived spread)" if gpcs else " (no published GPC layout: refused)"))
 sys.exit(1 if bad else 0)
 PY
 rc=$?

@@ -67,6 +67,14 @@ cuda:
   memory_bus_width_bits: 8192
   persisting_l2_bytes: 99090432   # 3/4 of the L2, twelve sixteenths, as the A100 and the H100 (31457280, 39321600): INFERRED, no Blackwell data-centre card has said (an A10G and an L4 are eleven sixteenths)
 
+# How the SMs are grouped, which a cluster launch needs (a cluster lives in one GPC). NVIDIA publishes no GPC count for the GB200's GPU itself.
+# Source: NVIDIA developer blog 'Inside NVIDIA Blackwell Ultra' (the same two-die Blackwell data-centre GPU, 160 SMs in 8 GPCs in the full implementation, 'available SM count varies by SKU'): this profile's 148 SMs (the B200's: no GB200 figure is published) are 74 of its 80 TPCs, so 8 GPCs are carried over. NVIDIA does not say which TPCs are off, so the spread is derived (even, larger first; vgpu::GpuLayout).
+layout:
+  gpcs: 8
+  tpcs: 74
+  sms_per_tpc: 2
+  counts_derived: true         # the die's figures, not this SKU's own
+
 # Numerics: the sum this device's tensor core makes of f16, bf16 and tf32 products (wmma, mma.sync, HMMA). The engines read it
 # from here. `provenance` gives each value one class (measured | documented | inferred | unknown) and `evidence` what the class
 # rests on. Schema: nvidia/docs/profiles.md. The rule and every card run: docs/matrix-numerics.md.
@@ -78,8 +86,9 @@ numerics:
   tensor_sum_fp8: via_f16          # sequential | ada | via_f16: the e4m3 and e5m2 forms (mma.sync), summed as f16 ones are
   tensor_sum_tcgen05: hopper        # sequential | hopper: tcgen05.mma .kind::f16 and .kind::tf32 (dense)
 provenance:
-  inferred: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid, numerics.tensor_sum_fp8, numerics.tensor_sum_tcgen05]
+  inferred: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid, numerics.tensor_sum_fp8, numerics.tensor_sum_tcgen05, layout.gpcs, layout.tpcs, layout.sms_per_tpc]
 evidence:
+  layout: "NVIDIA developer blog 'Inside NVIDIA Blackwell Ultra' (the same two-die Blackwell data-centre GPU, 160 SMs in 8 GPCs in the full implementation, 'available SM count varies by SKU'): this profile's 148 SMs (the B200's: no GB200 figure is published) are 74 of its 80 TPCs, so 8 GPCs are carried over. NVIDIA does not say which TPCs are off, so the spread is derived (even, larger first; vgpu::GpuLayout). The spread of the TPCs over the GPCs is derived (even, larger first), never published. No card of ours has run a cluster occupancy query on this part, so nothing here is measured (nvidia/docs/clusters.md)."
   numerics: "inferred from data recorded by others on a B200 (compute capability 10.0, the same as this GB200's), NOT run by us on a card, and not on a GB200. Khattak and Mikaitis (arXiv 2512.07004) recorded 20,000 test vectors on a B200 (f16 with an f32 accumulator, f16 with an f16 accumulator, bf16, tf32); this rule (chunks of 16, tf32 8, grid 26: the Hopper rule, also given to Blackwell by MMA-Sim, Xie et al., arXiv 2511.10909) reproduces all 20,000 and the sequential f32 sum mismatches 8,020. mma.sync, wmma and HMMA only; tcgen05.mma is not covered. VGPU_TC_EXACT=0 gives the earlier sequential sum back. docs/matrix-numerics.md, docs/numerics/tcpapers.md"
   numerics.tensor_sum_fp8: "inferred from data recorded by others on a B200, NOT run by us on a card. ptxas turns an FP8 mma.sync for sm_100 into a conversion to f16 and HMMA (F2FP.F16.E4M3.UNPACK_B in the SASS), so the device's f16 rule sums the products. The 5,000 e4m3 and 5,000 e5m2 vectors, f32 and f16 accumulators, that Khattak and Mikaitis (arXiv 2512.07004) recorded on a B200 are reproduced by it. docs/numerics/fp8-vectors.md, docs/matrix-numerics.md"
   numerics.tensor_sum_tcgen05: "inferred, NOT run by us on a card, and no recorded vectors of tcgen05.mma exist. Xie et al. (arXiv 2511.10909, MMA-Sim) give tcgen05.mma .kind::f16 and .kind::tf32 on Blackwell F = 25 and chunks of 32 bytes of operands (16 products, tf32 8), the accumulator joining the chunk: the numbers of the mma.sync rule that 20,000 vectors recorded by Khattak and Mikaitis on a B200 reproduce (numerics.tensor_sum). Khattak and Mikaitis's B200TCRN.m (final f32 rounding to nearest) is a variant for which no vectors exist; it is not used. Dense forms only. docs/matrix-numerics.md"

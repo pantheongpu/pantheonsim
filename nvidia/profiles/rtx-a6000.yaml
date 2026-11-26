@@ -80,8 +80,10 @@ numerics:
   tensor_sum_m8n8k4: chain_c_last   # sequential | volta | chain_c_last: mma.m8n8k4 (f32 accumulator; PTX engine)
   tensor_sum_sparse: ampere         # sequential | ampere: mma.sp / HMMA.SP with f16, bf16, tf32 operands
 provenance:
+  documented: [layout.gpcs, layout.tpcs, layout.sms_per_tpc]
   inferred: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid, numerics.tensor_sum_m8n8k4, numerics.tensor_sum_sparse]
 evidence:
+  layout: "NVIDIA Ampere GA102 GPU Architecture whitepaper, the RTX A6000 / A40 table: GPCs 7, TPCs 42, SMs 84. The spread of the TPCs over the GPCs is derived (even, larger first), never published. No card of ours has run a cluster occupancy query on this part, so nothing here is measured (nvidia/docs/clusters.md)."
   numerics: "not run on this model. Inferred from the same compute capability (8.6) as the cards that were run on 2026-11-15: an RTX 3060 and an A10G (nvidia/profiles/rtx3060.yaml, a10g.yaml). docs/matrix-numerics.md"
   numerics.tensor_sum_m8n8k4: "inferred from the A10G (sm_86, measured 2026-11-23, see numerics.tensor_sum_m8n8k4 of nvidia/profiles/a10g.yaml): ptxas emulates mma.m8n8k4 as f32 products added in order with C last on sm_80 and later; no card of this model was run, and the emulation is the cubin's (nvcc 13.0.88), not the hardware's. An f32 accumulator only. docs/numerics/m8n8k4-and-sparse.md"
   numerics.tensor_sum_sparse: "inferred from the A10G (sm_86, measured 2026-11-23, see numerics.tensor_sum_sparse of nvidia/profiles/a10g.yaml): the Ampere rule over the stored products; no card of this model was run. docs/numerics/m8n8k4-and-sparse.md"

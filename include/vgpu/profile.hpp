@@ -130,6 +130,9 @@ struct CudaClass {
 // by name instead of answered from a layout made up for it.
 struct GpuLayout {
   uint32_t gpcs = 0;          // GPCs with at least one TPC enabled
+  // layout.gpcs_alt: where NVIDIA publishes two GPC counts for one part ("7 or 8 GPCs": the H100 PCIe) the other one.
+  // The spread is then derived for each and an answer is given only where both agree (vgpu/exec/cluster.hpp).
+  uint32_t gpcs_alt = 0;
   uint32_t tpcs = 0;          // TPCs enabled in all
   uint32_t sms_per_tpc = 0;   // 2 on every part from Volta on
   // True where the counts above are not the part's own published figures but
@@ -138,6 +141,15 @@ struct GpuLayout {
   bool counts_derived = false;
 
   bool known() const { return gpcs && tpcs && sms_per_tpc; }
+  // The same part with the other published GPC count (gpcs_alt), or this layout again when there is none.
+  GpuLayout alternative() const {
+    GpuLayout a = *this;
+    if (gpcs_alt) {
+      a.gpcs = gpcs_alt;
+      a.gpcs_alt = 0;
+    }
+    return a;
+  }
   // SMs in each GPC, largest first: the spread described above.
   std::vector<uint32_t> gpc_sms() const {
     std::vector<uint32_t> v;
