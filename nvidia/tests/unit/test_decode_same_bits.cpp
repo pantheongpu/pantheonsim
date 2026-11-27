@@ -50,7 +50,13 @@
 // VGPU_DECODE_PRINT=1 prints the digests (to regenerate the table after a decoder change that is meant to change
 // them); VGPU_DECODE_DUMP=<dir> writes the full dump of every pass, so two builds can be diffed to see which
 // instruction differs; VGPU_DECODE_BENCH=1 times decode and to_text over the corpora.
-#include <chrono>
+
+//
+// *** 2026-11-26 (#758): the flipped and random digests were RE-RECORDED on purpose for BAR with a register operand (opcodes 0x31d, 0x51d, 0x91d,
+// which ptxas writes for `bar.sync a, b` with run-time numbers; they were "unknown opcode" before). Verified by dumping both passes
+// (VGPU_DECODE_DUMP) from a build with the old dec_bar table and one with the new and diffing them: 60 dump lines differ in "flipped" and 140 in
+// "random" (47 distinct words), every one a word whose low twelve bits are 0x31d, 0x51d or 0x91d, decoded as BAR; the corpora digest is UNCHANGED
+// (no word of the real-code corpora differs). ***#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <algorithm>
@@ -199,7 +205,7 @@ VTEST(words_with_flipped_bits_decode_to_the_same_bits) {
     words.push_back({w, 16 * (rng.next() % 4096)});
   }
   const std::vector<int> archs = {75, 86, 90, 100, 120};
-  check("flipped", run_pass("flipped", words, archs), "47b07a0f78bf31698c9609744e52b639");
+  check("flipped", run_pass("flipped", words, archs), "b7a32ef6f4e567c9a17975038062ec29");
 }
 
 VTEST(random_opcodes_decode_to_the_same_bits) {
@@ -212,7 +218,7 @@ VTEST(random_opcodes_decode_to_the_same_bits) {
     words.push_back({w, 16 * (rng.next() % 4096)});
   }
   const std::vector<int> archs = {80, 89, 103, 120};
-  check("random", run_pass("random", words, archs), "912ce8a6c57091999e2693f3bdfa83b5");
+  check("random", run_pass("random", words, archs), "8e3041307dac3fc7759d48093307a0bb");
 }
 
 VTEST(bench_decode) {

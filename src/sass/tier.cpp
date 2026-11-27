@@ -741,7 +741,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       return;
     }
     case Op::BAR: {   // a block barrier (B2R, which reads the last reduction's result, is the interpreter's)
-      if (ins.mnemonic != "BAR" || ins.src.empty() || (ins.f[2] % 32) != 0) return;   // (a count that is no multiple of 32 is an error there)
+      if (ins.mnemonic != "BAR" || ins.src.empty() || (ins.f[2] % 32) != 0 || ins.f[3]) return;   // (a count in a register is the interpreter's too)   // (a count that is no multiple of 32 is an error there)
       const unsigned mode = ins.f[0];
       if (mode == 2 && ins.src.back().kind != Kind::Pred && ins.src.back().kind != Kind::UPred) return;
       if (ins.src[0].kind == Kind::Imm) {

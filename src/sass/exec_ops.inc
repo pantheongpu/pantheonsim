@@ -5628,14 +5628,18 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
     const uint32_t expected = b.expected ? b.expected : live;
     if (b.arrived < expected) return;
     if (race_) ++blk.race_epoch;   // the barrier orders what came before it against what comes after
-    for (Warp& ww : blk.warps)
+    // The result goes to the warps that waited at this barrier only: a warp that waited at another one (barriers 1 and 2 release one after
+    // the other) reads, at its B2R, the result of its own, not whichever released last.
+    for (Warp& ww : blk.warps) {
+      bool woke = false;
       for (unsigned l = 0; l < 32; ++l)
         if (((ww.waiting >> l) & 1) && ww.wait_kind[l] == Wait::Bar && ww.wait_arg[l] == id) {
           ww.waiting &= ~(Mask{1} << l);
           ww.wait_kind[l] = Wait::None;
           ww.pc[l] += 16;
+          woke = true;
         }
-    for (Warp& ww : blk.warps) {
+      if (!woke) continue;
       ww.b2r = b.red == 0 ? b.popc : b.red == 1 ? b.and_ : b.or_;
       ww.b2r_pred = b.red == 0 ? b.popc != 0 : b.red == 1 ? b.and_ : b.or_;
     }
@@ -5924,7 +5928,17 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
         return false;
       }
       const unsigned mode = ins.f[0];
-      const unsigned id = ins.src[0].kind == Kind::Imm ? static_cast<unsigned>(ins.src[0].imm) : read32(w, ins.src[0], 0) & 15;
+      // A barrier or a count in a register is the executing lanes' (the first one's: they all hold the same, as the PTX says): a count in
+      // the register at src[1] (f[3] 1), or both in src[0]'s register (f[3] 2), the barrier in its low four bits and the count in bits 16-27 (ptxas fills it
+      // with `(count & 0xfff0000) | id`).
+      if (!ex && (ins.f[3] || ins.src[0].kind != Kind::Imm)) {   // (a guarded-off BAR with a register names no barrier: it does nothing)
+        each_lane(group, [&](unsigned l) { w.pc[l] += 16; });
+        return true;
+      }
+      const unsigned rl = ex ? static_cast<unsigned>(std::countr_zero(ex)) : 0;
+      const uint32_t reg0 = ins.src[0].kind == Kind::Imm ? 0 : read32(w, ins.src[0], rl);
+      const unsigned id = ins.src[0].kind == Kind::Imm ? static_cast<unsigned>(ins.src[0].imm) : reg0 & 15;
+      const uint32_t count = ins.f[3] == 1 ? read32(w, ins.src[1], rl) : ins.f[3] == 2 ? (reg0 >> 16) & 0xfff : ins.f[2];
       Block::Barrier& b = blk.bar(id);
       b.mode = mode;
       b.red = ins.f[1];
@@ -5933,7 +5947,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       // thread of the block, which held CUTLASS's consumer warpgroups at their
       // own barrier while its producer warps waited on them. As the PTX engine
       // counts it, from the ISA: a warp's arrival is all of its threads.
-      if (const uint32_t count = ins.f[2]) {
+      if (count) {
         if (count % 32)
           throw Error(Err::InvalidValue, "a barrier's thread count must be a non-zero multiple of the warp size (32); got " +
                                              std::to_string(count));
@@ -5941,7 +5955,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
         if (ex) b.arrived += 32;
       }
       each_lane(ex, [&](unsigned l) {
-        if (!ins.f[2]) ++b.arrived;
+        if (!count) ++b.arrived;
         if (mode == 2) {
           const bool p = pred(w, ins.src.back(), l);
           b.popc += p;
@@ -6022,6 +6036,48 @@ void Runner::builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const 
     each_lane(ex, [&](unsigned l) {
       w.rare().device_error[l] = w.reg(4, l);
       w.reg(4, l) = 0;
+    });
+    return;
+  }
+  // cp.async.bulk into shared memory, global to shared::cluster, on sm_120 (a card with no multicast hardware, and no way to name another CTA's
+  // memory the instruction does): ptxas calls a driver syscall in place of UBLKCP.MULTICAST, and a plain copy whose destination is another CTA's
+  // (the call is taken when the destination address's CTA is not this one's; same-CTA copies are UBLKCP). The call's ABI, read out of the
+  // sm_120 SASS of several kernels (CUDA 13.0 ptxas; a copy with and without .L2::cache_hint, constant and run-time sizes and masks):
+  // R4 the destination, a shared::cluster address (the CTA's rank in bits 24-31, the offset below), R5 zero; R6:R7 the global source; R8 the byte
+  // count; R9 a multicast's CTA mask (low 16 bits); R10 the destination's mbarrier, a shared::cluster address, R11 zero; R12:R13 the L2 cache hint
+  // (the unicast form zeroes it without one, the multicast form leaves it), which changes no data. Each calling lane copies, as the PTX engine's
+  // instruction does for every thread that executes it (ptxas wraps UBLKCP in an ELECT loop that does the same).
+  if (name == "__cuda_syscall_cp_async_bulk_unicast" || name == "__cuda_syscall_cp_async_bulk_multicast") {
+    const bool multicast = name == "__cuda_syscall_cp_async_bulk_multicast";
+    each_lane(ex, [&](unsigned l) {
+      const uint32_t dst_addr = w.reg(4, l), n = w.reg(8, l), bar_addr = w.reg(10, l);
+      const uint64_t g = w.reg(6, l) | (static_cast<uint64_t>(w.reg(7, l)) << 32);
+      const uint32_t mask = multicast ? w.reg(9, l) & 0xffff : 0;
+      if (g % 16) throw Fault("a bulk copy's global address must be 16-byte aligned");
+      if (n % 16) throw Fault("a bulk copy's size must be a multiple of 16 bytes");
+      std::vector<uint8_t> data(n);
+      mem_read(blk, w, l, Space::Global, g, data.data(), n);
+      blk.st.global_loads += 1;
+      blk.st.global_bytes_read += n;
+      uint32_t off, bar_off;
+      Block& to = shared_block(blk, dst_addr, &off);
+      Block& bar = shared_block(blk, bar_addr, &bar_off);
+      if (&bar != &to) throw Fault("a bulk copy's mbarrier must be in the block its data goes to");
+      if (off % 16) throw Fault("a bulk copy's shared address must be 16-byte aligned");
+      const auto deliver = [&](Block& dest) {
+        if (off + n > dest.shared.size())
+          throw Fault("a bulk copy reaches shared offset " + std::to_string(off + n) + ", past the block's " +
+                      std::to_string(dest.shared.size()) + " bytes");
+        std::memcpy(&dest.shared[off], data.data(), n);
+        mbar_arrive(dest, bar_off, 0, -static_cast<int64_t>(n), false);
+      };
+      if (!multicast) {
+        deliver(to);
+      } else {
+        // The same data at the same offset in every CTA the mask names, each completing on its own barrier at the barrier's offset.
+        for (uint32_t r = 0; r < 16; ++r)
+          if (mask >> r & 1) deliver(cluster_block(blk, r));
+      }
     });
     return;
   }
