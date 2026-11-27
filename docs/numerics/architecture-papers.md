@@ -40,6 +40,20 @@ discarded) plus the 5,000 recorded V100 vectors of [MATLAB-tensor-core](https://
 
 The paper's table 5 (an error-correction case) is not reproduced: its inputs print garbled in the HTML version we read.
 
+## Monotonicity of the block adder (Mikaitis, arXiv 2304.01407), added 2026-11-27
+
+The paper's result: an adder that aligns every term to the largest exponent and drops the bits that fall off is not monotonic. Raise one input past a
+power of two, the others are aligned one place higher and lose bits, and the result can fall. The rule of [tc_ampere.hpp](../../include/vgpu/exec/tc_ampere.hpp)
+is such an adder, so the effect must exist for each (block width, grid) the profiles use. [`test_tc_monotonicity`](../../tests/unit/test_tc_monotonicity.cpp)
+(unit test, no card) holds it to that, for Volta 4/24, Ampere 8/25 and tf32 4/25, Hopper 16/26 and tf32 8/26:
+
+- **a decrease exists**: an accumulator of 2 - 2^-23 against 2, with the other terms of the chunk just below the coarser cut: the larger accumulator gives the smaller
+  result (a scan of the size of the small terms finds it for every rule; it would fail for a rounding adder or a wider grid);
+- **monotone at a fixed alignment**: with the largest term held, raising any other product never lowers the result (20,000 random chunks a rule).
+
+Class: **published** (the paper's property) checked on the **measured** and **inferred** rules; it says nothing new about any card. Whether a card shows the decrease is
+the same question as whether its rule is right, which the card runs already answer for the measured devices.
+
 ## The MATLAB models that were not compared before
 
 `north-numerical-computing/MATLAB-tensor-core` holds, at our pinned commit 79143bd (and at 6fd05208, 2026-11-18: only the README changed, and

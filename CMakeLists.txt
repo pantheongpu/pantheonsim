@@ -1673,6 +1673,8 @@ vgpu_unit_test(test_launch_fp_flush)
 vgpu_unit_test(test_simd)
 # An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.
 vgpu_unit_test(test_tc_ampere)
+# Mikaitis's monotonicity result for the block adder (arXiv 2304.01407): a decrease exists for every block width and grid, and none at a fixed alignment.
+vgpu_unit_test(test_tc_monotonicity)
 # The vector kernels of that sum against its scalar form, bit for bit, over random and adversarial operands (on the tiles the dispatcher gives them).
 vgpu_unit_test(test_tc_ampere_fast)
 # The e4m3 / e5m2 tensor-core sums (include/vgpu/exec/tc_fp8.hpp): recorded Ada vectors, an independent form, special values, what each profile names.
