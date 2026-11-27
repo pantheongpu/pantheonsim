@@ -611,11 +611,7 @@ Still different, each listed in `cuda-samples-known.txt`:
   runtime; that asks the driver for its internal export table (`cuGetExportTable`), which a simulated driver
   does not have, and `cufftMakePlan1d` returns `CUFFT_INTERNAL_ERROR`. The simulator's cuFFT shim has legacy
   callbacks of its own (`e2e_fft_legacy_callbacks`), for programs that link the shared library.
-- `quasirandomGenerator` and `quasirandomGenerator_nvrtc`: with the decoder fixed the simulated GPU's numbers
-  agree with the CPU's to an L1 norm of 7.3e-12, where the card printed 9.439909E-08. The sample's CPU reference
-  is built by the sample's own host code from a table it generates, and the card's norm is that of a table built by
-  another compiler. The first norm printed is a property of the host build as much as of the GPU. Not proven here:
-  nothing but the card could say which build the 9.4e-8 came from.
+- `quasirandomGenerator` and `quasirandomGenerator_nvrtc`: with the decoder fixed they match the card in the nightly (2026-11-25), so they are off `cuda-samples-known.txt`. The note that was here said the card's 9.439909E-08 might come from a differently built host table; the nightly's check passes against that figure now.
 - `graphMemoryFootprint` and `simpleAttributes` (too slow): the first launches a 16.7M-thread kernel sixteen times,
   each thread spinning on `clock()` for 8900 clocks (the simulator's `clock()` is its instruction count); it did not
   finish in 3000 s. The second launches 65535 x 1024 threads that each loop about 700 times on a shared counter.
