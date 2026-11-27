@@ -502,8 +502,13 @@ std::string unsupported(const uint8_t* image, size_t size) {
       // place, so the loader gives them stub addresses (load) and the module
       // stays on SASS.
       const std::vector<std::string>& names = builtin_names();
+      // Other driver routines (__cuda_syscall_tex_grad_3d_v4_f32_f32, which sm_90 and later call for tex3DGrad) are no library's own code: a
+      // call to one that the executor does not provide ran a stub that returned nothing, and the kernel stored the register it left (#753:
+      // every 3D tex.grad case of an sm_90 build came out as the same garbage). Such a module is left to its PTX, whose tex.grad is the
+      // RTX 3060's, rather than run on a stub. The two bulk-copy syscalls of sm_120 are the executor's (#751).
       bool resolved = std::find(names.begin(), names.end(), r.symbol) != names.end() ||
-                      r.symbol.rfind("__cuda_syscall_", 0) == 0;
+                      r.symbol.rfind("__cuda_syscall_cnp", 0) == 0 || r.symbol == "__cuda_syscall_cp_async_bulk_unicast" ||
+                      r.symbol == "__cuda_syscall_cp_async_bulk_multicast";
       for (const CubinSymbol& sym : c.symbols) resolved = resolved || (sym.name == r.symbol && !sym.section.empty());
       if (!resolved) return "a call to " + r.symbol + ", which VirtualGPU's SASS path does not provide";
     }

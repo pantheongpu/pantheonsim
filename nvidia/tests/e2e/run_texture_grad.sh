@@ -28,3 +28,19 @@ for engine in 1 0; do
   sed 's/^/    /' "$log" | tail -n 8
   [[ $rc == 0 && "$(tail -n 1 "$log")" == PASS ]] || { echo "FAIL: tex.grad"; sed 's/^/    /' "$log" | grep -v " ok$" | head -20; exit 1; }
 done
+
+# From sm_90 ptxas builds tex3DGrad as a call to a driver routine (__cuda_syscall_tex_grad_3d_v4_f32_f32) the SASS executor does not provide; such a
+# module must run on its PTX, with the RTX 3060's numbers, and not on a stub that returns nothing (#753). The same program built for Hopper and
+# for Blackwell (CUDA 12.8 and later) and run on those profiles must print the same hashes.
+supported="$("$nvcc_bin" --list-gpu-code 2>/dev/null)"
+for pair in sm_90:nvidia/h100 sm_100:nvidia/b200 sm_120:nvidia/rtx5090; do
+  arch="${pair%%:*}" gpu="${pair#*:}"
+  grep -qx "$arch" <<< "$supported" || { echo "SKIP $arch: this nvcc does not build it"; continue; }
+  "$nvcc_bin" -std=c++17 -arch="$arch" -cudart shared -Wno-deprecated-gpu-targets "${san_flags[@]}" \
+       "$root/nvidia/tests/e2e/texture_grad.cu" -o "$out" || { echo "FAIL: does not compile for $arch"; exit 1; }
+  echo "$arch on $gpu"
+  VGPU_QUIET=1 VGPU_GPU="$gpu" LD_LIBRARY_PATH="$shim" "$out" > "$log" 2>&1
+  rc=$?
+  sed 's/^/    /' "$log" | tail -n 4
+  [[ $rc == 0 && "$(tail -n 1 "$log")" == PASS ]] || { echo "FAIL: tex.grad on $arch"; sed 's/^/    /' "$log" | grep -v " ok$" | head -20; exit 1; }
+done
