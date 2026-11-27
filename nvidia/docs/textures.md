@@ -388,6 +388,14 @@ The simulator runs the quad in the SASS engine (`BMOV`, `FSWZADD`, `MOV` with a 
 PTX engine computes the same level from P and the gradient, and both agree with the card on fetches where only some
 threads of a quad fetch (the `3d-divergent` cases).
 
+From sm_90 ptxas does not build the quad: `tex3DGrad` is a `CALL` to the driver routine `__cuda_syscall_tex_grad_3d_v4_f32_f32` (the
+texture object in R4:R5, the coordinates, gradients and a stack slot as arguments), whose code is the driver's and whose behaviour no
+card has been read for here. The SASS executor has no such routine, and a module that calls one it does not provide runs on its PTX
+(the loader says so; before, the call ran a stub that returned nothing and every 3D case printed the same garbage, #753). So an sm_90+ build
+gives the PTX engine's answer, the RTX 3060's. Whether a Hopper or Blackwell card gives it too is the one open question: run
+`texture_grad --print` on an H100 and on a B200 or an RTX PRO 6000 Blackwell (built with CUDA 13.0 for the card's own architecture) and compare
+with `texture_grad_expected.inc`; a difference is the driver routine's own rounding, to fit and add as a per-architecture rule.
+
 **Cube maps** were measured the same way but are refused. ptxas builds `texCubemapGrad` from the same quad of
 `TEX.NDV`, with each lane's direction normalized by its largest component (`FMNMX`, `MUFU.RCP`, `FMUL`). The unit
 then works in the face of the first lane: a lane on the same face gives the difference of the normalized
