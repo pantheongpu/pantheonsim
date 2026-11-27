@@ -222,9 +222,11 @@ because none was measured (the RTX 3080 Ti is a single card on its machine).
 
 ## GPC layout
 
-A profile may carry a `layout:` section (`gpcs`, `tpcs`, `sms_per_tpc`): the GPC and TPC counts NVIDIA's
-whitepapers publish for the part, which cluster occupancy needs. The spread of the SMs over the GPCs is always derived,
-and a part with no published GPC count has none. See [clusters.md](clusters.md) for the table and the rules.
+A profile may carry a `layout:` section (`gpcs`, `tpcs`, `sms_per_tpc`, optionally `gpcs_alt`, a second published GPC
+count, and `counts_derived`): the GPC and TPC counts NVIDIA's whitepapers publish for the part, which cluster occupancy
+needs. Its keys are classed: `documented` (published for this part; the word "published" elsewhere in the numerics notes)
+or `inferred` (`counts_derived: true`: the die's or a sibling's figures), never `measured`. The spread of the SMs over the
+GPCs is always derived, and a part with no published GPC count has none. See [clusters.md](clusters.md) for the table and the rules.
 
 ## Placeholder PCI ids
 

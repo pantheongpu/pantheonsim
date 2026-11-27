@@ -72,9 +72,10 @@ numerics:
   tensor_sum_m8n8k4: chain_c_last   # sequential | volta | chain_c_last: mma.m8n8k4 (f32 accumulator; PTX engine)
   tensor_sum_sparse: ampere         # sequential | ampere: mma.sp / HMMA.SP with f16, bf16, tf32 operands
 provenance:
-  inferred: [numerics.tensor_sum_fp8, numerics.tensor_sum_fp8_chunk, numerics.tensor_sum_fp8_grid, numerics.tensor_sum_fp8_out_bits, numerics.tensor_sum_m8n8k4, numerics.tensor_sum_sparse]
+  inferred: [numerics.tensor_sum_fp8, numerics.tensor_sum_fp8_chunk, numerics.tensor_sum_fp8_grid, numerics.tensor_sum_fp8_out_bits, numerics.tensor_sum_m8n8k4, numerics.tensor_sum_sparse, layout.gpcs, layout.tpcs, layout.sms_per_tpc]
   measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]
 evidence:
+  layout: "the L40's figures (GPCs 12, TPCs 71, SMs 142, NVIDIA Ada whitepaper Table 4); the L40S has the same SM count and NVIDIA gives no separate GPC count for it. The spread of the TPCs over the GPCs is derived (even, larger first), never published. No card of ours has run a cluster occupancy query on this part, so nothing here is measured (nvidia/docs/clusters.md)."
   numerics: "card: NVIDIA L40S (this model), AWS; driver: 595.112.07; toolkit: CUDA 13.0; date: 2026-11-15. Both probes, sm_86 and sm_89 builds, print the RTX 3060 lines (nvidia/tests/data/simd_lane_forms.rtx3060.txt, float_half_forms.rtx3060.txt); FTTN. docs/matrix-numerics.md"
   numerics.tensor_sum_fp8: "inferred from data recorded by others, NOT run by us on a card. Khattak and Mikaitis (arXiv 2512.07004) recorded 5,000 e4m3 and 5,000 e5m2 mma.sync m16n8k32 vectors with an f32 accumulator on an L40S and on an RTX 1000 Ada, and the same with an f16 accumulator on the RTX 1000 Ada; MMA-Sim (arXiv 2511.10909) gives the same numbers (chunks of 16, terms cut 13 bits below the largest, an f32 result cut to 13 fraction bits). The rule reproduces them (docs/numerics/fp8-vectors.md). Before this the sum was sequential in f32, which reproduces none of the f32 vectors. docs/matrix-numerics.md"
   numerics.tensor_sum_fp8_chunk: "see numerics.tensor_sum_fp8"

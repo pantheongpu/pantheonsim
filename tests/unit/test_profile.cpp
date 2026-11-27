@@ -281,11 +281,58 @@ VTEST(builtin_gpc_layouts_add_up_and_name_their_source) {
   VCHECK_EQ(vgpu::load_gpu("nvidia/h100").layout.tpcs, 66u);
   VCHECK_EQ(vgpu::load_gpu("nvidia/rtx5090").layout.tpcs, 85u);
   VCHECK_EQ(vgpu::load_gpu("nvidia/a100").layout.gpcs, 7u);
-  // A part whose GPC count NVIDIA does not give has none here.
-  VCHECK(!vgpu::load_gpu("nvidia/h100-pcie").layout.known());
-  VCHECK(!vgpu::load_gpu("nvidia/b200").layout.known());
+  // Blackwell data centre: 160 SMs in 8 GPCs in the full implementation (NVIDIA's Blackwell Ultra blog), 148 enabled = 74 TPCs.
+  for (const char* id : {"nvidia/b200", "nvidia/gb200", "nvidia/b300"}) {
+    const DeviceProfile b = vgpu::load_gpu(id);
+    VCHECK_EQ(b.layout.gpcs, 8u);
+    VCHECK_EQ(b.layout.tpcs, 74u);
+    VCHECK(b.layout.counts_derived);
+  }
+  // GB203 (RTX 5080's die, 84 SMs in 7 GPCs) cut to 82 SMs.
+  VCHECK_EQ(vgpu::load_gpu("nvidia/rtx-pro-4500").layout.gpcs, 7u);
+  // The H100 PCIe is published with two GPC counts, 7 or 8, and keeps both.
+  VCHECK_EQ(vgpu::load_gpu("nvidia/h100-pcie").layout.gpcs, 7u);
+  VCHECK_EQ(vgpu::load_gpu("nvidia/h100-pcie").layout.gpcs_alt, 8u);
+  VCHECK_EQ(vgpu::load_gpu("nvidia/h100-pcie").layout.alternative().gpcs, 8u);
+  // A part whose GPC count NVIDIA does not give has none here: Rubin (224 SMs, GPCs not stated), GB10, Thor.
+  for (const char* id : {"nvidia/vr200", "nvidia/gb10", "nvidia/thor"}) VCHECK(!vgpu::load_gpu(id).layout.known());
   VCHECK(vgpu::load_gpu("nvidia/gh200-480gb").layout.counts_derived);
   VCHECK(!vgpu::load_gpu("nvidia/h100").layout.counts_derived);
+}
+
+VTEST(layout_keys_say_what_they_rest_on_and_are_never_measured) {
+  // No card of ours has run a cluster occupancy query, so the layout of a profile is documented (NVIDIA's own figure for the part)
+  // or inferred (the die's, or another part's with the same SM count); a derived count is never documented.
+  int checked = 0;
+  for (const auto& id : vgpu::available_gpus()) {
+    const DeviceProfile p = vgpu::load_gpu(id);
+    if (!p.layout.known()) continue;
+    std::vector<std::string> keys{"layout.gpcs", "layout.tpcs", "layout.sms_per_tpc"};
+    if (p.layout.gpcs_alt) keys.push_back("layout.gpcs_alt");
+    for (const auto& k : keys) {
+      const auto c = p.provenance_of(k);
+      VCHECK(c.has_value());
+      if (!c) continue;
+      VCHECK(*c == vgpu::Provenance::Documented || *c == vgpu::Provenance::Inferred);
+      VCHECK((*c == vgpu::Provenance::Inferred) == p.layout.counts_derived);
+      VCHECK(!p.evidence_of(k).empty());
+    }
+    ++checked;
+  }
+  VCHECK(checked >= 30);
+  VCHECK(vgpu::load_gpu("nvidia/b200").provenance_of("layout.gpcs") == vgpu::Provenance::Inferred);
+  VCHECK(vgpu::load_gpu("nvidia/h100").provenance_of("layout.gpcs") == vgpu::Provenance::Documented);
+}
+
+VTEST(a_second_gpc_count_needs_a_first_and_must_differ) {
+  const std::string head = profile_with_telemetry("");
+  auto bad = [&](const std::string& layout) {
+    return VCAPTURE(Error, DeviceProfile::from_yaml(head + layout, "test-origin"));
+  };
+  VCHECK(bad("layout:\n  gpcs_alt: 8\n  tpcs: 66\n  sms_per_tpc: 2\n").code() == Err::ProfileParse);
+  VCHECK(bad("layout:\n  gpcs: 8\n  gpcs_alt: 8\n  tpcs: 66\n  sms_per_tpc: 2\n").code() == Err::ProfileParse);
+  VCHECK(bad("layout:\n  gpcs: 7\n  gpcs_alt: 99\n  tpcs: 66\n  sms_per_tpc: 2\n").code() == Err::ProfileParse);
+  VCHECK(DeviceProfile::from_yaml(head + "layout:\n  gpcs: 7\n  gpcs_alt: 8\n  tpcs: 66\n  sms_per_tpc: 2\n", "t").layout.gpcs_alt == 8u);
 }
 
 VTEST(a_layout_that_does_not_add_up_is_refused) {
@@ -327,12 +374,30 @@ VTEST(cluster_occupancy_follows_the_documented_rules) {
   VCHECK_EQ(vgpu::exec::cluster_occupancy(h, false, false, none, none, false, 1).value, 8);
   VCHECK_EQ(vgpu::exec::cluster_occupancy(h, false, false, none, none, true, 1).value, 16);
   VCHECK_EQ(vgpu::exec::cluster_occupancy(h, false, false, none, {4, 2, 1}, false, 1).value, 8);
-  // A part whose GPCs are not published answers what needs none and refuses what does.
+  // The H100 PCIe is published with 7 or 8 GPCs (57 TPCs): GPCs of 18 and 16 SMs, or of 16 and 14. A question is answered where both agree.
   const DeviceProfile pcie = vgpu::load_gpu("nvidia/h100-pcie");
   VCHECK_EQ(vgpu::exec::cluster_occupancy(pcie, true, true, {1, 1, 1}, none, false, 2).value, 228);
-  VCHECK(vgpu::exec::cluster_occupancy(pcie, true, true, {2, 1, 1}, none, false, 2).status == S::NotSupported);
+  VCHECK_EQ(vgpu::exec::cluster_occupancy(pcie, true, true, {2, 1, 1}, none, false, 2).value, 114);   // pairs: 57 TPCs either way
+  VCHECK(vgpu::exec::cluster_occupancy(pcie, true, true, {2, 1, 1}, none, false, 2).uses_layout);
+  VCHECK(vgpu::exec::cluster_occupancy(pcie, true, true, {4, 1, 1}, none, false, 1).status == S::NotSupported);   // 28 against 25
   VCHECK_EQ(vgpu::exec::cluster_occupancy(pcie, false, false, none, none, false, 2).value, 8);
-  VCHECK(vgpu::exec::cluster_occupancy(pcie, false, false, none, none, true, 2).status == S::NotSupported);
+  VCHECK_EQ(vgpu::exec::cluster_occupancy(pcie, false, false, none, none, true, 2).value, 16);   // 36 or 32 blocks in a GPC: 16 both
+  VCHECK_EQ(vgpu::exec::cluster_occupancy(pcie, false, false, none, none, true, 1).value, 16);   // 18 or 16 blocks: 16 both
+  // B200: 8 GPCs of 20, 20 and six of 18 SMs (74 TPCs, derived spread); inferred, so each answer says it is derived.
+  const DeviceProfile b = vgpu::load_gpu("nvidia/b200");
+  auto bact = [&](uint32_t size, uint32_t per_sm, bool nonportable = false) {
+    return vgpu::exec::cluster_occupancy(b, true, true, {size, 1, 1}, none, nonportable, per_sm);
+  };
+  VCHECK_EQ(bact(1, 1).value, 148);
+  VCHECK_EQ(bact(2, 1).value, 74);
+  VCHECK_EQ(bact(4, 1).value, 5 + 5 + 4 * 6);
+  VCHECK_EQ(bact(8, 1).value, 2 * 8);
+  VCHECK_EQ(bact(16, 1, true).value, 8);
+  VCHECK(bact(8, 1).uses_layout);
+  VCHECK_EQ(vgpu::exec::cluster_occupancy(b, false, false, none, none, true, 1).value, 16);
+  // Rubin's GPC count is not published: refused by name.
+  const DeviceProfile r = vgpu::load_gpu("nvidia/vr200");
+  VCHECK(vgpu::exec::cluster_occupancy(r, true, true, {2, 1, 1}, none, false, 1).status == S::NotSupported);
   // A part without clusters answers as the RTX 3060 does (measured): 0 unless a dimension is named.
   const DeviceProfile a = vgpu::load_gpu("nvidia/rtx3060");
   VCHECK(vgpu::exec::cluster_occupancy(a, true, false, none, none, false, 8).status == S::Ok);

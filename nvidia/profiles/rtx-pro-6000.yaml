@@ -86,6 +86,8 @@ numerics:
   tensor_sum_chunk_tf32: 8         # ... tf32
   tensor_sum_grid: 26              # a chunk's terms are cut at 2^(top - 26)
 provenance:
+  documented: [layout.gpcs, layout.tpcs, layout.sms_per_tpc]
   inferred: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]
 evidence:
+  layout: "NVIDIA RTX Blackwell GPU Architecture whitepaper (RTX PRO 6000 Blackwell Workstation Edition): GPCs 12, TPCs 94, SMs 188. The spread of the TPCs over the GPCs is derived (even, larger first), never published. No card of ours has run a cluster occupancy query on this part, so nothing here is measured (nvidia/docs/clusters.md)."
   numerics: "not run on this model. Inferred from the same compute capability (12.0) as the card that was run on 2026-11-17: an RTX PRO 6000 Blackwell Server Edition (nvidia/profiles/rtx-pro-6000-server.yaml), whose tensor cores sum by the hopper rule bit for bit on every probe. docs/matrix-numerics.md"

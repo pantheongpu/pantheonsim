@@ -6930,11 +6930,11 @@ CUresult cluster_occupancy_impl(const char* api_name, bool active, int* out, CUf
         std::fprintf(stderr, "[vgpu] %s is not implemented for %s: %s\n", api_name, p.id.c_str(), a.why);
       if (a.status == S::Ok && a.uses_layout && !said_derived.exchange(true))
         std::fprintf(stderr,
-                     "[vgpu] %s: %s has %u GPCs and %u TPCs (%s), spread evenly over the GPCs because NVIDIA "
+                     "[vgpu] %s: %s has %u GPCs%s and %u TPCs (%s), spread evenly over the GPCs because NVIDIA "
                      "does not publish how many each has; the answer is derived from that and is not checked "
                      "against a card\n",
-                     api_name, p.id.c_str(), p.layout.gpcs, p.layout.tpcs,
-                     p.layout.counts_derived ? "figures of a part with the same SM count" : "NVIDIA's figures for this part");
+                     api_name, p.id.c_str(), p.layout.gpcs, p.layout.gpcs_alt ? " or another published count" : "", p.layout.tpcs,
+                     p.layout.counts_derived ? "inferred from the figures of the same die or of a part with the same SM count" : "NVIDIA's figures for this part");
     }
     switch (a.status) {
       case S::Ok: *out = static_cast<int>(a.value); return CUDA_SUCCESS;

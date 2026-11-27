@@ -88,7 +88,9 @@ numerics:
   tensor_sum_grid: 25              # a chunk's terms are cut at 2^(top - 25)
   tensor_sum_m8n8k4: volta          # sequential | volta: mma.m8n8k4 with f16 operands (PTX engine)
 provenance:
+  documented: [layout.gpcs, layout.tpcs, layout.sms_per_tpc]
   inferred: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid, numerics.tensor_sum_m8n8k4]
 evidence:
+  layout: "NVIDIA Ada GPU Architecture whitepaper, Table 1 (GeForce RTX 2080 Ti): GPCs 6, TPCs 34, SMs 68. The spread of the TPCs over the GPCs is derived (even, larger first), never published. No card of ours has run a cluster occupancy query on this part, so nothing here is measured (nvidia/docs/clusters.md)."
   numerics: "not run on this model. Inferred from the same compute capability (7.5) as the cards that were run on 2026-11-15: a Tesla T4 (f16 forms only: a Turing card has no bf16 or tf32 form; nvidia/profiles/t4.yaml). docs/matrix-numerics.md"
   numerics.tensor_sum_m8n8k4: "inferred, NOT run by us on a card yet. Valpey et al. (arXiv 2502.15999) and Xie et al. (arXiv 2511.10909, MMA-Sim) give a Turing tensor core the numbers of Volta for the m8n8k4 form (HMMA.884): one step of 4 products and the accumulator, terms cut at 2^(top - 24). 5,000 of 5,000 f32-accumulator vectors recorded on a V100 by Khattak and Mikaitis (arXiv 2512.07004) are reproduced by that rule (nvidia/tests/data/tcpapers/V100.fp16.fp32.txt holds 24). docs/matrix-numerics.md"

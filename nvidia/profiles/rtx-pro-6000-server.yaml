@@ -84,6 +84,8 @@ numerics:
   tensor_sum_chunk_tf32: 8         # ... tf32
   tensor_sum_grid: 26              # a chunk's terms are cut at 2^(top - 26)
 provenance:
+  inferred: [layout.gpcs, layout.tpcs, layout.sms_per_tpc]
   measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid]
 evidence:
+  layout: "the Workstation Edition's figures (GPCs 12, TPCs 94, SMs 188): the server edition has the same SM count and NVIDIA gives no separate GPC count for it. The spread of the TPCs over the GPCs is derived (even, larger first), never published. No card of ours has run a cluster occupancy query on this part, so nothing here is measured (nvidia/docs/clusters.md)."
   numerics: "card: NVIDIA RTX PRO 6000 Blackwell Server Edition (this model), AWS g7e.2xlarge (sm_120); driver: 595.112.07; toolkit: nvcc 13.0.88 and 13.2.51; date: 2026-11-17. Both probes print the H100 PCIe lines, not the RTX 3060 ones (nvidia/tests/data/simd_lane_forms.h100.txt, float_half_forms.h100.txt: 60 of 60 and 169 of 169), the same from sm_86, sm_90, sm_100 and sm_120 builds; FTTN prints 1 extra bit, truncate, width 16 (bf16 width printed 10, which is 16; tf32 width 4) and the motivating example 191.875; all six corners of the subnormal range (tools/fttn/tc_corners.cu) are the hopper rule's (S1 0x0001, S2 0x00000042, R3 0x00411fcc; the ampere rule gives 0x00411fcd there); a dump of 8,388,608 wmma results, every one the hopper rule (tools/fttn/tc_dump_check.cpp; the ampere rule 8,366,093). mma.sync, wmma and HMMA only: the sparse, FP8 and f64 forms were not asked, and sm_120 has no tcgen05.mma. docs/matrix-numerics.md"
