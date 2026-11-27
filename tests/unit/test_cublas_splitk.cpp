@@ -150,7 +150,7 @@ VTEST(profiles_name_their_split_table) {
     const vgpu::DeviceProfile p = vgpu::load_gpu(id);
     if (p.numerics.cublas_splitk == CublasSplitK::None) continue;
     const bool t4 = p.numerics.cublas_splitk == CublasSplitK::T4;
-    if (p.cc_major != (t4 ? 7 : 8) || p.cc_minor != (t4 ? 5 : 6) || p.multiprocessors != (t4 ? 40u : 80u))
+    if (p.cc_major != (t4 ? 7 : 8) || p.cc_minor != (t4 ? 5 : 6) || p.limits.multiprocessors != (t4 ? 40u : 80u))
       throw vtest::Failure(id + ": carries a split-K table of a different compute capability or multiprocessor count");
   }
 }
