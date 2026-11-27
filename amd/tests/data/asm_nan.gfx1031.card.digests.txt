@@ -1,0 +1,8 @@
+# FNV-1a 64 (over the little-endian bytes of each result: 4 bytes for asm_nan.s, 8 for asm_nan2.s, the high dword 0xa5a5a5a5 where the card file prints 8 digits) of every result
+# an RX 6700 XT (gfx1031, ROCm 7.2.0, 2026-11-27) wrote for each kernel when asm_nan.s and asm_nan2.s were assembled for gfx1031 and run with tools/numerics/amd_nan_card_run.cpp.
+# The digests equal those of the RX 6800's asm_nan*.gfx1030.card.txt (test_amd_gcn_nan, test_amd_gcn_nan2 check that): the two cards give the same NaNs. Columns: kernel digest.
+nan_k 09f702956a1318a5
+nan_n 2904324acfea06a8
+n2_k 7d55c340ccb1a7a7
+n2_n 011402d9c0d46633
+n2_f 333b3894e709de4d

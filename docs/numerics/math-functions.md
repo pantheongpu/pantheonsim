@@ -524,11 +524,17 @@ What the earlier attempts could not reach (a closed form) was not needed: the mo
   Special operands (zero, denormal, infinity, NaN, a negative operand of `rsq` and `sqrt`) are the rule above and are in the same hashes.
 - Not the card's but the same on both cards: an RX 6700 XT's hashes are the RX 6800's on all seven functions (2026-11-16), so gfx1031 gets
   the same table; it was not dumped separately. gfx1032 and the other RDNA2 parts the loader maps to gfx1030 are **inferred**.
-- Not done, and why: `v_exp_f32`, `v_log_f32`, `v_sin_f32`, `v_cos_f32`. The same method needs the card's behaviour as a function of one
-  mantissa, and these are not: `v_exp_f32` of x uses a fraction of x finer than 2^-24 (adjacent operands of [0.25, 0.5) give different results
-  in 22 percent of pairs, even and odd alike), so its table is a function of the operand's binade too (about 130 of them), and `v_log_f32` and the
-  trigonometric forms add the exponent or the turn count to a fixed-point result. A table per binade is some two megabytes of exception lists for `exp`
-  alone; none was built.
+- Not done, and why: `v_exp_f32`, `v_log_f32`, `v_sin_f32`, `v_cos_f32` (measured 2026-11-27, RX 6800, `tools/numerics/amd_exp_binade_fit.py`).
+  - `v_exp_f32`: **not one mantissa table.** The card uses the whole operand (changes of the result occur at every operand index, so it is not a function of
+    the top 24 bits of a fraction), so each binade of the operand is its own function. The cubic-plus-exception method works on each binade it was tried on
+    (operands [0.25, 0.5): 68,055 exceptions of 2^23, 0.81 %; [0.5, 1): 67,024, 0.80 %; [1, 2): 65,999 to 76,660, 0.79 to 0.91 %: the same 0.8 % noise floor as
+    for `rcp`), so a table per binade would be exact. The count is the problem: a table per binade of the operand from about 2^-24 to 2^7, for each sign,
+    is 60 tables or more. Where the result changes rarely (small operands) the exceptions are a few runs, but the binades from about 2^-6 up carry (estimate) about 90 KB each (`rcp`'s 65,945 exceptions are 90 KB as gaps), so the whole is an estimated 3 MB of data (not built; the 0.8 % figure was measured on three binades only) against 700 KB for the three functions done, and the negative operands (a fraction of
+    1 + x) were not measured. Not done.
+  - `v_log_f32`: **not reducible.** The result for [2, 4) is not `1 + ` the result for [1, 2) rounded (68 % agree), and each binade of the operand has a result that is
+    its exponent plus a fixed-point logarithm: about 250 tables.
+  - `v_sin_f32`, `v_cos_f32`: the card's error is absolute near the zeros and the exact zeros are at fractions of a turn, so no mantissa structure; no table was tried.
+  Each of the three is documented and stopped here.
 
 **Measured: the double forms are about 24 bits.** (Still not modelled. 2026-11-25: the instruction's result depends on the top 30 or so bits of the operand's mantissa, not 23
 (over 2^32 adjacent operands the result changes 434 times), the results of the operands that are floats are not the single-precision instruction's
