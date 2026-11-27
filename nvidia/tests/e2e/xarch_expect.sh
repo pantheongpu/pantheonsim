@@ -46,6 +46,10 @@ xarch_groups[packed_f32x2@native]="b200 | rtx5090"   # two NaN-payload slots (17
 xarch_nodigest=" sched_pool "
 
 # --- known defects, each tracked: the profile listed last differs and should not. Delete the entry when its issue is fixed.
-xarch_groups[cg_multi_warp_tiles@native]="a100 a10g l4 | h100 h200 | b200 rtx5090"   # %reserved_smem_offset_* read 0 in SASS from sm_90 on; needs an H100; #752
-xarch_groups[texture_grad@native]="t4 a100 a10g l4 | h100 h200 | b200 rtx5090"       # sm_90+ SASS: 37 of 131 tex.grad.3d cases differ from the PTX engine and the RTX 3060; needs an H100; #753
+# #752: from sm_90 ptxas lowers %reserved_smem_offset_begin to 0, _cap to 0x400 and _0 to 0 (sm_90) or 0x40 (sm_100, sm_120) as constants (the reserved 1 KiB is
+# the start of shared memory and the kernel's own data starts at 0x400), so the SASS engine, which runs that code, is right for those three and the PTX engine's sm_86
+# formula (the region after the kernel's data) is not what a card compiled from PTX gives. %reserved_smem_offset_end and _1 are driver words in bank 0 (c[0x68], c[0x6c] on
+# sm_90; c[0x278], c[0x27c] indexed by SR_CgaSize on sm_100 and sm_120) the SASS engine leaves at 0: one run of cg_multi_warp_tiles on an H100 and on a B200 or an RTX PRO 6000
+# Blackwell (CUDA 13.0, the card's own arch) prints them; then both engines get the card's values.
+xarch_groups[cg_multi_warp_tiles@native]="a100 a10g l4 | h100 h200 | b200 rtx5090"
 xarch_groups[graph_capture_driver@native]="t4 a100 a10g l4 h100 h200 b200"           # sm_120's code makes other last bits (ptxas contracts differently); not a defect of the simulator; #754
