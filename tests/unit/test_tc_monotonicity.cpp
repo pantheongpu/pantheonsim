@@ -4,7 +4,7 @@
 // outweigh the increase, and the result goes DOWN. The effect needs the cut to be coarser than one unit of the raised term, so it exists for
 // every block width and every alignment grid the rules here use. Two checks, on the rule of tc_ampere.hpp with every (block width, grid)
 // the profiles name (Volta 4/24, Ampere 8/25 and tf32 4/25, Hopper 16/26 and tf32 8/26):
-//   * a_decrease_exists: an accumulator c below 2 and the same c = 2 (one unit in the last place higher), with the other terms of the chunk
+//   * a_decrease_exists (all rules but Ampere tf32 4/25, whose pattern is too narrow and is pinned as not reached): an accumulator c below 2 and the same c = 2 (one unit in the last place higher), with the other terms of the chunk
 //     just under the coarser cut: the result with the larger accumulator is smaller. This is the paper's adversarial pattern, found by a
 //     scan, so a change of the alignment (a rounding adder, a wider grid) would make the check fail and say so;
 //   * monotone_at_fixed_top: with the largest term fixed (so the alignment does not move), raising any other product never lowers the
@@ -28,8 +28,13 @@ struct Rule {
   const char* name;
   unsigned chunk;
   int grid;
+  bool reached;   // whether the one-ulp accumulator pattern below reaches a decrease (see the test)
 };
-const Rule kRules[] = {{"volta 4/24", 4, 24}, {"ampere 8/25", 8, 25}, {"ampere tf32 4/25", 4, 25}, {"hopper 16/26", 16, 26}, {"hopper tf32 8/26", 8, 26}};
+// The pattern raises the accumulator by one ulp across a power of two, so the decrease must beat one ulp of 2 (2^-23) with at most `chunk`
+// small terms each cut to a multiple of 2^-grid and each below the coarser cut: Ampere tf32 (4 terms, grid 25) is too narrow for it, and the
+// scan finds none, pinned as such. A wider pattern for it is not known; the paper's claim is general, this checks the family only.
+const Rule kRules[] = {{"volta 4/24", 4, 24, true},       {"ampere 8/25", 8, 25, true},       {"ampere tf32 4/25", 4, 25, false},
+                       {"hopper 16/26", 16, 26, true},    {"hopper tf32 8/26", 8, 26, true}};
 
 // One dot product of `chunk` products and an f32 accumulator under the rule: a[k] * 1 for every k.
 float dot(const Rule& r, const float* a, float c) {
@@ -53,7 +58,9 @@ VTEST(a_decrease_exists_for_every_block_width) {
         const float lo = dot(r, a, c_low), hi = dot(r, a, c_high);
         if (hi < lo) found = true;   // the larger accumulator gives the smaller result
       }
-    if (!found) throw vtest::Failure(std::string(r.name) + ": no input pair in the scan makes the result fall as the accumulator rises");
+    if (found != r.reached)
+      throw vtest::Failure(std::string(r.name) + (found ? ": the scan now finds a decrease where none was expected (the alignment changed?)"
+                                                       : ": no input pair in the scan makes the result fall as the accumulator rises"));
   }
 }
 

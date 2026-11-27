@@ -47,8 +47,11 @@ power of two, the others are aligned one place higher and lose bits, and the res
 is such an adder, so the effect must exist for each (block width, grid) the profiles use. [`test_tc_monotonicity`](../../tests/unit/test_tc_monotonicity.cpp)
 (unit test, no card) holds it to that, for Volta 4/24, Ampere 8/25 and tf32 4/25, Hopper 16/26 and tf32 8/26:
 
+(Result of the first CI run: the decrease is found for every rule but Ampere tf32 4/25, where four small terms cut to multiples of 2^-25 cannot outweigh one ulp of 2; that case is pinned as not reached by this pattern, not claimed either way for the paper's general statement.)
+
+
 - **a decrease exists**: an accumulator of 2 - 2^-23 against 2, with the other terms of the chunk just below the coarser cut: the larger accumulator gives the smaller
-  result (a scan of the size of the small terms finds it for every rule; it would fail for a rounding adder or a wider grid);
+  result (a scan of the size of the small terms finds it for every rule but tf32 4/25; it would fail for a rounding adder or a wider grid);
 - **monotone at a fixed alignment**: with the largest term held, raising any other product never lowers the result (20,000 random chunks a rule).
 
 Class: **published** (the paper's property) checked on the **measured** and **inferred** rules; it says nothing new about any card. Whether a card shows the decrease is
