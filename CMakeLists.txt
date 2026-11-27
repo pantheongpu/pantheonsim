@@ -250,6 +250,7 @@ add_library(vgpu STATIC
   amd/src/debugger.cpp
   amd/src/gcn_exec.cpp
   amd/src/gcn_tier.cpp
+  amd/src/rdna2_trans.cpp
   amd/src/gcn_tier_ds.cpp
   amd/src/gcn_blocks.cpp
   amd/src/gcn_matrix_kernels.cpp
@@ -1958,6 +1959,9 @@ vgpu_unit_test(test_amd_gcn_ops amd/tests/unit/test_gcn_ops.cpp)
 target_compile_definitions(test_amd_gcn_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # Doubles, packed halves, the modifiers, the transcendentals and the atomics.
 vgpu_unit_test(test_amd_gcn_math amd/tests/unit/test_gcn_math.cpp)
+# v_rcp_f32, v_rsq_f32 and v_sqrt_f32 of gfx1030 against an RX 6800's hashes of all 2^32 operands (amd/src/rdna2_trans.cpp).
+vgpu_unit_test(test_amd_rdna2_trans amd/tests/unit/test_rdna2_trans.cpp)
+target_compile_definitions(test_amd_rdna2_trans PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # The same one-instruction kernels on every AMD target and the same edge-case operands: where the targets differ, which side is the
 # hardware's (amd/tests/data/xarch.c, docs/amd-cross-arch.md).
 vgpu_unit_test(test_amd_gcn_cross_arch amd/tests/unit/test_gcn_cross_arch.cpp)

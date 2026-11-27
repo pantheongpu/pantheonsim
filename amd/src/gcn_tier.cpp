@@ -25,6 +25,7 @@ asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.skip 1536\n.popsection")
 #include "gcn_divide.hpp"
 #include "gcn_tier_ds.hpp"
 #include "nan_order.hpp"
+#include "rdna2_trans.hpp"
 #include "transcendental.hpp"
 #include "packed_math.hpp"
 #include "vgpu/amd_gcn.hpp"
@@ -136,7 +137,7 @@ constexpr uint32_t kVgprs = 256;
   X(PK_MULLO, k_pk_mullo) X(PK_ADDU, k_pk_addu) X(PK_ADDI, k_pk_addi) X(PK_SUBU, k_pk_subu) X(PK_SUBI, k_pk_subi) X(PK_SHL, k_pk_shl) X(PK_SHR, k_pk_shr) \
   X(PK_ASHR, k_pk_ashr) X(PK_MAXI, k_pk_maxi) X(PK_MINI, k_pk_mini) X(PK_MAXU, k_pk_maxu) X(PK_MINU, k_pk_minu) X(PK_MADU, k_pk_madu) X(PK_MADI, k_pk_madi) \
   X(PK_ADDU_C, k_pk_addu_c) X(PK_ADDI_C, k_pk_addi_c) X(PK_SUBU_C, k_pk_subu_c) X(PK_SUBI_C, k_pk_subi_c) X(PK_MADU_C, k_pk_madu_c) X(PK_MADI_C, k_pk_madi_c)
-#define TIER_F32_OPS(X) X(FADD, k_fadd) X(FSUB, k_fsub) X(FSUBREV, k_fsubrev) X(FMUL, k_fmul) X(FMA, k_ffma) X(FMIN, k_fmin) X(FMAX, k_fmax) X(FRCP, k_frcp) X(FSQRT, k_fsqrt) X(FRSQ, k_frsq) X(FEXP, k_fexp) X(FLOG, k_flog) X(FFLOOR, k_ffloor) X(FCEIL, k_fceil) X(FTRUNC, k_ftrunc) X(FRNDNE, k_frndne) X(FFRACT, k_ffract) X(FSIN_R, k_fsin_r) X(FSIN_T, k_fsin_t) X(FCOS_R, k_fcos_r) X(FCOS_T, k_fcos_t) X(FLDEXP, k_fldexp) X(FCVT_F32_F16, k_fcvt_f32_f16)
+#define TIER_F32_OPS(X) X(FADD, k_fadd) X(FSUB, k_fsub) X(FSUBREV, k_fsubrev) X(FMUL, k_fmul) X(FMA, k_ffma) X(FMIN, k_fmin) X(FMAX, k_fmax) X(FRCP, k_frcp) X(FSQRT, k_fsqrt) X(FRSQ, k_frsq) X(FEXP, k_fexp) X(FLOG, k_flog) X(FFLOOR, k_ffloor) X(FCEIL, k_fceil) X(FTRUNC, k_ftrunc) X(FRNDNE, k_frndne) X(FFRACT, k_ffract) X(FSIN_R, k_fsin_r) X(FSIN_T, k_fsin_t) X(FCOS_R, k_fcos_r) X(FCOS_T, k_fcos_t) X(FLDEXP, k_fldexp) X(FCVT_F32_F16, k_fcvt_f32_f16) X(FRCP_G10, k_frcp_g10) X(FSQRT_G10, k_fsqrt_g10) X(FRSQ_G10, k_frsq_g10)
 #define TIER_F64_OPS(X) X(DADD, k_dadd) X(DMUL, k_dmul) X(DFMA, k_dfma) X(DRCP, k_drcp) X(DSQRT, k_dsqrt) X(DFLOOR, k_dfloor) X(DCEIL, k_dceil) X(DTRUNC, k_dtrunc) X(DRNDNE, k_drndne) X(DMIN, k_dmin) X(DMAX, k_dmax)
 #define TIER_L64_OPS(X) X(MOV, l_mov) X(LSHLREV, l_lshlrev) X(LSHRREV, l_lshrrev) X(ASHRREV, l_ashrrev) X(LSHL_ADD, l_lshl_add) X(LSHL_ADD_G, l_lshl_add_g) X(CVT_F64_U, l_cvt_f64_u) X(CVT_F64_I, l_cvt_f64_i) X(LDEXP, l_ldexp) X(FREXP_MANT, l_frexp_mant) X(FREXP_EXP, l_frexp_exp) X(CVT_F64_F32, l_cvt_f64_f32) X(CVT_F32_F64, l_cvt_f32_f64) X(CVT_I32_F64, l_cvt_i32_f64) X(CVT_U32_F64, l_cvt_u32_f64)
 
@@ -2967,7 +2968,8 @@ void tier_classify(Inst& in) {
           default: break;   // v_min_f32 and v_max_f32 (MODE.IEEE decides), the rounding and the angles in turns: the interpreter's
         }
         if (in.arch == gcn::Target::Gfx1030) f.nan = kNanHandBack;   // (gfx1030's NaNs are the card's: the interpreter's rdna2_nan)
-        const int kernel = (e.flags & kTrigTurns) ? e.k + 1 : e.k;   // (every target counts the angle in turns and keeps its fraction)
+        int kernel = (e.flags & kTrigTurns) ? e.k + 1 : e.k;   // (every target counts the angle in turns and keeps its fraction)
+        if (in.arch == gcn::Target::Gfx1030) kernel = e.k == FRCP ? FRCP_G10 : e.k == FSQRT ? FSQRT_G10 : e.k == FRSQ ? FRSQ_G10 : kernel;   // (an RX 6800's bits: rdna2_trans.hpp)
         f.kern = reinterpret_cast<AnyFn>(T.f32[kernel]);
         f.run = e.k == FLDEXP ? TIER_RUN(h_ldexp) : TIER_RUN(h_f32);
       } else {
