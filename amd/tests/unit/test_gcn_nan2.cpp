@@ -8,6 +8,7 @@
 #include <exception>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -58,6 +59,28 @@ std::vector<uint64_t> card(const std::string& kernel) {
       if (k == kernel) v.push_back(std::stoull(w, nullptr, 16) | (w.size() == 8 ? 0xa5a5a5a5ull << 32 : 0));
   if (v.size() != size_t{kOps} * kItems) throw vtest::Failure("asm_nan2.gfx1030.card.txt has no full " + kernel);
   return v;
+}
+
+// The RX 6700 XT (gfx1031) ran the same programs, assembled for gfx1031: amd/tests/data/asm_nan.gfx1031.card.digests.txt has the FNV-1a 64 of
+// its results of each kernel, which must be the RX 6800's (the card file above): one rule for gfx1030 and gfx1031 (the executor maps both to one target).
+std::map<std::string, uint64_t> digests_1031() {
+  std::ifstream in(data("asm_nan.gfx1031.card.digests.txt"));
+  std::map<std::string, uint64_t> m;
+  for (std::string line; std::getline(in, line);) {
+    char k[16];
+    unsigned long long h;
+    if (line.empty() || line[0] == '#' || std::sscanf(line.c_str(), "%15s %llx", k, &h) != 2) continue;
+    m[k] = h;
+  }
+  return m;
+}
+
+template <class W>
+uint64_t fnv(const std::vector<W>& words) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (W w : words)
+    for (unsigned b = 0; b < sizeof(W); ++b) h = (h ^ (static_cast<uint64_t>(w) >> (8 * b) & 0xff)) * 0x100000001b3ull;
+  return h;
 }
 
 int run(const char* kernel, bool tier) {
@@ -131,5 +154,12 @@ VTEST(gfx1030_nans_with_ieee_mode_match_the_cards) { VCHECK_EQ(run_both("n2_k"),
 VTEST(gfx1030_nans_without_ieee_mode_match_the_cards) { VCHECK_EQ(run_both("n2_n"), 0); }
 
 VTEST(gfx1030_nans_with_denormals_flushed_match_the_cards) { VCHECK_EQ(run_both("n2_f"), 0); }
+
+VTEST(gfx1031_nans_are_gfx1030s_on_every_result_of_asm_nan2) {
+  const auto want = digests_1031();
+  VCHECK_EQ(fnv(card("n2_k")), want.at("n2_k"));
+  VCHECK_EQ(fnv(card("n2_n")), want.at("n2_n"));
+  VCHECK_EQ(fnv(card("n2_f")), want.at("n2_f"));
+}
 
 VTEST_MAIN
