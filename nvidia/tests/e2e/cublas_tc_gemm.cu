@@ -121,7 +121,10 @@ static void run(cublasHandle_t h, const Case& c) {
   cudaFree(dA); cudaFree(dB); cudaFree(dC);
 }
 
-int main() {
+// --sweep: the K walk of cuBLAS's kernels (K = 48 to 1024 at 128x128 into FP32 and FP16, all three formats), printed by the card runs of the
+// Hopper and Blackwell issues (a wgmma kernel steps K by 16 per instruction, 8 for TF32); not part of the pinned files of the default run.
+int main(int argc, char** argv) {
+  const bool sweep = argc > 1 && std::strcmp(argv[1], "--sweep") == 0;
   cudaDeviceProp prop;
   cudaGetDeviceProperties(&prop, 0);
   g_cc = prop.major * 10 + prop.minor;
@@ -148,6 +151,21 @@ int main() {
       {"tf32 f32 128x128x128 TN",   F32,  F32, CT, 128, 128, 128, true,  false, 1.f, 0.f},
       {"tf32 f32 128x128x128 NT alpha beta", F32, F32, CT, 128, 128, 128, false, true, 0.5f, 0.25f},
   };
+  if (sweep) {
+    static char names[64][48];
+    std::vector<Case> sw;
+    int n = 0;
+    for (int k : {16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024}) {
+      std::snprintf(names[n], 48, "f16 f32 128x128x%d NN", k); sw.push_back({names[n++], F16, F32, C32, 128, 128, k, false, false, 1.f, 0.f});
+      std::snprintf(names[n], 48, "f16 f16 128x128x%d NN", k); sw.push_back({names[n++], F16, F16, C32, 128, 128, k, false, false, 1.f, 0.f});
+      std::snprintf(names[n], 48, "bf16 f32 128x128x%d NN", k); sw.push_back({names[n++], BF16, F32, C32, 128, 128, k, false, false, 1.f, 0.f});
+      std::snprintf(names[n], 48, "tf32 f32 128x128x%d NN", k); sw.push_back({names[n++], F32, F32, CT, 128, 128, k, false, false, 1.f, 0.f});
+      if (n > 60) break;
+    }
+    for (const Case& c : sw) run(h, c);
+    cublasDestroy(h);
+    return 0;
+  }
   for (const Case& c : cases) run(h, c);
   cublasDestroy(h);
   return 0;
