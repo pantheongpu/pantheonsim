@@ -65,10 +65,12 @@ numerics:
   tensor_sum_chunk_tf32: 4         # ... tf32
   tensor_sum_grid: 25              # a chunk's terms are cut at 2^(top - 25)
   tensor_sum_m8n8k4: volta          # sequential | volta: mma.m8n8k4 with f16 operands (PTX engine)
+  cublas_splitk: t4                 # none | t4 | a10g: the cuBLAS split-K table (nvidia/src/cublas_splitk_t4.inc)
 provenance:
-  measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_grid, numerics.tensor_sum_m8n8k4]
+  measured: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_grid, numerics.tensor_sum_m8n8k4, numerics.cublas_splitk]
   inferred: [numerics.tensor_sum_chunk_tf32]
 evidence:
+  numerics.cublas_splitk: "card: Tesla T4 (AWS g4dn.xlarge, 40 multiprocessors), driver 595.112.07, CUDA 13.0.88 cuBLAS, 2026-11-25 and 2026-11-26. tools/cublas_splitk/split_probe.cu (a summation-tree probe) FP16 into FP32 and FP16 surveyed cublasGemmEx over m, n in 32..1024 and k in 64..8192, all four transposes: where the slices are chains of tensor-core chunks added in order the table lists the slice length, each row confirmed bit for bit on random inputs with alpha = 1.3, beta = 0.7 (tools/cublas_splitk/classify.cu) when m n k <= 2^25. Products off that grid are not known and are the plain chain; products whose tree is another kind (an interleaved k-parallel accumulator, partial sums rounded to half precision) are not in the table. nvidia/docs/cublas.md"
   numerics: "card: Tesla T4 (this model), AWS; driver: 595.112.07; toolkit: CUDA 13.0; date: 2026-11-15. simd_lane_forms built -DNO80 prints the 56 lines of the RTX 3060 that remain, the four wmma f16 lines among them (nvidia/tests/data/simd_lane_forms.t4.txt); FTTN fp16. f16 forms only; float_half_forms has not run on it. docs/matrix-numerics.md"
   numerics.tensor_sum_chunk_tf32: "not measurable on this card: a Turing tensor core has no tf32 form. The number is the ampere model's, as measured on the 8.0, 8.6 and 8.9 cards, written so that the rule is complete. docs/matrix-numerics.md"
   numerics.tensor_sum_m8n8k4: "card: Tesla T4 (this model), AWS g4dn.xlarge, driver 595.112.07, nvcc 13.0.88 (sm_75 build), 2026-11-23. tools/tcpapers/m8n8k4_vectors.cu ran the 5,000 f32-accumulator and the 5,000 f16-accumulator vectors Khattak and Mikaitis recorded on a V100 (arXiv 2512.07004): 0 mismatches of 5,000 in each, so a Turing m8n8k4 (HMMA.884) sums as a Volta one: one step of 4 products and C, terms cut at 2^(top - 24); and 800 inputs of our own for each accumulator (subnormals, cancellation, large and small terms), whose T4 results the simulator reproduces (nvidia/tests/data/tcpapers/m8n8k4.t4.fp32.txt, .fp16.txt). docs/numerics/m8n8k4-and-sparse.md"

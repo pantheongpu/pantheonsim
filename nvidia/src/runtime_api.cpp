@@ -7584,6 +7584,25 @@ extern "C" __attribute__((visibility("default"))) int vgpu_tensor_sum_v1(int dev
   }
 }
 
+// The same and the cuBLAS split-K table the profile carries (numerics.cublas_splitk: 0 none, 1 t4, 2 a10g). It is only in force when the model is
+// the Ampere rule (VGPU_TC_EXACT=0 turns the tensor-core sums and the slices off together).
+extern "C" __attribute__((visibility("default"))) int vgpu_tensor_sum_v2(int device, unsigned* chunk, unsigned* chunk_tf32, int* cc, int* splitk) {
+  const int model = vgpu_tensor_sum_v1(device, chunk, chunk_tf32, cc);
+  if (splitk) {
+    *splitk = 0;
+    if (model == 1) {
+      State& s = st();
+      std::lock_guard<std::recursive_mutex> lock(s.mu);
+      try {
+        ensure_init(s);
+        *splitk = static_cast<int>(s.rt->device(device).profile().numerics.cublas_splitk);
+      } catch (const std::exception&) {
+      }
+    }
+  }
+  return model;
+}
+
 // ---- What libcuda reaches by name, to order the driver API's work with the stream lanes (cuLaunchHostFunc, #487) -----------
 // The driver API has no lanes of its own: a host function it queues is a lane item here, and its stream, event and
 // synchronization calls ask these (dlsym, as for capture, driver_capture.inc). None is traced or profiled: they are not

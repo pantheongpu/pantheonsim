@@ -664,6 +664,24 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | NVENC | `libnvidia-encode.so.1` | video encode: every status, query, capability, preset configuration and error string of the API as an RTX 3060 answers it; compressing H.264 (CAVLC and CABAC, 8x8 transform, P and B pictures, slices) and HEVC (intra, P and B pictures, in-loop deblocking) encoders, rate control, and the card's NEED_MORE_INPUT protocol for B pictures (below) |
 | NVDEC | `libnvcuvid.so.1` | video decode: the cuvid parser and decoder API, Motion JPEG, H.264, HEVC and MPEG-2 decoded on the host into NV12 surfaces as the card writes them; every other codec reports itself unsupported (below) |
 
+## cuDNN convolution: TF32 on Ampere and newer (issue #739)
+
+PyTorch's default (`torch.backends.cudnn.allow_tf32 = True`) lets cuDNN read the FP32 operands of a convolution as TF32 on a card of compute
+capability 8.0 or later; a Tesla T4 has no TF32 and does the plain FP32 convolution either way. Measured on an A10G (cuDNN 9.23,
+`nvidia/tests/e2e/dnn_conv_tf32.cu`, 8x64x28x28 by 64x64x3x3): the default math type of `cudnnConvolutionForward` is TF32-class (error 2.8e-4
+against double), `CUDNN_FMA_MATH` is FP32 (3e-7); the graph API's heuristics return 35 configurations, the TF32 ones noting
+`CUDNN_NUMERICAL_NOTE_TENSOR_CORE` (cuDNN 9 has no TF32 note) and listed first, the others noting WINOGRAD, FFT or nothing (all FP32); PyTorch
+takes one by `allow_tf32`. On the T4: no engine notes TENSOR_CORE, both math types are FP32. The simulator now does the same on profiles of compute
+capability 8.0 and later (`NVIDIA_TF32_OVERRIDE=0` turns it off): `cudnnConvolutionForward`, `BackwardData`, `BackwardFilter` and the fused
+conv-bias-activation read FP32 operands as TF32 (round to nearest, ties away) unless the descriptor's math type is `CUDNN_FMA_MATH`; the graph
+API offers two engines for a graph with an FP32 convolution, global index 1 (note TENSOR_CORE, TF32 operands, first) and index 0 (plain).
+**Inferred, not the card's bits:** which order cuDNN's TF32 engines sum in (an A10G probe of a 1x1 convolution shows an interleaved 8-wide
+sequential structure reduced pairwise, and a 3x3 one a different kernel again: engine-specific, `tools/cublas_splitk/conv_probe.cu`), so the sum
+here is a double sum rounded once to FP32; the test holds the error class (TF32 or FP32) and the engine notes, not the bits. A convolution under
+`allow_tf32 = False` (an FMA math type, or the engine without the note) is unchanged and exact as before. Half-precision convolutions are not
+affected. Which profiles carry it: every one of compute capability 8.0 and later, by the card's capability, not by a table (`provenance` has no
+key for it: it is the device's capability, as the TF32 GEMM rounding is).
+
 ## Why the math runs on the host
 
 A vendor library is not user code. Nothing requires its internals to run on the

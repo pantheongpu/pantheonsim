@@ -7,10 +7,11 @@
 // sequence on every profile, so a half-precision GEMM printed the same bytes on a T4 profile and an H100 profile and neither was a
 // card's. This program is the oracle that holds the library to the cards that were run.
 //
-// Not here, because the card's answer there is not a plain chain of chunks: cuBLAS splits some products over K, and the split is its
-// heuristic's (the card's multiprocessor count among its inputs), which no rule here models. Seen on the cards that were run: K of 1024 and
-// more on a T4 (f16 128x128x1024, 256x256x4096), an A10G's f16 96x80x512 into FP32 with alpha and beta (a T4's is the chain), and its TF32
-// products of K 256 and 512 (K = 128 is the chain). Open: issue "Cross-architecture (cuBLAS tensor-core GEMM): products cuBLAS splits over K".
+// The cases of the first group are chains of chunks. The second group ("splitk ...") is made of products cuBLAS cuts over K: slices of L
+// products, each a chain from zero, added in order in f32 (found with tools/cublas_splitk/split_probe.cu, a summation-tree probe). L is
+// cuBLAS's heuristic's and depends on the shape, the transposes, the types and the card's multiprocessor count; the simulator carries the
+// table of the products that were measured on a T4 and an A10G (nvidia/src/cublas_splitk_*.inc, nvidia/docs/cublas.md) and the plain chain
+// for the rest, which is a guess.
 //
 // Output, one line per case:  <name>: status <cublas status> checksum 0x<fnv1a-64 of the output bits> first <first 4 outputs, hex>
 // Inputs: a fixed xorshift generator, values (r - 0.5) * 4 rounded to the input format; the same bytes on every machine.
@@ -147,8 +148,100 @@ int main() {
       {"tf32 f32 128x128x128 NN",   F32,  F32, CT, 128, 128, 128, false, false, 1.f, 0.f},
       {"tf32 f32 128x128x128 TN",   F32,  F32, CT, 128, 128, 128, true,  false, 1.f, 0.f},
       {"tf32 f32 128x128x128 NT alpha beta", F32, F32, CT, 128, 128, 128, false, true, 0.5f, 0.25f},
+      // Products cuBLAS cuts over K (issue "Cross-architecture (cuBLAS tensor-core GEMM): products cuBLAS splits over K"): the slices of each are
+      // a chain from zero, summed in order. Picked from the survey tables of nvidia/src/cublas_splitk_{a10g,t4}.inc by
+      // tools/cublas_splitk/gen_cases.py: a spread of transposes, types and slice counts, some with alpha and beta.
+      {"splitk bf16 f32 64x64x256 NN", BF16, F32, C32, 64, 64, 256, false, false, 1.f, 0.f},
+      {"splitk bf16 f32 64x64x256 NN alpha beta", BF16, F32, C32, 64, 64, 256, false, false, 0.5f, 0.25f},
+      {"splitk bf16 f32 64x64x256 NN alpha beta 1.3 0.7", BF16, F32, C32, 64, 64, 256, false, false, 1.3f, 0.7f},
+      {"splitk bf16 f32 64x64x256 NN alpha 1.3", BF16, F32, C32, 64, 64, 256, false, false, 1.3f, 0.f},
+      {"splitk bf16 f32 64x64x256 NN beta 0.7", BF16, F32, C32, 64, 64, 256, false, false, 1.f, 0.7f},
+      {"splitk bf16 f32 64x64x256 TN", BF16, F32, C32, 64, 64, 256, true, false, 1.f, 0.f},
+      {"splitk bf16 f32 64x64x256 TN alpha beta", BF16, F32, C32, 64, 64, 256, true, false, 0.5f, 0.25f},
+      {"splitk bf16 f32 64x64x256 TN alpha beta 1.3 0.7", BF16, F32, C32, 64, 64, 256, true, false, 1.3f, 0.7f},
+      {"splitk bf16 f32 64x64x256 TN alpha 1.3", BF16, F32, C32, 64, 64, 256, true, false, 1.3f, 0.f},
+      {"splitk bf16 f32 64x64x256 TN beta 0.7", BF16, F32, C32, 64, 64, 256, true, false, 1.f, 0.7f},
+      {"splitk bf16 f32 64x64x4096 NT alpha beta 1.3 0.7", BF16, F32, C32, 64, 64, 4096, false, true, 1.3f, 0.7f},
+      {"splitk bf16 f32 64x128x1024 NN", BF16, F32, C32, 64, 128, 1024, false, false, 1.f, 0.f},
+      {"splitk bf16 f32 64x128x1024 NN alpha beta", BF16, F32, C32, 64, 128, 1024, false, false, 0.5f, 0.25f},
+      {"splitk bf16 f32 64x128x1024 NN alpha beta 1.3 0.7", BF16, F32, C32, 64, 128, 1024, false, false, 1.3f, 0.7f},
+      {"splitk bf16 f32 64x128x1024 NN alpha 1.3", BF16, F32, C32, 64, 128, 1024, false, false, 1.3f, 0.f},
+      {"splitk bf16 f32 64x128x1024 NN beta 0.7", BF16, F32, C32, 64, 128, 1024, false, false, 1.f, 0.7f},
+      {"splitk bf16 f32 64x128x2048 NT alpha beta", BF16, F32, C32, 64, 128, 2048, false, true, 0.5f, 0.25f},
+      {"splitk bf16 f32 128x64x1536 TN alpha beta 1.3 0.7", BF16, F32, C32, 128, 64, 1536, true, false, 1.3f, 0.7f},
+      {"splitk bf16 f32 128x128x768 NN", BF16, F32, C32, 128, 128, 768, false, false, 1.f, 0.f},
+      {"splitk bf16 f32 128x128x768 NN alpha beta", BF16, F32, C32, 128, 128, 768, false, false, 0.5f, 0.25f},
+      {"splitk bf16 f32 128x128x768 NN alpha beta 1.3 0.7", BF16, F32, C32, 128, 128, 768, false, false, 1.3f, 0.7f},
+      {"splitk bf16 f32 128x128x768 NN alpha 1.3", BF16, F32, C32, 128, 128, 768, false, false, 1.3f, 0.f},
+      {"splitk bf16 f32 128x128x768 NN beta 0.7", BF16, F32, C32, 128, 128, 768, false, false, 1.f, 0.7f},
+      {"splitk bf16 f32 128x128x1024 NN", BF16, F32, C32, 128, 128, 1024, false, false, 1.f, 0.f},
+      {"splitk bf16 f32 128x128x1024 NN alpha beta", BF16, F32, C32, 128, 128, 1024, false, false, 0.5f, 0.25f},
+      {"splitk bf16 f32 128x128x1024 NN alpha beta 1.3 0.7", BF16, F32, C32, 128, 128, 1024, false, false, 1.3f, 0.7f},
+      {"splitk bf16 f32 128x128x1024 NN alpha 1.3", BF16, F32, C32, 128, 128, 1024, false, false, 1.3f, 0.f},
+      {"splitk bf16 f32 128x128x1024 NN beta 0.7", BF16, F32, C32, 128, 128, 1024, false, false, 1.f, 0.7f},
+      {"splitk bf16 f32 256x64x1024 TT alpha beta 1.3 0.7", BF16, F32, C32, 256, 64, 1024, true, true, 1.3f, 0.7f},
+      {"splitk f16 f16 64x64x128 TT", F16, F16, C32, 64, 64, 128, true, true, 1.f, 0.f},
+      {"splitk f16 f16 64x64x128 TT alpha beta", F16, F16, C32, 64, 64, 128, true, true, 0.5f, 0.25f},
+      {"splitk f16 f16 64x64x128 TT alpha beta 1.3 0.7", F16, F16, C32, 64, 64, 128, true, true, 1.3f, 0.7f},
+      {"splitk f16 f16 64x64x128 TT alpha 1.3", F16, F16, C32, 64, 64, 128, true, true, 1.3f, 0.f},
+      {"splitk f16 f16 64x64x128 TT beta 0.7", F16, F16, C32, 64, 64, 128, true, true, 1.f, 0.7f},
+      {"splitk f16 f16 64x128x1536 NN alpha beta", F16, F16, C32, 64, 128, 1536, false, false, 0.5f, 0.25f},
+      {"splitk f16 f16 64x512x512 TT alpha beta 1.3 0.7", F16, F16, C32, 64, 512, 512, true, true, 1.3f, 0.7f},
+      {"splitk f16 f16 256x64x768 NN", F16, F16, C32, 256, 64, 768, false, false, 1.f, 0.f},
+      {"splitk f16 f16 256x64x768 TN alpha beta", F16, F16, C32, 256, 64, 768, true, false, 0.5f, 0.25f},
+      {"splitk f16 f32 64x64x128 TN", F16, F32, C32, 64, 64, 128, true, false, 1.f, 0.f},
+      {"splitk f16 f32 64x64x128 TN alpha beta", F16, F32, C32, 64, 64, 128, true, false, 0.5f, 0.25f},
+      {"splitk f16 f32 64x64x128 TN alpha beta 1.3 0.7", F16, F32, C32, 64, 64, 128, true, false, 1.3f, 0.7f},
+      {"splitk f16 f32 64x64x128 TN alpha 1.3", F16, F32, C32, 64, 64, 128, true, false, 1.3f, 0.f},
+      {"splitk f16 f32 64x64x128 TN beta 0.7", F16, F32, C32, 64, 64, 128, true, false, 1.f, 0.7f},
+      {"splitk f16 f32 64x64x256 NN", F16, F32, C32, 64, 64, 256, false, false, 1.f, 0.f},
+      {"splitk f16 f32 64x64x256 NN alpha beta", F16, F32, C32, 64, 64, 256, false, false, 0.5f, 0.25f},
+      {"splitk f16 f32 64x64x256 NN alpha beta 1.3 0.7", F16, F32, C32, 64, 64, 256, false, false, 1.3f, 0.7f},
+      {"splitk f16 f32 64x64x256 NN alpha 1.3", F16, F32, C32, 64, 64, 256, false, false, 1.3f, 0.f},
+      {"splitk f16 f32 64x64x256 NN beta 0.7", F16, F32, C32, 64, 64, 256, false, false, 1.f, 0.7f},
+      {"splitk f16 f32 64x64x256 TN", F16, F32, C32, 64, 64, 256, true, false, 1.f, 0.f},
+      {"splitk f16 f32 64x64x256 TN alpha beta", F16, F32, C32, 64, 64, 256, true, false, 0.5f, 0.25f},
+      {"splitk f16 f32 64x64x256 TN alpha beta 1.3 0.7", F16, F32, C32, 64, 64, 256, true, false, 1.3f, 0.7f},
+      {"splitk f16 f32 64x64x256 TN alpha 1.3", F16, F32, C32, 64, 64, 256, true, false, 1.3f, 0.f},
+      {"splitk f16 f32 64x64x256 TN beta 0.7", F16, F32, C32, 64, 64, 256, true, false, 1.f, 0.7f},
+      {"splitk f16 f32 64x64x1536 TT alpha beta 1.3 0.7", F16, F32, C32, 64, 64, 1536, true, true, 1.3f, 0.7f},
+      {"splitk f16 f32 64x64x4096 NN", F16, F32, C32, 64, 64, 4096, false, false, 1.f, 0.f},
+      {"splitk f16 f32 64x128x512 NT alpha beta", F16, F32, C32, 64, 128, 512, false, true, 0.5f, 0.25f},
+      {"splitk f16 f32 128x128x512 NN alpha beta 1.3 0.7", F16, F32, C32, 128, 128, 512, false, false, 1.3f, 0.7f},
+      {"splitk tf32 f32 64x64x2048 TT", F32, F32, CT, 64, 64, 2048, true, true, 1.f, 0.f},
+      {"splitk tf32 f32 128x64x256 TN", F32, F32, CT, 128, 64, 256, true, false, 1.f, 0.f},
+      {"splitk tf32 f32 128x64x256 TN alpha beta", F32, F32, CT, 128, 64, 256, true, false, 0.5f, 0.25f},
+      {"splitk tf32 f32 128x64x256 TN alpha beta 1.3 0.7", F32, F32, CT, 128, 64, 256, true, false, 1.3f, 0.7f},
+      {"splitk tf32 f32 128x64x256 TN alpha 1.3", F32, F32, CT, 128, 64, 256, true, false, 1.3f, 0.f},
+      {"splitk tf32 f32 128x64x256 TN beta 0.7", F32, F32, CT, 128, 64, 256, true, false, 1.f, 0.7f},
+      {"splitk tf32 f32 128x64x1024 TT alpha beta 1.3 0.7", F32, F32, CT, 128, 64, 1024, true, true, 1.3f, 0.7f},
+      {"splitk tf32 f32 128x256x256 NN", F32, F32, CT, 128, 256, 256, false, false, 1.f, 0.f},
+      {"splitk tf32 f32 128x256x256 NN alpha beta", F32, F32, CT, 128, 256, 256, false, false, 0.5f, 0.25f},
+      {"splitk tf32 f32 128x256x256 NN alpha beta 1.3 0.7", F32, F32, CT, 128, 256, 256, false, false, 1.3f, 0.7f},
+      {"splitk tf32 f32 128x256x256 NN alpha 1.3", F32, F32, CT, 128, 256, 256, false, false, 1.3f, 0.f},
+      {"splitk tf32 f32 128x256x256 NN beta 0.7", F32, F32, CT, 128, 256, 256, false, false, 1.f, 0.7f},
+      {"splitk tf32 f32 128x256x512 NT alpha beta", F32, F32, CT, 128, 256, 512, false, true, 0.5f, 0.25f},
+      {"splitk tf32 f32 256x64x1024 TN alpha beta 1.3 0.7", F32, F32, CT, 256, 64, 1024, true, false, 1.3f, 0.7f},
+      {"splitk tf32 f32 512x64x512 NN", F32, F32, CT, 512, 64, 512, false, false, 1.f, 0.f},
+      {"chain f16 f32 128x96x256 NN alpha beta 1.3 0.7", F16, F32, C32, 128, 96, 256, false, false, 1.3f, 0.7f},
+      {"chain f16 f32 128x96x256 NN alpha 1.3", F16, F32, C32, 128, 96, 256, false, false, 1.3f, 0.f},
+      {"chain f16 f32 128x96x256 NN beta 0.7", F16, F32, C32, 128, 96, 256, false, false, 1.f, 0.7f},
+      {"chain f16 f16 128x96x256 NN alpha beta 1.3 0.7", F16, F16, C32, 128, 96, 256, false, false, 1.3f, 0.7f},
+      {"chain f16 f16 128x96x256 NN alpha 1.3", F16, F16, C32, 128, 96, 256, false, false, 1.3f, 0.f},
+      {"chain f16 f16 128x96x256 NN beta 0.7", F16, F16, C32, 128, 96, 256, false, false, 1.f, 0.7f},
+      {"chain bf16 f32 128x96x256 NN alpha beta 1.3 0.7", BF16, F32, C32, 128, 96, 256, false, false, 1.3f, 0.7f},
+      {"chain bf16 f32 128x96x256 NN alpha 1.3", BF16, F32, C32, 128, 96, 256, false, false, 1.3f, 0.f},
+      {"chain bf16 f32 128x96x256 NN beta 0.7", BF16, F32, C32, 128, 96, 256, false, false, 1.f, 0.7f},
+      {"chain tf32 f32 128x128x128 NN alpha beta 1.3 0.7", F32, F32, CT, 128, 128, 128, false, false, 1.3f, 0.7f},
+      {"chain tf32 f32 128x128x128 NN alpha 1.3", F32, F32, CT, 128, 128, 128, false, false, 1.3f, 0.f},
+      {"chain tf32 f32 128x128x128 NN beta 0.7", F32, F32, CT, 128, 128, 128, false, false, 1.f, 0.7f},
   };
-  for (const Case& c : cases) run(h, c);
+  for (const Case& c : cases) {
+    // A Turing card's BF16 and TF32 products are plain FP32 kernels (no tensor core): cuBLAS may cut those over K too, with a heuristic of its own
+    // that no table here covers. Only the products of a tensor core are printed from the split-K cases.
+    if (g_cc < 80 && (!std::strncmp(c.name, "splitk ", 7) || !std::strncmp(c.name, "chain ", 6)) && (c.in == BF16 || c.compute == CT)) continue;
+    run(h, c);
+  }
   cublasDestroy(h);
   return 0;
 }

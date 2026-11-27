@@ -788,6 +788,7 @@ struct ConvCall {
   const Layout *x = nullptr, *w = nullptr, *y = nullptr;
   cudnnDataType_t scale_type = CUDNN_DATA_FLOAT;
   int xv = 0, wv = 0, yv = 0;  // vector lanes of an NCHW_VECT_C operand
+  bool tf32 = false;           // FP32 operands, a card with TF32 tensor cores and a math type that allows them: the operands are read as TF32
   unsigned algos = ~0u;        // the forward algorithms this configuration runs, by bit
   bool unreorder = false;      // an INT8x32 filter (and bias) cudnnReorderFilterAndBias already permuted
 };
@@ -884,6 +885,9 @@ cudnnStatus_t conv_check(const char* fn, ConvDir dir, const void* xd, const void
     case CUDNN_DATA_FLOAT:     // FLOAT_CONFIG
       if (ct != CUDNN_DATA_FLOAT) return UNSUPPORTED(fn, config());
       call->acc = Accum::Exact;
+      // CUDNN_DEFAULT_MATH lets a card with TF32 tensor cores read FP32 operands as TF32 (CUDNN_FMA_MATH does not): PyTorch's
+      // torch.backends.cudnn.allow_tf32 = True, its default, is the default math type (issue #739).
+      call->tf32 = xt == CUDNN_DATA_FLOAT && conv_tf32_available() && c->math != CUDNN_FMA_MATH;
       return CUDNN_STATUS_SUCCESS;
     case CUDNN_DATA_DOUBLE:  // DOUBLE_CONFIG
       if (ct != CUDNN_DATA_DOUBLE) return UNSUPPORTED(fn, config());
@@ -990,6 +994,10 @@ cudnnStatus_t run_conv(const char* fn, ConvDir dir, cudnnHandle_t h, int algo, c
     const Layout* la = call.y;
     const Layout* lb = dir == ConvDir::Filter ? call.x : call.w;
     if (!read(*la, a, &va) || !read(*lb, b, &vb)) return CUDNN_STATUS_EXECUTION_FAILED;
+  }
+  if (call.tf32) {
+    for (double& v : va) v = tf32_round(v);
+    for (double& v : vb) v = tf32_round(v);
   }
   convolve(call.g, dir, va, vb, &r, call.acc);
   const Layout* lo = dir == ConvDir::Forward ? call.y : dir == ConvDir::Data ? call.x : call.w;
@@ -1586,6 +1594,10 @@ VGPU_EXPORT cudnnStatus_t cudnnConvolutionBiasActivationForward(
       if (src >= 0) logical[static_cast<size_t>(src)] = vb[static_cast<size_t>(j)];
     }
     vb.swap(logical);
+  }
+  if (call.tf32) {
+    for (double& v : vx) v = tf32_round(v);
+    for (double& v : vw) v = tf32_round(v);
   }
   convolve(call.g, ConvDir::Forward, vx, vw, &r, call.acc);
   const double a1 = scale_of(alpha1, call.scale_type), a2 = scale_of(alpha2, call.scale_type);

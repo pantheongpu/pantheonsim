@@ -11,13 +11,17 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "vgpu/exec/tc_ampere.hpp"
 
 extern "C" int vgpu_tensor_sum_v1(int device, unsigned* chunk, unsigned* chunk_tf32, int* cc);
+// The same, and which cuBLAS split-K table the profile carries (numerics.cublas_splitk): 0 none, 1 t4, 2 a10g.
+extern "C" int vgpu_tensor_sum_v2(int device, unsigned* chunk, unsigned* chunk_tf32, int* cc, int* splitk);
 
 namespace vgpu::gemmtc {
 
@@ -27,6 +31,7 @@ struct Model {
   int kind = 0;               // 0 sequential, 1 Ampere rule, 2 Hopper rule
   unsigned chunk = 0, chunk_tf32 = 0;
   int cc = 0;                 // compute capability times ten
+  int splitk = 0;             // 0 none, 1 t4, 2 a10g: the cuBLAS split-K table of the profile (cublas_splitk.hpp)
   // Is the product of these operands a tensor-core chain on this device (and so computed here, not by the host's loops)?
   bool takes(Format f) const {
     if (kind != 1) return false;
@@ -36,15 +41,29 @@ struct Model {
 
 inline Model model_of(int device) {
   Model m;
-  m.kind = vgpu_tensor_sum_v1(device, &m.chunk, &m.chunk_tf32, &m.cc);
+  m.kind = vgpu_tensor_sum_v2(device, &m.chunk, &m.chunk_tf32, &m.cc, &m.splitk);
   return m;
 }
 
 // P = op(A) x op(B), column-major m x n (leading dimension m), the sum a tensor core makes with a zero accumulator. A and B hold
 // values exactly representable in the format (inputs already rounded to it), column-major with leading dimensions lda and ldb.
+// `slice` > 0 (and < k): cuBLAS cut the product over K into slices of that many products (cublas_splitk.hpp): each is a chain from a
+// zero accumulator and the slice results are added one after the other in f32.
 inline void product(const Model& md, Format f, bool ta, bool tb, int m, int n, int k, const float* A, int lda, const float* B, int ldb,
-                    std::vector<float>& P) {
+                    std::vector<float>& P, int slice = 0) {
   using namespace vgpu::exec::tc86;
+  if (slice > 0 && slice < k) {
+    std::vector<float> part;
+    for (int k0 = 0; k0 < k; k0 += slice) {
+      const int len = std::min(slice, k - k0);
+      const float* As = ta ? A + k0 : A + static_cast<size_t>(k0) * static_cast<size_t>(lda);
+      const float* Bs = tb ? B + static_cast<size_t>(k0) * static_cast<size_t>(ldb) : B + k0;
+      product(md, f, ta, tb, m, n, len, As, lda, Bs, ldb, part, 0);
+      if (k0 == 0) { P = part; continue; }
+      for (size_t i = 0; i < P.size(); ++i) P[i] = P[i] + part[i];
+    }
+    return;
+  }
   const unsigned chunk = f == Format::Tf32 ? md.chunk_tf32 : md.chunk;
   const int emin = f == Format::F16 ? kEminF16 : kEminWide;
   const size_t M = static_cast<size_t>(m), N = static_cast<size_t>(n), K = static_cast<size_t>(k);
@@ -91,6 +110,54 @@ inline void product(const Model& md, Format f, bool ta, bool tb, int m, int n, i
       for (size_t b = t; b < bands; b += threads) band(b);
     });
   for (auto& th : pool) th.join();
+}
+
+// A product kept apart from the compiler's contraction: the card's epilogue fuses some multiplies and adds and not others (below), so
+// the unfused ones must not be fused by the host compiler either.
+inline float rmul(float a, float b) {
+  volatile float t = a * b;
+  return t;
+}
+
+// R = alpha * (op(A) x op(B)) + beta * C as the card's kernel makes it, for a product of this model (`slice`: product()'s argument), in f32 before
+// the output format's rounding. `Cold` is C as floats, column-major with leading dimension m, read only when beta != 0. What the card does
+// (found by running the cases of nvidia/tests/e2e/cublas_tc_gemm.cu with other alpha and beta, which separate the fused from the unfused forms;
+// powers of two for alpha and beta do not):
+//   * one chain (no split):   fma(alpha, acc, beta * c)
+//   * two slices, `serial2` (a row of the table that was measured to do so; the other two-slice rows are the sum form of the next line):    FP16 and BF16:  r = fma(beta, c, alpha * P0) (alpha * P0 for beta = 0), then r + alpha * P1
+//                             TF32:           r = fma(alpha, P0, beta * c) (alpha * P0 for beta = 0), then fma(alpha, P1, r)
+//   * the sum form (three slices or more, and two where serial2 is false):   fma(beta, c, alpha * (P0 + P1 + ...)), the slices summed in order first (alpha * sum for beta = 0)
+inline void product_epilogue(const Model& md, Format f, bool ta, bool tb, int m, int n, int k, const float* A, int lda, const float* B, int ldb,
+                             int slice, bool serial2, float alpha, float beta, const float* Cold, std::vector<float>& R) {
+  const size_t cnt = static_cast<size_t>(m) * static_cast<size_t>(n);
+  const bool split = slice > 0 && slice < k;
+  if (split && serial2 && (k + slice - 1) / slice == 2) {
+    std::vector<float> p0, p1;
+    product(md, f, ta, tb, m, n, slice, A, lda, B, ldb, p0, 0);
+    const float* As = ta ? A + slice : A + static_cast<size_t>(slice) * static_cast<size_t>(lda);
+    const float* Bs = tb ? B + static_cast<size_t>(slice) * static_cast<size_t>(ldb) : B + slice;
+    product(md, f, ta, tb, m, n, k - slice, As, lda, Bs, ldb, p1, 0);
+    R.resize(cnt);
+    for (size_t i = 0; i < cnt; ++i) {
+      float r;
+      if (f == Format::Tf32) {
+        r = beta == 0.0f ? rmul(alpha, p0[i]) : std::fma(alpha, p0[i], rmul(beta, Cold[i]));
+        r = std::fma(alpha, p1[i], r);
+      } else {
+        r = beta == 0.0f ? rmul(alpha, p0[i]) : std::fma(beta, Cold[i], rmul(alpha, p0[i]));
+        r = r + rmul(alpha, p1[i]);
+      }
+      R[i] = r;
+    }
+    return;
+  }
+  product(md, f, ta, tb, m, n, k, A, lda, B, ldb, R, slice);
+  for (size_t i = 0; i < cnt; ++i) {
+    const float acc = R[i];
+    if (beta == 0.0f) R[i] = rmul(alpha, acc);
+    else if (split) R[i] = std::fma(beta, Cold[i], rmul(alpha, acc));
+    else R[i] = std::fma(alpha, acc, rmul(beta, Cold[i]));
+  }
 }
 
 }  // namespace vgpu::gemmtc

@@ -413,6 +413,8 @@ struct Op {
   vc::ConvGeom geom;
   double alpha = 1.0, beta = 0.0, alpha2 = 1.0;
   vc::Accum acc = vc::Accum::Exact;
+  // Convolutions: the plan's engine reads FP32 inputs as TF32 (engine global index 1, numerical note TF32).
+  bool tf32 = false;
   // Pointwise: the mode and its parameters; in = {x}, {x, b}, {x, b, t} or,
   // for a backward mode, {dy, x}.
   cudnnPointwiseMode_t pw = CUDNN_POINTWISE_ADD;
@@ -2793,15 +2795,7 @@ void run_bandmask(const Op& op, const std::vector<const std::vector<double>*>& i
 
 // A value as a TF32 operand: float, the low 13 mantissa bits rounded away to
 // nearest, ties away from zero (what the card's fp32 grouped matmul reads).
-double tf32(double v) {
-  float f = static_cast<float>(v);
-  uint32_t x;
-  std::memcpy(&x, &f, sizeof x);
-  if ((x & 0x7f800000u) == 0x7f800000u) return f;
-  x = (x + 0x1000u) & 0xffffe000u;
-  std::memcpy(&f, &x, sizeof f);
-  return f;
-}
+double tf32(double v) { return vc::tf32_round(v); }
 
 // Rotary position embedding, forward or backward, as op_of defines it.
 void run_rope(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<double>* y) {
@@ -3301,9 +3295,27 @@ cudnnStatus_t Runner::run_op(const Op& op) {
   std::vector<double>& r = outs[0];
   double alpha = 1.0, beta = 0.0;
   switch (op.kind) {
-    case Kind::ConvFwd: vc::convolve(op.geom, vc::ConvDir::Forward, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
-    case Kind::ConvData: vc::convolve(op.geom, vc::ConvDir::Data, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
-    case Kind::ConvFilter: vc::convolve(op.geom, vc::ConvDir::Filter, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
+    case Kind::ConvFwd:
+    case Kind::ConvData:
+    case Kind::ConvFilter: {
+      // The TF32 engine: FP32 operands are read as TF32 (the products are then exact in FP32; the sum is a double one here, rounded once: the card's
+      // order of the sum is not modelled, nvidia/docs/libraries.md).
+      const std::vector<double>* a = in[0];
+      const std::vector<double>* b = in[1];
+      std::vector<double> ra, rb;
+      if (op.tf32 && op.in[0].l.type == CUDNN_DATA_FLOAT && op.in[1].l.type == CUDNN_DATA_FLOAT) {
+        ra.resize(a->size());
+        rb.resize(b->size());
+        for (size_t i = 0; i < a->size(); ++i) ra[i] = tf32((*a)[i]);
+        for (size_t i = 0; i < b->size(); ++i) rb[i] = tf32((*b)[i]);
+        a = &ra;
+        b = &rb;
+      }
+      const vc::ConvDir dir = op.kind == Kind::ConvFwd ? vc::ConvDir::Forward : op.kind == Kind::ConvData ? vc::ConvDir::Data : vc::ConvDir::Filter;
+      vc::convolve(op.geom, dir, *a, *b, &r, op.acc);
+      alpha = op.alpha, beta = op.beta;
+      break;
+    }
     case Kind::Matmul: run_matmul(op, in, &r); break;
     case Kind::Reduction: run_reduction(op, *in[0], &r); alpha = op.alpha; break;
     case Kind::PoolFwd:
@@ -3421,15 +3433,33 @@ cudnnStatus_t execute_graph(cudnnHandle_t handle, const std::vector<Op>& order, 
   return runner.run(order);
 }
 
+// Engine global index 1 is the TF32 one (numerical note CUDNN_NUMERICAL_NOTE_TENSOR_CORE, the only note the A10G's TF32 engines carry; cuDNN 9 has no TF32 note): a card with TF32 tensor cores (compute capability 8.0 and later) runs a
+// convolution of FP32 tensors with the inputs read as TF32, and cuDNN offers that engine next to the plain FP32 one (index 0), the TF32 one first as its
+// heuristics rank it. PyTorch picks by torch.backends.cudnn.allow_tf32 (True by default): it drops the engines that note TF32 when it is False.
+// Whether the card's own engine also exists for a graph is not asked here: this one is offered whenever the graph has a FP32 convolution and the card has
+// TF32 (nvidia/docs/libraries.md, issue #739; the sum order inside it is not the card's).
+constexpr int64_t kTf32Engine = 1;
+bool graph_has_tf32_conv(const Desc* graph) {
+  if (!vc::conv_tf32_available()) return false;
+  std::vector<Op> order;
+  std::string why;
+  if (!schedule(graph, &order, &why)) return false;
+  for (const Op& o : order)
+    if ((o.kind == Kind::ConvFwd || o.kind == Kind::ConvData || o.kind == Kind::ConvFilter) && o.in.size() >= 2 && o.in[0].l.type == CUDNN_DATA_FLOAT &&
+        o.in[1].l.type == CUDNN_DATA_FLOAT)
+      return true;
+  return false;
+}
+
+// The engines of a graph: the plain one, global index 0, and the TF32 one (above).
 // The one engine: global index 0, for the graph it was made for, owned (with
 // its own copy of the graph) by `owner`.
-Desc* make_engine(Desc* owner, const Desc* graph) {
+Desc* make_engine(Desc* owner, const Desc* graph, int64_t index = 0) {
   auto e = std::make_unique<Desc>();
   e->type = CUDNN_BACKEND_ENGINE_DESCRIPTOR;
   e->owned.push_back(clone(graph));
   Desc* g = e->owned.back().get();
   e->set(CUDNN_ATTR_ENGINE_OPERATION_GRAPH, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &g);
-  const int64_t index = 0;
   e->set(CUDNN_ATTR_ENGINE_GLOBAL_INDEX, CUDNN_TYPE_INT64, 1, &index);
   e->finalized = true;
   Desc* raw = e.get();
@@ -3693,7 +3723,8 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendGetAttribute(cudnnBackendDescriptor_t cons
     // What this library computes rather than stores.
     case CUDNN_ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT: {
       std::string why;
-      return give_i64(runnable(d, &why) && engine_gap(d).empty() ? 1 : 0);
+      if (!(runnable(d, &why) && engine_gap(d).empty())) return give_i64(0);
+      return give_i64(graph_has_tf32_conv(d) ? 2 : 1);
     }
     case CUDNN_ATTR_ENGINEHEUR_RESULTS: {
       // One configuration: engine 0, no knobs. The caller made the ENGINECFG
@@ -3713,15 +3744,19 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendGetAttribute(cudnnBackendDescriptor_t cons
         vgpu_cudnn::set_last_error("Warning: No viable engine configs among (0) heuristics result(s). \nWarning: " + gap);
         return give_none();
       }
-      if (count) *count = 1;
-      if (requested >= 1 && values) {
+      // The TF32 engine first (as the card's heuristics rank it), then the plain one; one configuration where the graph has no TF32 convolution.
+      std::vector<int64_t> indices;
+      if (graph_has_tf32_conv(graph)) indices.push_back(kTf32Engine);
+      indices.push_back(0);
+      if (count) *count = static_cast<int64_t>(indices.size());
+      for (int64_t i = 0; i < requested && i < static_cast<int64_t>(indices.size()) && values; ++i) {
         Desc* cfg = nullptr;
-        std::memcpy(&cfg, values, sizeof(void*));
+        std::memcpy(&cfg, static_cast<char*>(values) + i * sizeof(void*), sizeof(void*));
         if (!live(cfg)) return CUDNN_STATUS_BAD_PARAM;
         cfg->type = CUDNN_BACKEND_ENGINECFG_DESCRIPTOR;
         cfg->attrs.clear();
         cfg->owned.clear();
-        Desc* engine = make_engine(cfg, graph);
+        Desc* engine = make_engine(cfg, graph, indices[static_cast<size_t>(i)]);
         cfg->set(CUDNN_ATTR_ENGINECFG_ENGINE, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &engine);
         cfg->finalized = true;
       }
@@ -3759,8 +3794,19 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendGetAttribute(cudnnBackendDescriptor_t cons
       return give_i64(0);  // computed on the host: no workspace
     // Engine 0 has no knobs, numerical notes or behaviour notes to report,
     // and a plan computes no intermediates.
-    case CUDNN_ATTR_ENGINE_KNOB_INFO:
     case CUDNN_ATTR_ENGINE_NUMERICAL_NOTE:
+      if (d->i64(CUDNN_ATTR_ENGINE_GLOBAL_INDEX, -1) == kTf32Engine) {
+        // The TF32 engine says so (as the A10G's do: note 0, TENSOR_CORE), and PyTorch's allow_tf32 = False filters on it.
+        if (count) *count = 1;
+        if (requested >= 1 && values) {
+          const cudnnBackendNumericalNote_t note = CUDNN_NUMERICAL_NOTE_TENSOR_CORE;
+          std::memcpy(values, &note, sizeof note);
+        }
+        return CUDNN_STATUS_SUCCESS;
+      }
+      if (!d->get(name)) return give_none();
+      break;
+    case CUDNN_ATTR_ENGINE_KNOB_INFO:
     case CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE:
     case CUDNN_ATTR_ENGINE_LAYOUT_INFO:
     case CUDNN_ATTR_ENGINECFG_KNOB_CHOICES:
@@ -3822,6 +3868,9 @@ cudnnStatus_t prepare_plan(const Desc* p, const Desc* v, std::vector<Op>* order,
   if (!graph) return CUDNN_STATUS_BAD_PARAM;
   std::string why;
   if (!schedule(graph, order, &why)) return refuse("cudnnBackendExecute", why);
+  if (eng->i64(CUDNN_ATTR_ENGINE_GLOBAL_INDEX, -1) == kTf32Engine && vc::conv_tf32_available())
+    for (Op& o : *order)
+      if (o.kind == Kind::ConvFwd || o.kind == Kind::ConvData || o.kind == Kind::ConvFilter) o.tf32 = true;
   if (const std::string gap = engine_gap(graph); !gap.empty()) return refuse("cudnnBackendExecute", "no engine for this graph: " + gap);
   // The variant pack: unique ids and the device pointers that go with them.
   const std::vector<int64_t> uids = v->i64s(CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS);

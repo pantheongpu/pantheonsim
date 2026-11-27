@@ -249,6 +249,13 @@ enum class Accum { Exact, Half, Int };
 //   Filter:  dw[k,c',f] = sum dy[n,k,o] x[n,c,p]      (a = dy, b = x)
 // over the taps that land inside the input. Inputs and the result are in
 // logical (packed NCHW) order.
+// A float convolution on a card with TF32 tensor cores (compute capability 8.0 and later), as PyTorch's default has it (torch.backends.cudnn.allow_tf32 =
+// True): cuDNN offers an engine that reads its FP32 inputs as TF32 (numerical note CUDNN_NUMERICAL_NOTE_TENSOR_CORE) next to the plain FP32 one. True when the
+// current device has them and NVIDIA_TF32_OVERRIDE is not 0 (read once).
+bool conv_tf32_available();
+// A value as a TF32 operand: float, the low 13 mantissa bits rounded away to nearest, ties away from zero (cvt.rna.tf32.f32; nvidia/src/gemm_input_rounding.hpp).
+double tf32_round(double v);
+
 void convolve(const ConvGeom& g, ConvDir dir, const std::vector<double>& a, const std::vector<double>& b,
               std::vector<double>* out, Accum acc);
 

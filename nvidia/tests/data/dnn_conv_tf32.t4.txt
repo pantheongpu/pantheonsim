@@ -1,0 +1,3 @@
+legacy default math: fp32
+legacy FMA math: fp32
+engines: some note TENSOR_CORE: no; every engine that notes it gives class tf32: -; some engine without the note exists: yes; the first engine notes it: no
