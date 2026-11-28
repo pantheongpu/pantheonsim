@@ -48,6 +48,7 @@
 #include "fixed_point_gemm.hpp"
 #include "gemm_input_rounding.hpp"
 #include "gemm_tensor_sum.hpp"
+#include "cublas_splitk.hpp"
 #include "host_gemm.hpp"
 #include "host_trsm.hpp"
 
@@ -473,9 +474,17 @@ bool gemm_mixed(cublasOperation_t transa, cublasOperation_t transb, int m, int n
         fa[i] = at == 0 ? HalfLoader{rawA.data(), half_table()}(static_cast<int64_t>(i), 0, 0) : Bf16Loader{rawA.data()}(static_cast<int64_t>(i), 0, 0);
       for (size_t i = 0; i < fb.size(); ++i)
         fb[i] = at == 0 ? HalfLoader{rawB.data(), half_table()}(static_cast<int64_t>(i), 0, 0) : Bf16Loader{rawB.data()}(static_cast<int64_t>(i), 0, 0);
-      vgpu::gemmtc::product(md, fmt, ta, tb, m, n, k, fa.data(), lda, fb.data(), ldb, P);
+      // Cold: C as floats (read when beta != 0), column-major with leading dimension m.
+      std::vector<float> Cold;
+      if (beta != 0.0f) {
+        Cold.resize(static_cast<size_t>(m) * static_cast<size_t>(n));
+        for (int j = 0; j < n; ++j)
+          for (int i = 0; i < m; ++i) Cold[static_cast<size_t>(i) + static_cast<size_t>(j) * m] = c_get(c0, idx(i, j, ldc), Ctype);
+      }
+      const auto plan = vgpu::gemmtc::plan_of(static_cast<vgpu::gemmtc::SplitTable>(md.splitk), fmt, Ctype == CUDA_R_16F || Ctype == CUDA_R_16BF, ta, tb, m, n, k);
+      vgpu::gemmtc::product_epilogue(md, fmt, ta, tb, m, n, k, fa.data(), lda, fb.data(), ldb, plan.len, plan.serial, alpha, beta, Cold.data(), P);
       for (int j = 0; j < n; ++j)
-        for (int i = 0; i < m; ++i) epi(i, j, P[static_cast<size_t>(i) + static_cast<size_t>(j) * m]);
+        for (int i = 0; i < m; ++i) c_put(c0, idx(i, j, ldc), Ctype, P[static_cast<size_t>(i) + static_cast<size_t>(j) * m]);
       tc_done = true;
     }
   }
@@ -807,14 +816,22 @@ cublasStatus_t do_gemm(cublasHandle_t handle, cublasOperation_t transa, cublasOp
       cudaGetDevice(&dev);
       const auto md = vgpu::gemmtc::model_of(dev);
       if (md.takes(fmt) && k > 0) {
-        std::vector<float> P;
-        vgpu::gemmtc::product(md, fmt, transa != CUBLAS_OP_N, transb != CUBLAS_OP_N, m, n, k, hA.data(), lda, hB.data(), ldb, P);
+        std::vector<float> P, Cold;
+        // The slices cuBLAS cut the product into (cublas_splitk.hpp) are measured for GemmEx's FAST_TF32 compute type with FP32 operands only: the
+        // math-mode route and the FAST_16F/16BF conversions are other kernels' calls.
+        const vgpu::gemmtc::Plan plan = kind == Kind::Tf32 && t_gemm_round.explicit_kind
+                              ? vgpu::gemmtc::plan_of(static_cast<vgpu::gemmtc::SplitTable>(md.splitk), fmt, false, transa != CUBLAS_OP_N,
+                                                      transb != CUBLAS_OP_N, m, n, k)
+                              : vgpu::gemmtc::Plan{};
+        if (beta != 0.0f) {
+          Cold.resize(static_cast<size_t>(m) * static_cast<size_t>(n));
+          for (int j = 0; j < n; ++j)
+            for (int i = 0; i < m; ++i) Cold[static_cast<size_t>(i) + static_cast<size_t>(j) * m] = hC[idx(i, j, ldc)];
+        }
+        vgpu::gemmtc::product_epilogue(md, fmt, transa != CUBLAS_OP_N, transb != CUBLAS_OP_N, m, n, k, hA.data(), lda, hB.data(), ldb, plan.len,
+                                       plan.serial, alpha, beta, Cold.data(), P);
         for (int j = 0; j < n; ++j)
-          for (int i = 0; i < m; ++i) {
-            float& c = hC[idx(i, j, ldc)];
-            const float acc = P[static_cast<size_t>(i) + static_cast<size_t>(j) * m];
-            c = beta == 0.0f ? alpha * acc : alpha * acc + beta * c;
-          }
+          for (int i = 0; i < m; ++i) hC[idx(i, j, ldc)] = P[static_cast<size_t>(i) + static_cast<size_t>(j) * m];
         store(C, hC);
         return CUBLAS_STATUS_SUCCESS;
       }

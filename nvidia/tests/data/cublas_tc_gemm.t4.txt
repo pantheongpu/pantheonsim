@@ -14,3 +14,37 @@ f16 f32 64x64x8 NN: status 0 checksum 0x5a29d25c3ecfe0db first 40ba190f bf3f05fc
 tf32 f32 128x128x128 NN: status 0 class plain fp32
 tf32 f32 128x128x128 TN: status 0 class plain fp32
 tf32 f32 128x128x128 NT alpha beta: status 0 class tf32
+splitk f16 f16 64x64x128 TT: status 0 checksum 0x929fc685fef70717 first c750 4de1 bd99 c0a1
+splitk f16 f16 64x64x128 TT alpha beta: status 0 checksum 0x7ae4f136138ab112 first c2c0 49db b5f7 bd67
+splitk f16 f16 64x64x128 TT alpha beta 1.3 0.7: status 0 checksum 0xd5da58a0a054d332 first c85c 4f9c bb3b c319
+splitk f16 f16 64x64x128 TT alpha 1.3: status 0 checksum 0xfcf098362ab4c5c0 first c8c1 4fa4 bf47 c204
+splitk f16 f16 64x64x128 TT beta 0.7: status 0 checksum 0xdd53f4b2efeace3b first c686 4dd8 b7bf c1b6
+splitk f16 f16 64x128x1536 NN alpha beta: status 0 checksum 0xa4eaebcc2900a1db first 4e55 4d35 3efe c6b3
+splitk f16 f16 64x512x512 TT alpha beta 1.3 0.7: status 0 checksum 0xcbecaf5aea8f5b2e first 5023 4ead d489 4e96
+splitk f16 f16 256x64x768 NN: status 0 checksum 0x929c9812d2444ce7 first 4458 c899 4f38 4db7
+splitk f16 f16 256x64x768 TN alpha beta: status 0 checksum 0x549f91de848bfa51 first 4e3a cbf4 cfbd 4d10
+splitk f16 f32 64x64x128 TN: status 0 checksum 0xd3d9719a8091ce76 first 400a6411 41196a4d c0c94a75 c006ac6d
+splitk f16 f32 64x64x128 TN alpha beta: status 0 checksum 0x210de2dc4c1135e7 first 3fae9809 4097e64d c0345d34 bf9f6a52
+splitk f16 f32 64x64x128 TN alpha beta 1.3 0.7: status 0 checksum 0xdeb8b7b0b5718eb9 first 406697a4 41455164 c0e86170 c051b6ce
+splitk f16 f32 64x64x128 TN alpha 1.3: status 0 checksum 0x5f888547f536c835 first 4033e87c 41477097 c102d6cc c02f135a
+splitk f16 f32 64x64x128 TN beta 0.7: status 0 checksum 0x7e703271d0ec07f4 first 403d1339 41174b1a c0abfe4e c0294fe1
+splitk f16 f32 64x64x256 NN: status 0 checksum 0xb91d48cf4b696331 first c16018e3 410a9e5f c1472e32 c15b37c8
+splitk f16 f32 64x64x256 NN alpha beta: status 0 checksum 0x67e623a65c50bdc4 first c0ee6799 40787cb8 c0c2b316 c0dc1394
+splitk f16 f32 64x64x256 NN alpha beta 1.3 0.7: status 0 checksum 0x488afb98d6783003 first c19badac 41201444 c17ca94c c18f17b7
+splitk f16 f32 64x64x256 NN alpha 1.3: status 0 checksum 0x434135c0723e7660 first c191a9c6 41343448 c18177a0 c18e7ddb
+splitk f16 f32 64x64x256 NN beta 0.7: status 0 checksum 0xf26974d2aa7a5e63 first c17420ae 40ecfcb6 c140e83e c15c6b7f
+splitk f16 f32 64x64x256 TN: status 0 checksum 0xf6f28c0a6a74b2ac first c1a30765 41e43a71 41d20f62 4166d6dc
+splitk f16 f32 64x64x256 TN alpha beta: status 0 checksum 0x086191f3ada1a629 first c12a2ec0 415d0a70 41544cf0 40e5fb10
+splitk f16 f32 64x64x256 TN alpha beta 1.3 0.7: status 0 checksum 0x80d2102397d8afc7 first c1ddf3e9 420f512e 420a1b7c 419571cd
+splitk f16 f32 64x64x256 TN alpha 1.3: status 0 checksum 0x4a8e9ecfd1f4ba65 first c1d3f003 4214592f 420889ff 41960ba8
+splitk f16 f32 64x64x256 TN beta 0.7: status 0 checksum 0x9aa303a72d01166b first c1ad0b4b 41da2a6f 41d5325c 4165a325
+splitk f16 f32 64x64x1536 TT alpha beta 1.3 0.7: status 0 checksum 0x69aa6cab06e6df88 first c1c888a2 42078612 42110616 c2188287
+splitk f16 f32 64x64x4096 NN: status 0 checksum 0x5e4dc7e3a292051f first 4068cffc c2d314c3 420b70de 42cc095b
+splitk f16 f32 64x128x512 NT alpha beta: status 0 checksum 0x04fede59df957528 first bfe14b62 41379a10 c026f5fc 41f717c2
+splitk f16 f32 128x128x512 NN alpha beta 1.3 0.7: status 0 checksum 0xc56ae9d34122268c first c16f4553 40b7f754 4240bd93 428197ec
+chain f16 f32 128x96x256 NN alpha beta 1.3 0.7: status 0 checksum 0xec225e7e83e0986b first 418eb5f0 c2849326 42ca6367 428279c8
+chain f16 f32 128x96x256 NN alpha 1.3: status 0 checksum 0x14fe79fc9de1f486 first 41868d99 c28593e6 42c816bb 4280f8da
+chain f16 f32 128x96x256 NN beta 0.7: status 0 checksum 0x80fdcef625813913 first 415f51e9 c24b7f94 429c36c6 42496d05
+chain f16 f16 128x96x256 NN alpha beta 1.3 0.7: status 0 checksum 0xcabe11c8d310bd3d first 4c76 d425 5653 5414
+chain f16 f16 128x96x256 NN alpha 1.3: status 0 checksum 0x878c3cc4a771072b first 4c34 d42d 5641 5408
+chain f16 f16 128x96x256 NN beta 0.7: status 0 checksum 0x03a37592aeb2b9c2 first 4afb d25c 54e2 524b

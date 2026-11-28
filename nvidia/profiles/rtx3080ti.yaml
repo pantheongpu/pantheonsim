@@ -68,9 +68,11 @@ numerics:
   tensor_sum_grid: 25              # a chunk's terms are cut at 2^(top - 25)
   tensor_sum_m8n8k4: chain_c_last   # sequential | volta | chain_c_last: mma.m8n8k4 (f32 accumulator; PTX engine)
   tensor_sum_sparse: ampere         # sequential | ampere: mma.sp / HMMA.SP with f16, bf16, tf32 operands
+  cublas_splitk: a10g               # none | t4 | a10g: the A10G table, carried over (same compute capability, 80 multiprocessors)
 provenance:
-  inferred: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid, numerics.tensor_sum_m8n8k4, numerics.tensor_sum_sparse]
+  inferred: [numerics.tensor_sum, numerics.tensor_sum_chunk, numerics.tensor_sum_chunk_tf32, numerics.tensor_sum_grid, numerics.tensor_sum_m8n8k4, numerics.tensor_sum_sparse, numerics.cublas_splitk]
 evidence:
+  numerics.cublas_splitk: "inferred, not run on this model: cuBLAS chooses its split from the shape, the types and the multiprocessor count, and this profile has the A10G count of 80 at compute capability 8.6 (the A10G table was measured 2026-11-25, numerics.cublas_splitk of nvidia/profiles/a10g.yaml). Another cuBLAS tuning for a consumer card, if there is one, would not be seen. nvidia/docs/cublas.md"
   numerics: "not run on this model. Inferred from the same compute capability (8.6) as the cards that were run on 2026-11-15: an RTX 3060 and an A10G (nvidia/profiles/rtx3060.yaml, a10g.yaml). docs/matrix-numerics.md"
   numerics.tensor_sum_m8n8k4: "inferred from the A10G (sm_86, measured 2026-11-23, see numerics.tensor_sum_m8n8k4 of nvidia/profiles/a10g.yaml): ptxas emulates mma.m8n8k4 as f32 products added in order with C last on sm_80 and later; no card of this model was run, and the emulation is the cubin's (nvcc 13.0.88), not the hardware's. An f32 accumulator only. docs/numerics/m8n8k4-and-sparse.md"
   numerics.tensor_sum_sparse: "inferred from the A10G (sm_86, measured 2026-11-23, see numerics.tensor_sum_sparse of nvidia/profiles/a10g.yaml): the Ampere rule over the stored products; no card of this model was run. docs/numerics/m8n8k4-and-sparse.md"

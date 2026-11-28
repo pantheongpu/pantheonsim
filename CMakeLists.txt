@@ -1696,6 +1696,9 @@ vgpu_unit_test(test_wgmma_fp8)
 # The sums of mma.m8n8k4 (Volta's rule, recorded V100 vectors), wgmma (f16, bf16, tf32: recorded H100 vectors, MMA-Sim's claim) and tcgen05.mma, what each profile names.
 vgpu_unit_test(test_tc_forms)
 target_compile_definitions(test_tc_forms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# cuBLAS's split-K table, the slices' sums and the epilogue forms (nvidia/src/cublas_splitk.hpp, gemm_tensor_sum.hpp), and which profile carries which table.
+vgpu_unit_test(test_cublas_splitk)
+target_include_directories(test_cublas_splitk PRIVATE nvidia/src)
 # tcgen05.mma reading its operands whole from shared memory against the element reads, bit for bit.
 vgpu_unit_test(test_tcgen05_fast)
 # tcgen05.mma through the tile kernels for the forms the whole-operand route leaves to the row loop (f16 D, layouts F, B, G, A in Tensor Memory, sparse A,
@@ -3322,6 +3325,17 @@ if(TARGET vgpucublas)
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cublas_tc_gemm.sh)
   set_tests_properties(e2e_cublas_tc_gemm PROPERTIES
     DEPENDS "vgpucudart;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+
+  # PyTorch's default FP32 convolution on an Ampere or newer card is TF32 (cuDNN's engines that note TENSOR_CORE come first, torch.backends.cudnn.allow_tf32);
+  # a Turing card has none: the error class of cudnnConvolutionForward and of every backend-API engine, against a Tesla T4 and an A10G
+  # (nvidia/tests/e2e/dnn_conv_tf32.cu, nvidia/tests/data/dnn_conv_tf32.<card>.txt).
+  add_test(NAME e2e_dnn_conv_tf32
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dnn_conv_tf32.sh)
+  set_tests_properties(e2e_dnn_conv_tf32 PROPERTIES
+    DEPENDS "vgpucudart;vgpucudnn"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)

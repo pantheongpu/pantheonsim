@@ -256,6 +256,12 @@ inline constexpr const char* form_sum_name(FormSum m) {
   return m == FormSum::Hopper ? "hopper" : m == FormSum::Volta ? "volta" : m == FormSum::ChainCLast ? "chain_c_last" : m == FormSum::Ampere ? "ampere" : "sequential";
 }
 
+// numerics.cublas_splitk: which cuBLAS split-K table a card's tensor-core GEMMs follow (nvidia/src/cublas_splitk.hpp). cuBLAS cuts some products over K
+// and the cut is its heuristic's, a function of the shape and the card's multiprocessor count (issue #734); the tables are those measured on a Tesla T4
+// (40 multiprocessors) and an A10G (80). None: no table, the plain chain of chunks for every product.
+enum class CublasSplitK : uint8_t { None, T4, A10g };
+inline constexpr const char* cublas_splitk_name(CublasSplitK m) { return m == CublasSplitK::T4 ? "t4" : m == CublasSplitK::A10g ? "a10g" : "none"; }
+
 // A profile's `numerics:` section. Absent (present == false): the sequential sum and no published model, which is what an AMD or
 // Intel profile has -- their engines do not read this.
 struct Numerics {
@@ -287,6 +293,8 @@ struct Numerics {
   FormSum tensor_sum_tcgen05 = FormSum::Sequential;
   FormSum tensor_sum_m8n8k4 = FormSum::Sequential;
   FormSum tensor_sum_sparse = FormSum::Sequential;
+  // numerics.cublas_splitk (CublasSplitK above). Optional, absent is none.
+  CublasSplitK cublas_splitk = CublasSplitK::None;
 };
 
 // What a value in a profile rests on. Exactly four classes; a key carries at most one.

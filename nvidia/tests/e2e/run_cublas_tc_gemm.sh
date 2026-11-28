@@ -7,7 +7,7 @@
 # (docs/matrix-numerics.md): the simulator's cuBLAS must print the card's bytes, not those of its own host loop.
 #   * nvidia/t4 prints the T4's file: FP16 on the chunk-of-8 rule, BF16 as the ordinary FP32 kernel a Turing card runs (it has no BF16
 #     tensor core), and a TF32 request answered with the plain FP32 product (it has no TF32 either).
-#   * nvidia/a10g and nvidia/rtx3060 (sm_86) print the A10G's file.
+#   * nvidia/a10g prints the A10G's file; nvidia/rtx3060 (sm_86, 28 multiprocessors, no split-K table) prints it except the "splitk" lines.
 #   * with VGPU_TC_EXACT=0 (the sequential sums of the releases before the tensor-core rules) the T4 profile does NOT print the T4's
 #     file: the check is made by the rule and by nothing else.
 # What the files do not hold, and why, is in the header of cublas_tc_gemm.cu (products cuBLAS splits over K).
@@ -42,6 +42,9 @@ fails=0
 run() {
   local label=$1 bin=$2 gpu=$3 want=$4 expect=$5; shift 5
   env VGPU_QUIET=1 VGPU_GPU="nvidia/$gpu" LD_LIBRARY_PATH="$shim" "$@" timeout 900 "$bin" > "$tmp/out.txt" 2> "$tmp/err.txt" || true
+  if [[ -n "${FILTER_SPLITK:-}" ]]; then   # a profile of another multiprocessor count has no split-K table: only the products that are not cut are compared
+    grep -v '^splitk ' "$want" > "$tmp/want.txt"; grep -v '^splitk ' "$tmp/out.txt" > "$tmp/out2.txt"; want="$tmp/want.txt"; cp "$tmp/out2.txt" "$tmp/out.txt"
+  fi
   if diff "$want" "$tmp/out.txt" > "$tmp/d.txt"; then got=same; else got=differ; fi
   if [[ $got == "$expect" ]]; then echo "ok   $label"; else
     echo "FAIL $label: output $got, wanted $expect, against $(basename "$want")"; head -6 "$tmp/d.txt" | cut -c1-200; head -3 "$tmp/err.txt" | cut -c1-200; fails=1
@@ -51,6 +54,6 @@ t4_pin="$data/cublas_tc_gemm.t4.txt"
 [[ -n "${CUBLAS_TC_T4_PIN:-}" ]] && t4_pin="$CUBLAS_TC_T4_PIN"    # for the mutation check: another pin must fail
 run "cuBLAS tensor-core GEMMs, t4 profile = the Tesla T4"               "$tmp/t4"   t4      "$t4_pin"                          same
 run "cuBLAS tensor-core GEMMs, a10g profile = the A10G"                 "$tmp/a10g" a10g    "$data/cublas_tc_gemm.a10g.txt"    same
-run "cuBLAS tensor-core GEMMs, rtx3060 profile = the A10G (both sm_86)" "$tmp/a10g" rtx3060 "$data/cublas_tc_gemm.a10g.txt"    same
+FILTER_SPLITK=1 run "cuBLAS tensor-core GEMMs, rtx3060 profile = the A10G on the products that are not cut (28 multiprocessors: no split-K table)" "$tmp/a10g" rtx3060 "$data/cublas_tc_gemm.a10g.txt" same
 run "cuBLAS tensor-core GEMMs, t4 profile with VGPU_TC_EXACT=0 is not the T4" "$tmp/t4" t4  "$t4_pin"                          differ VGPU_TC_EXACT=0
 (( fails == 0 ))

@@ -107,7 +107,7 @@ void parse_numerics(const Value& doc, DeviceProfile& p, const std::string& origi
         key != "tensor_sum_published" && key != "tensor_sum_fp8" && key != "tensor_sum_fp8_chunk" && key != "tensor_sum_fp8_grid" &&
         key != "tensor_sum_fp8_out_bits" && key != "tensor_sum_wgmma_fp8" && key != "tensor_sum_wgmma_fp8_chunk" &&
         key != "tensor_sum_wgmma_fp8_grid" && key != "tensor_sum_wgmma_fp8_out_bits" && key != "tensor_sum_wgmma" &&
-        key != "tensor_sum_tcgen05" && key != "tensor_sum_m8n8k4" && key != "tensor_sum_sparse")
+        key != "tensor_sum_tcgen05" && key != "tensor_sum_m8n8k4" && key != "tensor_sum_sparse" && key != "cublas_splitk")
       fail(origin, "numerics: unknown key '" + key + "'");
   }
   // The tensor-core sum is read by the NVIDIA engines only. On another vendor's profile it would be a property nothing consults.
@@ -220,6 +220,19 @@ void parse_numerics(const Value& doc, DeviceProfile& p, const std::string& origi
   form_sum("tensor_sum_tcgen05", {FormSum::Hopper}, p.numerics.tensor_sum_tcgen05);
   form_sum("tensor_sum_m8n8k4", {FormSum::Volta, FormSum::ChainCLast}, p.numerics.tensor_sum_m8n8k4);
   form_sum("tensor_sum_sparse", {FormSum::Ampere}, p.numerics.tensor_sum_sparse);
+  // The cuBLAS split-K table: optional; none, or the table measured on a T4 or an A10G.
+  if (n.map.count("cublas_splitk")) {
+    const std::string name = get_str(n, "cublas_splitk", origin);
+    bool known = false;
+    for (CublasSplitK m : {CublasSplitK::None, CublasSplitK::T4, CublasSplitK::A10g})
+      if (name == cublas_splitk_name(m)) {
+        p.numerics.cublas_splitk = m;
+        known = true;
+      }
+    if (!known) fail(origin, "numerics.cublas_splitk must be none, t4 or a10g, got: " + name);
+    if (p.numerics.cublas_splitk != CublasSplitK::None && !tensor_sum_rule(p.numerics.tensor_sum))
+      fail(origin, "numerics.cublas_splitk cuts a chain of tensor-core chunks into slices, so it needs a tensor_sum that is not sequential");
+  }
 }
 
 // The `provenance:` and `evidence:` sections (Provenance in profile.hpp), and the rule that every numerics key is tagged.

@@ -3,6 +3,9 @@
 #include "cudnn_common.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -772,6 +775,28 @@ inline float curand_uniform_of(uint32_t x) {
 }
 
 }  // namespace
+
+bool conv_tf32_available() {
+  static const bool on = [] {
+    const char* e = std::getenv("NVIDIA_TF32_OVERRIDE");
+    return !(e && e[0] == '0');
+  }();
+  if (!on) return false;
+  int dev = 0, major = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return false;
+  if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) return false;
+  return major >= 8;
+}
+
+double tf32_round(double v) {
+  float f = static_cast<float>(v);
+  uint32_t x;
+  std::memcpy(&x, &f, sizeof x);
+  if ((x & 0x7f800000u) == 0x7f800000u) return f;
+  x = (x + 0x1000u) & 0xffffe000u;
+  std::memcpy(&f, &x, sizeof f);
+  return f;
+}
 
 size_t dropout_threads() {
   int dev = 0, sms = 28;

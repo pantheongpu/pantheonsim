@@ -249,6 +249,23 @@ enum class Accum { Exact, Half, Int };
 //   Filter:  dw[k,c',f] = sum dy[n,k,o] x[n,c,p]      (a = dy, b = x)
 // over the taps that land inside the input. Inputs and the result are in
 // logical (packed NCHW) order.
+// A float convolution on a card with TF32 tensor cores (compute capability 8.0 and later), as PyTorch's default has it (torch.backends.cudnn.allow_tf32 =
+// True): cuDNN offers an engine that reads its FP32 inputs as TF32 (numerical note CUDNN_NUMERICAL_NOTE_TENSOR_CORE) next to the plain FP32 one. True when the
+// current device has them and NVIDIA_TF32_OVERRIDE is not 0 (read once).
+bool conv_tf32_available();
+// A value as a TF32 operand: float, the low 13 mantissa bits rounded away to nearest, ties away from zero (cvt.rna.tf32.f32; nvidia/src/gemm_input_rounding.hpp).
+double tf32_round(double v);
+// Whether the TF32 engine is offered for a convolution of this geometry. INFERRED: the A10G ran an 8x64x28x28 by 64x64x3x3 convolution (231M multiply-adds)
+// in TF32, and the RTX 3060 goldens of the small convolutions of nvidia/tests (a few thousand to a few hundred thousand multiply-adds, 3 to 16 channels,
+// groups) are plain FP32: the line drawn here is a single group, channels a multiple of 4 (16-byte alignment of FP32 rows) and at least 2^24
+// multiply-adds. Where cuDNN really switches is not known (nvidia/docs/libraries.md).
+inline bool conv_tf32_eligible(const ConvGeom& g) {
+  if (g.G != 1 || g.C % 4 != 0 || g.K % 4 != 0) return false;
+  int64_t macs = g.N * g.K * g.Cg;
+  for (int d = 0; d < 3; ++d) macs *= g.out[d] * g.flt[d];
+  return macs >= (int64_t{1} << 24) && conv_tf32_available();
+}
+
 void convolve(const ConvGeom& g, ConvDir dir, const std::vector<double>& a, const std::vector<double>& b,
               std::vector<double>* out, Accum acc);
 
