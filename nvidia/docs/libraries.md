@@ -672,7 +672,7 @@ capability 8.0 or later; a Tesla T4 has no TF32 and does the plain FP32 convolut
 against double), `CUDNN_FMA_MATH` is FP32 (3e-7); the graph API's heuristics return 35 configurations, the TF32 ones noting
 `CUDNN_NUMERICAL_NOTE_TENSOR_CORE` (cuDNN 9 has no TF32 note) and listed first, the others noting WINOGRAD, FFT or nothing (all FP32); PyTorch
 takes one by `allow_tf32`. On the T4: no engine notes TENSOR_CORE, both math types are FP32. The simulator now does the same on profiles of compute
-capability 8.0 and later (`NVIDIA_TF32_OVERRIDE=0` turns it off): `cudnnConvolutionForward`, `BackwardData`, `BackwardFilter` and the fused
+capability 8.0 and later, for convolutions that qualify (**inferred**: one group, channels a multiple of 4, at least 2^24 multiply-adds; the card ran a 231M one in TF32 and its small convolutions, with 3 to 16 channels or groups, in plain FP32 per the RTX 3060 goldens; where cuDNN really switches is not known) (`NVIDIA_TF32_OVERRIDE=0` turns it off): `cudnnConvolutionForward`, `BackwardData`, `BackwardFilter` and the fused
 conv-bias-activation read FP32 operands as TF32 (round to nearest, ties away) unless the descriptor's math type is `CUDNN_FMA_MATH`; the graph
 API offers two engines for a graph with an FP32 convolution, global index 1 (note TENSOR_CORE, TF32 operands, first) and index 0 (plain).
 **Inferred, not the card's bits:** which order cuDNN's TF32 engines sum in (an A10G probe of a 1x1 convolution shows an interleaved 8-wide

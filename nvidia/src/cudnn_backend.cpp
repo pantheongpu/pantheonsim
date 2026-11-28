@@ -3446,7 +3446,7 @@ bool graph_has_tf32_conv(const Desc* graph) {
   if (!schedule(graph, &order, &why)) return false;
   for (const Op& o : order)
     if ((o.kind == Kind::ConvFwd || o.kind == Kind::ConvData || o.kind == Kind::ConvFilter) && o.in.size() >= 2 && o.in[0].l.type == CUDNN_DATA_FLOAT &&
-        o.in[1].l.type == CUDNN_DATA_FLOAT)
+        o.in[1].l.type == CUDNN_DATA_FLOAT && vc::conv_tf32_eligible(o.geom))
       return true;
   return false;
 }
@@ -3870,7 +3870,7 @@ cudnnStatus_t prepare_plan(const Desc* p, const Desc* v, std::vector<Op>* order,
   if (!schedule(graph, order, &why)) return refuse("cudnnBackendExecute", why);
   if (eng->i64(CUDNN_ATTR_ENGINE_GLOBAL_INDEX, -1) == kTf32Engine && vc::conv_tf32_available())
     for (Op& o : *order)
-      if (o.kind == Kind::ConvFwd || o.kind == Kind::ConvData || o.kind == Kind::ConvFilter) o.tf32 = true;
+      if (o.kind == Kind::ConvFwd || o.kind == Kind::ConvData || o.kind == Kind::ConvFilter) o.tf32 = vc::conv_tf32_eligible(o.geom);
   if (const std::string gap = engine_gap(graph); !gap.empty()) return refuse("cudnnBackendExecute", "no engine for this graph: " + gap);
   // The variant pack: unique ids and the device pointers that go with them.
   const std::vector<int64_t> uids = v->i64s(CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS);

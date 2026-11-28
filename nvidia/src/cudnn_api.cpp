@@ -887,7 +887,7 @@ cudnnStatus_t conv_check(const char* fn, ConvDir dir, const void* xd, const void
       call->acc = Accum::Exact;
       // CUDNN_DEFAULT_MATH lets a card with TF32 tensor cores read FP32 operands as TF32 (CUDNN_FMA_MATH does not): PyTorch's
       // torch.backends.cudnn.allow_tf32 = True, its default, is the default math type (issue #739).
-      call->tf32 = xt == CUDNN_DATA_FLOAT && conv_tf32_available() && c->math != CUDNN_FMA_MATH;
+      call->tf32 = xt == CUDNN_DATA_FLOAT && c->math != CUDNN_FMA_MATH && conv_tf32_eligible(call->g);
       return CUDNN_STATUS_SUCCESS;
     case CUDNN_DATA_DOUBLE:  // DOUBLE_CONFIG
       if (ct != CUDNN_DATA_DOUBLE) return UNSUPPORTED(fn, config());

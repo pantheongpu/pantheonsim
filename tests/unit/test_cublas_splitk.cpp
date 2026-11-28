@@ -63,14 +63,15 @@ VTEST(product_with_slices_is_the_slices_chains_added_in_order) {
   const Model md = model_of(0);
   const int m = 40, n = 24, k = 300, slice = 96;
   const auto A = random_matrix(static_cast<size_t>(m) * k, 1), B = random_matrix(static_cast<size_t>(k) * n, 2);
-  std::vector<float> whole, got, p0, p1, p2, plain;
+  std::vector<float> whole, got, p0, p1, p2, p3, plain;
   product(md, Format::F16, false, false, m, n, k, A.data(), m, B.data(), k, got, slice);
   // By hand: the chain of each slice from zero (A's columns k0.., B's rows k0..), then the f32 sum in order.
   product(md, Format::F16, false, false, m, n, 96, A.data(), m, B.data(), k, p0, 0);
   product(md, Format::F16, false, false, m, n, 96, A.data() + static_cast<size_t>(96) * m, m, B.data() + 96, k, p1, 0);
-  product(md, Format::F16, false, false, m, n, 108, A.data() + static_cast<size_t>(192) * m, m, B.data() + 192, k, p2, 0);
+  product(md, Format::F16, false, false, m, n, 96, A.data() + static_cast<size_t>(192) * m, m, B.data() + 192, k, p2, 0);
+  product(md, Format::F16, false, false, m, n, 12, A.data() + static_cast<size_t>(288) * m, m, B.data() + 288, k, p3, 0);
   for (size_t i = 0; i < got.size(); ++i) {
-    const float want = (p0[i] + p1[i]) + p2[i];
+    const float want = ((p0[i] + p1[i]) + p2[i]) + p3[i];
     if (bits(got[i]) != bits(want)) throw vtest::Failure("element " + std::to_string(i) + " is not the slices' sum");
   }
   // Transposed operands cut the same slices.
