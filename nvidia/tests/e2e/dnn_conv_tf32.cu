@@ -201,6 +201,10 @@ int main() {
   std::printf("engines: some note TENSOR_CORE: %s; every engine that notes it gives class tf32: %s; some engine without the note exists: %s;"
               " the first engine notes it: %s\n",
               yn(any_tf32), any_tf32 ? yn(tf32_all_tf32) : "-", yn(any_plain), yn(first_notes));
+  for (Desc c : cfgs) cudnnBackendDestroyDescriptor(c);
+  for (Desc d : {heur, graph, op, cv, tx, tw, ty}) cudnnBackendDestroyDescriptor(d);
+  cudnnDestroyTensorDescriptor(xd); cudnnDestroyTensorDescriptor(yd); cudnnDestroyFilterDescriptor(wd); cudnnDestroyConvolutionDescriptor(cd);
+  cudnnDestroy(H);
   cudaFree(dx); cudaFree(dw); cudaFree(dy);
   return 0;
 }
